@@ -777,7 +777,7 @@ class X12Source(SourceConnector):
                 if refusal.kind is not None:
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # closed in the outer finally
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
@@ -851,15 +851,18 @@ class X12Source(SourceConnector):
                         )
                         break
                     # Reached on the success path alone: every arm above breaks or raises.
-                    # X12FrameReader reports no end-of-frame bytes yet, so a newline after the IEA
-                    # segment terminator that arrives in a read of its own starts the clock. That
-                    # gap is open, not intended (vault BACKLOG #2847 review).
-                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded, trailer_only=False)
+                    # A newline after the IEA segment terminator that arrives in a read of its own
+                    # ends that interchange and starts no clock (vault BACKLOG #2938).
+                    clock.after_read(
+                        in_frame=decoder.in_frame,
+                        decoded=decoded,
+                        trailer_only=decoder.trailer_only,
+                    )
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:

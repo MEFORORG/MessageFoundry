@@ -38,15 +38,20 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
-from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing import _builtin_hl7, normalize, split
 from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import starts_with_msh
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import NegativeAckError
-from messagefoundry.transports.framing import frame_for_delivery, frame_reply
+from messagefoundry.transports.framing import (
+    MULTIPLE_MESSAGES_CODE,
+    frame_for_delivery,
+    frame_reply,
+)
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
 
@@ -74,6 +79,8 @@ SMUGGLED = (
 SMUGGLED_STX = MSH + CR + "PID|1||111\x03\x02" + MSH2 + CR
 #: Audit probe P15: an embedded start byte only, which an MLLP frame keeps as data.
 EMBEDDED_SB = MSH + CR + "PID|1||111" + CR + SB + MSH2 + CR + "PID|1||999" + CR
+#: ADR 0209: two whole messages in one payload, as a Handler bug or a pasted batch would Send it.
+TWO = CLEAN + MSH2 + CR + "PID|1||999^^^MRN||ROE" + CR
 
 
 def _frames(codec: FrameCodec, wire: bytes) -> list[bytes]:
@@ -511,6 +518,8 @@ def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
     [
         pytest.param(SMUGGLED, DEAD, {}, "frame", id="smuggled"),
         pytest.param(CLEAN, DONE, {}, "", id="clean-control"),
+        # ADR 0209: two messages in one payload dead-letter in shadow as a live send refuses them.
+        pytest.param(TWO, DEAD, {}, "more than one MSH segment", id="two-messages"),
         # A live send refuses a payload its rewrite cannot re-encode, permanently (ADR 0204,
         # ADR 0206), and check_frame shares that rewrite, so shadow dead-letters it too.
         pytest.param(
@@ -613,3 +622,164 @@ async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_b
     finally:
         await source.stop()
     assert got.count(b"\x02") == 1
+
+
+# --- ADR 0209: an MLLP or TCP delivery refuses an MSH-led payload holding a second MSH ----------
+# The shadow single-row case is the "two-messages" row of the shadow test above; the batch cases
+# are in tests/test_outbound_batch.py.
+
+#: TWO with each line-end shape a Handler may produce, with leading whitespace, and with byte
+#: order marks where two texts read without stripping them would put them.
+TWO_VARIANTS = [
+    pytest.param(TWO, id="cr"),
+    pytest.param(TWO.replace(CR, "\n"), id="lf"),
+    pytest.param(TWO.replace(CR, "\r\n"), id="crlf"),
+    pytest.param("\r\n" + TWO, id="leading-whitespace"),
+    pytest.param(CLEAN + split._BOM + TWO[len(CLEAN) :], id="byte-order-mark-between"),
+    pytest.param(split._BOM + TWO, id="byte-order-mark"),
+]
+#: A relayed X12 interchange, which a TCP outbound carries opaquely and never reads as HL7.
+X12 = (
+    "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *260101*1200*^*00501"
+    "*000000001*0*P*:~GS*HC*SENDER*RECEIVER*20260101*1200*1*X*005010X222A1~ST*837*0001~"
+    "SE*2*0001~GE*1*1~IEA*1*000000001~"
+)
+#: Message content the refusal text must never carry.
+CONTENT = ("SND", "FORGED", "DOE", "ROE", "CTRL1", "CTRL2", "111", "999")
+
+
+def _tcp(persistent: bool = False) -> TcpDestination:
+    settings: dict[str, object] = {
+        "host": "127.0.0.1",
+        "port": 1,
+        "framing": "stx_etx",
+        "timeout_seconds": 1,
+        "persistent": persistent,
+    }
+    return TcpDestination(Destination(name="out", type=ConnectorType.TCP, settings=settings))
+
+
+def _assert_two_messages_refusal(exc: NegativeAckError, transport: str) -> None:
+    assert exc.permanent is True
+    assert exc.code == MULTIPLE_MESSAGES_CODE
+    assert str(exc).startswith(transport + ": payload holds more than one MSH segment")
+    assert [word for word in CONTENT if word in str(exc)] == []
+
+
+def _record_wire(monkeypatch: pytest.MonkeyPatch, dest: Any) -> list[bytes]:
+    """Replace ``dest``'s connect-per-send path with a recorder of the framed bytes it is handed,
+    so the real ``send()`` runs up to the dial."""
+    sent: list[bytes] = []
+
+    async def record(wire: bytes, *_: Any) -> None:
+        sent.append(wire)
+
+    monkeypatch.setattr(dest, "_send_once", record)
+    return sent
+
+
+@pytest.mark.parametrize("payload", TWO_VARIANTS)
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("no_ack", [False, True])
+async def test_all_four_mllp_send_paths_refuse_two_messages_before_any_dial(
+    monkeypatch: pytest.MonkeyPatch, persistent: bool, no_ack: bool, payload: str
+) -> None:
+    # Before ADR 0209 each path framed the payload as asked: one frame, two messages, one ACK.
+    dest = _mllp(persistent, no_ack)
+    monkeypatch.setattr(dest, "_dial", _never_dial)
+    try:
+        with pytest.raises(NegativeAckError) as caught:
+            await dest.send(payload)
+    finally:
+        await dest.aclose()
+    _assert_two_messages_refusal(caught.value, "MLLP")
+
+
+@pytest.mark.parametrize("payload", TWO_VARIANTS)
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_both_tcp_send_paths_refuse_two_messages_before_any_dial(
+    monkeypatch: pytest.MonkeyPatch, persistent: bool, payload: str
+) -> None:
+    dest = _tcp(persistent)
+    monkeypatch.setattr(dest, "_dial", _never_dial)
+    try:
+        with pytest.raises(NegativeAckError) as caught:
+            await dest.send(payload)
+    finally:
+        await dest.aclose()
+    _assert_two_messages_refusal(caught.value, "TCP")
+
+
+async def test_the_mllp_send_control_frames_one_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The control for the refusals above: the same destination sends one message as one frame.
+    dest = _mllp(persistent=False, no_ack=False)
+    sent = _record_wire(monkeypatch, dest)
+    await dest.send(CLEAN)
+    assert sent == [MLLP_CODEC.frame(CLEAN)]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(CLEAN, id="one-hl7-message"),
+        pytest.param(X12, id="x12-relay"),
+        # Only an MSH-led payload is read: an opaque payload that merely carries MSH lines is not.
+        pytest.param("relay header\n" + TWO.replace(CR, "\n"), id="not-msh-led"),
+    ],
+)
+async def test_the_tcp_send_carries_one_message_and_an_opaque_relay(
+    monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    dest = _tcp()
+    sent = _record_wire(monkeypatch, dest)
+    await dest.send(payload)
+    assert sent == [STX_ETX_CODEC.frame(payload)]
+
+
+@pytest.mark.parametrize(
+    ("dest", "kwargs", "transport"),
+    [
+        pytest.param(lambda: _SendRecorder(), {}, "MLLP", id="mllp"),
+        pytest.param(lambda: _SendRecorder(), {"rewrite": False}, "MLLP", id="mllp-as-stored"),
+        pytest.param(
+            lambda: _SendRecorder(hl7_raw_separators=True), {}, "MLLP", id="mllp-raw-separators"
+        ),
+        # The delimiter override re-encodes first; the refusal is still this one, not "reencode".
+        pytest.param(
+            lambda: MLLPDestination(
+                Destination(
+                    name=DEST,
+                    type=ConnectorType.MLLP,
+                    settings={"host": "127.0.0.1", "port": 1, "encoding_characters": "#@*!%"},
+                )
+            ),
+            {},
+            "MLLP",
+            id="mllp-delimiter-override",
+        ),
+        pytest.param(lambda: _tcp(), {}, "TCP", id="tcp"),
+    ],
+)
+def test_check_frame_refuses_two_messages_as_a_send_does(
+    dest: Any, kwargs: dict[str, Any], transport: str
+) -> None:
+    # check_frame is what a batch member (rewrite=False) and a shadow outbound are judged by, so
+    # it must answer as a live send does; CLEAN is the control.
+    check = dest().check_frame
+    check(CLEAN, **kwargs)
+    with pytest.raises(NegativeAckError) as caught:
+        check(TWO, **kwargs)
+    _assert_two_messages_refusal(caught.value, transport)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [*TWO_VARIANTS, CLEAN, CLEAN.replace(CR, "\n"), "relay header\n" + TWO, X12],
+)
+def test_the_delivery_reading_is_the_ingress_reading_of_an_msh_led_payload(body: str) -> None:
+    # The ingress guard reads normalized text; a delivery reads the payload as it will send it.
+    # On the text a receiver reads once it drops each byte order mark, each must find what the
+    # other finds. The ingress guard itself reads no mark: the parser refuses a body one leads.
+    normalized = normalize(body).replace(split._BOM, "").lstrip()
+    expected = starts_with_msh(normalized) and split._holds_more_than_one_message(normalized)
+    assert split._sends_more_than_one_message(body) is expected

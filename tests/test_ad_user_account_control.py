@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_managed_app
@@ -56,6 +57,7 @@ from messagefoundry.auth.reconcile import (
     ProbeOutcome,
     ReconcilePlan,
     SessionRevocation,
+    breaker_tripped,
 )
 from messagefoundry.auth.service import AuthService, _BreakerStanding, _HoldStanding
 from messagefoundry.config.settings import (
@@ -65,6 +67,7 @@ from messagefoundry.config.settings import (
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
+    load_settings,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -269,6 +272,81 @@ def _settings(**over: Any) -> AuthSettings:
     }
     base.update(over)
     return AuthSettings(**base)
+
+
+# --- BACKLOG #3085: settings under which the mass-revoke breaker could never trip ---------------
+
+
+def test_a_fraction_of_one_is_refused_while_the_reconciler_runs() -> None:
+    """A pass never revokes more accounts than it probed, so with the AND in ``breaker_tripped`` a
+    1.0 fraction leaves the whole breaker unable to trip.
+
+    RED when: 1.0 loads with the reconciler on, and a site has no breaker without being told."""
+    with pytest.raises(ValidationError, match="must be below 1.0"):
+        _settings(ad_session_revoke_max_fraction=1.0)
+
+
+@pytest.mark.parametrize("users", [5, 1], ids=["budget-equals-cap", "budget-below-cap"])
+def test_a_budget_at_or_below_the_cap_loads_and_names_the_dead_breaker(users: int) -> None:
+    """Warned of, not refused (owner ruling 2026-10-17): the setting loads with the default cap of
+    5, revocation keeps working, and the warning names the settings and what to set.
+
+    RED when: the pair is refused, or loads with no warning."""
+    note = _settings(ad_session_recheck_max_users=users).breaker_budget_warning()
+    assert note is not None
+    assert "can never trip" in note
+    assert "raise ad_session_recheck_max_users above ad_session_revoke_max" in note
+
+
+def test_a_budget_one_above_the_cap_does_not_warn() -> None:
+    """The boundary control: at cap + 1 a pass can revoke more than the cap, so the breaker can
+    trip and nothing is warned of."""
+    assert _settings(ad_session_recheck_max_users=6).breaker_budget_warning() is None
+
+
+def test_serve_logs_the_dead_breaker_warning_once_logging_is_configured() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
+    or it would reach bare stderr only. Read from the source, as the unread-variable replay test in
+    tests/test_settings_env_keys.py does, because running ``serve`` that far starts an engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    checked = source.index("if _logging_refused is not None:")
+    warned = source.index("settings.auth.breaker_budget_warning()")
+    assert source.index("_load_service_settings(") < checked < warned
+    assert "breaker_budget_warning" not in inspect.getsource(load_settings)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ad_session_revoke_max_fraction": 1.0},
+        {"ad_session_recheck_max_users": 5},
+    ],
+    ids=["fraction-1.0", "budget-equals-cap"],
+)
+def test_the_breaker_settings_check_waits_for_a_reconciler_that_can_run(
+    override: dict[str, Any],
+) -> None:
+    """With AD off, or the interval at 0, the reconciler never runs, so these knobs are inert."""
+    assert _settings(ad_session_recheck_seconds=0, **override).breaker_budget_warning() is None
+    assert AuthSettings(**override).breaker_budget_warning() is None
+
+
+def test_the_shipped_breaker_defaults_pass_with_the_reconciler_on() -> None:
+    """The control: the defaults (200, 5, 0.34) load with no warning and can trip, and a fraction
+    just below 1.0 loads."""
+    defaults = _settings()
+    assert defaults.breaker_budget_warning() is None
+    assert breaker_tripped(
+        revoke_count=defaults.ad_session_recheck_max_users,
+        probed=defaults.ad_session_recheck_max_users,
+        max_absolute=defaults.ad_session_revoke_max,
+        max_fraction=defaults.ad_session_revoke_max_fraction,
+    ), "the shipped defaults leave the breaker unable to trip"
+    _settings(ad_session_revoke_max_fraction=0.99)
 
 
 # --- login: the password path and the password-free (Kerberos) path ----------------------------

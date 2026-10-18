@@ -3,6 +3,10 @@
 
 # Containerizing the MessageFoundry engine
 
+> **Not supported for v1.** The image runs Linux
+> ([why](../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)). Deploy v1
+> as a Windows service ([SERVICE.md](../docs/SERVICE.md)).
+
 The **headless engine** runs cleanly as an OCI container (ADR 0017 "container fast-follow"). This
 directory holds the image, a Topology-A `compose.yaml`, minimal Kubernetes manifests, and a CI smoke.
 
@@ -52,19 +56,21 @@ interpreter it starts.
   means a `PYTHONPATH` set with `-e` or in an orchestrator's manifest cannot decide what the
   engine imports, and the working directory, which is the writable store volume, is off the
   import path.
-- **`-u -B`** give unbuffered output and no bytecode files. The image also sets
-  `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE`; those now serve only the Python children the
-  engine starts, because the engine itself ignores them.
+- **`-u -B`** give unbuffered output and no bytecode files. The engine's Python children repeat
+  `-I` and `-B`, and take `-u` because the image sets `PYTHONUNBUFFERED`. The image's
+  `PYTHONDONTWRITEBYTECODE` reaches no engine process; it stays for a shell started in the image.
 - **The virtual environment is owned by root, and the engine runs as uid 10001.** So the engine's
   own account cannot add a file to `site-packages`, even where the root file system is left
   writable. Code planted there would run at every interpreter start. Uid 10001 owns only
   `/var/lib/mefor`; `/config` is root-owned too.
 
-Two things undo this, and the engine reports both:
+Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options. It then reports
-  `interpreter_not_isolated` and `remote_debug_enabled`.
+  in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
+  start, because remote debugging is on (vault BACKLOG #2700). Under `warn`, or with
+  `[security].allow_remote_debugging`, it reports `interpreter_not_isolated` and
+  `remote_debug_enabled`.
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
   reports `startup_directory_writable` when its account can write there.

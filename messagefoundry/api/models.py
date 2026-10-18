@@ -613,7 +613,22 @@ class ReloadResult(BaseModel):
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
     (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
-    ``config_reload`` audit row failed after the swap, BACKLOG #1940)."""
+    ``config_reload`` audit row failed after the swap, BACKLOG #1940).
+
+    ``restart_required`` names each settings trust anchor whose consumer loaded its bytes at start
+    (for example ``[auth].ad_tls_ca_cert_file``) and whose file has changed on disk since. The
+    reload checked the new file and passed it, but no reload rebuilds the consumer that loaded the
+    old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
+    ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
+
+    An empty list is narrower than "no restart needed". It means no anchor this field covers
+    changed, including when none is configured. It covers only the engine process that answered:
+    another engine shard, or a cluster node that converges on the reload, reports its own anchors
+    only in its own log, as the audit row names no node. It never lists at least the dialling
+    settings CAs (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``,
+    ``[logging].forward_tls_ca_file``): their hops load the file by path and record no fingerprint
+    to compare with. A changed one can still need a restart or a rebuild of the connections that
+    use it; ``docs/SECURITY.md`` says which."""
 
     inbound: int
     outbound: int
@@ -623,6 +638,7 @@ class ReloadResult(BaseModel):
     dry_run: bool = False
     degraded: bool = False
     failures: list[str] = []
+    restart_required: list[str] | None = None
 
 
 class ConfigProvenance(BaseModel):
@@ -1500,7 +1516,7 @@ class InterpreterView(BaseModel):
     code_path_variables: list[str] = Field(default_factory=list)
     startup_code: list[StartupCodeItemView] = Field(default_factory=list)
     #: The directories start-up code is read from: the site directories and every directory on
-    #: the import path, the engine's own and the one it hands its Python children.
+    #: the engine's import path, which its Python children share (they repeat its isolation).
     startup_dirs: list[str] = Field(default_factory=list)
     #: The ones the engine's own account can add a file to. Empty is the safe reading only while
     #: ``startup_dirs`` is not empty and ``unchecked_startup_dirs`` is.

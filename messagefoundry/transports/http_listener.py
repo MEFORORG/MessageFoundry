@@ -49,6 +49,7 @@ from typing import Any, ClassVar
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
 from messagefoundry.redaction import safe_exc
+from messagefoundry.tls_handshake_failures import HandshakeFailures, watch_loop_handshakes
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
     InboundHandler,
@@ -716,6 +717,12 @@ class HttpSource(SourceConnector):
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
+        # The loop runs this listener's handshakes on every loop, so a failed one never reaches
+        # `_on_client`. The context reports it, as a throttled `tls_handshake_failed` event like the
+        # MLLP listener's (vault BACKLOG #3302). The peer is not known there.
+        self._tls_failures = HandshakeFailures(self._emit_tls_failure)
+        if self._ssl is not None:
+            watch_loop_handshakes(self._ssl, self._note_tls_failure)
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already
@@ -775,6 +782,15 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        if self.max_body_bytes is None:
+            # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
+            # #2749, as FileSource does for its caps). Logged after every check in this constructor,
+            # so a source it refuses has not logged it. The line names the setting, never its value.
+            logger.warning(
+                "HTTP source %s: max_body_bytes is off, so a request body of any declared size is "
+                "read whole; set a positive value to bound it",
+                config.name or f"{self.host}:{self.port}",
+            )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -830,9 +846,15 @@ class HttpSource(SourceConnector):
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
             self._client_tasks.clear()
+            # Report the handshake failures a trailing event still held (vault BACKLOG #3302).
+            # Not once a restart has begun, whose failures are its own to report.
+            if self._admission.stopping:
+                await self._tls_failures.flush()
         finally:
             # Even when this stop() is cancelled: a task cancelled past its grace never released.
             self._admission.reset()
+            if self._admission.stopping:
+                self._tls_failures.cancel()
         # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
         # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
         # every client task is resolved, so a wait_closed() past the grace is an OS wedge — abandoning it
@@ -843,6 +865,20 @@ class HttpSource(SourceConnector):
             except TimeoutError:
                 logger.warning("HTTP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
+
+    @property
+    def tls_handshake_failures(self) -> int:
+        """Failed TLS handshakes this listener has seen since it was built, outside its stop()s
+        (vault BACKLOG #3302)."""
+        return self._tls_failures.count
+
+    def _note_tls_failure(self, cause: str) -> None:
+        # Not once stop() has begun, so no report outlives stop().
+        if not self._admission.stopping:
+            self._tls_failures.note_soon(None, cause)
+
+    async def _emit_tls_failure(self, peer_host: str | None, reason: str) -> None:
+        await self._emit_event("tls_handshake_failed", peer_host=peer_host, reason=reason)
 
     async def _emit_event(
         self, kind: str, *, peer_host: str | None = None, reason: str | None = None
@@ -1078,7 +1114,7 @@ class HttpSource(SourceConnector):
                     ),
                 )
                 return  # pre-ingress refusal — nothing accepted, so nothing to count
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             established = True  # set with the admit, so the finally below always releases it
             await self._emit_event("established", peer_host=peer_host)
             failed = await self._serve_one(reader, writer, peer_host=peer_host)
@@ -1094,7 +1130,7 @@ class HttpSource(SourceConnector):
             await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
             if established:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
             self._clients.discard(writer)
             if task is not None:
                 self._client_tasks.discard(task)

@@ -65,9 +65,16 @@ this line.**
   `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
+- **The reload pages say what a reload left undone.** The inline reload result page and the
+  approval page for a released reload show a banner for a degraded follow-on step and for each
+  settings trust anchor that takes a restart; before, both reached only the JSON answer. Seam
+  change: `ReloadResult` carries `restart_required`. (`BACKLOG #3015`)
 
 ### Changed
 
+- **Linux is not a supported v1 deployment target.** The package drops the
+  `Operating System :: POSIX :: Linux` classifier, matching the engine
+  ([why](../../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
 - **Seam only: the engine's posture model grew.** `SecurityPosture` gains
   `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
   renders nothing new, but the field is on the seam it pins, so the supported digest moved.
@@ -78,6 +85,20 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the seam digest covers each console route's gate.** The engine's seam snapshot now
+  records what this console installs: each route's top-level dependencies, gates included, with
+  their own source and captured settings, and its mounts, middleware and WebSocket authorizer
+  (vault `BACKLOG #2709`). No console route changed, but the supported digest moved. A console
+  release that adds a route, changes a route's gate, or edits a console helper a gate calls by
+  plain name now moves the seam too, so it needs an
+  engine that ships the new value. The released 0.4.0, whose DR routes sit on the session alone,
+  passed the handshake of engines from PR 1910 up to engine PR 1940, whose unrelated seam move
+  refuses it; this change guards the next gate change that moves nothing else.
+- **Each group input on the AD group page shows an example full DN.** The placeholder reads
+  `CN=MF-Admins,OU=Groups,DC=example,DC=com`, since both maps refuse a short name. Nothing is
+  stored from it. The page's two save forms now trim only a space, a tab and a line break from a
+  group, as the engine route does, so a group ending in a no-break space is refused with the
+  route's 400 rather than trimmed. (vault `BACKLOG #3222`)
 
 ### Fixed
 
@@ -92,6 +113,9 @@ this line.**
 
 ### Security
 
+- **The passkey registration finish draws on the per-actor ceremony budget.**
+  `POST /ui/account/webauthn/verify` now charges the same budget as `POST /ui/account/mfa/verify`,
+  and answers a throttle with a JSON 429 the page can show. No seam change. (BACKLOG #3014)
 - **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
   shows the address the engine recorded for the entry, or a dash when no client was in scope.
   An operator tracing a run of refused sign-ins can now see their source on the page, not only in
