@@ -14,8 +14,9 @@ No test sleeps. The wall clock the service and the store read is held, so no tim
 the sign-in and the early attempt however slow the runner is, and the clock then moves only forward.
 A clock that stepped behind a session's own stamps would end the session.
 
-The last two tests pin what the same two routes say when the service refuses a directory account
-the directory did not confirm (BACKLOG #3061), which is not a floor refusal.
+The last three tests pin what the same two routes say when the service refuses a directory account
+the directory did not confirm (BACKLOG #3061) or one under a second-step lock (BACKLOG #3810
+finding 4), neither of which is a floor refusal, and the passkey page's note on a stray passkey.
 
 Each test names the mutation that must turn it RED.
 """
@@ -202,7 +203,7 @@ def _refusal(refusal: str) -> Elevation:
 
 
 @_ENROL_REFUSALS
-async def test_the_console_totp_confirm_says_the_directory_could_not_confirm_the_account(
+async def test_the_console_totp_confirm_says_why_an_unchecked_code_was_refused(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     """``confirm_mfa_enrollment`` asks the directory before it checks a directory account's code,
@@ -235,7 +236,7 @@ async def test_the_console_totp_confirm_says_the_directory_could_not_confirm_the
 
 
 @_ENROL_REFUSALS
-async def test_the_console_passkey_finish_says_the_directory_could_not_confirm_the_account(
+async def test_the_console_passkey_finish_says_why_an_unchecked_passkey_was_refused(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     """As above, for ``finish_webauthn_registration``. The service answer is stubbed.
@@ -276,7 +277,7 @@ async def test_the_console_passkey_finish_says_the_directory_could_not_confirm_t
 
 def test_the_passkey_page_says_a_stray_passkey_can_be_deleted() -> None:
     """BACKLOG #3810 finding 4: every refusal at the passkey finish comes after the authenticator
-    made its credential, on engine main as here, so a failed enrolment can leave one behind that
+    made its credential, as it did before #3061, so a failed enrolment can leave one behind that
     the server never stored. RED when the page stops saying it can be deleted."""
     from messagefoundry_webconsole import pages
 

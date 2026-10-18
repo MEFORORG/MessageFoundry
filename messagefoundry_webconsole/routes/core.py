@@ -138,8 +138,8 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
 def _refusal_error(elevation: Elevation, fallback: str) -> str:
     """The words for a refused code or passkey: the directory's refusal, then a lock, then the leg's
     own ``fallback`` for a wrong proof. The first two never checked the proof, so ``fallback``
-    would be false for them (BACKLOG #3061, #3810 finding 4). The two never come together: a
-    directory refusal returns before the lock is read."""
+    would be false for them (BACKLOG #3061, #3810 finding 4). No leg sets both flags on one
+    answer, so the order between them decides nothing today."""
     if _directory_unconfirmed(elevation):
         return _DIRECTORY_UNCONFIRMED_ERROR
     if elevation.locked:

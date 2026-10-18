@@ -10776,7 +10776,7 @@ class AuthService:
         # reason given there; read-then-act as there. Only a PASSKEY is refused here. A TOTP that
         # another confirm enabled meanwhile, or an account gone, is left to the enable's
         # compare-and-set below, which ends this session as #2224 documents.
-        if await self._enrolment_session_gone(
+        if await self._refuse_lost_enrolment_session(
             token, actor=identity.username, event="auth.mfa_failed", client=client
         ):
             return Elevation(session_lost=True)
@@ -11274,19 +11274,20 @@ class AuthService:
         )
         return True
 
-    async def _enrolment_session_gone(
+    async def _refuse_lost_enrolment_session(
         self, token: str, *, actor: str, event: str, client: str | None
     ) -> bool:
-        """Whether the session an enrolment leg holds is gone, auditing the refusal if so.
+        """Refuse an enrolment leg whose session is gone: True, with the refusal audited, when it
+        is. A REFUSAL, not a liveness probe: a True answer writes a failure row, so call it only
+        where the caller then answers ``session_lost``.
 
-        The guard in front of the second factor-binding ask on :meth:`confirm_mfa_enrollment` and
-        :meth:`finish_webauthn_registration` (BACKLOG #3061), which fails closed on a dead session.
-        It answers ``session_lost`` before the code or the attestation is checked. On engine
-        ``main`` the same interleaving on a local account reached the rotation, which audited its
-        failure, so the guard writes a row too (BACKLOG #3807): ``event`` (the leg's own failure
-        event) with ``reason=session_lost`` and ``phase=enroll``. That is the row
-        :meth:`_factor_holder_current` writes for a directory account in the same state, so one
-        outcome has one row shape whichever kind of account met it. Not
+        The guard in front of each factor-binding ask on :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration` (BACKLOG #3014, #3061), which fails closed on a dead
+        session. Before BACKLOG #3807 the second guard wrote no row, where the code before #3061
+        reached the rotation in the same interleaving on a local account and audited its failure.
+        So it writes ``event`` (the leg's own failure event) with ``reason=session_lost`` and
+        ``phase=enroll``: the row :meth:`_factor_holder_current` writes for a directory account in
+        the same state, so one outcome has one row shape whichever kind of account met it. Not
         ``auth.session_rotation_failed``: no rotation was attempted."""
         if await self._load_session(hash_token(token)) is not None:
             return False
@@ -11298,7 +11299,7 @@ class AuthService:
     ) -> None:
         """The ``session_lost`` row a factor leg writes when its session or account went: ``event``
         with ``reason=session_lost``, and ``phase`` when given. The one spelling
-        :meth:`_factor_holder_current` and :meth:`_enrolment_session_gone` share, so the row a
+        :meth:`_factor_holder_current` and :meth:`_refuse_lost_enrolment_session` share, so the row a
         directory account's re-read writes and the one a local account's enrolment guard writes
         cannot drift apart."""
         lost = {"reason": "session_lost"}
@@ -11786,6 +11787,10 @@ class AuthService:
         "authenticator app again from the account page"
     )
 
+    #: The refusal :meth:`begin_webauthn_registration` raises for a directory account under a
+    #: second-step lock (BACKLOG #3810 finding 4), in the words the console shows for a lock.
+    ACCOUNT_LOCKED = "Account locked. Try again later."
+
     async def begin_webauthn_registration(
         self, identity: Identity, *, token: str, rp_id: str, rp_name: str
     ) -> str:
@@ -11794,7 +11799,9 @@ class AuthService:
         stolen pre-MFA cookie must never bind an attacker's passkey). Raises :class:`ValueError`
         for an unknown account; a full challenge cache raises
         :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly). Accepts a
-        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason."""
+        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason,
+        and raises :class:`ValueError` with :attr:`ACCOUNT_LOCKED` for one under a second-step lock,
+        audited ``auth.webauthn_failed`` with the shared locked detail (BACKLOG #3810 finding 4)."""
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
@@ -11802,6 +11809,15 @@ class AuthService:
         # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
         if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
             raise FactorEnrolmentRequired()
+        # BACKLOG #3810 finding 4: the finish refuses a directory account's second-step lock, and
+        # any refusal there comes after the authenticator made a credential the server never
+        # stores. A lock outlasts the ceremony, so it is refused here first, before the browser
+        # makes anything. Only a directory account, as at the finish; a local account is not
+        # lock-checked at enrolment. The finish keeps its check for a lock set during the ceremony.
+        if user.auth_provider == AuthProvider.AD.value and await self._mfa_lock_refused(
+            user, client=None, event="auth.webauthn_failed"
+        ):
+            raise ValueError(self.ACCOUNT_LOCKED)
         existing = await self._verified_passkeys(user)
         if existing is None:
             raise ValueError("no such user")
@@ -11856,13 +11872,11 @@ class AuthService:
         lock, a locked directory account cannot enrol a passkey, and that refusal carries
         ``locked`` (BACKLOG #3810 finding 4); a local account is not lock-checked here.
 
-        **Every refusal here comes after the authenticator made its credential** (BACKLOG #3810
-        finding 4). The browser's ``navigator.credentials.create`` runs between
-        :meth:`begin_webauthn_registration` and this call, and this call receives its attestation,
-        so a refusal leaves a passkey on the authenticator that the server never stored. Engine
-        ``main`` is the same: its factor-binding refusal, floor, lost session, failed verification
-        and duplicate refusals all sit here too. That passkey cannot sign in, since no row names it;
-        the console's passkey page says it can be deleted from the authenticator."""
+        **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
+        finding 4), so it leaves a passkey the server never stored. ``docs/SECURITY.md``, *A
+        refused registration can leave a passkey on the authenticator*, says which refusals and
+        what the console tells the user. A second-step lock is also refused at
+        :meth:`begin_webauthn_registration`, before any credential is made."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -11885,8 +11899,10 @@ class AuthService:
         # once more after the directory lookup below. Read-then-act: a factor bound between that
         # second ask and the stamp below is not caught, as the begin gate's is not.
         # The session is read first because the check fails closed on a dead one, which is a lost
-        # session to the caller, not a factor it owes.
-        if await self._load_session(hash_token(token)) is None:
+        # session to the caller, not a factor it owes. Audited, as the second guard below is.
+        if await self._refuse_lost_enrolment_session(
+            token, actor=identity.username, event="auth.webauthn_failed", client=client
+        ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
@@ -11922,7 +11938,7 @@ class AuthService:
         # check fails closed on a session revoked meanwhile. A directory account's lookup re-reads
         # the session and answers a revoked one lost first; a local account is never looked up, and
         # the floor, which reads the session only when it is above 0, does not refuse a revoked one.
-        if await self._enrolment_session_gone(
+        if await self._refuse_lost_enrolment_session(
             token, actor=identity.username, event="auth.webauthn_failed", client=client
         ):
             self._webauthn_challenges.pop((hash_token(token), "register"))

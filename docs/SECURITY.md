@@ -2689,20 +2689,21 @@ the lookup's outcome and `phase=enroll`. After a confirmed lookup each leg reads
 account and its lock again, and a session or account gone meanwhile is a lost session, which
 also ends a staged passkey ceremony. That re-read refuses a second-step lock too, so a locked
 directory account cannot enrol a factor, while a local account is not lock-checked at enrolment.
-The lock refusal reads as a lock, not as a wrong code, since the code or passkey was never
-checked (BACKLOG #3810 finding 4): `POST /me/mfa/confirm` answers **403** `account locked; try
-again later`, and the account page's two enrolment finishes show `Account locked. Try again
-later.`, the words `/ui/reauth` shows. On either account kind, a session found gone just before
-each leg's second factor-binding ask is a lost session audited as the leg's failure event with
-`reason=session_lost` and `phase=enroll` (BACKLOG #3807), so a local account's lost enrolment
-leaves the row a directory account's re-read writes.
 The TOTP leg judges the code as of the request's arrival, so a slow lookup does not push a good code
 out of its step. A refusal is not free: the route in front of each leg has already drawn its
 per-actor attempt budget, and `POST /me/mfa/confirm` and `/ui/account/mfa/verify` have spent their
 single-use password step-up, so each retry costs a password re-proof.
-`POST /me/mfa/confirm` answers **403** with the words `POST /auth/mfa-verify` uses, and the
-account page's two enrolment finishes show the words `/ui/mfa` shows. A local account is never
-looked up.
+For the directory refusal, `POST /me/mfa/confirm` answers **403** with the words
+`POST /auth/mfa-verify` uses, and the account page's two enrolment finishes show the words `/ui/mfa`
+shows. A local account is never looked up.
+The lock refusal reads as a lock, not as a wrong code, since the code or passkey was never
+checked (BACKLOG #3810 finding 4): `POST /me/mfa/confirm` answers **403** `account locked; try
+again later`, and the account page's two enrolment finishes show `Account locked. Try again
+later.`, the words `/ui/reauth` shows. A locked directory account is also refused when it begins a
+passkey registration, before the browser makes a credential. On either account kind, a session
+found gone at either factor-binding ask of the passkey finish, or at the TOTP confirm's second
+one, is a lost session audited as the leg's failure event with `reason=session_lost` and
+`phase=enroll` (BACKLOG #3807), the row a directory account's re-read writes.
 
 **Both second-factor legs read the session, the account and its lock once more right before they
 write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
@@ -2992,10 +2993,13 @@ account, enroll a second passkey or keep TOTP.
 
 **A refused registration can leave a passkey on the authenticator (BACKLOG #3810 finding 4).** The
 browser's `navigator.credentials.create` makes the credential before the finish request reaches the
-engine, so every refusal at finish comes after it: the factor-binding refusal, the login-to-MFA
-floor, a lost session, a failed verification, a duplicate, and a directory account's directory and
-lock refusals. That passkey is not stored, so it cannot sign in. The passkey page says the user may
-delete it from the browser's or security key's passkey list.
+engine, so any refusal or failure of the finish request comes after it. That includes at least the
+factor-binding refusal, the login-to-MFA floor, an expired ceremony, a bad label, a lost session,
+a failed verification, a duplicate, a directory account's directory and lock refusals, and the
+route's own refusals (rate limit, stale step-up window, malformed request). That passkey is not
+stored, so it cannot sign in. The passkey page says the user may delete it from the browser's or
+security key's passkey list. A second-step lock, which outlasts a ceremony, is refused at begin
+instead, before anything is made.
 
 Mechanics: ceremony challenges are **first-party 64-byte CSPRNG values**, single-use, 120 s TTL, staged
 in a bounded process-local cache (multi-node LBs need session affinity — the failure message says so).
