@@ -1549,9 +1549,7 @@ def _build_approval_gate(
                     client=None,
                     approval=approval,
                 )
-            except _RELOAD_ANSWERED:
-                raise
-            except Exception as exc:  # noqa: BLE001 - every reload failure is audited (#3157)
+            except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
                 # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row
                 # the inline route records, with the inline route's detail text, rather than
                 # escaping the approve route as a 500. That covers a bad config or trust anchor, and
@@ -2131,10 +2129,11 @@ async def _record_reload_audit(
 #: and audit row (:func:`_audit_refused_reload`). Every other ``Exception`` a reload raises is a
 #: fault inside it, a plain ``FileNotFoundError`` from a runner start or swap among them (BACKLOG
 #: #3157 item 3), and gets the one ``reload_fault`` row and the generic answer: 500 inline, 422 on a
-#: release. So every reload failure is audited. The catch sites (the inline route, a dry run
-#: included, the hold-parameter capture and the released executor; the console reaches the first
-#: two through the seam) catch ``Exception`` after :data:`_RELOAD_ANSWERED`, never
-#: ``BaseException``, so a cancellation, ``KeyboardInterrupt`` and ``SystemExit`` propagate.
+#: release. The catch sites (the inline route, a dry run included, the hold-parameter capture and
+#: the released executor; the console reaches the first two through the seam) catch ``Exception``
+#: around the reload alone, never ``BaseException``, so a cancellation, ``KeyboardInterrupt`` and
+#: ``SystemExit`` propagate. At least a convergence reload and a DR activation's reload are not
+#: among them, and a row whose own write fails is logged, not written.
 _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
     ConfigDigestMismatch,
@@ -2143,11 +2142,6 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDirMissing,
     WiringError,
 )
-
-#: What a reload catch site lets through rather than audit as ``reload_fault``: an answer already
-#: decided. At least the inline attempt row's 503, which is an ``HTTPException``, and the gate's own
-#: ``ApprovalError``.
-_RELOAD_ANSWERED: tuple[type[Exception], ...] = (HTTPException, ApprovalError)
 
 #: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
 #: WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
@@ -2204,8 +2198,10 @@ async def _audit_refused_reload(
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
     engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
     ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
-    writes reason ``reload_fault``, is logged at ERROR, and answers 500 with a generic detail
-    (BACKLOG #3157). So every reload failure writes a row.
+    writes reason ``reload_fault`` with the error's type name, is logged at ERROR, and answers 500
+    with a generic detail (BACKLOG #3157). A ``reload_fault`` row does not claim the old graph is
+    still serving: at least a fault raised after the swap committed leaves the new one live, and
+    ``GET /config/provenance`` says which is.
 
     The inline route and the dual-control executor share this, so a held reload whose directory
     vanished or left the reload roots before its release is refused and recorded the way an inline
@@ -2233,17 +2229,6 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
-    elif not isinstance(exc, _RELOAD_REFUSALS):
-        # BACKLOG #3157: not a refusal, so a fault inside the reload, such as a file the runner
-        # could not open or a source it could not start. Each escaped as a raw 500 with no outcome
-        # row.
-        _log.error(
-            "config reload failed (fault): %s",
-            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
-            exc_info=exc,
-        )
-        action, detail["reason"] = "config_reload_failed", "reload_fault"
-        status, answer = 500, "the reload failed inside the engine; see the engine log"
     elif isinstance(exc, ConfigDigestMismatch):
         # A hold that took no digest is told apart, so nobody goes looking for an edit that
         # never happened.
@@ -2284,7 +2269,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc.__cause__, AnchorStoreUnavailable):
+    elif isinstance(exc, WiringError) and isinstance(exc.__cause__, AnchorStoreUnavailable):
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
         _log.warning(
@@ -2294,7 +2279,7 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "store_unavailable"
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
-    else:
+    elif isinstance(exc, WiringError):
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(
             "config reload %s: %s",
@@ -2304,6 +2289,19 @@ async def _audit_refused_reload(
         action = "config_reload_failed"
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
+    else:
+        # BACKLOG #3157: not a refusal, so a fault inside the reload, such as a file the runner
+        # could not open. Each escaped as a raw 500 with no outcome row. Last, so a refusal type
+        # added without its own branch above is answered as a fault rather than as a bad graph.
+        # The row names the error's type, never its text, which can carry a path.
+        _log.error(
+            "config reload failed (fault): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+            exc_info=exc,
+        )
+        action, detail["reason"] = "config_reload_failed", "reload_fault"
+        detail["error"] = type(exc).__name__
+        status, answer = 500, "the reload failed inside the engine; see the engine log"
     row = json.dumps(detail)
     # The exc above and this row carry the caller's requested directory, so their arguments are
     # scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps`` already
@@ -5990,9 +5988,7 @@ def create_app(
         if not req.dry_run:
             try:
                 hold_params = await _reload_hold_params(engine, gate, req.config_dir, user.username)
-            except _RELOAD_ANSWERED:
-                raise
-            except Exception as exc:  # noqa: BLE001 - every reload failure is audited (#3157)
+            except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
                 hold_refusal = exc  # audited and answered by the core, after the spend
             else:
                 held = await _rejoin_without_proof(
@@ -6047,9 +6043,7 @@ def create_app(
                     hold_params = await _reload_hold_params(
                         engine, gate, req.config_dir, user.username
                     )
-                except _RELOAD_ANSWERED:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - every reload failure is audited (#3157)
+                except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
                     return await outliving.run(
                         _answer_refused_reload(engine, exc, req, request, user),
                         "refused config reload",
@@ -6080,6 +6074,16 @@ def create_app(
         req: ReloadRequest, request: Request, engine: Engine, user: Identity
     ) -> ReloadResult:
         """The body of :func:`reload_config` past its dual-control hold, run by ``outliving``."""
+        if not req.dry_run:
+            # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
+            # Ahead of the try, so its own 503 is not taken for a reload fault (BACKLOG #3157).
+            await _audit_reload_attempt(
+                engine,
+                actor=user.username,
+                requested=req.config_dir,
+                client=client_ip(request),
+                alert_sink=alert_sink_for(request.app.state),
+            )
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -6092,21 +6096,11 @@ def create_app(
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
                 failures = [f.step for f in outcome.failures]
             else:
-                # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
-                await _audit_reload_attempt(
-                    engine,
-                    actor=user.username,
-                    requested=req.config_dir,
-                    client=client_ip(request),
-                    alert_sink=alert_sink_for(request.app.state),
-                )
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
             registry = outcome.registry
-        except _RELOAD_ANSWERED:
-            raise
-        except Exception as exc:  # noqa: BLE001 - every reload failure is audited (#3157)
+        except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
             await _answer_refused_reload(engine, exc, req, request, user)
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were

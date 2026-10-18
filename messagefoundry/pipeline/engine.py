@@ -2752,10 +2752,10 @@ class Engine:
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
         run never applies them, so a raise of one of these leaves the running values as they were.
         Any other ``Exception`` is not a refusal. It is a fault inside the reload, at least a bare
-        ``FileNotFoundError``, a ``PermissionError`` or a ``SourceStartupError`` from a first load's
-        runner start or from the swap, and one from the swap is raised after its rollback rather
-        than before it. The API callers audit every such fault with reason ``reload_fault`` and
-        answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
+        ``FileNotFoundError`` or a ``PermissionError`` from a first load's runner start or from the
+        swap. One from the swap is raised after its rollback, and one from a step after the swap
+        committed leaves the new graph live. The API reload routes audit such a fault with reason
+        ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
         and is never audited as a fault: one that lands after the swap committed keeps the new
         values, and so does one during a first load's runner start.
         """

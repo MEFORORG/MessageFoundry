@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1923,29 +1923,35 @@ async def _raise_file_not_found(*_a: Any, **_k: Any) -> None:
     raise FileNotFoundError("a file the runner opened")
 
 
-def _runner_raising(error: BaseException) -> Any:
+def _runner_raising(make: Callable[[], BaseException]) -> Any:
+    """A runner method that raises a FRESH error on each call, so no traceback is carried from
+    one test, or one call, into the next."""
+
     async def _raise(*_a: Any, **_k: Any) -> None:
-        raise error
+        raise make()
 
     return _raise
 
 
-#: Faults a runner start or swap can raise that no refusal maps: each must still be audited
-#: (BACKLOG #3157). SourceStartupError is a File inbound whose validate_directory target is gone.
+#: Errors a runner start or swap can raise that no refusal maps: each must still be audited
+#: (BACKLOG #3157). SourceStartupError stands for any other Exception type here; a real first-load
+#: start isolates that one per inbound rather than raising it.
 _RUNNER_FAULTS = pytest.mark.parametrize(
     "fault",
     [
-        FileNotFoundError("a file the runner opened"),
-        PermissionError("a certificate the runner could not open"),
-        SourceStartupError("an inbound's directory is not there"),
+        lambda: FileNotFoundError("a file the runner opened"),
+        lambda: PermissionError("a certificate the runner could not open"),
+        lambda: SourceStartupError("an inbound's directory is not there"),
     ],
-    ids=["file_not_found", "permission", "source_startup"],
+    ids=["FileNotFoundError", "PermissionError", "SourceStartupError"],
 )
 
 
 @_RUNNER_FAULTS
 async def test_a_runner_start_fault_is_a_fault_row_on_release(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Callable[[], Exception],
 ) -> None:
     """A fault raised starting or swapping the runner escaped the release as a raw 500 with no
     outcome row (a FileNotFoundError was once mapped to not_found). The released reload now writes
@@ -1962,7 +1968,7 @@ async def test_a_runner_start_fault_is_a_fault_row_on_release(
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == _FAULT_DETAIL
     rows = await _failed_reload_rows(engine)
-    assert [d["reason"] for d in rows] == ["reload_fault"]
+    assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", type(fault()).__name__)]
     assert rows[0]["dry_run"] is False
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "failed"
@@ -1970,7 +1976,9 @@ async def test_a_runner_start_fault_is_a_fault_row_on_release(
 
 @_RUNNER_FAULTS
 async def test_an_inline_runner_fault_answers_the_generic_error_and_a_fault_row(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Callable[[], Exception],
 ) -> None:
     """The inline route with the fault raised where it really is, in the runner's start or swap,
     rather than by a stubbed reload: 500 with the generic detail, and one reload_fault row after
@@ -1986,7 +1994,33 @@ async def test_an_inline_runner_fault_answers_the_generic_error_and_a_fault_row(
     assert r.status_code == 500, r.text
     assert r.json() == {"detail": _FAULT_DETAIL}
     rows = await _failed_reload_rows(engine)
-    assert [(d["reason"], d["dry_run"]) for d in rows] == [("reload_fault", False)]
+    assert [(d["reason"], d["dry_run"], d["error"]) for d in rows] == [
+        ("reload_fault", False, type(fault()).__name__)
+    ]
+
+
+async def test_a_swap_fault_on_a_running_graph_is_a_fault_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap path, not a first load: a graph is running, and the second reload's swap raises.
+    Its answer and row are the same as a start fault's (BACKLOG #3157)."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        assert engine.registry_runner is not None  # so the next reload swaps, not starts
+        monkeypatch.setattr(
+            RegistryRunner, "reload", _runner_raising(lambda: PermissionError("a cert"))
+        )
+        r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 500, r.text
+    assert r.json() == {"detail": _FAULT_DETAIL}
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "PermissionError")]
 
 
 async def test_a_cancelled_reload_is_not_audited_as_a_fault(
@@ -1998,8 +2032,8 @@ async def test_a_cancelled_reload_is_not_audited_as_a_fault(
 
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
-    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(asyncio.CancelledError()))
-    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(asyncio.CancelledError()))
+    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(asyncio.CancelledError))
+    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(asyncio.CancelledError))
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         headers = await _token(c, "op")
         with contextlib.suppress(asyncio.CancelledError):

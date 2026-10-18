@@ -2156,20 +2156,24 @@ the requested directory. If the audit log refuses that row, the route answers **
 loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
 writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
 attempt row with no row after it is not proof the reload was refused or cancelled. At least a
-refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
-alone. The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
+refusal, a fault or a cancellation whose own row then fails leaves it alone. An unexpected fault
+in the reload now writes a `reload_fault` row after it (BACKLOG #3157). The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
 row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **Every reload
-failure writes a row (BACKLOG #3157).** Any error a reload raises that none of the other reasons
-names is `reload_fault`: at least a `FileNotFoundError`, a `PermissionError` or a source that fails
-its start check, raised by a runner start or swap. A `FileNotFoundError` there is never
-`not_found`, which only a missing config directory writes. A cancellation is not a failure: it
-writes `config_reload_interrupted` instead. An inline reload, a dry run included, answers **500**
-with a generic detail for `reload_fault`; a released one answers 422, the
-approve route's answer for a release the engine did not run. A trust-anchor check that the
+`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
+included, and released, any error the reload raises that none of the other reasons names is
+`reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
+missing config directory writes. The row does not claim the old graph is still serving: at least a
+fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
+which is. At least these write no such row: a convergence reload, a DR activation's reload, and a
+row whose own write fails, which is logged. A cancellation is not a fault: an applied reload's
+writes `config_reload_interrupted`, and a cancelled dry run or digest capture writes nothing. An
+inline reload answers **500** with a generic detail for `reload_fault`; a released one answers 422,
+the approve route's answer for a release the engine did not run. A trust-anchor check that the
 store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
 `store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
 reason is written only for an anchor that passed them. An anchor they refuse is still
