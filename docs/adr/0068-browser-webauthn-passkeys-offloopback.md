@@ -123,7 +123,8 @@ and permanent for synced passkeys. The store contract test lives in an **extra-f
 imported inside test functions of the SQLite *and both live* suites (a module-level
 `importorskip("webauthn")` would silently skip parity on exactly the legs it exists to cover), and a
 minimal TOTP-contract backfill lands in the same commit — finally executing the Postgres/SQL Server
-row-lock paths under test.
+row-lock paths under test. *Amended 2026-10-17: a CAS miss on a passkey that the same locked write
+confirms gone is not a clone signal; see the amendment of that date.*
 
 ### 5. Factor generalization and recovery
 
@@ -647,3 +648,34 @@ BACKLOG #2620 was filed on 2026-10-01 from that day's security architecture revi
 records as owner-approved. The row carries the verdict "build" and asks for the new-address check
 in the PHI-read gates and the paced-write gate, and not in the base gate. No file in this public
 tree records the approval itself, so nothing here quotes the owner.
+
+## Amendment (2026-10-17) -- a sign-count miss on a passkey confirmed gone is not a clone signal (BACKLOG #3068, #3774, #3777)
+
+**Status:** Behaviour changed. Section 4 says a compare-and-set miss "is a clone signal". One
+exception now holds: a miss on a passkey that no longer exists. A self-service passkey delete takes
+no account queue, and an MFA reset deletes every passkey before it revokes the sessions, so either
+can land during an assertion and fail its compare-and-set. That miss is no evidence of a cloned
+authenticator, so it writes no `auth.webauthn_clone_suspected` row. The assertion is still
+refused, audited `auth.webauthn_failed` with reason `factor_removed`, or `session_lost` when the
+session or the account went with it.
+
+**Gone is decided by the write that missed, never by a later read.** `update_webauthn_sign_count`
+answers `moved`, `mismatch` or `gone` under one locked write on every backend: on SQLite the
+existence read runs in the guarded UPDATE's own write transaction, before its commit; on PostgreSQL
+and SQL Server the answer is the row-locking `SELECT ... FOR UPDATE` / `UPDLOCK` read that the
+UPDATE follows in one transaction. Only `gone` is exempt. `mismatch` means the passkey still
+existed and held another count, so it writes the clone row at once, before any other read. A
+delete, a session revocation, a disable or a lock that lands after that write cannot remove the
+signal, and nor can a store error in the reads that follow it.
+
+This closes a window the first build of the exception left open: it asked whether the passkey was
+still held in a separate read after the miss, so a delete landing between the two turned a miss on
+a passkey that had existed into a confirmed-gone one and dropped the clone row.
+
+A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
+whether or not the passkey is later deleted. AC-4 is unchanged. Section 4 is left as written and
+dated by this amendment.
+
+**Who decided.** The exception was built under BACKLOG #3068 (engine PR 2392). The ledger rows
+#3774 and #3777, filed at the Lander's request on 2026-10-17, ask that it be decided atomically and
+recorded here. No owner ruling is recorded for it.
