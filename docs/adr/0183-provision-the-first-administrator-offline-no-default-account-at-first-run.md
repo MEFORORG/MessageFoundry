@@ -20,6 +20,9 @@
   sole-administrator recovery stay separate (BACKLOG #2304). Seat decision under owner delegation 2026-10-08, not an owner ruling;
   see the note under *To resolve on acceptance* and vault
   `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.
+- **Amended 2026-10-16:** Amendment E below. `provision-admin` runs whenever no enabled **local**
+  Administrator has a usable password, by owner ruling B258-R4 (vault BACKLOG #2711 step 1). A
+  directory or federated Administrator no longer blocks it.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -72,6 +75,8 @@ Four things this decision fixes in place:
    directory sign-in can: `_upsert_ad_user` calls `create_user` and assigns no role, so one completed
    sign-in leaves a roleless row, a non-empty table and no administrator — reached entirely through
    shipped code. An emptiness guard refuses exactly there, which is the state with no way in.
+   *(Amended 2026-10-16 by Amendment E: the Administrator must also be a local account with a
+   usable password. A directory or federated one no longer blocks the command.)*
 2. **The credential is read from a terminal, and unattended provisioning is refused in terms.** There
    is no `--password` and no `--password-file`; either would put a standing Administrator credential
    in argv, readable by every other process on the host, or on disk. An unattended MSI/Ansible/NSSM
@@ -90,6 +95,9 @@ Four things this decision fixes in place:
    conjunction, chosen because it is the only one true at **both** points — and it is also what makes
    the takeover safe, since such an account holds no permission to inherit and this branch is
    reachable only when no enabled administrator exists at all.
+   *(Amended 2026-10-16 by Amendment E: reachable only when no enabled local Administrator has a
+   usable password. A directory Administrator may exist beside the row and still sign in, so this
+   premise is narrower now; see that amendment's *What it opens*.)*
 
    **A draft of this ADR got that wrong and it is recorded rather than quietly corrected.** It also
    refused a stamped `password_claimed_at`, which the credential write sets — so the *second*
@@ -117,6 +125,8 @@ holds. See Amendment A.*
   that became true without running the command, so it now pins what the command itself leaves.)*
 - **AC-2** — IF an enabled Administrator already exists, THEN THE SYSTEM SHALL refuse to provision.
   → `tests/test_provision_first_administrator.py::test_it_refuses_once_an_enabled_administrator_exists`
+  *(Amended 2026-10-16 by Amendment E: an enabled local Administrator with a usable password. See
+  AC-18.)*
 - **AC-3** — WHILE the user table holds only roleless rows a directory sign-in created, THE SYSTEM
   SHALL still provision.
   → `tests/test_provision_first_administrator.py::test_the_guard_asks_for_an_administrator_not_an_empty_table`
@@ -299,7 +309,8 @@ changes what the ADR 0167 gate says and adds one WARNING.
 > an Administrator. The rest of the row stands: sign-in is simply always required. The table is kept
 > as written because it records what this amendment measured. The same change added a start WARNING
 > for a store whose every enabled Administrator signs in through an outside identity service (vault
-> BACKLOG #2711, step 2), since `provision-admin` refuses while such an account exists.
+> BACKLOG #2711, step 2), since `provision-admin` refused while such an account existed. Amendment
+E (vault BACKLOG #2711 step 1) since lets the command run on such a store.
 
 **Recommendation: add no new refusal. Confidence: medium.** Four reasons, and the second and fourth
 hold only if Wave 0 comes back green:
@@ -447,7 +458,7 @@ Three dependencies the plant cannot see, so do not read "115 in 16 files" as com
   It goes with that function in Wave 2.
 - The plant leaves WP-3 and the settings in place, so the `bootstrap_username` branch of
   `tests/test_asvs_login_deadline.py` and the tests of the settings and the alert do not fail under it.
-- `packaging/messagefoundry-webconsole/tests/test_webui.py::test_users_page_lists_accounts` asserts
+- `packaging/messagefoundry-webconsole/tests/test_webui_users.py::test_users_page_lists_accounts` asserts
   that `"admin"` appears on the users page, as the seeded bootstrap row. It passes on the substring
   in "Administrator" whether or not the row exists, so it will keep passing after its intent is gone.
 
@@ -500,7 +511,7 @@ runs in parallel with 3 and 4.
 |---|---|---|---|---|
 | **0 and 0b, one PR** | Measure Windows service store file access in both orders, and fix it if either breaks | `.github/workflows/ci.yml` (an auth-on arm of `windows-service-smoke`, or a sibling job), a helper under `scripts/service/` if needed, and in 0b the fix. The fix's shape is not decided here; one candidate is a named service principal granted Modify on the store trio | The bootstrap is still live here, so the arms measure **file access**, not the end-state flow. Both run as the runner identity through `_provision_admin`'s own open path, with only the password reader patched, since a hosted runner has no terminal. **Provision first:** provision with `--email`, start the NSSM service under the default virtual account, sign in, get a session. **Start first:** start the service on a fresh store and let it refuse, open that store through the CLI's path as the operator, then restart the service and show it can still open the store the operator's open re-secured. The arm configures an SMTP sink and a store key so the earlier gates pass. This job runs only on schedule, `workflow_dispatch` and `merge_group`, never on `pull_request`, and a red leg fails the required CI gate. So the Builder pushes the check, the Manager dispatches the workflow on the branch to see it red, and 0b adds the fix on the same branch before the PR is queued | Now. It must land before Wave 2 |
 | **1a** | Move tests off the bootstrap account, with no behaviour change: the four largest files | `tests/test_auth_service.py` (28 failures under the plant), `tests/test_mfa.py` (21), `tests/test_webauthn.py` (18), `tests/test_auth_hardening.py` (7), and a shared helper. The helper must behave the same **with and without** the bootstrap. So it writes through the store (`create_user`, `set_password`, `set_user_roles`), not through `create_local_user`, which ends by running `_retire_superseded_bootstrap` and would disable the bootstrap in one mode only. `provision_first_administrator` after `initialize()` refuses while the bootstrap exists. The helper's username must not be `admin`, which collides with the bootstrap. A test that asserts exact audit rows or user counts must stop counting the bootstrap's. A test whose SUBJECT is the bootstrap or WP-3 is not moved; the Builder lists it for Wave 2 | With the plant, every moved test passes; without it, they still pass | Now. The ruling's gate names PR 1445, which was closed unmerged on 2026-09-24; its commits landed inside engine PR 1446 (`01b5dc42b`). **This seat reads the gate as met by that. The Manager should confirm the reading with the owner if the literal wording matters** |
-| **1b** | The same, for the other files | `tests/test_session_rotation_wiring.py` (10), `tests/test_security_notice_deliverability.py` (7), `tests/test_session_token_at_elevation_sites.py` (6), `tests/test_last_admin_guard.py` (4), `tests/test_password_corpus_guard.py` (3), `tests/test_notifiable_admin.py` (3), `tests/test_username_identity_collation.py` (2), `tests/test_asvs_phase0.py` (1), `tests/test_admin_new_ip.py` (1), `packaging/messagefoundry-webconsole/tests/test_ui_mfa_gate.py` (1), and `test_webui.py::test_users_page_lists_accounts` with its neighbouring comments | As 1a, plus `test_users_page_lists_accounts` asserts on a user it created rather than on a substring | After 1a lands, because 1a adds the helper |
+| **1b** | The same, for the other files | `tests/test_session_rotation_wiring.py` (10), `tests/test_security_notice_deliverability.py` (7), `tests/test_session_token_at_elevation_sites.py` (6), `tests/test_last_admin_guard.py` (4), `tests/test_password_corpus_guard.py` (3), `tests/test_notifiable_admin.py` (3), `tests/test_username_identity_collation.py` (2), `tests/test_asvs_phase0.py` (1), `tests/test_admin_new_ip.py` (1), `packaging/messagefoundry-webconsole/tests/test_ui_mfa_gate.py` (1), and `test_webui_users.py::test_users_page_lists_accounts` with its neighbouring comments | As 1a, plus `test_users_page_lists_accounts` asserts on a user it created rather than on a substring | After 1a lands, because 1a adds the helper |
 | **1c** | Add the offline notification-address setter | `messagefoundry/__main__.py` (a new subcommand on `admin-unlock`'s gate), `messagefoundry/auth/service.py` if the write needs a service method, and a new test file | Provision without `--email` under the shipped posture: the next start is refused; run the setter; the start passes. The setter refuses a blank value, refuses a non-Administrator and a disabled account, cannot clear an address, and writes an audit row naming the OS user | Now. It is useful before retirement, since the strand exists today |
 | **2** | Delete the auto-create and the WP-3 lifecycle | `messagefoundry/auth/service.py` (`BOOTSTRAP_USERNAME`, `BootstrapAdmin`, `_ensure_bootstrap_admin`, `_unclaimed_bootstrap`, `_retire_superseded_bootstrap` and its callers in `initialize()`, the login path and `create_local_user`, `bootstrap_expiry_warning`, `bootstrap_deadline_configured`, the `has_notifiable_admin` docstring); `messagefoundry/api/app.py` (`_emit_bootstrap_admin`, `_bootstrap_expiry_reminder` and its task, the skipped-gate WARNING, the gate's branched message and its docstring); `messagefoundry/__main__.py` (`provision-admin` answers "an enabled Administrator exists" and runs the username and policy checks before it prompts or opens; its help, docstring and output; the `admin-unlock` rationale); `scripts/security/dast_target.py` if needed; `tests/test_first_run_default_account.py`, `tests/test_provision_first_administrator.py`, `tests/test_asvs_login_deadline.py`, the WP-3 tests 1a and 1b listed; delete `tests/test_bootstrap_admin_perms.py` | AC-10 to AC-13 and AC-15 below, each red on `main` first. The plant check again at this wave's base. Then the Manager dispatches the Wave 0 job with a third arm, the end-to-end start-first flow across two identities: refused, provisioned, restarted, signed in | Waves 0, 1a, 1b and 1c have landed |
 | **3** | Delete the settings and the alert, with the tests and table row that pin them | `messagefoundry/config/settings.py` (`bootstrap_expiry_hours`, `bootstrap_warn_hours`, and `bootstrap_admin_expiring` in the alert event list); `messagefoundry/pipeline/alerts.py`; `messagefoundry/pipeline/alert_sinks.py`; `messagefoundry/scaffold.py` only if it names the deleted settings; `tests/test_alert_sinks.py`, `tests/test_alert_rules.py`, `tests/test_settings.py`; **`tests/test_security_doc_rate_limits.py`, `tests/test_security_doc_drift.py`, and the `bootstrap_expiry_hours` row of `docs/SECURITY.md`'s limits table**, because deleting the field reds those tests and editing the row alone reds them the other way; `docs/CONFIGURATION.md` | A service TOML naming `bootstrap_expiry_hours` is refused at load as an unknown key, and an alert rule naming `bootstrap_admin_expiring` is refused. Leave both keys out of `_REMOVED_KEYS` in `config/settings.py`: that is the loader's named-refusal table, so adding them changes behaviour, and `tests/test_docs_cite_no_refused_config_keys.py` would then flag documents that Wave 4 has not yet rewritten | Wave 2 has landed |
@@ -558,6 +569,7 @@ and AC-16's message half as tests, each red at its base first.*
   → planned, Wave 0: the hosted check above.
 - **AC-15** — IF `provision-admin` refuses a username or password, OR finds an enabled Administrator,
   THEN THE SYSTEM SHALL refuse before prompting where it can, and SHALL leave no new store file.
+  *(Amended 2026-10-16 by Amendment E: an enabled local Administrator with a usable password.)*
   → `tests/test_provision_first_administrator.py::test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open`,
   `::test_a_password_the_policy_refuses_leaves_no_store` and
   `::test_an_existing_administrator_is_refused_before_the_prompt`, with
@@ -740,3 +752,80 @@ with no address. MessageFoundry has no deployments, so the change costs no migra
   `::test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open`,
   with `::test_the_provisioned_administrator_carries_the_address_it_was_given` as the control. The
   service half: `::test_a_blank_or_malformed_address_is_refused_and_writes_nothing`.
+
+## Amendment E (2026-10-16) -- the refusal asks for a local Administrator that can sign in
+
+Made by vault BACKLOG #2711 step 1, on owner ruling B258-R4 of 2026-10-16, "Widen provision-admin
+(Recommended)". **It changes Decision item 1.** `provision-admin` now refuses only while an enabled
+**local** Administrator holds a usable password: a hash, and not a must-change credential past its
+deadline. A directory account, a federated-bound one, or a local one with no usable password no
+longer blocks it. A disabled Administrator never did.
+
+**Why.** A site whose every Administrator signs in through the directory or an identity provider
+had no host command to get back in while that service was down. `admin-unlock` clears a local
+lockout only. Step 2 of the same item, engine PR 1952, made the engine say so at start with the
+`auth.no_local_administrator` notice. This amendment makes the command the recovery that notice
+names.
+
+**One computation.** `AuthService._administrator_standing` is read by both the refusal
+(`has_self_sufficient_administrator`) and the notice (`administrators_needing_an_outside_service`).
+So the command's Administrator check refuses where the notice is silent, on a store with an
+enabled Administrator, under the same settings and at the same moment. Both skip a row that fails
+its integrity seal, so a store whose only Administrator row fails it gets neither the notice nor a
+refusal. The command reads its own
+`--service-config`, and it can still refuse for reasons the notice never checks, such as the
+password policy. A store with no Administrator at all is the first-run case: the command runs and
+this notice stays silent, as before.
+
+**What it keeps.**
+
+- The repair branch is unchanged, with BACKLOG #2915's order: the notice to the earlier holder
+  before the address write, the role write last, and the second session revoke after it. The
+  takeover notice is unchanged. The `auth.first_administrator_provisioned` audit row gains one
+  field, `administrators_at_check`: every enabled Administrator when the run checked. None of them
+  could sign in with a local password.
+- `_existing_row_refusal` still never promotes a directory account. A local Administrator whose
+  password is unusable holds a role, so that row is refused by name; the operator makes a new
+  account under another name.
+- The refusal text keeps the words "already has an enabled Administrator". At least the VS Code
+  extension, the load rig and `scripts/service/measure-store-access.ps1` key on them.
+- The load rig (`harness/load/rigadmin.py`) keeps the rule from before this amendment. It runs the
+  command with `--no-totp` unless a leg supplies an authenticator key (vault BACKLOG #2796), and
+  with or without one it provisions only into a store with no enabled Administrator of
+  any kind, and refuses a store whose Administrators all need an outside service.
+
+**What it opens, and leaves open.**
+
+- The command can now add an Administrator beside directory Administrators that still sign in.
+  No alert or notice goes to them. The audit row's new field is the only trace.
+- The repair branch's safety argument (Decision item 4) was that it runs only when the store has
+  no Administrator at all. It now runs whenever no local one has a usable password. On a
+  directory-run site it can take over a roleless local account while the directory is up. The
+  earlier holder is still told, and the host gate is unchanged.
+- The IDE's Start probe now reads a directory-only store as "needs an Administrator". Its modal
+  still words that as "no enabled administrator".
+
+**The race of vault BACKLOG #3078 is closed by the guarded grant, which counts what this
+amendment counts.** The store's `grant_first_admin_unless_admin_exists` repeats the check in the
+role write's own transaction, under the last-administrator guard's lock, so of two runs with
+different usernames the one whose grant commits second is refused. The service hands that guard
+the same predicate the refusal reads (`_signs_in_without_an_outside_service`), so it counts only
+an enabled local Administrator with a usable password, and a directory or federated one refuses
+the grant no more than it refused the run. The store can still end with two at least these ways,
+each through a write that takes no lock: a directory Administrator who is signed in creates a
+local one from the web console during the run, or resets the password of a local Administrator
+the check passed over (a hashless or lapsed one). Each was made by someone with authority to make
+one.
+
+**New acceptance criterion.**
+
+- **AC-18** — WHILE no enabled local Administrator has a usable password, THE SYSTEM SHALL
+  provision, and IF one has, THEN it SHALL refuse; the refusal SHALL agree with the start notice on
+  every store that holds an enabled Administrator.
+  → `tests/test_provision_admin_without_a_local_administrator.py::test_provision_admin_runs_exactly_when_no_local_administrator_can_sign_in`
+  and `::test_the_refusal_and_the_start_notice_agree`, parametrized over directory-only,
+  federated-only, a hashless, expired or disabled local Administrator beside a directory one, and
+  two controls that refuse: a local Administrator with a usable password, and a locked-out one.
+  The in-transaction guard's half is
+  `tests/_first_admin_grant_store_contract.py::assert_grant_counts_only_a_local_administrator_that_signs_in`,
+  run on SQLite, Postgres and SQL Server.

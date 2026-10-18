@@ -46,6 +46,7 @@ from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
+from tests._store_audit import ALERT_AUDIT, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -806,7 +807,7 @@ async def test_cancel_queued(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
     )
-    cancelled = await store.cancel_queued("IB", "OB1", now=200.0)
+    cancelled = await store.cancel_queued("IB", "OB1", now=200.0, audit=no_purge_audit)
     assert cancelled == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     # All deliveries terminal (cancelled) → PROCESSED.
@@ -831,7 +832,9 @@ async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
         "next_attempt_at"
     ]
     assert await store.claim_next_fifo("OB1", now=103.0) is None  # the head blocks the lane
-    assert await store.cancel_queued(None, "OB1", top_only=True, now=103.0) == 1
+    assert (
+        await store.cancel_queued(None, "OB1", top_only=True, now=103.0, audit=no_purge_audit) == 1
+    )
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
     nxt = await store.claim_next_fifo("OB1", now=103.0)
@@ -1020,6 +1023,32 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
 
     await assert_concurrent_removals_leave_one(store)
+
+
+async def test_first_admin_grant_contract(store) -> None:
+    """BACKLOG #3078 on Postgres: the first-administrator grant refuses while another enabled
+    administrator exists, and over credentials the caller did not write."""
+    from tests._first_admin_grant_store_contract import assert_first_admin_grant_contract
+
+    await assert_first_admin_grant_contract(store)
+
+
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on Postgres: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_concurrent_first_admin_grants_leave_one(store) -> None:
+    """BACKLOG #3078 on Postgres: two grants to two accounts on two pooled connections, at once.
+    The last-administrator guard's advisory lock serializes them; one is refused."""
+    from tests._first_admin_grant_store_contract import assert_concurrent_grants_leave_one
+
+    await assert_concurrent_grants_leave_one(store)
 
 
 async def test_roles_permissions_contract(store) -> None:
@@ -4549,11 +4578,11 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
-    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0, audit=ALERT_AUDIT) is True
     got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
-    assert await store.ack_alert_instance(999999, actor="scott") is False
+    assert await store.ack_alert_instance(999999, actor="scott", audit=ALERT_AUDIT) is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
@@ -4576,11 +4605,11 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
-    assert await store.resolve_alert_instance(a.id, now=300.0) is True
+    assert await store.resolve_alert_instance(a.id, now=300.0, audit=ALERT_AUDIT) is True
     assert {
         r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
     } == {"OB_Y"}
-    assert await store.resolve_alert_instance(a.id) is False
+    assert await store.resolve_alert_instance(a.id, audit=ALERT_AUDIT) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
@@ -4612,7 +4641,9 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_Y"
     ]
-    await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
+    await store.resolve_alert_instance(
+        y.id, now=100.0, audit=ALERT_AUDIT
+    )  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
@@ -4622,7 +4653,9 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_R"
     ]
-    await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
+    await store.resolve_alert_instance(
+        rr.id, now=500.0, audit=ALERT_AUDIT
+    )  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
     # side-observer: an alert write creates NO message/queue row (invisible to the finalizer).
@@ -5526,7 +5559,8 @@ _AUDIT_ROWS_PER_PROCESS = 25
 
 #: Bound on ONE appender's wait, sized to stay under the suite's own ``--timeout=60`` watchdog (the
 #: gated ``postgres-store`` job adds no ``--timeout=`` of its own, so the pyproject value is what
-#: binds). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
+#: binds; the advisory ``postgres-store-windows`` twin passes 120, so 60 is the tighter of the
+#: two and the one to size against). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
 #: hard-exits the interpreter, which orphans both children AND takes the rest of this file's tests
 #: down with it. A bound above the watchdog would be dead code.
 _APPENDER_TIMEOUT_SECONDS = 30.0
@@ -5757,9 +5791,21 @@ async def test_audit_events_and_security_events_page_by_offset_pg(store) -> None
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "pg")
+    await check_keyed_audit_evidence(store, "pg")
     await check_security_events_paging(store, "pg")
     await check_connection_event_paging(store, "pg")
+
+
+async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)

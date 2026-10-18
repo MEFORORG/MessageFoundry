@@ -37,6 +37,7 @@ from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
+from tests._store_audit import ALERT_AUDIT, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -821,6 +822,32 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_first_admin_grant_contract(store) -> None:
+    """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
+    administrator exists, and over credentials the caller did not write."""
+    from tests._first_admin_grant_store_contract import assert_first_admin_grant_contract
+
+    await assert_first_admin_grant_contract(store)
+
+
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on SQL Server: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_concurrent_first_admin_grants_leave_one(store) -> None:
+    """BACKLOG #3078 on SQL Server: two grants to two accounts on two pooled connections, at once.
+    The last-administrator guard's applock serializes them; one is refused."""
+    from tests._first_admin_grant_store_contract import assert_concurrent_grants_leave_one
+
+    await assert_concurrent_grants_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real SQL Server backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
@@ -897,6 +924,31 @@ async def test_approval_repeat_request_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_repeat_request_contract
 
     await _assert_repeat_request_contract(store)
+
+
+async def test_approval_repeats_racing_from_two_processes_file_one_request(store, tmp_path) -> None:
+    """Vault BACKLOG #3236 on the SQL Server backend: two processes, each with its own store and
+    pool, race the same repeat in every round, and each round holds one request. The in-process
+    race in the contract above cannot show this, because the store's own lock serializes it first;
+    across processes only the read under the audit applock does."""
+    from tests._approval_repeat_two_process import (
+        assert_one_request_per_round,
+        filed_for,
+        open_requests,
+        race_repeat_requests,
+    )
+
+    nonce = uuid4().hex
+    try:
+        answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
+        await assert_one_request_per_round(store, answers)
+    finally:
+        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
+        # itself included, must not leave its open requests behind for a later test.
+        for approval_id in filed_for(nonce, await open_requests(store)):
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
+            )
 
 
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
@@ -2172,7 +2224,7 @@ async def test_cancel_queued_finalizes_via_batch_lock(store) -> None:
         disposition=MessageStatus.ROUTED,
         now=100.0,
     )
-    assert await store.cancel_queued(None, "OB", now=200.0) == 1
+    assert await store.cancel_queued(None, "OB", now=200.0, audit=no_purge_audit) == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
@@ -2191,7 +2243,9 @@ async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
         "next_attempt_at"
     ]
     assert await store.claim_next_fifo("OB", now=103.0) is None  # the head blocks the lane
-    assert await store.cancel_queued(None, "OB", top_only=True, now=103.0) == 1
+    assert (
+        await store.cancel_queued(None, "OB", top_only=True, now=103.0, audit=no_purge_audit) == 1
+    )
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
     nxt = await store.claim_next_fifo("OB", now=103.0)
@@ -4874,11 +4928,11 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
     assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
-    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0, audit=ALERT_AUDIT) is True
     got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
-    assert await store.ack_alert_instance(999999, actor="scott") is False
+    assert await store.ack_alert_instance(999999, actor="scott", audit=ALERT_AUDIT) is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
@@ -4901,11 +4955,11 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
-    assert await store.resolve_alert_instance(a.id, now=300.0) is True
+    assert await store.resolve_alert_instance(a.id, now=300.0, audit=ALERT_AUDIT) is True
     assert {
         r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
     } == {"OB_Y"}
-    assert await store.resolve_alert_instance(a.id) is False
+    assert await store.resolve_alert_instance(a.id, audit=ALERT_AUDIT) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
@@ -4937,7 +4991,9 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_Y"
     ]
-    await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
+    await store.resolve_alert_instance(
+        y.id, now=100.0, audit=ALERT_AUDIT
+    )  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
@@ -4947,7 +5003,9 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_R"
     ]
-    await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
+    await store.resolve_alert_instance(
+        rr.id, now=500.0, audit=ALERT_AUDIT
+    )  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
     # side-observer: an alert write creates NO message/queue row (invisible to the finalizer).
@@ -6073,10 +6131,12 @@ async def test_audit_events_and_security_events_page_by_offset_mssql(store) -> N
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "mssql")
+    await check_keyed_audit_evidence(store, "mssql")
     await check_security_events_paging(store, "mssql")
     await check_connection_event_paging(store, "mssql")
 
@@ -6089,6 +6149,38 @@ async def _nocount_reading(store: Any) -> tuple[int, int]:
     row = await store._fetchone("SELECT @@SPID AS spid, @@OPTIONS & 512 AS nocount")
     assert row is not None
     return int(row["spid"]), int(row["nocount"])
+
+
+async def test_an_alert_ack_under_nocount_still_writes_its_audit_row(store) -> None:
+    """Vault BACKLOG #3217, review round two: the alert mutations read their match from ``OUTPUT``,
+    so a session with ``SET NOCOUNT ON`` left on still appends the row for a matched change, and
+    an unmatched one still writes none. A one-connection store makes the NOCOUNT session the one
+    the ack borrows; the reading of the bit is the control that it is."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.base import AuditAppend
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_NOCOUNT", severity="warning", now=100.0
+    )
+    [a] = [
+        x
+        for x in await store.list_active_alert_instances(allowed_channels=None)
+        if x.connection == "OB_NOCOUNT"
+    ]
+    action = f"test.alert.nocount.{uuid4().hex[:8]}"
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as one:
+        try:
+            await one._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            _, nocount = await _nocount_reading(one)
+            assert nocount == 512, "the control: the session the ack borrows has NOCOUNT on"
+            audit = AuditAppend(action, actor="op")
+            assert await one.ack_alert_instance(a.id, actor="op", audit=audit) is True
+            assert await one.ack_alert_instance(999999999, actor="op", audit=audit) is False
+        finally:
+            await one._execute("SET NOCOUNT OFF;")
+    assert len(await store.list_audit(action=action)) == 1
 
 
 async def test_backlog_2097_nocount_persistence_probe() -> None:
@@ -6158,3 +6250,114 @@ async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
     from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
 
     await attestation_roundtrip(store)
+
+
+async def test_the_config_changed_reason_survives_a_long_node_ss(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)
+
+
+# --- vault BACKLOG #2223: the ServerCertificate pin is enforced under Encrypt=strict (gated) -------
+
+
+def _presented_certificate_pem(host: str, port: int) -> str:
+    """The certificate the server presents on a TDS 8.0 handshake, which opens with TLS on the
+    listener port. Read with verification off on purpose: this is the instrument that learns which
+    certificate to pin, and the pinned connect below is what verifies it."""
+    import socket
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["tds/8.0"])
+    with (
+        socket.create_connection((host, port), timeout=5) as raw,
+        ctx.wrap_socket(raw, server_hostname=host) as tls,
+    ):
+        der = tls.getpeercert(binary_form=True)
+    assert der, "the server presented no certificate"
+    return ssl.DER_cert_to_PEM_cert(der)
+
+
+@pytest.mark.skipif(
+    os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1",
+    reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
+    "strict encryption; the default CI containers are not, so the TLS-first read is cut",
+)
+async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_path: Any) -> None:
+    """The store's pinned string, ``ServerCertificate`` with ``Encrypt=strict``, connects with the
+    certificate the server presents and is refused with any other. Vault BACKLOG #3009 measured on
+    Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``, and that
+    measurement is the evidence the store change rests on. This would be the Linux driver's reading,
+    toward closing step 1 of #2223, on a server configured for strict encryption.
+
+    POSITIVE CONTROL: the right pin connects through the same builder, so the wrong pin's refusal is
+    the pin's doing and not a strict handshake this server cannot make. The two strings differ only
+    in the pinned file.
+
+    MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
+    before #2223. The CI container's certificate is self-signed and not in the runner's trust store,
+    so ``yes_right`` is the control for ``yes_wrong``: if ``yes_right`` is REFUSED, the chain check
+    refused both and ``yes_wrong`` says nothing about the pin. The test is skipped in CI unless
+    ``MEFOR_TEST_SQLSERVER_STRICT=1`` is set on a strict-configured server; where it runs, its
+    ``BACKLOG-2223-PIN`` warning line carries each outcome, and a refusal carries the driver's message."""
+    import warnings
+
+    import aioodbc
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.pki import make_self_signed
+    from messagefoundry.store.sqlserver import connection_string
+
+    base = load_settings(environ=os.environ).store
+    right = tmp_path / "presented.pem"
+    right.write_text(
+        await asyncio.to_thread(_presented_certificate_pem, base.server or "localhost", base.port)
+    )
+    # A fresh self-signed certificate the server never presents.
+    wrong = tmp_path / "not-presented.pem"
+    wrong.write_bytes(make_self_signed("mf-test-not-the-server", [], 30)[0])
+
+    def pinned_dsn(pin: Any) -> str:
+        # CI trusts the container's self-signed certificate through the escape; the pin replaces that.
+        return connection_string(
+            base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": str(pin)})
+        )
+
+    async def outcome(dsn: str) -> str:
+        # A short login timeout, so a stalled handshake reports here and not at the test watchdog.
+        try:
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=10)
+        except pyodbc.Error as exc:
+            # pyodbc puts the SQLSTATE in args[0] and the driver's message in args[1].
+            return f"REFUSED ({exc.args[-1] if exc.args else type(exc).__name__})"
+        try:
+            cur = await conn.cursor()
+            await cur.execute("SELECT 1")
+            row = await cur.fetchone()
+        finally:
+            await conn.close()
+        assert row is not None and row[0] == 1
+        return "CONNECTED"
+
+    right_dsn, wrong_dsn = pinned_dsn(right), pinned_dsn(wrong)
+    assert "Encrypt=strict;" in right_dsn and "Encrypt=strict;" in wrong_dsn
+    results = {
+        "strict_right": await outcome(right_dsn),
+        "strict_wrong": await outcome(wrong_dsn),
+        "yes_right": await outcome(right_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+        "yes_wrong": await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+    }
+    warnings.warn(
+        "BACKLOG-2223-PIN " + " ".join(f"{k}={v}" for k, v in results.items()), stacklevel=1
+    )
+    assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
+    assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"

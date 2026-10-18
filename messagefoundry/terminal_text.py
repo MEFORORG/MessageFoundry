@@ -9,12 +9,14 @@ do more, a bidirectional override reorders what the operator reads, and a charac
 console cannot encode stops the print. :func:`escape_for_terminal` is the rule at least
 ``samples/send_mllp.py``, ``harness/load/rigadmin.py`` ``get``, the harness ``--scenario`` and
 ``--load`` lines, the ``shardcert`` two-box engine-error lines, the ``--fuzz`` setup and failure
-lines, the reconcile text report and the ``messagefoundry verify`` console summary print by, so a
-later hardening applies to all of them at once. It is not every such tool. At least three keep a
-different rule or none:
-``check-privileges`` (``privilege_check.printable``) and the ``messagefoundry-toolkit`` command
-(BACKLOG #2516) each keep a category-based rule, and ``tee`` imports nothing from this package by
-design.
+lines, the reconcile text report, the ``messagefoundry verify`` console summary, the
+``check-privileges`` text report and the ``messagefoundry-toolkit`` report print by,
+so a later hardening applies to all of them at once (BACKLOG #2891). It is not every such tool: at
+least ``tee`` imports nothing from this package by design. ``privilege_check.printable`` still
+STRIPS the characters in :data:`CONTROL_CATEGORIES`, for one job this rule cannot do, judging
+whether a policy name reads as ``root``, and its docstring says why.
+``tests/test_adr_analyze.py`` holds the toolkit report, the ``check-privileges`` text and
+that comparison to the one set of categories.
 
 THE RULE. Printable ASCII, newline and tab print as themselves. Every other character prints as a
 visible escape: a C0 control or DEL as ``\\xNN``, and every code point past ASCII -- a C1 control,

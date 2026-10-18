@@ -15,5 +15,10 @@
 /docs/SECURITY.md                         @wshallwshall
 /docs/Secure_Development_Standards.md     @wshallwshall
 /scripts/security/                        @wshallwshall
+/messagefoundry/security/                 @wshallwshall
+# The required dependency audit imports these two as well (the package root, and the child-process
+# command line it starts pip and pip-audit with).
+/messagefoundry/__init__.py               @wshallwshall
+/messagefoundry/childenv.py               @wshallwshall
 /CLA.md                                   @wshallwshall
 /LICENSE                                  @wshallwshall

@@ -177,6 +177,25 @@ def _quiesce_background_loggers_at_teardown(
         _quiesce_targets()
 
 
+@pytest.fixture(autouse=True)
+def _restore_ui_write_action_registry() -> Iterator[None]:
+    """Undo what a test registers into the process-wide ``/ui`` write-action registry.
+
+    ``register_ui_action`` appends to ``_auth._UI_WRITE_ACTIONS`` for the life of the worker, and
+    ``test_golden_surface.py`` compares that list with a golden. A test that registers a synthetic
+    action would leak it into whichever file the worker runs next (BACKLOG #2509 exposed this:
+    split out of the one large file, the registry tests can run before the golden on one worker).
+    Importing the package first fires every module-level registration, since ``mount.py`` imports
+    every route module, so the snapshot holds all the real rows and the restore keeps them."""
+    from messagefoundry_webconsole import _auth
+
+    saved = list(_auth._UI_WRITE_ACTIONS)
+    try:
+        yield
+    finally:
+        _auth._UI_WRITE_ACTIONS[:] = saved
+
+
 def _restore_baseline(baseline: dict[str, _Baseline]) -> None:
     """Return every target logger to its natural, caplog-capturing baseline (pre-yield)."""
     for name, snap in baseline.items():

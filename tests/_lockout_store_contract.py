@@ -191,14 +191,18 @@ async def _assert_escalation(store: Any) -> None:
         now=1.0,
         password_generated=False,
     )
-    await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
-    assert await store.enable_totp("lock-totp", recovery_code_hashes=[], now=1.0)
+    staged_cell = await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(
+        "lock-totp", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
+    )
     # A directory account, with TOTP enrolled too: NEITHER lock escalates (ADR 0197 Decision 5).
     await store.create_user(
         user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0, password_generated=False
     )
-    await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
-    assert await store.enable_totp("lock-ad", recovery_code_hashes=[], now=1.0)
+    staged_cell = await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(
+        "lock-ad", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
+    )
     # A local account with no TOTP: only the second-step lock escalates.
     await store.create_user(
         user_id="lock-plain",
@@ -422,8 +426,10 @@ async def _assert_conditional_rotation(store: Any) -> None:
         True,
     )
     # TOTP on: the caller "checks" here and sees it...
-    await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
-    assert await store.enable_totp("rot-u1", recovery_code_hashes=[], now=2.0)
+    staged_cell = await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    assert await store.enable_totp(
+        "rot-u1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=2.0
+    )
     user = await store.get_user("rot-u1")
     assert user is not None and user.totp_enabled
     # ... then an administrator's factor reset lands between the check and the write ...
@@ -439,8 +445,10 @@ async def _assert_conditional_rotation(store: Any) -> None:
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
     # With TOTP standing, the same write lands.
-    await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
-    assert await store.enable_totp("rot-u1", recovery_code_hashes=[], now=4.0)
+    staged_cell = await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
+    assert await store.enable_totp(
+        "rot-u1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=4.0
+    )
     assert await store.set_password(
         "rot-u1",
         password_hash="h-chosen",
@@ -455,19 +463,15 @@ async def _assert_conditional_rotation(store: Any) -> None:
         False,
         False,
     )
-    # TOTP flagged on over a NULL secret is no way past: the conditional write refuses it too
-    # (review round 2). Since BACKLOG #2224 a confirm racing a factor reset cannot produce this
-    # state, because ``enable_totp`` is conditional; ``set_totp_secret(secret=None)`` still can.
-    await store.set_totp_secret("rot-u1", secret=None, now=5.0)
+    # TOTP flagged on over a NULL secret is no way past (review round 2). Since BACKLOG #2224 a
+    # confirm racing a factor reset cannot produce that state, because ``enable_totp`` is
+    # conditional, and since BACKLOG #3025 neither can a stage: ``set_totp_secret`` has no clear and
+    # writes nothing once TOTP is on, so the enabled secret is left as it was.
+    before = await store.get_totp_secret("rot-u1")
+    assert await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP"[::-1], now=5.0) is None
     user = await store.get_user("rot-u1")
     assert user is not None and user.totp_enabled
-    assert not await store.set_password(
-        "rot-u1",
-        password_hash="h-second",
-        password_generated=False,
-        must_change_password=False,
-        require_totp=True,
-    )
+    assert await store.get_totp_secret("rot-u1") == before
     # disable_totp forgets the removed secret's step high-water mark (review round 2): a new
     # secret's first code in the same 30 seconds is not refused as a replay.
     assert await store.consume_totp_step("rot-u1", 1_000)

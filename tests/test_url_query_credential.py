@@ -11,21 +11,27 @@ control, so a test is not green because the detector names every parameter.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, Priority
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     EnvRef,
+    FhirLookupSpec,
     Registry,
+    WiringError,
     build_outbound_connection,
     query_credential_hops,
 )
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.secretscrub import credential_query_params
-from messagefoundry.transports.egress import check_egress_allowed
+from messagefoundry.store import MessageStore
+from messagefoundry.transports.egress import check_egress_allowed, check_fhir_lookup_allowed
 
 _MARK = "carries a credential in its query string"
 
@@ -500,3 +506,167 @@ def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
     report = run_checks(_write(tmp_path, clean), run_lint=False)
     r = next(x for x in report.results if x.name == "url-query-credential")
     assert "no outbound or FhirLookup url carries a credential-like query parameter" in r.detail
+
+
+# --- once per reload (vault BACKLOG #2910) -----------------------------------------------------
+#
+# A reload runs ``build_check`` over the whole new graph, and that check warns. It then rebuilds the
+# outbounds that changed and the FhirLookup executor, and each rebuild runs the egress check again.
+# Only the WARNING is dropped on the rebuild: every refusal still runs there (vault BACKLOG #2605).
+
+_KEYED = "https://p.example.invalid/x?key=PLACEHOLDER&v={v}"
+
+
+def _warned(caplog: pytest.LogCaptureFixture, label: str) -> int:
+    return sum(1 for r in caplog.records if _MARK in r.getMessage() and label in r.getMessage())
+
+
+def _reload_graph(
+    *, v: int = 1, added: bool = False, fhir: bool = False, priority: Priority | None = None
+) -> Registry:
+    reg = Registry()
+    for name in ["OB_KEYED", "OB_ADDED"] if added else ["OB_KEYED"]:
+        spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=v)})
+        reg.add_outbound(build_outbound_connection(name, spec, priority=priority))
+    if fhir:
+        url = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
+        reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": url}))
+    return reg
+
+
+@pytest.fixture
+async def reload_store(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(tmp_path / "query-credential-reload.db")
+    yield s
+    await s.close()
+
+
+def _reload_runner(store: MessageStore, reg: Registry, **kw: Any) -> RegistryRunner:
+    return RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False), **kw
+    )
+
+
+async def test_a_reload_warns_once_for_a_changed_and_an_added_outbound(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``OB_KEYED`` changes, so it takes the in-place rebuild; ``OB_ADDED`` is new, so it takes the
+    added-lane build. Both used to log twice per reload: once in build_check, once in the rebuild."""
+    runner = _reload_runner(reload_store, _reload_graph(v=1))
+    await runner.start()
+    try:
+        before = runner._destinations["OB_KEYED"]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.reload(_reload_graph(v=2, added=True))
+        assert runner._destinations["OB_KEYED"] is not before  # the rebuild ran
+        assert "OB_ADDED" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert _warned(caplog, "outbound 'OB_ADDED'") == 1
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_warns_once_for_an_unchanged_outbound(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: an unchanged lane is not rebuilt, so the one line is build_check's. It still
+    fires on every reload, so the change did not drop the warning from a reload altogether."""
+    runner = _reload_runner(reload_store, _reload_graph(v=1))
+    await runner.start()
+    try:
+        before = runner._destinations["OB_KEYED"]
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                await runner.reload(_reload_graph(v=1))
+            assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert runner._destinations["OB_KEYED"] is before  # never rebuilt
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_warns_once_for_a_fhir_lookup(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = _reload_runner(reload_store, _reload_graph(fhir=True))
+    await runner.start()
+    try:
+        before = runner._fhir_lookup_executor
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.reload(_reload_graph(fhir=True))
+        assert runner._fhir_lookup_executor is not None
+        assert runner._fhir_lookup_executor is not before  # rebuilt from the new graph
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
+    finally:
+        await runner.stop()
+
+
+async def test_an_activation_reload_warns_once_for_a_lane_leaving_the_passive_park(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Another rebuild a reload makes: a passive standby's lane, built at its activation through
+    ``_ensure_destination_built``. docs/SECURITY-LOOSENING.md is the source of record for where the
+    warning fires."""
+    runner = _reload_runner(
+        reload_store, _reload_graph(priority=Priority.CRITICAL), dr_standby=Priority.CRITICAL
+    )
+    await runner.start()
+    try:
+        assert "OB_KEYED" not in runner._destinations  # parked unbuilt on the passive box
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.reload()
+        assert "OB_KEYED" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+    finally:
+        await runner.stop()
+
+
+def test_the_rebuild_form_still_refuses_and_only_drops_the_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``warn_query_credentials=False`` is not a quieter check: an unlisted host is still refused
+    on both seams, and the only line missing is the query-credential one."""
+    egress = EgressSettings(allowed_http=["other.example.invalid"])
+    url = _KEYED.format(v=1)
+    for warn in (True, False):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(WiringError, match="not in the"):
+                check_egress_allowed(_rest(url), egress, warn_query_credentials=warn)
+            with pytest.raises(WiringError, match="not in the"):
+                check_fhir_lookup_allowed("LK", {"url": url}, egress, warn_query_credentials=warn)
+        # The control is the True pass: the same egress reaches the warning on both seams.
+        assert _warned(caplog, "outbound 'OB_REST'") == int(warn)
+        assert _warned(caplog, "FhirLookup 'LK'") == int(warn)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("egress denied: outbound 'OB_REST'" in m for m in messages)
+        assert any("connect denied: FhirLookup 'LK'" in m for m in messages)
+
+
+async def test_a_start_and_an_operator_start_still_warn_once(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Builds with no build check before them keep the warning. This exercises two of them: the
+    engine start, for an outbound and a FhirLookup, and the operator start of a lane ``auto_start``
+    left unbuilt. docs/SECURITY-LOOSENING.md is the source of record for where the warning fires."""
+    reg = _reload_graph(fhir=True)
+    spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1)})
+    reg.add_outbound(build_outbound_connection("OB_OFF", spec, auto_start=False))
+    runner = _reload_runner(reload_store, reg)
+    with caplog.at_level(logging.WARNING):
+        await runner.start()
+    try:
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
+        assert "OB_OFF" not in runner._destinations
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.start_outbound("OB_OFF")
+        assert "OB_OFF" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_OFF'") == 1
+    finally:
+        await runner.stop()

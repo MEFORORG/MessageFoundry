@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.verify.checks import (
+    OdbcHops,
     check_credential_generation,
     check_lockable_accounts,
     run_host_checks,
@@ -26,6 +28,8 @@ from messagefoundry.verify.smoke import (
 ALL_SECTIONS: tuple[str, ...] = ("host", "store", "smoke", "manual", "federation")
 
 _DEFAULT_DICOM_PORT = 11112
+#: The ``--config`` default, which is the sample graph.
+_DEFAULT_CONFIG_DIR = "samples/config"
 _DEFAULT_API_PORT = 8765
 
 # Human-on-the-box steps the verifier cannot self-check — echoed MANUAL with instructions, never faked.
@@ -85,6 +89,77 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
     if settings is not None and settings.store.backend is StoreBackend.SQLITE:
         return Path(settings.store.path).resolve().parent
     return Path.cwd()
+
+
+def _odbc_hops(
+    settings: ServiceSettings | None, service_config: str | None, config_dir: str
+) -> OdbcHops:
+    """Which ODBC Driver 18 hops this deployment takes, for the ``host.ciphers`` row (BACKLOG #3277).
+
+    The SQL Server store is read from the service settings. A DATABASE connection on the SQL Server
+    dialect, a ``DatabaseRef`` reference set and a ``DatabaseLookup`` are read from the config graph,
+    which this loads the way the self smoke does, so it runs only when the store has not already
+    shown a hop. A hop found either way is enough.
+
+    Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
+    a graph that does not load, settings that did not load, or settings that came from the defaults
+    alone, with no ``--service-config``, no ``./messagefoundry.toml`` and no ``MEFOR_STORE_BACKEND``,
+    because an operator's shell need not carry the service's own environment. A generic-dialect
+    DATABASE connection is unknown too: its driver, not Driver 18, decides its TLS."""
+    if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
+        return OdbcHops(found=("the [store] backend is sqlserver",))
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.settings import settings_file_path
+    from messagefoundry.config.wiring import WiringError, load_config
+    from messagefoundry.redaction import codec_safe_str
+
+    if Path(config_dir) == Path(_DEFAULT_CONFIG_DIR):
+        # The CLI fills this in when --config is left out, so it is not the deployment's graph.
+        return OdbcHops(unknown=f"--config was left at {_DEFAULT_CONFIG_DIR!r}; pass --config")
+    if not Path(config_dir).is_dir():
+        return OdbcHops(unknown=f"no config dir at {config_dir!r}; pass --config")
+    try:
+        # allow_empty: an empty graph takes no hop, which is an answer, not an unknown.
+        reg = load_config(config_dir, allow_empty=True)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
+        # SystemExit: a config module that exits at import must not end the verify run.
+        reason = codec_safe_str(exc)[:200]
+        return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
+    database = sorted(
+        (str(conn.spec.settings.get("dialect", "sqlserver")).lower(), name)
+        for table in (reg.inbound, reg.outbound)
+        for name, conn in table.items()
+        if conn.spec.type is ConnectorType.DATABASE
+    )
+    found = (
+        *(f"DATABASE connection {name}" for dialect, name in database if dialect == "sqlserver"),
+        *(
+            f"DatabaseRef reference set {name}"
+            for name, ref in sorted(reg.references.items())
+            if ref.source.kind == "database"
+        ),
+        *(f"DatabaseLookup {name}" for name in sorted(reg.lookups)),
+    )
+    if found:
+        return OdbcHops(found=found)
+    generic = [name for dialect, name in database if dialect != "sqlserver"]
+    if generic:
+        return OdbcHops(
+            unknown=f"DATABASE connection {generic[0]} uses a generic ODBC driver, whose TLS "
+            "this row does not read"
+        )
+    if settings is None:
+        return OdbcHops(unknown="service settings did not load, so the store backend is not known")
+    if (
+        service_config is None
+        and not settings_file_path(None).exists()
+        and "MEFOR_STORE_BACKEND" not in os.environ
+    ):
+        return OdbcHops(
+            unknown="no service config was read, so the store may be SQL Server; pass "
+            "--service-config"
+        )
+    return OdbcHops(judged=f"the service settings and the graph in {config_dir!r}")
 
 
 def _manual_rows() -> list[CheckResult]:
@@ -167,7 +242,7 @@ def _run_live_smoke(
 
 def run_verify(
     *,
-    config_dir: str = "samples/config",
+    config_dir: str = _DEFAULT_CONFIG_DIR,
     service_config: str | None = None,
     sections: Sequence[str] | None = None,
     smoke_mode: str = "self",
@@ -205,7 +280,11 @@ def run_verify(
     if "host" in selected:
         api_port = settings.api.port if settings is not None else _DEFAULT_API_PORT
         ports = {"MLLP": mllp_port, "DICOM": _DEFAULT_DICOM_PORT, "API": api_port}
-        results += run_host_checks(ports=ports, writable_dir=_writable_dir(settings))
+        results += run_host_checks(
+            ports=ports,
+            writable_dir=_writable_dir(settings),
+            odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir),
+        )
 
     if "store" in selected:
         if settings is None:

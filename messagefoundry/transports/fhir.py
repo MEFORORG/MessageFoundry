@@ -71,7 +71,11 @@ from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import (
+    RepeatedKeyError,
+    json_loads_or_refusal,
+    refuse_repeated_keys,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -301,19 +305,6 @@ def entry_screen_settings(interaction: str, methods: object, types: object) -> _
     )
 
 
-class _RepeatedKey(ValueError):
-    """A JSON object in the body repeats a key. Carries neither the key nor any value."""
-
-
-def _refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    # json.loads keeps the LAST of two equal keys; a server may keep the first. Refused, so the
-    # screen and the server can never read two different entries out of one body.
-    obj = dict(pairs)
-    if len(obj) != len(pairs):
-        raise _RepeatedKey
-    return obj
-
-
 #: A percent-encoded control character (%00-%1F, %7F). A server decodes it back into one.
 _ENCODED_CONTROL_RE = re.compile(r"%(?:[01][0-9A-Fa-f]|7[Ff])")
 
@@ -405,12 +396,116 @@ def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None
         )
 
 
+#: The ``code`` of the permanent refusal for a wrapped update's 2xx reply that repeats a JSON key.
+_REPLY_REPEATS_A_KEY_CODE = "reply-repeats-a-key"
+
+
+class _ThirdReading(ValueError):
+    """A key occurs with a value equal to neither its first nor its last. Carries no key or value."""
+
+
+def _keep_first_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An ``object_pairs_hook`` that keeps the FIRST of two equal keys, where ``json`` keeps the
+    last: the reading a server that keeps the first would make. Raises :class:`_ThirdReading` when
+    a key occurs three or more times and some occurrence equals neither its first nor its last
+    value, since comparing the first and last readings would never see it."""
+    first: dict[str, Any] = {}
+    last: dict[str, Any] = {}
+    for key, value in pairs:
+        first.setdefault(key, value)
+        last[key] = value
+    if len(first) != len(pairs) and any(
+        value != first[key] and value != last[key] for key, value in pairs
+    ):
+        raise _ThirdReading
+    return first
+
+
+def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """The first entry's ``response`` of a ``Bundle`` reply, or None. The one walk both
+    :func:`_unwrap_transaction_reply` and :func:`_reply_reading` take, so they cannot drift."""
+    entries = obj.get("entry") if obj.get("resourceType") == "Bundle" else None
+    first = entries[0] if isinstance(entries, list) and entries else None
+    response = first.get("response") if isinstance(first, dict) else None
+    return response if isinstance(response, dict) else None
+
+
+def _entry_status(response: dict[str, Any]) -> int | None:
+    """The entry ``response.status`` as an HTTP code, or None when it does not read as one."""
+    status = response.get("status")
+    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None
+    return None if m is None else int(m.group(1))
+
+
+def _entry_verdict(obj: dict[str, Any]) -> DeliveryError | str:
+    """What :func:`_unwrap_transaction_reply` decides from a parsed reply: the classified failure
+    it raises, or the capture outcome of a delivery. An entry status that does not read as an HTTP
+    code is a delivery (the caller logs it)."""
+    response = _entry_response(obj)
+    if response is None:
+        return _capture_outcome_of(obj)
+    outcome = _as_operation_outcome(response.get("outcome"))
+    status = _entry_status(response)
+    if status is not None:
+        failure = _classify_status(status, outcome, where="transaction entry status")
+        if failure is not None:
+            return failure
+    return _capture_outcome_of(outcome) if outcome is not None else "accepted"
+
+
+def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
+    """The judgment :func:`_unwrap_transaction_reply` reaches on a parsed reply, plus the values a
+    delivery takes from it. Two readings that give equal tuples are judged identically; the rule is
+    stated once, in ADR 0095 Amendment B.1 (the 2026-10-17 entry)."""
+    verdict = _entry_verdict(obj)
+    judged: tuple[object, ...] = (
+        (
+            type(verdict).__name__,
+            getattr(verdict, "code", None),
+            getattr(verdict, "permanent", None),
+        )
+        if isinstance(verdict, DeliveryError)
+        else ("delivered", verdict)
+    )
+    response = _entry_response(obj)
+    consumed = (
+        () if response is None else tuple(response.get(f) for f in _ENTRY_RESPONSE_HEADERS.values())
+    )
+    return (obj.get("resourceType"), response is not None, judged, consumed)
+
+
+def _agreed_reading(body: str) -> dict[str, Any] | None:
+    """A reply :class:`FhirPeek` refused, read once keeping the first and once keeping the last
+    value of each repeated key (vault BACKLOG #2812). Returns the reading when both are JSON objects
+    and :func:`_reply_reading` gives them equal tuples, or ``None`` when the plain read is not a
+    JSON object, which is judged ``unparseable`` as before. Otherwise, including a body only the
+    plain read can parse, raises the permanent ``reply-repeats-a-key`` refusal, which names neither
+    a key nor a value. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule and its
+    costs."""
+    text = body.lstrip(_BOM)
+    # The plain read first: a body that is not a JSON object stops here, after one more parse.
+    last, hint = json_loads_or_refusal(text)
+    if hint is not None or not isinstance(last, dict):
+        return None
+    first, hint = json_loads_or_refusal(text, object_pairs_hook=_keep_first_key)
+    if hint is not None or _reply_reading(first) != _reply_reading(last):
+        raise NegativeAckError(
+            f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
+            "and is needed here. Check the partner before a replay (FHIR destination)",
+            code=_REPLY_REPEATS_A_KEY_CODE,
+            permanent=True,
+        )
+    return last
+
+
 def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
     """Why :func:`_screen_bundle` refuses ``payload``, or None when every entry passes."""
+    # A repeated key is refused, so the screen and the server can never read two different
+    # entries out of one body.
     parsed, hint = json_loads_or_refusal(
-        payload.lstrip(_BOM), object_pairs_hook=_refuse_repeated_keys
+        payload.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys
     )
-    if hint == _RepeatedKey.__name__:
+    if hint == RepeatedKeyError.__name__:
         return "a JSON object in it repeats a key"
     if hint is not None:
         return f"it is not parseable JSON ({hint})"
@@ -653,32 +748,36 @@ def _unwrap_transaction_reply(
     end in a 412 and a false dead-letter. PHI-safe: only the code is named, never the entry's
     ``status`` text or ``outcome``.
 
+    A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
+    each key (vault BACKLOG #2812), and judged as any other only when the readings agree; see
+    :func:`_agreed_reading`.
+
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even
     when the entry's value is then dropped. A value carrying a control character, or longer than a
     header value may be, is dropped: it came from a JSON body, which, unlike an HTTP header line,
     bounds neither. The rest are offered to the #154 allow-list."""
     try:
-        peek = FhirPeek.parse(body)
+        obj: dict[str, Any] | None = FhirPeek.parse(body).obj
     except FhirPeekError:
-        return headers, "unparseable"
-    entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None
-    first = entries[0] if isinstance(entries, list) and entries else None
-    response = first.get("response") if isinstance(first, dict) else None
-    if not isinstance(response, dict):
-        return headers, _capture_outcome_of(peek.obj)
-    outcome = _as_operation_outcome(response.get("outcome"))
-    status = response.get("status")
-    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None
-    if m is None:
+        obj = None
+    # Judged outside the handler, so nothing rides on the refusal's __context__ (BACKLOG #2048).
+    if obj is None:
+        # FhirPeek refuses a repeated key; a reply whose two readings agree is judged as before.
+        obj = _agreed_reading(body)
+        if obj is None:
+            return headers, "unparseable"
+    verdict = _entry_verdict(obj)
+    if isinstance(verdict, DeliveryError):
+        raise verdict
+    response = _entry_response(obj)
+    if response is None:
+        return headers, verdict
+    if _entry_status(response) is None:
         logger.warning(
             "FHIR transaction-response entry carries no readable status; taking the 2xx reply "
             "as delivered"
         )
-    else:
-        failure = _classify_status(int(m.group(1)), outcome, where="transaction entry status")
-        if failure is not None:
-            raise failure
     present = {
         name: response[field]
         for name, field in _ENTRY_RESPONSE_HEADERS.items()
@@ -694,7 +793,7 @@ def _unwrap_transaction_reply(
     taken = {name.lower() for name in present}
     kept = {name: value for name, value in headers.items() if name.lower() not in taken}
     captured = {**kept, **capture_response_headers(usable, allowlist)}
-    return captured, _capture_outcome_of(outcome) if outcome is not None else "accepted"
+    return captured, verdict
 
 
 class FhirDestination(DestinationConnector):
@@ -986,8 +1085,10 @@ class FhirDestination(DestinationConnector):
         try:
             return FhirPeek.parse(payload)
         except FhirPeekError as exc:
+            # A FhirPeekError's text is content-free; it says which refusal fired (a repeated key
+            # is valid JSON, so "not parseable" alone would mislead the operator).
             raise NegativeAckError(
-                "outgoing FHIR body is not parseable JSON", code="bad-body", permanent=True
+                f"outgoing FHIR body refused: {exc}", code="bad-body", permanent=True
             ) from exc
 
     def _resolve_request(self, payload: str) -> _FhirRequest:
@@ -1528,9 +1629,11 @@ class FhirLookupExecutor:
         egress: EgressSettings,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
         failed: Mapping[str, str] | None = None,
+        warn_query_credentials: bool = True,
     ) -> None:
         # `egress` is required and every connection is checked against it before anything is built,
         # so no caller can construct an executor that reads from an unchecked host (vault BACKLOG #2605).
+        # `warn_query_credentials` drops only the warning, never a refusal (vault BACKLOG #2910).
         from messagefoundry.transports.egress import check_fhir_lookup_allowed
 
         # Vault BACKLOG #3008: the lookups the runner could not build at start, name -> reason. Each
@@ -1539,7 +1642,9 @@ class FhirLookupExecutor:
         self._failed: dict[str, str] = dict(failed or {})
 
         for cname, s in connections.items():
-            check_fhir_lookup_allowed(cname, s, egress)
+            check_fhir_lookup_allowed(
+                cname, s, egress, warn_query_credentials=warn_query_credentials
+            )
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other

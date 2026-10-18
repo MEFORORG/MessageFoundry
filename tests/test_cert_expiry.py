@@ -37,6 +37,7 @@ from messagefoundry.pipeline.cert_expiry import (
     CertExpiryRunner,
     MonitoredCert,
     certs_from_registry,
+    certs_from_settings,
     client_cert_label,
     crls_from_settings,
     peer_cert_expiry,
@@ -743,3 +744,52 @@ def test_the_crl_log_line_names_no_direction(caplog: pytest.LogCaptureFixture) -
     assert "this listener" not in text
     assert "outbound hop cannot connect" in text
     assert "restart the engine" in text
+
+
+# --- vault BACKLOG #2223: the SQL Server store pin is watched -----------------------------------
+#
+# Under Encrypt=strict a pin match stands in for the driver's own expiry check, so the monitor watches
+# the pinned file and warns ahead of the store's own refusal at connect.
+
+
+def _store(backend: StoreBackend, pin: Path | None) -> ServiceSettings:
+    return ServiceSettings(
+        store=StoreSettings(
+            backend=backend,
+            server="db",
+            database="mefor",
+            username="mefor",
+            ssl_root_cert=str(pin) if pin is not None else None,
+        )
+    )
+
+
+def test_the_sqlserver_store_pin_is_watched_and_warns_ahead_of_not_after(tmp_path: Path) -> None:
+    pin = tmp_path / "db-server.pem"
+    _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
+    rows = certs_from_settings(_store(StoreBackend.SQLSERVER, pin))
+    assert rows == [MonitoredCert("store.ssl_root_cert", str(pin))]
+    sink = _RecordingSink()
+    checks = _runner(rows, sink, warn_days=30).run_once()
+    assert [(c.label, c.days_remaining) for c in checks] == [("store.ssl_root_cert", 10)]
+    assert [call[0] for call in sink.cert_calls] == ["store.ssl_root_cert"]
+
+
+def test_a_der_store_pin_is_read_by_the_monitor(tmp_path: Path) -> None:
+    pem = tmp_path / "db-server.pem"
+    _write_cert(pem, not_after=_REF + datetime.timedelta(days=5))
+    der = tmp_path / "db-server.cer"
+    der.write_bytes(
+        x509.load_pem_x509_certificate(pem.read_bytes()).public_bytes(serialization.Encoding.DER)
+    )
+    checks = _runner([MonitoredCert("store.ssl_root_cert", str(der))], _RecordingSink()).run_once()
+    assert [c.days_remaining for c in checks] == [5]
+
+
+def test_no_store_pin_row_without_a_sqlserver_pin(tmp_path: Path) -> None:
+    # POSITIVE CONTROL for the test above: no pin, or a PostgreSQL CA bundle, adds no row.
+    assert certs_from_settings(ServiceSettings()) == []
+    assert certs_from_settings(_store(StoreBackend.SQLSERVER, None)) == []
+    bundle = tmp_path / "db-ca.pem"
+    _write_cert(bundle, not_after=_REF + datetime.timedelta(days=10))
+    assert certs_from_settings(_store(StoreBackend.POSTGRES, bundle)) == []

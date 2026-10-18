@@ -55,11 +55,15 @@ only the host can. On a host that does not provide it:
   verdict your deployment warrants is yours to determine; nothing here should pre-fill it.)*
 - an **exposed** PHI instance **warns at every start** until the decision is recorded —
   `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
-  provides it. The engine **starts either way**: this is a host property, not a config error, and one no
-  operator can satisfy on Windows, so refusing by default would break deployments over something they
-  cannot change. An estate that has standardized on confidential-computing hosts can make the missing
-  declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
-  Loopback and synthetic instances are **silent — but not exempt.** The warning is keyed on exposure to
+  provides it. The engine **starts either way**: this is a host property, not a config error, and a
+  Windows engine VM is listed as getting it only as an Azure or Azure Local confidential VM (table
+  below, verified 2026-07-22), so refusing by default would stop a Windows engine on Windows Server
+  Hyper-V over something its operator cannot change. An estate that has standardized on
+  confidential-computing hosts can make the missing declaration fatal with
+  `[security].require_memory_encryption_declaration = true` (default `false`).
+  Unexposed instances ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)'s
+  exposure rule, as amended 2026-10-06) are **silent — but not exempt**, and no instance is spared as
+  synthetic ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). The warning is keyed on exposure to
   keep startup output off deployments nobody is watching, **not because the risk differs**: hardware
   memory encryption addresses a host / hypervisor / physical-attacker threat that does not care which
   interface is bound, and a loopback-bound engine ingesting real HL7 over an MLLP listener holds exactly
@@ -81,18 +85,19 @@ limitation travels with any copy of the posture body. The engine measures and re
 determines the verdict.
 
 **Availability on today's on-premises platforms (verified 2026-07-22).** For a **Windows** engine host —
-the primary supported platform — this requirement is presently **unmeetable on-premises**, and the
-blocker is the hypervisor, not the CPU:
+the only supported v1 platform — this requirement is presently **unmeetable on Windows Server Hyper-V**;
+ESXi 9.0 does not list Windows as a supported SEV-SNP guest. The blocker is the hypervisor, not the CPU:
 
 | Platform | Confidential guest for a **Windows** engine VM |
 |---|---|
 | **Hyper-V on-premises** (Windows Server 2019–2025) | ⛔ None. Windows Server 2025 ships no confidential VM; the vNext Insider "Trusted Launch" (Secure Boot + vTPM) is **not** memory encryption. |
 | **VMware ESXi 9.0** | **CAUTION:** SEV-SNP is a *Limited Availability* release and its guest requirements are stated in Linux-kernel terms; Windows is not listed as a supported SEV-SNP guest. |
 | **Azure / Azure Local confidential VMs** | ✅ SEV-SNP and TDX with Windows Server guests (a Microsoft paravisor supplies what a Windows guest needs). |
-| **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. |
+| **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). |
 
-So a Windows on-prem deployment is honestly capped at **Partial** today, and a Linux or Azure
-confidential-VM deployment is the route to the hardware property. Plan hardware refresh accordingly —
+The Linux row does not apply to v1, so for a v1 deployment the only row this table marks as a route is
+Azure / Azure Local. What verdict a Windows engine VM on the other rows warrants is yours to determine
+(see the 2026-08-02 correction above). For an Azure Local route, plan hardware refresh accordingly —
 SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer than much of a typical
 5–7-year hospital server refresh cycle.
 
@@ -103,14 +108,36 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 | **Windows Server 2022 / 2025** | ✅ Primary supported & serviced platform (Windows-service deployment via NSSM) |
 | Windows Server 2019 | ✅ Supported |
 | Windows 10 / 11 | ✅ Supported (development, pilot, test-harness host) |
-| **Linux** (modern x86-64 distributions) | ✅ Engine supported (cross-platform Python); no bundled service installer — run under systemd yourself |
+| **Linux** (any distribution, on a host or in a container) | **Not supported for v1 deployment** ([below](#linux-is-not-a-supported-v1-deployment-target)); development and CI use only |
 | macOS | **CAUTION:** Development / test-harness use only |
+
+### Linux is not a supported v1 deployment target
+
+Owner ruling, 2026-10-16: **Windows is the only supported v1 deployment platform** (versions in the
+table above). Linux, on a host or in the container image, is not. A Linux deployment would need its
+own thorough testing. That covers at least the POSIX branches in the security code, the container
+hardening and a systemd unit. It is too much for v1. Linux support may return after v1; no date is
+set.
+
+The ruling changes the support statement, not the code:
+
+- The engine keeps its POSIX code paths, and the [`docker/`](../docker/README.md) tree (image,
+  compose file, Kubernetes manifests, smoke test) stays as a development and CI artifact.
+- CI keeps its Linux legs. A green Linux leg is not evidence that a Linux deployment works.
+- Some CI jobs run only on Linux hosted runners, at least the SQL Server store and the load tests,
+  and on Windows that leaves a gap. CI exercises the PostgreSQL store on Linux (PostgreSQL 16,
+  gating) and, since the ruling, as an advisory leg that does not block a merge, on hosted Windows
+  Server 2022 and 2025 against the runner images' preinstalled PostgreSQL 14 and 17. SQL Server is
+  exercised on Linux containers only; there is no running Windows SQL Server CI leg.
+  `selfhosted-win2025-sql.yml` would be one, but has no runner known to be registered
+  ([CI-SELFHOSTED-RUNNER.md](CI-SELFHOSTED-RUNNER.md)). How each leg reaches the merge gate is in
+  [CI.md](CI.md#the-ci-gate-roll-up).
 
 ## Runtime
 
 | Component | Requirement |
 |---|---|
-| **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Linux + Windows Server 2022 + 2025, the primary deploy target) |
+| **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Windows Server 2022 + 2025 and on Linux, which is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target)) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
 | C compiler | Not required for the default install with standard CPython 3.14 on x86-64 Windows, glibc Linux (x86-64 or arm64) or arm64 macOS. The locked runtime dependencies ship wheels there (read from `uv.lock`, 2026-09-30). At least two other interpreters build packages from source. arm64 Windows builds `cryptography` and `httptools`. x86-64 macOS builds `cryptography` and `argon2-cffi-bindings`. Building `cryptography` needs a C compiler, a Rust toolchain and OpenSSL headers. |
 | **`httptools`** | **Required by `serve`.** The engine API parses HTTP requests with `httptools` (llhttp) and pins it to the version the request-framing tests measured (BACKLOG #1125). `serve` does not fall back to uvicorn's other parser, h11, because h11 frames some ambiguous requests differently. If `httptools` does not import, `serve` prints an error naming the module and the pinned HTTP parser, ending `refusing to start.`, and exits 2 before it creates any file. `supervise` refuses the same way, ending `refusing to start the fleet.`, before it starts any engine shard. The lock ships a ready-built wheel for x86-64 Windows, glibc and musl Linux (x86-64 or arm64) and macOS (arm64, and x86-64 through the universal2 wheel). arm64 Windows has none, so it builds `httptools` from source, and that needs a C compiler; so does any platform outside that list. |
@@ -121,7 +148,7 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 requirement. The engine reads the host's wall clock and trusts it. It never sets the clock, and by
 default it does not check it.
 
-The requirement covers each host that runs an engine process, on Windows and on Linux.
+The requirement covers each host that runs an engine process.
 
 ### What reads the clock
 
@@ -172,9 +199,10 @@ is **not** disciplined:
 
 ### Check it on Linux
 
-On a systemd host, run `timedatectl`. A healthy host shows `System clock synchronized: yes` and
-`NTP service: active`. Where chrony is the time service, `chronyc tracking` shows the current
-offset, and a healthy host shows a `Leap status` of `Normal`.
+Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target); this check is for a Linux
+host outside that support, such as a development box. On a systemd host, run `timedatectl`. A healthy host
+shows `System clock synchronized: yes` and `NTP service: active`. Where chrony is the time service,
+`chronyc tracking` shows the current offset, and a healthy host shows a `Leap status` of `Normal`.
 
 ### The engine can check at start, if you ask it to
 
@@ -192,8 +220,8 @@ query to the peer, so the host must be able to reach the peer on UDP port 123.
 | Database | Status | Driver / prerequisite |
 |---|---|---|
 | **SQLite (WAL)** | ✅ Default, bundled — single-node | None (`aiosqlite`, in-process) |
-| **PostgreSQL 13+** | ✅ Production | `messagefoundry[postgres]` extra (`asyncpg` — no OS dependency; ships compiled wheels) |
-| **Microsoft SQL Server 2022 / 2025** | ✅ Production | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server** (18.5+ covers both majors). Read-Committed Snapshot Isolation (RCSI) recommended. SQL Server 2025 requires an AVX-capable CPU. |
+| **PostgreSQL 13+** | ✅ Production ([CI coverage](#linux-is-not-a-supported-v1-deployment-target)) | `messagefoundry[postgres]` extra (`asyncpg` — no OS dependency; ships compiled wheels) |
+| **Microsoft SQL Server 2022 / 2025** | ✅ Production ([CI coverage](#linux-is-not-a-supported-v1-deployment-target)) | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server** (18.5+ covers both majors). Read-Committed Snapshot Isolation (RCSI) recommended. SQL Server 2025 requires an AVX-capable CPU. |
 | MySQL / Oracle | ⛔ Not supported (roadmap) | — |
 
 > The embedded SQLite store needs no setup and suits pilots and single-node deployments. A
@@ -292,6 +320,16 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 | **Standard single-node** | ~30–70 msg/s | ~1.0–2.2 M/day | 1 process, single node | SQLite, or PostgreSQL / SQL Server | 4 cores / 8 GB |
 | **High single-node** | ~70–100 msg/s | ~2.2–3.2 M/day | 1 process, tuned (lean transforms; low fan-out; the default `pooled` claim mode; finite-retry on hot lanes), many connections / lanes draining concurrently via `SKIP LOCKED` | Server DB on its **own** host (PostgreSQL / SQL Server) | 4–8 cores / 16 GB + a DB host sized to the commit load |
 | **Multi-process (engine shards)** | ~165 msg/s measured at 4 engine shards **on per-shard SQLite — a topology that is not supported above one shard** (see the Store cell). The **supported** shared-server-DB shape has never been measured at this rate; a 4-shard soak at fan-out 8 on one shared SQL Server store sustained **~10 msg/s ingress**. The portable result is the **~0.85 per-shard efficiency**, not the absolute rate: ≈ *N* × your measured single-shard rate × 0.85 | ~5.3 M/day **for the unsupported per-shard-SQLite run only** — not a figure any deployable shape has demonstrated | *N* `messagefoundry supervise` engine-shard processes, partitioned by inbound connection — **not yet certified as a production topology** (see above) | **PostgreSQL / SQL Server** — required above one shard, so all engine shards share **one unified store** | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
+
+> **Platform of the source runs.** The Pilot and Standard rows come from the reference config in
+> [TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), measured on a GitHub-hosted `ubuntu-latest` runner.
+> Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). That file's Windows
+> Server 2025 engine-shard run also measured one process on SQLite at ~50 msg/s, inside the Standard band.
+> The High single-node and engine-shard rows had a Windows engine host. The High row's run says so in
+> its [`environment.txt`](benchmarks/results/2026-07-03-adr0066-pooled-atscale/environment.txt). The
+> ~165 msg/s run ran on that Windows Server 2025 box. The shared SQL Server soak ran on the AWS rig that
+> [THROUGHPUT-STATUS-2026-07-10.md](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §8, *Rig sizing*,
+> records as all Windows.
 
 **Reading the tiers — and checking the arithmetic**
 

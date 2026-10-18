@@ -437,7 +437,7 @@ def require_ui(
     budget, so a password holder could throttle the real user by being refused in a loop. On a
     non-GET the same-origin check runs first. A refusal is audited here as ``auth.mfa_denied``, so
     the hook must not write that row itself. It may have other effects: the reauth-only action
-    hook records the new-IP signal, which can write ``auth.admin_action_new_ip``.
+    hook records the new-IP signal, which can write ``auth.new_address_reverify_required``.
 
     ``phi=True`` also applies the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and the same
     per-actor anti-automation throttle as ``require_phi_read`` (the /ui PHI views call the JSON
@@ -936,9 +936,30 @@ def _new_address_continuation(request: Request, *, landing: str) -> str:
     A GET comes back to itself, query included, so a filtered or deferred list does not return as
     a broader read than the operator asked for. A write, or a GET whose whole target ``/ui/reauth``
     would not take (not a registered unlock page, or past :data:`_REAUTH_NEXT_MAX`), goes to
-    ``landing``. A query is never dropped to make a target fit."""
+    ``landing``. A query is never dropped to make a target fit.
+
+    The path is the one the browser sent, still percent-encoded (vault BACKLOG #3052 item 8). Built
+    from the decoded path, an encoded ``?`` inside a segment became a query on the way back. A
+    path the browser would rewrite before it follows the 303 goes to ``landing`` instead, so it
+    cannot pass the registry as one page and arrive at another: an encoded ``/``, ``.`` or ``\\``,
+    a literal ``\\``, a ``.`` or ``..`` segment once decoded, or a byte outside ASCII. A query with
+    a byte outside ASCII goes to ``landing`` too: :func:`_reauth_redirect` quotes the target as
+    UTF-8, so a raw byte would come back as different bytes."""
     if request.method == "GET":
-        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        decoded: str = request.scope["path"]
+        raw = request.scope.get("raw_path")
+        # No raw path from the server: re-encode the decoded one, so a decoded "?" stays in its
+        # segment rather than cutting the path where request.url would.
+        path = raw.decode("latin-1") if isinstance(raw, bytes) else quote(decoded, safe="/")
+        query = request.scope.get("query_string", b"").decode("latin-1")
+        if (
+            not path.isascii()
+            or not query.isascii()
+            or any(token in path.lower() for token in ("%2f", "%2e", "%5c", "\\"))
+            or any(segment in (".", "..") for segment in decoded.split("/"))
+        ):
+            return landing
+        target = path + (f"?{query}" if query else "")
         if len(target) <= _REAUTH_NEXT_MAX and is_unlock_action(target):
             return target
     return landing
@@ -1215,7 +1236,7 @@ async def _refuse_from_new_address(
     """Send the browser to ``/ui/reauth`` when this request comes from a host its session has not
     verified from (vault BACKLOG #2620). The cookie twin of ``api.security``'s refusal of the same
     name; :func:`require_ui` says which requests ask. ``next_path`` is as for
-    :func:`_reauth_redirect`. Records the signal (``auth.admin_action_new_ip`` and a notice on a
+    :func:`_reauth_redirect`. Records the signal (``auth.new_address_reverify_required`` and a notice on a
     first sighting) the way the step-up factories do."""
     if await auth.flag_new_client_ip(
         session_token(request), client_ip(request), path=request.url.path

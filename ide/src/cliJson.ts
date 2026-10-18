@@ -30,10 +30,12 @@
 //   * any command: the dispatch-level catch in `cli_common.run_cli` (BACKLOG #1863) prints an
 //     uncaught exception as `safe_exc` text. That scrubber is not de-identification (it can miss a
 //     lone identifier), so it is the weakest of these.
-// The one unvetted fact-path text is `WiringError`'s "error loading config module <file>:
-// <exception>", which quotes what a config module raised at import: the author's own code, run
-// before any sample is read. Every command that imports config modules can print it, `connection
-// upsert` and `remove` included.
+// A config module that fails at import is reported by `WiringError` as "error loading config
+// module <file>: <type> ..." without the text of what the author's code raised; `_module_failure`
+// in config/wiring.py is the rule (vault BACKLOG #3249). Unvetted fact-path text remains, at least
+// an exception raised inside the engine while the module ran, which keeps its text and can quote a
+// value where it wraps another exception, and the identifier an import or name error names. Every
+// command that imports config modules can print them, `connection upsert` and `remove` included.
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {

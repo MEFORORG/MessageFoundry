@@ -234,8 +234,12 @@ async def test_a_code_at_the_mfa_gate_for_a_satisfied_oidc_session_opens_nothing
         token = await _federated_sign_in(service, c, monkeypatch)
         identity = await service.identity_for_token(token, activity=False)
         assert identity is not None and await service.mfa_satisfied(token)
-        await service.store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
-        assert await service.store.enable_totp(identity.user_id, recovery_code_hashes=[])
+        staged_cell = await service.store.set_totp_secret(
+            identity.user_id, secret="JBSWY3DPEHPK3PXP"
+        )
+        assert await service.store.enable_totp(
+            identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
+        )
         r = await c.post("/ui/mfa", data={"code": "000000"}, headers=_SAME, follow_redirects=False)
         assert r.status_code == 303 and r.headers["location"] == "/ui", r.headers
         assert c.cookies.get("mf_session") == token, "nothing rotated, so the cookie must not move"
@@ -351,5 +355,5 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
         )
         assert r.status_code == 403
         assert 'action="/ui/reauth/oidc"' in r.text
-        assert "did not complete the sign-in" in r.text
+        assert "did not complete the confirmation" in r.text  # BACKLOG #3221: a step-up word
         assert await service.identity_for_token(token) is not None

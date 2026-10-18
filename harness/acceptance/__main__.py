@@ -22,6 +22,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from harness.__main__ import hold_children_job
 from harness.acceptance.matrix import SECTIONS
 from harness.acceptance.report import (
     exit_code,
@@ -67,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
+    # The backing suites run as a pytest child, which a killed run would otherwise leave running.
+    hold_children_job(argv)
     results = run_matrix(run_pytest=not args.no_pytest, include_sections=include_sections)
 
     print(render_console(results))

@@ -1027,8 +1027,8 @@ class DestinationConnector(abc.ABC):
 
     def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
         """Raise the permanent :class:`NegativeAckError` :meth:`send` would raise for a ``payload``
-        its frame cannot carry (ADR 0205 rule 1), or its delimiter rewrite refuses (ADR 0206),
-        without sending it. The default is a no-op: only
+        its frame cannot carry (ADR 0205 rule 1), that holds more than one message (ADR 0209), or
+        that its delimiter rewrite refuses (ADR 0206), without sending it. The default is a no-op: only
         the MLLP and TCP destinations frame. The delivery stage calls it where no single-payload
         :meth:`send` runs: on a simulate (shadow) outbound, and on each MLLP batch member with
         ``rewrite=False``, because a member sits in the envelope as stored and :meth:`send` applies
@@ -1173,14 +1173,16 @@ def build_source(config: Source, *, egress: EgressSettings) -> SourceConnector:
     return builder(config)
 
 
-def build_destination(config: Destination, *, egress: EgressSettings) -> DestinationConnector:
+def build_destination(
+    config: Destination, *, egress: EgressSettings, warn_query_credentials: bool = True
+) -> DestinationConnector:
     from messagefoundry.transports.egress import check_egress_allowed
 
     try:
         builder = _DESTINATIONS[config.type]
     except KeyError:
         raise ValueError(f"no destination connector registered for {config.type.value!r}") from None
-    check_egress_allowed(config, egress)
+    check_egress_allowed(config, egress, warn_query_credentials=warn_query_credentials)
     if config.settings.get("ech_egress") and config.type not in _ECH_ROUTING_DESTINATIONS:
         raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return builder(config)

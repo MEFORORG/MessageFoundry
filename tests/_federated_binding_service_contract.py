@@ -183,8 +183,11 @@ async def _assert_bind_audit_names_factors_contract(store: Any) -> None:
 
     # 1b. A first bind of an account that already holds both factors reads them in the clear's
     #     already-unbound arm. Without this, dropping the fields from that arm would still pass 1.
-    await store.set_totp_secret(PRE_ENROLLED_USER, secret="JBSWY3DPEHPK3PXP")
-    assert await store.enable_totp(PRE_ENROLLED_USER, recovery_code_hashes=["h1"])
+    staged_cell = await store.set_totp_secret(PRE_ENROLLED_USER, secret="JBSWY3DPEHPK3PXP")
+    assert staged_cell is not None
+    assert await store.enable_totp(
+        PRE_ENROLLED_USER, recovery_code_hashes=["h1"], expected_secret_cell=staged_cell
+    )
     await store.add_webauthn_credential(_cred(PRE_ENROLLED_USER, "pre", id_hash="pre-passkey-hash"))
     await service.bind_federated_subject(
         PRE_ENROLLED_USER,
@@ -199,8 +202,11 @@ async def _assert_bind_audit_names_factors_contract(store: Any) -> None:
     )
 
     # 2. The account enrols both factors; the rebind row reads them.
-    await store.set_totp_secret(FACTOR_USER, secret="JBSWY3DPEHPK3PXP")
-    assert await store.enable_totp(FACTOR_USER, recovery_code_hashes=["h1"])
+    staged_cell = await store.set_totp_secret(FACTOR_USER, secret="JBSWY3DPEHPK3PXP")
+    assert staged_cell is not None
+    assert await store.enable_totp(
+        FACTOR_USER, recovery_code_hashes=["h1"], expected_secret_cell=staged_cell
+    )
     await store.add_webauthn_credential(_cred(FACTOR_USER, "mine", id_hash="factor-passkey-hash"))
     await service.bind_federated_subject(
         FACTOR_USER,

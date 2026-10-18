@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
 )
+from messagefoundry.controlchars import CONTROL_CATEGORIES
 from messagefoundry.store.privilege import (
     OVER_GRANT_OPT_OUT,
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
@@ -54,6 +55,7 @@ from messagefoundry.store.privilege import (
     preflight_outcome,
     refusal_reason,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap import BindAccountReading
@@ -156,9 +158,10 @@ def _store_minimal(store: StoreSettings) -> str:
 
 def _store_identity(store: StoreSettings, report: StorePrivilegeReport) -> str:
     if report.principal:
-        return f"{store.backend.value} principal {report.principal!r} on {report.database!r}"
+        principal, database = _quoted(report.principal), _quoted(report.database)
+        return f"{store.backend.value} principal {principal} on {database}"
     if store.backend is StoreBackend.SQLITE:
-        return f"sqlite file {store.path!r}"
+        return f"sqlite file {_quoted(str(store.path))}"
     if store.backend is StoreBackend.SQLSERVER and store.auth is SqlAuth.INTEGRATED:
         who = "the Windows account running this command ([store].auth = 'integrated')"
     elif store.backend is StoreBackend.SQLSERVER and store.auth is SqlAuth.ENTRA:
@@ -166,8 +169,8 @@ def _store_identity(store: StoreSettings, report: StorePrivilegeReport) -> str:
         # so the identity is whatever that chain resolves in THIS process's environment.
         who = "the Entra identity this command's environment resolves ([store].auth = 'entra')"
     else:
-        who = repr(store.username or "")
-    return f"{store.backend.value} principal {who} on {store.database!r}"
+        who = _quoted(store.username or "")
+    return f"{store.backend.value} principal {who} on {_quoted(store.database)}"
 
 
 def store_hop(report: StorePrivilegeReport, store: StoreSettings) -> HopPrivilege:
@@ -316,14 +319,28 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
 
 
 def printable(text: str) -> str:
-    """``text`` with every Unicode control, format and unassigned character removed, for printing
-    a value a remote server chose (a Vault policy name, a Who am I answer).
+    """``text`` with every character in :data:`~messagefoundry.controlchars.CONTROL_CATEGORIES`
+    REMOVED: what a reader would take a server-chosen value (a Vault policy name) for once the
+    characters a terminal does not show are gone. The set is the one the terminal and log escapes
+    use, imported rather than copied (BACKLOG #2891).
 
-    Wider than :func:`~messagefoundry.controlchars.strip_control_chars`, which removes C0 and DEL:
-    this also removes C1 controls such as U+009B, which a terminal can read as an escape sequence,
-    and format characters such as the U+202E right-to-left override, which can reorder a line so a
-    policy named ``root`` reads as something else. Category ``C*`` covers all of them."""
-    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
+    It strips rather than escapes for the root comparison in :func:`vault_hop`: ``r`` + U+200B +
+    ``oot`` must still compare equal to root, and an escaped form would not. Printing is the other
+    job, and :func:`render_text` escapes instead."""
+    return "".join(ch for ch in text if unicodedata.category(ch) not in CONTROL_CATEGORIES)
+
+
+def _quoted(text: str | None) -> str:
+    """``text`` quoted the way ``repr`` would quote it, single quotes unless it holds one and no
+    double quote, with a backslash and the chosen quote escaped, and NO other escape. So a
+    server- or config-chosen value cannot close its quote and append words that read as the
+    check's own. Every other character is left for :func:`render_text`, which escapes each printed
+    line once; ``repr``'s own escapes would be escaped a second time there, and a doubled escape
+    reads, by that rule, as text the value spelled out rather than a control it held."""
+    if text is None:
+        return "None"  # as repr writes it, for an unset setting
+    quote = '"' if "'" in text and '"' not in text else "'"
+    return quote + text.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
 
 
 #: Vault's capability words. Any other string a server returns is shown escaped, so a value that
@@ -346,7 +363,7 @@ _VAULT_CAPABILITIES = frozenset(
 
 
 def _caps(caps: Iterable[str]) -> str:
-    return ", ".join(sorted(c if c in _VAULT_CAPABILITIES else repr(c) for c in caps)) or "none"
+    return ", ".join(sorted(c if c in _VAULT_CAPABILITIES else _quoted(c) for c in caps)) or "none"
 
 
 def vault_hop(
@@ -375,8 +392,8 @@ def vault_hop(
             over.append("the token carries the root policy")
         elif not (p.isascii() and p.isprintable()):
             over.append(
-                f"the policy name {p!r} is not plain printable ASCII, so it cannot be told apart "
-                "from root by reading it; read the policy by hand"
+                f"the policy name {_quoted(p)} is not plain printable ASCII, so it cannot be told "
+                "apart from root by reading it; read the policy by hand"
             )
     for path, needed in reading.required.items():
         if path not in reading.capabilities:
@@ -428,9 +445,10 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    # printable() over the whole text, once, at the output boundary: a policy name reaches it inside
-    # an administrative PATH as well as in the policy list, and a per-field call misses the next one.
-    detail = printable(". ".join(parts))
+    # Kept as the server sent it: render_text escapes every printed line once, which reaches a
+    # policy name inside an administrative PATH as well as in the policy list, and the JSON output
+    # carries the value itself (json.dumps escapes it there).
+    detail = ". ".join(parts)
     return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, detail)
 
 
@@ -531,7 +549,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     if not settings.auth.ad_enabled:
         return _not_configured("ldap", "[auth].ad_enabled is off")
     auth = settings.auth
-    identity = f"bind DN {auth.ad_bind_dn!r} on {auth.ad_server!r}"
+    identity = f"bind DN {_quoted(auth.ad_bind_dn)} on {_quoted(auth.ad_server)}"
     minimal = (
         "read and search on the user and group search bases; no write, no administrative group"
     )
@@ -562,7 +580,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         )
     parts: list[str] = []
     if reading.authzid is not None:
-        parts.append(f"Who am I: bound as {printable(reading.authzid)!r}")
+        parts.append(f"Who am I: bound as {_quoted(reading.authzid)}")
     # Each group is labelled by the read that found it, so a direct-only find is not read as nested.
     found = [f"{g} (transitive, from tokenGroups)" for g in sorted(by_sid)]
     found += [f"{g} (direct memberOf)" for g in sorted(direct - by_sid)]
@@ -577,8 +595,8 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         parts.append("in none of the administrative groups the check knows (transitive read)")
     parts += [f"could not observe: {p}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
-    # As for a Vault hop: one printable() over everything the directory or ldap3 supplied.
-    return HopPrivilege("ldap", state, identity, minimal, printable(". ".join(parts)))
+    # As for a Vault hop: render_text escapes what the directory or ldap3 supplied.
+    return HopPrivilege("ldap", state, identity, minimal, ". ".join(parts))
 
 
 # --- the hops the engine cannot probe ---------------------------------------------------------
@@ -601,12 +619,12 @@ def _smtp_hop(settings: ServiceSettings) -> HopPrivilege:
     alerts = settings.alerts
     if not (alerts.email_smtp_host and alerts.email_from):
         return _not_configured("smtp", "no alert SMTP relay is set")
-    account = repr(alerts.email_username) if alerts.email_username else "no AUTH account"
+    account = _quoted(alerts.email_username) if alerts.email_username else "no AUTH account"
     return HopPrivilege(
         "smtp",
         HopState.NOT_PROBED,
         f"{account} on {alerts.email_smtp_host}:{alerts.email_smtp_port}",
-        f"send as {alerts.email_from!r} only; no mailbox read, no send-as for any other sender",
+        f"send as {_quoted(alerts.email_from)} only; no mailbox read, no send-as for any other sender",
         _NO_SMTP_PROBE,
     )
 
@@ -618,8 +636,9 @@ def _idp_hop(settings: ServiceSettings) -> HopPrivilege:
     return HopPrivilege(
         "idp",
         HopState.NOT_PROBED,
-        f"OIDC client {auth.oidc_client_id!r} at {auth.oidc_issuer!r}",
-        f"a confidential client allowed the scopes {' '.join(auth.oidc_scopes)!r} only; no "
+        f"OIDC client {_quoted(auth.oidc_client_id)} at {_quoted(auth.oidc_issuer)}",
+        f"a confidential client allowed the scopes {_quoted(' '.join(auth.oidc_scopes))} only; "
+        "no "
         "directory or admin API permission",
         _NO_IDP_PROBE,
     )
@@ -702,7 +721,16 @@ def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> s
 
 
 def render_text(hops: Iterable[HopPrivilege]) -> list[str]:
-    """Operator-readable lines, one block per hop."""
+    """Operator-readable lines, one block per hop, each through the shared terminal rule.
+
+    Every hop line is escaped here, by
+    :func:`~messagefoundry.terminal_text.escape_for_terminal` with ``single_line`` and
+    ``keep_printable_unicode`` (BACKLOG #2891): a hop's detail, the store summary's server-supplied
+    role names and the configured identity alike. A character in ``CONTROL_CATEGORIES`` that a
+    server or config chose prints as a visible escape, the line stays one line, and the engine's
+    own em dash prints as one. The command's ``serve:`` line is printed outside this function. The
+    judging functions keep the raw text, so ``--json`` carries the values themselves, as the
+    toolkit's JSON does: a consumer that prints a decoded value owns that escape."""
     lines: list[str] = []
     for h in hops:
         lines.append(f"{h.hop}: {_LOUD_LABEL.get(h.state, h.state.value.replace('_', ' '))}")
@@ -711,4 +739,6 @@ def render_text(hops: Iterable[HopPrivilege]) -> list[str]:
         if h.minimal:
             lines.append(f"  minimal:  {h.minimal}")
         lines.append(f"  {h.detail}")
-    return lines
+    return [
+        escape_for_terminal(line, single_line=True, keep_printable_unicode=True) for line in lines
+    ]

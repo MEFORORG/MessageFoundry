@@ -149,6 +149,42 @@ def _exc_text(exc: BaseException, *, single_line: bool = True) -> str:
 #: (ADR 0172); the monitor tab's default is the same URL.
 _DEFAULT_ENGINE = "https://127.0.0.1:8765"
 
+#: The kill-on-close job a headless run holds, on Windows. Never closed: closing the last handle ends
+#: the job, and the process exit is what should do that.
+_children_job: int | None = None
+
+
+def hold_children_job(argv: list[str] | None) -> None:
+    """On Windows, put this process in a kill-on-close job, so every process a headless run starts
+    dies with it.
+
+    A headless run starts engines, sinks, sender workers and ``connscale-remote`` bands, and stops
+    them in ``finally`` blocks. A coordinator that is killed, or ends by ``os._exit``, runs none of
+    them, so its children were left running. The job covers every start site reached from an entry
+    point that calls this: ``main`` here, and ``python -m harness.acceptance``, which starts pytest.
+    A new headless entry point must call it too. On POSIX it does nothing, so there a killed
+    coordinator's children are still reparented and left running.
+
+    Only for the process entry point (``argv is None``: the console script, ``python -m harness``).
+    A test calling ``main([...])`` in-process is a pytest worker, which ``tests/_process_guard.py``
+    already guards; a second job there would change the innermost job of every test that runs after
+    it in that worker. The GUI starts no process, so it holds no job. The cost is the one that guard
+    names: a child asking for ``CREATE_BREAKAWAY_FROM_JOB`` is refused, and nothing here asks. A job
+    that cannot be set up is reported on stderr and the run goes on unguarded."""
+    global _children_job
+    # The entry point is inferred from argv rather than given its own function because the console
+    # script and the release job's harness smoke both name `harness.__main__:main`.
+    if argv is not None:
+        return
+    from messagefoundry import proctree  # lazy: nothing from messagefoundry at module scope
+
+    _children_job = proctree.adopt_current_process(who="harness")
+    if _children_job is None and sys.platform == "win32":
+        print(
+            "harness: could not set up a Windows job, so a process this run starts can outlive it",
+            file=sys.stderr,
+        )
+
 
 def main(argv: list[str] | None = None) -> int:
     # Scenario text uses arrows (U+2192); a legacy Windows console (cp1252) would otherwise raise
@@ -172,30 +208,24 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower() in ("postgres", "sqlserver"):
         os.environ.setdefault("MEFOR_STORE_SCHEMA_MANAGEMENT", "auto")
     raw = list(sys.argv[1:] if argv is None else argv)
-    if raw and raw[0] == "multishard":
-        return _run_multishard(raw[1:])
-    if raw and raw[0] == "shardcert":
-        return _run_shardcert(raw[1:])
-    if raw and raw[0] == "shardcert-engine":
-        return _run_shardcert_engine(raw[1:])
-    if raw and raw[0] == "shardcert-driver":
-        return _run_shardcert_driver(raw[1:])
-    if raw and raw[0] == "shardcert-sink":
-        return _run_shardcert_sink(raw[1:])
-    if raw and raw[0] == "shardcert-driver-worker":
-        return _run_shardcert_driver_worker(raw[1:])
-    if raw and raw[0] == "shardcert-drive":
-        return _run_shardcert_drive(raw[1:])
-    if raw and raw[0] == "shardcert-engine-ladder":
-        return _run_shardcert_engine_ladder(raw[1:])
-    if raw and raw[0] == "shardcert-drive-ladder":
-        return _run_shardcert_drive_ladder(raw[1:])
-    if raw and raw[0] == "connscale-remote":
-        return _run_connscale_remote(raw[1:])
-    if raw and raw[0] == "batch-engine":
-        return _run_batch_engine(raw[1:])
-    if raw and raw[0] == "batch-driver":
-        return _run_batch_driver(raw[1:])
+    # Built per call, so a test that monkeypatches one of these module functions is still honoured.
+    subcommands = {
+        "multishard": _run_multishard,
+        "shardcert": _run_shardcert,
+        "shardcert-engine": _run_shardcert_engine,
+        "shardcert-driver": _run_shardcert_driver,
+        "shardcert-sink": _run_shardcert_sink,
+        "shardcert-driver-worker": _run_shardcert_driver_worker,
+        "shardcert-drive": _run_shardcert_drive,
+        "shardcert-engine-ladder": _run_shardcert_engine_ladder,
+        "shardcert-drive-ladder": _run_shardcert_drive_ladder,
+        "connscale-remote": _run_connscale_remote,
+        "batch-engine": _run_batch_engine,
+        "batch-driver": _run_batch_driver,
+    }
+    if raw and raw[0] in subcommands:
+        hold_children_job(argv)
+        return subcommands[raw[0]](raw[1:])
 
     from messagefoundry.api_tls_source import GENERATED_CERT_NAME
 
@@ -382,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if any(modes):
+        hold_children_job(argv)
     if fuzz:
         return _run_fuzz(args)
     if args.failover:
@@ -2176,7 +2208,12 @@ def _run_connscale_remote(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="harness connscale-remote",
         description="DRIVER-ONLY connscale (WS-C): drive already-running engines off-box + bind the "
-        "correlation sink locally. Never spawns an engine.",
+        "correlation sink locally. Never spawns an engine. Each process signs in for itself as the "
+        "rig Administrator, so N processes from one address need at least N on the engine's "
+        "session cap (MEFOR_AUTH_MAX_SESSIONS_PER_USER) and on its per-address and all-clients "
+        "sign-in limits per window (MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, "
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL); the batch_ab engine half raises each one its own "
+        "driver fleet would meet, unless the environment already sets it.",
     )
     parser.add_argument(
         "--engine-url",

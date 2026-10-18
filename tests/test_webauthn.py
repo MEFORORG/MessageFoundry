@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
+from tests._fake_directory import DirectoryOf  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -545,6 +546,8 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
             groups=frozenset(),
             directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
+        # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
+        service._ldap = DirectoryOf(principal)  # type: ignore[assignment]
         # mfa_verified is the per-mechanism grant (ASVS 6.3.4). Passing True here stands in for a
         # federated sign-in that DID carry a verified claim; what is under test is the enrollment
         # ceremony, and a satisfied session keeps the fixture free of the MFA gate.
@@ -634,6 +637,60 @@ async def test_an_account_deleted_mid_enrolment_is_not_reported_as_a_label_clash
             )
         # The refusal really was the store's foreign key, not an early check.
         assert "FOREIGN KEY" in str(raised.value.__cause__)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("other_account", [False, True], ids=["same-account", "other-account"])
+async def test_a_shared_authenticator_racing_an_enrolment_is_not_a_label_clash(
+    monkeypatch: pytest.MonkeyPatch, other_account: bool
+) -> None:
+    # BACKLOG #2733: the same authenticator enrolled concurrently passes the service's pre-check
+    # twice, and the credential-id primary key refuses the second insert. That used to be answered
+    # "label already in use" though the two labels differ. The racing enrolment may be this
+    # account's own other tab, or another account presenting the same authenticator.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        racer = identity.user_id
+        if other_account:
+            racer = "racer-account"
+            await store.create_user(
+                user_id=racer,
+                username="racer",
+                auth_provider="local",
+                password_hash="h",
+                now=1.0,
+                password_generated=False,
+            )
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.add_webauthn_credential
+
+        async def raced(cred: WebAuthnCredential) -> None:
+            await original(dataclasses.replace(cred, user_id=racer, label="the other tab"))
+            await original(cred)
+
+        monkeypatch.setattr(store, "add_webauthn_credential", raced)
+        with pytest.raises(ValueError, match="this passkey is already enrolled") as raised:
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="mykey",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        # The refusal really was the store's primary key, not the service's pre-check.
+        assert "UNIQUE constraint failed: webauthn_credentials.credential_id_hash" in str(
+            raised.value.__cause__
+        )
     finally:
         await store.close()
 
@@ -1018,6 +1075,8 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
             groups=frozenset(),
             directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
+        # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
+        service._ldap = DirectoryOf(principal)  # type: ignore[assignment]
         out = await service._complete_ad_login(principal, "10.6.6.6", mfa_verified=False)
         assert out.ok and out.mfa_required
         assert out.identity is not None and out.token is not None

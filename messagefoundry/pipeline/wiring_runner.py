@@ -41,6 +41,7 @@ from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.trust_anchors import (
+    AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
     refused_connection_anchor,
@@ -2396,7 +2397,10 @@ class RegistryRunner:
             raise DbLookupError(f"db_lookup on {connection!r}: the query was cancelled") from exc
 
     def _build_fhir_lookup_executor(
-        self, *, isolated: dict[str, Exception] | None = None
+        self,
+        *,
+        isolated: dict[str, Exception] | None = None,
+        warn_query_credentials: bool = True,
     ) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
         the graph declares none (so ``fhir_lookup`` is unavailable and its runner is not activated). Mirrors
@@ -2409,7 +2413,10 @@ class RegistryRunner:
         exception goes into ``isolated``. The caller logs and alerts each one once the start has
         succeeded, so no alert says the engine went on when a later step unwound the start. Without
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
-        single lookup's build reproduces is graph-wide, and raises either way."""
+        single lookup's build reproduces is graph-wide, and raises either way.
+
+        ``warn_query_credentials`` is passed to :class:`FhirLookupExecutor`; a reload passes False
+        (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -2437,6 +2444,7 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
+                    warn_query_credentials=warn_query_credentials,
                 )
 
         try:
@@ -3721,6 +3729,20 @@ class RegistryRunner:
                 "server log and the auth.trust_anchor audit rows say why"
             )
             raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
+        except AnchorStoreUnavailable as exc:
+            # BACKLOG #3091: the store stopped the check; the file is not known to be bad. A
+            # failing lane still fails with a fixed line, so an operator start reads `failed` and
+            # the control route answers it, but nothing is marked refused, and the next start
+            # checks the file again.
+            if not fails_lane:
+                raise
+            # No WARNING here: the check logged the store's error once, and a scheduled poller
+            # retries at every in-window tick.
+            raise TrustAnchorError(
+                f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
+                "the store refused the trust-anchor audit. Start the connection once the store is "
+                "back; the server log says why"
+            ) from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
@@ -3895,16 +3917,27 @@ class RegistryRunner:
         if self._lane_anchor_check is None:
             return []
         passed: list[tuple[Direction, str]] = []
+        store_fault: AnchorStoreUnavailable | None = None
         for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
+            except AnchorStoreUnavailable as exc:
+                # Not a refused CA. Go on, so a later lane's refused CA refuses as one; the store
+                # fault refuses the reload only if none does (BACKLOG #3091).
+                store_fault = store_fault or exc
+                continue
             except (TrustAnchorError, ValueError) as exc:
                 error = refused_connection_anchor(exc)
                 raise error from error.__cause__
             passed.append((direction, name))
+        if store_fault is not None:
+            error = refused_connection_anchor(store_fault)
+            raise error from error.__cause__
         return passed
 
-    async def _ensure_destination_built(self, name: str) -> None:
+    async def _ensure_destination_built(
+        self, name: str, *, warn_query_credentials: bool = True
+    ) -> None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
         an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
         resume alone could never deliver a single byte: the advertised ``POST /connections/{name}/start``
@@ -3928,7 +3961,8 @@ class RegistryRunner:
         rows are retried via the connector-None path and a later fix + reload/restart self-heals,
         EXCEPT for a lane that has left the DR park unbuilt (vault BACKLOG #3263): that one stays
         parked with its rows held (:meth:`_start_outbound_unsafe`). A reload that builds such a
-        lane leaves it parked the same way (:meth:`_reconcile_outbounds`)."""
+        lane leaves it parked the same way (:meth:`_reconcile_outbounds`), and passes
+        ``warn_query_credentials=False`` because its build check already warned (vault BACKLOG #2910)."""
         if name in self._destinations or ("outbound", name) in self._filtered:
             return
         oc = self.registry.outbound.get(name)
@@ -3944,7 +3978,9 @@ class RegistryRunner:
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture.
             with active_hop_posture(self._hop_posture):
-                connector = build_destination(dest, egress=self._egress)
+                connector = build_destination(
+                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                )
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
             # refusal the engine start path gives it, isolated the same way (this method never raises).
@@ -6708,7 +6744,8 @@ class RegistryRunner:
                     self._filtered.pop(("outbound", name), None)
                     self._failed.pop(("outbound", name), None)
                     self._dr_unbuilt[name] = False
-                await self._ensure_destination_built(name)
+                # build_check already warned for this reload (vault BACKLOG #2910)
+                await self._ensure_destination_built(name, warn_query_credentials=False)
                 if self._dr_passive:
                     # The box went passive while the build awaited: a failed activation hands
                     # the threshold back without the reload lock. The lane stays parked, under
@@ -6793,6 +6830,8 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
                         egress=self._egress,
+                        # build_check already warned for this reload (vault BACKLOG #2910)
+                        warn_query_credentials=False,
                     )
                 self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
@@ -6823,6 +6862,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
                         egress=self._egress,
+                        warn_query_credentials=False,  # as in the branch above
                     )
                 self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
@@ -7071,7 +7111,9 @@ class RegistryRunner:
                 self._lookup_executor = self._build_lookup_executor()
                 # The FHIR-read executor holds no pools (a shared, stateless opener), so no aclose: just
                 # rebuild it from the new graph (None when the new graph declares no FhirLookup).
-                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor(
+                    warn_query_credentials=False  # build_check warned (vault BACKLOG #2910)
+                )
                 # ADR 0057: re-evaluate inline eligibility against the swapped graph + rebuilt executors
                 # (a reload may add/remove a lookup, flip an inbound's inline=, or change ack_after).
                 self._recompute_inline_ok()
