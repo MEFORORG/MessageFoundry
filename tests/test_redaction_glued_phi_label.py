@@ -279,6 +279,19 @@ def test_the_boundary_free_heads_are_what_guard_glued_text(monkeypatch: pytest.M
     assert value in _through_the_chain(safe_exc(ValueError(text)) + after)
 
 
+def test_a_segment_id_head_glued_to_its_quote_is_refused() -> None:
+    """Found by the grammar differential after review round 2: a JSON log escapes the quote, and the
+    plain answer's ``ZqMSH\\"]},\\`` then declares delimiters that a mask would not."""
+    text = '{"name": A^B^C{"identifier":{"value":"Qa1 ZqMSH"]},"family":"Plantsix" Plantsixt'
+
+    def tee() -> str:
+        return _through_the_chain(json.dumps({"detail": safe_text(text)}, ensure_ascii=False))
+
+    with _rule_off():
+        main = tee()
+    assert _is_main_masked(tee(), main)
+
+
 def test_a_run_over_declared_delimiters_masks_a_glued_value() -> None:
     text = 'MSH*^~\\&*A*B\r x*y*z,"name":"Zqxdoe Vandtjane"}'
     assert "Vandtjane" not in redact(text)

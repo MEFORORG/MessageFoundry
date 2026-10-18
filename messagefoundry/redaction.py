@@ -1978,13 +1978,16 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
     if not words or any(word in _ANCHOR_PREFIXES for word in words) or _DATE_RUN.search(rest):
         return None
     last = words[-1]
-    if _TRAILING_SPACE.match(text, stop) and (
-        not last.isalpha() or last.lower().endswith(_UNBOUNDED_HEADS)
-    ):
-        return None  # it ends the answer, and a caller's glued text could read it
-    # A last word glued to a quote or a tag: two letters there can be a string prefix (``b"``,
-    # ``rb"``), and a run through the terminator's token would start inside the mask.
+    ends = _TRAILING_SPACE.match(text, stop) is not None
     glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
+    # Punctuation after the last word, a caller's or the terminator, could complete a word read
+    # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
+    if (ends or glued) and last.endswith(_UNBOUNDED_HEADS):
+        return None
+    if ends and not last.isalpha():
+        return None  # a caller's glued digits would join a date arm
+    # Two letters glued to a quote can be a string prefix (``b"``, ``rb"``), and a run through the
+    # terminator's token would start inside the mask.
     if glued and (len(last) <= 2 or field_run.match(text, stop - len(last)) is not None):
         return None
     return rest
