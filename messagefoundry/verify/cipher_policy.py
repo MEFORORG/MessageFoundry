@@ -58,24 +58,39 @@ _SCHANNEL_AEAD = re.compile("GCM|CCM|CHACHA20_POLY1305")
 #: ``Get-TlsCipherSuite`` cmdlet. Without the guard, PowerShell exits 1 there, which it also does
 #: for a cmdlet that ran and failed.
 _NO_CMDLET_EXIT = 64
+#: Exit status of the Windows probe when the module it imported, or the command it is about to
+#: run, is not the TLS module under ``$PSHOME``. Any non-zero exit but the one above is an ERROR.
+_WRONG_MODULE_EXIT = 65
 #: The warning and verbose streams are silenced first: Windows PowerShell 5.1 writes their lines to
 #: a redirected stdout, where they would fail the suite-name check and make the reading an ERROR.
-#: The cmdlet is then taken from the TLS module under ``$PSHOME``, imported by that path, and run
-#: as that module's exported command object, never looked up by name. So a script on ``PATH`` or
-#: a module in the account's own Documents folder that defines a ``Get-TlsCipherSuite`` cannot
-#: answer instead. ``$PSHOME`` is the folder of the pinned ``powershell.exe``. This does not guard
-#: against a change to that system folder, which takes an administrator. Only a missing module
-#: folder or a module without the cmdlet exits with the "not on this host" status; a module that
-#: is there and fails to import stops the command, which exits 1, an ERROR. Output is UTF-8, so a
-#: localized error line reaches the ERROR detail readable.
+#:
+#: NO COMMAND IN THIS TEXT IS LOOKED UP BY A BARE NAME. The probe's environment carries ``PATH``
+#: and no ``PSModulePath``, so a cmdlet whose module is not yet loaded loses to a ``Join-Path.cmd``
+#: or ``Test-Path.cmd`` on ``PATH``: measured, the Lander's hold on PR 2406, where such files
+#: pointed the import at a planted module and the probe read PASS on a fake suite. So the path is
+#: built and tested with .NET calls, which no command shadows; the one cmdlet left, ``Import-Module``,
+#: is named by its module, ``Microsoft.PowerShell.Core``, which is loaded in every session before
+#: any lookup; and ``Get-TlsCipherSuite`` is run as the imported module's exported command object.
+#: Before it runs, the module and the command must both come from the TLS folder under
+#: ``$PSHOME``, or the probe exits with the wrong-module status, an ERROR. ``$PSHOME`` is the
+#: folder of the pinned ``powershell.exe``; this does not guard against a change to that system
+#: folder, which takes an administrator. Only a missing module folder or a module without the
+#: cmdlet exits with the "not on this host" status; a module that is there and fails to import
+#: stops the command, which exits 1, an ERROR. Output is UTF-8, so a localized error line reaches
+#: the ERROR detail readable. ``tests/test_verify_cipher_policy.py`` parses this text with
+#: PowerShell's own parser and refuses a bare command name.
 _SUITES_COMMAND = (
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
     "$WarningPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; "
-    "$p = Join-Path $PSHOME 'Modules\\TLS'; "
-    f"if (-not (Test-Path -LiteralPath $p)) {{ exit {_NO_CMDLET_EXIT} }}; "
-    "$m = Import-Module -Name $p -PassThru -ErrorAction Stop; "
+    "$p = [IO.Path]::Combine($PSHOME, 'Modules', 'TLS'); "
+    f"if (-not [IO.Directory]::Exists($p)) {{ exit {_NO_CMDLET_EXIT} }}; "
+    "$m = @(Microsoft.PowerShell.Core\\Import-Module -Name $p -PassThru -ErrorAction Stop)[0]; "
     f"if (-not $m.ExportedCommands.ContainsKey('Get-TlsCipherSuite')) {{ exit {_NO_CMDLET_EXIT} }}; "
-    "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name"
+    "$c = $m.ExportedCommands['Get-TlsCipherSuite']; "
+    "if ($m.ModuleBase -ne $p -or $c.Module.ModuleBase -ne $p) { "
+    "[Console]::Error.WriteLine('Get-TlsCipherSuite did not come from the TLS module under "
+    f"$PSHOME'); exit {_WRONG_MODULE_EXIT} }}; "
+    "(& $c).Name"
 )
 #: The shape of an SChannel suite name. ``SSL_`` is there so an older host's SSL 2 suite is
 #: counted, and fails. Any other line is not a reading this check understands, so it is an ERROR
