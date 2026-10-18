@@ -7225,8 +7225,11 @@ def create_app(
             await refuse("undecodable", "attachment content is not decodable")
         # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
         # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
-        # SVG the parser cannot vet is refused and audited as a refusal, since no byte of it leaves.
-        # The pre-check keeps a PDF or an image off the thread pool. The audit row says when the
+        # SVG the parser cannot vet is refused and audited as a refusal, since no byte of it leaves,
+        # and so is a body labelled SVG or HTML that is not markup but holds an svg start tag in its
+        # head (BACKLOG #3257); under any other label a quoted tag is data and is served. The
+        # pre-check reads only a bounded head, so a body with no tag there (most PDFs, images and
+        # DICOM files) stays off the thread pool and the semaphore. The audit row says when the
         # served bytes are a sanitized copy, so they are never mistaken for the stored document's.
         served_as: dict[str, str] = {}
         if may_be_svg(body):
@@ -7237,7 +7240,7 @@ def create_app(
             except SvgRejected:
                 served = None
             if served is None:
-                await refuse("svg_unsanitizable", "attachment is SVG that cannot be sanitized")
+                await refuse("svg_unsanitizable", "attachment carries SVG that cannot be sanitized")
             if served is not body:
                 body = served
                 served_as["served"] = "sanitized-svg"
