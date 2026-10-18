@@ -273,7 +273,9 @@ jobs:
   # supply-chain" section).
   #
   # One step per command, and each after the first runs even when an earlier one failed
-  # (`!cancelled()`), so a failed install or one audit's finding never hides the other audit's result.
+  # (`!cancelled()`), so a failed install or one audit's finding never hides the requirements.txt
+  # audit's result, and a requirements.txt finding never hides the lock audit's. The lock audit
+  # needs the auditor the install brings, so a failed install skips it.
   # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
   audit-pin:
     runs-on: windows-latest
@@ -293,6 +295,7 @@ jobs:
       # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
       # dependencies win any version they share.
       - name: Install the locked engine for its auditor
+        id: engine
         if: ${{ hashFiles('requirements.lock') != '' }}
         run: python -m pip install --no-deps --require-hashes -r requirements.lock
       - name: Warn when the transitive resolve is not hash-pinned
@@ -306,8 +309,10 @@ jobs:
       - name: Audit requirements.txt as Windows resolves it
         if: ${{ !cancelled() }}
         run: pip-audit -r requirements.txt --desc
+      # Needs the auditor the install step brings, so it waits on that step alone: after a failed
+      # install it would only fail again, for a reason that is not an advisory.
       - name: Audit every pin of requirements.lock, whatever its marker
-        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
         run: python -P -m messagefoundry.security.audit_all_platforms requirements.lock
 """
 

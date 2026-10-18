@@ -345,15 +345,20 @@ urllib3==1.26.0 ; sys_platform == 'linux' \\
 
 _LOCK_PRESENT = "hashFiles('requirements.lock') != ''"
 
-#: GitHub's rule for each step condition the job uses, as ``(an earlier step failed, lock present)
-#: -> runs``. A condition with no status function means ``success() && ...``. A condition not listed
-#: fails the run, so the job cannot grow a condition this table does not model.
-_STEP_RUNS: dict[str | None, Callable[[bool, bool], bool]] = {
-    None: lambda failed, lock: not failed,
-    f"${{{{ {_LOCK_PRESENT} }}}}": lambda failed, lock: not failed and lock,
-    "${{ hashFiles('requirements.lock') == '' }}": lambda failed, lock: not failed and not lock,
-    "${{ !cancelled() }}": lambda failed, lock: True,
-    f"${{{{ !cancelled() && {_LOCK_PRESENT} }}}}": lambda failed, lock: lock,
+#: GitHub's rule for each step condition the job uses, as ``(an earlier step failed, lock present,
+#: outcome of each step with an id so far) -> runs``. A condition with no status function means
+#: ``success() && ...``. A condition not listed fails the run, so the job cannot grow a condition
+#: this table does not model.
+_STEP_RUNS: dict[str | None, Callable[[bool, bool, dict[str, str]], bool]] = {
+    None: lambda failed, lock, outcome: not failed,
+    f"${{{{ {_LOCK_PRESENT} }}}}": lambda failed, lock, outcome: not failed and lock,
+    "${{ hashFiles('requirements.lock') == '' }}": lambda failed, lock, outcome: (
+        not failed and not lock
+    ),
+    "${{ !cancelled() }}": lambda failed, lock, outcome: True,
+    "${{ !cancelled() && steps.engine.outcome == 'success' }}": lambda failed, lock, outcome: (
+        outcome.get("engine") == "success"
+    ),
 }
 
 
@@ -388,14 +393,17 @@ def _run_audit_job(
     stubs = {"python": _PYTHON_STUB, "pip-audit": _PIP_AUDIT_STUB}
     output = ""
     failed: list[str] = []
+    outcome: dict[str, str] = {}
     for i, step in enumerate(jobs["audit-pin"]["steps"]):
         if "run" not in step:
             continue
-        if not _STEP_RUNS[step.get("if")](bool(failed), lock is not None):
+        if not _STEP_RUNS[step.get("if")](bool(failed), lock is not None, outcome):
+            outcome[step.get("id", "")] = "skipped"
             continue
         script = _write_script(tmp_path / f"step{i}.sh", str(step["run"]))
         proc = _run_step(bash, script, work, stubs, env)
         output += proc.stdout + proc.stderr
+        outcome[step.get("id", "")] = "failure" if proc.returncode else "success"
         if proc.returncode:
             failed.append(step["name"])
     calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
@@ -423,6 +431,11 @@ def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
     assert audit["defaults"] == {"run": {"shell": "bash"}}
     assert "needs" not in audit and "if" not in audit
     assert 0 < audit["timeout-minutes"] < 360
+    # Static, so these hold where no bash can run the steps below.
+    runs = {s["name"]: s["run"] for s in audit["steps"] if "run" in s}
+    assert runs["Install the locked engine for its auditor"] == _LOCK_CALLS[0]
+    assert runs["Audit requirements.txt as Windows resolves it"] == _LOCK_CALLS[2]
+    assert runs["Audit every pin of requirements.lock, whatever its marker"] == _LOCK_CALLS[3]
     for job in ("audit-pin", "check"):
         assert scaffolded_jobs[1][job]["permissions"] == {"contents": "read"}, job
         [checkout] = [
@@ -445,10 +458,11 @@ def test_the_scaffolded_audit_job_audits_every_pin_of_a_lock(
 
 
 @pytest.mark.parametrize(
-    ("fail_env", "fails"),
+    ("fail_env", "fails", "runs"),
     [
-        ({"FAIL_ON": _LOCK_CALLS[0].removeprefix("python ")}, "Install the locked engine"),
-        ({"PIP_AUDIT_FINDS": "1"}, "Audit requirements.txt"),
+        # The lock audit needs the auditor the install brings, so only it is skipped.
+        ({"FAIL_ON": _LOCK_CALLS[0].removeprefix("python ")}, "Install the locked engine", 3),
+        ({"PIP_AUDIT_FINDS": "1"}, "Audit requirements.txt", 4),
     ],
 )
 def test_a_failed_step_does_not_hide_the_later_audits(
@@ -456,10 +470,12 @@ def test_a_failed_step_does_not_hide_the_later_audits(
     tmp_path: Path,
     fail_env: dict[str, str],
     fails: str,
+    runs: int,
 ) -> None:
-    """A failed lock install, or a finding on requirements.txt, still lets every later command run."""
+    """A failed lock install still lets the requirements.txt audit run, and a finding there still
+    lets the lock audit run."""
     calls, _, _, failed = _run_audit_job(scaffolded_ci, tmp_path, _ADOPTER_LOCK, fail_env)
-    assert calls == _LOCK_CALLS
+    assert calls == _LOCK_CALLS[:runs]
     assert [name.startswith(fails) for name in failed] == [True], failed
 
 
