@@ -507,6 +507,11 @@ def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
         if seen:
             found.add(rel)
         failures.extend(f"{rel}:{line} (docstring)" for line in unposted)
+    # Measured 2026-10-17 (vault BACKLOG #3753): the walk reads 20 package files, and 14 of them
+    # hold a docstring that names the escape, all 14 pinned. A floor of 10 leaves room to move a
+    # mention, and still fails a walk or a pinned list that went blind and judges nothing.
+    assert len(found) >= 10, f"the docstring walk found only {sorted(found)}"
+    assert len(_DOCSTRING_FILES) >= 10, sorted(_DOCSTRING_FILES)
     silent = [f"{rel} (docstrings)" for rel in sorted(_DOCSTRING_FILES - found)]
     for rel in _COMMENT_FILES:
         unposted, seen = comments_without_posture(_text(rel))
