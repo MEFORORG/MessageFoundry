@@ -148,6 +148,16 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         password_generated=False,
     )
     await store.set_user_roles("dir", [ADMIN], assigned_by="test")
+    # A directory account holding a hash still needs the directory: the provider is what decides.
+    await store.create_user(
+        user_id="dir-hashed",
+        username="name-dir-hashed",
+        auth_provider="ad",
+        now=1.0,
+        password_hash="synthetic-hash-dir-hashed",
+        password_generated=False,
+    )
+    await store.set_user_roles("dir-hashed", [ADMIN], assigned_by="test")
     await store.create_user(
         user_id="hashless",
         username="name-hashless",
@@ -161,7 +171,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
     await provisioned_row(store, "b", totp=False)
 
     assert await grant(store, "a", None) is AdminGrant.GRANTED
-    assert await enabled_admins(store) == {"dir", "hashless", "a"}
+    assert await enabled_admins(store) == {"dir", "dir-hashed", "hashless", "a"}
     # Paired control: a local Administrator with a usable password now exists, so it refuses.
     assert await grant(store, "b", None) is AdminGrant.ADMIN_EXISTS
     assert await store.get_user_role_ids("b") == []

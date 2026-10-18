@@ -2572,8 +2572,9 @@ class AuthStore(Protocol):
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
-        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator exists
-        (BACKLOG #3078). ``provision_first_administrator``'s grant.
+        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator that
+        ``counts_as_admin`` passes exists (BACKLOG #3078). ``provision_first_administrator``'s
+        grant.
 
         One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
         than ``user_id`` only when its record passes its integrity seal, as

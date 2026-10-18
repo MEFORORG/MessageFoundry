@@ -3291,10 +3291,9 @@ class AuthService:
         :meth:`has_self_sufficient_administrator`, the same computation the start notice reads. A
         directory or federated Administrator no longer blocks it, so a site whose every
         Administrator needs an outside service can make a local one at the host while that service
-        is down. The check is still a separate read before the writes, so two runs with different
-        usernames can both pass it (vault BACKLOG #3078, not fixed here). The widening adds no step
-        to that window; it only lets the check pass on more stores, those with directory
-        Administrators.
+        is down. The check is a read before the writes, so two runs with different usernames can
+        both pass it; the guarded grant below closes that race (vault BACKLOG #3078), and it counts
+        what this check counts, so it does not refuse where this check passed.
 
         **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
         The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
@@ -3668,7 +3667,9 @@ class AuthService:
                 "admin-reset-totp`, naming that account and giving the same --db and "
                 "--service-config as this run"
             )
-        if await self.has_enabled_administrator():
+        # The refusal's own test (vault BACKLOG #2711 step 1): a directory Administrator is not
+        # one this command would have been refused for, so it is not named as the cause here.
+        if await self.has_self_sufficient_administrator():
             return (
                 f"{prefix}. That account holds no Administrator role, and another enabled "
                 "Administrator now exists; remove any authenticator entry this run showed. If "

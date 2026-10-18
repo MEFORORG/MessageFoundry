@@ -163,15 +163,21 @@ def _unguarded_grant(store: MessageStore) -> Callable[..., Awaitable[AdminGrant]
     return unguarded
 
 
-def _hold_both_after_the_read(services: list[AuthService], monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hold each run after ``has_enabled_administrator`` until both have read it, so each has seen
-    no administrator before either writes. That is the race itself."""
+def _hold_both_after_the_read(
+    services: list[AuthService], monkeypatch: pytest.MonkeyPatch
+) -> asyncio.Event:
+    """Hold each run after the refusal's read, ``_administrator_standing`` (vault BACKLOG #2711
+    step 1), until both have read it, so each has seen no administrator before either writes. That
+    is the race itself. Returns the event both reads set: a caller asserts it, so a refusal that
+    stops reading this method fails the test instead of leaving the race to scheduling."""
     arrived = 0
     both_read = asyncio.Event()
     for service in services:
-        original = service.has_enabled_administrator
+        original = service._administrator_standing
 
-        async def held(original: Callable[[], Awaitable[bool]] = original) -> bool:
+        async def held(
+            original: Callable[[], Awaitable[tuple[bool, tuple[str, ...]]]] = original,
+        ) -> tuple[bool, tuple[str, ...]]:
             nonlocal arrived
             found = await original()
             arrived += 1
@@ -180,7 +186,8 @@ def _hold_both_after_the_read(services: list[AuthService], monkeypatch: pytest.M
             await asyncio.wait_for(both_read.wait(), timeout=10)
             return found
 
-        monkeypatch.setattr(service, "has_enabled_administrator", held)
+        monkeypatch.setattr(service, "_administrator_standing", held)
+    return both_read
 
 
 async def _provision(service: AuthService, username: str) -> Any:
@@ -218,12 +225,13 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
         services = [AuthService(s, AuthSettings()) for s in stores]
         for service in services:
             await service.initialize()
-        _hold_both_after_the_read(services, monkeypatch)
+        both_read = _hold_both_after_the_read(services, monkeypatch)
         outcomes = await asyncio.gather(
             _provision(services[0], "site-admin-one"),
             _provision(services[1], "site-admin-two"),
             return_exceptions=True,
         )
+        assert both_read.is_set(), "both runs must have read before either granted"
         refused = [o for o in outcomes if isinstance(o, FirstAdministratorRefused)]
         won = [o for o in outcomes if not isinstance(o, BaseException)]
         assert len(refused) == 1 and len(won) == 1, outcomes
@@ -255,7 +263,7 @@ async def test_a_grant_that_loses_to_another_process_is_refused_through_sqlite_b
         services = [AuthService(s, AuthSettings()) for s in stores]
         for service in services:
             await service.initialize()
-        _hold_both_after_the_read(services, monkeypatch)
+        both_read = _hold_both_after_the_read(services, monkeypatch)
         b_read = asyncio.Event()
         a_granted = asyncio.Event()
         in_grant = False
@@ -297,6 +305,7 @@ async def test_a_grant_that_loses_to_another_process_is_refused_through_sqlite_b
             _provision(services[1], "site-admin-two"),
             return_exceptions=True,
         )
+        assert both_read.is_set(), "both runs must have read before either granted"
         first, second = outcomes
         assert not isinstance(first, BaseException), first
         assert isinstance(second, FirstAdministratorRefused), second
@@ -318,12 +327,13 @@ async def test_mutation_control_an_unguarded_grant_lets_both_runs_through(
         for service in services:
             await service.initialize()
         monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", _unguarded_grant(store))
-        _hold_both_after_the_read(services, monkeypatch)
+        both_read = _hold_both_after_the_read(services, monkeypatch)
         outcomes = await asyncio.gather(
             _provision(services[0], "site-admin-one"),
             _provision(services[1], "site-admin-two"),
             return_exceptions=True,
         )
+        assert both_read.is_set(), "both runs must have read before either granted"
         assert not any(isinstance(o, BaseException) for o in outcomes), outcomes
         assert len(await enabled_admins(store)) == 2
         assert len(await _provisioned_rows(store)) == 2
