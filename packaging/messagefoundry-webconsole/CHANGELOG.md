@@ -86,15 +86,20 @@ this line.**
 - **A directory refusal at the second factor or a step-up names the fix for its cause.** When a
   directory refuses the account, the MFA gate (`/ui/mfa`) and the re-auth page (`/ui/reauth`, its
   passkey leg included) now show one text per fix. A role lost in the directory since sign-in is
-  told to sign out, then sign in again. Every other cause, an outage included, is told to try again
-  later and, if it is still refused, to ask an administrator. Each names the same fix as the
-  engine's 403 for that cause. Seam change: the console imports `DirectoryRefusal` and reads
-  `Elevation.directory_refusal`, so the supported digest moved. (`BACKLOG #3082`)
+  told to sign out, then sign in again. Every other cause, an outage and a role map that fails its
+  seal included, is told to try again later and, if it is still refused, to ask an administrator.
+  Each names the same fix as the engine's 403 for that cause. Seam change: the console imports
+  `DirectoryRefusal` and reads `Elevation.directory_refusal`, so the supported digest moved.
+  (`BACKLOG #3082`)
 - **The "Flag not changed" page has a hint for a cluster node.** A cluster node refuses the
   connection flag toggle with a 409. The page now carries a second hint, shown beside the
-  code-first one on every refusal: each node loads its own config directory, so set `flagged` on the
+  code-first one on every 409: each node loads its own config directory, so set `flagged` on the
   connection's entry in `connections.toml` on every node, then apply it with a coordinated restart.
   The code-first hint is reworded, with the same meaning. No seam change. (`BACKLOG #2933`)
+- **A flag toggle the audit log did not record gets its own page.** When the engine refuses the
+  toggle with a 503 because its audit row failed or timed out, the console shows a "Flag not
+  changed" page that says the engine undid the change, unless the message on the page says it
+  could not, and to try again. The 409 page's hints are not shown for it. (`BACKLOG #2945`)
 
 ### Fixed
 
