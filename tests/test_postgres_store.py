@@ -1025,6 +1025,32 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_first_admin_grant_contract(store) -> None:
+    """BACKLOG #3078 on Postgres: the first-administrator grant refuses while another enabled
+    administrator exists, and over credentials the caller did not write."""
+    from tests._first_admin_grant_store_contract import assert_first_admin_grant_contract
+
+    await assert_first_admin_grant_contract(store)
+
+
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on Postgres: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_concurrent_first_admin_grants_leave_one(store) -> None:
+    """BACKLOG #3078 on Postgres: two grants to two accounts on two pooled connections, at once.
+    The last-administrator guard's advisory lock serializes them; one is refused."""
+    from tests._first_admin_grant_store_contract import assert_concurrent_grants_leave_one
+
+    await assert_concurrent_grants_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real Postgres backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
@@ -5533,7 +5559,8 @@ _AUDIT_ROWS_PER_PROCESS = 25
 
 #: Bound on ONE appender's wait, sized to stay under the suite's own ``--timeout=60`` watchdog (the
 #: gated ``postgres-store`` job adds no ``--timeout=`` of its own, so the pyproject value is what
-#: binds). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
+#: binds; the advisory ``postgres-store-windows`` twin passes 120, so 60 is the tighter of the
+#: two and the one to size against). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
 #: hard-exits the interpreter, which orphans both children AND takes the rest of this file's tests
 #: down with it. A bound above the watchdog would be dead code.
 _APPENDER_TIMEOUT_SECONDS = 30.0
@@ -5764,9 +5791,21 @@ async def test_audit_events_and_security_events_page_by_offset_pg(store) -> None
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "pg")
+    await check_keyed_audit_evidence(store, "pg")
     await check_security_events_paging(store, "pg")
     await check_connection_event_paging(store, "pg")
+
+
+async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)

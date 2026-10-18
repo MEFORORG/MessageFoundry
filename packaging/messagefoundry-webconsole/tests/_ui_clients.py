@@ -28,6 +28,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -68,6 +69,18 @@ def ui_client(engine: Engine, service: AuthService, **app_kwargs: Any) -> httpx.
         app=create_app(engine, auth=service, serve_ui=True, **app_kwargs)
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+class PresentDirectory:
+    """A directory that confirms ``principal`` as present and enabled, whatever name is asked.
+    Since BACKLOG #3061 the two enrolment legs ask the directory about a directory account first,
+    and with none wired they refuse, so a test that enrols one wires this. Synthetic data only."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        self.principal = principal
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
 
 
 async def provision(service: AuthService, username: str, roles: list[str]) -> str:
@@ -164,7 +177,7 @@ def issue_continuation(client: httpx.AsyncClient, next_path: str) -> None:
 
     Stands in for the step-up gate's 303, which records it (vault BACKLOG #2764): ``/ui/reauth``
     auto-submits only an issued continuation. For a test whose subject is what the continuation
-    DOES, not how it was issued; the issuing itself is driven end to end in ``test_webui.py``."""
+    DOES, not how it was issued; the issuing itself is driven end to end in the ``test_webui_*.py`` files."""
     from messagefoundry_webconsole._auth import _ISSUED_CONTINUATIONS
 
     token = client.cookies.get("mf_session")

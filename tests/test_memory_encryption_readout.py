@@ -12,9 +12,11 @@ refuses.
 **The scoping.** An exposed PHI instance without the declaration WARNS — on every built-in
 environment, at both ``[security].enforcement`` settings. It refuses only behind the opt-in
 ``[security].require_memory_encryption_declaration``. That is not a softening: this is a HOST property
-that no operator can satisfy on Windows, ADR 0148 makes even ``dev`` derive PHI, and "exposed" includes
-the loopback-behind-proxy topology the runbook recommends — so a default refusal would stop a service
-that boots today from booting at all. The parametrized test below is the pin for that rule.
+the engine cannot observe on Windows and many Windows hosts cannot provide (ADR 0152, Amendment
+2026-10-17), ADR 0148 makes even ``dev`` derive PHI, and "exposed" includes the loopback-behind-proxy
+topology the runbook recommends — so a default refusal would leave an operator on such a host two
+choices: do not start, or declare a property the host does not have. The parametrized test below is
+the pin for that rule.
 
 **The naming.** ASVS 11.7.1 asks for full memory encryption protecting data in use, and NOTHING in
 this feature satisfies it — a local flag is emitted by the OS whose integrity the control exists to
@@ -189,8 +191,8 @@ def test_readout_never_raises_and_names_its_source() -> None:
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows arm")
 def test_windows_reports_unknown_not_false() -> None:
-    """ADR 0152 makes the Windows in-guest attestation path a spike that has NOT landed. Reporting
-    ``False`` there would be a measurement we never made; ``None`` is the honest answer."""
+    """ADR 0152's Windows spike (2026-07-22) decided that no Windows read-out is built.
+    Reporting ``False`` there would be a measurement we never made; ``None`` is the honest answer."""
     report = platform_memory_encryption_readout()
     assert report.capability is None
     assert report.active is None
@@ -444,9 +446,9 @@ def test_no_existing_deployment_newly_refuses_it_only_warns(
 
     Nothing here may return 2. ADR 0148 makes dev/staging/prod all derive ``DataClass.PHI``, so a
     default refusal would stop an exposed dev or test instance that declared nothing at all — over a
-    HOST property that is unsatisfiable on Windows, where the read-out is always null. That is a
-    hard-stop of a deployment which boots today, which the ADR 0151 precedent forbids ("only fire on
-    the opt-in, so it cannot break an existing deployment"). So: warn, always, and refuse only behind
+    HOST property the engine cannot observe on Windows, where the read-out reports nothing, and that
+    many Windows hosts cannot provide. The ADR 0151 precedent scopes such a refusal to its own opt-in
+    ("only fire on the opt-in, so it cannot break an existing deployment"). So: warn, always, and refuse only behind
     ``require_memory_encryption_declaration``."""
     _readout(monkeypatch, capability=False, active=False, source="test:negative")
     rc = _serve(tmp_path, monkeypatch, exposed_prod_phi(), env=env)

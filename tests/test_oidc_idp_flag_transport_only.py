@@ -22,6 +22,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
+from messagefoundry.auth.oidc_http import IdpReplyCutShortError, IdpReplyUnusableError
 from messagefoundry.auth.service import IDP_ANSWER_UNUSABLE
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.bounded_read import MalformedReplyHeadError
@@ -95,6 +96,32 @@ _CASES = [
     pytest.param(urllib.error.URLError("refused"), True, "idp_unavailable", id="raw-urlerror"),
     pytest.param(TimeoutError("timed out"), True, "idp_unavailable", id="timeout"),
     pytest.param(http.client.BadStatusLine("garbage"), True, "idp_unavailable", id="bad-status"),
+    # BACKLOG #3221 (ADR 0142 Amendment G): the JWKS leg's own refusals say whether an answer
+    # arrived, and only the named http.client faults read as transport.
+    pytest.param(
+        IdpReplyUnusableError("JWKS response framed its body length ambiguously"),
+        False,
+        IDP_ANSWER_UNUSABLE,
+        id="jwks-misframed-body",
+    ),
+    pytest.param(
+        IdpReplyCutShortError("JWKS response ended before its declared length"),
+        True,
+        "idp_unavailable",
+        id="jwks-cut-short",
+    ),
+    pytest.param(
+        http.client.LineTooLong("header line"), False, IDP_ANSWER_UNUSABLE, id="line-too-long"
+    ),
+    pytest.param(
+        http.client.UnknownProtocol("HTTP/9"), False, IDP_ANSWER_UNUSABLE, id="unknown-protocol"
+    ),
+    pytest.param(
+        http.client.IncompleteRead(b"x", 10), True, "idp_unavailable", id="incomplete-read"
+    ),
+    pytest.param(
+        http.client.RemoteDisconnected("closed"), True, "idp_unavailable", id="remote-disconnected"
+    ),
 ]
 
 
@@ -179,6 +206,46 @@ async def test_only_a_transport_failure_marks_the_idp_on_step_up(
         status = getattr(exc, "status", getattr(exc, "code", None))
         if isinstance(status, int):
             assert row["status"] == status
+        if reason == "token_refused":
+            # BACKLOG #3221: the generic line, as `too_early` reads, so the text cannot show
+            # whether the callback floor fired.
+            assert out.error == "The identity provider could not confirm it's you."
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        oidc.TokenRefusedError("token endpoint returned HTTP 400", status=400),
+        IdpReplyUnusableError("JWKS response framed its body length ambiguously"),
+    ],
+    ids=["token-refused", "jwks-misframed"],
+)
+async def test_a_step_up_answer_with_no_verified_token_leaves_an_outage_flag_set(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    """BACKLOG #3221: only a verified token clears the flag, so an answer without one, on the
+    step-up leg, leaves a flag a transport failure set. The sign-in leg's twin is in
+    tests/test_auth_oidc_service.py."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        signed_in = await _oidc_login(service, monkeypatch, rsa_key)
+        assert signed_in.ok and signed_in.token is not None
+        flow_id, _url = await _begin(service, signed_in.token)
+        flow = _staged(service, flow_id)
+        service.mark_oidc_unavailable("TimeoutError")
+        _exchange_raises(monkeypatch, exc)
+        out = await service.complete_oidc_step_up(
+            flow_id=flow_id,
+            state=flow.state,
+            code=AUTH_CODE,
+            client="10.0.0.9",
+            public_origin=ORIGIN,
+        )
+        assert not out.elevation.ok
+        assert service.oidc_available is False
     finally:
         await store.close()
 

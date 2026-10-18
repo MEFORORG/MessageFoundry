@@ -54,14 +54,15 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   **requires authentication**, so the IDE signs you in on first use (credentials → a token cached in
   VS Code SecretStorage; an expired token re-prompts); a plain-`http` off-box target is refused, and an
   `https` off-box target must be confirmed **by host name** before any credential is sent. Start the
-  engine from the status pill (local only), `messagefoundry serve`, or its Windows service
-  ([`docs/SERVICE.md`](../docs/SERVICE.md)).
+  engine from the status pill (local only),
+  `python -P -X disable-remote-debug -m messagefoundry serve --config <configDir>`, or its Windows
+  service ([`docs/SERVICE.md`](../docs/SERVICE.md)).
 - **Engine status pill + local engine lifecycle** — a status-bar item showing the current target and
   whether it is reachable; clicking it opens a menu of *Sign In* / *Sign Out*, *Re-check*, *Show the
   Engine Log*, **Open the Web Console** (`/ui`), *Copy the Engine Start Command*, and *Configure Engine
   Target*. For a **local, loopback** target in a trusted workspace it also offers **Start / Stop /
   Restart the Engine** and *Set Up Python Environment* (ADR 0112) — Start runs exactly
-  `python -m messagefoundry serve --config <configDir>`, with no `--db`/`--env` overrides, so the
+  `python -P -X disable-remote-debug -m messagefoundry serve --config <configDir>`, with no `--db`/`--env` overrides, so the
   service TOML stays the authority on store and environment. A workspace with no store yet gets the
   guided **Set Up an Engine** page instead.
 - **Live HL7-aware autocomplete** (no language server): field paths inside `msg["…"]` /

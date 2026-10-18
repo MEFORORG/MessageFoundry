@@ -15,6 +15,7 @@ Synthetic accounts and RFC 5737 / RFC 1918 addresses only.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.parse
 from typing import Any
@@ -64,7 +65,7 @@ class _RaisingNotifier:
 async def _service(
     store: MessageStore, notifier: object | None = None, **over: object
 ) -> AuthService:
-    settings = AuthSettings(require_mfa=False, **over)  # type: ignore[arg-type]
+    settings = AuthSettings(**{"require_mfa": False, **over})  # type: ignore[arg-type]
     service = AuthService(store, settings, security_notifier=notifier)  # type: ignore[arg-type]
     await service.initialize()
     return service
@@ -1024,5 +1025,330 @@ async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor()
         # KNOWN, not failed open: only the first sign-in ever wrote an unevaluated row.
         unevaluated = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
         assert len(unevaluated) == 1
+    finally:
+        await store.close()
+
+
+# --- follow-ups from the review of engine PR 1999 (vault BACKLOG #2964) ---
+
+
+async def _owing_service(store: MessageStore) -> AuthService:
+    """An account under ``require_mfa`` owes a factor. The floor is off so a test can enrol on the
+    session it just signed in (BACKLOG #2389)."""
+    return await _service(
+        store,
+        _FakeNotifier(),
+        require_mfa=True,
+        mfa_verify_min_elapsed_seconds=0,
+        mfa_recovery_code_count=1,
+    )
+
+
+async def test_a_first_local_sign_in_that_owes_a_factor_records_no_baseline() -> None:
+    """The local leg's ``not mfa_required`` gate, for an account with no baseline yet. That verdict
+    is one that seeds the record, so only the gate keeps a holder of the password alone from
+    writing the account's first known address before the factor."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = await _owing_service(store)
+        uid = await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.mfa_required
+        rows = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
+        assert len(rows) == 1 and '"reason": "no_baseline"' in str(rows[0]["detail"])
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+    finally:
+        await store.close()
+
+
+async def test_an_enrolment_records_its_address_after_its_audit_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enrolment's write runs after ``auth.mfa_enrolled`` is appended, so no address is ever
+    known for an enrolment that has no audit row. A store fault in that append raises out of the
+    confirm before the write, so the account's next proved factor writes the address instead."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = await _owing_service(store)
+        uid = await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        seen_at_write: list[list[str]] = []
+        real = store.remember_login_address
+
+        async def _spy(user_id: str, address: str, *, now: float) -> None:
+            seen_at_write.append(await _actions(store, "oper"))
+            await real(user_id, address, now=now)
+
+        monkeypatch.setattr(store, "remember_login_address", _spy)
+        await _enrol_totp(owed, out.identity, out.token, client="10.1.1.1")
+        assert len(seen_at_write) == 1
+        assert "auth.mfa_enrolled" in seen_at_write[0]
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+async def test_verify_mfa_records_its_address_inside_the_account_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``verify_mfa`` writes while it still holds the account's sign-in queue, so a local sign-in
+    queued behind it classifies against the written address rather than reading NEW."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = await _owing_service(store)
+        await _operator(owed)
+        queue_held: list[bool] = []
+        real = store.remember_login_address
+        key = service_module._credential_lock_key("oper")
+
+        async def _spy(user_id: str, address: str, *, now: float) -> None:
+            entry = owed._credential_locks.get(key)
+            queue_held.append(entry is not None and entry.lock.locked())
+            await real(user_id, address, now=now)
+
+        monkeypatch.setattr(store, "remember_login_address", _spy)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        secret = await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1", now=t0)
+        new = await owed.login("oper", PW, client="203.0.113.8")
+        assert new.ok and new.mfa_required and new.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert (
+            await owed.verify_mfa(new.token, totp.totp(secret, now=t1), client="203.0.113.8")
+        ).ok
+        # The enrolment takes no queue, so its write is the control that the spy can read False.
+        assert queue_held == [False, True]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "fault"),
+    [("remember_login_address", TypeError), ("forget_login_addresses", AttributeError)],
+)
+async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    fault: type[Exception],
+) -> None:
+    """The record's helper logs and never raises, even a ``TypeError`` or an ``AttributeError``.
+    It runs after the enrolment has committed, so a raise there would lose the reply that carries
+    the rotated token and the recovery codes, with TOTP already on."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = await _owing_service(store)
+        await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.identity is not None and out.token is not None
+
+        calls: list[str] = []
+
+        async def _broken(*_a: object, **_kw: object) -> None:
+            calls.append(method)
+            raise fault("synthetic programming error")
+
+        monkeypatch.setattr(store, method, _broken)
+        enroll = await owed.begin_mfa_enrollment(out.identity)
+        with caplog.at_level(logging.ERROR, logger=service_module._log.name):
+            elevation = await owed.confirm_mfa_enrollment(
+                out.identity, fresh_totp(enroll.secret), token=out.token, client="10.1.1.1"
+            )
+        assert elevation.ok and elevation.token is not None
+        assert elevation.recovery_codes
+        # The fault was reached, and its traceback logged: the only way it surfaces now.
+        assert calls == [method]
+        assert any(r.exc_info and r.exc_info[0] is fault for r in caplog.records)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("client", ["10.1.1.1", service_module._LOGIN_ADDRESS_RESET_MARKER])
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_an_admin_reset_clears_the_known_address_record(reset: str, client: str) -> None:
+    """vault BACKLOG #2946, owner ruling 2026-10-16: a password or MFA reset empties the record, so
+    the next sign-in from an address seen before the reset is challenged as NEW. The reset leaves
+    only its marker row, and a client whose text names the marker is not known either."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        assert "10.1.1.1" in await store.list_known_login_addresses(uid, since=0.0)
+        issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None
+        assert await store.list_known_login_addresses(uid, since=0.0) == [
+            service_module._LOGIN_ADDRESS_RESET_MARKER
+        ]
+        out = await service.login("oper", issued.password, client=client)
+        assert out.ok and not await _seeded(store, out.token)
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -> None:
+    """vault BACKLOG #2946 on the directory branch of ``admin_reset_mfa``, which issues no
+    credential: the record is still emptied down to the reset's marker row.
+
+    RED when: the clear runs only on the local branch, where a credential is issued."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        await store.create_user(
+            user_id="id-dir",
+            username="dir-user",
+            auth_provider="ad",
+            password_hash=None,
+            password_generated=False,
+        )
+        await store.remember_login_address("id-dir", "10.1.1.1", now=time.time())
+        assert await store.list_known_login_addresses("id-dir", since=0.0) == ["10.1.1.1"]
+        assert await service.admin_reset_mfa("id-dir", actor="boss") is None
+        assert await store.list_known_login_addresses("id-dir", since=0.0) == [
+            service_module._LOGIN_ADDRESS_RESET_MARKER
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_a_reset_drops_the_accounts_notice_debounce(reset: str) -> None:
+    """vault BACKLOG #2946: the first NEW sign-in after a reset is mailed, even from an address
+    noticed just before it. Another account's debounce entry stays.
+
+    RED when: the reset leaves the account's ``_login_new_ip_noticed`` entries in place."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        service._login_new_ip_noticed[(uid, "10.1.1.1")] = time.time()
+        service._login_new_ip_noticed[("someone-else", "10.1.1.1")] = time.time()
+        await getattr(service, reset)(uid, actor="boss")
+        assert list(service._login_new_ip_noticed) == [("someone-else", "10.1.1.1")]
+    finally:
+        await store.close()
+
+
+async def test_revoke_all_keeps_the_known_address_record() -> None:
+    """Revoking every session is routine, so it clears nothing (owner ruling 2026-10-16)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        assert await service.revoke_sessions_for_user(uid, actor="boss") >= 1
+        out = await service.login("oper", PW, client="10.1.1.1")
+        assert out.ok and await _seeded(store, out.token)
+        assert await store.list_audit(actor="oper", action="auth.login_new_ip") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_a_cleared_account_with_no_last_login_is_judged_new_not_no_baseline(
+    reset: str,
+) -> None:
+    """An account whose record came only from an enrolment never stamped ``last_login_at``. Emptied
+    and left at that, its next sign-in would fail open as ``no_baseline``. The reset's marker row
+    keeps a baseline, so the old address is judged NEW (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        await store.remember_login_address(uid, "10.1.1.1", now=time.time())
+        user = await store.get_user(uid)
+        assert user is not None and user.last_login_at is None
+        issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None
+        out = await service.login("oper", issued.password, client="10.1.1.1")
+        assert out.ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+        assert await store.list_audit(actor="oper", action="auth.login_address_unevaluated") == []
+    finally:
+        await store.close()
+
+
+async def test_the_next_real_write_prunes_the_reset_marker() -> None:
+    """The marker is stamped at the epoch, so the prune after the next real write removes it and
+    leaves that write's row as the baseline (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        issued = await service.admin_reset_password(uid, actor="boss")
+        stepped = await service.login("oper", issued.password, client="10.1.1.1")
+        assert stepped.ok and stepped.identity is not None and stepped.token is not None
+        assert (
+            await service.reauth(
+                stepped.identity, issued.password, token=stepped.token, client="10.1.1.1"
+            )
+        ).ok
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+@pytest.mark.parametrize("method", ["forget_login_addresses", "remember_login_address"])
+async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reset: str,
+    method: str,
+) -> None:
+    """A failed clear is logged at ERROR, and the reset still returns its credential and audits
+    (owner ruling 2026-10-16)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+
+        async def _broken(*_a: object, **_kw: object) -> None:
+            raise OSError("synthetic store fault")
+
+        monkeypatch.setattr(store, method, _broken)
+        with caplog.at_level(logging.ERROR, logger=service_module._log.name):
+            issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None and issued.password
+        assert any(
+            r.levelno == logging.ERROR
+            and "could not clear the known sign-in addresses of oper" in r.getMessage()
+            for r in caplog.records
+        )
+        action = "auth.password_reset" if reset == "admin_reset_password" else "auth.mfa_reset"
+        assert len(await store.list_audit(action=action)) == 1
+        # The record is as the failure left it: unchanged when the delete failed, emptied with no
+        # marker when the marker write failed.
+        monkeypatch.undo()
+        left = await store.list_known_login_addresses(uid, since=0.0)
+        assert left == (["10.1.1.1"] if method == "forget_login_addresses" else [])
+    finally:
+        await store.close()
+
+
+def test_the_store_contract_uses_the_service_reset_values() -> None:
+    from tests import _login_address_store_contract as contract
+
+    assert contract._FOREVER == service_module._LOGIN_ADDRESS_FOREVER
+    assert contract._RESET_MARKER == service_module._LOGIN_ADDRESS_RESET_MARKER
+
+
+async def test_a_client_naming_the_marker_is_never_written() -> None:
+    """A forwarded header can carry any text; a client equal to the marker is not recorded, so the
+    marker never enters the lookback (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        marker = service_module._LOGIN_ADDRESS_RESET_MARKER
+        await service.admin_reset_password(uid, actor="boss")
+        await service._mark_login_address_known(uid, marker)
+        assert await store.list_known_login_addresses(uid, since=1.0) == []
     finally:
         await store.close()

@@ -16,11 +16,11 @@ import pytest
 
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
-    ADMIN_NEW_IP,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
+    NEW_ADDRESS_REVERIFY,
     NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
@@ -485,10 +485,12 @@ def test_admin_new_ip_body_says_when_the_session_stops_reporting() -> None:
     """vault BACKLOG #2159: the notice for the first address past the per-session cap says later
     new addresses go unreported, so the holder does not read the silence as "no more"."""
     capped = _build_body(
-        SecurityEvent(ADMIN_NEW_IP, username="bob", email="bob@x", detail={"cap_reached": 8})
+        SecurityEvent(
+            NEW_ADDRESS_REVERIFY, username="bob", email="bob@x", detail={"cap_reached": 8}
+        )
     )
     assert "not reported until it re-verifies" in capped
-    plain = _build_body(SecurityEvent(ADMIN_NEW_IP, username="bob", email="bob@x"))
+    plain = _build_body(SecurityEvent(NEW_ADDRESS_REVERIFY, username="bob", email="bob@x"))
     assert "not reported until it re-verifies" not in plain
 
 

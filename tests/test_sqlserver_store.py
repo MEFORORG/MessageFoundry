@@ -822,6 +822,32 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_first_admin_grant_contract(store) -> None:
+    """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
+    administrator exists, and over credentials the caller did not write."""
+    from tests._first_admin_grant_store_contract import assert_first_admin_grant_contract
+
+    await assert_first_admin_grant_contract(store)
+
+
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on SQL Server: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_concurrent_first_admin_grants_leave_one(store) -> None:
+    """BACKLOG #3078 on SQL Server: two grants to two accounts on two pooled connections, at once.
+    The last-administrator guard's applock serializes them; one is refused."""
+    from tests._first_admin_grant_store_contract import assert_concurrent_grants_leave_one
+
+    await assert_concurrent_grants_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real SQL Server backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
@@ -898,6 +924,31 @@ async def test_approval_repeat_request_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_repeat_request_contract
 
     await _assert_repeat_request_contract(store)
+
+
+async def test_approval_repeats_racing_from_two_processes_file_one_request(store, tmp_path) -> None:
+    """Vault BACKLOG #3236 on the SQL Server backend: two processes, each with its own store and
+    pool, race the same repeat in every round, and each round holds one request. The in-process
+    race in the contract above cannot show this, because the store's own lock serializes it first;
+    across processes only the read under the audit applock does."""
+    from tests._approval_repeat_two_process import (
+        assert_one_request_per_round,
+        filed_for,
+        open_requests,
+        race_repeat_requests,
+    )
+
+    nonce = uuid4().hex
+    try:
+        answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
+        await assert_one_request_per_round(store, answers)
+    finally:
+        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
+        # itself included, must not leave its open requests behind for a later test.
+        for approval_id in filed_for(nonce, await open_requests(store)):
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
+            )
 
 
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
@@ -6080,10 +6131,12 @@ async def test_audit_events_and_security_events_page_by_offset_mssql(store) -> N
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "mssql")
+    await check_keyed_audit_evidence(store, "mssql")
     await check_security_events_paging(store, "mssql")
     await check_connection_event_paging(store, "mssql")
 
@@ -6197,6 +6250,16 @@ async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
     from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
 
     await attestation_roundtrip(store)
+
+
+async def test_the_config_changed_reason_survives_a_long_node_ss(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)
 
 
 # --- vault BACKLOG #2223: the ServerCertificate pin is enforced under Encrypt=strict (gated) -------

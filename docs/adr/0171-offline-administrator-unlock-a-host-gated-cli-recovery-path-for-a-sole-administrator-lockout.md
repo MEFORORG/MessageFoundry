@@ -312,6 +312,13 @@ writes only where TOTP is off, and
 passes through a state the property above forbids. The shared TOTP store contract,
 `tests/_webauthn_store_contract.py`, covers the method on every backend.
 
+> **Correction (2026-10-16, BACKLOG #3025).** The paragraph above describes the store methods as
+> they stood when this amendment was written. Since #3025, `set_totp_secret` also writes only where
+> TOTP is off, and returns the stored cell or `None` when it wrote nothing; it still leaves the
+> recovery codes and the step. `enable_totp` now also requires the staged cell to be the one the
+> caller verified (`expected_secret_cell`). Neither existing method can now write an enabled
+> factor's seed at all, so the conclusion stands: only `replace_totp_enrolment` swaps it.
+
 ### Not addressed
 
 - The command trusts the host gate, as `admin-unlock` does. Anyone who can run it already holds the

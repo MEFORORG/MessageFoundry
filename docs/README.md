@@ -68,8 +68,8 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [EXPOSURE-SURFACE.md](EXPOSURE-SURFACE.md) | What the engine exposes, as a map for a security team scoping it: listeners, outbound hops, startup guards, and what `verify` does not check. |
 | [SERVICE.md](SERVICE.md) | Running the engine as a long-lived service. |
 | [CLUSTERING.md](CLUSTERING.md) | Active/passive HA for the engine itself. |
-| [CLOUD-DEPLOYMENT.md](CLOUD-DEPLOYMENT.md) | Multi-node HA on Kubernetes or cloud, with managed Postgres. |
-| [CLOUD-PHI-HIPAA.md](CLOUD-PHI-HIPAA.md) | The PHI/HIPAA considerations that pair with cloud deployment. |
+| [CLOUD-DEPLOYMENT.md](CLOUD-DEPLOYMENT.md) | Multi-node HA on Kubernetes or cloud, with managed Postgres. Its Kubernetes shapes are not supported for v1. |
+| [CLOUD-PHI-HIPAA.md](CLOUD-PHI-HIPAA.md) | The PHI/HIPAA considerations that pair with cloud deployment. Its Kubernetes guidance is not supported for v1. |
 | [AOAG-DEPLOYMENT.md](AOAG-DEPLOYMENT.md) | Two-datacenter HA behind a SQL Server Always On AG. For DBAs. |
 | [DEPLOY-SERVER-DB.md](DEPLOY-SERVER-DB.md) | Store setup on a real database server. |
 | [ADOPTER-CI.md](ADOPTER-CI.md) | CI for **your config repo** — and honestly, what it does not prove. Not the engine's CI. |

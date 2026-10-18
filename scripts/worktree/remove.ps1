@@ -56,13 +56,26 @@
         entry directly under it, or anything in .pytest_cache or .ruff_cache. A worker that only
         reads files and runs tests leaves no git trace, but a FINISHED test run rewrites
         .pytest_cache (vault BACKLOG #2985, part B item 1). A run still in progress has written
-        nothing there yet, so this does not see one.
+        nothing there yet, so this does not see one;
+      * a target holding uncommitted work written in the last six hours, at any depth (vault BACKLOG
+        #1017 point (iv), #2554 finding 3). Every path `git status` lists, untracked files one by
+        one, is dated, and so is every folder above it, and the git state of each nested repository
+        named below. A path that cannot be dated refuses, and so does a tree listing more than 5000
+        pending paths. NOT DATED, at least: ignored files, files flagged skip-worktree or
+        assume-unchanged, a `git add` of an older edit, and a nested repository's working files.
 
-    WHAT -Force OVERRIDES ON -Path: uncommitted tracked changes, untracked files, ignored files, and
-    files flagged skip-worktree or assume-unchanged. Without -Force every one of those refuses, with
-    ONE exception: an IGNORED directory named .venv, node_modules, __pycache__, .pytest_cache,
-    .mypy_cache or .ruff_cache goes with the worktree. An UNTRACKED directory of those names refuses,
-    and so does one that is a junction or a symlink.
+    WHAT -Force OVERRIDES ON -Path: uncommitted tracked changes and untracked files older than six
+    hours, and ignored files and files flagged skip-worktree or assume-unchanged of any age. Without
+    -Force every one of those refuses, with ONE exception: an IGNORED directory named node_modules,
+    __pycache__, .pytest_cache, .mypy_cache or .ruff_cache at any depth, or .venv at the tree root,
+    goes with the worktree. An UNTRACKED directory of those names refuses. So does one that is a
+    junction or a symlink, and so does a .venv below the root (vault BACKLOG #1017 point (i)).
+
+    A GIT REPOSITORY GIT STATUS DOES NOT READ INTO refuses on both routes, and -Force overrides it
+    once its own git state is six hours quiet. At least these are found: an untracked nested
+    repository, a package with its own .git in an ignored .venv/src or venv/src (where pip puts
+    editable clones), and one in an ignored node_modules, an @scope level included. A clone deeper
+    than that, or in another ignored directory, is not looked for.
     -Force is the operator's switch. A session runs -Path without it, and a refusal is final for a
     session: it reports what was refused and why, and stops.
 
@@ -75,8 +88,8 @@
     is seen only if it left the tree dirty, or wrote where the activity signal below reads.
 
     -Name KEEPS ITS OLD RULES OTHERWISE. Of the -Path-only refusals it shares only the detached HEAD
-    one: tracked changes refuse without -Force, untracked files go with the worktree, there is no
-    occupancy check, and it runs `git worktree prune` afterwards. -Path runs no blanket prune,
+    one: tracked changes refuse without -Force, untracked files older than six hours and ignored
+    files other than the repositories named above go with the worktree, there is no occupancy check, and it runs `git worktree prune` afterwards. -Path runs no blanket prune,
     because that also drops OTHER worktrees' registrations.
 
     NEITHER ROUTE RELEASES A CLAIM. The work has to land, or the claim be released with
@@ -106,7 +119,7 @@
 .EXAMPLE
     .\remove.ps1 -Name alerts
     .\remove.ps1 -Name alerts -DeleteBranch
-    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes too
+    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes older than six hours too
     .\remove.ps1 -List
     .\remove.ps1 -Path C:\Users\me\AppData\Local\Temp\claude\x\y\scratchpad\wt
 #>
@@ -691,6 +704,182 @@ foreach ($signal in @(
     }
 }
 
+# SIGNAL THREE: RECENT UNCOMMITTED WORK, DATED PATH BY PATH (vault BACKLOG #1017, owner point (iv),
+# and #2554 finding 3). The working-tree signal above dates the root and the entries directly under
+# it, so an edit two folders down moves none of them. A subagent's tree is invisible to the session
+# registry, and a subagent with no claim that has not committed leaves only that edit. So every path
+# git status lists as pending, untracked files one by one, is dated, and one written inside the
+# quiet period refuses WHATEVER -Force SAYS. -Force still discards older work, so an owner can clear
+# an abandoned tree.
+#
+# EACH PATH AND EVERY FOLDER ABOVE IT, up to the root. A moved or renamed file keeps its own old write
+# time, and a deleted one has none, but creating, deleting or moving an entry rewrites the folder
+# that holds it. So a rename's source is dated through its folders too.
+#
+# WHAT THIS DOES NOT DATE, at least: ignored files; files flagged skip-worktree or assume-unchanged;
+# a `git add` of an older edit, since the index is left out for the reason given above; and the
+# working files inside a nested repository, which git lists as one folder. A nested repository's
+# own git state is dated below. A path git lists that cannot be dated refuses: a name Windows reads
+# differently from git, for one. Past the cap nothing is sampled, and no switch overrides that.
+$pendingCap = 5000
+$rawPending = $null
+$pendingCode = 0
+$savedEncoding = [Console]::OutputEncoding
+$encodingSet = $false
+try {
+    # -z prints each path raw, so no quoting rule stands between git's spelling and the file. UTF-8
+    # for this one call, because a name outside the console's page would decode to another string.
+    # A host with no console may refuse the setter; then such a name fails to date, and refuses.
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $encodingSet = $true } catch {}
+    # stderr is kept: git skips a folder it cannot open, says so there, and still exits 0.
+    $rawPending = @(& git -C $WorktreePath --no-optional-locks status --porcelain -z --untracked-files=all 2>&1)
+    $pendingCode = $LASTEXITCODE
+}
+finally { if ($encodingSet) { [Console]::OutputEncoding = $savedEncoding } }
+if ($pendingCode -ne 0) {
+    throw "git status failed in '$WorktreePath' (exit $pendingCode), so its pending work is unknown. Nothing was removed."
+}
+$unopened = @($rawPending | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] -and "$_" -match 'could not open' })
+if ($unopened.Count -gt 0) {
+    Write-Host "REFUSED: git could not read part of '$WorktreePath': $($unopened[0])" -ForegroundColor Red
+    throw "Pending work under an unreadable folder is unknown. Nothing was removed."
+}
+# The -join puts back a path holding a newline, which PowerShell split into two elements.
+$fields = @((@($rawPending | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") -split "`0")
+$toDate = [System.Collections.Generic.List[pscustomobject]]::new()
+# Every git repository inside the tree that git status does not read into, by path relative to it.
+$nestedRepos = [ordered]@{}
+for ($i = 0; $i -lt $fields.Count; $i++) {
+    if ($fields[$i].Length -lt 4) { continue }   # `XY <path>`, so 4 is the shortest real entry
+    $xy = $fields[$i].Substring(0, 2)
+    $rel = $fields[$i].Substring(3)
+    $toDate.Add([pscustomobject]@{ Rel = $rel.TrimEnd('/'); MayBeGone = $xy.Contains('D') })
+    # With every untracked file listed, only a nested git repository still shows as a folder.
+    if ($xy -eq '??' -and $rel.EndsWith('/')) { $nestedRepos[$rel.TrimEnd('/')] = 'an untracked git repository inside the tree' }
+    # A rename or copy carries its source as the next field.
+    if ($xy -match '[RC]') {
+        $i++
+        if ($i -lt $fields.Count -and $fields[$i]) { $toDate.Add([pscustomobject]@{ Rel = $fields[$i]; MayBeGone = $true }) }
+    }
+    if ($toDate.Count -gt $pendingCap) {
+        throw ("git status lists more than $pendingCap pending paths in '$WorktreePath', more than this script " +
+            "dates, so the tree's last activity is unknown. Nothing was removed.")
+    }
+}
+$rootLength = $WorktreePath.TrimEnd('\', '/').Length
+$datedFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($p in $toDate) {
+    $full = Join-Path $WorktreePath $p.Rel
+    $stamps = @()
+    $why = ''
+    try {
+        if (-not $p.MayBeGone -or (Test-PresentOrThrow $full 'a pending path')) {
+            $stamps += Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        }
+        # A folder already dated had its own folders dated with it.
+        $dir = Split-Path $full -Parent
+        while ($dir.TrimEnd('\', '/').Length -gt $rootLength -and $datedFolders.Add($dir)) {
+            if (Test-PresentOrThrow $dir 'a pending folder') { $stamps += Get-Item -LiteralPath $dir -Force -ErrorAction Stop }
+            $dir = Split-Path $dir -Parent
+        }
+    }
+    # Never empty, so an exception with no message cannot read as a dated path.
+    catch { $why = "$($_.Exception.GetType().Name): $($_.Exception.Message)" }
+    if ($why) {
+        Write-Host "REFUSED: git lists '$($p.Rel)' in '$WorktreePath' as pending, and it cannot be dated ($why)." -ForegroundColor Red
+        throw "Pending work of unknown age. Nothing was removed."
+    }
+    foreach ($s in $stamps) {
+        $age = [DateTime]::UtcNow - $s.LastWriteTimeUtc
+        if ($age.TotalHours -ge $quietHours) { continue }
+        $by = [System.IO.Path]::GetRelativePath($WorktreePath, $s.FullName).Replace('\', '/')
+        Write-Host ("REFUSED: '$($p.Rel)' in '$WorktreePath' is uncommitted, and '$by' was written " +
+            "$([int][Math]::Max(0, $age.TotalMinutes)) minute(s) ago, inside the $quietHours-hour quiet period.") -ForegroundColor Red
+        Write-Host ("Something may still be working on it. -Force does not override this; it discards only " +
+            "work older than the quiet period.") -ForegroundColor Red
+        throw "Target holds recent uncommitted work. Nothing was removed."
+    }
+}
+
+# EVERY IGNORED ENTRY, read on both routes: the -Path list below refuses from it, and the clone check
+# reads it.
+$statusLines = @(& git -C $WorktreePath --no-optional-locks status --porcelain --ignored --untracked-files=normal 2>$null)
+if ($LASTEXITCODE -ne 0) {
+    throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
+}
+
+# A CLONE INSIDE A TOLERATED DIRECTORY (vault BACKLOG #1017, owner point (i)). Git lists an ignored
+# directory as one line and never reads inside it, so the -Path exception lets the whole of it go.
+# pip's `-e git+...` clones each package into .venv/src/<pkg> with its own .git, and a hand-made or
+# linked-in clone can sit at node_modules/<pkg>. Either can hold commits no other ref has. Every
+# ignored .venv, venv and node_modules git lists is read, at any depth, one level down (two under an
+# @scope), no deeper. A link is not followed: git does not delete through one (measured, below).
+# Other ignored directories are not searched.
+function Get-PlainSubfolders([string]$Dir, [string]$What) {
+    @(Get-EntriesOrThrow $Dir $What | Where-Object {
+            $_ -is [System.IO.DirectoryInfo] -and -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })
+}
+# MEASURED on git 2.55.0.windows.5: an ignored directory holding NOTHING but nested repositories is
+# not listed at all, so the root ones are read whether git lists them or not. A deeper one holding
+# only clones is not seen.
+$envNames = @('.venv', 'venv', 'node_modules')
+$envDirs = @($statusLines | Where-Object { $_ -cmatch '\A!! (?:.*/)?(?:\.venv|venv|node_modules)/\z' } |
+        ForEach-Object { $_.Substring(3).TrimEnd('/') })
+foreach ($top in $envNames) {
+    if ($envDirs -notcontains $top -and (Test-PresentOrThrow (Join-Path $WorktreePath $top) "the $top directory")) { $envDirs += $top }
+}
+foreach ($rel in $envDirs) {
+    $dir = Join-Path $WorktreePath $rel
+    $item = Get-Item -LiteralPath $dir -Force
+    if (-not $item.PSIsContainer) { continue }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+    $packages = @()
+    if ($item.Name -ne 'node_modules') {
+        $src = Join-Path $dir 'src'
+        if (Test-PresentOrThrow $src 'a virtual environment src directory') { $packages = @(Get-PlainSubfolders $src 'editable packages') }
+    }
+    else {
+        $packages = @(Get-PlainSubfolders $dir 'packages')
+        foreach ($scope in @($packages | Where-Object { $_.Name.StartsWith('@') })) {
+            $packages += @(Get-PlainSubfolders $scope.FullName 'scoped packages')
+        }
+    }
+    foreach ($pkg in $packages) {
+        if (Test-PresentOrThrow (Join-Path $pkg.FullName '.git') 'a package .git') {
+            $nestedRepos[[System.IO.Path]::GetRelativePath($WorktreePath, $pkg.FullName).Replace('\', '/')] = "a git clone inside $($item.Name)"
+        }
+    }
+}
+
+# A NESTED REPOSITORY'S OWN GIT STATE IS DATED, WHATEVER -Force SAYS. A commit, checkout or fetch in
+# it rewrites a file directly in its .git, or its HEAD reflog, and moves no folder signal three
+# reads. A .git that is a file points elsewhere, and only the file is dated.
+foreach ($rel in @($nestedRepos.Keys)) {
+    $gitPath = Join-Path (Join-Path $WorktreePath $rel) '.git'
+    $state = @()
+    if (Test-PresentOrThrow $gitPath "the .git of $rel") {
+        $gitItem = Get-Item -LiteralPath $gitPath -Force
+        $state = @($gitItem)
+        if ($gitItem.PSIsContainer) {
+            $state += @(Get-EntriesOrThrow $gitPath "git state files of $rel" -FilesOnly)
+            $nestedLog = Join-Path $gitPath 'logs/HEAD'
+            if (Test-PresentOrThrow $nestedLog "the HEAD reflog of $rel") { $state += Get-Item -LiteralPath $nestedLog -Force }
+        }
+    }
+    foreach ($s in $state) {
+        $age = [DateTime]::UtcNow - $s.LastWriteTimeUtc
+        if ($age.TotalHours -ge $quietHours) { continue }
+        Write-Host ("REFUSED: git last wrote to the nested repository '$rel' in '$WorktreePath' " +
+            "$([int][Math]::Max(0, $age.TotalMinutes)) minute(s) ago ($($s.Name)), inside the $quietHours-hour quiet period.") -ForegroundColor Red
+        throw "Target holds a nested repository that was active recently. Nothing was removed."
+    }
+}
+if ($nestedRepos.Count -gt 0 -and -not $Force) {
+    foreach ($rel in $nestedRepos.Keys) { Write-Host "$rel/  ($($nestedRepos[$rel]))" }
+    throw ("Worktree holds a git repository that git status does not read into, which may hold commits no " +
+        "other ref has. Push what matters. -Force discards it, and it is the operator's switch. Nothing was removed.")
+}
+
 if ($byPath) {
     # EVERYTHING GIT WOULD DELETE IS SHOWN, whatever status.showUntrackedFiles says: tracked changes,
     # untracked files and ignored files all refuse without -Force. A -Path target is often another
@@ -701,11 +890,10 @@ if ($byPath) {
     # pattern needs both the `!!` and the trailing slash: an untracked directory of the same name is
     # `??` and refuses, and so does an ignored FILE of that name. Case-sensitive on purpose. A path git
     # had to quote ends in a quote, not a slash, and so refuses.
-    $exemptIgnored = '\A!! (?:.*/)?(?:\.venv|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)/\z'
-    $statusLines = @(& git -C $WorktreePath --no-optional-locks status --porcelain --ignored --untracked-files=normal 2>$null)
-    if ($LASTEXITCODE -ne 0) {
-        throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
-    }
+    # .venv is tolerated at the ROOT only (vault BACKLOG #1017, owner point (i)): one deeper down is
+    # not the tree's own environment. node_modules and the four caches at any depth, because this
+    # repository's own ide/node_modules is one (new.ps1 -Ide). The clones inside both are checked above.
+    $exemptIgnored = '\A!! (?:(?:.*/)?(?:node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)|\.venv)/\z'
     $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
     # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's
@@ -748,7 +936,7 @@ else {
     # Guard against losing UNCOMMITTED tracked work. Note this does NOT see committed-but-unpushed
     # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own
     # containment check below is what covers those. Untracked entries (??) -- the .venv, node_modules,
-    # dev db -- are expected and don't block removal.
+    # dev db -- are expected and don't block removal, once they are older than the quiet period.
     # The exit code is read BEFORE the filter: a git that cannot read this worktree (a corrupt index, say)
     # prints nothing, and nothing read as "no changes" here would hand `worktree remove --force` the very
     # edits this guard exists for. -Force does not override it (BACKLOG #1038).

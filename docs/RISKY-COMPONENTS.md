@@ -495,7 +495,8 @@ project in them, in any form.
 The word search ran over the 39 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
 a single module adapted from another project, 24 hold lines copied into a wheel's own module, and 59
 hold prose that marks no copy, such as a project's own licence header. The record lists each hit
-under its wheel.
+under its wheel. Each hit was sorted into its kind by hand. No test runs the search again: the
+wheels are not kept in this repository, so the counts of files hit are not checked against them.
 
 **Single modules adapted from another project, as found:**
 

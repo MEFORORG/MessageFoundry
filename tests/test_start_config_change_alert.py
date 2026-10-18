@@ -29,21 +29,26 @@ from fastapi import FastAPI
 import messagefoundry.api.app as app_module
 import messagefoundry.config.fingerprint as fp_mod
 from messagefoundry.api import create_managed_app
-from messagefoundry.config.fingerprint import FINGERPRINT_SCHEME, config_fingerprint
+from messagefoundry.config.fingerprint import (
+    FINGERPRINT_SCHEME,
+    UNREADABLE_FILES_KEY,
+    config_fingerprint,
+)
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
 from messagefoundry.config.wiring import load_config
-from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.alerts import LoggingAlertSink, config_changed_detail
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
+from tests.test_config_fingerprint import _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 
 _ACTIONS = ("config_loaded", "config_reload", "connection_flag_set")
@@ -979,14 +984,16 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
         baseline_actor="alice",
         baseline_at="2026-10-04T00:00:00+00:00",
         baseline_node="host:2:y",
+        comparison="partial_start_digest",
     )
     await _drain_transports(sink)
     await _drain_state(sink)
     (event,) = transport.events
     assert event["type"] == "config_changed" and event["connection"] == "config:aaaaaaaaaaaa"
+    assert event["comparison"] == "partial_start_digest"
     assert event["detail"] == (
-        "this process started with config aaaaaaaaaaaa; the store's baseline is config "
-        "bbbbbbbbbbbb (node host:2:y, action config_reload, time 2026-10-04T00:00:00+00:00)"
+        "baseline 2026-10-04T00:00:00+00:00 on node host:2:y (config_reload): started on config "
+        "aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
     )
     assert (event["fingerprint"], event["previous_fingerprint"]) == ("a" * 64, "b" * 64)
     assert set(event) <= {
@@ -1001,6 +1008,320 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
         "baseline_actor",
         "baseline_at",
         "baseline_node",
+        "comparison",
         "ts",
         "severity",
     }
+
+
+# --- vault BACKLOG #2944, items 4 to 6 -----------------------------------------------------------
+
+
+async def test_a_file_locked_at_one_start_pages_on_the_same_bytes_with_the_marker(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, as the Lander's send-back of engine PR 2370 left it (vault BACKLOG #3765): a file an
+    antivirus lock holds at one start and not at the next gives two digests for the same bytes.
+    main pages on both, and so does this; the marker says why, and nothing is passed over."""
+    await _start(tmp_path, cfg)
+    with monkeypatch.context() as m:
+        _unreadable(m, "cfg.py")
+        partial = await _start(tmp_path, cfg)
+    assert [a["comparison"] for a in alerts] == ["partial_start_digest"]
+    assert partial[-1][UNREADABLE_FILES_KEY] == ["cfg.py"]
+    assert partial[-1]["comparison"] == "partial_start_digest"
+    assert "baseline_unchecked" not in partial[-1]
+    # The next start, with the file readable again, compares against the partial row and pages.
+    rows = await _start(tmp_path, cfg)
+    assert [a["comparison"] for a in alerts] == ["partial_start_digest", "partial_baseline"]
+    assert rows[-1]["comparison"] == "partial_baseline" and rows[-1]["changed"] is True
+    # Control: a restart on the same bytes, whole both times, is quiet.
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 2 and rows[-1]["comparison"] == "compared"
+
+
+async def test_a_partial_baseline_row_pages_a_whole_start(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, the row side: a reload whose digest left out a file is still a baseline, and a whole
+    start whose digest differs pages, as on main (vault BACKLOG #3765, item 16)."""
+    await _start(tmp_path, cfg)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        await store.record_audit(
+            "config_reload",
+            actor="alice",
+            detail=json.dumps(
+                {
+                    "fingerprint": "f" * 64,
+                    "scheme": FINGERPRINT_SCHEME,
+                    UNREADABLE_FILES_KEY: ["codesets/x.csv"],
+                }
+            ),
+        )
+    finally:
+        await store.close()
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == "f" * 64
+    assert alerts[0]["comparison"] == "partial_baseline"
+    assert rows[-1]["comparison"] == "partial_baseline" and rows[-1]["changed"] is True
+
+
+async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_loaded(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 5: an edit between the load and the start's digest was recorded as loaded. Here the
+    start loads edited bytes and the edit is reverted before the digest, so without the check the
+    row named the baseline's bytes and no start ever reported the change this one ran. main did
+    not page at this start either; the marker and the withheld provenance are what it adds, and
+    the next start on the edited bytes pages (vault BACKLOG #3765)."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    original = (cfg / "cfg.py").read_bytes()
+    _edit(cfg)
+
+    def _load_then_revert(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        (cfg / "cfg.py").write_bytes(original)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module, "load_config", _load_then_revert)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            provenance_after = engine.loaded_config_fingerprint
+            unchecked_after = engine.config_baseline_unchecked
+            rows = await _start_rows(engine)
+    assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
+    assert alerts == []
+    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is False
+    assert "baseline_unchecked" not in rows[-1]
+    assert provenance_after is None, "the digest may name bytes the process never loaded"
+    assert unchecked_after is True, "its flag rows carry no digest, so they are no baseline"
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+    assert rows[-1]["comparison"] == "compared"
+
+
+#: A node id on a host whose name is the longest DNS allows: ``host:pid:tag``.
+_LONG_NODE = f"{'h' * 253}:4194304:abcdef12"
+
+
+def _long_node_detail() -> str:
+    return config_changed_detail(
+        fingerprint="a" * 64,
+        previous_fingerprint="b" * 64,
+        baseline_action="connection_flag_set",
+        baseline_node=_LONG_NODE,
+        baseline_at="2026-10-04T00:00:00+00:00",
+    )
+
+
+def test_the_detail_leads_with_the_baseline_time_and_node_and_fits_the_reason_column() -> None:
+    """Item 6: the reason column keeps about 200 characters, and a long host name pushed the
+    baseline time and node past it."""
+    detail = _long_node_detail()
+    assert len(detail) <= 200
+    assert detail.startswith("baseline 2026-10-04T00:00:00+00:00 on node hhh")
+    assert ":4194304:abcdef12 (connection_flag_set)" in detail
+    assert detail.endswith("baseline config bbbbbbbbbbbb")
+
+
+async def check_config_changed_reason_survives_a_long_node(store: Any) -> None:
+    """Store the ``config_changed`` detail at the longest node id and read it back uncut. Shared
+    with the SQL Server and PostgreSQL store suites (vault BACKLOG #2944, item 6).
+
+    The store's redaction replaces the ISO date as date-shaped text, on every backend and at every
+    node length, so the stored reason is the redacted line. The event carries ``baseline_at``
+    whole. What this pins is the cut: nothing past the node is lost."""
+    detail = _long_node_detail()
+    expected = detail.replace("2026-10-04T00:00:00+00:00", "[redacted]")
+    await store.upsert_alert_instance(
+        event_type="config_changed",
+        connection="config:aaaaaaaaaaaa",
+        severity="warning",
+        reason=detail,
+        now=100.0,
+    )
+    (row,) = [
+        a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.event_type == "config_changed"
+    ]
+    assert row.reason == expected
+
+
+async def test_the_config_changed_reason_survives_a_long_node_sqlite(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        await check_config_changed_reason_survives_a_long_node(store)
+    finally:
+        await store.close()
+
+
+async def test_two_digests_that_left_out_the_same_file_are_compared(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, review round 1: a file that stays unreadable must not turn the check off. Digests
+    that left out the same files cover the same files, so they compare like for like."""
+    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_locked.py")
+        first = await _start(tmp_path, cfg)
+        assert first[-1]["comparison"] == "no_baseline"
+        rows = await _start(tmp_path, cfg)
+        assert alerts == []
+        assert rows[-1]["comparison"] == "partial_start_digest" and rows[-1]["changed"] is False
+        _edit(cfg)
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1, "an edit to a file both digests cover is reported"
+    assert rows[-1]["comparison"] == "partial_start_digest" and rows[-1]["changed"] is True
+
+
+async def test_a_convergence_row_with_a_partial_digest_is_a_baseline(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """A partial convergence digest is a baseline, as any digest is on main: a whole start compares
+    against it and pages (vault BACKLOG #3765, item 15). Passing over it would let a start whose
+    bytes match an older row adopt whatever the convergence reload loaded."""
+    await _start(tmp_path, cfg)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with monkeypatch.context() as m:
+            _unreadable(m, "cfg.py")
+            await engine._converge_reload()
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    row = json.loads(reload_rows[0]["detail"])
+    assert row[UNREADABLE_FILES_KEY] == ["cfg.py"] and "baseline_unchecked" not in row
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "partial_baseline"
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == row["fingerprint"]
+
+
+async def test_a_failed_digest_before_the_load_never_blocks_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    await _start(tmp_path, cfg)
+    real = Engine.fingerprint_bundle
+    calls: list[Path] = []
+
+    async def _first_raises(self: Engine, path: Path) -> Any:
+        calls.append(path)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic")
+        return await real(self, path)
+
+    with monkeypatch.context() as m:
+        m.setattr(Engine, "fingerprint_bundle", _first_raises)
+        rows = await _start(tmp_path, cfg)  # asserts the graph is serving
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert alerts == []
+
+
+# --- vault BACKLOG #3765, items 15, 16, 17 and 19: never page less than main did ----------------
+# The Lander sent engine PR 2370 back: main pages on any digest change, and the partial and
+# during-load markers had turned some of those pages into WARNING-only or adopted baselines.
+
+
+async def test_a_partial_start_whose_digest_differs_pages_and_is_the_baseline(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 15: an edit made while a file is unreadable pages at that start, as main does."""
+    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    await _start(tmp_path, cfg)
+    with monkeypatch.context() as m:
+        _unreadable(m, "_locked.py")
+        _edit(cfg)
+        rows = await _start(tmp_path, cfg)
+        assert len(alerts) == 1, "main pages on this digest change"
+        assert alerts[0]["comparison"] == "partial_start_digest"
+        assert rows[-1]["comparison"] == "partial_start_digest"
+        assert rows[-1]["changed"] is True and "baseline_unchecked" not in rows[-1]
+        # Positive control: the same partial digest again does not page.
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+    assert rows[-1]["changed"] is False
+
+
+async def test_a_whole_start_after_a_partial_baseline_pages(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 16: the first whole start after a partial baseline compares and pages; it does not
+    adopt the edits made since then as a new baseline."""
+    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_locked.py")
+        await _start(tmp_path, cfg)
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+    assert alerts[0]["comparison"] == "partial_baseline"
+    assert rows[-1]["comparison"] == "partial_baseline" and rows[-1]["changed"] is True
+    # Positive control: the next whole start on the same bytes does not page.
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and rows[-1]["changed"] is False
+
+
+async def test_an_edit_that_lands_during_the_start_load_pages(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 17: main compares the digest taken after the load with the baseline and pages; the
+    during-load marker is information, never a reason to skip that comparison."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module, "load_config", _load_then_edit)
+        rows = await _start(tmp_path, cfg)
+    after = config_fingerprint(cfg)
+    assert after != before, "control: the edit changed the digest"
+    assert len(alerts) == 1
+    assert (alerts[0]["fingerprint"], alerts[0]["previous_fingerprint"]) == (after, before)
+    assert alerts[0]["comparison"] == "changed_during_load"
+    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
+
+
+async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 1: the fold does not hash what a digest left out, so a new module locked only
+    while the start digested it folds to the baseline's value. Coverage is compared too."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    (cfg / "_new.py").write_text("NEW = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_new.py")
+        assert config_fingerprint(cfg) == before, "control: the fold matches the baseline's"
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["comparison"] == "partial_start_digest"
+    assert rows[-1]["changed"] is True
+
+
+async def test_the_convergence_row_writes_the_fingerprint_it_judged(
+    tmp_path: Path, cfg: Path
+) -> None:
+    """Item 19: the row judged ``outcome.fingerprint`` but wrote whatever the engine held at the
+    write, so a later reload or flag toggle could put a digest it never judged on the row."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None and engine.convergence_reload_audit is not None
+        judged = {"fingerprint": "e" * 64, "scheme": FINGERPRINT_SCHEME, "files": 1}
+        # A later reload moved the engine on before the convergence row was written.
+        engine.loaded_config_fingerprint = {"fingerprint": "d" * 64, "scheme": FINGERPRINT_SCHEME}
+        await engine.convergence_reload_audit(
+            ReloadOutcome(registry=rr.registry, applied=True, directory=cfg, fingerprint=judged)
+        )
+        rows = await engine.store.list_audit(action="config_reload")
+    row = json.loads(rows[0]["detail"])
+    assert row["fingerprint"] == "e" * 64
+    assert row["baseline_unchecked"] is True, "the engine has moved on: it is no baseline"

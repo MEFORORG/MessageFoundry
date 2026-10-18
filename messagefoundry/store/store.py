@@ -1701,14 +1701,47 @@ class AdminRemoval(StrEnum):
         return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
 
 
+class AdminGrant(StrEnum):
+    """What ``grant_first_admin_unless_admin_exists`` did (BACKLOG #3078)."""
+
+    #: The account now holds Administrator.
+    GRANTED = "granted"
+    #: Another enabled, seal-valid administrator the caller's test counts exists, so nothing was
+    #: written. ``provision_first_administrator`` counts only one that signs in with a local
+    #: password (vault BACKLOG #2711 step 1).
+    ADMIN_EXISTS = "admin_exists"
+    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
+    #: disabled or gone, so nothing was written.
+    ACCOUNT_CHANGED = "account_changed"
+
+
+#: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
+#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
+#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
+#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
+#: an unrelated engine write can be what was busy.
+_ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
+_ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF == sqlite3.SQLITE_BUSY
+
+
 #: The last-administrator guard's read (vault BACKLOG #2779): every enabled account holding the
 #: role, each with a flag for whether it is the target. Binds: user id, role id. The ids are
 #: compared in SQL rather than in Python so the guard matches ids exactly as the write's
 #: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
 #: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
 #: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
-#: in all. Since BACKLOG #2592 the other holders are counted only when their record passes its
-#: integrity seal (:func:`admin_guard_counts`), as the service's enumerations count them.
+#: in all. The first-administrator grant's own narrowing (``counts_as_admin``, vault BACKLOG #2711)
+#: is not such a condition: it is applied after this read, to the grant only, and the removal
+#: guard must keep counting directory administrators. Since BACKLOG #2592 the other holders are
+#: counted only when their record passes its integrity seal (:func:`admin_guard_counts`), as the
+#: service's enumerations count them.
 _SQL_ADMIN_GUARD_HOLDERS = (
     "SELECT u.id, CASE WHEN u.id = ? THEN 1 ELSE 0 END"
     " FROM users u JOIN user_roles r ON r.user_id = u.id"
@@ -1716,22 +1749,34 @@ _SQL_ADMIN_GUARD_HOLDERS = (
 )
 
 
+#: Which other enabled administrators the first-administrator grant counts (vault BACKLOG #2711
+#: step 1, owner ruling B258-R4). The auth service supplies it from the same predicate its
+#: ``provision-admin`` refusal reads, so the guard and the refusal cannot disagree; the store has no
+#: rule of its own for what a usable administrator is.
+type AdminHolderTest = Callable[[UserRow], bool]
+
+
 async def admin_guard_counts(
     holders: Iterable[tuple[str, bool]],
     sealer: RowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
+    counts: AdminHolderTest | None = None,
 ) -> tuple[int, int]:
     """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
     rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
     ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
-    counting it would let the last usable administrator be removed."""
+    counting it would let the last usable administrator be removed. With ``counts``, it must also
+    pass that test (the first-administrator grant's); the removal guard passes none, so it counts
+    every sealed holder."""
     target = others = 0
     for holder_id, is_target in holders:
         if is_target:
             target += 1
             continue
         record = await read_record(holder_id)
-        if record is not None and user_seal_ok(sealer, record):
+        if record is None or not user_seal_ok(sealer, record):
+            continue
+        if counts is None or counts(record.row):
             others += 1
     return target, others
 
@@ -2060,6 +2105,13 @@ class SessionRecord:
             and self.expires_at >= now
             and now - self.last_used_at <= idle_seconds
         )
+
+
+#: What :meth:`MessageStore.update_webauthn_sign_count` found, decided under the one locked write on
+#: every backend (BACKLOG #3774): ``"moved"`` (the stored count equalled ``expected`` and now holds
+#: ``new``), ``"mismatch"`` (the passkey exists and holds another count) or ``"gone"`` (no such
+#: passkey). Either miss is a clone signal (ADR 0068 decision 4); the answer only says which.
+SignCountAnswer = Literal["moved", "mismatch", "gone"]
 
 
 @dataclass(frozen=True)
@@ -2645,14 +2697,47 @@ def lockout_increment(
     return apply
 
 
-def totp_enable(recovery_code_hashes: Sequence[str], now: float) -> UserChange:
-    """What ``enable_totp`` writes, only where a secret is staged and TOTP is still off (BACKLOG
-    #2224). The enrolment confirm rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an
-    ``admin_reset_mfa`` can clear the staged secret inside that window, and a second confirm can
-    enable first; either way this writes nothing and the caller refuses."""
+def totp_stage(sealed_secret: str | None, now: float) -> UserChange:
+    """What ``set_totp_secret`` writes: the sealed secret, only where TOTP is still off (BACKLOG
+    #3025). A begin that lands once TOTP is on writes nothing, so it can never replace the secret of
+    an enabled factor. There is no clear here: an empty secret raises, and ``disable_totp`` clears.
+
+    ``last_totp_step`` is kept on purpose. ``provision_first_administrator`` consumes its code's
+    step BEFORE it stages, and that step must stay spent. The cost: after a confirm refused because a
+    second begin replaced its secret, the replacing secret's code from the same 30 seconds can be
+    refused as a replay, and the holder uses the next code."""
+    if not sealed_secret:
+        raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if r.row.totp_secret is None or r.row.totp_enabled:
+        if r.row.totp_enabled:
+            return None
+        return r.changed(totp_secret=sealed_secret, updated_at=float(now))
+
+    return apply
+
+
+def totp_enable(
+    recovery_code_hashes: Sequence[str], now: float, *, expected_secret_cell: str | None
+) -> UserChange:
+    """What ``enable_totp`` writes, only where TOTP is still off and the staged secret is still the
+    cell the caller verified (BACKLOG #2224, #3025). The enrolment confirm rotates the session BEFORE
+    it enables TOTP (BACKLOG #1902), so inside that window an ``admin_reset_mfa`` can clear the
+    staged secret, a second confirm can enable first, or a second begin can stage another secret;
+    in each case this writes nothing and the caller refuses.
+
+    The compare is on the stored cell, byte for byte. A write to another column of the row carries
+    the cell over unchanged, so it does not make the compare refuse. At least a stage, a clear,
+    ``totp_replace`` and a store-key rotation that re-encrypts the column do change it; a rotation
+    landing inside a confirm makes that confirm refuse, which fails closed and a retry succeeds.
+    ``None`` matches nothing."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if (
+            expected_secret_cell is None
+            or r.row.totp_secret != expected_secret_cell
+            or r.row.totp_enabled
+        ):
             return None
         return r.changed(
             totp_enabled=True,
@@ -2660,6 +2745,40 @@ def totp_enable(recovery_code_hashes: Sequence[str], now: float) -> UserChange:
             totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
             updated_at=float(now),
         )
+
+    return apply
+
+
+def first_admin_grant(
+    admin_role_id: str,
+    *,
+    expected_password_hash: str,
+    expected_totp_secret_cell: str | None,
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """What ``grant_first_admin_unless_admin_exists`` writes once the guard passes (BACKLOG
+    #3078): the account holding exactly ``admin_role_id``, only while it is enabled, holds no role,
+    and still holds the credentials the caller wrote. That is the password hash, compared byte for
+    byte, and either no TOTP secret at all (``expected_totp_secret_cell`` ``None``; a secret another
+    run staged but has not enabled counts) or TOTP on with that staged cell.
+
+    Two provisioning runs on one row can interleave before either grant so that one run's password
+    sits beside the other's TOTP; this then writes nothing. A row that already holds a role is
+    refused too, so a second run on a row the first run already granted is never granted over it.
+    What this cannot see is a write landing AFTER a grant committed: the provisioning credential
+    writes before it are not conditional on the row being roleless."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        row = r.row
+        if row.disabled or r.roles or row.password_hash != expected_password_hash:
+            return None
+        if expected_totp_secret_cell is None:
+            if row.totp_enabled or row.totp_secret is not None:
+                return None
+        elif not row.totp_enabled or row.totp_secret != expected_totp_secret_cell:
+            return None
+        return r.with_roles([admin_role_id], assigned_by=assigned_by, now=now)
 
     return apply
 
@@ -5983,20 +6102,14 @@ async def settle_transit_bound_attestation(
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
-    audit, prev, key, mac = read.mac_check
-    seq = audit["seq"]
-    if mac is None:
-        expected = _audit_row_mac(audit, prev, key, None)
-    else:
-        try:
-            expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
-        except CipherError as exc:
-            return replace(
-                attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
-            )
-    if expected is None or not hmac.compare_digest(
-        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
-    ):
+    seq = read.mac_check[0]["seq"]
+    try:
+        verified = await _audit_row_mac_verifies(*read.mac_check)
+    except CipherError as exc:
+        return replace(
+            attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
+        )
+    if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
         )
@@ -6050,6 +6163,24 @@ async def _transit_attestation_audit_gap(
         audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(attestation.audit_hash)
     ):
         return f"audit row {seq} carries a different hash than the attestation recorded"
+    return await _audit_row_mac_check(audit, seq, fetch, mac_keys=mac_keys, mac_fn=mac_fn)
+
+
+async def _audit_row_mac_check(
+    audit: Mapping[str, Any],
+    seq: int,
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+    only_key_id: str | None = None,
+) -> str | tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None]:
+    """Why audit row ``seq`` (already read as ``audit``) cannot be MAC-checked here, or the inputs
+    of that check: ``(audit row, previous row hash, key, MAC provider)``. It reads the previous
+    row's hash and the opening row of ``seq``'s key range, so it walks no chain.
+
+    With ``only_key_id`` a row in any other range is refused: a keyless one, which anyone who can
+    write the table can recompute, and one under a retired key still in the keyring."""
     prev: object = ""
     if seq > 1:
         before = await fetch("SELECT row_hash FROM audit_log WHERE seq = ?", (seq - 1,))
@@ -6068,6 +6199,8 @@ async def _transit_attestation_audit_gap(
     elif opening is not None and opening["action"] == AUDIT_KEY_EPOCH_ACTION:
         parsed = parse_audit_epoch(opening["detail"])
         key_id = parsed[0] if parsed is not None else None
+    if only_key_id is not None and key_id != only_key_id:
+        return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
     if key_id is None:
         # A keyless chain walks as plain SHA-256, and only a process holding no key walks it so,
@@ -6080,6 +6213,95 @@ async def _transit_attestation_audit_gap(
     # A plain dict, so the row outlives the cursor and the read that produced it.
     columns = ("seq", *_AUDIT_CHAINED_COLUMNS, "row_hash")
     return ({c: audit[c] for c in columns}, prev, secret[0], secret[1])
+
+
+@runtime_checkable
+class KeyedAuditEvidenceStore(Protocol):
+    """The store slice that reads one audit row back only once its MAC verifies (vault BACKLOG
+    #3750 item 33). All three shipped backends implement it; the engine narrows with
+    ``isinstance``, and a store that does not implement it gives no evidence."""
+
+    async def audit_anchor(self) -> tuple[int, str]: ...
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """The newest ``action`` row by ``actor`` with a sequence number above ``after_seq``, when
+        its MAC verifies under the ACTIVE audit key; ``None`` when there is none, it does not
+        verify, it is under a retired key, or the store holds no key. It checks that one row, not
+        the chain: a row that verifies was sealed by a holder of the key, at that sequence
+        number."""
+        ...
+
+
+#: The verified evidence check :func:`read_newest_keyed_audit_row` gathers inside one read and
+#: :func:`settle_newest_keyed_audit_row` completes: ``(audit row, previous row hash, key, MAC
+#: provider)``, or ``None`` when there is nothing to check.
+type KeyedAuditRowCheck = tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None] | None
+
+
+async def read_newest_keyed_audit_row(
+    fetch: TransitAttestationFetch,
+    *,
+    action: str,
+    actor: str,
+    after_seq: int,
+    active_key_id: str | None,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> KeyedAuditRowCheck:
+    """The read half of ``newest_keyed_audit_row`` on all three backends (vault BACKLOG #3750 item
+    33): the newest ``action`` row by ``actor`` numbered above ``after_seq``, with what its MAC
+    check needs. ``None`` when there is no such row, or when it is not sealed under
+    ``active_key_id``, the key a new range opens under: a keyless row or one under a retired key
+    is no evidence. With no active key it reads nothing. Every query is portable and every value
+    a bound parameter. It makes no MAC call; pass the result to
+    :func:`settle_newest_keyed_audit_row` once the read is released."""
+    if active_key_id is None:
+        return None
+    audit = await fetch(
+        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
+        " WHERE seq = (SELECT MAX(seq) FROM audit_log WHERE action = ? AND actor = ? AND seq > ?)",
+        (action, actor, after_seq),
+    )
+    if audit is None:
+        return None
+    seq = _strict_int(audit["seq"])
+    # Matched again here, exactly: a padding or case-folding collation must not widen the query.
+    if seq is None or seq <= after_seq or audit["action"] != action or audit["actor"] != actor:
+        return None
+    found = await _audit_row_mac_check(
+        audit, seq, fetch, mac_keys=mac_keys, mac_fn=mac_fn, only_key_id=active_key_id
+    )
+    return None if isinstance(found, str) else found
+
+
+async def settle_newest_keyed_audit_row(check: KeyedAuditRowCheck) -> dict[str, Any] | None:
+    """The row ``check`` names, as a plain dict, when its MAC verifies under the audit key of its
+    range; ``None`` otherwise, including when Transit refuses the call. It costs one MAC, run off
+    the event loop for a MAC provider, compared in constant time."""
+    if check is None:
+        return None
+    try:
+        verified = await _audit_row_mac_verifies(*check)
+    except CipherError:
+        return None
+    return dict(check[0]) if verified else None
+
+
+async def _audit_row_mac_verifies(
+    audit: Mapping[str, Any], prev: object, key: bytes | None, mac: AuditMacFn | None
+) -> bool:
+    """Whether ``audit``'s stored hash is the MAC it should carry, chained from ``prev``: one MAC,
+    run off the event loop for a MAC provider (a blocking Vault call), compared in constant time.
+    A MAC provider's refusal raises :class:`~messagefoundry.store.crypto.CipherError`."""
+    if mac is None:
+        expected = _audit_row_mac(audit, prev, key, None)
+    else:
+        expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
+    return expected is not None and hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
+    )
 
 
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
@@ -14238,6 +14460,30 @@ class MessageStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See :class:`KeyedAuditEvidenceStore`. The rows are read in one ``_read()`` snapshot; the
+        MAC runs after it is released."""
+        async with self._read() as db:
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                cur = await db.execute(sql, params)
+                return cast("Mapping[str, Any] | None", await cur.fetchone())
+
+            check = await read_newest_keyed_audit_row(
+                fetch,
+                action=action,
+                actor=actor,
+                after_seq=after_seq,
+                active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+            )
+        return await settle_newest_keyed_audit_row(check)
+
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
     # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
 
@@ -14857,18 +15103,18 @@ class MessageStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted at rest. Does **not**
-        enable MFA — enrollment is confirmed by :meth:`enable_totp` after the user proves a live code.
-        ``secret=None`` clears the staged secret."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """Stage a user's base32 TOTP secret, store-cipher encrypted at rest, only where TOTP is still
+        off (BACKLOG #3025, see :func:`totp_stage`). Does **not** enable MFA — enrollment is
+        confirmed by :meth:`enable_totp` after the user proves a live code. Returns the stored cell,
+        which :meth:`enable_totp` compares against, or ``None`` when nothing was written."""
         now = time.time() if now is None else now
         sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
-            await self._write_user(
-                user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
-            )
+            written = await self._write_user(user_id, totp_stage(sealed, now))
             await self._commit()
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged."""
@@ -14883,14 +15129,20 @@ class MessageStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
-        recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
-        whether it wrote (BACKLOG #2224, see :func:`totp_enable`)."""
+        recovery codes. Writes only where the staged secret is still ``expected_secret_cell`` and TOTP
+        is still off, and returns whether it wrote (BACKLOG #2224, #3025, see :func:`totp_enable`)."""
         now = time.time() if now is None else now
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         async with _writer_guard(self._db, self._lock):
-            written = await self._write_user(user_id, totp_enable(recovery_code_hashes, now))
+            written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
 
@@ -14985,10 +15237,11 @@ class MessageStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
-        ``_CIPHER_COLUMNS`` note). A duplicate ``(user_id, label)`` raises the backend's
-        IntegrityError — the caller renders it as the same "label already in use" error as its
-        pre-check (the concurrent-enroll race, ADR 0068 §4). The account is re-sealed over its new
-        passkey digest in the same transaction (BACKLOG #2592)."""
+        ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
+        ``(user_id, label)``, a credential id already held and an account that does not exist; the
+        caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
+        (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
+        same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
@@ -15050,19 +15303,28 @@ class MessageStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). Runs as one guarded UPDATE under the writer lock."""
+        precedent), answering :data:`SignCountAnswer`. On a miss the existence read runs in the
+        SAME write transaction as the guarded UPDATE, under the writer lock and before the commit.
+        The UPDATE takes SQLite's write lock even when it matches no row, so no writer, in this
+        process or another on the same file, can delete the passkey between the miss and the answer
+        (BACKLOG #3774)."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
                 " WHERE credential_id_hash=? AND sign_count=?",
                 (new, used_at, credential_id_hash, expected),
             )
+            answer: SignCountAnswer = "moved"
+            if cur.rowcount <= 0:
+                held = await self._db.execute(
+                    "SELECT 1 FROM webauthn_credentials WHERE credential_id_hash=?",
+                    (credential_id_hash,),
+                )
+                answer = "mismatch" if await held.fetchone() is not None else "gone"
             await self._commit()
-            return cur.rowcount > 0
+            return answer
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
         """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
@@ -15138,6 +15400,57 @@ class MessageStore:
                 assert_never(change)
             await self._commit()
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
+        by SQLite's single writer: a write that lost to one committed after this read fails busy,
+        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
+            try:
+                async with _writer_txn(self._db, self._lock):
+                    cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                    holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                    _, others = await admin_guard_counts(
+                        holders, self._row_sealer, self._read_user_record, counts_as_admin
+                    )
+                    if others:
+                        await self._db.rollback()
+                        return AdminGrant.ADMIN_EXISTS
+                    if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    await self._commit()
+                return AdminGrant.GRANTED
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc) or attempt == _ADMIN_GRANT_BUSY_ATTEMPTS:
+                    raise
+                log.info(
+                    "sqlite: the first-administrator grant met a busy database (attempt %d of %d);"
+                    " running it again so its re-read decides",
+                    attempt,
+                    _ADMIN_GRANT_BUSY_ATTEMPTS,
+                )
+                await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _delete_user_rows(self, user_id: str) -> None:
         """Delete the account and every row keyed to it. Commits nothing: the caller holds the

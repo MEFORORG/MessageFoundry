@@ -264,8 +264,11 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     # The sign count is outside the digest: a counter moved through the store keeps the set whole.
     counted = await h.account("counted")
     await store.add_webauthn_credential(_credential(counted, "pk-count"))
-    assert await store.update_webauthn_sign_count(
-        f"{counted}-pk-count", expected=0, new=7, used_at=time.time()
+    assert (
+        await store.update_webauthn_sign_count(
+            f"{counted}-pk-count", expected=0, new=7, used_at=time.time()
+        )
+        == "moved"
     )
     counted_user = await h.service._load_user(counted)
     assert counted_user is not None

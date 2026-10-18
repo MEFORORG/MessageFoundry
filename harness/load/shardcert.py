@@ -855,7 +855,7 @@ def _shown_tail(node: EngineNode) -> str:
 
 class ShardCertNode(EngineNode):
     """An :class:`EngineNode` that serves ONE shard: injects ``--shard <id>`` into the argv (and keeps
-    per-PID :meth:`kill` for the crash leg, which ``supervise()`` does not expose). Everything else —
+    a per-node :meth:`kill` for the crash leg, which ``supervise()`` does not expose). Everything else —
     the store, the graph shape, and the sink target — comes from the shared ``MEFOR_*`` env."""
 
     def __init__(
@@ -867,11 +867,7 @@ class ShardCertNode(EngineNode):
     async def start(self, *, provision: bool = True) -> None:
         if provision:
             await self.provision()
-        self._proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "messagefoundry",
-            "serve",
+        await self._spawn(
             "--config",
             self._config_dir,
             "--shard",
@@ -884,10 +880,6 @@ class ShardCertNode(EngineNode):
             # override so serve's off-loopback plaintext-MLLP gate warns instead of refusing; a co-located
             # loopback bind adds nothing (byte-identical argv — the single-box path is unchanged).
             *_insecure_bind_args(self._env),
-            env=self._env,
-            cwd=str(self._cwd),
-            stdout=self._log,
-            stderr=asyncio.subprocess.STDOUT,
         )
 
 
