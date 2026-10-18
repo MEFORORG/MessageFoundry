@@ -13,8 +13,10 @@ the HOST it runs on and silently skips a requirement whose marker does not match
 collection paths do it: through pip (pip honours the marker) and with ``--disable-pip``
 (``RequirementSource._collect_preresolved_deps`` in pip-audit 2.10.1 calls ``marker.evaluate()`` and
 ``continue``s). Measured 2026-10-17 on Windows with pip-audit from ``ci/locks/ci-scanners.lock``:
-``urllib3==1.26.0`` with no marker reports three PYSEC ids, ``; sys_platform == 'linux'`` reports
-"No known vulnerabilities found", and ``; sys_platform == 'win32'`` reports the same three ids. The
+``urllib3==1.26.0`` with no marker reports its PYSEC ids, ``; sys_platform == 'linux'`` reports
+"No known vulnerabilities found", and ``; sys_platform == 'win32'`` reports the same ids as no
+marker. (How many ids depends on the advisory database on the day: three when first measured, twelve
+when re-measured later that day.) The
 required audit runs on ``ubuntu-latest``, so that gate never audited a pin gated to Windows: at
 least ``sys_platform == 'win32'`` (sspilib, colorama) and ``os_name == 'nt'`` (colorama in
 ``release-tools.lock``). Dependabot's alerts read ``uv.lock`` separately and are not this gate. The
@@ -80,7 +82,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import python_module_argv
+from messagefoundry.childenv import hook_environment, python_module_argv
 
 
 def is_requirement_line(line: str) -> bool:
@@ -179,9 +181,11 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
 
 
 def _run(cmd: list[str]) -> int:
-    # The whole environment on purpose: pip and pip-audit read their index, proxy and certificate
-    # settings from it, and this runs in CI or by hand, never in the service.
-    return subprocess.run(cmd, check=False).returncode  # nosec B603 - fixed argv, no shell
+    # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
+    # pip and pip-audit keep the index, proxy and certificate settings they read from the
+    # environment, and an engine secret set on the same runner does not reach them.
+    env = hook_environment()
+    return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - fixed argv, no shell
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:

@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.childenv import python_module_argv
 from messagefoundry.security.audit_all_platforms import (
+    _run,
     continued_requirement_lines,
     main,
     option_lines,
@@ -201,6 +202,24 @@ def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:
     ran, run = _recorder(1)
     assert main([str(src)], run=run) == 1
     assert len(ran) == 1
+
+
+#: Exits 3 when the engine secret arrived, 4 when the control variable did not, 0 otherwise.
+_ENV_PROBE = (
+    "import os, sys; "
+    "sys.exit(3 if 'MEFOR_TEST_AUDIT_SECRET' in os.environ "
+    "else 4 if os.environ.get('PIP_TEST_AUDIT_SETTING') != 'kept' else 0)"
+)
+
+
+def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real runner hands its children childenv.hook_environment, not the whole environment.
+
+    The control, a pip-style setting, must still arrive: pip reads its index and proxy from there.
+    """
+    monkeypatch.setenv("MEFOR_TEST_AUDIT_SECRET", "marker-not-a-secret")
+    monkeypatch.setenv("PIP_TEST_AUDIT_SETTING", "kept")
+    assert _run([sys.executable, "-c", _ENV_PROBE]) == 0
 
 
 def test_the_module_needs_nothing_outside_the_standard_library() -> None:

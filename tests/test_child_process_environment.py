@@ -814,10 +814,6 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
         "service; ruff and mypy read their settings from the developer's environment, so it passes "
         "all of it plus one variable"
     ),
-    ("security/audit_all_platforms.py", "_run", "subprocess.run"): (
-        "the dependency auditor, run in CI or by hand and never by the service; pip and pip-audit "
-        "read their index, proxy and certificate settings from the developer's environment"
-    ),
     ("tray/actions.py", "_run_detached", "subprocess.Popen"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "webbrowser.open"): _TRAY_OPENS_FOR_ITS_USER,
@@ -847,6 +843,8 @@ _MUST_CHOOSE = frozenset(
         ("store/store.py", "_grant_read", "subprocess.run"),
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
+        # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
+        ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }
 )
 
