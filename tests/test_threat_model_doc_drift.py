@@ -348,8 +348,10 @@ _SCRIPT_TEXT_FLAGS: tuple[str, ...] = (
     *("encodedcommand"[:n] for n in range(2, len("encodedcommand") + 1)),
 )
 _SCRIPT_TEXT_FLAG_RE = re.compile(
-    r"(?:^|\s)(?:(?i:(?:--?|/)(?:" + "|".join(_SCRIPT_TEXT_FLAGS) + r")|/[kr]|--?eval)"
-    r"|-[a-z]{1,3}c)(?=\s|$)"
+    r"(?:^|\s)(?:(?i:(?:--?|/)(?:" + "|".join(_SCRIPT_TEXT_FLAGS) + r")|/[kr]|--?eval(?:=\S*)?)"
+    # Case kept here: lowercase -e is node's, perl's and PowerShell's script flag, and the capital
+    # -E is Python's. A short cluster ending in c, such as -lc or -Ic, is a shell or Python -c.
+    r"|-e|-[A-Za-z]{1,3}c)(?=\s|$)"
 )
 _ALLOWED_SHELL_SITES: dict[str, str] = {
     "pipeline/dr.py": "[dr].takeover_hook / release_hook run via create_subprocess_shell",
@@ -1156,8 +1158,10 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
 
     The table previously asserted "list-form argv, **never** ``shell=True``" as a universal, which was
     false — ``[dr]``'s hooks run through ``create_subprocess_shell`` and Windows service control
-    launches an elevated ``cmd.exe``/``powershell.exe``. The doc now names both as deliberate
-    exceptions with their own guards; a NEW shell site anywhere else must add a row.
+    launches an elevated ``cmd.exe``/``powershell.exe``. Every site in ``_ALLOWED_SHELL_SITES`` is a
+    deliberate exception with its own guard; a NEW shell site anywhere else must add a row. Two
+    scans feed it: the token scan over code, and the literal scan for a flag that hands an
+    interpreter script text (BACKLOG #3277).
     """
     found = _shell_sites(_scanned_code()) | _script_text_sites(_scanned_source())
     expected = set(_ALLOWED_SHELL_SITES)
@@ -1204,6 +1208,9 @@ def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
         'run(["cmd.exe", "/K", line])',
         'run(["cmd.exe", "/r", line])',
         'run(["node", "--eval", text])',
+        'run(["node", "--eval=x"])',
+        'run(["powershell.exe", "-e", blob])',
+        'run([sys.executable, "-Ic", code])',
     ],
 )
 def test_the_script_text_scan_fires(source: str) -> None:

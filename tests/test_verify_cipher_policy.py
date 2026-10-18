@@ -977,6 +977,64 @@ def test_a_graph_that_does_not_load_is_unknown_and_says_why(
     assert unknown is not None and "did not load: bad graph" in unknown
 
 
+def test_the_default_config_dir_is_not_the_deployments_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """argparse fills in ``samples/config`` when ``--config`` is left out; the sample graph has no
+    hop, and a SKIP from it would hide the deployment's."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.settings import ServiceSettings
+
+    def must_not_load(d: object, allow_empty: bool = False) -> object:
+        raise AssertionError("the sample graph was read as the deployment's")
+
+    monkeypatch.setattr(wiring, "load_config", must_not_load)
+    unknown = _hops(Path("samples/config"), settings=ServiceSettings()).unknown
+    assert unknown is not None and "pass --config" in unknown
+
+
+def test_a_config_module_that_exits_leaves_the_census_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.config import wiring
+
+    def exits(d: object, allow_empty: bool = False) -> object:
+        raise SystemExit(1)
+
+    monkeypatch.setattr(wiring, "load_config", exits)
+    unknown = _hops(tmp_path).unknown
+    assert unknown is not None and "did not load" in unknown
+
+
+def test_an_inbound_database_connection_is_a_hop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection
+
+    poll = InboundConnection(
+        name="IB_DB", spec=ConnectionSpec(type=ConnectorType.DATABASE, settings={}), router="r"
+    )
+    _registry_with(monkeypatch, inbound={"IB_DB": poll})
+    assert _hops(tmp_path).found == ("DATABASE connection IB_DB",)
+
+
+def test_another_platform_takes_no_census(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reading SKIPs off Windows and Linux, so the config modules are not run for it."""
+
+    def must_not_run() -> checks.OdbcHops:
+        raise AssertionError("the census ran where the reading can only SKIP")
+
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    monkeypatch.setattr(
+        cipher_policy,
+        "read_host_cipher_policy",
+        lambda: CheckResult("host.ciphers", "t", Status.SKIP, "not darwin"),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert checks.check_host_cipher_policy(must_not_run).status is Status.SKIP
+
+
 def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _hide_pyodbc(monkeypatch)
     results = checks.run_host_checks(

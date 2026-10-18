@@ -62,7 +62,7 @@ these things still write:
 | What | When | What it writes |
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
-| `host.ciphers` | a host run on Windows that reads the policy (DEPLOY-SERVER-DB.md section 5.4 says when) | nothing of its own; the Windows PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
+| `host.ciphers` | a host run where `pyodbc` is installed, on Windows or Linux (DEPLOY-SERVER-DB.md section 5.4 says what it reads) | nothing of its own. Its hop census loads the `--config` graph, which can leave Python's `__pycache__` files in that folder, as the self smoke can. On Windows, the PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
 | `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 

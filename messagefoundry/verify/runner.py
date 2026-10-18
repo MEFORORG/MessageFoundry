@@ -28,6 +28,8 @@ from messagefoundry.verify.smoke import (
 ALL_SECTIONS: tuple[str, ...] = ("host", "store", "smoke", "manual", "federation")
 
 _DEFAULT_DICOM_PORT = 11112
+#: The ``--config`` default, which is the sample graph.
+_DEFAULT_CONFIG_DIR = "samples/config"
 _DEFAULT_API_PORT = 8765
 
 # Human-on-the-box steps the verifier cannot self-check — echoed MANUAL with instructions, never faked.
@@ -111,12 +113,16 @@ def _odbc_hops(
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.redaction import codec_safe_str
 
+    if Path(config_dir) == Path(_DEFAULT_CONFIG_DIR):
+        # The CLI fills this in when --config is left out, so it is not the deployment's graph.
+        return OdbcHops(unknown=f"--config was left at {_DEFAULT_CONFIG_DIR!r}; pass --config")
     if not Path(config_dir).is_dir():
         return OdbcHops(unknown=f"no config dir at {config_dir!r}; pass --config")
     try:
         # allow_empty: an empty graph takes no hop, which is an answer, not an unknown.
         reg = load_config(config_dir, allow_empty=True)
-    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
+        # SystemExit: a config module that exits at import must not end the verify run.
         reason = codec_safe_str(exc)[:200]
         return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
     database = sorted(
@@ -236,7 +242,7 @@ def _run_live_smoke(
 
 def run_verify(
     *,
-    config_dir: str = "samples/config",
+    config_dir: str = _DEFAULT_CONFIG_DIR,
     service_config: str | None = None,
     sections: Sequence[str] | None = None,
     smoke_mode: str = "self",

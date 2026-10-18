@@ -342,18 +342,18 @@ environment name into its command line. What holds both: the code refuses a serv
 environment name with any character outside a short safe set, before it builds the line. It also
 pins `cmd.exe`, `net.exe` and `powershell.exe` to the system directory.
 
+The install line also carries the installer script's path, which is not checked the same way. The
+code finds `scripts/service/install-service.ps1` beside the installed package and runs it as
+administrator with `-ExecutionPolicy Bypass`. So that script is only as safe as the folder it sits
+in: whoever can write there can run code as administrator the next time someone installs the
+service.
+
 **The host cipher read gives PowerShell script text.** On Windows, `verify/cipher_policy.py` starts
 the system-directory `powershell.exe` with `-Command` and a script, so PowerShell parses and runs
 that text, as a shell runs a shell string. The script is a constant in the module: no host data,
 setting or message reaches it, and it calls `Get-TlsCipherSuite` through the system TLS module
 imported by its path, never by name. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
-
-The install line also carries the installer script's path, which is not checked the same way. The
-code finds `scripts/service/install-service.ps1` beside the installed package and runs it as
-administrator with `-ExecutionPolicy Bypass`. So that script is only as safe as the folder it sits
-in: whoever can write there can run code as administrator the next time someone installs the
-service.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,

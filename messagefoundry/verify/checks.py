@@ -21,6 +21,7 @@ import ast
 import importlib
 import importlib.metadata
 import importlib.util
+import logging
 import socket
 import sys
 import tempfile
@@ -37,6 +38,8 @@ from messagefoundry.verify.model import FAILING, CheckResult, Status
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import AuthSettings, StoreSettings
+
+_log = logging.getLogger(__name__)
 
 
 def _can_import(module: str) -> bool:
@@ -160,12 +163,15 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             "pyodbc is not installed in this Python, so no ODBC hop runs from it; run verify "
             "from the engine's own environment to read the policy",
         )
+    if sys.platform != "win32" and not sys.platform.startswith("linux"):
+        # The reading SKIPs here, so the census, which runs config modules, is not taken.
+        return cipher_policy.read_host_cipher_policy()
     try:
         hops = odbc_hops()
     except Exception as exc:  # a census failure the census did not foresee: it read nothing
-        hops = OdbcHops(
-            unknown=f"the hop census raised {type(exc).__name__}: {codec_safe_str(exc)}"
-        )
+        _log.warning("host.ciphers: the ODBC hop census raised %s", type(exc).__name__)
+        reason = codec_safe_str(exc)[:200]
+        hops = OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
     if not hops.found and hops.unknown is None:
         return CheckResult(
             rid,

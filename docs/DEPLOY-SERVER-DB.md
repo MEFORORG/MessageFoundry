@@ -795,11 +795,11 @@ uses.
 The answer is unknown where at least one of these holds: the graph did not load or there is no
 `--config` directory; the service settings did not load; they came from the defaults alone, with
 no `--service-config`, no `./messagefoundry.toml` and no `MEFOR_STORE_BACKEND`, because the store
-could then be SQL Server; or the only DATABASE connection uses the generic dialect, whose driver
-brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
+could then be SQL Server; or every DATABASE connection found uses the generic dialect, whose
+driver brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
 MANUAL with the reading in its detail. Run `verify` with `--config` and `--service-config` naming
-the deployment's own, to get a FAIL that counts. With no `--config`, the folder read is
-`samples/config` under the working directory, which is not the deployment's graph.
+the deployment's own, to get a FAIL that counts. Without `--config` the answer is unknown too,
+because the default, `samples/config`, is the sample graph.
 
 It runs the commands of this step. It differs from them in at least the ways named here:
 
