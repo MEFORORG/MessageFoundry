@@ -843,6 +843,8 @@ _MUST_CHOOSE = frozenset(
         ("store/store.py", "_grant_read", "subprocess.run"),
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
+        # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
+        ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }
 )
 

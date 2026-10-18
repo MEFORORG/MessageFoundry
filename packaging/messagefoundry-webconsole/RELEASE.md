@@ -69,8 +69,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 - [ ] `uv lock` + `uv export` on the engine — the cyclic optional dep
       `messagefoundry[webconsole]` → `messagefoundry-webconsole` → `messagefoundry` resolves once the
       wheel is published. Confirm `requirements.lock` updates and stays in sync (DEP-1).
-- [ ] Run the **DEP-1 audit** (`pip-audit` on the lockfile) and confirm the second distribution is
-      covered — no known-CVE pins.
+- [ ] Run the **DEP-1 audit** with `python scripts/security/audit_all_platforms.py requirements.lock`
+      and confirm the second distribution is covered — no known-CVE pins. Not a bare
+      `pip-audit -r requirements.lock`; `messagefoundry/security/audit_all_platforms.py` says why.
 - [ ] Verify the cyclic optional dep resolves under **both** `uv lock` and plain `pip`.
 
 ## 4. SBOM + publish/mirror wiring
