@@ -1675,10 +1675,9 @@ started together, can each raise it; the alert list folds them into one instance
   file both fingerprints cover still alerts.
 - The start fingerprints the directory just before it loads it and again just after. When the two
   differ, or the first cannot be taken, the comparison is `changed_during_load`, and the start is
-  still compared, on the fingerprint taken after the load. When that one matches the baseline but
-  the one taken before the load does not, the alert names the one taken before, since the process
-  may have loaded those bytes. When both cover the same files and still differ, `GET
-  /config/provenance` also has no loaded fingerprint to vouch for until the next reload. The two
+  still compared, on the fingerprint taken after the load. When both cover the same files and still
+  differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
+  reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
   reads miss at least an edit that lands and is reverted between them, and a module the loader runs
   from a still-valid `__pycache__` bytecode file rather than from its source.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at

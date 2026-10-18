@@ -2262,10 +2262,17 @@ class _StartConfigComparison:
     baseline_actor: str | None
     baseline_at: str
     baseline_node: str | None
+    #: What each digest left out (:func:`digest_coverage`). The fold does not hash this list, so a
+    #: partial digest can equal a whole one over other files: coverage is compared too (vault
+    #: BACKLOG #3765).
+    left_out: tuple[str, ...] = ()
+    previous_left_out: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
-        return not fingerprint_matches(self.fingerprint, self.previous_fingerprint)
+        return self.left_out != self.previous_left_out or not fingerprint_matches(
+            self.fingerprint, self.previous_fingerprint
+        )
 
 
 def _iso_utc(ts: Any) -> str:
@@ -2344,17 +2351,17 @@ async def _compare_start_config(
     ``before_load`` is the digest the caller took of the directory it loads, just before the load
     (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
     two reads could be recorded as loaded. When the two digests differ, or the first could not be
-    taken, the outcome is ``changed_during_load``. The comparison still runs on the start's own
-    digest, and when that one matches the baseline but ``before_load`` covers the same files as
-    the baseline and does not, the comparison uses ``before_load``: the process may run those
-    bytes. Two reads miss at least two cases: an edit that lands and is reverted between them, and
+    taken, the outcome is ``changed_during_load``, and the comparison still runs on the start's own
+    digest, as main's did. The caller also stops the process vouching for that digest. Two reads
+    miss at least two cases: an edit that lands and is reverted between them, and
     a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
     source the digests hash.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
     start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it
     left out; a whole start that meets a partial baseline is ``partial_baseline``. Either pages
-    when the digests differ, and two digests that left out different files always differ.
+    when the digests differ, and two digests that left out different files count as different
+    (:attr:`_StartConfigComparison.changed`).
 
     ``read_failed`` and ``no_start_digest`` carry no comparison and leave the start unchecked
     (:data:`_UNCHECKED_OUTCOMES`), so a later start compares against the last checked row instead.
@@ -2437,23 +2444,17 @@ async def _compare_start_config(
             if baseline_left_out
             else "compared"
         )
-        judged = current
-        if (
-            fingerprint_matches(current, previous)
-            and before is not None
-            and before[1] == baseline_left_out
-            and not fingerprint_matches(before[0], previous)
-        ):
-            judged = before[0]  # the start may have loaded these bytes; see the docstring
         node = detail.get("node")
         actor = row.get("actor")
         return outcome, _StartConfigComparison(
-            fingerprint=judged,
+            fingerprint=current,
             previous_fingerprint=previous,
             baseline_action=str(row.get("action")),
             baseline_actor=actor if isinstance(actor, str) else None,
             baseline_at=_iso_utc(row.get("ts")),
             baseline_node=node if isinstance(node, str) else None,
+            left_out=left_out,
+            previous_left_out=baseline_left_out,
         )
     except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
         _log.warning(
@@ -10700,7 +10701,7 @@ def create_managed_app(
                 await engine.seed_config_version()
                 # The digest of the directory the load reads, just before it, set against the
                 # one taken just after it below, so an edit between the load and that digest is
-                # marked changed_during_load and judged on both digests (vault BACKLOG #2944).
+                # marked changed_during_load and not vouched for (vault BACKLOG #2944).
                 # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
                 # which reads as a changed directory.
                 before_load: Mapping[str, object] | None = None
@@ -10753,8 +10754,12 @@ def create_managed_app(
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 if _moved_during_load(before_load, start_loaded):
                     # The digest may name bytes this process never loaded, so the provenance route
-                    # and a DR activation must not vouch for it (vault BACKLOG #2944).
+                    # and a DR activation must not vouch for it (vault BACKLOG #2944). Its flag
+                    # rows then carry no digest, so they are marked unchecked too: a later start
+                    # passes over them to this start's row rather than reading one as a degraded
+                    # baseline and comparing nothing (vault BACKLOG #3765).
                     engine.loaded_config_fingerprint = None
+                    engine.config_baseline_unchecked = True
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises.
                 if start_config is not None and start_config.changed:

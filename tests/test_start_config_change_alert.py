@@ -1073,7 +1073,8 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
     """Item 5: an edit between the load and the start's digest was recorded as loaded. Here the
     start loads edited bytes and the edit is reverted before the digest, so without the check the
     row named the baseline's bytes and no start ever reported the change this one ran. main did
-    not page here; the digest taken before the load adds that page (vault BACKLOG #3765)."""
+    not page at this start either; the marker and the withheld provenance are what it adds, and
+    the next start on the edited bytes pages (vault BACKLOG #3765)."""
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
     original = (cfg / "cfg.py").read_bytes()
@@ -1090,18 +1091,17 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
         async with app.router.lifespan_context(app):
             engine: Engine = app.state.engine
             provenance_after = engine.loaded_config_fingerprint
+            unchecked_after = engine.config_baseline_unchecked
             rows = await _start_rows(engine)
     assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
-    assert len(alerts) == 1
-    assert alerts[0]["previous_fingerprint"] == before and alerts[0]["fingerprint"] != before
-    assert alerts[0]["comparison"] == "changed_during_load"
-    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
+    assert alerts == []
+    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is False
     assert "baseline_unchecked" not in rows[-1]
     assert provenance_after is None, "the digest may name bytes the process never loaded"
-    # The row recorded the digest after the load, so a start on the edited bytes pages again.
+    assert unchecked_after is True, "its flag rows carry no digest, so they are no baseline"
     _edit(cfg)
     rows = await _start(tmp_path, cfg)
-    assert len(alerts) == 2 and alerts[1]["previous_fingerprint"] == before
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
     assert rows[-1]["comparison"] == "compared"
 
 
@@ -1287,6 +1287,22 @@ async def test_an_edit_that_lands_during_the_start_load_pages(
     assert (alerts[0]["fingerprint"], alerts[0]["previous_fingerprint"]) == (after, before)
     assert alerts[0]["comparison"] == "changed_during_load"
     assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
+
+
+async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 1: the fold does not hash what a digest left out, so a new module locked only
+    while the start digested it folds to the baseline's value. Coverage is compared too."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    (cfg / "_new.py").write_text("NEW = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_new.py")
+        assert config_fingerprint(cfg) == before, "control: the fold matches the baseline's"
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["comparison"] == "partial_start_digest"
+    assert rows[-1]["changed"] is True
 
 
 async def test_the_convergence_row_writes_the_fingerprint_it_judged(
