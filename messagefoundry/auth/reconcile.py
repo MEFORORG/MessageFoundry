@@ -37,7 +37,8 @@ referrals and failures aborts as ``directory_referral``, which judges no account
 and alerts. Such a pass, like an outage, still strikes an UNKEYED row (BACKLOG #3170).
 
 A probe fault is not an outage either (BACKLOG #3100). A :attr:`ProbeOutcome.FAULT` account, whose
-probe raised something that is not an LDAP error, is left unjudged like an unreachable one, and
+probe raised something that is not an LDAP error, or a response ldap3 could not decode, is left
+unjudged like an unreachable one, and
 unlike one it alerts on every pass that probes it. A pass whose only answers are faults and failures,
 at least one a fault, aborts as ``probe_fault``, which judges no account it asked about and alerts.
 It too still strikes an UNKEYED row (BACKLOG #3170).
@@ -85,7 +86,8 @@ class ProbeOutcome(Enum):
     #: outcome whatever its account state, because it is not this account's entry.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config — other than a
-    #: referral), or a network-class ``OSError`` escaped the directory layer (BACKLOG #3100).
+    #: referral or a response ldap3 could not decode), or a network-class ``OSError`` escaped the
+    #: directory layer (BACKLOG #3100).
     #: Contributes nothing: no strike, no revocation, no strike reset.
     UNAVAILABLE = "unavailable"
     #: The directory answered with a referral, which the engine never follows (``LdapReferralError``,
@@ -96,9 +98,10 @@ class ProbeOutcome(Enum):
     #: being judged.
     REFERRED = "referred"
     #: The probe raised something that is neither an ``LdapError`` nor a network-class ``OSError``
-    #: (:attr:`UNAVAILABLE` takes both): the engine failed to read whatever
-    #: came back, such as a malformed entry or a defect in the directory layer (BACKLOG #2241,
-    #: #3100). It says nothing about the account, so it contributes nothing, like
+    #: (:attr:`UNAVAILABLE` takes both), or ``LdapUndecodableError``, which is an ``LdapError``
+    #: (vault BACKLOG #3696 item 2): the engine failed to read whatever came back, such as a
+    #: malformed entry, a response ldap3 could not decode, or a defect in the directory layer
+    #: (BACKLOG #2241, #3100). It says nothing about the account, so it contributes nothing, like
     #: :attr:`UNAVAILABLE`: no strike, no revocation, no strike reset, no recorded outcome, and it
     #: never moves the ADR 0195 hold. Unlike it, it is not an outage and it alerts, because it
     #: recurs on every pass until the entry or the engine is fixed, and read as unavailable it
