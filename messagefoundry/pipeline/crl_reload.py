@@ -841,7 +841,7 @@ def _failed(key: str, exc: Exception) -> None:
         log.error("crl_reload: could not check %s for a replacement", key, exc_info=exc)
 
 
-def _judged(
+def _record_judgment(
     key: str, pairs: Sequence[tuple[ssl.SSLContext, HeldCrl]], judged: dict[str, str]
 ) -> None:
     """Record that this pass judged the file at ``key``. A failure on it has then ended, so the
@@ -872,7 +872,7 @@ def _pending(judged: dict[str, str]) -> tuple[dict[str, _Change], list[ReloadOut
         if isinstance(verdict, _Change):
             pending[key] = verdict  # judged once the reload has run on it
             continue
-        _judged(key, pairs, judged)
+        _record_judgment(key, pairs, judged)
         if isinstance(verdict, ReloadRefusal):
             # A verdict the reload treats as final is not judged again, so the count is taken
             # here: the contexts that do not hold the refused bytes.
@@ -936,7 +936,7 @@ def reload_replaced_crls(
                 continue
             if outcome is _Unread.UNREAD:
                 continue
-            _judged(key, current[key], judged)
+            _record_judgment(key, current[key], judged)
             if outcome is not None:
                 outcomes.append(outcome)
     return outcomes
@@ -1142,9 +1142,12 @@ class CrlReloadRunner:
         judged (:data:`_JUDGED`).
 
         The pass fills that mapping under its lock, and the loop reads it only once this returns,
-        so the loop never reads the pass state, which a pass abandoned by an earlier runner's
-        :meth:`stop` may still be changing. An injected ``reload`` that runs no real pass judges
-        nothing, so its passes clear nothing at first sight."""
+        so the first-sight clear never reads the pass state (:data:`_SEEN`, :data:`_UNREADABLE`,
+        :data:`_FAILED`), which a pass abandoned by an earlier runner's :meth:`stop` may still be
+        changing. That does not reach the refusal record the clear also reads
+        (:func:`~messagefoundry.config.loaded_crls.reload_refusals`): such a pass can still change
+        it under the loop, and the next pass reads it afresh. An injected ``reload`` that runs no
+        real pass judges nothing, so its passes clear nothing at first sight."""
         judged: dict[str, str] = {}
         token = _JUDGED.set(judged)
         try:
@@ -1215,16 +1218,16 @@ class CrlReloadRunner:
         Each outcome is guarded on its own: one of an odd shape must not end the loop that
         applies revocations, nor hold back the outcomes after it or the clears. A refusal this
         pass returned an outcome for counts as judged by it, for :meth:`_remind`."""
-        judged: set[str] = set()
+        refused: set[str] = set()
         for outcome in outcomes if isinstance(outcomes, list) else ():
             if isinstance(outcome, ReloadOutcome) and outcome.refusal is not None:
                 try:
-                    judged.add(self._raise_refused(outcome, outcome.refusal))
+                    refused.add(self._raise_refused(outcome, outcome.refusal))
                 except Exception:
                     # Broad on purpose, as for the pass. A sink that raises is handled inside;
                     # this is an outcome the report itself could not read.
                     log.exception("crl_reload: could not report a refused file; will retry")
-        self._follow_record(judged)
+        self._follow_record(refused)
 
     def _follow_record(self, judged: Collection[str] = ()) -> None:
         """Bring the open alerts in line with the refusal record: resolve each one whose refusal

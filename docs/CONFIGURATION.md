@@ -2007,9 +2007,10 @@ by hand was never sent again. Each reminder is another occurrence of the alert, 
 stands. Neither acknowledging the alert nor resolving it by hand stops the reminders; suspending
 it mutes their pages. While the engine cannot read the file, a
 reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
-again every pass, such as `wait` or one that carries `start_refuses`, can name a time that has
-passed, so a reminder for it goes only from a reload pass that read the file and judged it
-again, and never while the engine cannot read the file. A read that hangs
+again every pass gets a reminder only from a reload pass that judged it again, and none while the
+engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer` and
+one that carries `start_refuses`: such a refusal can name a time that has passed, or lift on its
+own. A read that hangs
 rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
 reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
 refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
@@ -2033,8 +2034,7 @@ A file the engine cannot read resolves nothing, and neither does a reload pass t
 engine also resolves its open alerts when it stops, because a restart builds every hop from the
 file. An engine that dies without stopping leaves its alert open (vault BACKLOG #3543). Its next
 start under the same identity resolves it at the first reload pass that judges the file, if a
-hop still holds the file and the engine refuses nothing in it. A pass that cannot read the file,
-or fails on it, judges nothing. Resolve any other in the alert list: one for a file no hop
+hop still holds the file and the engine refuses nothing in it. Resolve any other in the alert list: one for a file no hop
 holds now, and one raised under an identity that changes on every start, as an unpinned cluster
 node's does. A
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped

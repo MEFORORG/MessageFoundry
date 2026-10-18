@@ -1289,11 +1289,13 @@ async def test_an_unreadable_pass_does_not_end_a_failing_streak(
 async def test_a_file_the_reload_cannot_read_is_not_judged_at_first_sight(
     pki: _Pki, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #3543, review findings 2 and 3, where the reload itself reads the file. With
-    its stamp unchanged since the triage last read it, the triage hands the reload no bytes, and
-    the reload reads them. A file that still stats but cannot be read there judged nothing, so it
-    must not clear an earlier run's alert. Here no refusal stands, because the reload before it
-    failed, so only that rule holds the clear back."""
+    """Vault BACKLOG #3543: the guard for the reload's own ``_Unread.UNREAD`` return, which the
+    fixes for review findings 2 and 3 added. The code before them passes this too, through its
+    ``_UNREADABLE`` check, so it pins the new return, not those findings. With its stamp unchanged
+    since the triage last read it, the triage hands the reload no bytes, and the reload reads
+    them. A file that still stats but cannot be read there judged nothing, so it must not clear
+    an earlier run's alert. Here no refusal stands, because the reload before it failed, so only
+    that rule holds the clear back."""
     hop = pki.outbound_hop()
     sink = _Sink()
     runner = _runner(sink)
