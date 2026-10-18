@@ -2169,7 +2169,8 @@ async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, was_available: bool
 ) -> None:
     """The refusal must not hide the link. Nor may it clear a real outage: the token endpoint
-    answered, but no sign-in succeeded, and only a completed login clears the flag (AC-8)."""
+    answered, but no token was verified, and only a verified token clears the flag (AC-8, ADR 0142
+    Amendment G)."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)

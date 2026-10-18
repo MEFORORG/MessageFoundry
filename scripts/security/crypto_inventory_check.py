@@ -294,6 +294,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1352 / #1171: every private-key TLS load goes through keywrap.load_checked_cert_chain,
     # which checks the key's passphrase wrap and then calls load_cert_chain; ssl for that one call.
     "messagefoundry/keywrap.py": frozenset({"ssl"}),
+    # Vault BACKLOG #3302: subclasses ssl.SSLObject to OBSERVE a failed inbound handshake the event
+    # loop ran, and installs it as a server context's sslobject_class. It re-raises unchanged, and
+    # builds no context, loads no key and chooses no algorithm, so section 4 gains no row.
+    "messagefoundry/tls_handshake_failures.py": frozenset({"ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
@@ -911,6 +915,11 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/tls_handshake_failures.py": (
+        "subclasses ssl.SSLObject to observe a failed handshake and re-raise it, and sets a "
+        "server context's sslobject_class; the contexts it watches are built in transports/mllp.py "
+        "and api/tls.py, which are inventoried"
+    ),
     "messagefoundry/pipeline/dr.py": (
         "names HopPosture, a value type, to hand the engine's posture to the cold-seed verify; "
         "that verify runs in pipeline/dr_backup.py, which is inventoried"
@@ -981,8 +990,14 @@ IMPORT_ONLY: dict[str, str] = {
 #: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
 #: import arm never saw carry their own.
 OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # Vault BACKLOG #2796: a rig account with an authenticator key signs in with a TOTP code the
+    # engine's own messagefoundry.auth.totp computes (HMAC-SHA-256), imported where it is used.
     "harness/load/rigadmin.py": frozenset(
-        {"csprng:secrets.token_hex", "tls_context:ssl.create_default_context"}
+        {
+            "csprng:secrets.token_hex",
+            "mac:via messagefoundry.auth.totp",
+            "tls_context:ssl.create_default_context",
+        }
     ),
     "harness/load/tlsmat.py": frozenset(
         {
@@ -1773,11 +1788,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # enginepoll.py also signs its clients in as the rig Administrator (vault BACKLOG #2719),
-    # which reaches that module's password draw and its verifying TLS context.
+    # which reaches that module's password draw, its verifying TLS context, and the TOTP code a
+    # rig account with an authenticator key signs in with (vault BACKLOG #2796).
     "harness/load/enginepoll.py": frozenset(
         {
             "csprng:via harness.load.rigadmin",
             "key_cert:via harness.load.tlsmat",
+            "mac:via harness.load.rigadmin",
             "sign_verify:via harness.load.tlsmat",
             "tls_context:via harness.load.rigadmin",
         }
@@ -1839,7 +1856,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/verify/runner.py": frozenset(
-        {"hash:via messagefoundry.verify.smoke", "tls_context:via messagefoundry.verify.smoke"}
+        {
+            "hash:via messagefoundry.verify.smoke",
+            "tls_context:via messagefoundry.verify.smoke",
+            # BACKLOG #3277: the host.ciphers hop census loads the config graph (load_config's
+            # digest, vault BACKLOG #2724), as the self smoke does.
+            "hash:via messagefoundry.config.wiring",
+        }
     ),
     # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import random
@@ -15,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import privilege_check, terminal_text
 from messagefoundry.controlchars import CONTROL_CATEGORIES
+from messagefoundry.privilege_probes import VaultTokenReading
 from messagefoundry_toolkit import __main__ as toolkit
 from messagefoundry_toolkit import adr_analyze
 from messagefoundry_toolkit.__main__ import main
@@ -435,12 +438,98 @@ def test_the_terminal_escapes_the_log_categories_on_a_cp1252_console(
     codes = {0xD800: "Cs", 0xE000: "Co", 0xFFFF: "Cn"}
     # The categories this test is about, read from the interpreter rather than assumed.
     assert {code: unicodedata.category(chr(code)) for code in codes} == codes
-    # The set the function actually reads, so a local copy of the categories cannot pass.
-    used = toolkit._print_record_line.__globals__["CONTROL_CATEGORIES"]
-    assert used is CONTROL_CATEGORIES, "a copy, not the engine's own set"
+    # The rule the function actually calls, and the set that rule reads, so a local copy of
+    # either cannot pass (BACKLOG #2891 moved the toolkit onto the shared rule).
+    used = toolkit._print_record_line.__globals__["escape_for_terminal"]
+    assert used is terminal_text.escape_for_terminal, "a local rule, not the shared one"
+    assert terminal_text.CONTROL_CATEGORIES is CONTROL_CATEGORIES, "a copy, not the engine's set"
     raw = io.BytesIO()
     console = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline="")
     monkeypatch.setattr(sys, "stdout", console)
     toolkit._print_record_line("a" + "".join(chr(code) for code in codes) + "\\z")
     console.flush()
-    assert raw.getvalue() == b"a\\ud800\\ue000\\uffff\\\\z\n"
+    # The backslash before ``z`` stays single: it cannot read as an escape there.
+    assert raw.getvalue() == b"a\\ud800\\ue000\\uffff\\z\n"
+
+
+def test_a_fullwidth_backslash_cannot_spell_a_fake_escape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fullwidth reverse solidus (U+FF3C) is printable, so the toolkit keeps it, and before
+    BACKLOG #2891 it printed ``x1b`` after it unchanged: a line that reads as an escaped ESC the
+    record never held. The shared rule escapes a kept character standing before an escape body."""
+    toolkit._print_record_line(f"open item: {chr(0xFF3C)}x1b and {chr(0xFF3C)} alone")
+    out = capsys.readouterr().out
+    assert out == "open item: \\uff3cx1b and \uff3c alone\n"
+
+
+#: One code point for each category in ``CONTROL_CATEGORIES``, built from integers so no editor
+#: can show or rewrite them. The test below checks the sample covers the set exactly, so a widened
+#: set cannot pass with the sample left behind.
+_ONE_PER_CATEGORY = {
+    "Cc": 0x9B,
+    "Cf": 0x200B,
+    "Zl": 0x2028,
+    "Zp": 0x2029,
+    "Cs": 0xD800,
+    "Co": 0xE000,
+    "Cn": 0xFFFF,
+}
+
+
+def _disagreements() -> list[str]:
+    """Every place one of the three terminal-text callers fails to treat a code point of
+    ``CONTROL_CATEGORIES`` as dangerous (BACKLOG #2891): the toolkit report line and the
+    ``check-privileges`` text must print it as its visible escape, and the root comparison
+    in ``privilege_check.printable`` must strip it. The escape is looked for, not the raw
+    character's absence, because ``_safe_print`` turns an unencodable one into ``?``."""
+    consumer = privilege_check.VaultConsumer("vault.store", "kek", "store key", "read the KEK")
+    found = []
+    for category, code in _ONE_PER_CATEGORY.items():
+        char, escape = chr(code), f"\\u{code:04x}"
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            toolkit._print_record_line(f"item a{char}b")
+        if escape not in printed.getvalue():
+            found.append(f"the toolkit line does not escape {category}")
+        reading = VaultTokenReading(looked_up=True, policies=(f"p{char}q",))
+        hop = privilege_check.vault_hop(consumer, reading)
+        if escape not in "\n".join(privilege_check.render_text([hop])):
+            found.append(f"the check-privileges text does not escape {category}")
+        if privilege_check.printable(f"ro{char}ot") != "root":
+            found.append(f"the root comparison does not strip {category}")
+    return found
+
+
+def test_the_three_terminal_text_callers_agree_on_the_dangerous_categories() -> None:
+    assert set(_ONE_PER_CATEGORY) == CONTROL_CATEGORIES
+    assert all(unicodedata.category(chr(c)) == k for k, c in _ONE_PER_CATEGORY.items())
+    assert vars(privilege_check)["CONTROL_CATEGORIES"] is CONTROL_CATEGORIES, (
+        "a copy, not the engine's set"
+    )
+    assert _disagreements() == []
+
+
+def test_the_agreement_check_fails_when_the_root_comparison_diverges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: the comparison's rule before BACKLOG #2891, category ``C*``, which left the line
+    and paragraph separators in."""
+    old = frozenset(c for c in CONTROL_CATEGORIES if c.startswith("C"))
+    monkeypatch.setattr(privilege_check, "CONTROL_CATEGORIES", old)
+    assert _disagreements() == [
+        "the root comparison does not strip Zl",
+        "the root comparison does not strip Zp",
+    ]
+
+
+def test_the_agreement_check_fails_when_the_shared_terminal_rule_diverges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: a shared rule that stopped escaping the line separator reaches the toolkit line,
+    and the check-privileges text, which both keep printable Unicode, and the check names both."""
+    monkeypatch.setattr(terminal_text, "CONTROL_CATEGORIES", CONTROL_CATEGORIES - {"Zl"})
+    assert _disagreements() == [
+        "the toolkit line does not escape Zl",
+        "the check-privileges text does not escape Zl",
+    ]

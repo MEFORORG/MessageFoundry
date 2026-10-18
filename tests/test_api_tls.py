@@ -667,8 +667,9 @@ def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]
         ("10.0.0.1/24", "10.0.0.1", "10.0.0.0/24"),
         ("10.1.2.3/0", "10.1.2.3", "0.0.0.0/0"),
         ("fd00::1/64", "fd00::1", "fd00::/64"),
-        # A zone survives into the suggested address: uvicorn compares a scoped peer with its zone.
-        ("fe80::1%eth0/64", "fe80::1%eth0", "fe80::/64"),
+        # The zone is dropped from the suggested address: a peer is reported without one, and a
+        # zoned host entry would never equal it (BACKLOG #3042).
+        ("fe80::1%eth0/64", "fe80::1", "fe80::/64"),
     ],
 )
 def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, network: str) -> None:
@@ -706,6 +707,213 @@ def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, netw
         assert "Trust that range only if every host in it is a proxy" in message
     # Both names load.
     ApiSettings(trusted_proxies=[network], tls_terminated_upstream=True)
+    ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
+
+
+def _link_local_peer() -> tuple[str, int]:
+    """The host string and scope id CPython reports for a peer on a link-local socket, measured by
+    connecting to one. Skips where the host has no link-local address to bind."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6)
+    except OSError:
+        pytest.skip("no IPv6 address to resolve")
+    link_local = [info[4] for info in infos if info[4][0].lower().startswith("fe80")]
+    if not link_local:
+        pytest.skip("no link-local IPv6 address on this host")
+    host, _, _, scope = link_local[0][:4]
+    try:
+        with socket.socket(socket.AF_INET6) as server, socket.socket(socket.AF_INET6) as client:
+            server.bind((host, 0, 0, scope))
+            server.listen()
+            client.connect(server.getsockname())
+            conn, peer = server.accept()
+            conn.close()
+    except OSError as exc:
+        pytest.skip(f"cannot connect over link-local: {exc}")
+    return peer[0], scope
+
+
+def test_a_link_local_peer_is_reported_without_its_zone() -> None:
+    """BACKLOG #3042's premise for refusing a zoned host entry, measured rather than assumed: CPython
+    reports a link-local peer's host WITHOUT its zone (the zone is the tuple's scope id), which is
+    the string uvicorn's ``get_remote_addr`` hands ``_TrustedHosts``. So the zoneless entry matches
+    and the zoned one never does."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    host, scope = _link_local_peer()
+    assert "%" not in host
+    assert host in _TrustedHosts([host])
+    assert host not in _TrustedHosts([f"{host}%{scope}"])
+    ApiSettings(trusted_proxies=[host], tls_terminated_upstream=True)
+    with pytest.raises(ValidationError, match="is an IPv6 entry with a zone"):
+        ApiSettings(trusted_proxies=[f"{host}%{scope}"], tls_terminated_upstream=True)
+
+
+@pytest.mark.parametrize(
+    ("entry", "peer"),
+    [
+        ("fe80::1%eth0", "fe80::1"),
+        ("fd00::1%eth0", "fd00::1"),
+    ],
+)
+def test_trusted_proxies_refuses_a_zoned_host_uvicorn_parses_and_never_matches(
+    entry: str, peer: str
+) -> None:
+    """BACKLOG #3042: a zoned IPv6 host parses in uvicorn and then matches no peer, because every
+    peer is reported without a zone, which ``IPv6Address`` compares (measured in the test above).
+    It would collapse every client to the proxy address on a first deployment, so the load refuses
+    it and names the form that matches.
+
+    Mutation: return None from ``_matching_form``. Red: DID NOT RAISE."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    # The premise, read from uvicorn itself: the entry misses the peer, the named fix matches it.
+    assert peer not in _TrustedHosts([entry])
+    assert peer in _TrustedHosts([peer])
+
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"[api].trusted_proxies entry {entry!r} is an IPv6 entry with a zone" in message
+    assert f"List {peer!r} instead" in message
+    ApiSettings(trusted_proxies=[peer], tls_terminated_upstream=True)
+
+
+#: A forwarded chain whose last hop, the proxy at 10.0.0.1, a dual-stack proxy behind it wrote in
+#: the IPv4-mapped spelling.
+_MAPPED_XFF = "203.0.113.9, ::ffff:10.0.0.1"
+
+
+@pytest.mark.parametrize(
+    ("entry", "missed"),
+    [
+        ("10.0.0.1", "::ffff:10.0.0.1"),
+        ("::ffff:10.0.0.1", "10.0.0.1"),
+        ("10.0.0.0/8", "::ffff:10.0.0.1"),
+        ("::ffff:10.0.0.0/104", "10.0.0.1"),
+    ],
+)
+def test_serve_hands_uvicorn_both_spellings_of_an_ipv4_entry(entry: str, missed: str) -> None:
+    """BACKLOG #3042: uvicorn's ``_TrustedHosts`` never normalises a mapped address, so an entry in
+    one spelling misses a hop written in the other, and the client resolves to the proxy's hop.
+    ``uvicorn_trusted_hosts`` adds the other spelling, so either entry trusts both and the client
+    behind a dual-stack inner proxy is the real one. The load accepts the entry as written.
+
+    Mutation: return None from ``_other_spelling``. Red: the both-spellings assertions."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    # The premise, read from uvicorn itself: the entry alone misses the other spelling.
+    assert missed not in _TrustedHosts([entry])
+    assert ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True).trusted_proxies == [
+        entry
+    ]
+
+    hosts = _TrustedHosts(uvicorn_trusted_hosts([entry]))
+    assert "10.0.0.1" in hosts and "::ffff:10.0.0.1" in hosts
+    assert hosts.get_trusted_client_address(_MAPPED_XFF)[0] == "203.0.113.9"
+    assert hosts.get_trusted_client_address("203.0.113.9, 10.0.0.1")[0] == "203.0.113.9"
+    # Control: a hop outside the entry is still untrusted, so the doubling widened nothing.
+    assert "172.16.0.1" not in hosts and "::ffff:172.16.0.1" not in hosts
+
+
+def test_uvicorn_trusted_hosts_keeps_the_entries_and_adds_only_missing_twins() -> None:
+    """BACKLOG #3042: the configured entries come first, as written. A twin the list already holds
+    is not repeated, and an IPv6 entry outside the mapped block has none."""
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    assert uvicorn_trusted_hosts([]) == []
+    assert uvicorn_trusted_hosts(["10.0.0.1", "::ffff:10.0.0.1"]) == ["10.0.0.1", "::ffff:10.0.0.1"]
+    assert uvicorn_trusted_hosts(["fd00::7", "fe80::/64"]) == ["fd00::7", "fe80::/64"]
+    assert uvicorn_trusted_hosts(["10.0.0.0/24", "::ffff:0:0/96"]) == [
+        "10.0.0.0/24",
+        "::ffff:0:0/96",
+        "::ffff:10.0.0.0/120",
+        "0.0.0.0/0",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "other_link_peer", "spans"),
+    [
+        ("fe80::%eth0/64", "fe80::1", "It spans the network 'fe80::/64'"),
+        ("fe80::1%eth0/128", "fe80::1", "List 'fe80::1' instead"),
+        # A zone on the mapped boundary used to slip past ``subnet_of``, which compares zones. The
+        # zoneless range is the whole IPv4 family in its mapped spelling.
+        (
+            "::ffff:0:0%eth0/96",
+            "::ffff:10.0.0.1",
+            "It spans '::ffff:0.0.0.0/96', which would trust",
+        ),
+    ],
+)
+def test_trusted_proxies_refuses_a_zoned_network_whose_zone_uvicorn_ignores(
+    entry: str, other_link_peer: str, spans: str
+) -> None:
+    """BACKLOG #3042: uvicorn matches a network by prefix and ignores its zone, so a zoned network
+    trusts the prefix on every interface while claiming one. The load refuses the zone and names
+    the zoneless network without recommending it.
+
+    Mutation: delete the zoned-network arm of ``_matching_form``. Red: DID NOT RAISE."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert other_link_peer in _TrustedHosts([entry])  # the zone narrowed nothing
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"[api].trusted_proxies entry {entry!r} is an" in message
+    assert spans in message
+
+
+@pytest.mark.parametrize(
+    ("entry", "peer"),
+    [
+        ("fe80::1", "fe80::1"),  # the zoneless host is the form a link-local peer is reported in
+        ("fe80::/64", "fe80::1"),  # a network matches by prefix
+        ("::fffe:0:0/95", "::fffe:0:1"),  # wider than the mapped range, so it matches other peers
+        ("::ffff:10.0.0.1/128", "::ffff:10.0.0.1"),  # a mapped host, written as a network
+    ],
+)
+def test_trusted_proxies_accepts_the_neighbouring_forms_that_match(entry: str, peer: str) -> None:
+    """The positive control for the refusals above: each neighbouring form loads, and uvicorn
+    matches a peer with it."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert peer in _TrustedHosts([entry])
+    api = ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    assert api.trusted_proxies == [entry]
+
+
+@pytest.mark.parametrize(
+    ("entry", "address", "spans"),
+    [
+        ("fe80::1%eth0/64", "fe80::1", "It spans the network 'fe80::/64'"),
+        ("::1/80", "::1", "It spans '::/80', which would trust every IPv4 peer"),
+        ("::1/0", "::1", "It spans '::/0', which would trust every IPv6 peer"),
+        ("::ffff:10.0.0.1/120", "::ffff:10.0.0.1", "It spans the network '::ffff:10.0.0.0/120'"),
+        (
+            "::ffff:10.0.0.1/96",
+            "::ffff:10.0.0.1",
+            "It spans '::ffff:0.0.0.0/96', which would trust every IPv4 peer",
+        ),
+    ],
+)
+def test_the_host_bits_refusal_never_suggests_a_refused_form(
+    entry: str, address: str, spans: str
+) -> None:
+    """BACKLOG #3042: the host-bits message named the host part as written, so for a zoned entry it
+    suggested a zoned host, which the load refuses. It names the form that matches, and a mapped
+    range spanning the whole IPv4 family gets the whole-family wording.
+
+    Mutation: name ``entry.partition('/')[0]`` again. Red: the address assertion."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"List the proxy's own address {address!r}" in message
+    assert spans in message
     ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
 
 
@@ -950,7 +1158,18 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     # without --allow-insecure-bind, and uvicorn trusts XFF only from the proxy (no ssl context).
     from messagefoundry.store.crypto import generate_key
 
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(logging.INFO)
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
     captured: dict[str, Any] = {}
+    # On serve's own logger, not caplog: serve's configure_logging replaces the root handlers.
+    serve_logger = logging.getLogger("messagefoundry.__main__")
+    kept = _Keep()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
@@ -966,10 +1185,24 @@ def test_serve_allows_non_loopback_with_upstream_tls(
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    old_level = serve_logger.level
+    serve_logger.addHandler(kept)
+    serve_logger.setLevel(logging.INFO)
+    try:
+        assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    finally:
+        serve_logger.removeHandler(kept)
+        serve_logger.setLevel(old_level)
     assert "refusing to serve" not in capsys.readouterr().err
-    assert captured["forwarded_allow_ips"] == ["10.0.0.7"]  # XFF trusted only from the proxy
+    # XFF trusted only from the proxy, in both its spellings (BACKLOG #3042).
+    assert captured["forwarded_allow_ips"] == ["10.0.0.7", "::ffff:10.0.0.7"]
     assert "ssl_context_factory" not in captured  # TLS is at the proxy, not in-process
+    # The startup line names the CONFIGURED list, not uvicorn's doubled one: logging the
+    # uvicorn_trusted_hosts result raised a CodeQL clear-text-logging alert on PR 2380.
+    proxy_lines = [m for m in kept.messages if "TLS-terminating proxy" in m]
+    assert len(proxy_lines) == 1
+    assert "['10.0.0.7']" in proxy_lines[0]
+    assert "::ffff:10.0.0.7" not in proxy_lines[0]
 
 
 def test_serve_forwarded_allow_ips_empty_when_no_proxy(

@@ -141,8 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # HARD-FAILING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
-    # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
-    # accept a triaged advisory.
+    # red (the intended forcing function) — bump the lockfile, or append `--ignore-vuln <ID>` to
+    # that lock's audit line to accept a triaged advisory.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -203,8 +203,14 @@ jobs:
           # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
           # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
           python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
+          # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
+          # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
+          # Each line below goes through scripts/security/audit_all_platforms.py, a wrapper over
+          # messagefoundry/security/audit_all_platforms.py, which carries the 2026-10-17 measurement
+          # and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
-          pip-audit -r requirements.lock --desc
+          python scripts/security/audit_all_platforms.py requirements.lock
           # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
           # without this a CVE in a pinned scanner is invisible to every gate — the "pinned, stale,
           # unpatched is worse than floating" failure ADR 0034 section 3 names. `--ignore-vuln <ID>` is
@@ -216,8 +222,8 @@ jobs:
           # exactly this — but it does add 40 distributions to the blocking set (23 from ci-scanners, 17
           # from ci-quality; measured). Zero advisories at the time of writing. If the owner would rather
           # the advisory half not block, move the ci-quality line alone to its own step.
-          pip-audit -r ci/locks/ci-scanners.lock --desc
-          pip-audit -r ci/locks/ci-quality.lock --desc
+          python scripts/security/audit_all_platforms.py ci/locks/ci-scanners.lock
+          python scripts/security/audit_all_platforms.py ci/locks/ci-quality.lock
           # THE SIGNING TOOLCHAIN, and it is the one that most needs this (BACKLOG #332). a9354808e
           # added ci/locks/release-tools.lock to the export set and the byte-diff gate above but NOT
           # here, so from 2026-08-29 until this line landed the release signing closure was the only
@@ -233,7 +239,7 @@ jobs:
           # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
           # and the VEX with the job's OIDC identity, so blocking is the wanted behaviour, not a cost
           # reluctantly accepted for an advisory tool. `--ignore-vuln <ID>` remains the escape hatch.
-          pip-audit -r ci/locks/release-tools.lock --desc
+          python scripts/security/audit_all_platforms.py ci/locks/release-tools.lock
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
       # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
       # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it
@@ -346,8 +352,8 @@ jobs:
     # artifact -- security/vex/README.md's own worked example names the product with no version
     # qualifier, so a statement applies to every release forever. That would turn this gate green at
     # the exact moment the assessment was written and before any release carried the fix. To accept a
-    # triaged advisory, add `--ignore-vuln <ID>` below with the reason in a comment: explicit,
-    # greppable and per-advisory, the same escape hatch the pip-audit job documents.
+    # triaged advisory, append `--ignore-vuln <ID>` to the audit line below with the reason in a
+    # comment: explicit, greppable and per-advisory, the same escape hatch the pip-audit job documents.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -419,7 +425,8 @@ jobs:
               echo "::error::$tag: read only $pinned pinned requirements -- the audit input is missing or truncated. Failing closed." >&2
               exit 2
             fi
-            pip-audit -r "core-$tag.lock" --desc
+            # Every pin, whatever its marker: the pip-audit job's comment on the same script says why.
+            python scripts/security/audit_all_platforms.py "core-$tag.lock"
             echo "$tag: CLEAN -- $pinned pinned requirements of the CORE RUNTIME closure, no known advisory"
             examined=$((examined + 1))
           done
@@ -456,8 +463,14 @@ jobs:
           echo "   release, never by amending an old one."
           echo
           echo "5. NO UPSTREAM FIX YET? .github/SECURITY.md -- apply a documented compensating control"
-          echo "   and track to the fix. To silence a triaged advisory here, add '--ignore-vuln <ID>'"
-          echo "   to the pip-audit call in the previous step, with the reason."
+          echo "   and track to the fix. To silence a triaged advisory here, append '--ignore-vuln <ID>'"
+          echo "   to the audit_all_platforms.py line in the previous step, with the reason."
+          echo
+          echo "NOT EVERY RED HERE IS AN ADVISORY. If the log shows the dry-run install check failing"
+          echo "(a hash mismatch, no installable artifact) or pip-audit stopping on '<name>: <reason>' under"
+          echo "--strict (a pin it could not look up, such as one PyPI no longer serves), there is no"
+          echo "advisory to triage: read the error, and see messagefoundry/security/audit_all_platforms.py"
+          echo "for what each step checks."
 
   cla-action-audit:
     name: cla-action-audit (vendored CLA action's declared closure)
@@ -1666,8 +1679,14 @@ jobs:
           # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
           # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
           python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
+          # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
+          # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
+          # Each line below goes through scripts/security/audit_all_platforms.py, a wrapper over
+          # messagefoundry/security/audit_all_platforms.py, which carries the 2026-10-17 measurement
+          # and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
-          pip-audit -r requirements.lock --desc
+          python scripts/security/audit_all_platforms.py requirements.lock
           # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
           # without this a CVE in a pinned scanner is invisible to every gate — the "pinned, stale,
           # unpatched is worse than floating" failure ADR 0034 section 3 names. `--ignore-vuln <ID>` is
@@ -1679,8 +1698,8 @@ jobs:
           # exactly this — but it does add 40 distributions to the blocking set (23 from ci-scanners, 17
           # from ci-quality; measured). Zero advisories at the time of writing. If the owner would rather
           # the advisory half not block, move the ci-quality line alone to its own step.
-          pip-audit -r ci/locks/ci-scanners.lock --desc
-          pip-audit -r ci/locks/ci-quality.lock --desc
+          python scripts/security/audit_all_platforms.py ci/locks/ci-scanners.lock
+          python scripts/security/audit_all_platforms.py ci/locks/ci-quality.lock
           # THE SIGNING TOOLCHAIN, and it is the one that most needs this (BACKLOG #332). a9354808e
           # added ci/locks/release-tools.lock to the export set and the byte-diff gate above but NOT
           # here, so from 2026-08-29 until this line landed the release signing closure was the only
@@ -1696,7 +1715,7 @@ jobs:
           # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
           # and the VEX with the job's OIDC identity, so blocking is the wanted behaviour, not a cost
           # reluctantly accepted for an advisory tool. `--ignore-vuln <ID>` remains the escape hatch.
-          pip-audit -r ci/locks/release-tools.lock --desc
+          python scripts/security/audit_all_platforms.py ci/locks/release-tools.lock
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
       # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
       # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it

@@ -590,6 +590,17 @@ async def test_error_on_unparseable_body() -> None:  # AC-6 (unparseable)
         await ex.read("epic", "Patient/123")
 
 
+async def test_error_on_a_reply_that_repeats_a_key() -> None:
+    # Vault BACKLOG #2812: json keeps the last of two equal keys, so a Handler would read a value
+    # a first-key reader would not. Refused as unparseable; the text names neither id.
+    canary = "mf2812-second-id"
+    body = '{"resourceType": "Patient", "id": "first-id", "id": "' + canary + '"}'
+    ex, _ = _executor(body=body.encode())
+    with pytest.raises(FhirLookupError, match="unparseable") as ei:
+        await ex.read("epic", "Patient/123")
+    assert canary not in str(ei.value) and "first-id" not in str(ei.value)
+
+
 async def test_error_on_network_failure() -> None:  # AC-6 (timeout/conn)
     ex, _ = _executor(exc=urllib.error.URLError("connection refused"))
     with pytest.raises(FhirLookupError, match="unreachable"):

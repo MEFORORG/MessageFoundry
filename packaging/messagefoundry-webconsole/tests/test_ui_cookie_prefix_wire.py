@@ -44,7 +44,7 @@ from messagefoundry.api import create_app
 from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApiSettings, AuthSettings
+from messagefoundry.config.settings import ApiSettings, AuthSettings, uvicorn_trusted_hosts
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._auth import BROWSER_HARDENING_OPT_OUT_ENV
 
@@ -130,7 +130,7 @@ async def _serving(
             log_level="warning",
             # The serve path's rule verbatim: forwarded headers are trusted only from the declared
             # proxies. Left unset, uvicorn would fall back to its own 127.0.0.1 default instead.
-            forwarded_allow_ips=list(api.trusted_proxies),
+            forwarded_allow_ips=uvicorn_trusted_hosts(api.trusted_proxies),
             # `None` is uvicorn's own default, so the cleartext arms take the stock path rather than
             # a test-only one -- the serve path's rule verbatim: material -> a factory -> https.
             ssl_context_factory=(

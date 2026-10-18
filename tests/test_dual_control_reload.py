@@ -587,7 +587,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         detail = json.loads(row["detail"])
         assert row["actor"] == "alice" and detail["fingerprint"] == digest_a["fingerprint"]
         assert "superseded" not in detail and "baseline_unchecked" not in detail
-        outcome, comparison = await _compare_start_config(engine, digest_a)
+        outcome, comparison = await _compare_start_config(engine, digest_a, before_load=digest_a)
         assert outcome == "compared" and comparison is not None
         assert comparison.baseline_action == "config_reload"
         assert not comparison.changed, "a false config_changed on the next start"

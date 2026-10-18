@@ -307,14 +307,16 @@ def test_real_ldap3_reads_the_notifications_name_and_refuses_one_it_does_not_kno
     """THE CONTRAST for the notice: the same message naming another OID is refused by ldap3's
     unknown-notification branch, not as a terminated session, so ldap3 reads the scripted
     messageID-0 message and its responseName rather than skipping it. ldap3 raises the same class
-    for an invalid messageId or a failed receive, so the text, its ``last_error``, pins the branch.
+    for an invalid messageId or a failed receive, so the cause's text, its ``last_error``, pins the
+    branch; the engine's own text names only ldap3's error type (BACKLOG #3017).
     Still a plain :class:`LdapError`, so the re-bind reads it as ``directory_unavailable`` and
     does not count it."""
     refusal, closed_by_server = _bind_answered_with((_unsolicited(b"1.3.6.1.4.1.32473.3169"), b""))
     assert not closed_by_server
     assert type(refusal) is LdapError
     assert isinstance(refusal.__cause__, LDAPSocketReceiveError)
-    assert str(refusal) == "unknown unsolicited notification from server"
+    assert str(refusal.__cause__) == "unknown unsolicited notification from server"
+    assert "unsolicited" not in str(refusal)
 
 
 async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(

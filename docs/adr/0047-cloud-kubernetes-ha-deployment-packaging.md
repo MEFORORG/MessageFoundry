@@ -328,3 +328,16 @@ Owner delegated the open items ("you sort it out / do what is best"); resolved a
 - **Cloud PHI doc** is published against the **current** HIPAA Security Rule; the 2025 NPRM floor is flagged as anticipated-not-final.
 - **Off-box syslog stayed OUT of the cloud manifest as-is** — at the time `[logging]` syslog forwarding had no TLS transport, so the decision was to pair it with a TLS sidecar/collector before any enablement and never tell operators to "flip it on" (no cleartext PHI-adjacent metadata on the wire). **A native TLS syslog transport has since shipped under ADR 0080**, so the premise for the sidecar-only answer no longer holds; the manifest decision itself is unrevisited here.
 - **A kubeconform / policy-lint CI leg ships with the build lane** (the verifier AC-4/AC-5 name).
+
+## Amendment (2026-10-16) -- the Kubernetes and container paths are not supported for v1
+
+> Append-only. It records an owner ruling and does not change the Status line above.
+
+Under the owner's 2026-10-16 v1 platform
+[ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target), the deliverables
+here that run the Linux engine image are not a supported way to deploy v1: at least the
+multi-replica reference manifest, the cloud docs' Kubernetes shapes, and an edge relay run as the
+image. The manifests stay in [`docker/`](../../docker/README.md) as development and CI artifacts,
+and CI is unchanged. Deliverables that do not run the image are not narrowed, such as the
+raw-TCP/X12 startup TLS guard. For engine HA on Windows, see [CLUSTERING.md](../CLUSTERING.md), and
+for a SQL Server Always On store, [AOAG-DEPLOYMENT.md](../AOAG-DEPLOYMENT.md).

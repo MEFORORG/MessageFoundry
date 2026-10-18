@@ -513,8 +513,8 @@ def client_ip(conn: HTTPConnection) -> str | None:
     one from that scope rather than read the scope a second way (BACKLOG #2289).
 
     Behind a declared trusted proxy this already resolves to the real client:
-    uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
-    defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
+    uvicorn runs with ``forwarded_allow_ips`` built from ``settings.api.trusted_proxies`` (``__main__.py``,
+    ``uvicorn_trusted_hosts``; defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
     residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
     rotation by a directly-reachable attacker (SEC-024). The real brute-force bounds are the global
     ceiling and the per-account lockout, applied to both the password and the MFA factor.
@@ -1158,7 +1158,7 @@ async def refuse_from_new_address(request: Request) -> None:
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
-    ``auth.admin_action_new_ip`` and a notice, deduped and capped per session as
+    ``auth.new_address_reverify_required`` and a notice, deduped and capped per session as
     :meth:`AuthService.flag_new_client_ip` says.
 
     It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an

@@ -16,7 +16,9 @@ Six things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
-   Windows service scripts in `scripts/service/` (section 8).
+   Windows service scripts in `scripts/service/` (section 8). Only the Windows service is supported
+   for v1 ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)); the image
+   stays in scope here.
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
 5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
@@ -54,7 +56,7 @@ on its own.
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
-| 4 | Starting processes | 11 modules | Varies, see below |
+| 4 | Starting processes | 13 modules | Varies, see below |
 | 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
@@ -235,8 +237,32 @@ in its place. That holds whether or not the relaunch then works. The process als
 tray itself in at least three cases. Branding is unavailable, the relaunch cannot start, or the
 branded child exits within a short grace window. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py`
 sets that window. **A tray started by hand gets neither the script nor the options, by decision,
-and that limit is open.** The `messagefoundry-tray` command is a launcher the installer writes. It was not
-run to measure this, because it starts a real tray. Its console twin from the same install,
+and that limit is open.**
+
+**A hand start may also exit before any code runs (vault BACKLOG #2914).** It gets no `-E`, so the
+user's `PYTHON*` variables reach it. `tests/test_tray_hand_start.py` measured it on Windows, Python
+3.14.7, on 2026-10-16, with a stand-in for the tray that records whether it had a stderr. A
+GUI-script launcher of the kind pip writes, and `pythonw -m`, were each started with no standard
+handles. The launcher was also started through `ShellExecuteExW`, the Windows shell's call for
+opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
+`PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
+`pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
+stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
+launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
+into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
+operator's remedy.
+
+Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
+`messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
+and a `[project.gui-scripts]` entry names only a function. A documented command
+to type instead, such as `pythonw -E -P -m messagefoundry.tray`, would not match the login
+command, which also turns remote debugging off, uses the bootstrap script in a checkout, and adds
+`-s` where `PYTHONNOUSERSITE` is set. Start at Login already writes the right command for the
+install it runs from.
+
+The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
+import path, because that starts a real tray; the stand-in measurement above covers only the
+exit. Its console twin from the same install,
 `messagefoundry.exe`, has the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
@@ -247,7 +273,7 @@ debugging on, because a launcher passes no interpreter option.
 
 ## 4. The engine starts processes
 
-11 modules start a process. The reason differs at each, and so does the form of the start:
+13 modules start a process. The reason differs at each, and so does the form of the start:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
@@ -259,6 +285,8 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
+| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
+| `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
 | `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |
@@ -280,10 +308,13 @@ system tool, the code pins its absolute path under the system directory, so a sa
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
 
-Two argument-list starts are not pinned that way:
+Three argument-list starts are not pinned that way:
 
 - `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
   copy in the working directory before the one on `PATH`.
+- `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
+  [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
+  `verify` with picks the copy. On Windows it runs Windows PowerShell by its system-directory path.
 - `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
   batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
   command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks
@@ -343,6 +374,14 @@ code finds `scripts/service/install-service.ps1` beside the installed package an
 administrator with `-ExecutionPolicy Bypass`. So that script is only as safe as the folder it sits
 in: whoever can write there can run code as administrator the next time someone installs the
 service.
+
+**The host cipher read gives PowerShell script text.** On Windows, `verify/cipher_policy.py` starts
+the system-directory `powershell.exe` with `-Command` and a script, so PowerShell parses and runs
+that text, as a shell runs a shell string. The script is a constant in the module: no host data,
+setting or message reaches it, and it calls `Get-TlsCipherSuite` through the system TLS module
+imported by its path, never by name. No command it runs is looked up by a bare name, so a
+program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
+site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
@@ -1002,19 +1041,29 @@ password from a terminal and takes it no other way. A test rig has no terminal. 
 function with one that returns a password the rig holds. It then calls the shipped command's
 `main`. The rest of `provision-admin` runs as shipped.
 
+When the rig also holds an authenticator key, for a leg whose engine requires MFA (vault BACKLOG
+#2796), two more functions of the same module are replaced. `_enrol_totp_at_terminal` returns that
+key and a code computed from it, where the shipped one shows a new key on the console and reads a
+code back. `_show_recovery_codes_once` shows the recovery codes nowhere and returns `False`, as the
+shipped one does when the console cannot show them. The shipped command still checks the code,
+spends its step and writes the key.
+
 What holds it:
 
 - The swap runs only in a `rigadmin provision` process, and changes nothing on disk. Either
   `provision` started that process as a child, or a workflow step ran the command itself.
-- No engine module imports the harness, so no shipped command gains a password path.
-- The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable. The process takes
-  it out of its own environment before any engine code runs.
+- No engine module imports the harness, so no shipped command gains a password path or an
+  authenticator input.
+- The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable, and the key from
+  `MEFOR_RIG_ADMIN_TOTP_KEY`. The process takes both out of its own environment before any engine
+  code runs.
 - The shipped command refuses a store that already has an enabled Administrator, and the swap
   does not change that.
 
 What it means: on a store with no enabled Administrator, whoever can run the harness with access
-to that store can create one with no terminal and no authenticator app. The swap passes
-`--no-totp`, and sets `MEFOR_SECURITY_REQUIRE_MFA=false` in that process.
+to that store can create one with no terminal. With no key, the swap passes `--no-totp` and sets
+`MEFOR_SECURITY_REQUIRE_MFA=false` in that process, so the account has no authenticator app. With a
+key, the account's second factor is a key the caller chose rather than one the engine drew.
 
 **Parsing.** Section 7's six patterns, run over the harness, find these modules:
 

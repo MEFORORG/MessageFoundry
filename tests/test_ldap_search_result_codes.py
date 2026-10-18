@@ -812,7 +812,10 @@ class _ScriptedDc:
                 self.searches.append(raw)
                 replies = self._answer(raw)
             else:  # unbind, or anything this server does not speak
-                self.closed_by_server = op != _UNBIND_REQUEST
+                # Never reset by an unbind: another session's, such as the service account's
+                # (_service_session, BACKLOG #3017), may end after the one that hung up.
+                if op != _UNBIND_REQUEST:
+                    self.closed_by_server = True
                 return
             for reply, controls in replies:
                 if reply == _HANG_UP[0]:

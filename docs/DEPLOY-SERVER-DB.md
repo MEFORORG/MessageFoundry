@@ -606,7 +606,8 @@ context exists for the engine to narrow or check
 18*). The engine's own checks on these hops cover whether the hop is encrypted and whether the server
 certificate is validated. They do not cover cipher suites, so the engine would not notice a host that
 still allows a CBC suite. The owner declined a startup check that reads the host policy, so nothing in
-the engine would warn about a missed step.
+the engine would warn about a missed step at start. `messagefoundry verify` runs the checks below when
+an operator runs it; see *Both platforms: the `host.ciphers` verify row*.
 
 **How far the statements below are proven.** The load-bearing ones carry one of three labels:
 
@@ -661,6 +662,8 @@ and drop the values a hardening baseline put there. The commands in steps 1 and 
 take effect on the next boot." Restarting the engine service is not enough for the suite change.
 
 **4. Check it, after the reboot.** Both checks read state and change nothing.
+`messagefoundry verify --section host` runs both, with the control, as its `host.ciphers` row; see
+*Both platforms: the `host.ciphers` verify row*. The commands stay here so you can run them by hand.
 
 ```powershell
 # Control for check 1: the number of enabled suites. It must be above 0.
@@ -700,6 +703,10 @@ unconfigured host, which reads as healthy.
 
 #### Linux: the host OpenSSL configuration binds the driver (measured)
 
+Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target);
+this applies only to a Linux engine host outside that support, such as the container image. The
+v1 platform is the Windows half above, whose cipher-suite result is **unmeasured**.
+
 **Measured: the OpenSSL configuration decides which suites and versions the driver offers.** An
 earlier reading held that the driver might use a suite list of its own. On the rig below, it did not.
 
@@ -733,7 +740,9 @@ Keep the `@SECLEVEL=2` part, which the stock line carried. The `Ciphersuites` li
 its 256-bit suites. The AEAD floor does not need it. Then restart the engine service, so the
 driver reads the file again.
 
-**Check it (measured).** Run these as the account the engine runs as, with the same environment:
+**Check it (measured).** Run these as the account the engine runs as, with the same environment.
+`messagefoundry verify --section host`, run the same way, runs all three as its `host.ciphers` row;
+see *Both platforms: the `host.ciphers` verify row*. By hand:
 
 ```bash
 openssl ciphers -s -v | grep -c .        # every suite on offer: must be above 0
@@ -771,6 +780,98 @@ too. That variable replaces the system file for the driver (measured, last table
 - The engine process itself. The rig drove the driver through `sqlcmd`, not through the engine.
 - `dialect="generic"` with another vendor's ODBC driver. Which TLS stack and which rules that driver
   follows was not run, so this step does not cover it.
+
+#### Both platforms: the `host.ciphers` verify row
+
+`messagefoundry verify` runs the checks of this step as one row of its host section, `host.ciphers`
+([`testing/VERIFY.md`](testing/VERIFY.md)). The host section runs by default, and
+`--section host` runs it alone. It changes no TLS or registry setting and no file of the engine's;
+what the programs it starts may still write is listed once, in
+[`testing/VERIFY.md`](testing/VERIFY.md), *What writes, and what does not*. It is not part of
+`messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
+engine runs as, with the same environment, after the reboot on Windows.
+
+**It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
+installed in the Python that runs `verify`, found on the import path without being imported. It
+then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
+settings, or a SQL Server dialect DATABASE connection, a `DatabaseRef` reference set or a
+`DatabaseLookup` in the `--config` graph. A hop found names itself in the row's evidence. The graph
+is loaded only when the store is not already a hop, and loading it runs the config modules, as the
+self smoke does, so `--section host` runs them too. With no hop configured the row SKIPs and names
+what it read, so a host that only has `pyodbc` installed does not fail on a policy nothing of it
+uses.
+
+The answer is unknown where at least one of these holds: the graph did not load or there is no
+`--config` directory; the service settings did not load; they came from the defaults alone, with
+no `--service-config`, no `./messagefoundry.toml` and no `MEFOR_STORE_BACKEND`, because the store
+could then be SQL Server; or every DATABASE connection found uses the generic dialect, whose
+driver brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
+MANUAL with the reading in its detail. Run `verify` with `--config` and `--service-config` naming
+the deployment's own, to get a FAIL that counts. Without `--config` the answer is unknown too,
+because the default, `samples/config`, is the sample graph.
+
+It runs the commands of this step. It differs from them in at least the ways named here:
+
+- Windows: `Get-TlsCipherSuite` through Windows PowerShell at its `System32` path, with the name
+  filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
+  registry. It imports the system TLS module by its path under the Windows PowerShell folder and
+  runs that module's own `Get-TlsCipherSuite`, so a script on the `PATH` or a module in the
+  account's Documents folder with the same name cannot answer instead. No command it runs is
+  looked up by a bare name, so a program or script of that name on the `PATH`, such as a
+  `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
+  `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
+  It silences PowerShell's
+  warning and verbose streams. Any other output line that is not shaped like a suite name makes the
+  row ERROR, so such a line is neither counted as a suite nor dropped. **It also reads one thing the
+  manual checks do not.** Where Group Policy sets **SSL Cipher Suite Order**, it reads that list from the registry value the
+  policy writes, and applies the same filter to it. Which of the two lists SChannel uses when they
+  differ is **unmeasured**, so a suite that is not AEAD in either list is a FAIL. **So a host
+  configured only through Group Policy may read FAIL** while its policy list is AEAD-only, if the
+  local list that `Get-TlsCipherSuite` prints still holds a suite that is not AEAD. Whether that
+  local list follows the policy is **unmeasured**; until it is measured, read such a FAIL against
+  the policy list the row prints.
+- Linux: `openssl ciphers -s -v` from the `PATH`, and the `CipherString`, `Ciphersuites` and
+  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. It differs from the manual `grep` in at least
+  these ways. Where `OPENSSL_CONF` is set in the environment, it reads the file that variable
+  names, which is the file `openssl` itself loaded, so there the row and the manual `grep` read
+  different files. It reads only the section OpenSSL applies as the system default: it follows
+  `openssl_conf` in the top of the file, then that section's `ssl_conf`, then that section's
+  `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. The
+  `ssl_conf` line names a module, so as in OpenSSL it may carry a suffix after its last `.`, such
+  as `ssl_conf.0`. A shorter name OpenSSL may match to that module as a prefix, such as `ssl`,
+  reads MANUAL. A file where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
+  regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
+  drops a `#` comment outside quotes, and drops a leading byte-order mark. It ends a line only at a
+  newline, as OpenSSL does. Any `openssl ciphers` output line not shaped like a suite line makes
+  the row ERROR, as on Windows. It does not follow at
+  least these: an `.include` or `.pragma` line, a line that ends in a backslash, a
+  `section::name` assignment, or a `$name` value. A file with any of the first four anywhere, or
+  with `$` in a `CipherString` or `MinProtocol` value or in the section chain, reads MANUAL. So does
+  an `OPENSSL_CONF` that is set but empty. A PASS still rests on this reading matching OpenSSL's
+  for every construct the file uses. RHEL-family hosts, which set the policy through
+  `update-crypto-policies` and an included file, are outside what this row was written and
+  measured for. On a stock one, expect MANUAL: its file pulls the policy in through `.include`, and
+  it is not at `/etc/ssl/openssl.cnf`. That is **unmeasured**.
+
+| Status | When |
+|---|---|
+| PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the system-default section holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
+| FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
+| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
+| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
+| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
+
+When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a
+broken reading never hides a finding. A FAIL or an ERROR makes `verify` exit 1, like any other FAIL
+or ERROR row. Apart
+from the differences above, it reads what the commands above read, so the limits listed under each
+platform hold for it too.
+
+**Measured** on 2026-10-17, on a stock Windows 11 host with no policy set, calling the row's reading
+directly because that host has no `pyodbc`, with the TLS module imported by its path as above: 18 of 28 suites not AEAD and both `Enabled` values unset,
+so FAIL. The manual Windows checks on the same host printed `28`, 18 names, and nothing. Its healthy
+reading is **unmeasured** on a real host; the tests cover it with the probes stubbed. The Linux branch
+is **unmeasured** on Linux.
 
 #### Both platforms: what to expect afterwards
 
