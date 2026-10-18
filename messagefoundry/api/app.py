@@ -1564,7 +1564,8 @@ def _build_approval_gate(
                 #
                 # The row names the requester either way and differs from an inline one only by its
                 # NULL client, so this line names the release too. Type name only, never the text:
-                # for a 404 or 422 refusal, _audit_refused_reload logs the redacted text itself.
+                # for a 404 or 422 refusal, or a reload_fault, _audit_refused_reload logs the
+                # redacted text itself.
                 _log.warning("released config reload refused: %s", type(exc).__name__)
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
@@ -2134,15 +2135,16 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDirUnreadable,
     ConfigDirMissing,
     # A plain FileNotFoundError, such as one a runner start or swap raises, is a fault, not a
-    # missing directory: it is audited with reason reload_fault and answered 500 with the generic
-    # detail, never as not_found (BACKLOG #3157 item 3). ConfigDirMissing, its subclass, stays
-    # not_found; _audit_refused_reload tests it first.
+    # missing directory: it is audited with reason reload_fault and answered with the generic
+    # detail, 500 inline and 422 on a release, never as not_found (BACKLOG #3157 item 3).
+    # ConfigDirMissing, its subclass, stays not_found ONLY because _audit_refused_reload tests it
+    # first; this tuple cannot tell the two apart. Tests pin both reasons.
     FileNotFoundError,
     WiringError,
 )
 
 #: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
-#: WARNINGs, which carry the real reload error that the answer withholds. ``safe_exc``'s default
+#: WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer withholds. ``safe_exc``'s default
 #: 200-character cut dropped the directory from a long config path and the fix from a long
 #: WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
 #: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
@@ -2201,8 +2203,8 @@ async def _audit_refused_reload(
     vanished or left the reload roots before its release is refused and recorded the way an inline
     one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
-    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log that error redacted,
-    with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`, which says why. The
+    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs, and the
+    ``reload_fault`` ERROR, log that error redacted, with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`, which says why. The
     403 writes no WARNING.
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.

@@ -1942,6 +1942,26 @@ async def test_a_runner_start_file_not_found_is_a_fault_row_not_a_missing_dir(
     assert row is not None and str(row["status"]) == "failed"
 
 
+async def test_an_inline_runner_file_not_found_answers_the_generic_error_and_a_fault_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inline route with the fault raised where it really is, in the runner's start or swap,
+    rather than by a stubbed reload: 500 with the generic detail, and one reload_fault row after
+    the attempt row (BACKLOG #3157)."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    monkeypatch.setattr(RegistryRunner, "start", _raise_file_not_found)
+    monkeypatch.setattr(RegistryRunner, "reload", _raise_file_not_found)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        r = await c.post("/config/reload", json={}, headers=await _token(c, "op"))
+    assert r.status_code == 500, r.text
+    assert r.json() == {"detail": _FAULT_DETAIL}
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["dry_run"]) for d in rows] == [("reload_fault", False)]
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 async def test_an_inline_reload_file_not_found_answers_the_generic_error_and_a_fault_row(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, dry_run: bool

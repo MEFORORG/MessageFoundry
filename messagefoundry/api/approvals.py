@@ -2133,7 +2133,8 @@ class ApprovalGate:
         self, approval_id: str, *, status: str, wrong: Callable[[str], str]
     ) -> ApprovalRow:
         """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
-        :meth:`_verified_rows`, the ONLY reader of the store's request readers in this gate;
+        :meth:`_verified_rows` and :meth:`_read_back_request`, which checks what it reads through
+        :meth:`_verified`, the only readers of the store's request readers in this gate;
         ``tests/test_approval_seal.py`` holds that. Raises 404 for no such request, 409 with
         ``wrong(<its status>)`` for one in another status, and 409 for one that fails its seal,
         which is reported.

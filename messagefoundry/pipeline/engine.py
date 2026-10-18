@@ -2615,8 +2615,8 @@ class Engine:
             missing = False
         if missing:
             # Outside the handler, so the error it replaces does not ride __context__. Its own
-            # type, so the routes map only this to not_found, and a FileNotFoundError a runner
-            # start raises stays an unmapped fault (BACKLOG #3157 item 3).
+            # type, so the routes map only this to not_found. A plain FileNotFoundError, such as
+            # one a runner start raises, is mapped to reason reload_fault instead (BACKLOG #3157).
             raise ConfigDirMissing(f"config directory not found: {config_dir}")
         return path
 
@@ -2741,7 +2741,7 @@ class Engine:
         and no more.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
-        (missing dir; a ``FileNotFoundError`` subclass, and the only one the callers map),
+        (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
         ``ConfigDirUnreadable`` (a dir that cannot be resolved),
         ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
@@ -2750,9 +2750,10 @@ class Engine:
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
         run never applies them, so a raise of one of these leaves the running values as they were.
-        Any other error is not a refusal and the callers do not map it, a bare
-        ``FileNotFoundError`` from a first load's runner start or from the swap among them (BACKLOG
-        #3157 item 3). A cancellation is not one of the refusals either: one that lands after the
+        Any other error is not a refusal, and the callers do not map it, with one exception: a bare
+        ``FileNotFoundError``, at least one from a first load's runner start or from the swap,
+        which is raised after a swap's rollback rather than before it. The API callers audit that
+        one with reason ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either: one that lands after the
         swap committed keeps the new values, and so does one during a first load's runner start.
         """
         failures: list[ReloadStepFailure] = []
