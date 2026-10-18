@@ -233,13 +233,14 @@ async def _new_ip_rows(store: MessageStore) -> list[str]:
 async def test_each_refused_request_writes_its_own_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """RED when: a refused request from a new address writes no WARNING of its own, as under the
-    per-session throttle vault BACKLOG #3052 item 16 proposed and then declined: a throttle loses
-    records an operator would rely on (vault BACKLOG #3773), and log volume is the logging layer's
-    job. N refused requests on one session write N lines: each repeat from an address already
-    reported, and each request past the per-session cap, which carries the address because it
-    writes no audit row. That address is the sender's text on a proxied hop, so a line break in it
-    is escaped. No line adds an audit row or a notice."""
+    """RED when: a refused request that is not a first sighting writes no WARNING of its own, as
+    under the per-session throttle vault BACKLOG #3052 item 16 proposed. Why it was declined is
+    stated once, in docs/SECURITY.md item 6 of "Administrative-interface defense-in-depth". After
+    the first sightings, which write rows and notices and no WARNING, N refused requests on one
+    session write N lines: each repeat from an address already reported, and each request past
+    the per-session cap, whose line carries the address because it writes no new-address row. That
+    address is the sender's text on a proxied hop, so a line break in it is escaped. No line adds
+    a new-address row or a notice."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
