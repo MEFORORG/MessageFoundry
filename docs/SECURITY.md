@@ -3056,12 +3056,14 @@ confirm asks the store to end the session it just rotated, and answers as a lost
 `secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
 so a `reason` points an operator at the likely cause rather than proving it. The row's
 `session_ended` is false when the store refused to end the rotated session. The token is still not
-handed back, and the row is written whatever the revoke raised (vault BACKLOG #3113). The compare is
+handed back, and the row is written whatever the revoke raised, unless its own write fails,
+which is logged at ERROR (vault BACKLOG #3113). The compare is
 on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
 window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
-stands. The user signs in again, because the refused confirm ended the session, and passes the
+stands. The user signs in again, because the refused confirm hands no token back and asks the
+store to end the session, and passes the
 step-up `POST /me/mfa/confirm` asks of any confirm: a password proof bound to the confirm action
 (ADR 0077), or a recent step-up window where `[auth].require_action_step_up` is off. The user then
 confirms with a code from a later step, because the refused confirm spent

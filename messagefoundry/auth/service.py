@@ -3559,23 +3559,19 @@ class AuthService:
             # another run that enabled TOTP first, or another run that staged its own secret, since
             # the secret was staged above makes it match no row. Refused before the role, so the
             # row stays roleless and a re-run completes it.
-            #
-            # The words below say to keep the entry this run showed (vault BACKLOG #3113). They
-            # were written while staging was unconditional, when another run's enable could turn
-            # on THIS run's secret. The #3025 compare-and-set binds each enable to the cell its
-            # own run staged, so that case no longer arises; the cautious words are kept rather
-            # than changed in a merge.
+            # Each enable is bound to the cell its own run staged, so no other run can turn on
+            # THIS run's secret, and the entry it showed is never the live one: the words say to
+            # remove it. (Vault BACKLOG #3113 item 1 had them say keep it, for the re-stage race
+            # the #3025 compare-and-set closed.)
             if not await self._store.enable_totp(
                 user_id, recovery_code_hashes=hashes, expected_secret_cell=staged_cell
             ):
                 raise FirstAdministratorRefused(
                     "the authenticator enrolment was changed while this command ran, so this run "
-                    "did not turn TOTP on and granted no role. Another run may have turned on the "
-                    "secret this run showed, so keep the authenticator entry it showed until a "
-                    "sign-in to this account shows which entry works. "
-                    "If another provision-admin run is in progress, let it finish. Then run the "
-                    "command again: it reads that account and either completes it or says why it "
-                    "cannot"
+                    "did not turn TOTP on and granted no role; remove the authenticator entry it "
+                    "showed. If another provision-admin run is in progress, let it finish. Then "
+                    "run the command again: it reads that account and either completes it or says "
+                    "why it cannot"
                 )
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
         # created with no roles, say -- so its earlier holder is told, at the address they held.
@@ -11778,9 +11774,10 @@ class AuthService:
             reason = "secret_replaced"
         else:
             # The row still holds the verified cell with TOTP off, so the write lost to some other
-            # concurrent write to the row (BACKLOG #3025). The session is revoked by the caller, so
-            # a plain retry is a lost session; recovery is as for a session lost before the
-            # rotation (the ROTATE BEFORE ENABLING comment in ``confirm_mfa_enrollment``).
+            # concurrent write to the row (BACKLOG #3025). The caller asked the store to revoke the
+            # session first (``session_ended`` says whether it did) and hands no token back, so a
+            # plain retry is a lost session; recovery is as for a session lost before the rotation
+            # (the ROTATE BEFORE ENABLING comment in ``confirm_mfa_enrollment``).
             reason = "write_lost"
         await self._audit(
             "auth.mfa_enroll_refused",
