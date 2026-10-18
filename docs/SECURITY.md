@@ -2672,9 +2672,10 @@ grants more. A lookup whose groups map to no role refuses every directory accoun
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
 `directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
-map fails its seal, no role can be judged, so these legs refuse with the outcome
-`directory_role_map_unsealed` instead. That is not a demotion: nothing changed in the directory, and
-the fix is an administrator saving the map again.
+map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
+account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion: nothing
+changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
+the map again. So it is never told to sign out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears

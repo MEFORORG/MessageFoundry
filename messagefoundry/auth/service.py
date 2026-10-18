@@ -859,6 +859,12 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "Your directory groups no longer grant the roles this session holds. Sign out, then"
             " sign in again to take the roles your groups grant now."
         ),
+        # Not a demotion: a new sign-in reads the same failing map, so it is never told to sign
+        # out (BACKLOG #3082).
+        DIRECTORY_ROLE_MAP_UNSEALED: (
+            "Your directory roles could not be confirmed. Try again later. If it is still refused,"
+            " ask an administrator."
+        ),
     }
 )
 
@@ -5352,9 +5358,10 @@ class AuthService:
                 lost=True,
                 extra=floor_marker,
             )
-        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
+        lost = await self._lost_role(fresh.role_ids, principal.groups)
+        if lost is not None:
             return await self._step_up_refused(
-                DIRECTORY_ROLES_DEMOTED,
+                lost,
                 actor=actor,
                 client=client,
                 return_to=return_to,
@@ -8670,8 +8677,9 @@ class AuthService:
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
-        seal. A directory role decision reads the map through here, or through :meth:`_ad_map`
-        once for a whole pass."""
+        seal. A directory role decision reads the map through here, through :meth:`_ad_map` once
+        for a whole pass, or through :meth:`_lost_role`, which tells a failing map from a lost
+        role."""
         return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
 
     async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
@@ -11221,12 +11229,23 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
+        return await self._lost_role(fresh.role_ids, answer.groups)
+
+    async def _lost_role(self, role_ids: Iterable[str], groups: Iterable[str]) -> str | None:
+        """Why a directory account's stored ``role_ids`` are not all among those its ``groups``
+        map to, or ``None`` when they are. An account with no roles has none to lose.
+
+        :data:`DIRECTORY_ROLES_DEMOTED` for a lost role, and :data:`DIRECTORY_ROLE_MAP_UNSEALED`
+        when the role map fails its seal, since every stored role would then read as lost and
+        telling the account to sign in again would cost it the session for nothing (BACKLOG
+        #3082)."""
+        held = set(role_ids)
+        if not held:
+            return None
         role_map = await self._sealed_ad_map(AD_ROLE_MAP)
         if role_map is None:
-            # Every stored role would read as lost, and telling the account to sign in again
-            # would cost it the session for nothing (BACKLOG #3082).
             return DIRECTORY_ROLE_MAP_UNSEALED
-        if not set(fresh.role_ids) <= role_map.values_for(answer.groups):
+        if not held <= role_map.values_for(groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 
