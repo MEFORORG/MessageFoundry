@@ -13355,8 +13355,7 @@ class SqlServerStore:
         precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
         read from the ``UPDLOCK`` SELECT, in the same transaction as the UPDATE, so concurrent
         assertions can't both win and no delete can land between a miss and the answer (BACKLOG
-        #3774). The caller reads ``"mismatch"`` as a clone signal (ADR 0068 decision 4) and
-        ``"gone"`` as none, save when the passkey set then fails its seal."""
+        #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(

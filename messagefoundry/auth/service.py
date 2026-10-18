@@ -159,6 +159,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     RoleRow,
     SessionRecord,
+    SignCountAnswer,
     UserAuthzRecord,
     UserRecord,
     VerifiedUser,
@@ -12062,41 +12063,12 @@ class AuthService:
         answer = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         )
-        if answer == "mismatch":
-            # A compare-and-set miss is a clone signal (ADR 0068 decision 4, as amended 2026-10-17)
-            # unless the passkey is confirmed gone. A self-service delete takes no queue, and an MFA
-            # reset deletes every passkey before it revokes the sessions, so either fails this
-            # compare-and-set too (BACKLOG #3068). "gone" and "mismatch" are told apart by the SAME
-            # locked write that missed (BACKLOG #3774), so a delete landing after the miss cannot
-            # turn a miss on a passkey that still existed into a confirmed-gone one. Written now,
-            # before any other read, so neither the holder re-read below, a store error in it, nor
-            # ending one's own session, a disable or a lock landing mid-flight can drop the signal.
-            await self._clone_suspected(user, cred, client)
-        standing: _PasskeyHeld | None = None
-        if answer == "gone":
-            # The write found no passkey, but that is a confirmed delete only if the set still
-            # passes its seal: a row gone outside the store's sealed write path proves no holder's
-            # delete, so the miss keeps its clone signal, as a mismatch does. Asked BEFORE the
-            # holder re-read below, so a revocation, a disable or a lock found by that re-read
-            # cannot drop the signal, and a store error in these reads writes it before it is
-            # raised. The account is read afresh first: the row read before the write still
-            # covers the deleted passkey, so its digest would fail every sealed delete into the
-            # seal's reload path. Not BaseException: a cancel before the row is written proves
-            # nothing about the passkey and writes none.
-            try:
-                owner = await self._load_user(user.id)
-                if owner is not None:
-                    standing = await self._passkey_held(owner, cred)
-            except Exception:
-                await self._clone_suspected(user, cred, client)
-                raise
-            if owner is None or standing in ("unverified", "account_gone"):
-                # A gone answer whose account does not load, or is gone, writes the clone row here,
-                # once and whatever follows: a missing account row does not say whether the account
-                # was deleted, tampered with or lost a race, and the engine wrote the row on every
-                # miss before this exception, so a false clone row is preferred to a missing one
-                # (BACKLOG #3774).
-                await self._clone_suspected(user, cred, client)
+        if answer != "moved":
+            # Every compare-and-set miss is a clone signal (ADR 0068 decision 4), whatever follows:
+            # the row records the store's answer, so an operator can tell a passkey deleted in the
+            # window from a counter mismatch (BACKLOG #3774). Written before any other read, so no
+            # refusal or store error below can drop it.
+            await self._clone_suspected(user, cred, client, answer=answer)
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked whatever the write answered,
@@ -12111,12 +12083,10 @@ class AuthService:
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
-        if standing is None:
-            # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue,
-            # so the passkey that signed may be gone. Asked after the holder re-read, as the last
-            # read before the factor write. A gone answer wrote any clone row it owes above, so
-            # nothing this read finds writes another.
-            standing = await self._passkey_held(user, cred)
+        # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
+        # passkey that signed may be gone. Asked after the holder re-read, as the last read before
+        # the factor write. It decides the refusal only: the clone row, if owed, is written above.
+        standing = await self._passkey_held(user, cred)
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
@@ -12164,10 +12134,8 @@ class AuthService:
         #3068). ``"held"``, or why not: ``"account_gone"`` when the account row no longer exists,
         ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the answer
         cannot be trusted: the set fails its seal, or the account row still exists but does not
-        load (its own seal fails, or its lookup keys changed). It decides the refusal; whether a
-        sign-count miss is a clone signal is the write's own answer (BACKLOG #3774), save that on a
-        passkey the write found gone, a set failing its seal or an account gone keeps the signal, as
-        an account that does not load does. The account is asked
+        load (its own seal fails, or its lookup keys changed). It decides the refusal only; a
+        sign-count miss writes its clone row before this is asked. The account is asked
         only when the set does not hold ``cred``, since a set read of a deleted account fails its
         seal on a keyed store and is empty on a keyless one. This re-check compares every
         credential, each in constant time (ASVS 11.2.4, as the delete path does); the lookup that
@@ -12185,14 +12153,20 @@ class AuthService:
         return "removed" if held is not None else "unverified"
 
     async def _clone_suspected(
-        self, user: UserRecord, cred: WebAuthnCredential, client: str | None
+        self,
+        user: UserRecord,
+        cred: WebAuthnCredential,
+        client: str | None,
+        *,
+        answer: SignCountAnswer,
     ) -> None:
-        """Audit ``auth.webauthn_clone_suspected`` for passkey ``cred``, the sign-count clone signal
-        :meth:`finish_webauthn_assertion` writes (ADR 0068 decision 4, as amended 2026-10-17)."""
+        """Audit ``auth.webauthn_clone_suspected`` for passkey ``cred``, the clone signal
+        :meth:`finish_webauthn_assertion` writes on every sign-count compare-and-set miss (ADR 0068
+        decision 4), naming the store's ``answer`` (BACKLOG #3774)."""
         await self._audit(
             "auth.webauthn_clone_suspected",
             actor=user.username,
-            detail=_json({"label": cred.label}),
+            detail=_json({"label": cred.label, "sign_count_answer": answer}),
             client=client,
         )
 

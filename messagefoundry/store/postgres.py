@@ -9136,8 +9136,7 @@ class PostgresStore:
         precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
         read from the ``SELECT ... FOR UPDATE`` that locks the row, in the same transaction as the
         guarded ``UPDATE`` (no cross-node double-spend), so no delete can land between a miss and
-        the answer (BACKLOG #3774). The caller reads ``"mismatch"`` as a clone signal (ADR 0068
-        decision 4) and ``"gone"`` as none, save when the passkey set then fails its seal."""
+        the answer (BACKLOG #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"

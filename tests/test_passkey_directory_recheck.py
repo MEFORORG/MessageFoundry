@@ -153,6 +153,12 @@ async def _audited_assertion_failures(store: MessageStore) -> list[dict[str, obj
     return [json.loads(r["detail"]) for r in rows if r["detail"]]
 
 
+async def _clone_answers(store: MessageStore) -> list[object]:
+    """The store answer each ``auth.webauthn_clone_suspected`` row names (BACKLOG #3774)."""
+    rows = await store.list_audit(action="auth.webauthn_clone_suspected")
+    return [json.loads(r["detail"]).get("sign_count_answer") for r in rows]
+
+
 async def _assert_refused_and_uncharged(p: _Pending, outcome: str, sign_count: int) -> None:
     refused = await p.service.finish_webauthn_assertion(
         p.token, p.response, rp_id=_RP, origin=_ORIGIN
@@ -511,9 +517,11 @@ async def test_what_lands_before_the_factor_write_is_honoured(
     and clear both lockout counters, or when the refusal of a spent proof writes no audit row.
 
     A delete that lands BEFORE the sign-count write fails its compare-and-set, as a concurrent
-    assertion that moved the counter does. RED when: that delete is audited as a suspected clone,
-    or the moved counter is not, or an MFA reset (every passkey deleted, then the sessions revoked)
-    landing there answers as a wrong proof rather than a lost session."""
+    assertion that moved the counter does, and every miss is a clone signal (ADR 0068 decision 4).
+    RED when: either miss writes other than one ``auth.webauthn_clone_suspected`` row naming the
+    store's answer (``gone`` for a delete or an MFA reset, ``mismatch`` for the moved counter), or
+    an MFA reset (every passkey deleted, then the sessions revoked) landing there answers as a wrong
+    proof rather than a lost session."""
     if account == "directory":
         p = await _directory_session_owing_a_passkey(store)
         service, token, response, user_id = p.service, p.token, p.response, p.user_id
@@ -568,11 +576,10 @@ async def test_what_lands_before_the_factor_write_is_honoured(
     assert refused.session_lost is (change in ("revoke", "disable", "reset"))
     session = await store.get_session(hash_token(token))
     assert session is not None and session.mfa_verified_at is None
-    clones = await store.list_audit(action="auth.webauthn_clone_suspected")
+    misses = {"counter-moved": ["mismatch"], "passkey-deleted-first": ["gone"], "reset": ["gone"]}
+    assert await _clone_answers(store) == misses.get(change, [])
     if change == "counter-moved":
-        assert len(clones) == 1
         return
-    assert clones == []
     reason = {
         "lock": "locked",
         "passkey-deleted": "factor_removed",
@@ -588,8 +595,8 @@ async def test_what_lands_before_the_factor_write_is_honoured(
 async def test_an_account_deleted_mid_assertion_is_a_lost_session(keyed: bool) -> None:
     """On a keyed store an account gone also fails its passkey set's seal re-read. RED when: the
     miss answers as a wrong proof rather than a lost session, or writes other than one
-    ``auth.webauthn_clone_suspected`` row: a gone answer whose account does not load writes one,
-    since a missing account row does not say why it is missing (BACKLOG #3774)."""
+    ``auth.webauthn_clone_suspected`` row naming ``gone``: every miss writes one (ADR 0068
+    decision 4, BACKLOG #3774)."""
     cipher = make_cipher(generate_key()) if keyed else None
     store = await MessageStore.open(":memory:", cipher=cipher)
     try:
@@ -607,7 +614,7 @@ async def test_an_account_deleted_mid_assertion_is_a_lost_session(keyed: bool) -
         )
 
         assert refused.ok is False and refused.session_lost is True
-        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert await _clone_answers(store) == ["gone"]
         assert {"reason": "session_lost"} in await _audited_assertion_failures(store)
     finally:
         await store.close()
@@ -636,29 +643,27 @@ async def _break_the_passkey_seal(store: MessageStore, user_id: str) -> None:
 
 
 #: What each change does to a sign-count miss: whether a concurrent count moved first (so the write
-#: answers ``mismatch`` rather than ``gone``), whether it writes the clone row, and the reason the
-#: refusal is audited with. Only a passkey confirmed gone while its account still loads writes none;
-#: a gone answer whose account does not load writes one (BACKLOG #3774).
-_MISS_OUTCOMES: dict[str, tuple[bool, bool, str]] = {
-    "revoke": (True, True, "session_lost"),
-    "disable": (True, True, "session_lost"),
-    "lock": (True, True, "locked"),
-    "seal": (True, True, "factor_unverified"),
-    "passkey-deleted": (False, False, "factor_removed"),
-    "reset": (False, False, "session_lost"),
-    "account-deleted": (False, True, "session_lost"),
+#: answers ``mismatch`` rather than ``gone``), and the reason the refusal is audited with. Every
+#: miss writes one clone row naming the store's answer (BACKLOG #3774).
+_MISS_OUTCOMES: dict[str, tuple[bool, str]] = {
+    "revoke": (True, "session_lost"),
+    "disable": (True, "session_lost"),
+    "lock": (True, "locked"),
+    "seal": (True, "factor_unverified"),
+    "passkey-deleted": (False, "factor_removed"),
+    "reset": (False, "session_lost"),
+    "account-deleted": (False, "session_lost"),
 }
 
 
 @pytest.mark.parametrize("change", list(_MISS_OUTCOMES))
-async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(change: str) -> None:
-    """BACKLOG #3068, ADR 0068 decision 4. A compare-and-set miss is a clone signal, and only a
-    passkey confirmed gone (deleted by itself or by an MFA reset) explains one away; a passkey gone
-    with its account cannot be told from a racing account, so it keeps the signal (BACKLOG #3774).
-    RED when: a session the holder ended, a disable, a lock, a passkey set failing its seal or an
-    account gone suppresses the ``auth.webauthn_clone_suspected`` row, or a confirmed delete still
-    writes one, or the refusal is not audited with that change's own reason. Keyed, so the seal
-    can fail."""
+async def test_every_sign_count_miss_is_a_clone_signal_naming_the_store_answer(change: str) -> None:
+    """BACKLOG #3068, #3774, ADR 0068 decision 4. Every compare-and-set miss is a clone signal, as
+    engine main writes it, and the row names what the store answered, so a passkey deleted by
+    itself or by an MFA reset reads ``gone``. RED when: a session the holder ended, a disable, a
+    lock, a passkey set failing its seal, a passkey delete, an MFA reset or an account gone leaves
+    other than one ``auth.webauthn_clone_suspected`` row naming that answer, or the refusal is not
+    audited with that change's own reason. Keyed, so the seal can fail."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
@@ -704,11 +709,10 @@ async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(ch
             token, response, rp_id=_RP, origin=_ORIGIN
         )
 
-        _, clone, reason = _MISS_OUTCOMES[change]
+        moved_first, reason = _MISS_OUTCOMES[change]
         assert refused.ok is False
         assert refused.session_lost is (reason == "session_lost")
-        clones = await store.list_audit(action="auth.webauthn_clone_suspected")
-        assert len(clones) == (1 if clone else 0)
+        assert await _clone_answers(store) == ["mismatch" if moved_first else "gone"]
         assert {"reason": reason} in await _audited_assertion_failures(store)
         session = await store.get_session(hash_token(token))
         assert session is None or session.mfa_verified_at is None
@@ -748,7 +752,7 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
         with pytest.raises(RuntimeError, match="synthetic"):
             await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
 
-        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert await _clone_answers(store) == ["mismatch"]
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
     finally:
@@ -759,11 +763,10 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
 async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
     keyed: bool,
 ) -> None:
-    """BACKLOG #3774, ADR 0068 decision 4 as amended 2026-10-17. The miss is judged by the write
-    that missed: the passkey still existed and held another count, so it is a clone signal, and a
-    delete landing AFTER that write, before the holder is asked, must not explain it away. RED
-    when: no ``auth.webauthn_clone_suspected`` row is written, which is what the old two-step
-    question (a miss, then a separate read whether the passkey is still held) gave."""
+    """BACKLOG #3774, ADR 0068 decision 4. The miss is judged by the write that missed: the
+    passkey still existed and held another count, and a delete landing AFTER that write, before the
+    holder is asked, must not change the row. RED when: the ``auth.webauthn_clone_suspected`` row is
+    missing or names other than ``mismatch``."""
     cipher = make_cipher(generate_key()) if keyed else None
     store = await MessageStore.open(":memory:", cipher=cipher)
     try:
@@ -792,7 +795,7 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
         )
 
         assert refused.ok is False and refused.session_lost is False
-        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert await _clone_answers(store) == ["mismatch"]
         assert {"reason": "factor_removed"} in await _audited_assertion_failures(store)
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
@@ -801,10 +804,10 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
 
 
 async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -> None:
-    """BACKLOG #3774, ADR 0068 amendment of 2026-10-17. The write answers ``gone``, but the row
-    left outside the store's sealed write path, so the account's set fails its seal: that proves no
-    holder's delete. RED when: no ``auth.webauthn_clone_suspected`` row is written, or the refusal
-    reads ``factor_removed`` rather than ``factor_unverified``. Keyed, so the seal can fail."""
+    """BACKLOG #3774. The write answers ``gone`` and the row left outside the store's sealed
+    write path, so the account's set fails its seal. RED when: the ``auth.webauthn_clone_suspected``
+    row is missing or names other than ``gone``, or the refusal reads ``factor_removed`` rather
+    than ``factor_unverified``. Keyed, so the seal can fail."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
@@ -824,7 +827,7 @@ async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -
         )
 
         assert refused.ok is False and refused.session_lost is False
-        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert await _clone_answers(store) == ["gone"]
         failures = await _audited_assertion_failures(store)
         assert {"reason": "factor_unverified"} in failures
         assert {"reason": "factor_removed"} not in failures
@@ -847,11 +850,10 @@ async def test_an_unsealed_gone_passkey_keeps_the_clone_signal_whatever_the_hold
     change: str,
 ) -> None:
     """BACKLOG #3774, the review of PR 2392 at 5d8901d8. The write answers ``gone`` and the set
-    fails its seal, so the clone row is owed, and it must be written whatever the holder re-read
-    then finds. RED when: a revocation, a disable or a lock landing before the factor write, or a
-    set read that raises, leaves no ``auth.webauthn_clone_suspected`` row, which is what asking
-    the set only AFTER the holder re-read, with no finally, gave. Exactly one row, so the write
-    before the re-read is not repeated after it. Keyed, so the seal can fail."""
+    fails its seal, and the clone row must be written whatever the holder re-read then finds. RED
+    when: a revocation, a disable or a lock landing before the factor write, or a set read that
+    raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``. Keyed, so
+    the seal can fail."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
@@ -893,7 +895,7 @@ async def test_an_unsealed_gone_passkey_keeps_the_clone_signal_whatever_the_hold
             assert refused.session_lost is (reason == "session_lost")
             assert {"reason": reason} in await _audited_assertion_failures(store)
         store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
-        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert await _clone_answers(store) == ["gone"]
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
     finally:
@@ -933,37 +935,35 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
         await store.close()
 
 
-#: Each case: whether the passkey leaves through the store's sealed delete (else outside it, so the
-#: set fails its seal; only the cases that reach a set read consult it), what the request answers (a
-#: refusal reason, ``"raises"`` or ``"cancelled"``), and how many clone rows it writes.
-_UNLOADED_GONE_CASES: dict[str, tuple[bool, str, int]] = {
-    "holder-revoked": (False, "session_lost", 1),
-    "holder-disabled": (False, "session_lost", 1),
-    "holder-locked": (False, "locked", 1),
-    "holder-reread-raises": (False, "raises", 1),
-    "account-fails-to-load-again": (False, "session_lost", 1),
-    "set-unverified": (False, "factor_unverified", 1),
-    "set-read-raises": (False, "raises", 1),
-    "set-removed": (True, "factor_removed", 1),
-    "set-read-cancelled": (False, "cancelled", 1),
-    "load-cancelled": (False, "cancelled", 0),
-    "account-deleted-after-load": (True, "session_lost", 1),
+#: Each case: how the passkey goes before the write (``"held"``: it does not, and the store is made
+#: to answer ``gone`` anyway; ``"sealed"``: through the store's sealed delete; ``"unsealed"``:
+#: outside it, so the set fails its seal), and what the request answers (a refusal reason,
+#: ``"raises"`` or ``"cancelled"``).
+_GONE_CASES: dict[str, tuple[str, str]] = {
+    "set-held": ("held", "factor_removed"),
+    "set-removed": ("sealed", "factor_removed"),
+    "set-unverified": ("unsealed", "factor_unverified"),
+    "set-read-raises": ("sealed", "raises"),
+    "set-read-cancelled": ("sealed", "cancelled"),
+    "account-unloadable": ("sealed", "session_lost"),
+    "account-deleted-after-load": ("sealed", "session_lost"),
+    "holder-revoked": ("sealed", "session_lost"),
+    "holder-disabled": ("sealed", "session_lost"),
+    "holder-locked": ("sealed", "locked"),
+    "holder-reread-raises": ("sealed", "raises"),
 }
 
 
-@pytest.mark.parametrize("case", list(_UNLOADED_GONE_CASES))
-async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(case: str) -> None:
-    """BACKLOG #3774, the Manager's ruling on PR 2392 at 146be6e1. The write answers ``gone`` and
-    the fresh account load the gone path asks returns nothing (for example its seal check lost a
-    race to a rename or a rebind), so the engine cannot tell a deleted passkey from a tampered or
-    racing account; engine main alerts on every miss, so the clone row is written right there, once,
-    whatever follows. RED when: a holder re-read that refuses or raises, an account that fails to
-    load again, or a sealed delete the late set read finds leaves no ``auth.webauthn_clone_suspected``
-    row, which is what 146be6e1 gave, or any case writes two. An account deleted after a fresh load
-    that did succeed writes one too, so the outcome does not hang on when the delete landed. The
-    control: a cancel before the row is written writes none, while a cancel after it leaves it.
+@pytest.mark.parametrize("case", list(_GONE_CASES))
+async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str) -> None:
+    """BACKLOG #3774, the Manager's ruling on PR 2392 at 38b26723. Engine main writes the clone row
+    on every compare-and-set miss, so a ``gone`` answer writes it too, once, before any other read,
+    naming ``gone``. RED when: a gone answer whose set still holds the passkey, loses it through
+    the sealed delete, fails its seal, or whose set read raises or is cancelled; whose account does
+    not load or is deleted after it loads; or whose holder re-read refuses (revoked, disabled,
+    locked) or raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``.
     Keyed, so the seal can fail."""
-    sealed, outcome, clone_rows = _UNLOADED_GONE_CASES[case]
+    gone_by, outcome = _GONE_CASES[case]
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
@@ -971,45 +971,7 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
         real_list = store.list_webauthn_credentials
         real_load = service._load_user
         real_holder = service._factor_holder_current
-        state = {"written": False, "unloaded": False}
-
-        async def _gone(*args: Any, **kwargs: Any) -> SignCountAnswer:
-            # The holder change lands first, so a user-row write cannot re-seal the set.
-            if case == "holder-revoked":
-                await store.revoke_session(hash_token(token))
-            elif case == "holder-disabled":
-                await store.set_user_disabled(user_id, disabled=True)
-            elif case == "holder-locked":
-                await _lock_second_step(store, user_id)
-            if sealed:
-                (held,) = await real_list(user_id)
-                assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
-            else:
-                await store._db.execute(
-                    "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
-                )
-                await store._db.commit()
-            answer = await real_update(*args, **kwargs)
-            assert answer == "gone"
-            state["written"] = True
-            return answer
-
-        async def _load_fails_after_the_write(*args: Any, **kwargs: Any) -> Any:
-            again = case == "account-fails-to-load-again"
-            if case == "account-deleted-after-load":
-                loaded = await real_load(*args, **kwargs)
-                if state["written"] and not state["unloaded"]:
-                    state["unloaded"] = True
-                    await store.delete_user(user_id)
-                return loaded
-            if state["written"] and (not state["unloaded"] or again):
-                state["unloaded"] = True
-                if case == "load-cancelled":
-                    raise asyncio.CancelledError
-                if case in ("set-read-raises", "set-read-cancelled"):
-                    store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
-                return None
-            return await real_load(*args, **kwargs)
+        state = {"written": False, "deleted": False}
 
         async def _set_read_fails(*_args: Any) -> list[object]:
             if case == "set-read-cancelled":
@@ -1019,8 +981,43 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
         async def _holder_reread_fails(*_args: Any, **_kwargs: Any) -> Any:
             raise RuntimeError("synthetic: the holder re-read failed")
 
+        async def _gone(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            # The holder change lands first, so a user-row write cannot re-seal the set.
+            if case == "holder-revoked":
+                await store.revoke_session(hash_token(token))
+            elif case == "holder-disabled":
+                await store.set_user_disabled(user_id, disabled=True)
+            elif case == "holder-locked":
+                await _lock_second_step(store, user_id)
+            if gone_by == "held":
+                answer: SignCountAnswer = "gone"
+            else:
+                if gone_by == "sealed":
+                    (held,) = await real_list(user_id)
+                    assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+                else:
+                    await store._db.execute(
+                        "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
+                    )
+                    await store._db.commit()
+                answer = await real_update(*args, **kwargs)
+                assert answer == "gone"
+            if case in ("set-read-raises", "set-read-cancelled"):
+                store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
+            state["written"] = True
+            return answer
+
+        async def _load_after_the_write(*args: Any, **kwargs: Any) -> Any:
+            if state["written"] and case == "account-unloadable":
+                return None
+            loaded = await real_load(*args, **kwargs)
+            if state["written"] and case == "account-deleted-after-load" and not state["deleted"]:
+                state["deleted"] = True
+                await store.delete_user(user_id)
+            return loaded
+
         store.update_webauthn_sign_count = _gone  # type: ignore[method-assign]
-        service._load_user = _load_fails_after_the_write  # type: ignore[method-assign]
+        service._load_user = _load_after_the_write  # type: ignore[method-assign]
         if case == "holder-reread-raises":
             service._factor_holder_current = _holder_reread_fails  # type: ignore[method-assign]
 
@@ -1037,16 +1034,34 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
             assert refused.ok is False
             assert refused.session_lost is (outcome == "session_lost")
             assert {"reason": outcome} in await _audited_assertion_failures(store)
-        assert state["unloaded"], "the fresh account load of the gone path was never asked"
+        if case == "account-deleted-after-load":
+            assert state["deleted"], "the account was never loaded after the write"
         store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
         service._factor_holder_current = real_holder  # type: ignore[method-assign]
-        rows = await store.list_audit(action="auth.webauthn_clone_suspected")
-        assert len(rows) == clone_rows
+        assert await _clone_answers(store) == ["gone"]
         session = await store.get_session(hash_token(token))
-        if case == "account-deleted-after-load":
-            assert session is None or session.mfa_verified_at is None
-        else:
-            assert session is not None and session.mfa_verified_at is None
+        assert session is None or session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_cancel_before_the_store_answers_writes_no_clone_row() -> None:
+    """BACKLOG #3774, the control for the gone cases above. A cancel before the sign-count write
+    answers proves nothing about the passkey. RED when: it writes an
+    ``auth.webauthn_clone_suspected`` row."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, _user_id = await _local_assertion(store)
+
+        async def _cancelled(*_args: Any, **_kwargs: Any) -> SignCountAnswer:
+            raise asyncio.CancelledError
+
+        store.update_webauthn_sign_count = _cancelled  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.CancelledError):
+            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+        assert await _clone_answers(store) == []
     finally:
         await store.close()
 

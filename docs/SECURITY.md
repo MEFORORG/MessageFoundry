@@ -2981,28 +2981,17 @@ COSE **public keys are stored plaintext by design** (verification material, not 
 outside the store cipher, documented in the crypto inventory); the authenticator **sign counter is
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
-normal for synced passkeys). A miss whose passkey is confirmed gone, while its account still loads
-and holds it, writes no clone row (BACKLOG
-#3068; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment of 2026-10-17).
-**Gone is decided by the write that missed** (BACKLOG #3774): the compare-and-set answers moved,
-mismatch or gone under one locked write on every backend, so a delete landing after the miss
-cannot turn a miss on a passkey that still existed into a confirmed-gone one. A gone passkey is
-refused as `auth.webauthn_failed` with `reason=factor_removed`, or `reason=session_lost` when the
-session or the account went with it. An MFA reset gives `reason=session_lost` once its revocation
-has landed, and `reason=factor_removed` before. So a genuine counter race followed by a delete
-that lands BEFORE the write leaves no clone row; that is accepted. A gone passkey keeps the signal
-when the passkey set read after the write fails its seal: the row may have gone
-outside the store's sealed write path, so the clone row is written and the refusal is
-`reason=factor_unverified`, unless the holder re-read refuses first with its own reason. A
-mismatch writes the clone row
-at once, before the session, the account, the lock and the passkey set are read again, and a gone
-passkey whose set fails its seal writes it after that one set read and still before the rest. So
-at least these cannot suppress it: a holder ending their own session, a disable, a lock, a passkey
-delete, or a store error landing after the write. The refusal then also carries that change's own
-reason. When the account, read afresh for that set read, does not load or is gone, the clone row
-is written there, once and before any other read, because a missing account row does not say
-whether the account was deleted, tampered with or lost a race, and the engine wrote the row on
-every miss before this exception, so a false clone row is preferred to a missing one.
+normal for synced passkeys). Every compare-and-set miss writes that row once, as soon as the
+store answers and before any other read, and its detail names the store's answer as
+`sign_count_answer`: `mismatch` (the passkey held another count) or `gone` (the passkey was deleted
+during the assertion, for example by its holder or an MFA reset), decided under one locked write on
+every backend (BACKLOG #3068, #3774; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+amendment of 2026-10-17). So at least these cannot suppress it: a holder ending their own session, a
+disable, a lock, a passkey delete, or a store error landing after the write. A gone passkey is then
+refused as `auth.webauthn_failed` with `reason=factor_removed`, `reason=factor_unverified` when the
+passkey set read after the write fails its seal, or `reason=session_lost` when the session or the
+account went with it; an MFA reset gives `reason=session_lost` once its revocation has landed, and
+`reason=factor_removed` before.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,

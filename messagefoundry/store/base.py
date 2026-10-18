@@ -2368,9 +2368,8 @@ class AuthStore(Protocol):
 
     # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey
     # exists and holds another count) or ``"gone"`` (no such passkey) under ONE locked write on every
-    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Only ``"gone"``
-    # is not a clone signal, save when the account's passkey set then fails its seal (ADR 0068
-    # decision 4, as amended 2026-10-17).
+    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Either miss is
+    # a clone signal (ADR 0068 decision 4); the answer only says which.
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
     ) -> SignCountAnswer: ...
