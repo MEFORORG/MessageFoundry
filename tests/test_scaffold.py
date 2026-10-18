@@ -385,7 +385,8 @@ def _run_audit_job(
         **(fail_env or {}),
     }
     stubs = {"python": _PYTHON_STUB, "pip-audit": _PIP_AUDIT_STUB}
-    output, failed = "", []
+    output = ""
+    failed: list[str] = []
     for i, step in enumerate(jobs["audit-pin"]["steps"]):
         if "run" not in step:
             continue
