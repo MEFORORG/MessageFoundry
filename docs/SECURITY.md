@@ -2722,11 +2722,16 @@ TOTP secret that does not open for the check itself is refused the same way, bef
 read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
 turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
 change can leave the check nothing to spend, so the code fails its spend. Only a code that
-MATCHED the factor is asked further: the account is read again, and a factor turned off or
-replaced since the check began is refused with `reason=factor_removed` or
+MATCHED the factor is asked further: the session, the account and its lock are read again, as
+before a factor write. A session revoked or an account disabled or gone meanwhile answers
+`reason=session_lost`, and a lock answers locked, both charged nothing. Otherwise a factor turned
+off or replaced since the check began is refused with `reason=factor_removed` or
 `reason=factor_replaced` and charged nothing. A code that matched nothing is a wrong code and is
-charged unread, whatever lands meanwhile. A matched code is still charged when the row cannot be
-read, the secret does not open, or the re-read raises: none of those proves a change. The
+charged unread, whatever lands meanwhile. A matched code is still charged when the secret does not
+open, when the re-read raises, or when the factor is unchanged, as for a replayed code: none proves a
+change. When the re-read answers, the charge and its `auth.mfa_failed` row name the account as it
+found it, so a rename during the check is charged under the new name; when the re-read raises, they
+name the account as the check began. The
 passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
@@ -3036,12 +3041,19 @@ has landed, and `reason=factor_removed` before. So a genuine counter race follow
 that lands BEFORE the write leaves no clone row; that is accepted. One case keeps the signal on a
 gone passkey: when the passkey set read after the write fails its seal, the row may have gone
 outside the store's sealed write path, so the clone row is written and the refusal is
-`reason=factor_unverified`. A mismatch writes the clone row
+`reason=factor_unverified`, unless the holder re-read refuses first with its own reason. A
+mismatch writes the clone row
 at once, before the session, the account, the lock and the passkey set are read again, and a gone
 passkey whose set fails its seal writes it after that one set read and still before the rest. So
 at least these cannot suppress it: a holder ending their own session, a disable, a lock, a passkey
 delete, or a store error landing after the write. The refusal then also carries that change's own
-reason.
+reason. One path is narrower: when the account, loaded afresh for that set read, does not load
+although its row still exists (for example its seal check losing a race to a rename or a rebind),
+the set is read only after the session, the account and the lock. A set failing its seal there, or
+a store error in that read, still writes the one clone row. At least these leave none on that path:
+a revocation, a disable or a lock found first, an account that again fails to load
+(`reason=session_lost`), a store error in that re-read, and a passkey delete through the sealed
+path that lands before the late set read.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,

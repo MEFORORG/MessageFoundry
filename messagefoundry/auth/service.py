@@ -11136,14 +11136,14 @@ class AuthService:
             # replaced during the check can fail its spend. That is no guess, so it is refused with
             # its own reason and charges nothing to the second-step lockout. Only a code that
             # MATCHED is asked; a wrong code is charged unread. The session, the account and its
-            # lock are read again first, as on the proved branch, so an administrator's replace or
-            # an MFA reset, which revoke the sessions, answers as the lost session it is, and a
-            # lock that landed meanwhile answers locked; neither charges the code. A cell that no
-            # longer opens, or a store error in the re-read, proves no change and is charged as
+            # lock are read again first, as on the proved branch, so a session revoked or an
+            # account disabled or gone meanwhile answers as the lost session it is, and a lock
+            # that landed meanwhile answers locked; neither charges the code. An administrator's
+            # replace revokes with the swap, so it answers a lost session; an MFA reset revokes in
+            # a later write, so a re-read between the two reads as the factor removed. A cell that
+            # no longer opens, or a store error in the re-read, proves no change and is charged as
             # before (fail closed).
             if match.matched:
-                after: VerifiedUser | None = None
-                change: _TotpMoved | None = None
                 try:
                     held = await self._factor_holder_current(
                         token,
@@ -11154,19 +11154,21 @@ class AuthService:
                     )
                     if isinstance(held, Elevation):
                         return held
-                    after = held
-                    change = self._totp_enrolment_moved(verified_enrolment, after)
+                    change = self._totp_enrolment_moved(verified_enrolment, held)
                 except Exception:  # noqa: BLE001 - any re-read failure is charged, never raised
                     _log.exception("verify_mfa: the factor re-read after a failed spend raised")
-                    after, change = None, None
-                if after is not None and change in ("factor_removed", "factor_replaced"):
-                    await self._audit(
-                        "auth.mfa_failed",
-                        actor=after.username,
-                        detail=_json({"reason": change}),
-                        client=client,
-                    )
-                    return Elevation()
+                else:
+                    if change in ("factor_removed", "factor_replaced"):
+                        await self._audit(
+                            "auth.mfa_failed",
+                            actor=held.username,
+                            detail=_json({"reason": change}),
+                            client=client,
+                        )
+                        return Elevation()
+                    # Charged below against the row as it is now, so the wrong-code row and any
+                    # lock notice name the account a rename during the check left (#2291 class).
+                    user = held
             # Wrong code: register the failure through the SAME machinery the password path uses, so
             # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
             # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
@@ -11444,9 +11446,10 @@ class AuthService:
 
         For a check that must land just before a factor is written, after awaits in which a
         revocation, a disable or a lock could have landed (BACKLOG #3068).
-        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, and both second-
-        factor legs run it again right before ``mark_session_mfa_verified``. A session revoked or
-        gone, or an account disabled or gone, returns ``session_lost``: the token no longer
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, both second-
+        factor legs run it again right before ``mark_session_mfa_verified``, and :meth:`verify_mfa`
+        runs it on a matched code whose spend failed, before it decides the charge. A session
+        revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
         authenticates, so the caller must not report a wrong proof. It is audited as ``event``
         with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
         read), because the proof may already be spent. A live second-step lock is audited as
@@ -12247,33 +12250,36 @@ class AuthService:
             # turn a miss on a passkey that still existed into a confirmed-gone one. Written now,
             # before any other read, so neither the holder re-read below, a store error in it, nor
             # ending one's own session, a disable or a lock landing mid-flight can drop the signal.
-            await self._audit(
-                "auth.webauthn_clone_suspected",
-                actor=user.username,
-                detail=_json({"label": cred.label}),
-                client=client,
-            )
+            await self._clone_suspected(user, cred, client)
         standing: _PasskeyHeld | None = None
         if answer == "gone":
             # The write found no passkey, but that is a confirmed delete only if the set still
             # passes its seal: a row gone outside the store's sealed write path proves no holder's
             # delete, so the miss keeps its clone signal, as a mismatch does. Asked BEFORE the
-            # holder re-read below and written in a finally, so a revocation, a disable or a lock
-            # found by that re-read, or a store error in either read, cannot drop the signal.
+            # holder re-read below, so a revocation, a disable or a lock found by that re-read
+            # cannot drop the signal, and a store error in these reads writes it before it is
+            # raised. The account is read afresh first: the row read before the write still
+            # covers the deleted passkey, so its digest would fail every sealed delete into the
+            # seal's reload path. An account row that still exists but does not load (its seal
+            # check lost a race to a rename or a rebind) leaves the set unasked here, so the set
+            # read after the holder re-read owes the same row; on that path a refusal by the
+            # holder re-read comes first and writes none (BACKLOG #3774).
             try:
-                standing = await self._passkey_held(user, cred)
-            finally:
-                if standing in (None, "unverified"):
-                    await self._audit(
-                        "auth.webauthn_clone_suspected",
-                        actor=user.username,
-                        detail=_json({"label": cred.label}),
-                        client=client,
-                    )
+                owner = await self._load_user(user.id)
+                if owner is not None:
+                    standing = await self._passkey_held(owner, cred)
+            except Exception:
+                # Not BaseException: a cancelled request proves nothing about the passkey.
+                await self._clone_suspected(user, cred, client)
+                raise
+            if standing == "unverified":
+                await self._clone_suspected(user, cred, client)
+        # A gone answer whose set was not asked above: its clone row, if owed, is not written yet.
+        gone_unasked = answer == "gone" and standing is None
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
-        # between must stop the factor write, as on verify_mfa. Asked on all three paths, so each
-        # refusal is audited with its own reason.
+        # between must stop the factor write, as on verify_mfa. Asked whatever the write answered,
+        # so each refusal is audited with its own reason.
         fresh = await self._factor_holder_current(
             token,
             actor=user.username,
@@ -12287,13 +12293,24 @@ class AuthService:
         if standing is None:
             # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue,
             # so the passkey that signed may be gone. Asked after the holder re-read, as the last
-            # read before the factor write. A gone answer was asked above, for its clone signal.
-            standing = await self._passkey_held(user, cred)
+            # read before the factor write. A gone answer whose account loaded was asked above;
+            # one whose account did not is asked here, and a store error writes its clone row
+            # before it is raised, as the read above does.
+            try:
+                standing = await self._passkey_held(user, cred)
+            except Exception:
+                # Not BaseException, as above.
+                if gone_unasked:
+                    await self._clone_suspected(user, cred, client)
+                raise
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
             return await self._assertion_refused(user, client, "session_lost", session_lost=True)
         if standing == "unverified":
+            if gone_unasked:
+                # The gone answer's set fails its seal, so the miss keeps its clone signal.
+                await self._clone_suspected(user, cred, client)
             return await self._assertion_refused(user, client, "factor_unverified")
         if answer == "gone" or standing != "held":
             # Confirmed gone by the write itself, or by the set read after it.
@@ -12354,6 +12371,18 @@ class AuthService:
         if not await self._user_id_held(user.id):
             return "account_gone"
         return "removed" if held is not None else "unverified"
+
+    async def _clone_suspected(
+        self, user: UserRecord, cred: WebAuthnCredential, client: str | None
+    ) -> None:
+        """Audit ``auth.webauthn_clone_suspected`` for passkey ``cred``, the sign-count clone signal
+        :meth:`finish_webauthn_assertion` writes (ADR 0068 decision 4, as amended 2026-10-17)."""
+        await self._audit(
+            "auth.webauthn_clone_suspected",
+            actor=user.username,
+            detail=_json({"label": cred.label}),
+            client=client,
+        )
 
     async def _assertion_refused(
         self, user: UserRecord, client: str | None, reason: str, *, session_lost: bool = False

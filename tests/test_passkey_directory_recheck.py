@@ -15,6 +15,7 @@ data here is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -918,6 +919,91 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
         assert {"reason": "factor_unverified"} in failures
         assert {"reason": "factor_removed"} not in failures
         assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+#: Each case: what the set read after the holder re-read finds when the fresh account load of the
+#: gone path returned nothing, the reason the refusal is audited with (``None``: the read raises),
+#: and how many clone rows that request writes.
+_UNLOADED_GONE_CASES: dict[str, tuple[str | None, int]] = {
+    "set-unverified": ("factor_unverified", 1),
+    "set-removed": ("factor_removed", 0),
+    "set-read-raises": (None, 1),
+    "set-read-cancelled": (None, 0),
+}
+
+
+@pytest.mark.parametrize("case", list(_UNLOADED_GONE_CASES))
+async def test_a_gone_passkey_whose_account_does_not_load_keeps_the_clone_signal(case: str) -> None:
+    """BACKLOG #3774, the review of PR 2392 at fcac75a5. The write answers ``gone``, and the fresh
+    account load the gone path asks returns nothing although the account still exists (for example
+    its seal check lost a race to a rename or a rebind), so the passkey set is asked only after the
+    holder re-read. RED when: that later read finds the set failing its seal after an unsealed
+    delete, or raises, and no ``auth.webauthn_clone_suspected`` row is written, which is what the
+    head before this fix gave. Exactly one row, so no path writes it twice. The controls: a delete
+    through the store's sealed path is a confirmed delete and writes none, and a cancelled read
+    writes none, since a cancel proves nothing about the passkey. Keyed, so the seal can fail."""
+    reason, clone_rows = _UNLOADED_GONE_CASES[case]
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+        real_list = store.list_webauthn_credentials
+        real_load = service._load_user
+        state = {"written": False, "unloaded": False, "set_read_failed": False}
+
+        async def _gone(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            if case == "set-removed":
+                (held,) = await real_list(user_id)
+                assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            else:
+                await store._db.execute(
+                    "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
+                )
+                await store._db.commit()
+            answer = await real_update(*args, **kwargs)
+            assert answer == "gone"
+            state["written"] = True
+            return answer
+
+        async def _first_load_after_the_write_fails(*args: Any, **kwargs: Any) -> Any:
+            if state["written"] and not state["unloaded"]:
+                state["unloaded"] = True
+                if reason is None:
+                    store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
+                return None
+            return await real_load(*args, **kwargs)
+
+        async def _set_read_fails(*_args: Any) -> list[object]:
+            state["set_read_failed"] = True
+            if case == "set-read-cancelled":
+                raise asyncio.CancelledError
+            raise RuntimeError("synthetic: the store read failed")
+
+        store.update_webauthn_sign_count = _gone  # type: ignore[method-assign]
+        service._load_user = _first_load_after_the_write_fails  # type: ignore[method-assign]
+
+        if reason is not None:
+            refused = await service.finish_webauthn_assertion(
+                token, response, rp_id=_RP, origin=_ORIGIN
+            )
+            assert refused.ok is False and refused.session_lost is False
+            failures = await _audited_assertion_failures(store)
+            assert {"reason": reason} in failures
+        elif case == "set-read-cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        else:
+            with pytest.raises(RuntimeError, match="synthetic"):
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        assert state["unloaded"], "the fresh account load of the gone path was never asked"
+        assert state["set_read_failed"] is (reason is None)
+        store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
+        rows = await store.list_audit(action="auth.webauthn_clone_suspected")
+        assert len(rows) == clone_rows
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
     finally:

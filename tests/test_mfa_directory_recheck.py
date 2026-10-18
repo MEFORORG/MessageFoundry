@@ -674,6 +674,65 @@ async def test_a_factor_changed_with_the_sessions_revoked_answers_a_lost_session
     assert user is not None and user.second_step_failed_attempts == 0
 
 
+#: Each case: what lands with the factor turned off during the check, and what the refusal is:
+#: ``session_lost``, ``locked``, or ``charged`` (the re-read raised, which proves no change).
+_FAILED_SPEND_REREAD_CASES = {
+    "disable": "session_lost",
+    "lock": "locked",
+    "reread-raises": "charged",
+}
+
+
+@pytest.mark.parametrize("change", list(_FAILED_SPEND_REREAD_CASES))
+async def test_the_failed_spend_reread_answers_the_holder_first(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392. A CORRECT recovery code whose factor is turned
+    off during the check fails its spend, and the branch that then asks why reads the session, the
+    account and its lock first. RED when: an account disabled meanwhile answers ``factor_removed``
+    rather than a lost session, a lock landing meanwhile is not answered ``locked``, or either
+    charges the matched code; or when a re-read that raises is not charged (fail closed)."""
+    outcome = _FAILED_SPEND_REREAD_CASES[change]
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        await store.disable_totp(user_id)
+        if change == "disable":
+            await store.set_user_disabled(user_id, disabled=True)
+        elif change == "lock":
+            await _lock_second_step(store, user_id)
+        return await real_verify(*args, **kwargs)
+
+    async def _reread_fails(*_args: Any, **_kwargs: Any) -> object:
+        raise RuntimeError("synthetic: the holder re-read failed")
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_something_lands)
+    if change == "reread-raises":
+        monkeypatch.setattr(service, "_factor_holder_current", _reread_fails)
+
+    refused = await service.verify_mfa(confirmed.token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False
+    assert refused.session_lost is (outcome == "session_lost")
+    assert refused.locked is (outcome == "locked")
+    failures = await _audited_mfa_failures(store)
+    assert {"reason": "factor_removed"} not in failures
+    if outcome == "session_lost":
+        assert {"reason": "session_lost"} in failures
+    user = await store.get_user(user_id)
+    assert user is not None
+    # The lock case's one failure is the lock itself; the code adds none.
+    assert user.second_step_failed_attempts == (0 if outcome == "session_lost" else 1)
+
+
 async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -695,6 +754,36 @@ async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     assert verified.ok
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
+async def test_a_replayed_code_checked_across_a_rename_is_charged_under_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392 at fcac75a5. A replayed code MATCHES but fails its
+    spend with the factor unchanged, so it is charged as a wrong code, and against the row the
+    holder re-read returned: a rename landing during the check must not leave the wrong-code row
+    and the lockout naming the account as it was. RED when: the ``auth.mfa_failed`` row names the
+    old username, or the replay is not charged."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    (second,) = await _more_sessions(e, 1)
+    code = totp.totp(e.secret, now=_T1)
+    assert (await e.service.verify_mfa(e.token, code)).ok
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
+
+    refused = await e.service.verify_mfa(second, code)
+
+    assert refused.ok is False and refused.session_lost is False and refused.locked is False
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == 1
 
 
 async def test_a_secret_that_does_not_open_for_the_check_is_refused_and_spends_nothing(
