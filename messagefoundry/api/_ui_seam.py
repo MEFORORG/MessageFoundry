@@ -428,6 +428,18 @@ from typing import Any
 #: (#2709 to 589456358a5fe441, #3192 to bd77ef41628d287c). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both: the route-gate section and the grown DTO.
 #:
+#: Vault BACKLOG #3189, #3031 and #3192, MOVED ON PURPOSE: ``UserSummary`` gained the required
+#: ``channel_scope_withheld``, which the users page reads to tell a withheld scope from one that
+#: denies. ``ConfigProvenance`` gained the required ``reload_refused``, the engine's own reload
+#: refusal for the caller, which the config page reads to stop offering a Reload the engine will
+#: refuse after the step-up. ``ReleaseBlocked`` gained ``requester_not_authorized``, which the
+#: Approvals page has a note for. The channel-scope change before these moved no digest, so a
+#: console built before it shared this engine's digest and passed the handshake. Such a console
+#: rendered "(none)" for a withheld scope, never rendered the posture's ``loosenings_scope`` line on
+#: ``/ui/status``, and skipped the name check on a channel-scoped actor's bulk selection, which
+#: ``audit_channel_denied`` in ``message_scope.py`` now bounds itself. Moving the digest refuses that console at mount, which
+#: closes all three. Re-derived with ``--write``.
+#:
 #: Vault BACKLOG #2709, review repair: the route-gate table also records the qualified name of each
 #: engine function a gate reaches by a plain global name, follows names in nested code at any depth,
 #: reads a ``functools.wraps`` wrapper's source from the function it wraps, and its section is
@@ -464,23 +476,36 @@ from typing import Any
 #: main's #3029 (digests 0cd684e3f53d2469 and 344979df3bd2c662). The value below was re-derived
 #: with ``--write`` on the merged tree, so it covers every entry above.
 #:
-#: Vault BACKLOG #3192 review repair: ``ReleaseBlocked`` gained ``params_no_requester``, a held
-#: purge or reload whose params name no requester, which the gate now refuses before its claim (vault BACKLOG
-#: #3217). The Approvals page keys a note on every value, so an older console on this engine is
-#: refused at mount rather than meeting a value it has no note for. Re-derived with ``--write``
-#: from 71c27581e7c9f921.
+#: Vault BACKLOG #3189 and #3031 merged with the #3192 branch, whose digest was 0cd684e3f53d2469,
+#: and with main: re-derived with ``--write`` on that merged tree. The #3189 branch stood at
+#: 1246ce9b2b511c9e before the last merge below.
+#:
+#: Vault BACKLOG #3192 review repair, on the #3192 branch: ``ReleaseBlocked`` gained
+#: ``params_no_requester``, a held purge or reload whose params name no requester, which the gate
+#: now refuses before its claim (vault BACKLOG #3217). The Approvals page keys a note on every
+#: value, so an older console on this engine is refused at mount rather than meeting a value it
+#: has no note for. Re-derived with ``--write`` from 71c27581e7c9f921 to 6d7dcabe1103f08d.
+#:
+#: Vault BACKLOG #3189 and #3031 (at 1246ce9b2b511c9e) merged again with the #3192 branch after
+#: its review repair (at 6d7dcabe1103f08d), then with main: re-derived with ``--write`` on the
+#: merged tree, so the value below covers every entry above.
 #:
 #: Vault BACKLOG #3192 merged with main after BACKLOG #2709 landed there (PR 2341, digest
 #: 344979df3bd2c662 on main). Main moved the seam by that merge alone: the route-gate table and
 #: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
-#: merged tree; the digest did not move, so the value below covers every entry above.
+#: merged tree; the digest did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
+#:
+#: Vault BACKLOG #3189 and #3031 (at 0b2a8d6524e4acc6) merged with main after PR 2352 landed
+#: there at 6d7dcabe1103f08d. The #3192 review-repair entry above is that branch's own, kept once.
+#: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
+#: covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "6d7dcabe1103f08d"
+ENGINE_UI_SEAM: str = "0b2a8d6524e4acc6"
 
 
 @dataclass(frozen=True, slots=True)

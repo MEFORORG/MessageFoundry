@@ -250,9 +250,11 @@ async def test_mfa_verify_refuses_a_satisfied_oidc_session_with_the_idp_header(
     ordinary 401, so the refusal keys on the session's mechanism."""
     uid = await _add_admin(service)
     secret = "JBSWY3DPEHPK3PXP"
-    await service.store.set_totp_secret(uid, secret=secret)
+    staged_cell = await service.store.set_totp_secret(uid, secret=secret)
     wrong = "000000" if totp.totp(secret) != "000000" else "111111"
-    assert await service.store.enable_totp(uid, recovery_code_hashes=[])
+    assert await service.store.enable_totp(
+        uid, expected_secret_cell=staged_cell, recovery_code_hashes=[]
+    )
     oidc_token = await _session(service, uid, "tok-mfa-oidc", mechanism="oidc")
     password_token = await _session(service, uid, "tok-mfa-pw", mechanism="password")
     for token in (oidc_token, password_token):

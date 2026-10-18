@@ -790,7 +790,8 @@ this notice stays silent, as before.
 - The refusal text keeps the words "already has an enabled Administrator". At least the VS Code
   extension, the load rig and `scripts/service/measure-store-access.ps1` key on them.
 - The load rig (`harness/load/rigadmin.py`) keeps the rule from before this amendment. It runs the
-  command with `--no-totp`, so it provisions only into a store with no enabled Administrator of
+  command with `--no-totp` unless a leg supplies an authenticator key (vault BACKLOG #2796), and
+  with or without one it provisions only into a store with no enabled Administrator of
   any kind, and refuses a store whose Administrators all need an outside service.
 
 **What it opens, and leaves open.**

@@ -2290,9 +2290,13 @@ class AuthStore(Protocol):
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
+    # CONDITIONAL (BACKLOG #3025): stages ``secret``, sealed, only where TOTP is still off, and
+    # returns the stored cell, or None when nothing was written. A caller must refuse on None, and
+    # passes the returned cell to ``enable_totp`` as ``expected_secret_cell``. There is no clear: a
+    # factor, staged or enabled, is removed with ``disable_totp``.
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None: ...
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None: ...
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
@@ -2301,15 +2305,20 @@ class AuthStore(Protocol):
     # second, unchecked read. ``None`` for no cell. No I/O.
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None: ...
 
-    # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
-    # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
-    # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between
-    # the caller's checks and this write makes it match no row. A caller must refuse on False and
-    # never treat MFA as on, the way ``set_password(require_totp=...)`` callers do. It does not
-    # check that the staged secret is the one the caller verified; a re-stage in the window is
-    # not caught.
+    # CONDITIONAL (BACKLOG #2224, #3025): writes only where the staged ``totp_secret`` cell is still
+    # ``expected_secret_cell`` (the cell the caller verified a code against) and TOTP is still off,
+    # in the same write, and returns whether a row was written. An ``admin_reset_mfa`` that clears
+    # the secret, a second confirm that enables first, or a second begin that stages another
+    # secret, between the caller's read and this write, makes it match no row. ``None`` matches
+    # nothing. A caller must refuse on False and never treat MFA as on, the way
+    # ``set_password(require_totp=...)`` callers do.
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool: ...
 
     # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's

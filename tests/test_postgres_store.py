@@ -5773,3 +5773,13 @@ async def test_audit_events_and_security_events_page_by_offset_pg(store) -> None
     await check_keyed_audit_evidence(store, "pg")
     await check_security_events_paging(store, "pg")
     await check_connection_event_paging(store, "pg")
+
+
+async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)

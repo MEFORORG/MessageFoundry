@@ -53,6 +53,8 @@ Administrator, serve the synthetic high-fan-out system-under-test, then run a pr
 #    itself (harness/load/failover.py), plus the one the rig account needs. Both commands below
 #    read them. To run at the shipped `enforce` posture instead, copy the env block of the
 #    `load test (smoke, sqlite)` step in .github/workflows/ci.yml, which also mints a store key.
+#    That block sets MEFOR_SECURITY_REQUIRE_MFA=true, so draw an authenticator key too (see
+#    "One leg runs with MFA required" below), or the rig cannot sign in.
 export MEFOR_SECURITY_ENFORCEMENT=warn MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI=true \
        MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=false MEFOR_SECURITY_REQUIRE_MFA=false
 
@@ -90,10 +92,44 @@ its nodes, and then signs in. You pass nothing.
 
 | When | What you do |
 |---|---|
-| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. |
+| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it: a rig account has no authenticator app unless the rig supplies a key. To keep MFA required instead, see *One leg runs with MFA required* below. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
-| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an enabled local Administrator with a usable password, and a new run draws a new password, so the engine then refuses the sign-in. When the store's only enabled Administrators are directory or federated accounts, the rig refuses to provision and the run fails. A fresh store needs neither variable. |
-| The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
+| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell, and `MEFOR_RIG_ADMIN_TOTP_KEY` to the same key when the account has one. `provision-admin` declines when the store already has an enabled local Administrator with a usable password, and a new run draws a new password, so the engine then refuses the sign-in. When the store's only enabled Administrators are directory or federated accounts, the rig refuses to provision and the run fails, with or without a key. A fresh store needs none of these variables. |
+| The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. Keep `require_mfa` off and supply no key here: a split drive signs in from several processes at once, which a key does not suit (below). |
+
+#### One leg runs with MFA required
+
+The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) starts its engine
+with `[security].require_mfa` on, as shipped (vault BACKLOG #2796). Its run block draws an
+authenticator key, a base32 TOTP secret, beside the password, and hands it to `rigadmin provision`
+and `rigadmin run` in `MEFOR_RIG_ADMIN_TOTP_KEY`. The provisioning child replaces the terminal
+enrolment with that key and a code computed from it, and runs the rest of the shipped enrolment.
+The sign-in sends the password and a code in one request, the combined sign-in of ADR 0197. Nothing
+is added to `provision-admin`: it still takes no authenticator key as input. To do the same by hand:
+
+```bash
+# In step 0, export MEFOR_SECURITY_REQUIRE_MFA=true in place of false, and use a fresh store. The
+# key is handed to the two rigadmin commands only, never exported, so `serve` never holds it.
+rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" python -m harness.load.rigadmin provision --db ./load.db
+# ...serve as in step 2, then drive as in step 3 with the same prefix:
+MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" python -m harness.load.rigadmin run --engine ... -- ...
+```
+
+A sign-in with a key first waits for a TOTP step to open, up to about 31 seconds, and processes
+that sign in at the same time with one key can be refused, so the key suits a leg that signs in
+once. `_code_in_a_fresh_step` in [`rigadmin.py`](../harness/load/rigadmin.py) says why.
+
+**The other rig legs keep `require_mfa` off, on purpose**: at least the benchmark legs, the
+server-store load smokes, the container and service smokes, and the harness runners that start
+their own nodes. Those legs measure throughput, store
+access, failover and the container and service start, and the second factor touches none of that:
+it is checked once, at sign-in, and every request after it carries the session. The cost of a key
+would be real there: the wait above at each sign-in, and runners that sign in more than
+once (a poller renewing its session, a step-up re-proof, a split drive with a session per process)
+would wait at each. A re-proof (`/me/reauth`) takes the password alone, so the key does not cover
+it. One CI rig leg is enough to show an engine that requires MFA starts, admits an enrolled rig account,
+and names no account without an authenticator app at start.
 
 **Signed-in polling is in the numbers, and the report measures its share.** The poller's reads are
 not free. For each signed-in request the engine stamps the session's last use, one commit. With

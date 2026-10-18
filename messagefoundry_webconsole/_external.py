@@ -145,6 +145,12 @@ def _is_plain_host(ascii_host: str) -> bool:
 #: ``idna`` codec maps them away (sharp s becomes ``ss``), and a browser's UTS 46 non-transitional
 #: processing keeps them as an ``xn--`` label, so the two name different hosts. A host carrying
 #: one is not one this module can name truthfully.
+#:
+#: WHY NOT UTS 46 (BACKLOG #3075 item 6, declined). The stdlib ``idna`` codec is IDNA 2003, and a
+#: browser applies UTS 46. The two differ on these deviation characters, and on little else a host
+#: check reads. Refusing every host that carries one is the stdlib-only stand-in: such a host is
+#: classified external, so the interstitial shows. Matching the browser exactly would need the
+#: third-party ``idna`` package as a new dependency of this console, which this gap does not justify.
 _IDNA_DEVIATIONS = frozenset("\u00df\u1e9e\u03c2\u200c\u200d")
 
 
@@ -199,9 +205,11 @@ def _matches_domain(host: str, domain: str) -> bool:
 
     ``evilhospital.example`` must not match ``hospital.example``. A plain ``endswith`` says it does.
     An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
-    an address has no subdomains (vault BACKLOG #2843).
+    an address has no subdomains (vault BACKLOG #2843). No leading dot is stripped: settings refuse
+    one at load, so a dot-led entry from any other caller matches nothing, which shows the
+    interstitial rather than widening the match (BACKLOG #3075).
     """
-    domain = domain.strip().lower().lstrip(".")
+    domain = domain.strip().lower()
     if not domain or not host:
         return False
     if _is_ipv4(domain):

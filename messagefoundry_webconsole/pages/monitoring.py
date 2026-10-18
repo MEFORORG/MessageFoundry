@@ -707,6 +707,12 @@ def status(
                 *[el("li", f"{lo.switch} — {lo.risk}") for lo in posture.loosenings],
             )
         )
+    if posture.loosenings_scope is not None:
+        # The engine says what the list above leaves out: no loaded graph, or a channel-scoped
+        # reader (BACKLOG #3189). Without it, an empty list would read as a fully hardened engine.
+        security_section.append(
+            el("p", f"Loosenings listed: {posture.loosenings_scope}", class_="banner")
+        )
     cluster_tbl = rows_table(
         ["Field", "Value"],
         [

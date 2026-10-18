@@ -1438,6 +1438,27 @@ def _owed_a_route(survey: dict[str, Any]) -> set[str]:
     return {w["name"] for w in survey["wheels"] if _counts_as_code(w)} - _designated()
 
 
+def _files_phrase(files: object) -> str:
+    """A second release line's count of files, as the page words it."""
+    return f"{files} file" + ("" if files == 1 else "s")
+
+
+def _search_figures(wheels: list[dict[str, Any]]) -> dict[str, int]:
+    """The search's two figures, as the answers give them: the wheels fetched, and their files."""
+    per_wheel = [
+        [
+            f["file"]
+            for f in w.get("files_read") or []
+            if isinstance(f, dict) and str(f.get("file", "")).endswith(".whl")
+        ]
+        for w in wheels
+    ]
+    return {
+        "wheels_searched": sum(1 for files in per_wheel if files),
+        "wheel_files_searched": sum(len(files) for files in per_wheel),
+    }
+
+
 def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     """Where the page's survey subsection disagrees with the record. Not through the renderer."""
     section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
@@ -1499,6 +1520,30 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
             start = f"| `{wheel['name']}` | {wheel['pinned']} | {words} |"
             if (_said(wheel, form) != "no") != any(row.startswith(start) for row in rows):
                 problems.append(f"row: the page and the survey differ on {wheel['name']}, {form}")
+            # A project's ``display`` is the whole phrase its row prints, in place of name and
+            # version, so the row must carry it.
+            answer = wheel if form == "compiled" else wheel.get(form) or {}
+            for project in answer.get("projects") or []:
+                display = project.get("display") if isinstance(project, dict) else None
+                # The Carries cell alone, so a short display cannot match another column.
+                shown = any(
+                    row.startswith(start) and str(display) in row.split("|")[4] for row in rows
+                )
+                if isinstance(display, str) and display.strip() and not shown:
+                    problems.append(f"display: {wheel['name']}, {form} lacks {display!r}")
+        # A second release line of the wheel's own project is stated in prose, with its figures.
+        lines = wheel.get("own_release_lines")
+        for line in lines if isinstance(lines, list) else []:
+            if not isinstance(line, dict):
+                problems.append(f"own line: {wheel['name']} records {line!r}")
+                continue
+            files = _files_phrase(line.get("files"))
+            stated = (
+                f"`{wheel['name']}` also holds a second release line of its own project: "
+                f"`{line.get('path')}`, {files}, version {line.get('version')}."
+            )
+            if stated not in flat:
+                problems.append(f"own line: the page does not state {stated!r}")
     data_only = sorted(
         w["name"] for w in wheels if not _counts_as_code(w) and _said(w, "data") == "yes"
     )
@@ -1543,6 +1588,9 @@ def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_record
         survey, _snapshot(), component_readings.designation_labels(page)
     )
     assert problems == [], f"{_SURVEY.name} is incomplete:\n  " + "\n  ".join(problems)
+    # The search's own figures, derived here from the files the answers name, not by the generator.
+    figures = _search_figures(survey["wheels"])
+    assert {key: survey["search"].get(key) for key in figures} == figures, figures
     routed = {w["name"] for w in survey["wheels"] if w.get("route") in component_readings.ROUTES}
     assert _owed_a_route(survey) == routed, (
         f"owed a route: {sorted(_owed_a_route(survey))}; routed: {sorted(routed)}"
@@ -1619,7 +1667,11 @@ def test_the_survey_checks_can_fail() -> None:
     base = [routed if w is plain else designated if w is ranked else w for w in wheels]
 
     def problems(changed: list[dict[str, Any]]) -> list[str]:
-        return component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
+        # ``base`` stops fetching two wheels, so the search's own figures are re-stated to match.
+        # ``test_the_survey_record_field_checks_can_fail`` holds those figures.
+        search = {**survey["search"], **_search_figures(changed)}
+        record = {**survey, "search": search, "wheels": changed}
+        return component_readings.survey_problems(record, data, labels)
 
     def swap(target: dict[str, Any], **change: Any) -> list[dict[str, Any]]:
         return [{**w, **change} if w is target else w for w in base]
@@ -1639,6 +1691,7 @@ def test_the_survey_checks_can_fail() -> None:
         (swap(routed, route_reason=" "), f"{name}: not designated"),
         (swap(routed, route="read"), f"{name}: a read route must record"),
         (swap(routed, route="read", read={**read, "result": None}), f"{name}: a read route"),
+        (swap(routed, route="read", read={**read, "date": "20260101"}), f"{name}: a read route"),
         (swap(designated, route="highlight"), f"{rank}: a route is recorded"),
         (swap(designated, carries="maybe"), f"{rank}: the answer 'maybe'"),
         (swap(designated, projects=[]), f"{rank}: the answer 'yes' does not match"),
@@ -1777,9 +1830,12 @@ def test_the_survey_checks_can_fail() -> None:
         found = component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
         assert any(line.startswith(f"{target['name']}: ") for line in found), (malformed, found)
         component_readings.render_page(page, data, {**survey, "wheels": changed})
-    # A read route whose ``read`` is loose text is reported the same way.
-    found = problems(swap(routed, route="read", read="see the notices"))
+    # A read route whose ``read`` is loose text is reported the same way, and the renderer, which
+    # prints that route's table, does not raise on it.
+    loose_read = swap(routed, route="read", read="see the notices")
+    found = problems(loose_read)
     assert any(line.startswith(f"{name}: a read route must record") for line in found), found
+    component_readings.render_page(page, data, {**survey, "wheels": loose_read})
     # The word-search hits and the adapted modules. Built on ``plain``, which was fetched.
     word = stated["words"][0]
     hit = {"files": ["a/module.py"], "words": [word], "kind": "adapted module", "says": "a note"}
@@ -1918,6 +1974,204 @@ def test_the_survey_checks_can_fail() -> None:
         assert edited != page, "the criterion sentence was not found on the page"
         drift = _survey_page_drift(edited, survey)
         assert [line.partition(":")[0] for line in drift] == ["criterion"], drift
+
+
+def test_the_survey_record_field_checks_can_fail() -> None:
+    """RED when: a survey check stops seeing a recorded field that is wrong. That covers a date
+    that is not ``YYYY-MM-DD`` (the basic form ``YYYYMMDD`` included), a search that drops
+    ``suffixes``, ``cannot_see`` or ``module_rule``, a search figure the answers do not give, a
+    hit whose line numbers are not line numbers, a file named twice among the hits or the adapted
+    modules, an adapted module with no ``words``, a ``display`` that is not text, a second release
+    line of its own that is half recorded, and a page that drops a ``display`` or that line.
+
+    THE POSITIVE CONTROL FOR THE RECORD FIELDS (vault BACKLOG #3030). Most cases change one field
+    of the tracked record, on a not-designated wheel that was fetched and carries nothing. The
+    search cases change the record's ``search``, one case uses a wheel nobody fetched, and the
+    page cases edit a copy of the tracked page.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    data, survey = _snapshot(), _survey()
+    labels = component_readings.designation_labels(page)
+    wheels = survey["wheels"]
+    plain = next(
+        w
+        for w in wheels
+        if w["name"] not in labels
+        and all(_said(w, form) == "no" for form in _FORMS)
+        and any(f["file"].endswith(".whl") for f in w["files_read"])
+        and "own_release_lines" not in w
+    )
+    name = plain["name"]
+
+    def one(change: dict[str, Any], record: dict[str, Any] = survey) -> list[str]:
+        changed = [{**w, **change} if w is plain else w for w in wheels]
+        return component_readings.survey_problems({**record, "wheels": changed}, data, labels)
+
+    assert one({}) == []
+    # Dates: the basic form parses with ``date.fromisoformat``, and must still be refused.
+    for change, problem in (
+        ({"surveyed": "20261005"}, f"{name}: no date is recorded for the answer"),
+        ({"forms_surveyed": "20261005"}, f"{name}: no date is recorded for the source and data"),
+        ({"surveyed": "2026-10-5x"}, f"{name}: no date is recorded for the answer"),
+    ):
+        found = one(change)
+        assert any(line.startswith(problem) for line in found), (change, found)
+    stated = survey["search"]
+    no_search = "the survey does not state its search"
+    for search_change, problem in (
+        ({"run": "20261005"}, "the survey's search gives no day it was run"),
+        ({"run": None}, "the survey's search gives no day it was run"),
+        ({"suffixes": []}, no_search),
+        ({"cannot_see": []}, no_search),
+        ({"module_rule": " "}, no_search),
+        ({"wheels_searched": stated["wheels_searched"] + 1}, "the search gives wheels_searched"),
+        (
+            {"wheel_files_searched": stated["wheel_files_searched"] - 1},
+            "the search gives wheel_files_searched",
+        ),
+    ):
+        found = one({}, {**survey, "search": {**stated, **search_change}})
+        assert any(line.startswith(problem) for line in found), (search_change, found)
+    # The days the page prints are sorted as days, and a basic-form value is not among them.
+    assert component_readings._days(["2026-10-05", "20261004"]) == "on 2026-10-05"
+    assert component_readings._days(["2026-10-05", "2026-10-04"]) == (
+        "between 2026-10-04 and 2026-10-05"
+    )
+    # The word-search hits and the adapted modules, field by field.
+    word = stated["words"][0]
+    hit = {"files": ["a/module.py"], "words": [word], "kind": "adapted module", "says": "a note"}
+    module = {"file": "a/module.py", "project": "another project", "words": "copied from it"}
+    assert one({"word_hits": [{**hit, "lines": [3]}], "adapted_modules": [module]}) == []
+    for hits_change, problem in (
+        ({"word_hits": [hit], "adapted_modules": [{**module, "words": None}]}, "an adapted module"),
+        ({"word_hits": [{**hit, "lines": []}], "adapted_modules": [module]}, "a word-search hit"),
+        ({"word_hits": [{**hit, "lines": [0]}], "adapted_modules": [module]}, "a word-search hit"),
+        ({"word_hits": [{**hit, "lines": ["3"]}], "adapted_modules": [module]}, "a word-search"),
+        ({"word_hits": [{**hit, "lines": [True]}], "adapted_modules": [module]}, "a word-search"),
+        ({"word_hits": [hit, hit], "adapted_modules": [module]}, "the word-search hits name a"),
+        ({"word_hits": [hit], "adapted_modules": [module, module]}, "the adapted modules name a"),
+    ):
+        found = one(hits_change)
+        assert any(line.startswith(f"{name}: {problem}") for line in found), (problem, found)
+    # A project's ``display``, and a second release line of the wheel's own project.
+    yes = {"carries": "yes", "evidence": "a file list"}
+    shown = {"name": "a table", "version": "1.0", "display": "a table, the first edition"}
+    assert one({"data": {**yes, "projects": [shown]}}) == []
+    for display in (3, " ", None):
+        found = one({"data": {**yes, "projects": [{**shown, "display": display}]}})
+        assert any(line.startswith(f"{name}: the data answer 'yes'") for line in found), found
+    own = {"path": "a/v1", "files": 3, "version": "1.0", "note": "the project's own 1.x line"}
+    assert one({"own_release_lines": [own]}) == []
+    for lines in (
+        None,
+        "a/v1",
+        [{**own, "files": 0}],
+        [{**own, "files": True}],
+        [{**own, "files": "3"}],
+        [{**own, "version": " "}],
+        [{k: v for k, v in own.items() if k != "path"}],
+    ):
+        found = one({"own_release_lines": lines})
+        assert any(line.startswith(f"{name}: a second release line") for line in found), (
+            lines,
+            found,
+        )
+    unfetched = next(
+        w for w in wheels if not any(f["file"].endswith(".whl") for f in w["files_read"])
+    )
+    changed = [{**w, "own_release_lines": [own]} if w is unfetched else w for w in wheels]
+    found = component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
+    assert any(
+        line.startswith(f"{unfetched['name']}: a wheel that was not fetched records a second")
+        for line in found
+    ), found
+    doubled = [*plain["files_read"], plain["files_read"][0]]
+    found = one({"files_read": doubled})
+    assert any(
+        line.startswith(f"{name}: the files read name a file more than once") for line in found
+    )
+    for figure in (float(stated["wheels_searched"]), True):
+        found = one({}, {**survey, "search": {**stated, "wheels_searched": figure}})
+        assert any(line.startswith("the search gives wheels_searched") for line in found), found
+    single = {**survey, "wheels": [{**plain, "own_release_lines": [{**own, "files": 1}]}]}
+    text = " ".join(" ".join(component_readings._render_survey(single, labels)).split())
+    assert "`a/v1`, 1 file, version 1.0." in text, text
+    # The page side: each is rendered into a copy of the page, which agrees with that record,
+    # while the tracked page lacks it and only that check sees it.
+    for page_change, label in (
+        ({"data": {**yes, "projects": [shown]}}, "display"),
+        ({"own_release_lines": [own]}, "own line"),
+    ):
+        mutated = {**survey, "wheels": [{**w, **page_change} if w is plain else w for w in wheels]}
+        rendered = component_readings.render_page(page, data, mutated)
+        assert _survey_page_drift(rendered, mutated) == []
+        drift = _survey_page_drift(page, mutated)
+        assert label in {line.partition(":")[0] for line in drift}, (label, drift)
+    # The rendered display and the tracked line, edited on the page, are each seen.
+    shown_project = next(
+        (
+            p
+            for w in wheels
+            for form in _FORMS
+            for p in ((w if form == "compiled" else w.get(form) or {}).get("projects") or [])
+            if p.get("display")
+        ),
+        None,
+    )
+    assert shown_project is not None, f"no project in {_SURVEY.name} records a display to edit"
+    edited = page.replace(shown_project["display"], shown_project["name"], 1)
+    assert edited != page, shown_project["display"]
+    drift = _survey_page_drift(edited, survey)
+    assert [line.partition(":")[0] for line in drift] == ["display"], drift
+    lined = next((w for w in wheels if w.get("own_release_lines")), None)
+    assert lined is not None, f"no wheel in {_SURVEY.name} records a second release line"
+    stated_line = lined["own_release_lines"][0]
+    phrase = f"{_files_phrase(stated_line['files'])}, version"
+    edited = page.replace(phrase, "0 files, version", 1)
+    assert edited != page, stated_line
+    drift = _survey_page_drift(edited, survey)
+    assert [line.partition(":")[0] for line in drift] == ["own line"], drift
+
+
+def test_the_survey_count_phrases_agree_at_a_count_of_one() -> None:
+    """RED when: a count phrase in the survey subsection reads wrongly at a count of one, or a
+    search that lists nothing prints a bare number. Built on one fetched wheel, so it holds
+    whatever the tracked record counts.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    survey = _survey()
+    labels = component_readings.designation_labels(page)
+    fetched = next(
+        w for w in survey["wheels"] if any(f["file"].endswith(".whl") for f in w["files_read"])
+    )
+    single = {
+        **survey,
+        "wheels": [fetched],
+        "search": {
+            **survey["search"],
+            "directories": ["vendor"],
+            "words": ["vendored"],
+            "suffixes": [".py"],
+        },
+    }
+    text = " ".join(component_readings._render_survey(single, labels))
+    flat = " ".join(text.split())
+    for phrase in (
+        "whether the 1 pinned wheel carries a bundled copy",
+        "ran over the 1 wheel that was fetched.",
+        "a directory with one of 1 vendoring name,",
+        "any of 1 marker word.",
+        "whose name ends in one of 1 suffix: `.py`.",
+    ):
+        assert phrase in flat, phrase
+    bare = {**single, "search": {}}
+    flat = " ".join(" ".join(component_readings._render_survey(bare, labels)).split())
+    for phrase in (
+        "one of no recorded vendoring names,",
+        "any of no recorded marker words.",
+        "one of no recorded suffixes: not recorded.",
+    ):
+        assert phrase in flat, phrase
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:

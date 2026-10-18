@@ -7,8 +7,8 @@
 list accepted hexadecimal IPv4 forms the address rule refuses. One table now feeds every list the
 same values, and ``envelope_address_problem`` each value that reaches its domain check. The
 verdicts must agree, except for two stated differences: the two navigation lists also accept a
-canonical dotted-quad IPv4 address, and the recipient list takes a 253-character domain that no
-address can carry.
+canonical dotted-quad IPv4 address of one host, and the recipient list caps a domain at 252
+characters, the most an address leaves, where the shape rule allows 253 (BACKLOG #3075).
 
 Read on the unfixed code at ``873aa9d75a``: ``organization_domains`` and
 ``external_link_allowlist`` accepted every value in :data:`_REFUSED` except the URL, port and
@@ -16,6 +16,8 @@ wildcard forms (``"."`` was dropped silently), and ``allowed_recipient_domains``
 ``example.org.``, ``10.0.0.0x1`` and ``0x7f000001``."""
 
 from __future__ import annotations
+
+import ipaddress
 
 import pytest
 from pydantic import ValidationError
@@ -48,7 +50,7 @@ _REFUSED = {
     "-mx.example.org": "hyphen",
     "mx-.example.org": "hyphen",
     "x" * 64 + ".example.org": "longer than 63",
-    ".".join(["x" * 63] * 4): "longer than 253",
+    ".".join(["x" * 63] * 4): "longer than 25[23] characters",  # the recipient list caps at 252
     "example.123": "start with a letter",
     "0.1": "start with a letter",
     "010.0.0.1": "start with a letter",
@@ -76,6 +78,10 @@ _ACCEPTED = [
 #: The stated difference: a canonical IPv4 address is a navigation host, never a mail domain.
 _IPV4 = "10.20.30.40"
 
+#: Canonical quads that are no one host's address: unspecified, limited broadcast, multicast and
+#: class E. Built from integers, so the file carries no routable literal for the leak scan.
+_NOT_ONE_HOST = [str(ipaddress.IPv4Address(n)) for n in (0, 0xFFFF_FFFF, 0xE000_0001, 0xF000_0001)]
+
 
 @pytest.mark.parametrize("value", list(_REFUSED))
 @pytest.mark.parametrize("list_name", list(_MODELS))
@@ -99,7 +105,7 @@ _LONGEST_SENDABLE = ".".join(["x" * 63] * 3 + ["x" * 60])
 _ONE_TOO_LONG = _LONGEST_SENDABLE + "x"
 
 
-@pytest.mark.parametrize("value", [*_DOMAIN_ONLY, _LONGEST_SENDABLE])
+@pytest.mark.parametrize("value", [*_DOMAIN_ONLY, _LONGEST_SENDABLE, _ONE_TOO_LONG])
 def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     # The send rule and the list a recipient is matched against give one verdict, so no entry is
     # accepted that no sendable address could match, and no sendable domain is unlistable.
@@ -111,13 +117,45 @@ def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     assert (envelope_address_problem("a@" + value.strip()) is None) is listed
 
 
-def test_a_253_character_domain_is_the_one_stated_gap() -> None:
-    # The shared rule allows 253 characters, the RFC 1035 limit. The address cap of 254 leaves
-    # 252 for the domain, so the list takes an entry no address can carry. Pinned so a change to
-    # either cap is a decision rather than drift.
-    assert len(_ONE_TOO_LONG) == 253
-    assert _load("allowed_recipient_domains", _ONE_TOO_LONG) == [_ONE_TOO_LONG]
-    assert envelope_address_problem("a@" + _ONE_TOO_LONG) == "is longer than SMTP allows"
+def test_the_recipient_list_refuses_a_domain_no_address_can_carry() -> None:
+    """BACKLOG #3075: the shared rule allows 253 characters, the RFC 1035 limit, and the address
+    cap of 254 leaves 252 for the domain. The list now caps it there, so the gap #2843 pinned is
+    closed. Pinned to the send path, so a change to either cap is a decision rather than drift.
+
+    Mutation: drop ``max_length`` from the recipient list's call. Red: DID NOT RAISE. The
+    agreement test above also holds the list to the send path at both lengths."""
+    assert len(_LONGEST_SENDABLE) == 252 and len(_ONE_TOO_LONG) == 253
+    with pytest.raises(ValidationError, match="longer than 252 characters"):
+        _load("allowed_recipient_domains", _ONE_TOO_LONG)
+    # The other lists keep the shape rule's 253, which is a host a browser may open.
+    assert _load("organization_domains", _ONE_TOO_LONG) == [_ONE_TOO_LONG]
+
+
+@pytest.mark.parametrize("value", _NOT_ONE_HOST)
+@pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
+def test_the_navigation_lists_refuse_an_address_that_is_not_one_host_s(
+    list_name: str, value: str
+) -> None:
+    """BACKLOG #3075 item 7: the unspecified address, the limited broadcast, a multicast group and
+    the reserved range are canonical dotted quads but no one host's address. ``0.0.0.0`` reaches the
+    local machine in some browsers, so as an entry it would mark a loopback page as internal. The
+    console and the engine still agree that each is an IPv4 entry; see the agreement test below.
+
+    Mutation: return False from ``_not_a_host_address``. Red: DID NOT RAISE."""
+    with pytest.raises(ValidationError, match="an IPv4 address that is not one host's"):
+        _load(list_name, value)
+
+
+def test_the_console_does_not_strip_a_leading_dot_from_an_entry() -> None:
+    """BACKLOG #3075 item 5: settings refuse a dot-led entry at load, and the console stripped the
+    dot from one that came another way, which only ever widened a match. Such an entry now covers
+    nothing, so the interstitial shows. Control: the bare domain covers the host.
+
+    Mutation: put ``.lstrip(".")`` back in ``_matches_domain``. Red: the first assertion."""
+    url = "https://adfs.hospital.example/"
+    assert is_external(url, [".hospital.example"])
+    assert not is_allowlisted(url, [".hospital.example"])
+    assert not is_external(url, ["hospital.example"])
 
 
 @pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
@@ -140,7 +178,10 @@ def test_the_console_matches_an_ipv4_entry_exactly() -> None:
     assert not is_allowlisted(f"https://x.{_IPV4}/", entries)
 
 
-@pytest.mark.parametrize("value", [*_REFUSED, _IPV4, "10.20.30.040", "0.0.0.0"])
+@pytest.mark.parametrize(
+    "value",
+    [*_REFUSED, _IPV4, "10.20.30.040", *_NOT_ONE_HOST],
+)
 def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -> None:
     # The console keeps its own stdlib check rather than import the engine module, so the two
     # must not drift: an entry would move between exact and label-boundary matching.

@@ -1313,8 +1313,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Where it is NOT reported, and why:** `messagefoundry security show` reads a settings file and never
   loads the connection graph, so it cannot see these declarations; it says so explicitly in its
   `loosenings_scope` output rather than reporting a settings-only list as if it were the whole posture.
-  `GET /security/posture` carries the same `loosenings_scope` marker in the one case it is blind — an
-  engine with no loaded graph (an embedding, or a query before start); it is `null` on a running engine.
+  `GET /security/posture` carries the same `loosenings_scope` marker when it is blind, on an engine
+  with no loaded graph (an embedding, or a query before start). It carries one too for a
+  channel-scoped reader, whose list is narrowed to its own scope (BACKLOG #3189). It is `null` for an
+  unscoped reader of a running engine.
   The `serve`-time loosening warning fires before the graph is loaded for the same reason — the
   construction gate's own per-connection WARN covers it moments later, at startup, with more detail.
 - **What it cannot do:** it never yields ALLOW. An accepted hop is always a WARN, so it can never become

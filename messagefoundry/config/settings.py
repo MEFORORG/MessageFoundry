@@ -101,7 +101,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
-from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
+from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
@@ -4308,6 +4308,10 @@ class AuthSettings(_Section):
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
         suffix source is configured at all, which the validator above refuses when stripping is on.
         """
+        # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
+        # compared with the raw suffix an identity provider writes into a claim, not with a DNS
+        # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
+        # both of which the shared rule refuses.
         if self.oidc_allowed_username_domains:
             return tuple(d.strip().lower() for d in self.oidc_allowed_username_domains if d.strip())
         return (self.ad_domain.strip().lower(),) if self.ad_domain else ()
@@ -4793,23 +4797,51 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
-def _bare_domain_entries(value: list[str], *, allow_ipv4: bool, refusal: str) -> list[str]:
+def _not_a_host_address(text: str) -> bool:
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the unspecified
+    ``0.0.0.0``, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075). No identity provider or link is served from one,
+    and some browsers route ``0.0.0.0`` to the local machine. This does not refuse loopback: a
+    ``127.0.0.1`` entry still loads, as ``localhost`` does."""
+    address = ipaddress.IPv4Address(text)
+    return address.is_unspecified or address.is_multicast or address.is_reserved
+
+
+def _bare_domain_entries(
+    value: list[str], *, allow_ipv4: bool, refusal: str, max_length: int | None = None
+) -> list[str]:
     """One domain list's entries, normalised, or a ``ValueError`` for the first that can never match.
 
     Shared by ``[egress].allowed_recipient_domains`` and the two ``[security]`` navigation lists
     (vault BACKLOG #2843). Surrounding whitespace is stripped and a blank entry is skipped. Each
     entry must pass :func:`~messagefoundry.domainshape.domain_shape_problem`, or with
-    ``allow_ipv4`` be a canonical IPv4 address. No dot is stripped, so a leading or trailing dot is
-    refused rather than silently dropped. An entry is lowercased only after the check, because
-    ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones, which
-    would accept a value that differs from the one written. ``refusal`` ends the error message."""
+    ``allow_ipv4`` be a canonical IPv4 address :func:`_not_a_host_address` does not refuse
+    (BACKLOG #3075). ``max_length``, when set, is a
+    tighter cap than the shape rule's 253 characters. No dot is stripped, so a leading or trailing
+    dot is refused rather than silently dropped. An entry is lowercased only after the check,
+    because ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones,
+    which would accept a value that differs from the one written. ``refusal`` ends the error
+    message.
+
+    A single label is accepted, a bare public suffix such as ``com`` included (BACKLOG #3075 item
+    4, declined): an intranet name is often one label, and telling a public suffix from a private
+    name needs the Public Suffix List, which this stdlib-only rule does not carry."""
     cleaned: list[str] = []
     for raw in value:
         item = raw.strip()
         if not item:
             continue
-        problem = domain_shape_problem(item)
-        if problem is not None and not (allow_ipv4 and is_canonical_ipv4(item)):
+        if allow_ipv4 and is_canonical_ipv4(item):
+            problem = (
+                "an IPv4 address that is not one host's; list a single host's address"
+                if _not_a_host_address(item)
+                else None
+            )
+        elif max_length is not None and len(item) > max_length:
+            problem = f"a domain longer than {max_length} characters"
+        else:
+            problem = domain_shape_problem(item)
+        if problem is not None:
             raise ValueError(f"{item!r} is {problem}. {refusal}")
         cleaned.append(item.lower())
     return cleaned
@@ -4874,7 +4906,11 @@ class EgressSettings(_Section):
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
-    # MEFOR_EGRESS_PROXY_NO_PROXY.
+    # MEFOR_EGRESS_PROXY_NO_PROXY. It keeps its own rule, transports/rest.py `_proxy_bypasses`, which
+    # config/static_credentials.py reads rather than restates (BACKLOG #3075 item 2, declined). It
+    # takes an IP literal, a port and an underscore host the shared domain rule refuses. An entry
+    # that matches nothing sends that host through the proxy; that rule ignores a port and reads
+    # '*:443' as '*', so a malformed entry can also bypass the proxy for every host.
     proxy_no_proxy: list[str] = []
     # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
     # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
@@ -4949,14 +4985,15 @@ class EgressSettings(_Section):
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
 
         Each entry must pass the shape rule the send path applies to a recipient's domain, so an
-        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
-        domain of exactly 253 characters passes here, but the send path's 254-character address cap
-        refuses every address in it. Normalisation, in
+        entry shaped like no sendable domain is refused here, not at the gate. The domain is also
+        capped at 252 characters, the most the send path's 254-character address cap leaves, so a
+        253-character domain no address can carry is refused too (BACKLOG #3075). Normalisation, in
         :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
         lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
         return _bare_domain_entries(
             value,
             allow_ipv4=False,
+            max_length=MAX_MAIL_DOMAIN,
             refusal="[egress].allowed_recipient_domains needs a bare domain such as "
             "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
             "subdomain as its own entry",
