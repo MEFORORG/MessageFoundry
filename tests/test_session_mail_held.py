@@ -1468,7 +1468,9 @@ def test_a_pass_stops_at_the_message_budget_and_leaves_the_rest_for_the_next_one
     # Housekeeping must never break the turn it precedes, budget or no budget.
     assert "live mail, so housekeeping cannot break the turn it precedes" in text
 
-    second = injection(run_drain(repo, event="Stop", session_id=SESSION_B))
+    # SessionStart, because this pass shows no mail (SESSION_A consumed it) and a Stop drain that
+    # shows nothing is silent by design: output at Stop re-wakes the model.
+    second = injection(run_drain(repo, event="SessionStart", session_id=SESSION_B))
     assert bulk_left(repo) == 0, "the remainder was not cleared, so the budget is a cap not a delay"
     assert TRUNCATED_MESSAGES not in second, (
         f"a pass that finished still says it stopped, so the two facts render alike:\n{second}"
