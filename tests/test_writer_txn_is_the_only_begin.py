@@ -388,10 +388,12 @@ def test_only_writer_txn_and_the_read_snapshot_open_a_transaction() -> None:
     # connection (BACKLOG #2337). `revoke_user_sessions` was a fourth until BACKLOG #2592 spelled
     # its statement at the call. The fourth today is `_write_passkeys` (BACKLOG #2592), whose three
     # callers each pass one of the module's `_WEBAUTHN_*` constants: an INSERT or a DELETE, never a
-    # transaction verb. If you added one, confirm it carries no transaction verb and then move this
-    # number.
-    assert scan.unreadable == 4, (
-        f"{scan.unreadable} SQL arguments could not be read as text, expected 4. A new one is a new "
+    # transaction verb. The fifth is `newest_keyed_audit_row`'s read-only `fetch` (vault BACKLOG
+    # #3750 item 33), which runs only the SELECTs `read_newest_keyed_audit_row` passes it, on a
+    # `_read()` connection. If you added one, confirm it carries no transaction verb and then move
+    # this number.
+    assert scan.unreadable == 5, (
+        f"{scan.unreadable} SQL arguments could not be read as text, expected 5. A new one is a new "
         f"blind spot in this guard: check it carries no transaction verb before moving the number."
     )
 

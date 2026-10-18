@@ -900,6 +900,31 @@ async def test_approval_repeat_request_contract(store) -> None:
     await _assert_repeat_request_contract(store)
 
 
+async def test_approval_repeats_racing_from_two_processes_file_one_request(store, tmp_path) -> None:
+    """Vault BACKLOG #3236 on the SQL Server backend: two processes, each with its own store and
+    pool, race the same repeat in every round, and each round holds one request. The in-process
+    race in the contract above cannot show this, because the store's own lock serializes it first;
+    across processes only the read under the audit applock does."""
+    from tests._approval_repeat_two_process import (
+        assert_one_request_per_round,
+        filed_for,
+        open_requests,
+        race_repeat_requests,
+    )
+
+    nonce = uuid4().hex
+    try:
+        answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
+        await assert_one_request_per_round(store, answers)
+    finally:
+        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
+        # itself included, must not leave its open requests behind for a later test.
+        for approval_id in filed_for(nonce, await open_requests(store)):
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
+            )
+
+
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     """BACKLOG #2624 on the real SQL Server backend: each operator mutation takes the audit applock
     inside its own transaction, at the append, so a failed append rolls it back. The applock needs that transaction open, and each mutation's first statement opens it."""
@@ -6080,10 +6105,12 @@ async def test_audit_events_and_security_events_page_by_offset_mssql(store) -> N
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "mssql")
+    await check_keyed_audit_evidence(store, "mssql")
     await check_security_events_paging(store, "mssql")
     await check_connection_event_paging(store, "mssql")
 
