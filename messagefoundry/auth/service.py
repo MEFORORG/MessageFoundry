@@ -7680,8 +7680,7 @@ class AuthService:
         ``held`` is the row holding ``new_username`` when the caller read it. One naming another
         row is re-checked, not trusted: the rule is at the ``held`` pre-check below (BACKLOG
         #3070). ``held=None`` skips that pre-check, so a holder appearing after the caller's read is
-        caught only by the write's guard. The login caller passes None because it **provably**
-        already has the answer.
+        caught only by the write's guard. The login caller **provably** already has the answer:
         ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
         it exists with a different id -- so the login path reaches this method only with
         ``held=None``, and the collision branch below is reachable from the **reconciler alone**,
