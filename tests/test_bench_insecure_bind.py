@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from harness.load import failover
 from harness.load.failover import EngineNode, _insecure_bind_args
 from harness.load.shardcert import ShardCertNode
 
@@ -53,6 +54,9 @@ def _capture_exec(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    # The fake's PID names no process, so there is nothing to put in a job: Windows would
+    # refuse to open it. These cases are about the argv alone.
+    monkeypatch.setattr(failover, "resume_into_job", lambda pid, *, who: None)
     return captured
 
 

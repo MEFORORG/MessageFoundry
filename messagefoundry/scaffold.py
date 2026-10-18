@@ -233,8 +233,13 @@ jobs:
     # though the dependency may have been skipped.
     if: ${{ always() && needs.verify-engine.result != 'failure' && needs.verify-engine.result != 'cancelled' }}
     runs-on: ubuntu-latest
+    # It runs engine code, so the token reads only, and the checkout keeps no credential.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -249,42 +254,66 @@ jobs:
   # audit the pinned engine + its resolved dependency closure against published advisories, so a CVE
   # disclosed against the version you're pinned to turns YOUR CI red — your remediation clock starts
   # automatically, without waiting to read an advisory email. Remediate by bumping the engine pin in
-  # requirements.txt to a release that fixed it; accept a triaged advisory with
-  # `pip-audit --ignore-vuln <ID>` (record why, per your own change control).
+  # requirements.txt to a release that fixed it; accept a triaged advisory by appending
+  # `--ignore-vuln <ID>` to each audit line that reports it (record why, per your own change control).
   # Declare any third-party package your Routers/Handlers import in requirements.txt too — pip-audit
   # then covers your Handler supply chain alongside the engine (ADR 0144 supply-chain gate; see
   # docs/security/SECURING-HANDLER-CONFIG-IN-CI.md).
+  #
+  # WINDOWS, the engine's only supported deployment platform: pip-audit silently skips a dependency
+  # whose environment marker does not match the runner. With a hashed requirements.lock the job
+  # installs the lock under --require-hashes and runs the engine's own auditor, which audits every
+  # pin in it whatever its marker. The engine's docs/ADOPTER-CI.md, "Job 3", says more.
+  #
+  # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a novel
+  # malicious substitute from a compromised/confused index. Without a lock, `pip install -r
+  # requirements.txt` resolves the whole transitive closure (fastapi, cryptography, pydantic, …) LIVE
+  # and UNHASHED, so the step WARNS and recommends an index pin (--index-url / PIP_CONSTRAINT) against
+  # dependency-confusion. Generate the lock over YOUR closure (see the README "Transitive
+  # supply-chain" section).
+  #
+  # One step per command, and each after the first runs even when an earlier one failed
+  # (`!cancelled()`), so a failed install or one audit's finding never hides the requirements.txt
+  # audit's result, and a requirements.txt finding never hides the lock audit's. The lock audit
+  # needs the auditor the install brings, so a failed install skips it.
+  # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
   audit-pin:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - name: Audit the pinned engine + deps against advisories
+      # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
+      # dependencies win any version they share.
+      - name: Install the locked engine for its auditor
+        id: engine
+        if: ${{ hashFiles('requirements.lock') != '' }}
+        run: python -m pip install --no-deps --require-hashes -r requirements.lock
+      - name: Warn when the transitive resolve is not hash-pinned
+        if: ${{ hashFiles('requirements.lock') == '' }}
         run: |
-          pip install pip-audit
-          pip-audit -r requirements.txt --desc
-      # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a
-      # novel malicious substitute pulled from a compromised/confused index. The default
-      # requirements.txt pins ONLY the engine, so `pip install -r requirements.txt` resolves the
-      # whole transitive closure (fastapi, cryptography, pydantic, …) LIVE and UNHASHED. Two
-      # defences, gated on whether you ship a hash-pinned lock:
-      #   - requirements.lock present  -> install with --require-hashes (every byte verified).
-      #   - engine-only requirements.txt -> WARN that the closure resolves live and recommend an
-      #     index pin (--index-url / PIP_CONSTRAINT) to defeat dependency-confusion.
-      # Generate the lock with `pip-compile --generate-hashes` or `uv export` over YOUR closure
-      # (see the README "Transitive supply-chain" section), then this job verifies it reproducibly.
-      - name: Verify the transitive resolve is hash-pinned (or warn it is not)
-        run: |
-          if [ -f requirements.lock ]; then
-            echo "requirements.lock present — verifying a fully hash-pinned resolve (--require-hashes)."
-            python -m venv .verify-resolve
-            ./.verify-resolve/bin/pip install --require-hashes --dry-run -r requirements.lock
-          else
-            echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
-            echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (pip-compile --generate-hashes / uv export) installed with --require-hashes. See the README."
-          fi
+          echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
+          echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
+      - name: Install pip-audit
+        if: ${{ !cancelled() }}
+        run: python -m pip install pip-audit
+      - name: Audit requirements.txt as Windows resolves it
+        if: ${{ !cancelled() }}
+        run: pip-audit -r requirements.txt --desc
+      # Needs the auditor the install step brings, so it waits on that step alone: after a failed
+      # install it would only fail again, for a reason that is not an advisory.
+      - name: Audit every pin of requirements.lock, whatever its marker
+        if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
+        run: python -P -m messagefoundry.security.audit_all_platforms requirements.lock
 """
 
 _GITIGNORE = """\
@@ -349,10 +378,10 @@ messagefoundry check --config config --messages messages/sets
 
 # 3. Run an instance. environments/<env>.toml resolves against the project root — by default the
 #    process working directory, so launch from the repo root:
-messagefoundry serve --config config --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev
 #    Or pin the root explicitly (an ABSOLUTE path) so it resolves no matter the launch directory —
 #    REQUIRED under a service like NSSM, where the CWD isn't the repo root:
-# messagefoundry serve --config config --env dev --project-root /srv/mefor/this-config-repo
+# python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev --project-root /srv/mefor/this-config-repo
 #    (Equivalently, set [environments].base_dir to that absolute path in messagefoundry.toml.)
 ```
 
@@ -374,8 +403,13 @@ matching manual verify-before-install recipe.
 A second supply-chain job, **`audit-pin`**, runs `pip-audit` against your pinned engine and its
 dependency closure, so a vulnerability **disclosed against the version you're pinned to** turns *your*
 CI red automatically — your remediation clock starts without waiting to read an advisory. Remediate by
-bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory with
-`pip-audit --ignore-vuln <ID>`, recorded per your own change control).
+bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory by
+appending `--ignore-vuln <ID>` to each audit line that reports it, recorded per your own change control).
+It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
+whose environment marker does not match the runner, so a Linux runner never audits the engine's
+Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
+(`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
+in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses.
 
 ## Transitive supply-chain (your deps, not the engine)
 `gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`
@@ -395,13 +429,15 @@ hardening steps (recommended for any PHI-handling adopter):
    *your* resolved deps and install with `--require-hashes`:
    ```bash
    # generate (pick one):
-   pip-compile --generate-hashes -o requirements.lock requirements.txt
-   uv export --format requirements-txt > requirements.lock
+   uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock
+   pip-compile --generate-hashes --no-emit-index-url --no-emit-trusted-host --no-emit-find-links --no-emit-options -o requirements.lock requirements.txt
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```
    When you commit a `requirements.lock`, the `audit-pin` CI job verifies it installs reproducibly
-   under `--require-hashes`; without one it **warns** that the closure resolves live and unhashed.
+   under `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
+   closure resolves live and unhashed. `uv pip compile --universal` writes every platform's pins;
+   `pip-compile` locks only the platform it runs on, so run it on Windows.
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…

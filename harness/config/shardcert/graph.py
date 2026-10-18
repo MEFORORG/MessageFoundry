@@ -17,12 +17,12 @@ which is the graph as it was; splitting them is what lets the bench model a real
 unsharded, for a smoke) as::
 
     MEFOR_SHARDCERT_SHARDS=a,b,c,d MEFOR_SHARDCERT_SINK_PORT=3700 \
-      python -m messagefoundry serve --config harness/config/shardcert --db ./shardcert.db
+      python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/shardcert --db ./shardcert.db
 
 or one shard against a server store::
 
     MEFOR_STORE_BACKEND=sqlserver ... \
-      python -m messagefoundry serve --config harness/config/shardcert --shard a --port 8801
+      python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/shardcert --shard a --port 8801
 
 Every value here is synthetic and generic — no real partner, site, host, or volume.
 """

@@ -13,7 +13,7 @@ transport builds the ``<soap:Envelope>`` and stamps the non-deterministic ``<wsa
 mints them). ``capture_response=True`` records the submit confirmation/error into the immutable
 ``response`` artifact for reconciliation (view it via ``GET /messages/{id}/responses``).
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 """
 
 from html import escape

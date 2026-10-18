@@ -6,6 +6,8 @@
 # TEMPLATE: supply your own cert/key, store-encryption key, and an adopter config repo. Read
 # docker/README.md before running in anger — especially the config-OWNERSHIP requirement and the
 # "secrets via env are visible in `docker inspect`" caveat.
+# NOT A SUPPORTED V1 DEPLOYMENT (the image runs Linux). See
+# docs/SYSTEM-REQUIREMENTS.md, "Linux is not a supported v1 deployment target".
 
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
 # extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose

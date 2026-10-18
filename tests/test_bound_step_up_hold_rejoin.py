@@ -339,7 +339,7 @@ def _called_names(node: ast.AST) -> set[str]:
 #: Nothing here holds a new request or runs the operation.
 _BEFORE_THE_SPEND = frozenset(
     {
-        "_purge_in_scope",
+        "_cross_channel_in_scope",
         "_purge_target_refusal",
         "_purge_hold_params",
         "_reload_hold_params",

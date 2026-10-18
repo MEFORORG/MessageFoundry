@@ -233,6 +233,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.USERS_READ)),
     ) -> HTMLResponse:
         users = await admin.list_users(service=service, identity=identity)
+        # Each summary says whether its scope was withheld from this caller (BACKLOG #3189).
         return HTMLResponse(pages.users_page(users))
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
