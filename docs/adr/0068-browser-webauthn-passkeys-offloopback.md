@@ -670,10 +670,12 @@ path, which proves no holder's delete, so the clone row is written and the refus
 before the holder re-read, from the account loaded afresh, and the row is written before a store
 error in it is raised, so a revocation, a disable, a lock or that error cannot remove this signal
 either. One path is narrower: when that fresh load returns nothing although the account row still
-exists (its seal check losing a race to a rename or a rebind), the set is read only after the holder
-re-read. A set failing its seal there, or a store error in that read, still writes the one clone
-row, but a revocation, a disable or a lock the holder re-read finds first refuses with its own
-reason and writes none. A cancelled request writes none on either path. `mismatch` means the
+exists (for example its seal check losing a race to a rename or a rebind), the set is read only
+after the holder re-read. A set failing its seal there, or a store error in that read, still writes
+the one clone row. At least these leave none on that path: a revocation, a disable or a lock the
+holder re-read finds first, an account that again fails to load there (refused `session_lost`), a
+store error in that re-read, and a passkey delete through the sealed path that lands before the late
+set read. A cancel inside either set read writes none. `mismatch` means the
 passkey still
 existed and held another count, so it writes the clone row at once, before any other read. A
 delete, a session revocation, a disable or a lock that lands after that write cannot remove the

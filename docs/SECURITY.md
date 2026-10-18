@@ -2698,8 +2698,9 @@ off or replaced since the check began is refused with `reason=factor_removed` or
 `reason=factor_replaced` and charged nothing. A code that matched nothing is a wrong code and is
 charged unread, whatever lands meanwhile. A matched code is still charged when the secret does not
 open, when the re-read raises, or when the factor is unchanged, as for a replayed code: none proves a
-change. The charge and its `auth.mfa_failed` row name the account as the re-read found it, so a
-rename during the check is charged under the new name. The
+change. When the re-read answers, the charge and its `auth.mfa_failed` row name the account as it
+found it, so a rename during the check is charged under the new name; when the re-read raises, they
+name the account as the check began. The
 passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
@@ -2998,10 +2999,12 @@ passkey whose set fails its seal writes it after that one set read and still bef
 at least these cannot suppress it: a holder ending their own session, a disable, a lock, a passkey
 delete, or a store error landing after the write. The refusal then also carries that change's own
 reason. One path is narrower: when the account, loaded afresh for that set read, does not load
-although its row still exists (its seal check losing a race to a rename or a rebind), the set is
-read only after the session, the account and the lock. A set failing its seal there, or a store
-error in that read, still writes the one clone row, but a revocation, a disable or a lock found
-first refuses with its own reason and writes none.
+although its row still exists (for example its seal check losing a race to a rename or a rebind),
+the set is read only after the session, the account and the lock. A set failing its seal there, or
+a store error in that read, still writes the one clone row. At least these leave none on that path:
+a revocation, a disable or a lock found first, an account that again fails to load
+(`reason=session_lost`), a store error in that re-read, and a passkey delete through the sealed
+path that lands before the late set read.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
