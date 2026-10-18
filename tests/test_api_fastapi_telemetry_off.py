@@ -3,8 +3,11 @@
 """The engine app turns fastapi's built-in OpenTelemetry telemetry off (CLAUDE.md section 9).
 
 fastapi 0.142 reads ``OTEL_EXPORTER_OTLP_*`` before lifespan startup and installs its own OTLP
-exporters unless the app says otherwise. ``create_app`` passes a telemetry config with every switch
-off, so an environment variable alone cannot make the engine export anything.
+exporters unless the app says otherwise; 0.143 makes that opt-in (the comment above
+``_FASTAPI_TELEMETRY_OFF`` in messagefoundry/api/app.py). ``create_app`` passes a telemetry config with
+every switch off. These tests show fastapi's own environment auto-configuration does not fire for
+the engine app. CI runs them on the locked fastapi only; on 0.142.2 they were run once, by hand, when
+the lock moved to 0.143.0. They say nothing about exporters another component installs.
 
 fastapi's lifespan catches a failed auto-configuration and logs a warning instead of raising, so
 the warning is the observable. Each test pairs the engine app with a bare ``FastAPI()`` under the
@@ -64,6 +67,8 @@ def test_an_otlp_endpoint_in_the_environment_configures_nothing(
         "OTEL_LOGS_EXPORTER",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The 0.143 opt-in (see the module docstring); 0.142 ignores it. It keeps the control firing.
+    monkeypatch.setenv("FASTAPI_OTEL_AUTO_CONFIGURE", "true")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
     for name, value in extra_env.items():
         monkeypatch.setenv(name, value)
