@@ -237,6 +237,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     UserAuthzRecord,
     UserChange,
@@ -13441,12 +13442,12 @@ class SqlServerStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``UPDLOCK`` SELECT + UPDATE run in one transaction so concurrent
-        assertions can't both win."""
+        precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
+        read from the ``UPDLOCK`` SELECT, in the same transaction as the UPDATE, so concurrent
+        assertions can't both win and no delete can land between a miss and the answer (BACKLOG
+        #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -13459,14 +13460,16 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 if not rows or int(rows[0][0]) != expected:
                     await self._commit(conn)
-                    return False  # missing row, or a concurrent assertion moved the counter
+                    # A missing row is a passkey gone. Another count is a concurrent assertion
+                    # that moved the counter, or a cloned key.
+                    return "mismatch" if rows else "gone"
                 await cur.execute(
                     "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
                     " WHERE credential_id_hash=?",
                     (new, used_at, credential_id_hash),
                 )
                 await self._commit(conn)
-                return True
+                return "moved"
             except Exception:
                 await conn.rollback()
                 raise

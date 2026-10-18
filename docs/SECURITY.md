@@ -2731,16 +2731,75 @@ and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 **The passkey leg asks the same question before it checks an assertion (BACKLOG #2239).** A passkey
 opens no window, but it does mark the factor met. So without the check, an account disabled in the
 directory would clear the MFA gate with its passkey until the reconciliation pass revoked it.
-`finish_webauthn_assertion` uses the same lookup and refuses the same answers. It asks after the
-second-step lock and the `[auth].mfa_verify_min_elapsed_seconds` floor, and before it takes the
-challenge. That includes a row with no directory object id, refused without a lookup as on the code
-leg, so such an account cannot clear the MFA gate by verifying a passkey either. After a confirmed lookup
+`finish_webauthn_assertion` uses the same lookup and refuses the same answers, through the one
+helper both legs call (`_directory_vouches_for_factor`, BACKLOG #3068). That includes a row with
+no directory object id, refused without a lookup as on the code leg, so such an account cannot
+clear the MFA gate by verifying a passkey either. It asks after the second-step lock and the
+`[auth].mfa_verify_min_elapsed_seconds` floor, and only once a ceremony is staged for the session,
+before it takes the challenge. A post with nothing staged for the session, which includes every
+post from an account that has never staged a ceremony because it holds no passkey, gets the plain
+failure audited `reason=expired` and causes no lookup, so such a caller does not learn what the
+directory said on this leg (BACKLOG #3068). The code leg does not gate this way: it asks the
+directory before it checks any code, so a session that has proved nothing can still read the
+directory refusal there, up to the route's rate limiter. **The passkey leg's gate does not stop
+a session that has staged a ceremony from reading the directory refusal.** The lookup still runs before the assertion is verified, so such a session can post a response that
+proves nothing and still cost one lookup and read the directory refusal, up to the per-actor
+limiter on `POST /ui/reauth/webauthn`. A ceremony staged before its passkey was deleted stays
+staged until it expires. After a confirmed lookup
 the leg reads the session, the account and its lock again. A refusal checks
 no assertion, leaves the challenge in flight, leaves the sign count alone, and charges nothing to
 the lockout. It is audited as `auth.webauthn_failed` with
 `reason=directory_unconfirmed` and the lookup's outcome. For that refusal
 `POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
 account gone after the lookup answers **401**.
+
+**Both second-factor legs read the session, the account and its lock once more right before they
+write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
+revocation, a disable or a second-step lock that lands while a good code or a good assertion is
+being checked stops the write, and so does the proved factor itself going meanwhile: a TOTP
+factor turned off (`reason=factor_removed`), or turned off and enrolled again with a new secret
+(`reason=factor_replaced`, read from the enrolment stamp and the opened secret, neither of which a
+store-key rotation changes), or the passkey that signed deleted (`reason=factor_removed`). An
+administrator's TOTP replace swaps the secret and revokes the account's sessions in one
+transaction, so a re-read answers it as a lost session. An MFA reset removes the factors and then
+revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
+gone. The factor is then not marked and no counter is cleared, and because the proof is already
+spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
+at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
+once the code has been checked, which is also logged, and a passkey set that fails its seal. A
+TOTP secret that does not open for the check itself is refused the same way, before any code is
+read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
+turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
+change can leave the check nothing to spend, so the code fails its spend. Only a code that
+MATCHED the factor is asked further: the session, the account and its lock are read again, as
+before a factor write. A session revoked or an account disabled or gone meanwhile answers
+`reason=session_lost`, and a lock answers locked, both charged nothing. Otherwise a factor turned
+off or replaced since the check began is refused with `reason=factor_removed` or
+`reason=factor_replaced` and charged nothing. A code that matched nothing is a wrong code and is
+charged unread, whatever lands meanwhile. A matched code is still charged when the secret does not
+open, when the re-read raises, or when the factor is unchanged, as for a replayed code: none proves a
+change. When the re-read answers, the charge and its `auth.mfa_failed` row name the account as it
+found it, so a rename during the check is charged under the new name; when the re-read raises, they
+name the account as the check began. The
+passkey leg re-reads whether or not its
+sign-count compare-and-set succeeded. What a miss means is stated once, under
+[WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
+A session or account gone answers
+as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
+`POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg.
+On the code leg it answers the same when it goes during the directory lookup or the account
+queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
+spent: the code leg has consumed the TOTP step or the single-use recovery code, with no refund.
+On the passkey leg the challenge is spent, and the sign count has moved, because the passkey did
+sign that challenge, except where the compare-and-set missed.
+**A window remains, and it is accepted.** It runs from the re-read through the factor stamp (and
+on the code leg the window stamp) to `record_login_success`, which clears both lockout counters
+unconditionally. A change landing there is not seen: for example, a run of wrong codes on another
+session of the same account can set the second-step lock there, and the passkey leg, which takes
+no account queue, would then clear it. The re-read does not check the session's expiry either;
+the rotation that follows refuses an expired session, but only after the counters are cleared.
+Closing the window would take store writes conditional on the state the re-read saw, which no leg
+has. The re-read narrows it from the whole proof check to those writes.
 
 **Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
 lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
@@ -2921,8 +2980,11 @@ stored ciphertext, so at least a store-key rotation that re-encrypts the column 
 refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
-stands. The user signs in again and confirms with a code from a later step, passing the same
-step-up as any confirm, because the refused confirm spent its code's step. With
+stands. The user signs in again, because the refused confirm ended the session, and passes the
+step-up `POST /me/mfa/confirm` asks of any confirm: a password proof bound to the confirm action
+(ADR 0077), or a recent step-up window where `[auth].require_action_step_up` is off. The user then
+confirms with a code from a later step, because the refused confirm spent
+its code's step. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to
@@ -2999,7 +3061,21 @@ COSE **public keys are stored plaintext by design** (verification material, not 
 outside the store cipher, documented in the crypto inventory); the authenticator **sign counter is
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
-normal for synced passkeys). Assertion failures are audited but deliberately do **not** feed the
+normal for synced passkeys). Every compare-and-set miss writes that row once, as soon as the
+store answers and before any other read, and its detail names the store's answer as
+`sign_count_answer`: `mismatch` (the passkey held another count) or `gone` (no passkey row was
+left, whether its holder or an MFA reset deleted it, or it left outside the store's sealed write
+path, which the refusal below tells apart as `reason=factor_unverified`), decided under one locked
+write on
+every backend (BACKLOG #3068, #3774; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+amendment of 2026-10-17). So at least these cannot suppress it: a holder ending their own session, a
+disable, a lock, a passkey delete, or a store error landing after the write. The reasons a gone
+passkey is then refused with, audited `auth.webauthn_failed`, include at least
+`reason=factor_removed`, `reason=factor_unverified` when the passkey set read after the write fails
+its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
+an MFA reset gives `reason=session_lost` once its revocation has landed, and
+`reason=factor_removed` before.
+Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
 charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-only reachability. With it
@@ -4854,7 +4930,8 @@ from the second-step lock. Since BACKLOG #1638 a
 Kerberos or OIDC sign-in refuses a mirror row under either lock before it completes. WebAuthn
 assertion failures deliberately do not **feed** a counter (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an account under the second-step lock IS refused at the assertion leg
-before any verification** (`finish_webauthn_assertion` checks `second_step_locked` first and audits
+before any verification** (`finish_webauthn_assertion` asks `_mfa_lock_refused`, the second-step
+lock check the code leg also calls, before it checks anything of the assertion, and it audits
 `auth.webauthn_failed` with `reason=locked`). So the second-step lock is *enforced* on both
 second-factor legs, though the assertion leg does not feed it.
 
@@ -4948,13 +5025,16 @@ Only a check the engine runs can raise that. It may be, at least, a password or 
 engine verified itself, a signed `amr` or `acr` value its claim gate accepted, or a step-up it ran. OIDC requires two values: an
 `auth_time`, and, while the claim gate is on, a configured `amr` or `acr`. A token missing either is
 refused, which grants nothing. The table covers at least these legs. Each cell was read against the
-code at engine commit `3345056505`, and the Where column names the code that does it.
+code at engine commit `3345056505`, and the Where column names the code that does it, except the
+**WebAuthn passkey** cell. That cell was read against `AuthService.finish_webauthn_assertion` as
+BACKLOG #3068 left it, because its directory sentences describe code merged after `3345056505`
+(BACKLOG #2239).
 
 | Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |
 |---|---|---|---|
 | **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
 | **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. Since BACKLOG #2142 it stamps no window on an `oidc` session, whose window opens only at the IdP. A directory account gets there only after the directory confirms the account (BACKLOG #2023) | `AuthService.verify_mfa` |
-| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it verifies a passkey (BACKLOG #2239; see [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). Registering a passkey also marks the factor, and the engine does not ask the directory there; the step-up window gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it verifies a passkey (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and the engine does not ask the directory there; the step-up window gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion` |
 | **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
