@@ -22,10 +22,10 @@ the code meets them.
 - Markup whose root is not ``svg`` but which carries an SVG element anywhere, such as XHTML or an HTML
   page with an inline ``<svg>``, is refused rather than rewritten (BACKLOG #2391). Rewriting would
   change the parts that are not SVG, and those are verbatim clinical content.
-- Bytes that are not markup, such as leading text before ``<svg onload=...>``, have the first 64 KiB
-  past their leading noise scanned for an ``svg`` start tag, plain or inflated, and are refused when
-  one is found (BACKLOG #3257). Only the tag counts, so a PDF or a DICOM file that names the SVG
-  namespace is still served. :func:`may_be_svg` reads the same head, so a binary with no tag in it
+- Bytes that are not markup, such as leading text before ``<svg onload=...>``, are refused when
+  their label names a type a browser renders as SVG or HTML and the first 64 KiB past their leading
+  noise hold an ``svg`` start tag, plain or inflated (BACKLOG #3257). Under any other label a quoted
+  tag is data and is served. :func:`may_be_svg` reads the same head, so a binary with no tag in it
   stays on the caller's thread unless its leading noise runs past a head.
 - A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
   plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
@@ -81,6 +81,10 @@ _MAX_GZIP_MEMBERS: Final = 16
 #: inflated (BACKLOG #3257). Also how much of a gzip body is inflated first, to clear one that is
 #: plainly not markup cheaply.
 _HEAD_BYTES: Final = 64 * 1024
+#: The HTML media types. A browser that renders one parses an inline ``<svg>`` as a live element, so
+#: such a label, like an SVG label, makes an ``svg`` start tag past leading text markup rather than
+#: data (BACKLOG #3257).
+_HTML_TYPES: Final = frozenset({"text/html", "application/xhtml+xml"})
 #: Any byte that is not NUL. Only NUL padding may follow the last gzip member.
 _NOT_NUL_RE: Final = re.compile(rb"[^\x00]")
 #: Traces of SVG in markup the parser could not read through: an ``svg`` start tag under any prefix
@@ -229,8 +233,8 @@ _IMPORTANT: Final = "important"
 
 class SvgRejected(ValueError):
     """The document is SVG, or carries an SVG element or start tag, and could not be vetted, so no
-    copy of it may be served. A document that is not markup is refused here for the tag alone
-    (BACKLOG #3257), so the refused document need not be an SVG."""
+    copy of it may be served. A document that is not markup, under an SVG or HTML label, is refused
+    here for the tag alone (BACKLOG #3257), so the refused document need not be an SVG."""
 
 
 class _RootFound(Exception):
@@ -426,6 +430,20 @@ def _head_is_tagged(head: bytes) -> bool:
     return _has_svg_tag(head)
 
 
+def _label_names_svg(label: str | None) -> bool:
+    """Whether the stored label names SVG, in any case and under any type that spells it, such as
+    ``image/svg+xml`` or ``image/svg+xml-compressed``."""
+    return "svg" in (label or "").casefold()
+
+
+def _label_renders_markup(label: str | None) -> bool:
+    """Whether the stored label names a type a browser renders as SVG or HTML, so an ``svg`` start
+    tag past leading text would be live markup rather than data (BACKLOG #3257): SVG under any
+    label :func:`_label_names_svg` accepts, and the HTML types in :data:`_HTML_TYPES`."""
+    media_type = (label or "").partition(";")[0].strip().casefold()
+    return _label_names_svg(label) or media_type in _HTML_TYPES
+
+
 def _refuse_if_tagged(head: bytes) -> None:
     """Refuse a document that is not markup when its head holds an ``svg`` start tag."""
     if _head_is_tagged(head):
@@ -576,15 +594,18 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
 def _vet_markup(label: str | None, body: bytes) -> bytes:
     """:func:`sanitize_if_svg` for bytes that are not gzip.
 
-    Bytes that are not markup are cleared unless their head holds an ``svg`` start tag. Only the
-    head is read, the same span past leading noise a gzip body's tag scan reads, so the chance that
-    a binary's bytes spell a tag does not grow with its size, and a large one is never copied whole.
-    A tag past the head rests on the route's content-type allow-list, as it does for gzip."""
+    Bytes that are not markup are served as stored, unless their label names a type a browser
+    renders as SVG or HTML and their head holds an ``svg`` start tag (BACKLOG #3257). Under any
+    other label, a quoted ``<svg>`` is data: a JSON value or an HL7 field holding that text is
+    served. Only the head is read, the same span past leading noise a gzip body's tag scan reads,
+    so a large body is never copied whole. A tag past the head rests on the route's content-type
+    allow-list, as it does for gzip."""
     head = _plain_head(body, _FIRST_CONTENT_BYTE_RE.search(body))
     if head is not None:
-        _refuse_if_tagged(head)
+        if _label_renders_markup(label):
+            _refuse_if_tagged(head)
         return body
-    if "svg" in (label or "").casefold() or _root_is_svg(body):
+    if _label_names_svg(label) or _root_is_svg(body):
         return sanitize_svg(body)
     if _contains_svg(body):
         raise SvgRejected("document whose root is not svg carries an SVG element")
@@ -604,11 +625,12 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     """:func:`sanitize_if_svg` for a gzip body. Only markup inside it is the sanitizer's business.
 
     A body is treated as not markup only once its first byte past leading noise is seen and is not
-    ``<``. It is then cleared unless the first :data:`_HEAD_BYTES` from that byte on hold an
-    ``svg`` start tag, which refuses it: the same head a plain body's scan reads (BACKLOG #3257).
-    Leading noise does not shorten that head: a walk that stopped before it held a full head past
-    the noise reads on to exactly that head, and one the bound stopped first is refused. A plain
-    body needs no second read, since all its bytes are at hand. A body that inflates to nothing but
+    ``<``. It is then cleared, unless its label names a type a browser renders as SVG or HTML and
+    the first :data:`_HEAD_BYTES` from that byte on hold an ``svg`` start tag, which refuses it:
+    the same rule and head as for plain bytes (BACKLOG #3257). Leading noise does not shorten that
+    head: a walk that stopped before it held a full head past the noise reads on to exactly that
+    head, and one the bound stopped first is refused. A plain body needs no second read, since all
+    its bytes are at hand. A body that inflates to nothing but
     whitespace within the bound has not shown that byte, so it is treated as markup: a reader
     that inflates the rest may find an SVG there. A gzip that is not sound is refused by
     :func:`_gunzip_bounded` before anything is judged.
@@ -626,6 +648,8 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     So markup over the bound is refused before any of it is held."""
     head = _gunzip_bounded(body, _HEAD_BYTES, keep_output=False)
     if head.first not in (None, b"<"):
+        if not _label_renders_markup(label):
+            return body
         if head.head_short:
             # Leading noise took part of the head, so read on to exactly a full head past it, and
             # no further: damage past the bytes the scan needs is not this pass's business.
@@ -635,7 +659,8 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     # A body that inflated whole within the head needs no second trial pass.
     trial = head if head.whole else _gunzip_bounded(body, _MAX_SVG_BYTES, keep_output=False)
     if trial.first not in (None, b"<"):
-        _refuse_gzip_if_tagged(trial)
+        if _label_renders_markup(label):
+            _refuse_gzip_if_tagged(trial)
         return body
     if not trial.whole:
         # Markup that passes the bound cannot be vetted, and a reader may still show the part that
@@ -787,8 +812,9 @@ def may_be_svg(body: bytes) -> bool:
     """A cheap pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body`` unchanged
     whatever its label, so the caller can skip the thread hop. ``True`` for gzip, since an SVGZ
     reader inflates it first, for markup, and for bytes that are not markup but whose head holds an
-    ``svg`` start tag, which :func:`sanitize_if_svg` refuses (BACKLOG #3257). It takes the same head
-    as that refusal, through the same functions, so the two cannot disagree. A PDF, an image or a
+    ``svg`` start tag, which :func:`sanitize_if_svg` refuses under an SVG or HTML label (BACKLOG
+    #3257). It has no label, so it answers for every label at once; it takes the same head as that
+    refusal, through the same functions, so the two cannot disagree. A PDF, an image or a
     DICOM file with no tag in its head is cleared here and does not take the hop, unless its
     leading noise runs past a head.
 
@@ -808,8 +834,9 @@ def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
     """``body`` unchanged unless it carries SVG, in which case the sanitized copy.
 
     An SVG document is sanitized. Markup whose root is not ``svg`` but which holds an SVG element is
-    refused, and so are bytes that are not markup but hold an ``svg`` start tag. A gzip body is
-    judged by what it inflates to, and a sanitized SVG inside it is gzipped again.
+    refused, and so are bytes that are not markup but hold an ``svg`` start tag in their head under
+    an SVG or HTML label. A gzip body is judged by what it inflates to, and a sanitized SVG inside
+    it is gzipped again.
 
     Raises :class:`SvgRejected` for SVG that cannot be vetted, and for each refusal above. Blocking
     work: run it off the event loop."""

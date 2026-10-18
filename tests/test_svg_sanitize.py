@@ -226,18 +226,21 @@ def test_the_corrupt_gzip_probes_really_fail_in_zlib() -> None:
 
 def test_damage_past_a_cleared_head_is_not_read() -> None:
     """The recorded trade, changed on purpose by BACKLOG #3257. A head whose first byte is not ``<``
-    and which holds no ``svg`` start tag clears the body without reading the rest, so a large
-    non-markup gzip damaged near its end is served as stored, and so is an ``svg`` tag past the
-    head. What the head scan does not reach rests on the route's content-type allow-list. A tag
-    inside the head is refused, damage or not: the docstring this replaces said a document whose
-    first byte is not ``<`` could hide no SVG, and a browser reading it as HTML would show one."""
+    clears the body without reading the rest, so a large non-markup gzip damaged near its end is
+    served as stored, and so is an ``svg`` tag past the head. What the head scan does not reach
+    rests on the route's content-type allow-list. Under a label a browser renders as SVG or HTML, a
+    tag inside the head is refused, damage or not: the docstring this replaces said a document
+    whose first byte is not ``<`` could hide no SVG, and a browser reading it as HTML would show
+    one. Under any other label the tag is data, as it was before."""
     filler = bytes(range(256)) * 2048
     body = _flip(_gz(b"%PDF-1.4 " + filler), -8)
     assert sanitize_if_svg("application/gzip", body) is body
     past_the_head = _flip(_gz(b"%PDF-1.4 " + filler + b"<svg onload=alert(1)>"), -8)
-    assert sanitize_if_svg("application/gzip", past_the_head) is past_the_head
+    assert sanitize_if_svg("image/svg+xml", past_the_head) is past_the_head
+    in_the_head = _flip(_gz(b"%PDF-1.4 <svg onload=x>" + filler), -8)
     with pytest.raises(SvgRejected, match="svg start tag"):
-        sanitize_if_svg("application/gzip", _flip(_gz(b"%PDF-1.4 <svg onload=x>" + filler), -8))
+        sanitize_if_svg("image/svg+xml", in_the_head)
+    assert sanitize_if_svg("application/gzip", in_the_head) is in_the_head
 
 
 @pytest.mark.parametrize(
@@ -377,16 +380,17 @@ def test_a_large_body_whose_head_is_only_noise_is_cleared_by_its_first_content_b
 ) -> None:
     """The trial pass keeps no output, yet still sees the first byte past leading noise. A body that
     passes the bound but starts, past that noise, with a byte other than ``<`` is not markup and is
-    served as stored, as it was before the trial pass, unless the head past that noise holds an
-    ``svg`` start tag. Changed on purpose by BACKLOG #3257: the noise does not use up the head, so
-    padding cannot push the tag out of the scan's reach."""
+    served as stored, as it was before the trial pass, unless its label renders as SVG or HTML and
+    the head past that noise holds an ``svg`` start tag. Changed on purpose by BACKLOG #3257: the
+    noise does not use up the head, so padding cannot push the tag out of the scan's reach."""
     monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     body = _gz(b" " * 2048 + b"%PDF-1.4 synthetic" + b"A" * 8192)
     assert sanitize_if_svg("application/gzip", body) is body
     tagged = _gz(b" " * 2048 + b"%PDF-1.4 synthetic <svg onload=x>" + b"A" * 8192)
     with pytest.raises(SvgRejected, match="svg start tag"):
-        sanitize_if_svg("application/gzip", tagged)
+        sanitize_if_svg("image/svg+xml", tagged)
+    assert sanitize_if_svg("application/gzip", tagged) is tagged
 
 
 # --- BACKLOG #2391: SVG below a root that is not svg -----------------------------------------------
@@ -689,21 +693,17 @@ def test_an_svg_over_the_size_bound_is_refused() -> None:
 @pytest.mark.parametrize(
     ("label", "data"),
     [
-        (
-            "application/pdf",
-            b"%PDF-1.4\nsynthetic document << /Subtype /svg >> image/svg+xml\n%%EOF\n",
-        ),
-        ("image/png", bytes.fromhex("89504e470d0a1a0a") + b"<svgz/>"),
-        ("text/plain", b"synthetic note mentioning an svg drawing in passing"),
+        ("application/pdf", b"%PDF-1.4\nsynthetic document <svg onload=x>\n%%EOF\n"),
+        ("image/png", bytes.fromhex("89504e470d0a1a0a") + b"<svg/>"),
+        ("text/plain", b"synthetic note mentioning <svg> in passing"),
         ("text/xml", b'<?xml version="1.0"?><ClinicalDocument><note/></ClinicalDocument>'),
-        ("application/json", b'{"svg": "<svgs onload=x>"}'),
+        ("application/json", b'{"svg": "<svg onload=x>"}'),
         ("text/plain", b""),
     ],
 )
 def test_non_svg_documents_are_returned_unchanged(label: str, data: bytes) -> None:
-    """Changed on purpose by BACKLOG #3257. The PDF, PNG, text and JSON rows held a literal ``<svg``
-    tag past leading text and pinned that it was served. They now hold near misses that are not an
-    ``svg`` start tag; the tag itself is refused below."""
+    """A quoted ``<svg`` past leading text is data under a label no browser renders as SVG or HTML,
+    so these are served as stored (BACKLOG #3257 keeps origin/main's rows, on the Lander's ruling)."""
     assert sanitize_if_svg(label, data) is data
 
 
@@ -811,19 +811,64 @@ def test_iso_2022_jp_text_with_a_lt_and_no_tag_is_served_plain_and_gzipped() -> 
         pytest.param(_ISO2022_TEXT_THEN_SVG, id="iso-2022-jp-escape"),
     ],
 )
-@pytest.mark.parametrize("label", ["image/svg+xml", "text/html", "text/plain", None])
-def test_an_svg_tag_past_leading_text_is_refused_plain_and_gzipped(
-    label: str | None, data: bytes
+@pytest.mark.parametrize(
+    "label",
+    [
+        "image/svg+xml",
+        "Image/SVG+XML; charset=utf-8",
+        "image/svg+xml-compressed",
+        "text/html",
+        "Text/HTML; charset=utf-8",
+        "application/xhtml+xml",
+    ],
+)
+def test_an_svg_tag_past_leading_text_is_refused_under_a_rendering_label(
+    label: str, data: bytes
 ) -> None:
     """BACKLOG #3257, the positive control. A body whose first byte past leading noise is not ``<``
-    used to be served as stored even when it carried ``<svg onload=...>`` further on, under an SVG
-    label too. It is refused now, plain and gzipped, and the pre-check sends it to the sanitizer."""
+    used to be served as stored even when it carried ``<svg onload=...>`` further on. Under a label
+    a browser renders as SVG or HTML it is refused now, plain and gzipped, and the pre-check sends
+    it to the sanitizer."""
     assert not _starts_as_markup(data)
     assert may_be_svg(data)
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg(label, data)
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg(label, _gz(data))
+
+
+#: An HL7-shaped text body whose OBX-5 field quotes an SVG as text, within the head.
+_HL7_QUOTING_SVG = (
+    b"MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ORU^R01|MSG3257|P|2.5\r"
+    b"OBX|1|TX|NOTE^Note||synthetic note quoting <svg onload=alert(1)> as text||||||F\r"
+)
+_JSON_QUOTING_SVG = b'{"note": "synthetic", "icon": "<svg onload=alert(1)><rect/></svg>"}'
+
+
+@pytest.mark.parametrize(
+    ("label", "data"),
+    [
+        ("text/plain", _HL7_QUOTING_SVG),
+        ("application/json", _JSON_QUOTING_SVG),
+        ("application/hl7-v2", _HL7_QUOTING_SVG),
+        ("application/pdf", b"%PDF-1.4\nsynthetic <svg onload=x>\n%%EOF\n"),
+        ("application/octet-stream", b"synthetic <svg onload=x>"),
+        ("image/png", bytes.fromhex("89504e470d0a1a0a") + b"<svg/>"),
+        ("application/dicom", b"\x00" * 128 + b"DICM synthetic <svg onload=x>"),
+        (None, b"synthetic <svg onload=x>"),
+    ],
+)
+def test_a_quoted_svg_tag_under_a_data_label_is_served_plain_and_gzipped(
+    label: str | None, data: bytes
+) -> None:
+    """The Lander's ruling on PR 2346: a quoted ``<svg>`` in a data field, under a label no browser
+    renders as SVG or HTML, is data, and is served as stored, plain and gzipped. The tag sits well
+    inside the head, so only the label decides."""
+    assert not _starts_as_markup(data)
+    assert data.index(b"<svg") < svg_sanitize._HEAD_BYTES
+    assert sanitize_if_svg(label, data) is data
+    gz = _gz(data)
+    assert sanitize_if_svg(label, gz) is gz
 
 
 def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
@@ -845,16 +890,16 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     calls = _spy_on_inflate(monkeypatch)
     inside = at_the_end(b"<svg onload=", b"x>")
     with pytest.raises(SvgRejected, match="svg start tag"):
-        sanitize_if_svg("application/gzip", inside)
+        sanitize_if_svg("image/svg+xml", inside)
     assert calls == [(False, 1024), (False, 900 + 1024)]
     calls.clear()
     outside = _gz(lead + b"A" * 1024 + b"<svg onload=x>" + b"A" * 4096)
-    assert sanitize_if_svg("application/gzip", outside) is outside
+    assert sanitize_if_svg("image/svg+xml", outside) is outside
     assert calls == [(False, 1024), (False, 900 + 1024)]
     with pytest.raises(SvgRejected, match="svg start tag"):
-        sanitize_if_svg("application/gzip", at_the_end(b"<svg", b"z/>"))
+        sanitize_if_svg("image/svg+xml", at_the_end(b"<svg", b"z/>"))
     cut = at_the_end(b"<sv", b"g onload=x>")
-    assert sanitize_if_svg("application/gzip", cut) is cut
+    assert sanitize_if_svg("image/svg+xml", cut) is cut
 
 
 def test_a_plain_tag_scan_reads_the_same_head_as_gzip(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -872,14 +917,14 @@ def test_a_plain_tag_scan_reads_the_same_head_as_gzip(monkeypatch: pytest.Monkey
         assert may_be_svg(refused)
         for body in (refused, _gz(refused)):
             with pytest.raises(SvgRejected, match="svg start tag"):
-                sanitize_if_svg("application/pdf", body)
+                sanitize_if_svg("image/svg+xml", body)
     for served in (
         lead + b"A" * 1024 + b"<svg onload=x>" + b"A" * 4096,
         at_the_end(b"<sv", b"g onload=x>"),
     ):
         assert not may_be_svg(served)
         for body in (served, _gz(served)):
-            assert sanitize_if_svg("application/pdf", body) is body
+            assert sanitize_if_svg("image/svg+xml", body) is body
 
 
 def _random_bodies() -> list[bytes]:
@@ -915,13 +960,15 @@ def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
 ) -> None:
     """A body that is only noise for the head is read up to the bound. If its first content byte
     lies so near the bound that no full head fits past it, the tag scan cannot see a full head, so
-    the body is refused rather than cleared (BACKLOG #3257). The control starts its content early
+    a body under an SVG or HTML label is refused rather than cleared (BACKLOG #3257). The control starts its content early
     enough to leave a full head, and is served."""
     monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     near = _gz(b" " * 4000 + b"%PDF-1.4 " + b"A" * 8192)
     with pytest.raises(SvgRejected, match="before a full head"):
-        sanitize_if_svg("application/gzip", near)
+        sanitize_if_svg("image/svg+xml", near)
+    # Under a data label the tag scan does not run, so the body is served as on origin/main.
+    assert sanitize_if_svg("application/gzip", near) is near
     room = _gz(b" " * 2048 + b"%PDF-1.4 " + b"A" * 8192)
     assert sanitize_if_svg("application/gzip", room) is room
 
@@ -929,7 +976,8 @@ def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
 @pytest.mark.parametrize(
     ("data", "expected"),
     [
-        # Changed on purpose by BACKLOG #3257: this row was False, and the tag is now refused.
+        # Changed on purpose by BACKLOG #3257: this row was False. The pre-check has no label, and the
+        # tag is refused under an SVG or HTML label.
         (b"%PDF-1.4 <svg>", True),
         (b"%PDF-1.4 synthetic", False),
         (bytes.fromhex("89504e470d0a1a0a"), False),
@@ -969,7 +1017,7 @@ def test_the_head_re_read_stops_at_a_full_head_past_the_noise(
     damaged_second_member = _flip(_gz(b"B" * 4096), 12)
     for lead in (b"", b"\n", b"\n\n", b" " * 600):
         body = _gz(lead + b"%PDF-1.4 " + b"A" * 1100) + damaged_second_member
-        assert sanitize_if_svg("application/pdf", body) is body
+        assert sanitize_if_svg("image/svg+xml", body) is body
 
 
 def test_the_pre_check_leaves_noise_past_a_head_to_the_thread() -> None:

@@ -1046,20 +1046,35 @@ async def test_xml_embedding_svg_below_another_root_is_refused(
 async def test_an_svg_tag_after_leading_text_is_refused(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """BACKLOG #3257, end to end: a body whose first byte is not ``<`` but which carries
-    ``<svg onload=...>`` further on is refused, not served, under an inert label. The refusal is
-    audited under the route's one SVG reason, which this pins so a change to it is seen. The answer
-    says the attachment carries SVG, not that it is one: a text or PDF body refused for a tag is not
-    an SVG."""
-    before_marker = b"synthetic document text-then-svg not real PHI"
+    """BACKLOG #3257, end to end: a body labelled ``text/html`` whose first byte is not ``<`` but
+    which carries ``<svg onload=...>`` further on is refused, not served. The refusal is audited
+    under the route's one SVG reason, which this pins so a change to it is seen. The answer says the
+    attachment carries SVG, not that it is one: an HTML body refused for a tag is not an SVG."""
+    before_marker = b"synthetic document html-then-svg not real PHI"
     mid, ref = await _seed_labelled(
-        engine, "text/plain", marker="text-then-svg", suffix=b' <svg onload="x">'
+        engine, "text/html", marker="html-then-svg", suffix=b' <svg onload="x">'
     )
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 422
     assert r.json()["detail"] == "attachment carries SVG that cannot be sanitized"
     assert before_marker not in r.content
     await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
+
+
+async def test_a_quoted_svg_tag_in_a_text_body_is_served(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """The Lander's ruling on PR 2346, end to end: a ``text/plain`` body that quotes
+    ``<svg onload=...>`` as data is served byte for byte, under its own inert type, and audited as
+    a download of the stored bytes."""
+    suffix = b' quoting <svg onload="x"> as text'
+    mid, ref = await _seed_labelled(engine, "text/plain", marker="text-quoting-svg", suffix=suffix)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.content == b"synthetic document text-quoting-svg not real PHI" + suffix
+    assert _base_media_type(r) == "text/plain"
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert "sanitized-svg" not in (row["detail"] or "")
 
 
 # --- BACKLOG #2391: SVGZ, settled end to end through ingress detach and the download ---------------

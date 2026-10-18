@@ -569,9 +569,10 @@ R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
    decision and its limits are recorded beside the table in `api/app.py`.
 
 **How an SVG is recognised.** Only markup can be an SVG. Markup here means bytes whose first byte,
-after any whitespace, NUL or byte-order mark, is `<`. Bytes that are not markup are refused when
-the first 64 KiB past that noise hold an `svg` start tag, under any prefix and in any case, and are
-otherwise served as before, so a PDF or an image under an SVG label is unchanged. That covers SVGZ
+after any whitespace, NUL or byte-order mark, is `<`. Bytes that are not markup, under a label a
+browser renders as SVG or HTML, are refused when the first 64 KiB past that noise hold an `svg`
+start tag, under any prefix and in any case. Otherwise they are served as before, so a PDF or an
+image under an SVG label, or any body under a data label, is unchanged. That covers SVGZ
 too: ingress already relabels gzip bytes under a `+xml` label as `application/octet-stream`.
 *Corrected 2026-10-07 (BACKLOG #2391):* the relabel changes only the label, so that sentence was
 wrong. See the correction below.
@@ -579,13 +580,17 @@ wrong. See the correction below.
 *Amended 2026-10-16 (BACKLOG #3257):* the first rule read *"No SVG reader renders anything else"*,
 and bytes that were not markup were served with no scan at all. So leading text before
 `<svg onload=...>` passed, under an SVG label too, and a browser reading such a body as HTML would
-run it. The scan reads only that 64 KiB head, the same span a gzip body's scan reads (step 3 of
-the correction below), so a large binary is never copied whole and the chance that its bytes spell
-a tag does not grow with its size. The download's pre-check reads the same head, so a PDF, an
-image or a DICOM file with no tag there stays off the thread pool unless its leading noise runs
-past a head. The scan looks for the tag only, never the SVG namespace name, so a PDF or a DICOM
-file that names the namespace is still
-served. It also reads the tag spelled through an ISO-2022-JP escape sequence, which decodes to
+run it. *Amended again 2026-10-17 (BACKLOG #3257, the Lander's ruling on PR 2346):* the refusal
+applies only under a label a browser renders as SVG or HTML: one that names `svg` in any case, such
+as `image/svg+xml` or `image/svg+xml-compressed`, and `text/html` or `application/xhtml+xml`. Under
+any other label, such as `text/plain`, `application/json`, an HL7 type, a PDF, an image, DICOM or
+`application/octet-stream`, a quoted `<svg>` is data, and the body is served as it was before this
+amendment. An earlier version refused it under every label, which refused valid traffic. The scan
+reads only that 64 KiB head, the same span a gzip body's scan reads (step 3 of the correction
+below), so a large body is never copied whole. The download's pre-check has no label, so it reads
+the same head and sends a body with a tag there to the sanitizer, which decides by label; a body
+with no tag there stays off the thread pool unless its leading noise runs past a head. The scan
+looks for the tag only, never the SVG namespace name. It also reads the tag spelled through an ISO-2022-JP escape sequence, which decodes to
 nothing; unlike markup, such a body is not refused for the escape byte alone, since most binaries
 hold it. What the scan does not reach, past the head included, rests on the inert-type allow-list:
 every type it declares is served as an attachment with `nosniff`, and none is SVG or HTML.
@@ -642,9 +647,9 @@ refused. The size bound caps the memory one download can take, and at most two d
 once, because the work runs on the thread pool the pipeline's workers share. These are the only
 cases where the route refuses a linked attachment it can decode. *Amended 2026-10-16 (BACKLOG
 #3257):* that sentence no longer holds. The 2026-10-07 correction below added refusals, and a body
-that is not markup is now refused when the head past its leading noise holds an `svg` start tag;
-"What this leaves open" under that correction lists at least the documents with no SVG in them
-that these refuse.
+that is not markup, under an SVG or HTML label, is now refused when the head past its leading
+noise holds an `svg` start tag; "What this leaves open" under that correction lists at least the
+documents with no SVG in them that these refuse.
 `_safe_attachment_content_type` still decides only the declared type.
 
 **Audited.** When the served bytes are a sanitized copy, the `attachment_download` audit row carries
@@ -698,22 +703,22 @@ real detach and the download, and fails against the sanitizer this correction re
    2026-10-07:* the first version of this correction served such a body as stored, unsanitized.
    The Lander found it on PR 2158.
 3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
-   byte-order-mark bytes is not `<`, the body is not markup. It is refused when the 64 KiB from that
-   byte on hold an `svg` start tag, and otherwise served as stored without reading the rest. Where
-   the leading noise took part of the first 64 KiB, the head is read on to exactly 64 KiB past the
+   byte-order-mark bytes is not `<`, the body is not markup. Under any label but an SVG or HTML one
+   it is served as stored without reading the rest. Under an SVG or HTML label it is refused when
+   the 64 KiB from that byte on hold an `svg` start tag, and otherwise served as stored. Where the
+   leading noise took part of the first 64 KiB, the head is read on to exactly 64 KiB past the
    noise, so a full 64 KiB past it is scanned, and damage that read reaches is refused as in step 2.
-   The scan also
-   reads the tag spelled through an ISO-2022-JP escape sequence. Damage past the bytes read is not
+   The scan also reads the tag spelled through an ISO-2022-JP escape sequence. Damage past the bytes read is not
    seen, and nor is a tag past the head. That rests on the inert-type allow-list, as it does for
    plain bytes, whose scan reads the same 64 KiB past the noise and needs no second read, since all
    their bytes are at hand. It does not rest on how a browser reads the document. *Amended
-   2026-10-16 (BACKLOG #3257):* this step read that the trade could not hide an SVG, *"since no browser renders a document as SVG when its first byte past that noise is not
-   `<`"*, and a head that was not markup was served with no scan. Inflating the rest of every large
+   2026-10-16 (BACKLOG #3257):* this step read that the trade could not hide an SVG, *"since no
+   browser renders a document as SVG when its first byte past that noise is not `<`"*, and a head that was not markup was served with no scan. Inflating the rest of every large
    PDF or image would undo BACKLOG #1129, so the scan stops at the head. A reader that autodetects
    EBCDIC could still find an SVG; plain bytes rest on the same assumption. Bytes that are only that
    noise for the whole head do not clear the body: it is inflated up to the bound, and the same rule
    then applies from the first byte past the noise. If that byte lies so near the bound that no
-   full 64 KiB fits past it, the body is refused.
+   full 64 KiB fits past it, a body under an SVG or HTML label is refused.
 4. Markup that passes the bound is refused, since it cannot be vetted.
 5. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
    the served copy keeps the stored representation. The audit row says `sanitized-svg`.
@@ -765,15 +770,11 @@ declares or names the SVG namespace without using it is served.
   - any document whose root scan runs out of steps;
   - any gzip whose damage the inflate reaches before its head clears it, such as a small damaged
     PDF, whatever it holds;
-  - *added 2026-10-16 (BACKLOG #3257):* a body that is not markup and quotes an `svg` start tag as
-    data in its first 64 KiB past leading noise, such as a JSON value, a plain-text note or an
-    MHTML report with an inline icon, whatever its label;
-  - *added 2026-10-16 (BACKLOG #3257):* a body that is not markup and holds the bytes of an `svg`
-    start tag by chance, such as compressed data in a large PDF or image, or 16-bit DICOM samples
-    once NUL bytes are removed. By arithmetic rather than measurement, uniformly random bytes hold
-    one in the scanned 64 KiB head about once in 240,000 bodies, whatever the body's size, plain or
-    gzipped. A head that ends on `<svg` is refused as if the tag went on.
+  - *added 2026-10-16, narrowed 2026-10-17 (BACKLOG #3257):* a body under an SVG or HTML label
+    that is not markup and whose head quotes an `svg` start tag as text, or whose head ends on
+    `<svg`, which is refused as if the tag went on. Under any other label such a body is served.
 - *Added 2026-10-16 (BACKLOG #3257):* the download's pre-check, which runs on the event loop, now
   reads the first 64 KiB past leading noise of every plain body that is not markup, a copy of at
-  most 64 KiB and one scan of it. Only a body whose head holds an `svg` start tag, or whose leading
-  noise runs past 64 KiB, goes to the thread pool besides markup and gzip.
+  most 64 KiB, scanned only when it holds a `<`. A body whose head holds an `svg` start tag, or
+  whose leading noise runs past 64 KiB, goes to the thread pool besides markup and gzip, whatever
+  its label, since the pre-check has none; the sanitizer then serves it under a data label.
