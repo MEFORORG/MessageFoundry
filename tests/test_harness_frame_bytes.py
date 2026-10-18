@@ -150,8 +150,11 @@ def test_neutralise_returns_the_same_object_when_clean() -> None:
 )
 @pytest.mark.parametrize("codec", [MLLP_CODEC, STX_ETX_CODEC, FrameCodec(start=0xC3, end=0xA9)])
 def test_the_engine_delivery_check_is_the_leaf_check(codec: FrameCodec, payload: str) -> None:
-    # One definition: the engine's refusal fires exactly where the leaf's does, with the same text,
-    # and its reply framer neutralises exactly as the leaf does. Imported here only, never by harness.
+    # One definition of the frame-byte rule: on these payloads, none led by MSH, the engine's
+    # refusal fires exactly where the leaf's does, with the same text, and its reply framer
+    # neutralises exactly as the leaf does. The engine also refuses an MSH-led payload holding a
+    # second MSH (ADR 0209), which the leaf still frames.
+    # Imported here only, never by harness.
     from messagefoundry.transports.base import NegativeAckError
     from messagefoundry.transports.framing import check_frame_bytes, frame_reply
 

@@ -20,6 +20,7 @@ from messagefoundry.api.tls import _generated_pair
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.config.retention_classification import warn_only_windows
 from messagefoundry.config.settings import load_settings, security_loosenings
+from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_refusal
 from messagefoundry.scaffold import scaffold
 from scripts.release.tag_spelling import allowed
 
@@ -319,6 +320,30 @@ def test_init_refuses_nonempty_dir(tmp_path: Path, capsys: pytest.CaptureFixture
     assert rc == 1
     # text-mode errors go to stderr (BACKLOG #1673)
     assert "not empty" in capsys.readouterr().err
+
+
+def test_every_serve_start_init_names_disables_remote_debugging(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #2700: under the default ``enforce``, ``serve`` refuses to start with the
+    interpreter's remote debugging on, so a start ``init`` prints or scaffolds that leaves it on
+    would refuse. Each one starts the interpreter the way the refusal names."""
+    repo = tmp_path / "repo"
+    assert main(["init", str(repo)]) == 0
+    printed = capsys.readouterr().out
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    starts = [
+        line
+        for line in [*printed.splitlines(), *readme.splitlines()]
+        if "messagefoundry serve" in line
+    ]
+    assert len(starts) >= 3  # the printed next step, the README launch and its commented form
+    for line in starts:
+        assert "python -P -X disable-remote-debug -m messagefoundry serve" in line, line
+    refusal = remote_debug_refusal(
+        RemoteDebugPosture(interpreter_enabled=True, guard_installed=True)
+    )
+    assert refusal is not None and "python -P -X disable-remote-debug -m messagefoundry" in refusal
 
 
 # --- BACKLOG #1318: what `init` writes, the loader must accept ---------------------------------

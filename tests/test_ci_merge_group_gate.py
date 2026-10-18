@@ -52,12 +52,15 @@ _SOURCE_REPO = "MEFORORG/MessageFoundry"
 #: What the queue gates on. Read as a pair with the job `if:` conditions asserted at the bottom of
 #: this file, because these rows DO NOT all mean the same thing:
 #:
-#: * `serverdb` decides nothing. sqlserver-store and postgres-store name merge_group in their own
-#:   job `if:`, so a queue entry runs them whatever this emits.
+#: * `serverdb` decides nothing for sqlserver-store and postgres-store, which name merge_group in
+#:   their own job `if:`, so a queue entry runs them whatever this emits. It DOES decide
+#:   postgres-store-windows, which names merge_group nowhere: false here keeps that advisory leg
+#:   out of the queue.
 #: * `code` is belt-and-braces. `test` and `webconsole` name merge_group in their own STEP `if:`.
 #: * `docker`, `ide`, `tooling` and `packaging` DO decide their jobs -- docker-smoke, ide, tooling
 #:   and packaging-build are each gated on an output of this step AND name merge_group nowhere, so
-#:   false here is that job OFF in the queue. `_DECIDED_BY_THE_ARM_ALONE` below pins that set.
+#:   false here is that job OFF in the queue. So does `serverdb` for postgres-store-windows, per the
+#:   first bullet. `_DECIDED_BY_THE_ARM_ALONE` below pins all five.
 #:
 #: Asserting the outputs without that context would teach a reader the opposite of what the workflow
 #: does. The same partition is stated at the arm in ci.yml; the two move together.
@@ -96,6 +99,9 @@ _DECIDED_BY_THE_ARM_ALONE = {
     "ide",
     "tooling",
     "packaging-build",
+    # Gated on `serverdb` and names merge_group nowhere, so the arm's `serverdb=false` keeps this
+    # advisory leg out of the queue, on purpose.
+    "postgres-store-windows",
 }
 
 #: The jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
@@ -134,6 +140,7 @@ _NAMES_MERGE_GROUP_NOWHERE = {
     "ide",
     "tooling",
     "packaging-build",
+    "postgres-store-windows",
 }
 
 #: The other side of the arm's predicate, and the one nothing pinned until 2026-09-22: jobs gated on
@@ -540,7 +547,7 @@ def test_the_two_pins_are_a_strict_narrowing() -> None:
 
 
 def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> None:
-    """The four jobs whose queue fate `changes` settles by itself -- with the control for that four.
+    """The five jobs whose queue fate `changes` settles by itself -- with the control for that five.
 
     The arm's comment in ci.yml enumerates these. An earlier draft enumerated the SAME four under a
     wider predicate, "the jobs that name merge_group nowhere", which also takes in `changes` itself

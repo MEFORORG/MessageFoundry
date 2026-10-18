@@ -16,7 +16,7 @@ body, and ``dryrun`` output all contain only the tokens.
 Everything is environment-specific and comes from ``env()`` (non-secret values in
 ``environments/<env>.toml``; secrets via ``MEFOR_VALUE_<KEY>`` env vars). No PHI, no real endpoint.
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 """
 
 from html import escape

@@ -355,8 +355,8 @@ _EVENT_KINDS = (
     # BACKLOG #1619 -- the MLLP listener's inbound handler faulted on a frame it read cleanly (a
     # store outage at the ingress commit is the reachable case). Not a framing fault, so not that kind.
     "handler_error",
-    # vault BACKLOG #2613 -- a TLS handshake on an MLLP listener failed. Throttled to one per minute
-    # per listener; the reason carries the count since the last one.
+    # vault BACKLOG #2613 and #3302 -- a TLS handshake on an MLLP or HTTP listener failed. Throttled
+    # to one per minute per listener; the reason carries the count since the last one.
     "tls_handshake_failed",
     # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
     # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
@@ -673,7 +673,7 @@ def status(
             ["Allow keeping PHI indefinitely", _sec("allow_keeping_phi_indefinitely")],
             # The per-tier retention acknowledgements (BACKLOG #1967, #2280). The switch above covers
             # the auto-bounded tiers only, so each of these is its own row. A literal list because a
-            # client may not import the engine's classification; test_webui.py pins it to that
+            # client may not import the engine's classification; test_webui_bulk.py pins it to that
             # classification instead, so a tier given a switch there reds until it has a row here.
             [
                 "Allow keeping transform state indefinitely",

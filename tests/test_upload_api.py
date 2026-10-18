@@ -1424,3 +1424,110 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     assert detail["file_id"] == fid
     assert set(detail) == {"file_id", "size"}  # no file name (vault BACKLOG #2619)
     assert "acme" not in str(rows[0]["detail"])
+
+
+# --- vault BACKLOG #3178: the upload.create and upload.delete rows outlive the request -------------
+
+
+def _park_audit(engine: Engine, action: str, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Make ``record_audit`` for ``action`` wait until the returned event is set, so the request
+    deadline fires while that row is being written. Every other row writes through."""
+    release = asyncio.Event()
+    real = engine.store.record_audit
+
+    async def _parked(name: str, **kwargs: Any) -> Any:
+        if name == action:
+            await release.wait()
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", _parked)
+    return release
+
+
+async def _settle(app: Any) -> None:
+    """Wait for the app's outliving operations to finish."""
+    for _ in range(200):
+        if not app.state.outliving_operations.inflight:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("an outliving operation never finished")
+
+
+async def test_a_deadline_during_the_create_row_still_writes_it(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #3178: the deadline cancelled the route inside its ``upload.create`` write, so
+    the stored file had no row saying who created it."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
+        h = await _login(c, "op")
+        release = _park_audit(engine, "upload.create", monkeypatch)
+        app.state.request_timeout_seconds = 0.5
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 503, r.text
+        release.set()
+        await _settle(app)
+    [stored] = await app.state.upload_store.list_files()
+    [row] = await engine.store.list_audit(action="upload.create")
+    assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == stored.file_id
+
+
+async def test_a_create_row_that_fails_removes_the_stored_file(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that cannot be written leaves no file behind it, rather than a file with no row."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    real = engine.store.record_audit
+
+    async def _failing(name: str, **kwargs: Any) -> Any:
+        if name == "upload.create":
+            raise RuntimeError("the audit log refused the row")
+        return await real(name, **kwargs)
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "record_audit", _failing)
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+    assert r.status_code == 500
+    assert await app.state.upload_store.list_files() == []
+    assert not list((tmp_path / "uploads").iterdir())
+
+
+async def test_a_deadline_during_the_delete_row_still_writes_it(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #3178: the file was already unlinked when the deadline cancelled the route in
+    its ``upload.delete`` write, so a removed file had no row saying who removed it."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]
+        release = _park_audit(engine, "upload.delete", monkeypatch)
+        app.state.request_timeout_seconds = 0.5
+        d = await c.delete(f"/uploads/{fid}", headers=h)
+        assert d.status_code == 503, d.text
+        release.set()
+        await _settle(app)
+    assert await app.state.upload_store.list_files() == []
+    [row] = await engine.store.list_audit(action="upload.delete")
+    assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == fid

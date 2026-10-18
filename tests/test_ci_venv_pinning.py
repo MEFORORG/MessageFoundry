@@ -139,7 +139,8 @@ LOCK_ONLY_VENVS = (
 
 #: The runners the engine SBOM is built on, one step per runner in each of `release.yml` and
 #: `security.yml`. Two, because the core lock's `sys_platform` markers resolve differently on win32 and
-#: the engine deploys on both (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment). Declared up
+#: linux, so one SBOM cannot describe both installs (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30
+#: amendment). Only Windows is a supported v1 deployment target (docs/SYSTEM-REQUIREMENTS.md). Declared up
 #: here, not beside `_sbom_steps`, because parametrize decorators above that helper read it at import.
 _SBOM_RUNNERS = ("ubuntu-latest", "windows-latest")
 
