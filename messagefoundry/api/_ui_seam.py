@@ -500,12 +500,19 @@ from typing import Any
 #: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
 #: covers every entry above.
 #:
+#: Vault BACKLOG #3316 merged with main after BACKLOG #2709 landed there (digest
+#: da529979e55cb966 on main). #2709 hashes the console helpers a gate calls, and #3316 changes
+#: them in ``_auth.py``: it edits ``assert_same_origin`` and ``assert_not_cross_site`` and adds
+#: ``_sec_fetch_site`` and ``_fetch_site_lines_disagree``. Each parent was consistent alone, so
+#: the move comes from the merge.
+#: Re-derived with ``--write`` on the merged tree.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "da529979e55cb966"
+ENGINE_UI_SEAM: str = "8b2fa06dd4c4938b"
 
 
 @dataclass(frozen=True, slots=True)
