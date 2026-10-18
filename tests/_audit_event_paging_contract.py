@@ -18,9 +18,11 @@ What each check guards:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from messagefoundry.store.audit_exclusion import AuditExclusion
+from messagefoundry.store.store import audit_active_key_id
 
 _EXCLUDE = AuditExclusion(
     actions=frozenset({"auth.account_locked"}),
@@ -198,3 +200,26 @@ async def check_connection_event_paging(store: Any, tag: str) -> None:
     assert await store.connection_event_extent(
         connection=f"IB_{tag}_none", since=since, allowed_channels=None
     ) == (0, 0)
+
+
+async def check_keyed_audit_evidence(store: Any, tag: str) -> None:
+    """``newest_keyed_audit_row`` (vault BACKLOG #3750 item 33): the newest matching row above the
+    watermark, read back only when the store holds an audit key. Matched on action and actor
+    exactly, and never a row at or below ``after_seq``. On a keyless store it is always ``None``,
+    because a keyless row's hash is one anyone who can write the table can recompute."""
+    who = f"e3750-{tag}"
+    action = "auth.ad_session_revoked"
+    keyed = audit_active_key_id(store._audit_mac_key, store._audit_mac_fn) is not None
+    before, _ = await store.audit_anchor()
+    assert await store.newest_keyed_audit_row(action, actor=who, after_seq=before) is None
+    await store.record_audit(action, actor=who, detail='{"reason": "r"}')
+    await store.record_audit(action, actor=f"{who}-other", detail=None)
+    row = await store.newest_keyed_audit_row(action, actor=who, after_seq=before)
+    if not keyed:
+        assert row is None
+        return
+    assert row is not None and row["actor"] == who and row["action"] == action
+    assert int(row["seq"]) > before and json.loads(row["detail"]) == {"reason": "r"}
+    assert await store.newest_keyed_audit_row(action, actor=who.upper(), after_seq=before) is None
+    after, _ = await store.audit_anchor()
+    assert await store.newest_keyed_audit_row(action, actor=who, after_seq=after) is None
