@@ -370,7 +370,7 @@ host, before the first start:
 
 ```powershell
 messagefoundry provision-admin --username <name> --email <address>
-messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-config-repo
+python -P -X disable-remote-debug -m messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-config-repo
 ```
 
 At the shipped posture, once the earlier start checks pass (the store key and `[alerts]` among

@@ -3,7 +3,7 @@
 """Harness REMOTEFILE graph: an SFTP inbound polling the harness share and an SFTP outbound writing
 back to it.
 
-Served on its own -- ``python -m messagefoundry serve --config harness/config/remotefile --env dev`` --
+Served on its own -- ``python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/remotefile --env dev`` --
 and NOT by ``serve --config harness/config``, which reads only top-level modules. It lives apart because
 it cannot load without ``MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD`` (the password has no default, so no
 credential sits in source), and because its inbound polls a share that exists only while a remotefile
