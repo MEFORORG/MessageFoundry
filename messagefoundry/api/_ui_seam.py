@@ -506,7 +506,8 @@ from typing import Any
 #: the field additive; the pinned digest still refuses a skewed pair at mount.
 #:
 #: Vault BACKLOG #2954 (and #2956, which builds on it) merged with main after the #3189 / #3031
-#: entries above landed there (main at da529979e55cb966). #2956 moves no seam field itself.
+#: entries above landed there (main at 440d71aaf, seam digest da529979e55cb966). #2956 moves no
+#: seam field itself.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
