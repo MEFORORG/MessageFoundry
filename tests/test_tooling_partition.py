@@ -76,6 +76,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Reads tests/conftest.py and packaging/messagefoundry-webconsole/tests/{conftest,
+        # _ui_clients}.py off disk, the two copies of the in-process browser stand-in that every
+        # /ui write test in both suites runs through (vault BACKLOG #3316). No messagefoundry/**
+        # file, but its subject is how the engine and console suites measure the /ui origin
+        # check, and a drift arrives as a test diff on the engine or console side that the
+        # tooling job's path gate would not see. Ambiguous, so it stays.
+        "test_browser_standin_copies_agree.py",
         # Reads messagefoundry/config/ai_policy.py, messagefoundry/anon/__init__.py and
         # harness/load/corpus.py off disk (BACKLOG #2996). It fails when the ai_policy or corpus
         # docstring calls the anonymizer's output PHI-free again. Its anon/__init__.py arm is about

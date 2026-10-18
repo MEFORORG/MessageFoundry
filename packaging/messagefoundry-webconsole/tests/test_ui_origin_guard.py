@@ -26,7 +26,12 @@ from typing import Any
 
 import httpx
 import pytest
-from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen
+from _ui_clients import (
+    HEADERLESS_UI_REQUEST,
+    create_local_user_chosen,
+    fetch_metadata_answer,
+    origin_check_request,
+)
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
@@ -186,14 +191,9 @@ async def test_a_write_with_an_unrecognised_sec_fetch_site_fails_closed(
 def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
     """The HTTP layer may trim a header value before the route sees it, so the padded cases are
     also put to ``assert_same_origin`` directly, where nothing trims them."""
-    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
 
     def request(method: str, value: str) -> Any:
-        return SimpleNamespace(
-            method=method,
-            headers=Headers({"sec-fetch-site": value, "host": "t"}),
-            app=SimpleNamespace(state=state),
-        )
+        return origin_check_request(method, {"sec-fetch-site": value, "host": "t"})
 
     for value in (" same-origin", "same-origin ", "\tnone", "Same-Origin", "x"):
         with pytest.raises(HTTPException) as refused:
@@ -222,14 +222,9 @@ def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() 
 
     Controls: the same foreign ``Origin`` with NO ``Sec-Fetch-Site`` line is refused on a GET, and
     the same headers on a POST are refused, so the passes are this rule and not a dead check."""
-    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
 
     def request(method: str, headers: dict[str, str]) -> Any:
-        return SimpleNamespace(
-            method=method,
-            headers=Headers({"host": "t", "origin": EVIL_ORIGIN, **headers}),
-            app=SimpleNamespace(state=state),
-        )
+        return origin_check_request(method, {"host": "t", "origin": EVIL_ORIGIN, **headers})
 
     # Which branch refuses the POST differs: an empty line is absence, so Origin decides; an
     # unknown value is refused before Origin is read.
@@ -289,12 +284,8 @@ def _verdict(method: str, site: str | None, origin: str | None) -> str:
         headers["sec-fetch-site"] = site
     if origin is not None:
         headers["origin"] = origin
-    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
-    request: Any = SimpleNamespace(
-        method=method, headers=Headers(headers), app=SimpleNamespace(state=state)
-    )
     try:
-        webconsole_auth.assert_same_origin(request)
+        webconsole_auth.assert_same_origin(origin_check_request(method, headers))
     except HTTPException as refused:
         assert refused.status_code == 403, (method, site, origin, refused.status_code)
         return "refuse"
@@ -302,8 +293,9 @@ def _verdict(method: str, site: str | None, origin: str | None) -> str:
 
 
 def test_the_docstring_rule_table_is_what_the_function_does() -> None:
-    """The docstring of ``assert_same_origin`` is the ONE complete statement of the /ui origin
-    rule, and every other document points at it. Hand-written copies of that rule disagreed with
+    """The docstring of ``assert_same_origin`` is the one statement of the /ui origin rule for one
+    line of each header, and every other document points at it. The docstring also names what the
+    table does not cover, so "complete" would claim more than it holds. Hand-written copies of that rule disagreed with
     the code three times on this branch. So the table is read out of the docstring and the function
     is driven over every row, with several concrete header values per state.
 
@@ -353,19 +345,99 @@ def test_a_post_with_origin_null_and_no_sec_fetch_site_is_refused() -> None:
     """``docs/BROWSER-SUPPORT.md`` leans on this: a browser that sends ``Origin: null`` on its form
     POST and no ``Sec-Fetch-Site`` is refused as a mismatch, by the Origin branch and not by the
     neither-header one. The control is the same POST with a matching ``Origin``."""
-    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
 
     def request(origin: str) -> Any:
-        return SimpleNamespace(
-            method="POST",
-            headers=Headers({"host": "t", "origin": origin}),
-            app=SimpleNamespace(state=state),
-        )
+        return origin_check_request("POST", {"host": "t", "origin": origin})
 
     with pytest.raises(HTTPException) as refused:
         webconsole_auth.assert_same_origin(request("null"))
     assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN)
     webconsole_auth.assert_same_origin(request("http://t"))
+
+
+# --- repeated Sec-Fetch-Site lines: the function and the middleware agree (BACKLOG #3316) ----------
+
+_CONFLICTING = "conflicting Sec-Fetch-Site lines rejected"
+
+#: Two lines with different values, each order. A browser sends one line; the second order is the
+#: one the middleware used to wave through (it kept the last line) while the function read the first.
+_DISAGREEING = (("cross-site", "same-origin"), ("same-origin", "cross-site"), ("", "none"))
+
+
+async def _middleware_answer(method: str, lines: tuple[str, ...]) -> tuple[int, bytes]:
+    """Put ``lines`` as repeated ``Sec-Fetch-Site`` headers through the fetch-metadata middleware."""
+    return await fetch_metadata_answer(method, [("sec-fetch-site", line) for line in lines])
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_disagreeing_sec_fetch_site_lines_are_refused_by_both_checks(method: str) -> None:
+    """The function used to read the FIRST line and the middleware the LAST, so the two could judge
+    different values of one request. Lines that disagree are now refused by both, on any method and
+    in either order, with the same reason, so neither can be shown a value the other did not see.
+
+    Controls: the same two values as ONE line each are judged on that value, so the refusal is the
+    disagreement and not either value."""
+    for lines in _DISAGREEING:
+        request = origin_check_request(
+            method, [("host", "t"), *(("sec-fetch-site", v) for v in lines)]
+        )
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_same_origin(request)
+        assert (refused.value.status_code, refused.value.detail) == (403, _CONFLICTING), lines
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_not_cross_site(request)
+        assert (refused.value.status_code, refused.value.detail) == (403, _CONFLICTING), lines
+        assert await _middleware_answer(method, lines) == (403, _CONFLICTING.encode()), lines
+    # control: one line of the accepted value passes all three
+    single = origin_check_request(method, {"host": "t", "sec-fetch-site": "same-origin"})
+    webconsole_auth.assert_same_origin(single)
+    webconsole_auth.assert_not_cross_site(single)
+    assert await _middleware_answer(method, ("same-origin",)) == (200, b"inner")
+
+
+@pytest.mark.parametrize("value", ["same-origin", "none", "cross-site"])
+async def test_repeated_sec_fetch_site_lines_with_one_value_are_that_value(value: str) -> None:
+    """Only DISAGREEMENT is refused. Two lines carrying one value are judged as that value by both
+    checks, so a proxy that repeats the line as a second line changes nothing. One that folds the
+    lines into a single comma-joined value sends one value, judged like any other."""
+    twice = origin_check_request(
+        "POST", [("host", "t"), ("sec-fetch-site", value), ("sec-fetch-site", value)]
+    )
+    once = origin_check_request("POST", {"host": "t", "sec-fetch-site": value})
+
+    def verdict(request: Any) -> tuple[int, str] | None:
+        try:
+            webconsole_auth.assert_same_origin(request)
+        except HTTPException as refused:
+            return refused.status_code, str(refused.detail)
+        return None
+
+    assert verdict(twice) == verdict(once), value
+    assert await _middleware_answer("POST", (value, value)) == await _middleware_answer(
+        "POST", (value,)
+    )
+
+
+async def test_a_sign_in_post_with_disagreeing_sec_fetch_site_lines_is_refused(
+    engine: Engine,
+) -> None:
+    """Over HTTP, through the mounted console: refused, and nothing is minted. The middleware
+    answers first (plain text), so the route's own refusal is not reached here; the direct calls
+    in the test above cover it. The control is the same POST with the two lines agreeing, which
+    signs in."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        for lines in _DISAGREEING:
+            headers = [("Sec-Fetch-Site", v) for v in lines]
+            r = await c.post("/ui/login", data=_creds(), headers=headers)
+            assert r.status_code == 403, (lines, r.status_code)
+            assert _CONFLICTING in r.text, (lines, r.text)
+            assert r.headers["content-type"].startswith("text/plain"), (lines, r.headers)
+            assert "set-cookie" not in {k.lower() for k in r.headers}
+        same = [("Sec-Fetch-Site", "same-origin"), ("Sec-Fetch-Site", "same-origin")]
+        ok = await c.post("/ui/login", data=_creds(), headers=same)
+        assert ok.status_code == 303
 
 
 async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(

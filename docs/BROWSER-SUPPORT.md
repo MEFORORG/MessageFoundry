@@ -122,7 +122,7 @@ unchecked by that rule.
 
 | Header | What the server does with it | When the browser does not send it |
 |---|---|---|
-| `Sec-Fetch-Site` | On every `/ui` request, static files included, a value of `cross-site` or `same-site` is refused with a 403. The one exception is a safe top-level navigation, defined by the next three rows. Every state-changing `/ui` POST refuses those two values again, and refuses any other non-empty value that is not exactly `same-origin` or `none`. Only those two let the POST through on this header alone. The complete rule is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which a test drives row by row. | **Allowed** by the middleware, which passes the request. A page read then rests on the `SameSite=Strict` session cookie. A state-changing POST does not get through on this alone: the `Origin` check below takes over, and it refuses a POST that carries neither header. |
+| `Sec-Fetch-Site` | On every `/ui` request, static files included, a value of `cross-site` or `same-site` is refused with a 403. The one exception is a safe top-level navigation, defined by the next three rows. Lines that carry different values are refused with a 403 on every `/ui` request, with no exception; a browser sends one line. Every state-changing `/ui` POST refuses those two values again, and refuses any other non-empty value that is not exactly `same-origin` or `none`. Only those two let the POST through on this header alone. The rule for one line of each header, by method, is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which a test drives row by row and which also names what the table does not cover. | **Allowed** by the middleware, which passes the request. A page read then rests on the `SameSite=Strict` session cookie. A state-changing POST does not get through on this alone: the `Origin` check below takes over, and it refuses a POST that carries neither header. |
 | `Sec-Fetch-Mode` | A `cross-site` or `same-site` request passes only as a `navigate` GET or HEAD. The Kerberos and OIDC sign-in routes also reject, and audit, any mode other than `navigate`. | **Refused** by the middleware, which reads it only after `Sec-Fetch-Site` said `cross-site` or `same-site`. The sign-in routes allow a request without it. |
 | `Sec-Fetch-Dest` | That navigation must be for a `document`. This refuses cross-site framing before anything is served. | **Refused**, and read only after `Sec-Fetch-Site` said `cross-site` or `same-site`. |
 | `Sec-Fetch-User` | A `same-site` navigation must carry `?1`, meaning the user started it with a click or a key. A `cross-site` one is not asked for it, so an identity provider's redirect back to the console still works. | **Refused**, and read only for a `same-site` navigation. |
@@ -147,11 +147,19 @@ In both cases the console falls back to the engine's static `script-src 'self'` 
 `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy` and `Reporting-Endpoints`. The passkey
 line still appears, because it lives in the console's main script, which that policy still runs.
 
-**In these two configurations those three absences have none of the three answers.** The page does
-not warn, the server does not refuse, and no other control tells you that the browser ignores CSP or
-runs no script. The server-side controls in the tables above still hold. The first configuration is a choice you
-make by setting the variable. The second cannot be reached through `messagefoundry serve`, and
-nothing else covers it.
+**In these two configurations the page does not warn about those three absences.** The server does
+not refuse, and nothing on the page tells you that the browser ignores CSP or runs no script. The
+server-side controls in the tables above still hold. What each configuration does have:
+
+- The first is a choice you make by setting the variable, and `messagefoundry serve` warns about it.
+  At startup it prints a `warning:` line to standard error naming the variable and saying that the
+  nonce CSP, COOP and CSP reporting are not emitted for that run. That line does not name the three
+  banners: losing the nonce CSP is what removes them. Under the Windows service the line lands in its
+  stderr log (`service.err.log`, see [SERVICE.md](SERVICE.md)). It is a warning and nothing more. It
+  does not stop the console from starting, and it does not bring the banners back.
+- The second cannot be reached through `messagefoundry serve`, and nothing covers it, not even a
+  warning. Only code that builds the engine's app itself reaches it, and that code chose its own
+  transport.
 
 The cookies differ between the two cases:
 
