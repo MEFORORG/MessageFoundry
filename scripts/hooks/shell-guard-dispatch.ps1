@@ -102,11 +102,14 @@ function Write-ShellGuardFailure([string]$Path, [string]$Why) {
 
 $ShellGuardHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $ShellGuardAccount = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $ShellGuardHome '.claude' }
-$ShellGuardProofDir = Join-Path $ShellGuardAccount 'shell-guard-proof'
+$ShellGuardProofDir = [System.IO.Path]::Combine($ShellGuardAccount, 'shell-guard-proof')
 # The same patterns the account's bash entry uses, so both name the same files; a payload they read
 # differently only costs the entry its wait.
 $ShellGuardSession = if ($ShellGuardPayload -cmatch '"session_id"\s*:\s*"(?<v>[A-Za-z0-9-]{1,100})"') { $Matches['v'] } else { $null }
-$ShellGuardCall = if ($ShellGuardPayload -cmatch '"tool_use_id"\s*:\s*"(?<v>[A-Za-z0-9_-]{1,100})"') { $Matches['v'] } else { $null }
+# tool_use_id from the key's LAST occurrence, as the entry reads it.
+$ShellGuardAt = $ShellGuardPayload.LastIndexOf('"tool_use_id"', [System.StringComparison]::Ordinal)
+$ShellGuardCall = if ($ShellGuardAt -ge 0 -and
+    $ShellGuardPayload.Substring($ShellGuardAt + 13) -cmatch '^\s*:\s*"(?<v>[A-Za-z0-9_-]{1,100})"') { $Matches['v'] } else { $null }
 # Scoping is dynamic, so a guard reading $Matches before its own first match would see ours.
 $Matches = $null
 
@@ -114,7 +117,7 @@ function Write-ShellGuardProof([string]$Kind) {
     # Kind 'ok' stands the account's entry down for this call; 'run' tells it to run the gate now.
     if (-not $ShellGuardSession -or -not $ShellGuardCall) { return }
     try {
-        $final = Join-Path $ShellGuardProofDir "$ShellGuardCall.$Kind"
+        $final = [System.IO.Path]::Combine($ShellGuardProofDir, "$ShellGuardCall.$Kind")
         $part = "$final.$PID.tmp"
         # Written whole, then renamed, so the entry never reads a half-written proof.
         [System.IO.File]::WriteAllText($part, "$ShellGuardSession`n")
@@ -129,16 +132,16 @@ function Clear-ShellGuardProofs {
     # Every call leaves files behind, so prune at most every 10 minutes: proofs and waits older
     # than that, and session hints older than 30 days. A session older than that only waits.
     try {
-        $stamp = Join-Path $ShellGuardProofDir 'pruned'
+        $stamp = [System.IO.Path]::Combine($ShellGuardProofDir, 'pruned')
         $calls = [DateTime]::UtcNow.AddMinutes(-10)
         # A missing stamp reads as 1601, so it prunes.
         if ([System.IO.File]::GetLastWriteTimeUtc($stamp) -gt $calls) { return }
         [System.IO.File]::WriteAllText($stamp, '')
         $sessions = [DateTime]::UtcNow.AddDays(-30)
-        foreach ($f in [System.IO.Directory]::GetFiles($ShellGuardProofDir)) {
-            $cutoff = if ($f.EndsWith('.session')) { $sessions } else { $calls }
-            if ([System.IO.File]::GetLastWriteTimeUtc($f) -lt $cutoff) {
-                try { [System.IO.File]::Delete($f) } catch { $null = $_ }
+        foreach ($f in [System.IO.DirectoryInfo]::new($ShellGuardProofDir).EnumerateFiles()) {
+            $cutoff = if ($f.Name.EndsWith('.session')) { $sessions } else { $calls }
+            if ($f.LastWriteTimeUtc -lt $cutoff) {
+                try { $f.Delete() } catch { $null = $_ }
             }
         }
     } catch {
@@ -154,17 +157,17 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
     $ShellGuardProof = $null
     if ($ShellGuardPath -ceq '--user-hook=worktree_gate') {
         $ShellGuardPath = Join-Path $ShellGuardHome '.claude/hooks/worktree_gate.ps1'
-        $ShellGuardHint = if ($ShellGuardSession) { Join-Path $ShellGuardProofDir "$ShellGuardSession.session" } else { $null }
+        $ShellGuardHint = if ($ShellGuardSession) { [System.IO.Path]::Combine($ShellGuardProofDir, "$ShellGuardSession.session") } else { $null }
         $ShellGuardDelegated = $false
         try {
-            $ShellGuardDelegated = [System.IO.File]::ReadAllText((Join-Path $ShellGuardAccount 'settings.json')).Contains('shell-guard-proof')
+            $ShellGuardDelegated = [System.IO.File]::ReadAllText([System.IO.Path]::Combine($ShellGuardAccount, 'settings.json')).Contains('shell-guard-proof')
         } catch {
             # No readable account settings: nothing delegates, so the gate is not this run's.
             $null = $_
         }
         if (-not $ShellGuardDelegated) {
             # An entry still waiting on this session's hint is told to stop waiting.
-            if ($ShellGuardHint -and (Test-Path -LiteralPath $ShellGuardHint)) {
+            if ($ShellGuardHint -and [System.IO.File]::Exists($ShellGuardHint)) {
                 Write-ShellGuardProof 'run'
                 try { [System.IO.File]::Delete($ShellGuardHint) } catch { $null = $_ }
             }
@@ -174,8 +177,7 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         if ($ShellGuardHint) {
             try {
                 $null = [System.IO.Directory]::CreateDirectory($ShellGuardProofDir)
-                if (-not (Test-Path -LiteralPath $ShellGuardHint)) { [System.IO.File]::WriteAllText($ShellGuardHint, '') }
-                Clear-ShellGuardProofs
+                if (-not [System.IO.File]::Exists($ShellGuardHint)) { [System.IO.File]::WriteAllText($ShellGuardHint, '') }
             } catch {
                 [Console]::Error.WriteLine("shell-guard-dispatch: could not record the session hint: $($_.Exception.Message)")
             }
@@ -216,7 +218,11 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         if ($ShellGuardProof -and -not $ShellGuardOutput) { $ShellGuardProof = 'ok' }
     } finally {
         # Every way out of the gate's run -- continue, exit 2, a throw -- writes its proof first.
-        if ($ShellGuardProof) { Write-ShellGuardProof $ShellGuardProof }
+        if ($ShellGuardProof) {
+            Write-ShellGuardProof $ShellGuardProof
+            # After the proof, so pruning never delays the entry that is waiting on it.
+            Clear-ShellGuardProofs
+        }
     }
     if (-not $ShellGuardOutput.Trim()) { continue }
     $ShellGuardVerdict = $null

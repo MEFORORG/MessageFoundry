@@ -1187,20 +1187,25 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 #
 # COST, measured 2026-10-17 on mefordev01; the PR that added this records the instrument and numbers.
 # The wait reads with `read -t` on a pseudo-terminal nobody writes to, which sleeps without starting
-# a process; where /dev/ptmx cannot be opened, the entry runs the gate at once.
+# a process; where /dev/ptmx cannot be opened, the entry runs the gate at once. `read -N` because
+# with -d bash reads one byte per syscall (about 2 ms per KB here). tool_use_id is found from the
+# LAST occurrence of its key with `##`, because a regex scan to it from the start of the payload cost
+# about 1 ms per KB; the dispatcher reads the same occurrence. JSON escapes the quotes inside a
+# command, so a command cannot spell the key.
 # Single-quoted in bash below, so a quote in the profile path is closed, escaped and reopened.
 $gateForBash = $GateDst.Replace('\', '/').Replace("'", "'\''")
 $shellEntry = @'
 # worktree_gate.ps1 for shell tool calls: stands down only on this call's shell-guard-proof.
 # scripts/worktree/install-gate.ps1 says why each check is here.
 g='__GATE__'
-IFS= read -r -d '' in
+IFS= read -r -N 2147483647 in
 d=${CLAUDE_CONFIG_DIR:-$USERPROFILE/.claude}/shell-guard-proof
 if [[ $in =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]{1,100})\" ]]; then
   s=${BASH_REMATCH[1]}
-  if [[ -e $d/$s.session && $in =~ \"tool_use_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]{1,100})\" ]]; then
+  r=${in##*\"tool_use_id\"}
+  if [[ -e $d/$s.session && $r != "$in" && $r =~ ^[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]{1,100})\" ]]; then
     t=${BASH_REMATCH[1]} ps=
-    { IFS= read -r -d '' ps < "$CLAUDE_PROJECT_DIR/.claude/settings.json"; } 2>/dev/null
+    { IFS= read -r -N 2147483647 ps < "$CLAUDE_PROJECT_DIR/.claude/settings.json"; } 2>/dev/null
     if [[ $ps == *--user-hook=worktree_gate* ]] && { : > "$d/$t.wait" && exec {w}<>/dev/ptmx; } 2>/dev/null; then
       e=$(( ${EPOCHREALTIME//[!0-9]/} + 20000000 ))
       for (( i = 0; i < 400; i++ )); do

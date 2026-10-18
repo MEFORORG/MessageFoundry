@@ -14,6 +14,7 @@ first deny winning, and that one guard's scope, failure or absence cannot change
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -550,17 +551,40 @@ def _installed_shell_entry(tmp_path: Path, gate_dst: Path) -> dict[str, Any]:
     return entry
 
 
-class _Entry:
-    """The installed entry, run through bash -c the way a shell-form hook runs."""
+# The entry is built once, for a placeholder gate path each test swaps for its own, and bash is
+# resolved once: each costs a pwsh start or several bash probes.
+_GATE_PLACEHOLDER = "C:/mefor-test-gate-placeholder/worktree_gate.ps1"
+_WAIT = "+ 20000000 ))"
 
-    def __init__(self, tmp_path: Path, world: _World) -> None:
+
+@functools.cache
+def _entry_command() -> str:
+    command = str(
+        _installed_shell_entry(Path(tempfile.mkdtemp()), Path(_GATE_PLACEHOLDER))["command"]
+    )
+    assert command.count(_GATE_PLACEHOLDER) == 1 and command.count(_WAIT) == 1, command
+    return command
+
+
+@functools.cache
+def _bash() -> str:
+    return require_bash(Path(tempfile.mkdtemp()))
+
+
+class _Entry:
+    """The installed entry, run through bash -c the way a shell-form hook runs. `wait_us` replaces
+    its 20 s wait, so a test of the wait running out does not spend the whole 20 s."""
+
+    def __init__(self, world: _World, wait_us: int | None = None) -> None:
         self.world = world
-        self.hook = _installed_shell_entry(tmp_path, world.gate)
-        self.shell = require_bash(tmp_path)
+        self.command = _entry_command().replace(_GATE_PLACEHOLDER, world.gate.as_posix())
+        if wait_us is not None:
+            self.command = self.command.replace(_WAIT, f"+ {wait_us} ))")
+        self.shell = _bash()
 
     def start(self) -> subprocess.Popen[str]:
         proc = subprocess.Popen(
-            [self.shell, "-c", self.hook["command"]],
+            [self.shell, "-c", self.command],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -602,11 +626,13 @@ def test_the_installed_shell_entry_is_bash_and_blocks_on_its_own_failure(tmp_pat
     # Measured 2026-10-17: a bash started without Git's /usr/bin on PATH ran Windows' timeout.exe
     # for a bare `timeout`, which exits 1 without running the gate. The hook's timeout bounds it.
     assert "timeout " not in hook["command"]
+    # The wait the tests shorten: 20 s by the clock, and at most 400 polls of 0.05 s.
+    assert _WAIT in hook["command"] and "i < 400" in hook["command"]
 
 
 def test_an_unhinted_session_runs_the_gate_at_once(tmp_path: Path) -> None:
     world = _World(tmp_path, gate=_GATE_DENIES)
-    done, took = _Entry(tmp_path, world).run()
+    done, took = _Entry(world).run()
     assert done.returncode == 0, done.stderr
     assert assert_denied(_decision(done.stdout)) == "installed gate"
     assert world.runs() == 1
@@ -619,7 +645,7 @@ def test_the_entry_stands_down_on_this_call_s_proof_and_the_gate_runs_once(
     """The whole design, end to end: the entry and the real dispatcher start together, as Claude
     Code starts them, and the gate runs once -- in the dispatcher -- for an allowed call."""
     world = _World(tmp_path)
-    entry = _Entry(tmp_path, world)
+    entry = _Entry(world)
     _hinted(world)
     with spawn_burst("test_shell_guard_dispatch entry and dispatcher"):
         waiting = entry.start()
@@ -632,7 +658,7 @@ def test_the_entry_stands_down_on_this_call_s_proof_and_the_gate_runs_once(
 
 def test_a_deny_in_the_dispatcher_is_repeated_by_the_entry_without_a_wait(tmp_path: Path) -> None:
     world = _World(tmp_path, gate=_GATE_DENIES)
-    entry = _Entry(tmp_path, world)
+    entry = _Entry(world)
     _hinted(world)
     with spawn_burst("test_shell_guard_dispatch entry and dispatcher, deny"):
         waiting = entry.start()
@@ -653,7 +679,7 @@ def test_a_proof_older_than_the_wait_is_not_this_call_s(tmp_path: Path) -> None:
     world.proof("ok").write_text(_SID + "\n", encoding="utf-8")
     old = time.time() - 5
     os.utime(world.proof("ok"), (old, old))
-    done, took = _Entry(tmp_path, world).run()
+    done, took = _Entry(world).run()
     assert assert_denied(_decision(done.stdout)) == "installed gate"
     assert world.runs() == 1
     assert took < 15, took
@@ -661,7 +687,7 @@ def test_a_proof_older_than_the_wait_is_not_this_call_s(tmp_path: Path) -> None:
 
 def test_a_proof_for_another_session_is_not_this_call_s(tmp_path: Path) -> None:
     world = _World(tmp_path, gate=_GATE_DENIES)
-    entry = _Entry(tmp_path, world)
+    entry = _Entry(world)
     _hinted(world)
     with single_spawn():
         waiting = entry.start()
@@ -681,7 +707,7 @@ def test_a_project_that_does_not_wire_the_gate_costs_no_wait(tmp_path: Path) -> 
     world = _World(tmp_path, gate=_GATE_DENIES)
     _hinted(world)
     world.project_settings("--something-else")
-    done, took = _Entry(tmp_path, world).run()
+    done, took = _Entry(world).run()
     assert assert_denied(_decision(done.stdout)) == "installed gate"
     assert took < 15, took
     assert not world.proof("wait").exists()
@@ -691,10 +717,11 @@ def test_with_no_answer_the_wait_ends_and_the_gate_runs(tmp_path: Path) -> None:
     """A hinted session whose dispatcher never answers: a missing, broken or slow replacement."""
     world = _World(tmp_path, gate=_GATE_DENIES)
     _hinted(world)
-    done, took = _Entry(tmp_path, world).run()
+    done, took = _Entry(world, wait_us=2_000_000).run()
     assert assert_denied(_decision(done.stdout)) == "installed gate", done.stderr
     assert world.runs() == 1
-    assert 19 < took < 55, took
+    assert world.proof("wait").exists(), "the entry did wait"
+    assert 1.9 < took < 40, took
 
 
 @pytest.mark.parametrize(
@@ -712,7 +739,7 @@ def test_the_gate_s_own_exit_keeps_its_old_meaning(
     """onFailure=block covers the entry, not the gate: a gate that crashes still fails open, now
     with a message, and its blocking exit still blocks."""
     world = _World(tmp_path, gate=gate)
-    done, _ = _Entry(tmp_path, world).run()
+    done, _ = _Entry(world).run()
     assert done.returncode == code, (done.returncode, done.stdout, done.stderr)
     if message is None:
         assert "gate blocks" in done.stderr
