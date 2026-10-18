@@ -72,7 +72,7 @@ async def _service(
     engine: Engine, *users: tuple[str, Role], per_actor: int = 120, step_up_max_age: int = 300
 ) -> AuthService:
     # per_actor mirrors AuthSettings' default (120); pass a smaller value to exercise the per-actor
-    # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
+    # PHI-read budget in a single test (see test_webui_edit.py test_edit_editor_charges_the_phi_read_budget).
     # step_up_max_age mirrors AuthSettings' default (300); pass -1 to make every step-up window stale
     # on arrival, the idiom the rest of the console suite uses to exercise the /ui/reauth bounce.
     # The resend's action-bound proof (vault BACKLOG #2625) is pinned in test_ui_bound_step_up.py;
@@ -568,7 +568,7 @@ async def test_a_stale_window_strips_a_flag_aimed_at_the_detail_page(
     # property of the DETAIL page, which is unaffected by that change, so it keeps the stale window.
     #
     # step_up_max_age_seconds=-1 is the console suite's idiom for a window that is stale on arrival
-    # (test_webui.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
+    # (test_webui_users.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
     service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
     fid = await _upload_through_a_fresh_window(engine, tmp_path, "op")
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
@@ -1054,7 +1054,7 @@ async def test_reauth_unlocks_the_upload_form(engine: Engine, tmp_path: Path) ->
     ``test_write_action_method_matches_its_continuation`` asserts INSIDE a ``fullmatch`` guard, so a
     pattern matching no route passes it vacuously.
 
-    Modelled on ``test_webui.py::test_reauth_unlocks_real_user_form``, the same arm for /ui/users/new.
+    Modelled on ``test_webui_users.py::test_reauth_unlocks_real_user_form``, the same arm for /ui/users/new.
     """
     service = await _service(engine, ("op", Role.OPERATOR))
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))

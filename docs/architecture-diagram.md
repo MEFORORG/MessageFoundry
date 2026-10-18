@@ -163,7 +163,8 @@ and gates.
 
 Three shipped pieces are not drawn: the Windows tray service-manager
 ([`messagefoundry/tray/`](../messagefoundry/tray/)), the `mefor-net-helper` network helper
-([`net-helper/`](../net-helper/)) and the container image ([`docker/`](../docker/)).
+([`net-helper/`](../net-helper/)) and the container image ([`docker/`](../docker/)), which is
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 
 ---
 

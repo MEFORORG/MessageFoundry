@@ -548,8 +548,9 @@ seconds.
 
 ### The hook's run time is bounded by a length cap
 
-`.claude/settings.json` gives the hook 15 seconds, and a hook that runs longer lets the command
-run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
+The guard runs first in the one shell handler in `.claude/settings.json`, through
+`scripts/hooks/shell-guard-dispatch.ps1`, whose timeout is 15 seconds for each of the three guards
+it runs. A hook that runs longer lets the command run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
 paths matter, and three rounds of repair on the wiring change each closed one and found or opened
 another. **This page does not claim that no slow path is left.** The bound on run time is a cap
 on length instead.
@@ -659,8 +660,9 @@ newline, `EOF`, newline, `git add -A`; `echo $[1<<n]`, newline, `git add -A`; an
 reading the command from a script file. `bash -c` on Windows drops one of two backslashes from its
 argument, which changes the escaped-backslash row.
 
-**The hook's time limit is a residual too.** `.claude/settings.json` gives the hook 15 seconds,
-and a hook that runs longer lets the command run, whatever the guard would have decided. The
+**The hook's time limit is a residual too.** The handler this guard runs in has a timeout, 15
+seconds for each guard it runs (section 4a), and a hook that runs longer lets the command run,
+whatever the guard would have decided. The
 length cap in section 4a is what bounds the run time: a command past it is refused unread. Under
 the cap, every payload family measured for section 4a finished well inside the limit. A slow
 machine, or a payload shape nobody has measured, could still take longer. This page does not claim

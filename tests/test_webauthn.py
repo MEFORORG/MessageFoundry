@@ -639,6 +639,60 @@ async def test_an_account_deleted_mid_enrolment_is_not_reported_as_a_label_clash
         await store.close()
 
 
+@pytest.mark.parametrize("other_account", [False, True], ids=["same-account", "other-account"])
+async def test_a_shared_authenticator_racing_an_enrolment_is_not_a_label_clash(
+    monkeypatch: pytest.MonkeyPatch, other_account: bool
+) -> None:
+    # BACKLOG #2733: the same authenticator enrolled concurrently passes the service's pre-check
+    # twice, and the credential-id primary key refuses the second insert. That used to be answered
+    # "label already in use" though the two labels differ. The racing enrolment may be this
+    # account's own other tab, or another account presenting the same authenticator.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        racer = identity.user_id
+        if other_account:
+            racer = "racer-account"
+            await store.create_user(
+                user_id=racer,
+                username="racer",
+                auth_provider="local",
+                password_hash="h",
+                now=1.0,
+                password_generated=False,
+            )
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.add_webauthn_credential
+
+        async def raced(cred: WebAuthnCredential) -> None:
+            await original(dataclasses.replace(cred, user_id=racer, label="the other tab"))
+            await original(cred)
+
+        monkeypatch.setattr(store, "add_webauthn_credential", raced)
+        with pytest.raises(ValueError, match="this passkey is already enrolled") as raised:
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="mykey",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        # The refusal really was the store's primary key, not the service's pre-check.
+        assert "UNIQUE constraint failed: webauthn_credentials.credential_id_hash" in str(
+            raised.value.__cause__
+        )
+    finally:
+        await store.close()
+
+
 async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:

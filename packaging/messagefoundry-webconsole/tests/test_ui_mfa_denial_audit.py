@@ -208,7 +208,7 @@ async def test_the_console_uses_the_engines_own_action_name(engine: Engine, path
 #
 # A NULL client on an audit row asserts "no client was in scope" (docs/PHI.md section 6), and these
 # rows are only ever written FROM a request. The engine's gates stamp the address since PR 1303; the
-# two below pin the console's HTTP gate. Its WebSocket twin is pinned in test_webui.py.
+# two below pin the console's HTTP gate. Its WebSocket twin is pinned in test_webui_ws.py.
 
 
 async def test_the_mfa_denial_row_carries_the_client_address(engine: Engine) -> None:

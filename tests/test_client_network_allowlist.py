@@ -322,6 +322,20 @@ def test_broad_trusted_proxies_refused_once_the_allowlist_is_in_use() -> None:
     ServiceSettings(api=_proxied(["10.0.0.0/8"]))
 
 
+def test_a_mapped_trusted_proxy_meets_the_single_host_rule_as_its_ipv4_form() -> None:
+    """BACKLOG #3042: a mapped entry loads and trusts the IPv4 hosts it names, so under the
+    allow-list it is held to the same rule: a mapped host loads, a mapped range is refused."""
+    with pytest.raises(ValueError, match="single host"):
+        ServiceSettings(
+            security=SecuritySettings(allowed_client_networks=WARD),
+            api=_proxied(["::ffff:10.0.0.0/120"]),
+        )
+    ServiceSettings(
+        security=SecuritySettings(allowed_client_networks=WARD),
+        api=_proxied(["::ffff:10.0.0.1/128", "::ffff:10.0.0.2"]),
+    )
+
+
 # --- HTTP enforcement ----------------------------------------------------------------------------
 
 

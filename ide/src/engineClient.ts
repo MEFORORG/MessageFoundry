@@ -6,6 +6,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 
+import { serveCommandLine } from "./engineControlModel";
 import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
 
 /**
@@ -226,7 +227,7 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
   }
   if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
     return new NetworkError(
-      `engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`,
+      `engine not reachable at ${baseUrl} — if it runs on this machine, start it (the status pill, or \`${serveCommandLine("<configDir>")}\`).`,
       err.code,
     );
   }

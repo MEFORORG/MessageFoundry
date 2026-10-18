@@ -2538,7 +2538,7 @@ class PostgresStore:
         ``_fetchall``/``_fetchone``/``_execute`` convenience trio, which were routed through here for
         exactly that reason — they called ``self._pool.fetch(...)``, which acquires inside asyncpg with
         no timeout, so leaving them outside would have left the class open while looking closed. It is
-        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._acquire``,
+        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._borrow``,
         which is that backend's sole borrow site,
         this is not yet a single chokepoint — do not describe it as one, and check
         ``tests/test_store_pool_acquire_timeout.py`` (which pins the set of borrows that bypass it)
@@ -9097,10 +9097,12 @@ class PostgresStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
-        material, not a secret — excluded from the store cipher). A duplicate ``(user_id, label)``
-        raises asyncpg's UniqueViolationError — the caller renders it as the same "label already in
-        use" error as its pre-check (the concurrent-enroll race, ADR 0068 §4). The account is
-        re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        material, not a secret — excluded from the store cipher). asyncpg raises
+        UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
+        and ForeignKeyViolationError for an account that does not exist; the caller tells them
+        apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
+        BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
+        transaction (BACKLOG #2592)."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)
