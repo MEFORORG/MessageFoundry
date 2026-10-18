@@ -4512,7 +4512,7 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
 
 def test_the_stray_passkey_guidance_sends_the_user_to_the_list_before_deleting() -> None:
     """BACKLOG #3810 finding 4: a failed passkey finish does not prove the passkey was not stored
-    (a session revoked after the store, or "already enrolled", fail with it registered). RED when
+    (a session revoked late in the finish fails at the re-key, after the store). RED when
     SECURITY.md says again that such a passkey is not stored, which would lead a user to delete a
     registered factor, or stops sending the user to the account's list first."""
     block = _flat(_doc_text())
@@ -4521,4 +4521,7 @@ def test_the_stray_passkey_guidance_sends_the_user_to_the_list_before_deleting()
     assert "That passkey is not stored" not in para
     assert "**A failed finish does not prove the passkey was not stored.**" in para
     assert "check the account's Passkeys list first" in para
-    assert "A passkey listed there is registered, and the user keeps it." in para
+    assert (
+        "A passkey listed there is registered, and the user keeps it on the authenticator." in para
+    )
+    assert "a user who cannot tell which is which keeps it" in para

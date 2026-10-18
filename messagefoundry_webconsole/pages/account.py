@@ -1055,16 +1055,16 @@ def webauthn_enroll_page(options_json: str) -> Markup:
         ),
         # BACKLOG #3810 finding 4: every refusal at finish comes after the authenticator made its
         # credential, so a failed enrolment can leave one behind. But not every failure means the
-        # server did not store it: a session revoked after the store, or "already enrolled", fails
-        # with the passkey registered. So the account's list decides, never the failure; deleting
-        # a registered passkey on a passkey-only account would need an administrator's MFA reset.
+        # server did not store it: a session revoked late in the finish fails at the re-key, after
+        # the store. So the account's list decides, never the failure; deleting a registered
+        # passkey on a passkey-only account would need an administrator's MFA reset.
         el(
             "p",
             "If your browser or security key saved a passkey but adding it here then failed, "
             "check the Passkeys list on your account page first. A passkey listed there is "
-            "registered: keep it. Only a passkey your browser or security key shows that is not "
-            "in that list is a leftover you may delete from your browser's or security key's "
-            "passkey list.",
+            "registered: keep it on your browser or security key. Only a passkey your browser or "
+            "security key shows that is not in that list is a leftover you may delete from your "
+            "browser's or security key's passkey list. If you cannot tell which is which, keep it.",
             class_="muted",
         ),
         el(

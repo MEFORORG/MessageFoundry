@@ -18,6 +18,7 @@ here is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 
@@ -449,6 +450,8 @@ async def test_a_local_account_is_never_probed_on_totp_enrolment(
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
     await _lock_second_step(store, identity.user_id)
+    locked = await store.get_user(identity.user_id)
+    assert locked is not None and locked.second_step_locked(time.time())  # the lock is live
     pin_totp_clock(monkeypatch, _T0)
     enroll = await service.begin_mfa_enrollment(identity)
 
@@ -604,6 +607,8 @@ async def test_a_local_account_is_never_probed_on_passkey_registration(
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
     await _lock_second_step(store, identity.user_id)
+    locked = await store.get_user(identity.user_id)
+    assert locked is not None and locked.second_step_locked(time.time())  # the lock is live
     p = await _passkey_staged(_Signed(service, store, directory, identity, token))
 
     served = await _register(p)

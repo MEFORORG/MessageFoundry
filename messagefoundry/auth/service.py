@@ -11319,12 +11319,14 @@ class AuthService:
         these legs write the lock row: ``auth.mfa_failed`` from :meth:`verify_mfa` and from
         :meth:`confirm_mfa_enrollment`, and ``auth.webauthn_failed`` from
         :meth:`finish_webauthn_assertion` and from :meth:`finish_webauthn_registration`. The two
-        enrolment legs reach it only for a directory account, through
-        :meth:`_directory_vouches_for_factor` (BACKLOG #3061, #3810 finding 4).
+        enrolment legs reach it only for a directory account, after a confirmed lookup in
+        :meth:`_directory_vouches_for_factor` (BACKLOG #3061, #3810 finding 4), and do not feed
+        the counter.
 
         Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
         MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
-        sidestep). ADR 0197: this leg feeds, and is refused by, the SECOND-STEP lock only. The
+        sidestep). ADR 0197: the TOTP/recovery leg feeds, and every caller is refused by, the
+        SECOND-STEP lock only. The
         sign-in lock is the one a caller who knows only the username can set, and a session holder
         has already passed the step it guards. A locked account is refused before any verify."""
         if not user.second_step_locked(time.time()):
@@ -11930,8 +11932,9 @@ class AuthService:
 
         **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
         finding 4), so it can leave a passkey on the authenticator. Not every failure means the
-        server did not store it: a session revoked after :meth:`add_webauthn_credential` and before
-        :meth:`_elevated` re-keys it, and "already enrolled", fail with the passkey registered.
+        server did not store it: a session revoked or lapsed after the last session check above
+        fails at the re-key in :meth:`_elevated`, after ``self._store.add_webauthn_credential``
+        has stored the passkey.
         ``docs/SECURITY.md``, *A refused registration can leave a passkey on the authenticator*,
         says which refusals, and that the console sends the user to the account's passkey list
         before deleting anything."""
