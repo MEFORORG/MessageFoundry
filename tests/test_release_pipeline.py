@@ -4005,11 +4005,12 @@ def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_p
     harness_if = str(_upload_step(jobs["publish-pypi"], "harness-dist/").get("if"))
     assert "needs.release-harness.outputs.publish-harness" in harness_if, harness_if
     assert jobs["release-harness"]["outputs"]["publish-harness"] == "${{ vars.PUBLISH_HARNESS }}"
-    gated = sorted(
-        key
-        for key in _upstream(_PUBLISH_JOB) | {_PUBLISH_JOB}
-        if "vars." in str(jobs[key].get("if") or "")
-    )
+    # release.yml chains seven jobs into the publisher: tag-provenance, sbom-linux, sbom-windows,
+    # release, release-harness, publish-pypi and the publisher itself. Fewer means the walk lost a
+    # `needs:` edge, and the empty-`gated` check below would then pass on jobs it never read.
+    upstream = _upstream(_PUBLISH_JOB) | {_PUBLISH_JOB}
+    assert len(upstream) >= 7, sorted(upstream)
+    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
     assert not gated, (
         f"job(s) {gated} upstream of {_PUBLISH_JOB} are gated on a variable; unset, they skip it"
     )
@@ -4026,11 +4027,11 @@ def test_an_unset_publish_webconsole_still_publishes_the_console_release() -> No
     job upstream of the console publisher on a variable. Red here.
     """
     jobs = _jobs()
-    gated = sorted(
-        key
-        for key in _upstream(_CONSOLE_PUBLISH_JOB) | {_CONSOLE_PUBLISH_JOB}
-        if "vars." in str(jobs[key].get("if") or "")
-    )
+    # release.yml chains four jobs into the console publisher: tag-provenance, release-webconsole,
+    # publish-pypi-webconsole and the publisher itself. Fewer would make the empty check vacuous.
+    upstream = _upstream(_CONSOLE_PUBLISH_JOB) | {_CONSOLE_PUBLISH_JOB}
+    assert len(upstream) >= 4, sorted(upstream)
+    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
     assert not gated, (
         f"job(s) {gated} upstream of {_CONSOLE_PUBLISH_JOB} are gated on a variable; unset, "
         "they skip it and the console release stays a draft"
