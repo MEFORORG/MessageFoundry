@@ -2631,6 +2631,39 @@ async def test_a_store_read_fault_answers_503_and_pages_nothing(
     assert await _status_of(engine, approval_id) == "pending"
 
 
+async def test_the_queue_degrades_a_requester_read_fault_and_leaves_approve_its_error(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The queue reads each requester's account to predict a refusal (BACKLOG #3189). A fault there
+    predicts nothing for that requester rather than failing the queue, and must not spend the
+    throttle slot of approve()'s 503 (BACKLOG #3157 item 1), or approve() would log nothing."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    store = _StandingStore(engine.store)
+    sink, paged = _paging_sink()
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve, alert_sink=sink)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    store.get_user = _refuse_reads  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        [entry] = await gate.list_pending()
+        assert entry["release_blocked"] is None
+        queue_errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert queue_errors == [
+            f"approval {approval_id}: the requester's standing could not be read"
+        ]
+        caplog.clear()
+        with pytest.raises(ApprovalError) as refused:
+            await _READ_FAULT_ACTS["approve"](gate, approval_id)
+    assert refused.value.status == 503
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == ["approvals: the store failed to read the requester's account"]
+    assert paged == []
+
+
 async def test_a_queue_the_store_cannot_read_answers_503_on_the_route(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

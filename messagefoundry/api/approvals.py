@@ -1009,7 +1009,9 @@ class ApprovalGate:
         requester_user_id = r.requester_user_id
         if requester_user_id not in authority:
             try:
-                authority[requester_user_id] = await self._requester_authority(requester_user_id)
+                authority[requester_user_id] = await self._requester_authority(
+                    requester_user_id, outage_is_503=False
+                )
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception("approval %s: the requester's standing could not be read", r.id)
                 authority[requester_user_id] = None
@@ -1695,15 +1697,22 @@ class ApprovalGate:
         Existence and the disabled flag come from the store row, not from the resolved identity. The
         resolver deliberately resolves a disabled user too (it also serves the permission inspector),
         so it cannot say "disabled" on its own."""
-        return self._standing_of(await self._requester_authority(requester_user_id), op, params)
+        authority = await self._requester_authority(requester_user_id, outage_is_503=True)
+        return self._standing_of(authority, op, params)
 
-    async def _requester_authority(self, requester_user_id: str) -> Identity | str:
+    async def _requester_authority(
+        self, requester_user_id: str, *, outage_is_503: bool
+    ) -> Identity | str:
         """The requester's live identity, or the reason slug that refuses every operation they
         requested. The half of :meth:`_requester_standing` that reads the store, so the queue can
-        read it once per requester."""
-        user = await self._read(
-            self._store.get_user(requester_user_id), what="the requester's account"
-        )
+        read it once per requester.
+
+        With ``outage_is_503`` a store fault on the account read is :meth:`_read`'s 503, as approve()
+        answers it (BACKLOG #3157 item 1). Without it the fault is raised as it is: the queue
+        degrades it to no prediction for that requester and logs it itself (BACKLOG #3189), so it
+        must not spend :meth:`_read`'s throttle slot, which would silence approve()'s own ERROR."""
+        read = self._store.get_user(requester_user_id)
+        user = await (self._read(read, what="the requester's account") if outage_is_503 else read)
         if user is None:
             return "requester_missing"
         if user.disabled:

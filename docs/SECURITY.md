@@ -2371,6 +2371,10 @@ A store that refuses a READ on the approval routes answers 503 for at least the 
 row and the requester's `users` row (BACKLOG #3157). The gate logs it at ERROR, at most once per
 five minutes for each kind of read, and pages nothing, because a read loses no audit row. Nothing
 is decided or run.
+The queue's own read of each requester's `users` row, which predicts a refusal (BACKLOG
+#3189), is the exception: a fault there leaves that requester's requests with no prediction, the
+queue still answers, and the fault is logged at ERROR on every listing that meets it. Approving
+the request reads the row again and answers 503 as above.
 
 What this does not cover, at least: a request or a repeat whose write fails, and that does not
 read back as held, is not mapped. It answers a raw 500, or the request timeout's 503 when the call
