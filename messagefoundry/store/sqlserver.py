@@ -803,9 +803,12 @@ _MSSQL_APPROVAL_INSERT: Final = (
     " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
 )
+#: Reports through ``OUTPUT``, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283),
+#: rather than ``cursor.rowcount`` (vault BACKLOG #3193).
 _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
-    " seal = ? WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+    " seal = ? OUTPUT inserted.id"
+    " WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -12710,7 +12713,7 @@ class SqlServerStore:
         await cur.execute(
             _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
         )
-        return int(cur.rowcount) > 0
+        return bool(await cur.fetchall())
 
     async def _open_under_audit_applock(self, cur: Any) -> None:
         """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
