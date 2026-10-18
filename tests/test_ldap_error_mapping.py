@@ -160,7 +160,11 @@ def test_an_ldap3_error_keeps_its_own_handler_and_text(
 
     with pytest.raises(LdapError) as err:
         LdapAuthenticator(_ad_settings()).probe_principal("alice")
-    assert str(err.value) == f"AD directory call failed: ldap3 raised {type(fault).__name__}"
+    # The cause's type follows in brackets: each of these also subclasses an interpreter error.
+    assert str(err.value).startswith(
+        f"AD directory call failed: ldap3 raised {type(fault).__name__}"
+    )
+    assert "synthetic ldap3 text" not in str(err.value)
     assert err.value.__cause__ is fault
 
 

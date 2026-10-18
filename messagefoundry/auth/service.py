@@ -6393,7 +6393,7 @@ class AuthService:
         with no readable ``objectGUID`` (:class:`DirectoryObjectIdMissing`, since such a row could
         never take a binding), a name or id a row already holds (:class:`UsernameTaken`), and the
         address rule above. :class:`~messagefoundry.auth.ldap.LdapError` propagates when the
-        directory is unreachable.
+        directory is unreachable, and for any other fault the lookup raises (``_ask_directory``).
 
         The row carries no roles. A directory account's roles come from the AD-group map at each
         sign-in, and no administrator route sets them. Audited as ``user.created`` with
@@ -6405,7 +6405,7 @@ class AuthService:
         name = username.strip()
         if not name:
             raise DirectoryAccountRefused("a directory account name is required")
-        principal = await asyncio.to_thread(self._ldap.resolve_principal, name)
+        principal = await _ask_directory(self._ldap.resolve_principal, name)
         if principal is None:
             raise DirectoryAccountNotFound("the directory returned no enabled account by that name")
         if not principal.directory_object_id:

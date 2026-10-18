@@ -791,8 +791,9 @@ _UNANSWERED_HINTS: dict[int, str] = {
     "account cannot see it.",
     34: " invalidDNSyntax usually means a configured DN is not a distinguished name, such as a UPN "
     "or DOMAIN\\user.",
-    49: " invalidCredentials on the service-account bind usually means [auth].ad_bind_dn or its "
-    "password is wrong.",
+    49: " invalidCredentials on a bind usually means the DN or its password is wrong, or the "
+    "account is locked or its password has expired; for the service-account bind, check "
+    "[auth].ad_bind_dn and its password.",
     50: " insufficientAccessRights means the service account may not read it.",
 }
 
@@ -1213,19 +1214,35 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
 
 
 def _ldap3_failed(exc: BaseException) -> LdapError:
-    """The :class:`LdapError` an ldap3 error becomes in ``authenticate`` and ``probe_principal``.
+    """The :class:`LdapError` an ldap3 error becomes in ``authenticate``, ``probe_principal`` and
+    ``read_bind_account``.
 
     BACKLOG #3017. The text is fixed and names ldap3's error type, never its text. That text can
     carry each address the engine tried and the error at each (``LDAPSocketOpenError``), or the
     directory's diagnostic message, and the sign-in callers write this text into
-    ``auth.login_error``. It differs from :func:`_socket_faults_as_ldap_error`'s text, so a reader
-    can tell an ldap3 error from a bare socket fault.
+    ``auth.login_error``. ``check-privileges`` prints the same text. It differs from
+    :func:`_socket_faults_as_ldap_error`'s text, so a reader can tell an ldap3 error from a bare
+    socket fault.
 
-    The text is kept for diagnosis in a DEBUG traceback only, which is what tells a pinned-CA
-    mismatch from a refused port or a name-lookup miss.
+    **The cause's type is named too.** ldap3 builds a socket error as a class that also
+    subclasses the error the interpreter raised (``communication_exception_factory``), such as
+    ``SSLCertVerificationError`` or ``ConnectionRefusedError``. Its name tells a pinned-CA mismatch
+    from a refused port without quoting anything. The full text goes to a DEBUG traceback only.
     """
     logger.debug("AD directory call failed", exc_info=exc)
-    return LdapError(f"AD directory call failed: ldap3 raised {type(exc).__name__}")
+    name = type(exc).__name__
+    cause = next(
+        (
+            kind.__name__
+            for kind in type(exc).__mro__
+            if not kind.__module__.startswith("ldap3")
+            and kind not in (Exception, BaseException, object)
+        ),
+        None,
+    )
+    return LdapError(
+        f"AD directory call failed: ldap3 raised {name}" + (f" ({cause})" if cause else "")
+    )
 
 
 #: The ldap3 module and method whose frame raises ``LDAPBindError`` for a refused ``auto_bind``.
@@ -1271,9 +1288,7 @@ def _refuse_service_bind(exc: BaseException) -> NoReturn:
     conn = _auto_binding_connection(exc)
     if conn is not None:
         _refuse_unanswered(conn, "service-account bind")
-    raise LdapError(
-        f"AD refused the service-account bind; ldap3 raised {type(exc).__name__}"
-    ) from exc
+    raise LdapError("AD refused the service-account bind; ldap3 raised LDAPBindError") from exc
 
 
 @contextlib.contextmanager
@@ -1487,8 +1502,8 @@ class LdapAuthenticator:
         the directory refuses, ``invalidCredentials`` included, returns ``False`` and raises
         nothing. ldap3 2.9.1's simple bind raises when the connection fails, and when it cannot
         ask: no user or no password, neither possible here, or a password SASLprep (RFC 4013)
-        refuses, such as one holding a control character. That last raises before anything is
-        sent, on both branches alike, so such a password reads as a directory error for an absent
+        refuses, such as one holding a control character. That last raises after the socket opens
+        and before the bind request is sent, on both branches alike, so such a password reads as a directory error for an absent
         account and a present one. A test pins the healthy-directory path.
 
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code

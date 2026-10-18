@@ -227,6 +227,22 @@ def test_a_failed_search_still_unbinds_the_service_connection(
     assert rec.unbinds == [_SERVICE_DN]
 
 
+def test_an_ldap3_socket_error_names_the_interpreters_error_type() -> None:
+    """ldap3 merges the interpreter's error into its own class, so the type tells a CA mismatch
+    from a refused port without quoting the text, which can name the directory's addresses."""
+    import ssl
+
+    from ldap3.core.exceptions import LDAPSocketOpenError, communication_exception_factory
+
+    merged = communication_exception_factory(
+        LDAPSocketOpenError, ssl.SSLCertVerificationError("synthetic")
+    )
+    error = ldap_module._ldap3_failed(merged(f"socket ssl wrapping error: {_ADDRESSES}"))
+    assert str(error) == (
+        "AD directory call failed: ldap3 raised LDAPSocketOpenError (SSLCertVerificationError)"
+    )
+
+
 def test_a_failed_service_unbind_does_not_change_the_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,7 +294,7 @@ def test_any_other_service_bind_refusal_names_its_result_code() -> None:
     assert str(err.value).startswith(
         "AD ended the service-account bind with result code 49 (invalidCredentials)"
     )
-    assert "[auth].ad_bind_dn or its password is wrong" in str(err.value)
+    assert "check [auth].ad_bind_dn and its password" in str(err.value)
     assert dc.searches == []
 
 
@@ -354,8 +370,6 @@ async def test_ask_directory_passes_an_ldap_error_through_unchanged() -> None:
 _OWN_FAULT_READING = {
     # Reads any other fault as a probe fault, which alerts (BACKLOG #3100).
     "_probe_principal",
-    # Not a sign-in or step-up leg: an administrator's route, which BACKLOG #3017 does not name.
-    "create_directory_account",
 }
 
 
@@ -387,4 +401,5 @@ def test_every_sign_in_and_step_up_leg_asks_the_directory_through_the_mapper() -
         "_authenticate_oidc",
         "complete_oidc_step_up",
         "_reauth_ad",
+        "create_directory_account",
     } <= mapped, mapped

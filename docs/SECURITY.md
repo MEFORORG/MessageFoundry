@@ -4296,7 +4296,8 @@ the referral, a rule names its source exactly. The alert's text names `ad_user_s
 is a referral too (BACKLOG #3010). ldap3 cannot decode its hosts, so the ERROR line names none. The
 alert's text still points at the two search bases and not at `ad_bind_dn`, the DN that bind used,
 so for this case it names the wrong setting. A service-account bind answered with the referral
-code and no referral field is not covered: it still reads as unreachable. When it resolves itself
+code and no referral field is refused as a referral as well (BACKLOG #3017), with the same wrong
+setting named. When it resolves itself
 is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
