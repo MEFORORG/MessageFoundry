@@ -238,7 +238,8 @@ async def test_each_refused_request_writes_its_own_warning(
     stated once, in docs/SECURITY.md item 6 of "Administrative-interface defense-in-depth". After
     the first sightings, which write rows and notices and no WARNING, N refused requests on one
     session write N lines: each repeat from an address already reported, and each request past
-    the per-session cap, whose line carries the address because it writes no new-address row. That
+    the per-session cap and its ``cap_reached`` row, whose line carries the address because it
+    writes no new-address row. That
     address is the sender's text on a proxied hop, so a line break in it is escaped. No line adds
     a new-address row or a notice."""
     store = await MessageStore.open(":memory:")

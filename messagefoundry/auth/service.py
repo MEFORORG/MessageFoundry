@@ -10280,8 +10280,9 @@ class AuthService:
         epoch still return ``True`` (so the step-up stays forced) but only log to the rotating ops
         log — so a token replayed in a tight loop, from one address or alternating between several,
         cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
-        precedent). Each such repeat, and each request past the cap, writes its own WARNING line; a
-        first sighting writes the row and notice instead. Why those lines are not throttled (vault
+        precedent). Each such repeat, and each request from an address after the ``cap_reached``
+        row, writes its own WARNING line; a first sighting up to that row writes the row and notice
+        instead. Why those lines are not throttled (vault
         BACKLOG #3052 item 16) is stated once, in docs/SECURITY.md under "Administrative-interface
         defense-in-depth", item 6. One epoch audits at most
         ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
@@ -10330,9 +10331,9 @@ class AuthService:
             )
             return True
         if flag == "over_cap":
-            # Past the cap no new-address row is written, so this line carries the address. On a
-            # PHI-view route it is the only record of it; docs/SECURITY.md item 6 says which
-            # routes still write a grant row. The address is attacker-supplied text on a proxied hop.
+            # Past the cap no new-address row is written, so this line carries the address;
+            # docs/SECURITY.md item 6 says which other records do. The address is
+            # attacker-supplied text on a proxied hop.
             _log.warning(
                 "a request from a new client address must re-verify; the address is past the "
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",

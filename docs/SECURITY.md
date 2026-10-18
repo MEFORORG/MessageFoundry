@@ -3106,29 +3106,32 @@ alone:
    `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
    in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
    `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
-   **A first sighting writes a row and a notice, and every later refusal for a new address writes
-   a WARNING line instead.** The first request from an address since the last re-verification,
-   and the first one past the cap, write the `auth.new_address_reverify_required` row and the
-   notice, and no WARNING line. Each later request from an already-reported address writes its
-   own WARNING line, and so does each request past the cap. Past the cap no
-   `auth.new_address_reverify_required` row is written, so that line carries the address. On the
-   HTTP API's paced and step-up routes the request's own `auth.permission_granted` row carries it
-   too, under the default `[diagnostics].audit_all_authz`. A route gated only by a PHI-view
-   permission (`messages:view_raw`, `messages:view_summary`) writes no grant row, because the
-   PHI-access audit records those reads, and a refused read never reaches that audit. **So past
-   the cap on those routes the WARNING line is the only record of the address**; everywhere else
-   the audit rows are the durable record.
+   **A first sighting writes a row and a notice; a later sighting writes a WARNING line.** This
+   covers the requests from a new address that reach `flag_new_client_ip`; a gate that refuses
+   earlier, for pacing or a missing factor, never asks. Since the last re-verification, the first
+   request from each of the first eight addresses writes the `auth.new_address_reverify_required`
+   row and the notice, and no WARNING line. So does the ninth address, whose row carries
+   `cap_reached`. After that, each request from an already-reported address writes its own WARNING
+   line, and so does each request from a tenth or later address. Those later addresses write no
+   `auth.new_address_reverify_required` row, so their WARNING line carries the address. The HTTP
+   API's gates write `auth.permission_granted`, with the client address, before they ask, under
+   the default `[security].audit_all_authorization_decisions`. At least these refused requests
+   write no grant row: a route gated only by a PHI-view permission, a gate built with no
+   permission (for example `POST /me/notify-email` and `DELETE /me/mfa`), and every web console
+   gate. **On those, past the cap, the WARNING line is the only log line or audit row naming the
+   address that is not an INFO access-log line.**
    **A per-session throttle on those lines was proposed and declined (vault BACKLOG #3052 item
    16).** It would lose records an operator would rely on, and bounding log volume is the logging
-   layer's job. A sustained replay loop does not push older lines out to make room. NSSM rotates
-   the captured stdout by size and deletes nothing. A full off-box forwarding queue, or a full
-   forwarding spool, drops the newest record and reports the drop, so the newest lines are the ones
-   the forwarded stream loses. What deletes is set by the operator: `[retention].app_log_days`
-   deletes log files older than its window, and the engine-owned `[logging].file` keeps only
-   `file_backup_count` backups, which a loop fills sooner.
-   **The decline covers only the WARNING half of item 16.** Each refused request still reads the
+   layer's job. That layer does not keep every line. At least these lose some: the engine-owned
+   `[logging].file` deletes its oldest backup past `file_backup_count` at each size rollover, so a
+   replay loop evicts older lines sooner; `[retention].app_log_days` deletes log files older than
+   its window; and on the off-box stream a full hand-off queue or spool drops the newest record and
+   reports it, a failed TCP or TLS send with no spool loses the record in flight, and UDP loses
+   datagrams with no report. NSSM's own size rotation deletes nothing, so under NSSM alone the
+   log directory has no size bound.
+   **The decline covers only the WARNING half of item 16.** Each refused request also reads the
    session: `flag_new_client_ip` loads it, and the HTTP refusal reads it again to pick its wording.
-   That cost predates #3052 and stays open.
+   That half is not declined, is not new in this change, and stays open.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have
