@@ -11135,17 +11135,27 @@ class AuthService:
             # clears what the check spends, so a CORRECT code whose factor was turned off or
             # replaced during the check can fail its spend. That is no guess, so it is refused with
             # its own reason and charges nothing to the second-step lockout. Only a code that
-            # MATCHED is asked; a wrong code is charged unread. A row gone or unreadable, a cell
-            # that no longer opens, or a store error in the re-read proves no change and is charged
-            # as before (fail closed).
+            # MATCHED is asked; a wrong code is charged unread. The session, the account and its
+            # lock are read again first, as on the proved branch, so an administrator's replace or
+            # an MFA reset, which revoke the sessions, answers as the lost session it is, and a
+            # lock that landed meanwhile answers locked; neither charges the code. A cell that no
+            # longer opens, or a store error in the re-read, proves no change and is charged as
+            # before (fail closed).
             if match.matched:
+                after: VerifiedUser | None = None
+                change: _TotpMoved | None = None
                 try:
-                    after = await self._load_user(user.id)
-                    change = (
-                        None
-                        if after is None
-                        else self._totp_enrolment_moved(verified_enrolment, after)
+                    held = await self._factor_holder_current(
+                        token,
+                        actor=user.username,
+                        event="auth.mfa_failed",
+                        client=client,
+                        report_lock=True,
                     )
+                    if isinstance(held, Elevation):
+                        return held
+                    after = held
+                    change = self._totp_enrolment_moved(verified_enrolment, after)
                 except Exception:  # noqa: BLE001 - any re-read failure is charged, never raised
                     _log.exception("verify_mfa: the factor re-read after a failed spend raised")
                     after, change = None, None
@@ -12232,9 +12242,26 @@ class AuthService:
                 detail=_json({"label": cred.label}),
                 client=client,
             )
+        standing: _PasskeyHeld | None = None
+        if answer == "gone":
+            # The write found no passkey, but that is a confirmed delete only if the set still
+            # passes its seal: a row gone outside the store's sealed write path proves no holder's
+            # delete, so the miss keeps its clone signal, as a mismatch does. Asked BEFORE the
+            # holder re-read below and written in a finally, so a revocation, a disable or a lock
+            # found by that re-read, or a store error in either read, cannot drop the signal.
+            try:
+                standing = await self._passkey_held(user, cred)
+            finally:
+                if standing in (None, "unverified"):
+                    await self._audit(
+                        "auth.webauthn_clone_suspected",
+                        actor=user.username,
+                        detail=_json({"label": cred.label}),
+                        client=client,
+                    )
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
-        # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
+        # between must stop the factor write, as on verify_mfa. Asked on all three paths, so each
         # refusal is audited with its own reason.
         fresh = await self._factor_holder_current(
             token,
@@ -12246,25 +12273,16 @@ class AuthService:
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
-        # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so
-        # the passkey that signed may be gone. Asked after the holder re-read, as the last read
-        # before the factor write.
-        standing = await self._passkey_held(user, cred)
+        if standing is None:
+            # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue,
+            # so the passkey that signed may be gone. Asked after the holder re-read, as the last
+            # read before the factor write. A gone answer was asked above, for its clone signal.
+            standing = await self._passkey_held(user, cred)
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
             return await self._assertion_refused(user, client, "session_lost", session_lost=True)
         if standing == "unverified":
-            if answer == "gone":
-                # The write found no passkey, but the set fails its seal, so the row may have gone
-                # outside the store's sealed write path: that proves no holder's delete, and the
-                # miss keeps its clone signal, as a mismatch does.
-                await self._audit(
-                    "auth.webauthn_clone_suspected",
-                    actor=user.username,
-                    detail=_json({"label": cred.label}),
-                    client=client,
-                )
             return await self._assertion_refused(user, client, "factor_unverified")
         if answer == "gone" or standing != "held":
             # Confirmed gone by the write itself, or by the set read after it.

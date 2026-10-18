@@ -3030,9 +3030,10 @@ that lands BEFORE the write leaves no clone row; that is accepted. One case keep
 gone passkey: when the passkey set read after the write fails its seal, the row may have gone
 outside the store's sealed write path, so the clone row is written and the refusal is
 `reason=factor_unverified`. A mismatch writes the clone row
-at once, before the session, the account, the lock and the passkey set are read again. So a
-holder ending their own session cannot suppress it, and nor can a disable, a lock, a passkey
-delete or a store error landing after the write. The refusal then also carries that change's own
+at once, before the session, the account, the lock and the passkey set are read again, and a gone
+passkey whose set fails its seal writes it after that one set read and still before the rest. So
+at least these cannot suppress it: a holder ending their own session, a disable, a lock, a passkey
+delete, or a store error landing after the write. The refusal then also carries that change's own
 reason.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor

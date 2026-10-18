@@ -823,6 +823,74 @@ async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -
         await store.close()
 
 
+#: Each case: what lands with the unsealed delete, and the reason the refusal is audited with
+#: (``None``: the set read raises, so the call raises rather than refusing).
+_UNSEALED_GONE_CASES: dict[str, str | None] = {
+    "revoke": "session_lost",
+    "disable": "session_lost",
+    "lock": "locked",
+    "set-read-raises": None,
+}
+
+
+@pytest.mark.parametrize("change", list(_UNSEALED_GONE_CASES))
+async def test_an_unsealed_gone_passkey_keeps_the_clone_signal_whatever_the_holder_reread_finds(
+    change: str,
+) -> None:
+    """BACKLOG #3774, the review of PR 2392 at 5d8901d8. The write answers ``gone`` and the set
+    fails its seal, so the clone row is owed, and it must be written whatever the holder re-read
+    then finds. RED when: a revocation, a disable or a lock landing before the factor write, or a
+    set read that raises, leaves no ``auth.webauthn_clone_suspected`` row, which is what asking
+    the set only AFTER the holder re-read, with no finally, gave. Exactly one row, so the write
+    before the re-read is not repeated after it. Keyed, so the seal can fail."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+        real_list = store.list_webauthn_credentials
+
+        async def _set_read_fails(*_args: Any) -> list[object]:
+            raise RuntimeError("synthetic: the store read failed")
+
+        async def _gone_unsealed_while_something_lands(
+            *args: Any, **kwargs: Any
+        ) -> SignCountAnswer:
+            # The holder change lands first, so its own user-row write cannot re-seal the set.
+            if change == "revoke":
+                await store.revoke_session(hash_token(token))
+            elif change == "disable":
+                await store.set_user_disabled(user_id, disabled=True)
+            elif change == "lock":
+                await _lock_second_step(store, user_id)
+            await store._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+            await store._db.commit()
+            answer = await real_update(*args, **kwargs)
+            assert answer == "gone"
+            if change == "set-read-raises":
+                store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
+            return answer
+
+        store.update_webauthn_sign_count = _gone_unsealed_while_something_lands  # type: ignore[method-assign]
+
+        reason = _UNSEALED_GONE_CASES[change]
+        if reason is None:
+            with pytest.raises(RuntimeError, match="synthetic"):
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        else:
+            refused = await service.finish_webauthn_assertion(
+                token, response, rp_id=_RP, origin=_ORIGIN
+            )
+            assert refused.ok is False
+            assert refused.session_lost is (reason == "session_lost")
+            assert {"reason": reason} in await _audited_assertion_failures(store)
+        store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() -> None:
     """BACKLOG #3068, the ``factor_unverified`` branch on its own. A set that fails its seal once the
     sign count has moved says nothing about the passkey, so the factor write is refused as
