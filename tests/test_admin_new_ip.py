@@ -234,10 +234,8 @@ async def test_each_refused_request_writes_its_own_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """RED when: a refused request that is not a first sighting writes no WARNING of its own, as
-    under the per-session throttle vault BACKLOG #3052 item 16 proposed. Why it was declined is in
-    docs/SECURITY.md, "Administrative-interface defense-in-depth". Here, after the first
-    sightings, N such requests write N lines and add no new-address row or notice; a past-cap
-    line carries the address, with a line break in it escaped."""
+    under a per-session throttle. Why that throttle was declined is in docs/SECURITY.md,
+    "Administrative-interface defense-in-depth"."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()

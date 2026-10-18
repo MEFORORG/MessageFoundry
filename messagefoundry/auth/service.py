@@ -10328,9 +10328,8 @@ class AuthService:
             )
             return True
         if flag == "over_cap":
-            # Past the cap no new-address row is written, so this line carries the address (see
-            # docs/SECURITY.md, "Administrative-interface defense-in-depth"). The address is
-            # attacker-supplied text on a proxied hop.
+            # Past the cap no new-address row is written, so this line carries the address. The
+            # address is attacker-supplied text on a proxied hop.
             _log.warning(
                 "a request from a new client address must re-verify; the address is past the "
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",

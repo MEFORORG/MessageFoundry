@@ -3106,18 +3106,15 @@ alone:
    `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
    in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
    `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
-   **A call that writes no new-address row writes a WARNING line.** Each time
-   `flag_new_client_ip` returns True without writing an `auth.new_address_reverify_required` row,
-   it writes one WARNING line: `_first_new_ip_flag` answers `repeat` for an address already in the
-   session's flagged set, or `over_cap` for another once that set is past the cap. Vault BACKLOG
-   #3052 left that behaviour as it was and changed only the line's wording. **A per-session
-   throttle on that line was proposed and declined (vault BACKLOG #3052 item 16):** a per-session
-   WARNING throttle loses records an operator would rely on (vault BACKLOG #3773), and log volume
-   is the logging layer's job. That layer does not keep every line: at least, a full off-box hand-off
-   queue drops the newest record, the `[logging].file` handler deletes its oldest backup at a size
-   rollover, and a UDP forward can lose datagrams. The decline covers only the WARNING half of
-   item 16. The other half, the session read `flag_new_client_ip` makes before each True it
-   returns, stays open.
+   Each time `flag_new_client_ip` returns True without writing an
+   `auth.new_address_reverify_required` row, it writes one WARNING line: `_first_new_ip_flag`
+   answers `repeat` for an address already in the session's flagged set, or `over_cap` for another
+   once that set is past the cap. **A per-session throttle on that line was proposed and
+   declined:** a per-session WARNING throttle loses records an operator would rely on (vault
+   BACKLOG #3773), and log volume is the logging layer's job. That layer does not keep every line:
+   at least, a full off-box hand-off queue drops the newest record, and a UDP forward can lose
+   datagrams. The decline covers only the WARNING half of vault BACKLOG #3052 item 16. The other
+   half, the session read `flag_new_client_ip` makes before each True it returns, stays open.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have
