@@ -6,8 +6,8 @@ fastapi 0.142 reads ``OTEL_EXPORTER_OTLP_*`` before lifespan startup and install
 exporters unless the app says otherwise; 0.143 makes that opt-in (the comment above
 ``_FASTAPI_TELEMETRY_OFF`` in messagefoundry/api/app.py). ``create_app`` passes a telemetry config with
 every switch off. These tests show fastapi's own environment auto-configuration does not fire for
-the engine app, measured on 0.142.2 and 0.143.0. They say nothing about exporters another component
-installs.
+the engine app. CI runs them on the locked fastapi only; on 0.142.2 they were run once, by hand, when
+the lock moved to 0.143.0. They say nothing about exporters another component installs.
 
 fastapi's lifespan catches a failed auto-configuration and logs a warning instead of raising, so
 the warning is the observable. Each test pairs the engine app with a bare ``FastAPI()`` under the

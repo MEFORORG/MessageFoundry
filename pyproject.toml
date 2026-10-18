@@ -154,16 +154,21 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 # launcher-only). The harness monitor's HTTP client (httpx/truststore via messagefoundry.apiclient) is
 # now a BASE dependency, so it's no longer declared here.
 #
-# The <6.12 cap (Dependabot PR 2416) keeps the harness closure to the names docs/RISKY-COMPONENTS.md
-# assesses. PySide6 6.12 adds the pyside6-pdf and pyside6-webengine wheels, and neither has a reading
-# in security/risky-component-readings.json or an answer in security/bundled-code-survey.json. The
-# cap is in published metadata, not only the lock, so an install from an index gets the assessed
-# names too. Lifting it needs, in one PR: both readings and survey answers, the RISKY-COMPONENTS.md
-# harness tables and counts, the dependabot.yml `pyside6` ignore entry removed, and a fix for the
-# forbidden-content scanner reading their four-part versions (6.12.0 and a build number) in
-# security/runtime-closure-harness.txt as routable IPv4 addresses. While it holds, a Qt fix shipped
-# only in 6.12 is withheld, and no gate here would show it: an advisory against Qt names Qt, not a
-# PyPI package pip-audit reads.
+# The <6.12 cap (Dependabot PR 2416) is a RECORD hold, not a code hold. PySide6 6.12 moves the Qt web
+# engine and PDF modules, which pyside6-addons 6.11.2 already carries and the record already
+# describes, out into two new distributions, pyside6-pdf and pyside6-webengine. Neither NAME has a
+# reading in security/risky-component-readings.json or an answer in
+# security/bundled-code-survey.json, so tests/test_risky_component_designation.py refuses a lock
+# holding them. The cap is in published metadata, so a release built from here keeps index
+# installs to the assessed names too; releases already on PyPI do not carry it. Lifting it needs at
+# least, in one PR: both readings and survey answers; the RISKY-COMPONENTS.md harness tables and
+# counts, and the pyside6-addons row read again, since those modules leave it; the dependabot.yml
+# `pyside6` ignore entry removed; `uv lock --upgrade-package pyside6`, because a plain `uv lock`
+# keeps 6.11.2, then the DEP-1 exports and `python scripts/security/runtime_closure.py`; and a fix
+# for the forbidden-content scanner reading the new wheels' four-part versions (6.12.0 and a build
+# number) in security/runtime-closure-harness.txt as routable IPv4 addresses. While it holds, a Qt
+# fix shipped only in 6.12 or later is withheld, and no gate here would show it: an advisory
+# against Qt names Qt, not a PyPI package pip-audit reads.
 harness = [
     "PySide6>=6.6,<6.12",   # the harness GUI (LGPL — OSS-distributable); cap: see above
 ]

@@ -172,7 +172,9 @@ updates:
       # Why: the comment above the [vault] extra in pyproject.toml.
       - dependency-name: "hvac"
         versions: [">=3.0.0"]
-      # Why: the comment above the [harness] extra in pyproject.toml.
+      # Why: the comment above the [harness] extra in pyproject.toml. The TRADE-OFF note's
+      # detection premise does NOT hold for this entry: an advisory against Qt names Qt, not
+      # `pyside6`, so pip-audit would not red on a Qt fix this range withholds.
       - dependency-name: "pyside6"
         versions: [">=6.12.0"]
     groups:
