@@ -690,6 +690,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
+    "messagefoundry/pipeline/engine.py::_read_touched": Site(
+        1,
+        INTERNAL,
+        "File names the engine's own config-write caller declares (the connections.toml name "
+        "literal), on the running config directory the operator configured.",
+    ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
