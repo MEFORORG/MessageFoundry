@@ -32,6 +32,7 @@ from fastapi import HTTPException
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
     _REFUSAL_LOG_LIMIT,
+    _RELOAD_FAULT_ANSWER,
     _audit_refused_reload,
     _audit_reload_attempt,
     _compare_start_config,
@@ -1912,27 +1913,89 @@ def test_only_a_missing_directory_is_a_reload_refusal() -> None:
     assert not isinstance(FileNotFoundError("a file the runner opened"), _RELOAD_REFUSALS)
 
 
+def _fault_row(*, dry_run: bool) -> dict[str, Any]:
+    """The row a reload a bare FileNotFoundError stopped writes: the type only, never the text,
+    which can carry a path."""
+    return {"requested": None, "dry_run": dry_run, "reason": "fault", "error": "FileNotFoundError"}
+
+
+async def _raise_file_not_found(*_a: Any, **_k: Any) -> None:
+    raise FileNotFoundError("a file the reload opened")
+
+
+def _break_the_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every runner start and swap raise a bare FileNotFoundError, as a file it opens would."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    monkeypatch.setattr(RegistryRunner, "start", _raise_file_not_found)
+    monkeypatch.setattr(RegistryRunner, "reload", _raise_file_not_found)
+
+
 async def test_a_runner_start_file_not_found_is_not_audited_as_a_missing_dir(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A FileNotFoundError raised starting or swapping the runner was mapped to not_found, so a
-    fault was recorded and answered as a missing config directory. The directory is there. It now
-    escapes unmapped: the gate records the release failed, and no not_found row is written."""
-    from messagefoundry.pipeline.wiring_runner import RegistryRunner
-
-    async def _gone(*_a: Any, **_k: Any) -> None:
-        raise FileNotFoundError("a file the runner opened")
-
-    def _break_the_runner() -> None:
-        monkeypatch.setattr(RegistryRunner, "start", _gone)
-        monkeypatch.setattr(RegistryRunner, "reload", _gone)
-
+    fault was recorded and answered as a missing config directory. The directory is there. Then it
+    escaped the approve route as a raw 500 with no outcome row. A released reload now answers the
+    generic 422, writes a config_reload_failed row whose reason is ``fault``, and the gate records
+    the release failed."""
     service = await _service(engine)
-    approval_id, r = await _hold_then_release(engine, service, {}, between=_break_the_runner)
-    assert r.status_code == 500, r.text
-    assert await _failed_reload_rows(engine) == []
+    approval_id, r = await _hold_then_release(
+        engine, service, {}, between=lambda: _break_the_runner(monkeypatch)
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == _RELOAD_FAULT_ANSWER
+    assert await _failed_reload_rows(engine) == [_fault_row(dry_run=False)]
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "failed"
+
+
+async def test_an_inline_reload_a_file_not_found_stops_answers_the_generic_error_and_audits_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inline route: the attempt row, then the fault row, and the generic 422, not a raw 500."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    _break_the_runner(monkeypatch)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        r = await c.post("/config/reload", json={}, headers=await _token(c, "deployer"))
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == _RELOAD_FAULT_ANSWER
+    assert len(await engine.store.list_audit(action="config_reload_attempted")) == 1
+    assert await _failed_reload_rows(engine) == [_fault_row(dry_run=False)]
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+async def test_a_dry_run_a_file_not_found_stops_answers_the_generic_error_and_audits_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run swaps nothing, so the fault is raised by the check itself."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    monkeypatch.setattr(Engine, "reload_detail", _raise_file_not_found)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        r = await c.post(
+            "/config/reload", json={"dry_run": True}, headers=await _token(c, "deployer")
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == _RELOAD_FAULT_ANSWER
+    assert await _failed_reload_rows(engine) == [_fault_row(dry_run=True)]
+    assert await engine.store.list_audit(action="config_reload_check") == []
+
+
+async def test_a_gated_reload_whose_digest_meets_a_file_not_found_files_no_hold_and_audits_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hold's own digest is taken at request time; a fault there files no hold."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    monkeypatch.setattr(Engine, "reload_target_digest", _raise_file_not_found)
+    async with _client(engine, service, GATED, raise_app_exceptions=False) as c:
+        r = await c.post("/config/reload", json={}, headers=await _token(c, "deployer"))
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == _RELOAD_FAULT_ANSWER
+    assert await _failed_reload_rows(engine) == [_fault_row(dry_run=False)]
+    assert await engine.store.list_pending_approvals(now=0.0) == []
 
 
 # --- BACKLOG #3157 item 4: a shutdown drain does not cut a reload's own row short -----------------

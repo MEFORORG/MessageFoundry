@@ -2142,8 +2142,12 @@ attempt row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
-store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
+`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `fault`. `fault` is a
+`FileNotFoundError` that is not a missing config directory, such as one a runner start or swap
+raises: the row adds `error`, the exception's type name and never its text, and every API
+reload path, the web console's included, answers it with a generic 422 (BACKLOG #3157). A
+trust-anchor check that the store stops, by refusing the `auth.trust_anchor` audit read or write it
+needs, is
 `store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
 reason is written only for an anchor that passed them. An anchor they refuse is still
 `trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.

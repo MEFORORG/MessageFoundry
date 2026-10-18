@@ -988,7 +988,7 @@ async def _reload_hold_params(
     bytes it releases and the release refuses any others (vault BACKLOG #2596, step 3). It is taken
     only when dual control gates the reload, and is ``None`` otherwise, because an inline reload
     holds nothing and takes its own digest. A target the reload would refuse, or one whose digest
-    cannot be taken, raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it."""
+    cannot be taken, raises one of :data:`_RELOAD_ANSWERED` here, so no hold is filed for it."""
     gated = gate is not None and gate.gates("config_reload")
     digest = await engine.reload_target_digest(config_dir) if gated else None
     return {"config_dir": config_dir, "requester": requester, "fingerprint": digest}
@@ -1439,7 +1439,7 @@ def _build_approval_gate(
                     client=None,
                     approval=approval,
                 )
-            except _RELOAD_REFUSALS as exc:
+            except _RELOAD_ANSWERED as exc:
                 # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row
                 # the inline route records, with the inline route's detail text, rather than
                 # escaping the approve route as a 500. That covers a bad config or trust anchor, and
@@ -2013,8 +2013,9 @@ async def _record_reload_audit(
 
 
 #: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
-#: and audit row (:func:`_audit_refused_reload`). The inline route and the released executor catch
-#: this one tuple, so a held reload is refused exactly as an ungated one is (vault BACKLOG #2459).
+#: and audit row (:func:`_audit_refused_reload`). The API's reload paths catch it through
+#: :data:`_RELOAD_ANSWERED`, so a held reload is refused exactly as an ungated one is (vault BACKLOG
+#: #2459).
 _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
     ConfigDigestMismatch,
@@ -2025,6 +2026,16 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDirMissing,
     WiringError,
 )
+
+#: Every fault a reload route answers and audits through :func:`_audit_refused_reload`: the
+#: refusals above, and a bare ``FileNotFoundError`` that is not one. A runner start or swap, a dry
+#: run's check or a hold's digest can raise one for a file other than the config directory. It is
+#: answered with the generic 422 and audited as ``config_reload_failed`` with reason ``fault``, so it
+#: neither reads as a missing directory (BACKLOG #3157 item 3) nor escapes as a raw 500 with no
+#: outcome row. Only the API's reload paths catch it; the engine's own reloads do not.
+_RELOAD_ANSWERED: tuple[type[Exception], ...] = (*_RELOAD_REFUSALS, FileNotFoundError)
+#: The generic answer to a reload that :data:`_RELOAD_ANSWERED`'s ``FileNotFoundError`` stopped.
+_RELOAD_FAULT_ANSWER: Final = "the config reload failed in the engine; see the engine log"
 
 #: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
 #: WARNINGs, which carry the real reload error that the answer withholds. ``safe_exc``'s default
@@ -2064,9 +2075,11 @@ async def _audit_refused_reload(
 ) -> tuple[int, str]:
     """Write the audit row for a reload the engine refused, and return the status and detail to answer.
 
-    ``exc`` is one of :data:`_RELOAD_REFUSALS`. A directory outside the reload roots writes
+    ``exc`` is one of :data:`_RELOAD_ANSWERED`. A directory outside the reload roots writes
     ``config_reload_denied`` and answers 403. A missing directory writes ``config_reload_failed``
-    with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
+    with reason ``not_found`` and answers 404. Any other ``FileNotFoundError`` is a fault, not a
+    missing directory: it writes reason ``fault`` with the exception's type name, never its text,
+    and answers 422 (BACKLOG #3157). A bad graph writes ``config_reload_failed`` and
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
@@ -2084,7 +2097,7 @@ async def _audit_refused_reload(
     vanished or left the reload roots before its release is refused and recorded the way an inline
     one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
-    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log that error redacted,
+    holder cannot probe the filesystem through it. The 404 and 422 lines log that error redacted,
     with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`, which says why. The
     403 writes no WARNING.
 
@@ -2106,6 +2119,16 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
+    elif isinstance(exc, FileNotFoundError):
+        # After ConfigDirMissing, its subclass. The text can name a path, so the row carries the
+        # type name only and the text is logged here, redacted, as the refusals below log theirs.
+        _log.error(
+            "config reload failed (fault): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "fault"
+        detail["error"] = type(exc).__name__
+        status, answer = 422, _RELOAD_FAULT_ANSWER
     elif isinstance(exc, ConfigDigestMismatch):
         # A hold that took no digest is told apart, so nobody goes looking for an edit that
         # never happened.
@@ -5866,7 +5889,7 @@ def create_app(
         if not req.dry_run:
             try:
                 hold_params = await _reload_hold_params(engine, gate, req.config_dir, user.username)
-            except _RELOAD_REFUSALS as exc:
+            except _RELOAD_ANSWERED as exc:
                 hold_refusal = exc  # audited and answered by the core, after the spend
             else:
                 held = await _rejoin_without_proof(
@@ -5921,7 +5944,7 @@ def create_app(
                     hold_params = await _reload_hold_params(
                         engine, gate, req.config_dir, user.username
                     )
-                except _RELOAD_REFUSALS as exc:
+                except _RELOAD_ANSWERED as exc:
                     return await outliving.run(
                         _answer_refused_reload(engine, exc, req, request, user),
                         "refused config reload",
@@ -5976,7 +5999,7 @@ def create_app(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
             registry = outcome.registry
-        except _RELOAD_REFUSALS as exc:
+        except _RELOAD_ANSWERED as exc:
             await _answer_refused_reload(engine, exc, req, request, user)
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were

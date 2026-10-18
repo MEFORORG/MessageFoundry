@@ -109,6 +109,53 @@ async def test_a_console_reload_held_by_dual_control_names_its_config_digest(
         await engine.stop()
 
 
+async def test_a_console_reload_a_file_not_found_stops_answers_generically_and_audits_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The console seam calls the reload core, so a FileNotFoundError from a runner start or swap
+    must not escape it as a raw 500: it answers the generic 422 and writes the fault row."""
+    from messagefoundry.api.app import _RELOAD_FAULT_ANSWER
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    async def _gone(*_a: Any, **_k: Any) -> None:
+        raise FileNotFoundError("a file the runner opened")
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\n"
+        f"outbound('FILE-OUT_T_ADT', File(directory={str(tmp_path / 'out')!r}))\n",
+        encoding="utf-8",
+    )
+    engine = await Engine.create(
+        tmp_path / "ui.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await auth_service(engine)
+        await provision(service, "adm", [Role.ADMINISTRATOR.value])
+        monkeypatch.setattr(RegistryRunner, "start", _gone)
+        monkeypatch.setattr(RegistryRunner, "reload", _gone)
+        async with ui_client(engine, service) as c:
+            await cookie_login(c, "adm")
+            await mint_bound_proof(c, "/ui/config/reload")
+            r = await c.post("/ui/config/reload", headers=SAME_ORIGIN)
+        assert r.status_code == 422, r.text
+        assert _RELOAD_FAULT_ANSWER in r.text
+        rows = [
+            json.loads(str(row["detail"]))
+            for row in await engine.store.list_audit(action="config_reload_failed")
+        ]
+        assert rows == [
+            {"requested": None, "dry_run": False, "reason": "fault", "error": "FileNotFoundError"}
+        ]
+    finally:
+        await engine.stop()
+
+
 async def test_purge_takes_its_own_proof(engine: Engine) -> None:
     service = await auth_service(engine)
     await provision(service, "op", [Role.OPERATOR.value])
