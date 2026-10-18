@@ -747,7 +747,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            # BACKLOG #3061: as on ui_mfa_confirm, a directory refusal checked no attestation, and
+            # BACKLOG #3061: a directory refusal checked no attestation, and
             # neither did a lock refusal (BACKLOG #3810 finding 4).
             error = _refusal_error(elevation, "passkey verification failed")
             return JSONResponse({"ok": False, "error": error}, status_code=400)

@@ -3089,9 +3089,8 @@ factor-binding refusal, the login-to-MFA floor, an expired ceremony, a bad label
 a failed verification, a duplicate, a directory account's directory and lock refusals, and the
 route's own refusals (rate limit, stale step-up window, malformed request). **A failed finish does
 not prove the passkey was not stored.** The store asks nothing of the session, and the re-key
-that follows it is what refuses, so at least two cases store the passkey and then answer a lost
-session: a session revoked after the finish's last session check, and a temporary credential
-that lapsed at any point after the route's gate let the request in. So the passkey
+that follows it is what refuses, so at least a session revoked after the finish's last session
+check and before the re-key stores the passkey and then answers a lost session. So the passkey
 page tells the user to check the account's Passkeys list first. A passkey listed there is
 registered, and the user keeps it on the authenticator. Only a credential the authenticator shows
 that is not in that list is a stray the user may delete from the browser's or security key's

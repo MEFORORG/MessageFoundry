@@ -11782,8 +11782,7 @@ class AuthService:
         ``event`` with the shared locked detail, and returns a wrong-proof refusal, with
         ``locked`` set when ``report_lock`` is. ``phase``, when given, is added to the
         ``session_lost`` row only, for the reason :meth:`_directory_vouches_for_factor` states. Only
-        revocation is asked of the session, not its expiry; the rotation that follows a factor write
-        refuses an expired one."""
+        revocation is asked of the session, not its expiry."""
         session = await self._load_session(hash_token(token))
         user = (
             None
@@ -12262,8 +12261,9 @@ class AuthService:
         **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
         finding 4), so it can leave a passkey on the authenticator, and not every failure means the
         server did not store it. ``docs/SECURITY.md``, *A refused registration can leave a passkey
-        on the authenticator*, states which refusals and how a stored passkey can still fail, and
-        that the console sends the user to the account's passkey list before deleting anything."""
+        on the authenticator*, states which refusals and how the finish can still fail after the
+        passkey was stored, and that the console sends the user to the account's passkey list
+        before deleting anything."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
