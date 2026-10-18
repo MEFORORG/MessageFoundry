@@ -7628,8 +7628,10 @@ def _config_module_name(path: Path) -> str:
     # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
     # __module__, get_type_hints). Helpers are named the same way, so a helper is never registered
     # under the plain name a stdlib or installed module would use (vault BACKLOG #2780).
-    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
-    return f"mefor_config_{path.stem}_{digest}"
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[
+        : _CONFIG_MODULE_SUFFIX_LEN - 1
+    ]
+    return f"{_CONFIG_MODULE_PREFIX}{path.stem}_{digest}"
 
 
 def _is_helper_name(name: str) -> bool:
@@ -7956,7 +7958,7 @@ class _HelperImporter:
                 # load. Names only, never the exception text (CLAUDE.md section 9).
                 self._failed[name] = (
                     _textless_import_error(exc),
-                    _failure_detail(self._dir.resolve(), f"{name}.py", exc),
+                    _failure_detail((self._dir / f"{name}.py").resolve().parent, f"{name}.py", exc),
                 )
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
@@ -9020,9 +9022,14 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
     if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
         located = (filename, lineno)
     else:
+        # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
+        seen: dict[str, bool] = {}
         for frame, frame_line in traceback.walk_tb(exc.__traceback__):
-            if _in_dir(frame.f_code.co_filename, config_dir):
-                located = (frame.f_code.co_filename, frame_line)
+            name = frame.f_code.co_filename
+            if name not in seen:
+                seen[name] = _in_dir(name, config_dir)
+            if seen[name]:
+                located = (name, frame_line)
     detail = type(exc).__name__
     if located is None:
         return detail
@@ -9044,8 +9051,9 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
 
 
 def _dotted_names_on_line(source_file: str, line: int) -> list[str]:
-    """Every dotted name (``a``, ``a.b.c``) written in code on ``line`` of ``source_file``; never a
-    string literal's or a comment's content.
+    """Every dotted name (``a``, ``a.b.c``) written in code in the statement that starts on, or spans,
+    ``line`` of ``source_file`` -- a parenthesized import over several lines is one statement --
+    never a string literal's or a comment's content.
 
     The file is read afresh, never through :mod:`linecache`: that cache holds whatever version of the
     file was read first, so after an edit and a reload a stale line could vouch for a run-time value.
@@ -9055,11 +9063,12 @@ def _dotted_names_on_line(source_file: str, line: int) -> list[str]:
     try:
         with tokenize.open(source_file) as f:
             for tok in tokenize.generate_tokens(f.readline):
-                if tok.start[0] > line:
-                    break
-                if tok.start[0] == line and (
-                    tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == ".")
-                ):
+                if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                    # A logical line ended: keep it only if it spans `line`, else start afresh.
+                    if tok.start[0] >= line:
+                        break
+                    runs = [[]]
+                elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
                     runs[-1].append(tok.string)
                 elif runs[-1]:
                     runs.append([])
@@ -9193,9 +9202,11 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
             try:
                 _exec_module(path, helpers)
             except WiringError as exc:
-                # Not scrubbed: `_module_failure` withholds a module's own text (vault BACKLOG
-                # #3249), and the scrub would mangle the engine's own fix advice, which spells
-                # `credential_password=env(...)`.
+                # Not scrubbed, because the scrub would mangle the engine's own fix advice, which
+                # spells `credential_password=env(...)`. `_module_failure` withholds a module's own
+                # text (vault BACKLOG #3249), but an engine-raised WiringError passes through as
+                # worded, and at least a few engine raise sites wrap another exception's text, so
+                # this arm can still print an author value (vault BACKLOG #3765 item 1).
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the

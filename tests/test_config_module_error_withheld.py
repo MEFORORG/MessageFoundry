@@ -342,3 +342,32 @@ def test_a_pseudo_filename_frame_is_never_resolved_against_the_cwd(
     (msg,) = _messages(Path("."))
     assert pseudo not in msg
     assert "RuntimeError at line 2" in msg
+
+
+def test_a_name_on_a_later_line_of_a_parenthesized_import_is_named(tmp_path: Path) -> None:
+    # ruff format wraps a long import, and the traceback reports the statement's first line.
+    _write(tmp_path, "feed.py", f"from json import (\n    dumps,\n    {IDENT},\n)\n")
+    (msg,) = _messages(tmp_path)
+    assert f"naming 'json', {IDENT!r}" in msg
+
+
+def test_a_symlinked_helper_keeps_its_line_and_name(tmp_path: Path) -> None:
+    # The Kubernetes ConfigMap layout: every config file is a symlink into a dated folder.
+    real = tmp_path / "data"
+    real.mkdir()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write(real, "_opt.py", f"import {IDENT}\n")
+    _write(
+        real,
+        "feed_a.py",
+        "def f():\n    try:\n        import _opt\n    except ImportError:\n        pass\n",
+    )
+    _write(real, "feed_b.py", "def g():\n    import _opt\n")
+    try:
+        for name in ("_opt.py", "feed_a.py", "feed_b.py"):
+            (cfg / name).symlink_to(real / name)
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+    msgs = _messages(cfg)
+    assert any(f"at line 1 naming {IDENT!r}" in m and "_opt.py" in m for m in msgs), msgs
