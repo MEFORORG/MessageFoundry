@@ -83,9 +83,10 @@ this line.**
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
   group, as the engine route does, so a group ending in a no-break space is refused with the
   route's 400 rather than trimmed. (vault `BACKLOG #3222`)
-- **A directory refusal at the second factor or a step-up names the fix for its cause.** When a
-  directory refuses the account, the MFA gate (`/ui/mfa`) and the re-auth page (`/ui/reauth`, its
-  passkey leg included) now show one text per fix. A role lost in the directory since sign-in is
+- **A directory refusal at the second factor, an enrolment or a step-up names the fix for its
+  cause.** When a directory refuses the account, the MFA gate (`/ui/mfa`), the re-auth page
+  (`/ui/reauth`, its passkey leg included) and the account page's TOTP and passkey enrolment
+  finishes now show one text per fix. A role lost in the directory since sign-in is
   told to sign out, then sign in again. Every other cause, an outage and a role map that fails its
   seal included, is told to try again later and, if it is still refused, to ask an administrator.
   Each names the same fix as the engine's 403 for that cause. Seam change: the console imports
