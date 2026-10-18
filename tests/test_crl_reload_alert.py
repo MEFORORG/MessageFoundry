@@ -1519,20 +1519,9 @@ class _RaiseDown(_Sink):
         super()._record(kind, name, payload)
 
 
-class _NoCollect:
-    """The ``gc`` module with ``collect`` a no-op, for a test whose passes would each collect."""
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(gc, name)
-
-    @staticmethod
-    def collect(*_args: Any, **_kwargs: Any) -> int:
-        return 0
-
-
 @pytest.mark.parametrize("raise_lands", [True, False], ids=["follow-the-record", "first-sight"])
 async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
-    pki: _Pki, monkeypatch: pytest.MonkeyPatch, raise_lands: bool
+    pki: _Pki, raise_lands: bool
 ) -> None:
     """Vault BACKLOG #3543, review of 585270cd3. Every write to the refusal record is made under
     the pass lock, and a pass an earlier runner's stop abandoned may still be making one. So the
@@ -1546,12 +1535,6 @@ async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
     hop = pki.outbound_hop()
     sink = _Sink() if raise_lands else _RaiseDown()
     refused: list[bool] = []
-    # With the refusal cleared, a pass finds no retry on record for the bytes, so its collect gate
-    # fires and every pass runs a full gc.collect(), whose cost grows with the heap. On every CI
-    # test leg (run 39127455923) only three passes were reached in the wait; locally, with 15M
-    # ballast objects, one collect took 1.6 s and both cases failed the same way. The hop is held
-    # strongly here, so the collect decides nothing this test asserts, and it is not run.
-    monkeypatch.setattr(crl_reload, "gc", _NoCollect())
 
     def reload() -> list[ReloadOutcome]:
         outcomes = reload_replaced_crls()
@@ -1561,13 +1544,21 @@ async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
 
     runner = _runner(sink, interval_seconds=0.01, reload=reload)
     pki.crl.write_bytes(_expired(pki))
+    # While a cleared record makes the pass's collect gate fire, every pass here runs a real
+    # gc.collect(), and its cost grows with the heap the suite has built up: in a worker that has
+    # run many files, four passes may not fit the wait. Frozen objects are not walked, so each
+    # collect costs what this test allocates.
+    gc.freeze()
     runner.start()
     try:
         await until(lambda: len(refused) >= 4, "four passes that refused the file")
         # Before the stop, which resolves whatever is still open.
         kinds = sink.kinds()
     finally:
-        await runner.stop()
+        try:
+            await runner.stop()
+        finally:
+            gc.unfreeze()
 
     assert all(refused), "the premise: each pass refused the file and recorded the refusal"
     assert sink.threads, "the control: the runner tried to raise the refusal"
