@@ -199,6 +199,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # connections.toml the engine's account cannot write (vault BACKLOG #3106).
             if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
+            if exc.status_code == 503:
+                # The route's only 503: the audit log did not record the toggle (vault BACKLOG
+                # #2945), whose fix is neither of flag_rejected's.
+                return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)
 

@@ -3865,11 +3865,17 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
     """BACKLOG #3081 item 8: the paragraph saying the password re-bind refuses a demoted directory
     account is pinned to the code that does it. RED when the doc drops the paragraph or brings back
     the old line saying the re-bind does not compare roles, or when ``_reproof_serialized`` stops
-    calling the shared comparison or refusing with ``DIRECTORY_ROLES_DEMOTED``."""
+    calling the shared comparison, or that comparison stops refusing with
+    ``DIRECTORY_ROLES_DEMOTED``."""
     src = (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
-    for name in ("_directory_roles_lost", "DIRECTORY_ROLES_DEMOTED"):
-        assert _function_references(src, "_reproof_serialized", name), (
-            f"_reproof_serialized no longer uses {name}; if the re-bind leg stopped refusing a "
+    # The shared comparison returns the refusal reason itself (BACKLOG #3082), so the re-bind
+    # leg uses it and the comparison names DIRECTORY_ROLES_DEMOTED.
+    for function, name in (
+        ("_reproof_serialized", "_directory_roles_lost"),
+        ("_directory_roles_lost", "DIRECTORY_ROLES_DEMOTED"),
+    ):
+        assert _function_references(src, function, name), (
+            f"{function} no longer uses {name}; if the re-bind leg stopped refusing a "
             "demoted account, docs/SECURITY.md's re-bind paragraph must change with it."
         )
     doc = _doc_text()

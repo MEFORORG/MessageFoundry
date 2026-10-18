@@ -44,7 +44,8 @@ class ConfigConvergenceRunner:
 
     Construct with: ``applied_version`` (a getter for this node's currently-applied config version),
     ``set_applied_version`` (a setter the runner calls after a successful convergence reload), and
-    ``reload`` (an awaitable that re-applies this node's local startup config, NON-propagating). The
+    ``reload`` (an awaitable that re-applies this node's local startup config, NON-propagating, called
+    with the shared version it converges on, so its audit row can name it; vault BACKLOG #3109). The
     runner never imports the engine — it takes these as plain callbacks so the dependency direction
     stays one-way (pipeline only).
     """
@@ -55,7 +56,7 @@ class ConfigConvergenceRunner:
         *,
         applied_version: Callable[[], int],
         set_applied_version: Callable[[int], None],
-        reload: Callable[[], Awaitable[None]],
+        reload: Callable[[int], Awaitable[None]],
         interval_seconds: float,
     ) -> None:
         self._coordinator = coordinator
@@ -130,7 +131,7 @@ class ConfigConvergenceRunner:
         # Re-read THIS node's own startup config dir (NON-propagating: convergence, not initiation — it
         # must not bump the token again, or nodes would chase each other's reloads). A bad local config
         # raises here; the loop isolates it (logged, the node keeps running its current graph).
-        await self._reload()
+        await self._reload(shared)
         # Only advance the applied version after a clean reload, so a failed convergence retries next
         # tick rather than silently skipping the version it couldn't apply.
         self._set_applied_version(shared)

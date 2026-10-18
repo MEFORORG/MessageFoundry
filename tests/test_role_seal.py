@@ -335,7 +335,8 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_load_custom_roles": frozenset({"list_roles"}),
     # An existence question: only a bool leaves it, never the unchecked row.
     "_custom_role_held": frozenset({"get_role"}),
-    "_ad_map": frozenset({"get_ad_map"}),
+    # _ad_map reads through it, so a caller can tell a failing map from an empty one (#3082).
+    "_sealed_ad_map": frozenset({"get_ad_map"}),
 }
 
 

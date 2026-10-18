@@ -1504,7 +1504,7 @@ async def _anchored_engine(
 
 
 async def _convergence(engine: Any, _cfg: Path) -> None:
-    await engine._converge_reload()
+    await engine._converge_reload(1)
 
 
 async def _dr_profile(engine: Any, _cfg: Path) -> None:

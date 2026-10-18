@@ -36,6 +36,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
+    DirectoryRefusal,
     Elevation,
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
@@ -164,7 +165,11 @@ async def _assert_refused_and_uncharged(p: _Pending, outcome: str, sign_count: i
         p.token, p.response, rp_id=_RP, origin=_ORIGIN
     )
     assert refused.ok is False
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     session = await p.store.get_session(hash_token(p.token))
     assert session is not None and session.revoked_at is None  # the token still authenticates
@@ -332,7 +337,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
     refused = await _finish(p)
 
     assert refused.ok is False
-    assert refused.directory_unconfirmed is False
+    assert refused.directory_refusal is None
     assert p.directory.probes == []
 
 
@@ -370,7 +375,7 @@ async def test_what_lands_during_the_lookup_is_honoured(
 
     refused = await _finish(p)
 
-    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.ok is False and refused.directory_refusal is None
     # A lock leaves the token authenticating; a revocation or a disable does not.
     assert refused.session_lost is (change != "lock")
     session = await store.get_session(hash_token(p.token))
@@ -449,7 +454,7 @@ async def test_a_staged_ceremony_is_peeked_not_taken_before_the_lookup(
     the assertion it refused cannot verify once the directory answers."""
     p = await _directory_session_owing_a_passkey(store)
     p.directory.answer = DirectoryAnswer.DISABLED
-    assert (await _finish(p)).directory_unconfirmed is True
+    assert (await _finish(p)).directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert p.service._webauthn_challenges.peek((hash_token(p.token), "assert")) is not None
 
     p.directory.answer = DirectoryAnswer.FOUND
@@ -474,7 +479,7 @@ async def test_an_oidc_minted_session_is_checked_too(store: MessageStore) -> Non
 
     refused = await p.service.finish_webauthn_assertion(oidc, response, rp_id=_RP, origin=_ORIGIN)
 
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]
     session = await store.get_session(hash_token(oidc))
     assert session is not None and session.mfa_verified_at is None

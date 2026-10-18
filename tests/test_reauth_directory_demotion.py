@@ -30,6 +30,7 @@ from messagefoundry.auth.service import (
     DIRECTORY_ROLES_DEMOTED,
     STEP_UP_ACTION_MFA_DISABLE,
     AuthService,
+    DirectoryRefusal,
     _DirectoryRebind,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -107,7 +108,7 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_re_bind_
     # One wrong password first, so a refusal that popped the session's budget or cleared the account
     # counter would show as a drop from one to zero.
     wrong = await s.service.reauth(s.identity, "synthetic-wrong", token=s.token)
-    assert not wrong.ok and wrong.directory_unconfirmed is False
+    assert not wrong.ok and wrong.directory_refusal is None
     before = await store.get_session(token_hash)
     assert before is not None
     s.directory.bound = _principal(*now_in)
@@ -117,7 +118,7 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_re_bind_
     )
 
     assert not refused.ok and refused.token is None
-    assert refused.directory_unconfirmed is True and refused.session_lost is False
+    assert refused.directory_refusal is DirectoryRefusal.DEMOTED and refused.session_lost is False
     after = await store.get_session(token_hash)
     assert after is not None and after.revoked_at is None
     assert after.reauth_at == before.reauth_at, "the demoted account's window was renewed"
@@ -181,6 +182,28 @@ async def test_the_re_bind_judges_the_roles_read_after_the_bind(
     assert elevation.ok and elevation.token is not None
 
 
+async def test_a_role_map_that_fails_its_seal_is_no_demotion_on_the_re_bind(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3082 on the re-bind leg (#3081): a failing role map grants nothing, so every stored
+    role would read as lost, but a new sign-in reads the same map. The refusal is
+    ``directory_role_map_unsealed`` and its fix is UNCONFIRMED, never sign out. RED when the
+    re-bind calls it a demotion."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.auth.service import DIRECTORY_ROLE_MAP_UNSEALED
+
+    s = await _signed_in(store, _OPERATORS, _VIEWERS)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+
+    refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert not refused.ok and refused.token is None and refused.session_lost is False
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    reasons = await _reauth_reasons(store)
+    assert any(f'"reason": "{DIRECTORY_ROLE_MAP_UNSEALED}"' in d for d in reasons), reasons
+    assert not any(f'"reason": "{DIRECTORY_ROLES_DEMOTED}"' in d for d in reasons), reasons
+
+
 async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -206,18 +229,20 @@ async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(
 
     elevation = await s.service.reauth(s.identity, _GOOD, token=s.token)
 
-    assert not elevation.ok and elevation.token is None and elevation.directory_unconfirmed
+    assert not elevation.ok and elevation.token is None
+    assert elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
     user = await store.get_user(s.identity.user_id)
     assert user is not None and user.failed_attempts == 0
     assert any('"reason": "directory_identity_conflict"' in d for d in await _reauth_reasons(store))
 
 
-async def test_the_reauth_route_answers_a_demoted_account_as_unconfirmed(
+async def test_the_reauth_route_answers_a_demoted_account_with_the_sign_in_again_words(
     tmp_path: Path,
 ) -> None:
     """The caller-facing half SECURITY.md states: ``POST /me/reauth`` answers a right password on a
-    demoted account 403 with the directory words, never "re-verification failed". RED when the
-    demotion stops setting ``directory_unconfirmed``."""
+    demoted account 403 with the demotion words, never "re-verification failed" and never the
+    outage words, since a new sign-in clears a demotion (BACKLOG #3082). RED when the demotion
+    stops setting ``directory_refusal``, or sets it to the outage fix."""
     engine = await Engine.create(
         tmp_path / "reauth_demoted.db",
         poll_interval=0.02,
@@ -237,6 +262,7 @@ async def test_the_reauth_route_answers_a_demoted_account_as_unconfirmed(
                 headers={"Authorization": f"Bearer {s.token}"},
             )
         assert r.status_code == 403
-        assert "directory could not confirm this account" in r.json()["detail"]
+        assert "sign out and sign in again" in r.json()["detail"]
+        assert "could not confirm" not in r.json()["detail"]
     finally:
         await engine.stop()
