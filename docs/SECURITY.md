@@ -3106,32 +3106,18 @@ alone:
    `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
    in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
    `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
-   **A first sighting writes a row and a notice; a later sighting writes a WARNING line.** This
-   covers the requests from a new address that reach `flag_new_client_ip`; a gate that refuses
-   earlier, for pacing or a missing factor, never asks. Since the last re-verification, the first
-   request from each of the first eight addresses writes the `auth.new_address_reverify_required`
-   row and the notice, and no WARNING line. So does the ninth address, whose row carries
-   `cap_reached`. After that, each request from an already-reported address writes its own WARNING
-   line, and so does each request from a tenth or later address. Those later addresses write no
-   `auth.new_address_reverify_required` row, so their WARNING line carries the address. The HTTP
-   API's gates write `auth.permission_granted`, with the client address, before they ask, under
-   the default `[security].audit_all_authorization_decisions`. At least these refused requests
-   write no grant row: a route gated only by a PHI-view permission, a gate built with no
-   permission (for example `POST /me/notify-email` and `DELETE /me/mfa`), and every web console
-   gate. **On those, past the cap, the WARNING line is the only log line or audit row naming the
-   address that is not an INFO access-log line.**
-   **A per-session throttle on those lines was proposed and declined (vault BACKLOG #3052 item
-   16).** It would lose records an operator would rely on, and bounding log volume is the logging
-   layer's job. That layer does not keep every line. At least these lose some: the engine-owned
-   `[logging].file` deletes its oldest backup past `file_backup_count` at each size rollover, so a
-   replay loop evicts older lines sooner; `[retention].app_log_days` deletes log files older than
-   its window; and on the off-box stream a full hand-off queue or spool drops the newest record and
-   reports it, a failed TCP or TLS send with no spool loses the record in flight, and UDP loses
-   datagrams with no report. NSSM's own size rotation deletes nothing, so under NSSM alone the
-   log directory has no size bound.
-   **The decline covers only the WARNING half of item 16.** Each refused request also reads the
-   session: `flag_new_client_ip` loads it, and the HTTP refusal reads it again to pick its wording.
-   That half is not declined, is not new in this change, and stays open.
+   **A call that writes no new-address row writes a WARNING line.** Each time
+   `flag_new_client_ip` returns True without writing an `auth.new_address_reverify_required` row,
+   it writes one WARNING line: `_first_new_ip_flag` answers `repeat` for an address already in the
+   session's flagged set, or `over_cap` for another once that set is past the cap. Vault BACKLOG
+   #3052 left that behaviour as it was and changed only the line's wording. **A per-session
+   throttle on that line was proposed and declined (vault BACKLOG #3052 item 16):** a per-session
+   WARNING throttle loses records an operator would rely on (vault BACKLOG #3773), and log volume
+   is the logging layer's job. That layer does not keep every line: at least, a full off-box hand-off
+   queue drops the newest record, the `[logging].file` handler deletes its oldest backup at a size
+   rollover, and a UDP forward can lose datagrams. The decline covers only the WARNING half of
+   item 16. The other half, the session read `flag_new_client_ip` makes before each True it
+   returns, stays open.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have
