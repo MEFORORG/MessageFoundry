@@ -181,9 +181,9 @@ pip install "messagefoundry==0.5.1"        # pin the exact engine version (core 
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> **WARNING: Early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
+> **WARNING: Early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.5.0`) resolves today; earlier releases, back to the `0.1.0rc1`
+> launch. The exact-pin command above resolves today; earlier releases, back to the `0.1.0rc1`
 > pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
 > organization's **private index**.
 
