@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import warnings
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -493,10 +492,22 @@ def _sddl_of(path: Path, scratch: Path) -> str:
     return [line for line in text.splitlines() if line.strip()][1]
 
 
-def _harden(path: Path, grant: str) -> None:
-    """Strip ``path``'s inherited entries and grant this account only ``grant`` (F or R)."""
-    # OWNER RIGHTS and CREATOR OWNER can survive as explicit entries (see test_store_trio_acl.py),
-    # and an OWNER RIGHTS full-control entry would let an R-hardened file be written anyway.
+def _my_sids() -> set[str]:
+    """This account as SDDL may spell it: its SID, or ``LA`` when it IS the built-in Administrator
+    (RID 500), which the hosted runners run as (see test_store_trio_acl.py)."""
+    me = _own_sid()
+    return {me, "LA"} if me.endswith("-500") else {me}
+
+
+def _harden(path: Path, grant: str) -> str:
+    """Leave ``path`` exactly one entry, granting this account ``grant`` (F or R), check that it
+    took, and return the list as SDDL."""
+    # /inheritance:r drops only INHERITED entries. SYSTEM, Administrators, OWNER RIGHTS and CREATOR
+    # OWNER can survive onto the file as EXPLICIT ones (test_store_trio_acl.py, CI run
+    # 36039014999), and a hosted runner's elevated token has Administrators switched on. Measured
+    # in CI run 39087669047 (windows-2025): removing only the last two left
+    # D:PAI(A;;FR;;;LA)(A;;FA;;;SY)(A;;FA;;;BA), and the process opened that R-hardened file for
+    # writing through the Administrators entry.
     _win_run(
         "icacls.exe",
         str(path),
@@ -504,53 +515,31 @@ def _harden(path: Path, grant: str) -> None:
         "/remove:g",
         "*S-1-3-4",
         "*S-1-3-0",
+        "*S-1-5-18",
+        "*S-1-5-32-544",
         "/grant:r",
         f"*{_own_sid()}:{grant}",
     )
+    # A fixture that did not produce its shape is reported as a fixture, not as a product failure,
+    # on any host whose token the list does not bind as written. A plain split, not store's SDDL
+    # parser: the tee's tests import nothing from the engine they do not already.
+    sddl = _sddl_of(path, path.parent / "acl")
+    trustees = [ace.rstrip(")").rsplit(";", 1)[-1] for ace in sddl.split("(")[1:]]
+    assert len(trustees) == 1 and trustees[0] in _my_sids(), f"fixture: {path.name} has {sddl}"
+    assert _opens_for_writing(path) == (grant == "F"), f"fixture: {path.name} under {sddl}"
+    return sddl
 
 
 def _opens_for_writing(path: Path) -> bool:
-    """Whether this process can open ``path`` for writing. ``r+b`` neither creates nor truncates."""
+    """Whether this process can open ``path`` for writing. ``r+b`` neither creates nor truncates.
+
+    A sharing violation also raises PermissionError on Windows, so a file another process holds
+    without write sharing reads as unwritable here too; nothing in the error tells them apart."""
     try:
         with path.open("r+b"):
             return True
     except PermissionError:
         return False
-
-
-def _token_report() -> str:
-    """This process's groups and privileges, for a message saying why a hardening did not hold."""
-    return _win_run("whoami.exe", "/groups", "/priv", "/fo", "list")
-
-
-class AllowOnlyListDidNotDeny(UserWarning):
-    """A list granting this account only read still let this process open the file for writing."""
-
-
-def _deny_writing(path: Path, scratch: Path) -> None:
-    """Make ``path`` a file this process cannot write, and prove it before the test relies on it.
-
-    An R-only grant was not enough on the hosted Windows runners (run 39066524803, both legs): the
-    process there is an elevated administrator, and a list granting the account read only still
-    let the write through. An explicit deny entry for this account's SID is checked against the
-    whole token, elevated or not, before any allow entry. The rights it denies leave READ_CONTROL
-    and SYNCHRONIZE alone, so the file can still be read and its list saved.
-    """
-    _harden(path, "R")
-    if _opens_for_writing(path):
-        warnings.warn(
-            f"{path.name}: an R-only list let this process open it for writing; the deny entry "
-            f"is what makes it unwritable here. DACL {_sddl_of(path, scratch)}",
-            AllowOnlyListDidNotDeny,
-            stacklevel=2,
-        )
-    _win_run("icacls.exe", str(path), "/deny", f"*{_own_sid()}:(WD,AD,WEA,WA)")
-    # Precondition: a host where even this does not deny the token fails here, naming why, and
-    # not in the product assert that follows.
-    assert not _opens_for_writing(path), (
-        f"{path.name} is still writable by this process after the deny entry. "
-        f"DACL {_sddl_of(path, scratch)}\n{_token_report()}"
-    )
 
 
 @_WINDOWS_ACLS
@@ -565,8 +554,7 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     out = tmp_path / "out.json"
     # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
     out.write_text("stale\n" * 4000, encoding="utf-8")
-    _harden(out, "F")
-    hardened = _sddl_of(out, scratch)
+    hardened = _harden(out, "F")
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     # Control: the hardening really differs from what a new file in this folder gets.
@@ -607,8 +595,7 @@ def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_window
     other.write_text("stale\n", encoding="utf-8")
     out = tmp_path / "out.json"
     os.link(other, out)
-    _harden(out, "F")
-    hardened = _sddl_of(out, scratch)
+    hardened = _harden(out, "F")
     assert os.stat(out).st_nlink == 2  # control: the target really has a second link
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
     assert _sddl_of(out, scratch) == hardened
@@ -636,8 +623,7 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     scratch = tmp_path / "acl"
     target = tmp_path / "hardened.json"
     target.write_text("stale\n", encoding="utf-8")
-    _harden(target, "F")
-    hardened = _sddl_of(target, scratch)
+    hardened = _harden(target, "F")
     out = tmp_path / "out.json"
     _symlink_or_skip(out, target)
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
@@ -670,8 +656,7 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
         os.link(other, out)
     else:
         out.write_text("untouched\n", encoding="utf-8")
-    _deny_writing(out, scratch)
-    hardened = _sddl_of(out, scratch)
+    hardened = _harden(out, "R")  # and checks this process really may not write it
     # A str, since Path itself would drop the separator before the CLI saw it.
     named = str(out) + os.sep if name == "trailing-separator" else str(out)
     assert _write_out(command, tmp_path, monkeypatch, named) == 1
@@ -718,8 +703,7 @@ def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
     out.write_text("stale\n", encoding="utf-8")
-    _harden(out, "F")
-    hardened = _sddl_of(out, scratch)
+    hardened = _harden(out, "F")
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     # Control: a file renamed into this folder would get a different list, so a replace fails this.
@@ -756,8 +740,7 @@ def test_compare_out_replaces_a_hardened_target_on_windows(
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
     out.write_text("stale\n", encoding="utf-8")
-    _harden(out, grant)
-    hardened = _sddl_of(out, scratch)
+    hardened = _harden(out, grant)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     folders = _sddl_of(sibling, scratch)
