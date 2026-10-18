@@ -695,13 +695,19 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
 # --- BACKLOG #2137: a failed write of the pass's own row does not end the pass -------------------
 
 
-def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> None:
-    """Make the store refuse every audit write of ``action``, as a full or failing disk would."""
+def _refuse_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    action: str,
+    error: Exception | None = None,
+) -> None:
+    """Make the store refuse every audit write of ``action``, as a full or failing disk would, or
+    raise ``error`` there instead."""
     real = store.record_audit
 
     async def refusing(name: str, **kwargs: Any) -> None:
         if name == action:
-            raise sqlite3.OperationalError("synthetic: disk I/O error")
+            raise error or sqlite3.OperationalError("synthetic: disk I/O error")
         await real(name, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", refusing)
@@ -1971,8 +1977,11 @@ async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_f
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The forfeit is recorded before the revocation lands. Here the revocation's own audit write
-    fails, so the pass raises after the sessions are gone and returns no plan. The next pass no
-    longer sees the account, and must not release the hold on the accounts it left."""
+    raises a defect, so the pass raises after the sessions are gone and returns no plan. The next
+    pass no longer sees the account, and must not release the hold on the accounts it left.
+
+    A defect, not a store refusal: since BACKLOG #3018 a refused revocation row is logged and the
+    pass goes on, so only a defect still raises from that write."""
     names = ["u1", "ok1", "ok2"]
     async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
         await _left_open_by_an_earlier_run(store)
@@ -1982,8 +1991,9 @@ async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_f
         sink = NotifierAlertSink([], store=store)
         assert (await _alerted_pass(service, sink)).revocations == ()  # strike 1
         real = store.record_audit
-        _refuse_audit(monkeypatch, store, "auth.ad_session_revoked")
-        with pytest.raises(sqlite3.OperationalError):
+        defect = NotImplementedError("synthetic defect")
+        _refuse_audit(monkeypatch, store, "auth.ad_session_revoked", defect)
+        with pytest.raises(NotImplementedError):
             await service.reconcile_directory_sessions()
         monkeypatch.setattr(store, "record_audit", real)
         after = await _alerted_pass(service, sink)

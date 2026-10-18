@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     approval_update,
+    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -281,6 +282,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -305,6 +307,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -803,9 +806,12 @@ _MSSQL_APPROVAL_INSERT: Final = (
     " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
 )
+#: Reports through ``OUTPUT``, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283),
+#: rather than ``cursor.rowcount`` (vault BACKLOG #3193).
 _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
-    " seal = ? WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+    " seal = ? OUTPUT inserted.id"
+    " WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -12122,6 +12128,28 @@ class SqlServerStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Each read is its own pooled statement; a row that changes between
+        them fails its MAC check, which gives no evidence."""
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+            return await self._fetchone(sql, params)
+
+        check = await read_newest_keyed_audit_row(
+            fetch,
+            action=action,
+            actor=actor,
+            after_seq=after_seq,
+            active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+            mac_keys=self._audit_mac_keys,
+            mac_fn=self._audit_mac_fn,
+        )
+        return await settle_newest_keyed_audit_row(check)
+
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
@@ -12710,7 +12738,7 @@ class SqlServerStore:
         await cur.execute(
             _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
         )
-        return int(cur.rowcount) > 0
+        return bool(await cur.fetchall())
 
     async def _open_under_audit_applock(self, cur: Any) -> None:
         """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
