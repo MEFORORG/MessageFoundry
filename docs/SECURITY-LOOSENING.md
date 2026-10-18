@@ -772,7 +772,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   for a healthy round trip, or for a healthy nested group search of the largest account.
 - **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
   how many start per window, not how many are held, and a session recheck does not pass it. So
-  raise the timeout only as far as the measured round trip needs.
+  raise the timeout only as far as the measured round trip, or the measured group search, needs.
 - **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
 
 ### `[auth].require_action_step_up = false` — the action-bound step-up falls back to the session window

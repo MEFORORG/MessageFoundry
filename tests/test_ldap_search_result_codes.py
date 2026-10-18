@@ -451,8 +451,8 @@ _BUDGET = 60.0
 
 
 class _FakeSocket:
-    """The two socket methods :func:`ldap_module._receive_timeout_capped` calls, recording each
-    timeout set."""
+    """The two socket methods :class:`ldap_module._SocketTimeoutCap` calls, recording each timeout
+    set."""
 
     def __init__(self, timeout: float | None) -> None:
         self.timeout = timeout
@@ -713,6 +713,52 @@ def test_a_refused_page_is_abandoned_only_inside_the_deadline(
     if abandoned:  # the abandon's reads got what was left: 10 - 6
         assert conn.socket.set[-2] == pytest.approx(4.0)
     assert conn.socket.timeout == 20.0
+
+
+_RECEIVE_ERROR = ldap3.core.exceptions.LDAPSocketReceiveError
+_SEND_ERROR = ldap3.core.exceptions.LDAPSocketSendError
+
+
+@pytest.mark.parametrize("kind", [_RECEIVE_ERROR, _SEND_ERROR], ids=["read", "send"])
+@pytest.mark.parametrize(
+    ("on_call", "own", "as_deadline"),
+    [
+        pytest.param(1, 60.0, False, id="first-page-is-one-slow-read"),
+        pytest.param(2, 5.0, False, id="later-page-bounded-by-the-socket-timeout"),
+        pytest.param(2, 60.0, True, id="later-page-bounded-by-the-deadline"),
+    ],
+)
+def test_only_a_later_page_timing_out_against_the_deadline_is_refused_as_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: type[Exception],
+    on_call: int,
+    own: float,
+    as_deadline: bool,
+) -> None:
+    """ldap3 merges the socket's TimeoutError into its own class. Only a timeout the deadline set
+    is the deadline: a first page's, or one the socket's own shorter timeout set, passes through
+    as ldap3's error, as any slow read does."""
+    monkeypatch.setattr(ldap_module, "_monotonic", _FakeClock())
+    calls = 0
+
+    def time_out() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == on_call:
+            raise ldap3.core.exceptions.communication_exception_factory(
+                kind, TimeoutError("synthetic")
+            )("synthetic")
+
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")], on_page=time_out)
+    conn.socket = _FakeSocket(own)
+    with pytest.raises(LdapUnansweredError if as_deadline else kind) as raised:
+        ldap_module._search_paged(conn, "group search", budget=10.0)
+    if as_deadline:
+        assert isinstance(raised.value, LdapUnansweredError)
+        assert raised.value.code_name == "deadline spent"
+        assert isinstance(raised.value.__cause__, kind)
+    assert conn.abandons == []
+    assert conn.socket.timeout == own
 
 
 _ENTRY = object()
@@ -1101,7 +1147,7 @@ def test_real_ldap3_refuses_a_group_search_whose_second_page_is_busy() -> None:
 def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3696 item 3 through a real socket. The second page takes 1.5 s, inside the 2 s
+    """BACKLOG #3696 item 3 through a real socket. The second page takes 0.6 s, inside the 2 s
     receive timeout, so before the deadline it was read. The first page spends all but 0.2 s of
     the deadline on the engine's clock, so the second page's read may wait only that, and times
     out. The timeout is refused as the deadline, not passed on as one slow read."""
@@ -1110,7 +1156,7 @@ def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
 
     def answer(raw: bytes) -> list[_Reply]:
         if b"synthetic-cookie-1" in raw:
-            time.sleep(1.5)
+            time.sleep(0.6)
         else:
             clock.now += 1.8  # before the reply is sent, so before the engine reads it
         return _two_pages(raw)

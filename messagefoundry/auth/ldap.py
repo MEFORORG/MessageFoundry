@@ -1149,10 +1149,11 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
     the directory was paging, and a page that does not say whether it is the last cannot be read
     as the last.
 
-    **All the pages share one deadline, ``budget`` seconds** (BACKLOG #3696 item 3). Each page's
-    reads wait at most what is left of it (:class:`_SocketTimeoutCap`), and no page is asked for
-    once it is spent. A read that waits out the deadline, or a deadline spent between pages, is
-    refused as ``deadline spent``. Without it, every page could take the whole
+    **All the pages share one deadline, ``budget`` seconds** (BACKLOG #3696 item 3). Each socket
+    read of a page waits at most what was left when the page was asked for
+    (:class:`_SocketTimeoutCap`), and no page is asked for once it is spent. A deadline spent
+    between pages, or a read or send of a later page that waits out what was left, is refused as
+    ``deadline spent``; a first page that times out is one slow read, as any other search's. Without it, every page could take the whole
     ``[auth].ad_receive_timeout``, so the bound was that times the page count. What the bound
     does not cover is in ``docs/CONNECTIONS.md``, the Active Directory row of the timeout table.
 
@@ -1180,7 +1181,10 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
         nonlocal out_of_time
         out_of_time = True
         return _paging_refused(
-            operation, "deadline spent", f"did not finish paging within {budget:g} s"
+            operation,
+            "deadline spent",
+            f"did not finish paging within {budget:g} s",
+            "BACKLOG #3696",
         )
 
     try:
@@ -1191,10 +1195,13 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
             shortened = timeout.cap(remaining)
             try:
                 _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
-            except ldap3.core.exceptions.LDAPSocketReceiveError as exc:
-                # ldap3 merges the socket's own exception into its class, so a read that waited
-                # out the deadline rather than the receive timeout is a TimeoutError here.
-                if shortened and isinstance(exc, TimeoutError):
+            except (
+                ldap3.core.exceptions.LDAPSocketReceiveError,
+                ldap3.core.exceptions.LDAPSocketSendError,
+            ) as exc:
+                # ldap3 merges the socket's own exception into its class, so a read or send that
+                # waited out the deadline rather than the socket's timeout is a TimeoutError here.
+                if page and shortened and isinstance(exc, TimeoutError):
                     raise spent() from exc
                 raise
             entries.extend(conn.entries)
@@ -1211,6 +1218,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
                     operation,
                     "too many entries",
                     f"returned more than {_MAX_PAGED_ENTRIES:,} entries",
+                    "BACKLOG #3696",
                 )
             if not cookie:
                 return entries
@@ -1249,7 +1257,13 @@ class _SocketTimeoutCap:
         if self._sock is None:
             return False
         shortened = self._original is None or seconds < self._original
-        self._sock.settimeout(seconds if shortened else self._original)
+        try:
+            self._sock.settimeout(seconds if shortened else self._original)
+        except OSError as failed:
+            # A socket ldap3 already closed: nothing reads it, and the refusal or the next
+            # search's own error is the answer, so this must not replace either.
+            logger.debug("AD socket timeout cap on a paged search: %s", _type_name(failed))
+            return False
         return shortened
 
     def restore(self) -> None:
@@ -1288,12 +1302,15 @@ def _abandon_paging(
         logger.debug("AD abandon of a refused %s failed: %s", operation, _type_name(failed))
 
 
-def _paging_refused(operation: str, case: str, what: str) -> LdapUnansweredError:
-    """The refusal for a paged search whose pages each ended with success but whose paging did not
-    end, warned once per operation and case."""
+def _paging_refused(
+    operation: str, case: str, what: str, item: str = "BACKLOG #3010"
+) -> LdapUnansweredError:
+    """The refusal for a paged search refused for its paging rather than for a result code: the
+    paging did not end, or ran past its deadline or entry cap. Warned once per operation and case;
+    ``item`` is the backlog item that added the case."""
     message = (
         f"AD {what} on the {operation}; the engine reads it as the directory not answering "
-        "(BACKLOG #3010)."
+        f"({item})."
     )
     _warn_once(f"unanswered: {operation}: {case}", "%s Reported once.", message)
     return LdapUnansweredError(message, code_name=case)
