@@ -2720,7 +2720,15 @@ spent the refusal is audited, with at least the reasons named here. A factor tha
 at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
 once the code has been checked, which is also logged, and a passkey set that fails its seal. A
 TOTP secret that does not open for the check itself is refused the same way, before any code is
-read, so no recovery code is spent and nothing is charged. The passkey leg re-reads whether or not its
+read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
+turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
+change can leave the check nothing to spend, so the code fails its spend. Only a code that
+MATCHED the factor is asked further: the account is read again, and a factor turned off or
+replaced since the check began is refused with `reason=factor_removed` or
+`reason=factor_replaced` and charged nothing. A code that matched nothing is a wrong code and is
+charged unread, whatever lands meanwhile. A matched code is still charged when the row cannot be
+read, the secret does not open, or the re-read raises: none of those proves a change. The
+passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers
@@ -3013,15 +3021,21 @@ outside the store cipher, documented in the crypto inventory); the authenticator
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
 normal for synced passkeys). A miss whose passkey is confirmed gone writes no clone row (BACKLOG
-#3068). The leg cannot tell why a compare-and-set missed, so after a miss it asks whether the
-passkey is still held. If the passkey, or its whole account, is gone by then, the miss is refused
-as `auth.webauthn_failed`. A deleted passkey gives `reason=factor_removed`, and a deleted account
-gives `reason=session_lost`. An MFA reset gives `reason=session_lost` once its revocation has
-landed, and `reason=factor_removed` before. So a genuine counter race that a delete follows leaves
-no clone row; that is accepted. A miss writes the clone row in at least these cases: the passkey
-is still held, or its set fails its seal. The row is written before the session, the account and
-the lock are read again. So a holder ending their own session cannot suppress it, and nor can a
-disable or a lock landing meanwhile. The refusal then also carries that change's own reason.
+#3068; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment of 2026-10-17).
+**Gone is decided by the write that missed** (BACKLOG #3774): the compare-and-set answers moved,
+mismatch or gone under one locked write on every backend, so a delete landing after the miss
+cannot turn a miss on a passkey that still existed into a confirmed-gone one. A gone passkey is
+refused as `auth.webauthn_failed` with `reason=factor_removed`, or `reason=session_lost` when the
+session or the account went with it. An MFA reset gives `reason=session_lost` once its revocation
+has landed, and `reason=factor_removed` before. So a genuine counter race followed by a delete
+that lands BEFORE the write leaves no clone row; that is accepted. One case keeps the signal on a
+gone passkey: when the passkey set read after the write fails its seal, the row may have gone
+outside the store's sealed write path, so the clone row is written and the refusal is
+`reason=factor_unverified`. A mismatch writes the clone row
+at once, before the session, the account, the lock and the passkey set are read again. So a
+holder ending their own session cannot suppress it, and nor can a disable, a lock, a passkey
+delete or a store error landing after the write. The refusal then also carries that change's own
+reason.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,

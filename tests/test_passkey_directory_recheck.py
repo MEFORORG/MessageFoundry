@@ -40,7 +40,11 @@ from messagefoundry.auth.service import (  # noqa: E402
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.crypto import generate_key, make_cipher  # noqa: E402
-from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
+from messagefoundry.store.store import (  # noqa: E402
+    MessageStore,
+    SignCountAnswer,
+    UserRecord,
+)
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
 from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
@@ -523,7 +527,7 @@ async def test_what_lands_before_the_factor_write_is_honoured(
         response = await _staged_assertion(service, token, key)
     real_update = store.update_webauthn_sign_count
 
-    async def _update_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+    async def _update_while_something_lands(*args: Any, **kwargs: Any) -> SignCountAnswer:
         if change == "lock":
             await _lock_second_step(store, user_id)
         elif change == "revoke":
@@ -538,11 +542,14 @@ async def test_what_lands_before_the_factor_write_is_honoured(
         elif change == "counter-moved":
             # A concurrent assertion of the same passkey got its count written first.
             (held,) = await store.list_webauthn_credentials(user_id)
-            assert await real_update(
-                held.credential_id_hash,
-                expected=held.sign_count,
-                new=held.sign_count + 100,
-                used_at=0.0,
+            assert (
+                await real_update(
+                    held.credential_id_hash,
+                    expected=held.sign_count,
+                    new=held.sign_count + 100,
+                    used_at=0.0,
+                )
+                == "moved"
             )
         else:
             # After the write: a delete before it already fails the sign-count compare-and-set.
@@ -585,7 +592,7 @@ async def test_an_account_deleted_mid_assertion_on_a_keyed_store_is_a_lost_sessi
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
 
-        async def _update_after_the_account_goes(*args: Any, **kwargs: Any) -> bool:
+        async def _update_after_the_account_goes(*args: Any, **kwargs: Any) -> SignCountAnswer:
             await store.delete_user(user_id)
             return await real_update(*args, **kwargs)
 
@@ -649,15 +656,18 @@ async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(ch
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
 
-        async def _miss_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        async def _miss_while_something_lands(*args: Any, **kwargs: Any) -> SignCountAnswer:
             (held,) = await store.list_webauthn_credentials(user_id)
             if _MISS_OUTCOMES[change][0]:
                 # A concurrent assertion of the same passkey got its count written first.
-                assert await real_update(
-                    held.credential_id_hash,
-                    expected=held.sign_count,
-                    new=held.sign_count + 100,
-                    used_at=0.0,
+                assert (
+                    await real_update(
+                        held.credential_id_hash,
+                        expected=held.sign_count,
+                        new=held.sign_count + 100,
+                        used_at=0.0,
+                    )
+                    == "moved"
                 )
             if change == "revoke":
                 await store.revoke_session(hash_token(token))
@@ -675,9 +685,9 @@ async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(ch
                 await service.admin_reset_mfa(user_id, actor="synthetic-admin")
             else:
                 assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
-            moved = await real_update(*args, **kwargs)
-            assert moved is False
-            return moved
+            answer = await real_update(*args, **kwargs)
+            assert answer == ("mismatch" if _MISS_OUTCOMES[change][0] else "gone")
+            return answer
 
         store.update_webauthn_sign_count = _miss_while_something_lands  # type: ignore[method-assign]
 
@@ -709,13 +719,16 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
         async def _store_error(*_args: Any) -> list[object]:
             raise RuntimeError("synthetic: the store read failed")
 
-        async def _miss(*args: Any, **kwargs: Any) -> bool:
+        async def _miss(*args: Any, **kwargs: Any) -> SignCountAnswer:
             (held,) = await store.list_webauthn_credentials(user_id)
-            assert await real_update(
-                held.credential_id_hash,
-                expected=held.sign_count,
-                new=held.sign_count + 100,
-                used_at=0.0,
+            assert (
+                await real_update(
+                    held.credential_id_hash,
+                    expected=held.sign_count,
+                    new=held.sign_count + 100,
+                    used_at=0.0,
+                )
+                == "moved"
             )
             # Every read of the set from here on fails, which is the holder question's first read.
             store.list_webauthn_credentials = _store_error  # type: ignore[method-assign,assignment]
@@ -733,6 +746,83 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
         await store.close()
 
 
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
+    keyed: bool,
+) -> None:
+    """BACKLOG #3774, ADR 0068 decision 4 as amended 2026-10-17. The miss is judged by the write
+    that missed: the passkey still existed and held another count, so it is a clone signal, and a
+    delete landing AFTER that write, before the holder is asked, must not explain it away. RED
+    when: no ``auth.webauthn_clone_suspected`` row is written, which is what the old two-step
+    question (a miss, then a separate read whether the passkey is still held) gave."""
+    cipher = make_cipher(generate_key()) if keyed else None
+    store = await MessageStore.open(":memory:", cipher=cipher)
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _miss_then_the_passkey_goes(*args: Any, **kwargs: Any) -> Any:
+            (held,) = await store.list_webauthn_credentials(user_id)
+            # A concurrent assertion of the same passkey got its count written first. ``True`` is
+            # what the store answered before BACKLOG #3774, so the test also runs red there.
+            assert await real_update(
+                held.credential_id_hash,
+                expected=held.sign_count,
+                new=held.sign_count + 100,
+                used_at=0.0,
+            ) in ("moved", True)
+            answer = await real_update(*args, **kwargs)
+            # The old window: after the miss, before the question whether the passkey is held.
+            assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            return answer
+
+        store.update_webauthn_sign_count = _miss_then_the_passkey_goes  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        assert {"reason": "factor_removed"} in await _audited_assertion_failures(store)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -> None:
+    """BACKLOG #3774, ADR 0068 amendment of 2026-10-17. The write answers ``gone``, but the row
+    left outside the store's sealed write path, so the account's set fails its seal: that proves no
+    holder's delete. RED when: no ``auth.webauthn_clone_suspected`` row is written, or the refusal
+    reads ``factor_removed`` rather than ``factor_unverified``. Keyed, so the seal can fail."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _the_row_goes_unsealed(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            await store._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+            await store._db.commit()
+            answer = await real_update(*args, **kwargs)
+            assert answer == "gone"
+            return answer
+
+        store.update_webauthn_sign_count = _the_row_goes_unsealed  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        failures = await _audited_assertion_failures(store)
+        assert {"reason": "factor_unverified"} in failures
+        assert {"reason": "factor_removed"} not in failures
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() -> None:
     """BACKLOG #3068, the ``factor_unverified`` branch on its own. A set that fails its seal once the
     sign count has moved says nothing about the passkey, so the factor write is refused as
@@ -743,9 +833,9 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
 
-        async def _update_then_break_the_seal(*args: Any, **kwargs: Any) -> bool:
+        async def _update_then_break_the_seal(*args: Any, **kwargs: Any) -> SignCountAnswer:
             moved = await real_update(*args, **kwargs)
-            assert moved is True
+            assert moved == "moved"
             await _break_the_passkey_seal(store, user_id)
             return moved
 

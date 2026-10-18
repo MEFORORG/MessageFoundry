@@ -121,15 +121,24 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     else:
         raise AssertionError("duplicate (user_id, label) was silently accepted")
 
-    # Sign-count CAS (the consume_totp_step precedent): True iff stored == expected; a miss is the
-    # clone signal. 0->0 (synced passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) is True
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) is False
+    # Sign-count CAS (the consume_totp_step precedent), answered by the one locked write (BACKLOG
+    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count
+    # (the clone signal), which writes nothing; "gone" when there is no such passkey. 0->0 (synced
+    # passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
+    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) == "moved"
+    assert (
+        await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) == "mismatch"
+    )
     got = await store.get_webauthn_credential("h1")
     assert got.sign_count == 6 and got.last_used_at == 60.0
+    assert (
+        await store.update_webauthn_sign_count("h-none", expected=0, new=1, used_at=62.0) == "gone"
+    )
+    assert await store.get_webauthn_credential("h-none") is None
     for used_at in (70.0, 71.0):
         assert (
-            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at) is True
+            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at)
+            == "moved"
         )
     assert (await store.get_webauthn_credential("h2")).sign_count == 0
 
@@ -138,6 +147,8 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h1") is not None
     assert await store.delete_webauthn_credential("wa-u1", "h1") is True
     assert await store.delete_webauthn_credential("wa-u1", "h1") is False  # already gone
+    # A deleted passkey answers "gone" whatever count is offered, the stored one included.
+    assert await store.update_webauthn_sign_count("h1", expected=6, new=8, used_at=63.0) == "gone"
     assert await store.has_webauthn_credentials("wa-u1") is True  # h2 remains
 
     # delete_all (admin_reset_mfa) returns the removed count.

@@ -561,6 +561,73 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
+#: Each case: the change landing during the check, whether the code sent is the correct one, and the
+#: reason it is refused with (``None``: charged as a wrong code).
+_CHANGED_FACTOR_CASES: dict[str, tuple[str, bool, str | None]] = {
+    "factor-off": ("factor-off", True, "factor_removed"),
+    "factor-replaced": ("factor-replaced", True, "factor_replaced"),
+    "factor-replaced-same-stamp": ("factor-replaced-same-stamp", True, "factor_replaced"),
+    "wrong-code-meets-a-change": ("factor-off", False, None),
+    "wrong-code": ("none", False, None),
+}
+
+
+@pytest.mark.parametrize("case", list(_CHANGED_FACTOR_CASES))
+async def test_a_factor_changed_during_the_check_charges_no_lockout(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """BACKLOG #3780 item 1. A self-service disable or re-enrolment takes no queue and clears the
+    recovery codes the check spends, so a CORRECT recovery code whose factor is turned off, or
+    turned off and enrolled again, while the code is checked fails its spend. RED when: that code
+    falls through to the wrong-code branch, which charges the second-step lockout, rather than
+    being refused with its own reason. ``-same-stamp`` gives the new enrolment the old stamp, so
+    only the secret tells them apart. The controls: a WRONG code is charged whether or not a change
+    lands during its check, since it matched nothing."""
+    change, correct, reason = _CHANGED_FACTOR_CASES[case]
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_the_factor_changes(*args: Any, **kwargs: Any) -> bool:
+        # The check holds the row it loaded, so a change landing now is one it cannot see.
+        before = await store.get_user(user_id)
+        assert before is not None
+        if change != "none":
+            await store.disable_totp(user_id)
+        if change.startswith("factor-replaced"):
+            cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+            assert cell is not None
+            stamp = before.totp_enrolled_at if change.endswith("same-stamp") else _T1
+            assert stamp is not None
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=stamp
+            )
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_the_factor_changes)
+    code = confirmed.recovery_codes[0] if correct else "ZZZZ-ZZZZ-ZZZZ"
+
+    refused = await service.verify_mfa(confirmed.token, code)
+
+    assert refused.ok is False and refused.locked is False and refused.session_lost is False
+    user = await store.get_user(user_id)
+    assert user is not None
+    if reason is None:
+        assert user.second_step_failed_attempts == 1
+        return
+    assert {"reason": reason} in await _audited_mfa_failures(store)
+    assert user.second_step_failed_attempts == 0
+    # No plain wrong-code row: the refusal is audited once, with its reason.
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert all(r["detail"] for r in rows)
+
+
 async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
