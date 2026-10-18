@@ -493,9 +493,8 @@ async def test_each_failing_sink_call_has_its_own_streak(
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
         for _ in range(3):
-            runner._report(
-                outcomes, _recorded()
-            )  # A's raise fails every time; B's raise lands once
+            # A's raise fails every time; B's raise lands once.
+            runner._report(outcomes, _recorded())
         assert (warned("raised"), warned("resolved")) == (1, 0)
         assert sink.kinds() == ["refused"]
 
@@ -587,9 +586,8 @@ async def test_a_report_that_raises_does_not_end_the_loop(
         return [ReloadOutcome(path, 0, refusal, 1)]
 
     runner = _runner(sink, interval_seconds=0.01, reload=reload, skip_when_idle=idle)
-    runner._report(
-        [ReloadOutcome(path, 0, refusal, 1)], _recorded()
-    )  # one open alert, so clears read
+    # One open alert, so clears read the record.
+    runner._report([ReloadOutcome(path, 0, refusal, 1)], _recorded())
     reads: list[int] = []
 
     def broken_record() -> dict[str, ReloadRefusal]:
@@ -632,9 +630,8 @@ async def test_a_streak_ends_once_its_call_is_no_longer_owed(
             assert len(failures) == expected, "one WARNING per streak"
             assert crl_path_key(path) in failures[-1].getMessage(), "and it names the file"
             loaded_crls.clear_reload_refusal(path)
-            runner._report(
-                [], _recorded()
-            )  # the refusal is gone, so the failed raise is no longer owed
+            # The refusal is gone, so the failed raise is no longer owed.
+            runner._report([], _recorded())
     assert sink.events == []
 
 
@@ -1032,20 +1029,33 @@ async def test_the_idle_runner_decides_nothing_while_another_pass_holds_the_lock
         ticks.append(1)
         return forget_all()
 
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(crl_reload, "_forget_all", counted)
-        crl_reload._PASS_LOCK.acquire()  # the abandoned pass, still running
-        runner.start()
-        try:
+    held, release = threading.Event(), threading.Event()
+
+    def abandoned_pass() -> None:
+        # Its own thread, as an abandoned pass is, so a loop that waited on the lock would stall
+        # for the timeout and fail the test, not deadlock on a lock its own thread holds.
+        with crl_reload._PASS_LOCK:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=abandoned_pass, name="abandoned-pass")
+    holder.start()
+    try:
+        assert held.wait(5), "the premise: the abandoned pass holds the lock"
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(crl_reload, "_forget_all", counted)
+            runner.start()
             try:
                 await until(lambda: len(ticks) >= 3, "three idle intervals")
                 assert sink.kinds() == ["refused"], "nothing decided while the lock is held"
+                release.set()
+                # The control: the same branch resolves once it can take the lock.
+                await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
             finally:
-                crl_reload._PASS_LOCK.release()
-            # The control: the same branch resolves once it can take the lock.
-            await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
-        finally:
-            await runner.stop()
+                await runner.stop()
+    finally:
+        release.set()
+        holder.join(10)
     assert passes == [] and sink.kinds() == ["refused", "applied"]
 
 
@@ -1306,6 +1316,54 @@ async def test_the_first_sight_clear_reads_what_its_own_pass_judged(
 
     assert all(unread), "the premise: each pass found the file unreadable"
     assert sink.events == []
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+class _PassAborted(BaseException):
+    """Ends a whole pass: the pass guards each file against an ``Exception`` only."""
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["a-pass-that-returns", "a-pass-that-raises"])
+def test_the_real_pass_copies_the_record_before_it_releases_the_lock(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    """The copy is taken in the same hold of the pass lock as the pass's own writes, so no other
+    pass can write between them, and also when the pass raises: what it recorded stands."""
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_expired(pki))
+    copied_locked: list[bool] = []
+    real_read = loaded_crls.reload_refusals
+
+    def read() -> dict[str, ReloadRefusal]:
+        copied_locked.append(crl_reload._PASS_LOCK.locked())
+        return real_read()
+
+    monkeypatch.setattr(crl_reload, "reload_refusals", read)
+    if fails:
+        real_finish = crl_reload._finish
+
+        def finish_then_fail(*args: Any) -> ReloadOutcome:
+            real_finish(*args)  # records the refusal
+            raise _PassAborted("the pass fails after recording")
+
+        # Not an Exception, so the per-file guard lets it end the whole pass.
+        monkeypatch.setattr(crl_reload, "_finish", finish_then_fail)
+    view = crl_reload._PassView()
+    token = crl_reload._PASS_VIEW.set(view)
+    try:
+        if fails:
+            with pytest.raises(_PassAborted):
+                reload_replaced_crls()
+        else:
+            reload_replaced_crls()
+    finally:
+        crl_reload._PASS_VIEW.reset(token)
+
+    assert copied_locked == [True], "one copy, taken while the pass still held the lock"
+    assert crl_path_key(pki.crl) in view.refusals(), "the refusal the pass recorded"
+    assert (crl_path_key(pki.crl) in view.judged) is not fails, (
+        "judged only by a pass that returned"
+    )
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 

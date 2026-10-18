@@ -481,11 +481,15 @@ class _PassView:
     """What one pass of a :class:`CrlReloadRunner` saw, for the runner's loop to decide from.
 
     ``judged`` holds each file the pass judged, by path key, with the path it read the file by.
-    :meth:`take_refusals` copies the refusal record as the pass left it. The pass fills both under
-    :data:`_PASS_LOCK`, in the worker thread, before it releases the lock, and the loop reads them
-    only once the pass has returned. So the loop decides from its own pass alone, and never from
-    the pass state above or the live record, which a pass abandoned by an earlier runner's
-    :meth:`~CrlReloadRunner.stop` may still be changing."""
+    :meth:`take_refusals` copies the refusal record, which is written only under
+    :data:`_PASS_LOCK`. A real pass fills both in the worker thread, in the same hold of that lock
+    as its own writes, before it releases it. Two views come from outside a pass, and judge
+    nothing: the idle branch's, copied on the event loop by :func:`_forget_all` under a lock it
+    took without waiting, and an injected ``reload``'s, copied by
+    :meth:`CrlReloadRunner._judged_pass` in a hold of its own. The loop reads a view only once it
+    is filled, and decides from it alone, never from the pass state above or the live record,
+    which a pass abandoned by an earlier runner's :meth:`~CrlReloadRunner.stop` may still be
+    changing."""
 
     def __init__(self) -> None:
         self.judged: dict[str, str] = {}
@@ -498,18 +502,22 @@ class _PassView:
         return self._refusals is not None or self._unread is not None
 
     def take_refusals(self) -> None:
-        """Copy the refusal record now. Under :data:`_PASS_LOCK`, which every write to the record
-        is made under. A failure is kept, not raised: it is raised again on the loop, by the step
-        that needs the record (:meth:`refusals`), which is guarded there."""
+        """Copy the refusal record now, under :data:`_PASS_LOCK`. A failure is kept, not raised:
+        :meth:`refusals` raises it again on the loop, in the step that needs the record, which is
+        guarded there and logs it once per failing streak of its type and message."""
         try:
             self._refusals = reload_refusals()
         except Exception as exc:  # noqa: BLE001 - kept, and raised again by refusals()
-            self._unread = exc
+            # Without its traceback, whose frames would keep the pass's contexts alive in a cycle
+            # through this view until a collection.
+            self._unread = exc.with_traceback(None)
 
     def refusals(self) -> dict[str, ReloadRefusal]:
-        """The refusal record as this view's pass left it, by path key."""
+        """The refusal record as this view copied it, by path key."""
+        if self._unread is not None:
+            raise self._unread
         if self._refusals is None:
-            raise RuntimeError("the pass left no reading of the refusal record") from self._unread
+            raise RuntimeError("the pass took no copy of the refusal record")
         return self._refusals
 
 
@@ -952,10 +960,12 @@ def reload_replaced_crls(
 
     Each file it judged, and the refusal record as it leaves it, is recorded in the
     :class:`_PassView` that :data:`_PASS_VIEW` points to, if any."""
-    now = time.time() if now is None else now
     view = _PASS_VIEW.get()
     judged: dict[str, str] = {} if view is None else view.judged
     with _PASS_LOCK:
+        # Once the lock is held: a pass queued behind one an earlier runner's stop abandoned may
+        # have waited minutes, and judges expiry and effect by the time it runs.
+        now = time.time() if now is None else now
         try:
             pending, outcomes = _pending(judged)
             if not pending:
@@ -1053,9 +1063,10 @@ class CrlReloadRunner:
     **It resolves that alert with ``crl_reload_applied``, and only on evidence.** A pass returns
     no outcome for a file it could not read, and none when it failed, while the refusal still
     stands. So a missing outcome clears nothing: the alert is resolved only once the refusal is
-    gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`), as this
-    runner's own pass left it (:class:`_PassView`). That is when the file was applied, when it was put back to the bytes the hops hold, and when no hop
-    holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
+    gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`), as read
+    under the pass lock by this runner's own pass or, when no hop holds a CRL, by its idle branch
+    (:class:`_PassView`). That is when the file was applied, when it was put back to the bytes
+    the hops hold, and when no hop holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
     every context from the file and nothing later would clear it.
 
     **A process that died without stopping is cleared up after, where it can be (vault BACKLOG
