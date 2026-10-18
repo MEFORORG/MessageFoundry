@@ -25,6 +25,7 @@ from messagefoundry.api.models import (
     ApprovalDecisionResult,
     ApprovalList,
     PendingApprovalInfo,
+    ReleaseBlocked,
     ResolveOutcome,
 )
 from messagefoundry.auth import Role
@@ -136,9 +137,7 @@ async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: En
     assert await _status(engine, approval_id) == "rejected"
 
 
-def test_an_ungated_row_offers_no_approve() -> None:
-    """The page reads ``gated`` alone; a gated row of the same shape still offers Approve."""
-    aid = "b" * 32
+def _row(aid: str, **update: object) -> PendingApprovalInfo:
     row = PendingApprovalInfo(
         id=aid,
         operation="dead_letter_replay",
@@ -147,9 +146,16 @@ def test_an_ungated_row_offers_no_approve() -> None:
         requester="maker",
         requested_at=time.time(),
     )
-    gated = str(pages.approvals_page(ApprovalList(approvals=[row])))
+    return row.model_copy(update=update)
+
+
+def test_an_ungated_row_offers_no_approve() -> None:
+    """The page reads ``release_blocked`` alone; an unblocked row of the same shape still offers
+    Approve."""
+    aid = "b" * 32
+    gated = str(pages.approvals_page(ApprovalList(approvals=[_row(aid)])))
     ungated = str(
-        pages.approvals_page(ApprovalList(approvals=[row.model_copy(update={"gated": False})]))
+        pages.approvals_page(ApprovalList(approvals=[_row(aid, release_blocked="not_gated")]))
     )
     assert f'action="/ui/approvals/{aid}/approve"' in gated
     assert f'action="/ui/approvals/{aid}/approve"' not in ungated
@@ -159,7 +165,7 @@ def test_an_ungated_row_offers_no_approve() -> None:
     own = str(
         pages.approvals_page(
             ApprovalList(
-                approvals=[row.model_copy(update={"gated": False, "caller_is_requester": True})]
+                approvals=[_row(aid, release_blocked="not_gated", caller_is_requester=True)]
             )
         )
     )
@@ -169,6 +175,28 @@ def test_an_ungated_row_offers_no_approve() -> None:
     # on anyone else's.
     assert "Withdraw it;" in own and "Reject it;" not in own
     assert "Reject it;" in ungated and "Withdraw it;" not in ungated
+
+
+def test_every_blocked_reason_hides_approve_and_names_the_rows_own_verb() -> None:
+    """Vault BACKLOG #3192: each reason the engine names gets a note, no Approve, and the verb of
+    the button beside it, so no note says Reject beside a Withdraw button."""
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    reasons = get_args(ReleaseBlocked)
+    assert set(reasons) == set(page_module._BLOCKED)
+    aid = "d" * 32
+    for reason in reasons:
+        for own, verb, other in ((False, "Reject it", "Withdraw"), (True, "Withdraw it", "Reject")):
+            html = str(
+                pages.approvals_page(
+                    ApprovalList(
+                        approvals=[_row(aid, release_blocked=reason, caller_is_requester=own)]
+                    )
+                )
+            )
+            assert f'action="/ui/approvals/{aid}/approve"' not in html, reason
+            assert f'action="/ui/approvals/{aid}/reject"' in html, reason
+            assert verb in html and f"{other} it" not in html, (reason, own)
 
 
 def test_enter_in_the_resolve_form_records_no_outcome() -> None:
@@ -498,27 +526,23 @@ def test_every_resolve_outcome_has_a_button_and_a_notice() -> None:
 
 
 def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
-    def _row(params: dict[str, object] | None) -> PendingApprovalInfo:
-        return PendingApprovalInfo(
-            id="b" * 32,
-            operation="dead_letter_replay",
-            label="replay",
-            requester="maker",
-            requested_at=0.0,
-            params=params,
-        )
+    def _with(params: dict[str, object] | None) -> PendingApprovalInfo:
+        # What the engine sends beside params it could not read (vault BACKLOG #3192).
+        blocked = None if params is not None else "params_unreadable"
+        return _row("b" * 32, params=params, release_blocked=blocked)
 
-    unreadable = str(pages.approvals_page(ApprovalList(approvals=[_row(None)])))
+    unreadable = str(pages.approvals_page(ApprovalList(approvals=[_with(None)])))
     assert ">unreadable<" in unreadable
     # The gate refuses to release a row it cannot read, so the page does not offer Approve.
     assert "/approve" not in unreadable and "/reject" in unreadable
-    assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_row({})])))
+    assert "Its parameters are unreadable" in unreadable
+    assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_with({})])))
     # The requester carry-over is left out while it repeats the Requester column...
     assert ">none<" in str(
-        pages.approvals_page(ApprovalList(approvals=[_row({"requester": "maker"})]))
+        pages.approvals_page(ApprovalList(approvals=[_with({"requester": "maker"})]))
     )
     # ...and shown when it differs, since the release audits under that value.
-    differs = str(pages.approvals_page(ApprovalList(approvals=[_row({"requester": "other"})])))
+    differs = str(pages.approvals_page(ApprovalList(approvals=[_with({"requester": "other"})])))
     assert "requester: other" in differs
 
 

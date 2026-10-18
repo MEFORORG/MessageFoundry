@@ -265,13 +265,19 @@ async def _assert_repeat_request_contract(store: Any) -> None:
             detail=json.dumps({"approval_id": existing}),
         )
 
-    async def request(*, requester_user_id: str = _REQUESTER_ID, now: float = 1_000.0) -> str:
+    async def request(
+        *,
+        requester_user_id: str = _REQUESTER_ID,
+        now: float = 1_000.0,
+        operation: str = "dead_letter_replay",
+        text: str = params,
+    ) -> str:
         approval_id = uuid4().hex
         held = str(
             await store.create_pending_approval(
                 approval_id=approval_id,
-                operation="dead_letter_replay",
-                params=params,
+                operation=operation,
+                params=text,
                 requester=_REQUESTER,
                 requester_user_id=requester_user_id,
                 requested_at=now,
@@ -306,6 +312,14 @@ async def _assert_repeat_request_contract(store: Any) -> None:
         # Another requester, or the same one after the request expired, files a new one.
         other = await request(requester_user_id="contract-other-requester-id")
         assert other != first
+        # The match compares bytes on every backend (vault BACKLOG #3193). SQL Server's default
+        # collation is case-INSENSITIVE, so without its BIN2 COLLATE each of these would join.
+        cased = {
+            await request(text=params.upper()),
+            await request(operation="DEAD_LETTER_REPLAY"),
+            await request(requester_user_id=_REQUESTER_ID.upper()),
+        }
+        assert len(cased) == 3 and not cased & {first, other}
         later = await request(now=1_061.0)
         assert later not in (first, other)
 

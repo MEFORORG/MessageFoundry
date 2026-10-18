@@ -74,6 +74,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
@@ -1277,7 +1278,8 @@ def _app_drain_steps(
        cancelled save left running, the releases they start, and the save-time sweeps that write
        ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
        ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
-    3. Approval outcome writes (BACKLOG #2087), which would otherwise meet a closed store.
+    3. Every approval write the gate still has running (BACKLOG #2087), at least the outcome writes
+       and the request writes (vault BACKLOG #3193), which would otherwise meet a closed store.
     4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
        security notifier, so they drain before that notifier stops.
     5. The open summary-access windows (M-5, BACKLOG #1640). Every clean restart otherwise dropped
@@ -1318,7 +1320,9 @@ def _app_drain_steps(
     if gate is not None:
         steps.append(
             _TeardownStep(
-                "the approval outcome-write drain", 0.5, lambda b: gate.drain(b * _INNER_SHARE)
+                "the approval request- and outcome-write drain",
+                0.5,
+                lambda b: gate.drain(b * _INNER_SHARE),
             )
         )
     if auth is not None and owns_auth:
@@ -1441,11 +1445,13 @@ def _build_approval_gate(
         #
         # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
         # whose params carry none is refused before anything runs, rather than released as a
-        # destructive purge whose row names no actor. The raise reaches the gate's compensation,
-        # which records the release as 'failed', and the route answers 409. Every hold the route
-        # files carries the key (_purge_hold_params), so this is a guard, not a migration path.
-        requester = p.get("requester")
-        if not isinstance(requester, str) or not requester:
+        # destructive purge whose row names no actor. The gate refuses such a hold before its claim
+        # (requires_requester below, release_blocked 'params_no_requester', the same test), so
+        # this one is reached only if that registration flag is dropped; its raise would then reach
+        # the gate's compensation as 'failed'. Every hold the route files carries the key
+        # (_purge_hold_params), so this is a guard, not a migration path.
+        requester = named_requester(p)
+        if requester is None:
             raise ApprovalError(
                 409,
                 "this purge request records no requester, so its connection_purge row could not "
@@ -1486,9 +1492,17 @@ def _build_approval_gate(
         # refusal, below). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
-        # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
-        # gate's compensation and record a reload that ran as 'failed'.
-        actor = str(p["requester"])
+        # Read BEFORE the reload (BACKLOG #1940): a raise after the swap would reach the gate's
+        # compensation and record a reload that ran as 'failed'. The gate refuses a hold naming no
+        # requester before its claim (requires_requester below), so this refusal, as the purge's,
+        # is reached only if that flag is dropped; it keeps a row naming no actor from being written.
+        actor = named_requester(p)
+        if actor is None:
+            raise ApprovalError(
+                409,
+                "this reload request records no requester, so its config_reload row could not "
+                "name who ran it; it was not run",
+            )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
         # whose params carry no digest (none is filed that way now) binds to None, which matches
         # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
@@ -1566,12 +1580,14 @@ def _build_approval_gate(
         _purge,
         permission=Permission.MESSAGES_PURGE,
         in_scope=lambda identity, _p: _purge_in_scope(identity),
+        requires_requester=True,
     )
     gate.register(
         "config_reload",
         "Reload the live config graph (config:deploy)",
         _config_reload,
         permission=Permission.CONFIG_DEPLOY,
+        requires_requester=True,
     )
     return gate
 
@@ -9807,9 +9823,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     A breaker trip is ``auth.ad_reconcile_aborted`` and becomes one ``ad_reconcile_aborted`` alert.
     An engaged undetermined-wave hold is ``auth.ad_reconcile_held`` and becomes one
     ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
-    (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
-    alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
-    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
+    (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one
+    ``ad_session_revoked`` alert, except a quiet one whose row was written, which the service
+    leaves off the returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says
+    which are quiet). A whole-directory outage aborts too, but it is audited as
+    ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the directory is not,
+    and the pass is fail-open.
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -9826,10 +9845,13 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
-    the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
-    part-way for another reason, such as inside one revocation, has already audited the revocations
-    it applied before that point; those rows stand, and no alert is raised for them.
+    held, aborted, skipped, referred, faulted or unkeyed-binding row no longer ends the pass
+    (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts still fire.
+    Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked`` row and a
+    rename's rows. A pass that still raises part-way, such as on a store fault ending one account's
+    sessions, returns no plan, so no alert is raised for the revocations it applied before that
+    point. Their rows stand, except a row that was refused: that account has neither its row nor
+    its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
     Each standing alert also gets its inverse, which pages nobody and resolves the open instance
     (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
