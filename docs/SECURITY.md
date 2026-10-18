@@ -5044,9 +5044,11 @@ Every other refused bind is counted: each other result code ldap3 decodes, stron
 included, though it judges no password either, and a refused bind whose result holds no integer code.
 A correct password the DC refuses anyway, for example because the domain account is locked or its
 password has expired, **is** counted. AD answers both with invalidCredentials (49), and the engine
-reads the bind's result code, never its diagnostic text. A bind that accepts the password on an
-account the directory has demoted since sign-in is refused but not counted either, as the re-bind
-role-test paragraph says (BACKLOG #3081); it needs the right password, so it opens no guessing window. **What bounds the uncounted re-binds:** none
+reads the bind's result code, never its diagnostic text. A bind that accepts the password is not
+counted when the leg then refuses it, because the account lost a role in the directory since
+sign-in or its row moved to another directory object during the bind: it needed the right
+password, so it opens no guessing window (BACKLOG #3081, the re-bind role-test paragraph).
+**What bounds the uncounted re-binds:** none
 is charged to the row or the session, so while the DC answers that way the per-session cap does not
 bound them and only the per-actor budget does. The settings that turn that budget off or loosen it
 are listed once, in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced). A value there that turns the ceremony limit off
