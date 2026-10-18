@@ -1018,7 +1018,9 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
       override set on the app is not seen for it. The engine includes no router (vault BACKLOG
       #2739). ``tests/test_auth_before_body.py`` fails when an included route that takes a body is
       gated or undeclared and its body would be parsed before its refusal (#2956). An included
-      router whose route class is this one does refuse early on the route's own gate.
+      router whose route class is this one does refuse early on the route's own gate, but not
+      on an undeclared route: the app-level refusal is not among that route's own dependencies,
+      so its body is read first and one that does not parse gets 422 before the refusal.
     * A gate nested inside another dependency. Only a route's top-level dependencies are read,
       which is also all ``scripts/security/route_gates.py`` reads.
     * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers
