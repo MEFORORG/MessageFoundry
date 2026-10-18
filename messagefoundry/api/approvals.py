@@ -927,7 +927,9 @@ class ApprovalGate:
                 self._store.list_pending_approvals(now=self._clock()), what="the approval queue"
             )
         )
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        # One authority read per requester for the whole listing, however many requests they hold.
+        authority: dict[str, Identity | str | None] = {}
+        return [await self._queue_entry(r, caller_user_id, authority) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
@@ -939,7 +941,7 @@ class ApprovalGate:
                 self._store.list_interrupted_approvals(), what="the interrupted releases"
             )
         )
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        return [await self._queue_entry(r, caller_user_id, {}) for r in rows]
 
     async def _read[T](self, read: Awaitable[T], *, what: str) -> T:
         """A store read an approval route needs, with a fault answered as 503 rather than a raw
@@ -969,7 +971,9 @@ class ApprovalGate:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
         BACKLOG #3192). approve() refuses on exactly these, so the queue cannot predict a refusal
         the gate does not make; :class:`~messagefoundry.api.models.PendingApprovalInfo` states
-        what each value means and what ``None`` does not promise."""
+        what each value means and what ``None`` does not promise. The requester's standing is the
+        one reason not tested here: :meth:`_queue_release_blocked` adds it for the queue, and
+        approve() reads it after the dwell floor."""
         if not r.requester_user_id:
             return "no_requester_id"
         op = self._ops.get(r.operation)
@@ -985,9 +989,55 @@ class ApprovalGate:
             return "params_no_requester"
         return None
 
-    def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
+    async def _queue_release_blocked(
+        self,
+        r: ApprovalRow,
+        params: dict[str, Any] | None,
+        authority: dict[str, Identity | str | None],
+    ) -> ReleaseBlocked | None:
+        """:meth:`_release_blocked`, then the requester's standing by the rule approve() refuses on
+        (BACKLOG #3189), so a held reload or purge whose requester has since been channel-scoped is
+        marked ``requester_not_authorized``. ``authority`` caches each requester's read for one
+        listing, a failed read as ``None``. A read that fails predicts nothing for that requester's
+        requests rather than failing the whole queue, so the operator can still reach Reject on
+        every other row; approve() reads it again."""
+        blocked = self._release_blocked(r, params)
+        # The last two tests only narrow the types: _release_blocked returned None, so both hold.
+        if blocked is not None or not r.requester_user_id or params is None:
+            return blocked
+        op = self._ops[r.operation]
+        requester_user_id = r.requester_user_id
+        if requester_user_id not in authority:
+            try:
+                authority[requester_user_id] = await self._requester_authority(requester_user_id)
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                log.exception("approval %s: the requester's standing could not be read", r.id)
+                authority[requester_user_id] = None
+        read = authority[requester_user_id]
+        if read is None:
+            return None
+        try:
+            standing = self._standing_of(read, op, params)
+        except Exception:  # noqa: BLE001 - an operation's own scope check; approve() reads it again
+            log.exception("approval %s: the requester's standing could not be read", r.id)
+            return None
+        return None if standing is None else "requester_not_authorized"
+
+    async def _queue_entry(
+        self,
+        r: ApprovalRow,
+        caller_user_id: str | None,
+        authority: dict[str, Identity | str | None],
+    ) -> dict[str, Any]:
         operation = r.operation
         params = _stored_params(r.id, r.params, throttle=self._unreadable_params_reported)
+        # Only a pending row can be approved; an interrupted one is resolved instead, so its
+        # requester's standing is not read.
+        blocked = (
+            await self._queue_release_blocked(r, params, authority)
+            if r.status == "pending"
+            else None
+        )
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -1007,8 +1057,7 @@ class ApprovalGate:
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
             "gated": self.gates(operation),
-            # Only a pending row can be approved; an interrupted one is resolved instead.
-            "release_blocked": self._release_blocked(r, params) if r.status == "pending" else None,
+            "release_blocked": blocked,
         }
 
     async def approve(
@@ -1191,6 +1240,7 @@ class ApprovalGate:
         # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
+        # The queue reads the same rule, as requester_not_authorized (BACKLOG #3189).
         reason = await self._requester_standing(requester_user_id, op, params)
         if reason is not None:
             await self._refuse_stale_requester(
@@ -1645,6 +1695,12 @@ class ApprovalGate:
         Existence and the disabled flag come from the store row, not from the resolved identity. The
         resolver deliberately resolves a disabled user too (it also serves the permission inspector),
         so it cannot say "disabled" on its own."""
+        return self._standing_of(await self._requester_authority(requester_user_id), op, params)
+
+    async def _requester_authority(self, requester_user_id: str) -> Identity | str:
+        """The requester's live identity, or the reason slug that refuses every operation they
+        requested. The half of :meth:`_requester_standing` that reads the store, so the queue can
+        read it once per requester."""
         user = await self._read(
             self._store.get_user(requester_user_id), what="the requester's account"
         )
@@ -1657,9 +1713,18 @@ class ApprovalGate:
         identity = await self._resolve_identity(requester_user_id)
         if identity is None:  # deleted between the two reads, or no auth service is bound
             return "requester_unverifiable"
-        if not identity.has(op.permission):
+        return identity
+
+    @staticmethod
+    def _standing_of(
+        authority: Identity | str, op: _Operation, params: Mapping[str, Any]
+    ) -> str | None:
+        """:meth:`_requester_standing` from an already-read :meth:`_requester_authority`."""
+        if isinstance(authority, str):
+            return authority
+        if not authority.has(op.permission):
             return "requester_lacks_permission"
-        if op.in_scope is not None and not op.in_scope(identity, params):
+        if op.in_scope is not None and not op.in_scope(authority, params):
             return "requester_out_of_scope"
         return None
 

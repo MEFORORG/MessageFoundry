@@ -15,6 +15,7 @@ import { registerSteps } from "./stepsView";
 import { showAiPolicy } from "./aiPolicy";
 import { configDir, isExecGated, workspaceDir } from "./cli";
 import { RefreshCoalescer } from "./configRefresh";
+import { runTrustGrantSteps } from "./trustGrant";
 import { registerConfigWatcher } from "./configWatcher";
 import { registerLiveStatus } from "./liveStatus";
 import { CookbookPanel } from "./cookbook";
@@ -23,9 +24,9 @@ import { registerChat } from "./chat";
 import { registerConfigEditors } from "./configEditors";
 import { newConnectionWizard } from "./connectionQuickInput";
 import { registerEditorToolbar } from "./editorToolbar";
-import { disposeEngineLog } from "./engineLog";
+import { disposeEngineLog, engineLog } from "./engineLog";
 import { EngineSetupPanel } from "./engineSetup";
-import { registerEngineTrust } from "./engineTrust";
+import { refreshEngineTrustThenRecheck, registerEngineTrust } from "./engineTrust";
 import { registerEngineStatusBar } from "./statusBar";
 import { registerInsertElement } from "./insertElement";
 import { generateSamples } from "./generate";
@@ -120,7 +121,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // below can verify the self-signed pair it mints on first run — BACKLOG #1695. Fail-soft: with no
   // engine, no service TOML, or an untrusted workspace it registers nothing and changes nothing.
   registerEngineTrust(context);
-  registerEngineStatusBar(context);
+  const engineStatusBar = registerEngineStatusBar(context);
   // Custom editors (#221b): connections.toml + codesets/*.csv open in the form/grid by default, with
   // "Reopen With → Text Editor" always available. Reuses the existing form rendering; the router names
   // feed the connection form's router dropdown.
@@ -468,11 +469,23 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   // One-time nudge to put a MessageFoundry project under version control + commit-time checks. It
-  // stays silent in an untrusted workspace (vault BACKLOG #2791), and VS Code does not re-activate a
-  // "limited" extension when trust is granted, so the grant re-offers it.
+  // stays silent in an untrusted workspace (vault BACKLOG #2791).
   void maybeSuggestSourceControl(context);
+  // VS Code does not re-activate a "limited" extension when trust is granted, so at least these
+  // activation steps an untrusted workspace skipped are re-run from the grant (vault BACKLOG #2791,
+  // #3166). The views go through the coalescer, so a save just before the grant costs one pass.
   context.subscriptions.push(
-    vscode.workspace.onDidGrantWorkspaceTrust(() => void maybeSuggestSourceControl(context)),
+    vscode.workspace.onDidGrantWorkspaceTrust(() =>
+      runTrustGrantSteps(
+        {
+          refreshViews: () => refreshCoalescer.trigger(),
+          repaintStatusBar: () => engineStatusBar.repaint(),
+          refreshEngineTrust: () => refreshEngineTrustThenRecheck(),
+          suggestSourceControl: () => maybeSuggestSourceControl(context),
+        },
+        (step, err) => engineLog().error(`trust grant: ${step} failed: ${String(err)}`),
+      ),
+    ),
   );
 }
 

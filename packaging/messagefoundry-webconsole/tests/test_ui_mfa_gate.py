@@ -1145,6 +1145,8 @@ async def _directory_session(
 
     ``enrolled`` activates TOTP on the account first, on a throwaway session, so the returned one
     is enrolled-but-unverified. Either way the directory floor leaves it unsatisfied."""
+    from _ui_clients import PresentDirectory
+
     from messagefoundry.auth.ldap import AdPrincipal
 
     principal = AdPrincipal(
@@ -1155,6 +1157,8 @@ async def _directory_session(
         groups=frozenset(),
         directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
     )
+    # BACKLOG #3061: the TOTP enrolment below asks the directory about a directory account.
+    service._ldap = PresentDirectory(principal)  # type: ignore[assignment]
     if enrolled:
         _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
         setup = await service._complete_ad_login(principal, None, mfa_verified=False)
@@ -1407,6 +1411,29 @@ async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
         error = r.json()["error"]
         assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
         assert (error == "passkey verification failed") is not unconfirmed
+
+
+async def test_the_passkey_leg_answers_a_lost_session_with_401(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068, item 3: the service answers ``session_lost`` when the session or the account
+    went during the ceremony, for example under the directory lookup. The token then no longer
+    authenticates, so the route must send the page back to sign-in rather than report a wrong
+    passkey. The service answer is stubbed.
+
+    RED when: /ui/reauth/webauthn drops its ``session_lost`` branch (the answer is then a 400)."""
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def _lost(token: str | None, response_json: str, **_kwargs: object) -> Elevation:
+        return Elevation(session_lost=True)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        monkeypatch.setattr(service, "finish_webauthn_assertion", _lost)
+        r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert r.status_code == 401, r.text
+        assert r.json() == {"ok": False, "error": "session expired"}
 
 
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------

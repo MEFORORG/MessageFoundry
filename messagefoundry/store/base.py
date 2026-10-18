@@ -67,6 +67,8 @@ from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
+    AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -104,6 +106,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RoleGrant,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
     UserRecord,
@@ -2271,7 +2274,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key). The caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
+    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
+    # caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
@@ -2288,9 +2293,13 @@ class AuthStore(Protocol):
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
+    # CONDITIONAL (BACKLOG #3025): stages ``secret``, sealed, only where TOTP is still off, and
+    # returns the stored cell, or None when nothing was written. A caller must refuse on None, and
+    # passes the returned cell to ``enable_totp`` as ``expected_secret_cell``. There is no clear: a
+    # factor, staged or enabled, is removed with ``disable_totp``.
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None: ...
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None: ...
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
@@ -2299,15 +2308,20 @@ class AuthStore(Protocol):
     # second, unchecked read. ``None`` for no cell. No I/O.
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None: ...
 
-    # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
-    # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
-    # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between
-    # the caller's checks and this write makes it match no row. A caller must refuse on False and
-    # never treat MFA as on, the way ``set_password(require_totp=...)`` callers do. It does not
-    # check that the staged secret is the one the caller verified; a re-stage in the window is
-    # not caught.
+    # CONDITIONAL (BACKLOG #2224, #3025): writes only where the staged ``totp_secret`` cell is still
+    # ``expected_secret_cell`` (the cell the caller verified a code against) and TOTP is still off,
+    # in the same write, and returns whether a row was written. An ``admin_reset_mfa`` that clears
+    # the secret, a second confirm that enables first, or a second begin that stages another
+    # secret, between the caller's read and this write, makes it match no row. ``None`` matches
+    # nothing. A caller must refuse on False and never treat MFA as on, the way
+    # ``set_password(require_totp=...)`` callers do.
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool: ...
 
     # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
@@ -2356,9 +2370,13 @@ class AuthStore(Protocol):
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 
+    # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey
+    # exists and holds another count) or ``"gone"`` (no such passkey) under ONE locked write on every
+    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Either miss is
+    # a clone signal (ADR 0068 decision 4); the answer only says which.
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool: ...
+    ) -> SignCountAnswer: ...
 
     # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
     # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
@@ -2538,11 +2556,52 @@ class AuthStore(Protocol):
         this process: the server backends take a transaction-scoped lock before the read, because
         each engine shard serves its own API over one unified store (ADR 0063). So two removals
         that each see two administrators cannot both pass, which a check in one await and a write
-        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
-        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
-        do not come through here and were never guarded: they take roles on the directory's word.
-        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
-        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        in the next allowed. A write that only ADDS an administrator cannot empty the set, so it
+        needs this lock only when it is itself guarded, as the first-administrator grant
+        (:meth:`grant_first_admin_unless_admin_exists`, BACKLOG #3078) is. An unguarded role write
+        that adds one, such as :meth:`set_user_roles`, takes no lock. The directory-driven role
+        writes (the AD sign-in sync and the session reconciler) do not come through here and were
+        never guarded: they take roles on the directory's word. ``DISABLE`` and ``SET_ROLES`` leave
+        the account's sessions for the caller to revoke after; ``DELETE``, like
+        :meth:`delete_user`, removes them with the account."""
+        ...
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator that
+        ``counts_as_admin`` passes exists (BACKLOG #3078). ``provision_first_administrator``'s
+        grant.
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
+        than ``user_id`` only when its record passes its integrity seal, as
+        :meth:`remove_unless_last_admin` counts them, and ``counts_as_admin`` passes its ``users``
+        row. The auth service passes the predicate its ``provision-admin`` refusal reads, so only
+        an administrator that signs in with a local password counts (vault BACKLOG #2711 step 1,
+        owner ruling B258-R4); a directory one does not. When any is counted it writes nothing and
+        returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
+        account is enabled, holds no role, and still holds the credentials the caller wrote:
+        ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
+        ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
+        writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
+        compare on the seal lost to a concurrent write, answer the same.
+
+        **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
+        on the same database**, under the same lock, not only in this process. So two provisioning
+        runs with different usernames, each of which saw no administrator ``counts_as_admin``
+        passes, cannot both be granted:
+        the one whose grant commits second reads the first and is refused. SQLite has no such lock
+        across processes and relies on its single writer instead; its implementation re-runs the
+        transaction a bounded number of times when the write fails busy, and raises past that bound
+        rather than answering a refusal."""
         ...
 
     async def set_user_channel_scope(
@@ -3408,7 +3467,7 @@ async def open_store(
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
-    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` reads
+    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on an enforcing hop (decision 2). ``None`` reads
     the ambient posture, and with none the escape is NOT permitted (vault BACKLOG #2354). CORRECTED:
     this read *"``None`` ... leaves it unclamped, byte-identical to pre-#200"*. So a CLI command that
     opens a weakened store needs an instance at ``[security].enforcement = warn`` AND a posture; the

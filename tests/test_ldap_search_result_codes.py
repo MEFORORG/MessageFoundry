@@ -73,6 +73,7 @@ from tests.test_ldap_referrals import (
     _BIND_RESPONSE,
     _SEARCH_DONE,
     _SEARCH_REQUEST,
+    _UNBIND_REQUEST,
     _read_message,
     _tlv,
 )
@@ -713,6 +714,9 @@ _EXTENDED_REQUEST, _EXTENDED_RESPONSE = 0x77, 0x78
 #: One message a loopback server sends: its protocolOp, and its controls (empty for none).
 _Reply = tuple[bytes, bytes]
 
+#: A reply that closes the socket where an answer would go, with nothing sent.
+_HANG_UP: _Reply = (b"", b"")
+
 
 def _enumerated(code: int) -> bytes:
     """A non-negative resultCode as BER ENUMERATED content, two's complement, minimal.
@@ -739,7 +743,17 @@ class _ScriptedDc:
     answered by ``bind_reply(raw request)``, or with success where that is absent or returns
     ``None``; an extended operation such as Who am I is answered with ``extended_reply``, or ends
     with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
-    ``ended`` is set when a client's socket closes."""
+    ``ended`` is set when a client's socket closes. A reply that is already a whole LDAPMessage is
+    sent as written, under its own messageID, and :data:`_HANG_UP` closes the socket instead of
+    answering.
+
+    A client reads any close as the server ending the session, so a test that expects exactly that
+    could pass with nothing it scripted read. Two records stop that. ``closed_by_server`` is set
+    whenever a session closes its socket of its own accord: a hang-up, an operation other than an
+    unbind, or the server's own idle timeout. ``failures`` holds whatever a session raised other
+    than a socket error, recorded before its socket closes; :func:`_scripted_dc` raises the first
+    in the test's own thread, and the session thread re-raises it too, so a fault after the test
+    has left the server is still reported, as an unhandled thread exception."""
 
     def __init__(
         self,
@@ -751,6 +765,8 @@ class _ScriptedDc:
         self._answer, self._extended_code, self._bind_reply = answer, extended_code, bind_reply
         self._extended_reply = extended_reply
         self.searches: list[bytes] = []
+        self.failures: list[Exception] = []
+        self.closed_by_server = False
         self.ended = threading.Event()
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._listener.getsockname()[1]
@@ -766,29 +782,54 @@ class _ScriptedDc:
 
     def _session(self, sock: socket.socket) -> None:
         try:
-            with sock, contextlib.suppress(OSError):
-                sock.settimeout(10)
-                while (message := _read_message(sock)) is not None:
-                    raw, body = message
-                    message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
-                    op = body[2 + body[1]]
-                    if op == _BIND_REQUEST:
-                        scripted = self._bind_reply(raw) if self._bind_reply else None
-                        replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
-                    elif op == _EXTENDED_REQUEST:
-                        replies = [
-                            self._extended_reply
-                            or _done(self._extended_code, tag=_EXTENDED_RESPONSE)
-                        ]
-                    elif op == _SEARCH_REQUEST:
-                        self.searches.append(raw)
-                        replies = self._answer(raw)
-                    else:  # unbind, or anything this server does not speak
-                        return
-                    for reply, controls in replies:
-                        sock.sendall(_tlv(0x30, message_id + reply + controls))
+            with sock:
+                try:
+                    self._serve(sock)
+                except TimeoutError:
+                    self.closed_by_server = True  # the client sent nothing for the idle timeout
+                except OSError:
+                    pass  # the client went away mid-read or mid-send
+                except Exception as exc:  # any script fault; see the class docstring
+                    self.failures.append(exc)
+                    raise
         finally:
             self.ended.set()
+
+    def _serve(self, sock: socket.socket) -> None:
+        sock.settimeout(10)
+        while (message := _read_message(sock)) is not None:
+            raw, body = message
+            message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
+            op = body[2 + body[1]]
+            if op == _BIND_REQUEST:
+                scripted = self._bind_reply(raw) if self._bind_reply else None
+                replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
+            elif op == _EXTENDED_REQUEST:
+                replies = [
+                    self._extended_reply or _done(self._extended_code, tag=_EXTENDED_RESPONSE)
+                ]
+            elif op == _SEARCH_REQUEST:
+                self.searches.append(raw)
+                replies = self._answer(raw)
+            else:  # unbind, or anything this server does not speak
+                # Never reset by an unbind: another session's, such as the service account's
+                # (_service_session, BACKLOG #3017), may end after the one that hung up.
+                if op != _UNBIND_REQUEST:
+                    self.closed_by_server = True
+                return
+            for reply, controls in replies:
+                if reply == _HANG_UP[0]:
+                    assert not controls, "a hang-up sends nothing"
+                    self.closed_by_server = True
+                    return
+                # A reply that is already a whole LDAPMessage (a SEQUENCE, 0x30) goes out as
+                # written, so a test can send one under another messageID, such as an unsolicited
+                # notification under 0. No protocolOp tag is 0x30.
+                if reply[:1] == b"\x30":
+                    assert not controls, "a whole LDAPMessage carries its own controls"
+                    sock.sendall(reply)
+                else:
+                    sock.sendall(_tlv(0x30, message_id + reply + controls))
 
     def close(self) -> None:
         # shutdown wakes a blocked accept() on Linux, where close() alone does not.
@@ -815,6 +856,9 @@ def _scripted_dc(
         yield dc, LdapAuthenticator(settings, enforcing=False)
     finally:
         dc.close()
+        # In the finally, so a failure also replaces an exception the test expected to see.
+        if dc.failures:
+            raise AssertionError(f"the scripted DC failed: {dc.failures[0]!r}") from dc.failures[0]
 
 
 @contextlib.contextmanager

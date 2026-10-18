@@ -22,6 +22,7 @@ already used, and a placeholder is not a digit so no pattern here reads it.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -99,8 +100,13 @@ def test_every_pin_names_the_shipped_version(
     assert set(found) == {expected}, f"{doc}: pins {found}, the tree ships {expected}"
 
 
+#: Swept beside the sequenced documents: the console pairing install lines a bump moves (vault
+#: BACKLOG #2732; release PR 1895 left both at the previous engine).
+_ALSO_SWEPT = ("README.md", "packaging/messagefoundry-webconsole/README.md")
+
+
 def test_the_sequenced_documents_pin_only_the_shipped_versions() -> None:
-    """Every pin in all six sequenced documents, not only the lines the cases above name.
+    """Every pin in the six sequenced documents and the two READMEs, not only the lines named above.
 
     The armed cases above prove each pattern still fits its guide. This sweep carries no such arm
     per document, because SYSTEM-REQUIREMENTS, DEPLOYMENT and VERIFY pin nothing today; it is
@@ -108,7 +114,7 @@ def test_the_sequenced_documents_pin_only_the_shipped_versions() -> None:
     """
     stale: dict[str, list[str]] = {}
     matched = 0
-    for rel in sequenced_documents():
+    for rel in [*sequenced_documents(), *_ALSO_SWEPT]:
         text = (_ROOT / rel).read_text(encoding="utf-8")
         matched += sum(len(pattern.findall(text)) for _, pattern, _ in _PINS)
         if bad := _stale_pins(text):
@@ -173,3 +179,74 @@ def test_a_planted_stale_pin_is_caught(shape: str, stale_e: str, stale_c: str) -
 def test_a_version_named_as_history_is_not_a_pin(history: str) -> None:
     """NEGATIVE CONTROL: a true statement about an old release must survive the next release."""
     assert _stale_pins(history) == [], history
+
+
+# --- the version-bump list names every file a bump moves (vault BACKLOG #2732) ---------------------
+# It lives here, not beside the harness pin in tests/test_packaging.py, because this module is one of
+# ci.yml's DOC_GUARDS: a pull request that edits only CONTRIBUTING.md still runs it.
+
+_CONTRIBUTING = _ROOT / "CONTRIBUTING.md"
+_BUMP_HEADING = "## Bumping the engine version"
+_BUMP_NOT_MOVED = "\nWhat an engine bump does not move:"
+# Splits the list into the paths it names: on whitespace, and on the Markdown around a path.
+_BUMP_TOKEN_SEP = re.compile(r"[\s`*()\[\],;:]+")
+
+
+def _tokens(text: str) -> frozenset[str]:
+    return frozenset(_BUMP_TOKEN_SEP.split(text))
+
+
+@functools.cache
+def _bump_edits() -> frozenset[str]:
+    """The tokens of CONTRIBUTING.md's numbered bump items, from item 1 to *does not move*.
+
+    The intro and the *does not move* paragraph name files too, and a file named only there is not
+    an edit, so a reworded marker fails here rather than widening the span.
+    """
+    text = _CONTRIBUTING.read_text(encoding="utf-8")
+    assert _BUMP_HEADING in text.splitlines(), f"CONTRIBUTING.md has no {_BUMP_HEADING!r} heading"
+    body = text.split(f"\n{_BUMP_HEADING}\n", 1)[1].split("\n## ", 1)[0]
+    assert "\n1. " in body, "the bump list has no item 1"
+    assert _BUMP_NOT_MOVED in body, f"the bump list lost its {_BUMP_NOT_MOVED.strip()!r} marker"
+    return _tokens(body.split("\n1. ", 1)[1].split(_BUMP_NOT_MOVED, 1)[0])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "messagefoundry/__init__.py",
+        "packaging/messagefoundry-harness/pyproject.toml",
+        "packaging/messagefoundry-toolkit/pyproject.toml",
+        "docs/INSTALL-GUIDE.md",
+        "docs/EARLY-ADOPTER-GUIDE.md",
+        "docs/USER-GUIDE.md",
+        "README.md",
+        "packaging/messagefoundry-webconsole/README.md",
+        "docs/SERVICE.md",
+        "CHANGELOG.md",
+    ],
+)
+def test_the_bump_list_names_every_file_a_version_bump_moves(path: str) -> None:
+    """Each file a bump is known to edit is named in the bump list.
+
+    The list is prose, so this cannot prove it complete. It proves the known files are not dropped
+    from it: the old "at least three edits" count left out the install guides, and release PR 1895
+    went red on them. A path must appear as a whole token, so ``README.md`` is not satisfied by
+    ``packaging/messagefoundry-webconsole/README.md``.
+    """
+    assert (_ROOT / path).is_file(), f"{path} no longer exists; re-derive the bump list"
+    assert path in _bump_edits(), f"CONTRIBUTING.md, *Bumping the engine version*, omits `{path}`"
+
+
+@pytest.mark.parametrize(
+    ("text", "path"),
+    [
+        ("`packaging/messagefoundry-webconsole/README.md`", "README.md"),
+        ("[changelog.d/README.md](changelog.d/README.md)", "README.md"),
+        ("`docs/SERVICE.md.bak`", "docs/SERVICE.md"),
+    ],
+)
+def test_a_path_inside_a_longer_one_is_not_named(text: str, path: str) -> None:
+    """NEGATIVE CONTROL: the whole-token match the guard above relies on."""
+    assert path not in _tokens(text)
+    assert path in _tokens(f"{text} and `{path}`")

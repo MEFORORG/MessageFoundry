@@ -18,6 +18,7 @@ does not depend on how pytest was started.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
@@ -27,6 +28,12 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.permissions import Role
+from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.crypto import make_cipher
+from messagefoundry.store.store import MessageStore
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
@@ -94,3 +101,38 @@ def test_a_store_with_an_administrator_answers_with_the_exists_fragment(
     error = json.loads(capsys.readouterr().out)["error"]
     assert _ts_string_const("ADMIN_EXISTS_REFUSAL") in error
     assert _ts_string_const("NO_TERMINAL_REFUSAL") not in error
+
+
+def test_a_store_run_only_by_directory_administrators_answers_with_the_no_terminal_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #2711 step 1 (ADR 0183 Amendment E): a directory Administrator no longer
+    blocks ``provision-admin``, so the probe gets past the Administrator check and asks for a
+    terminal. The IDE then reads the store as ``needsAdmin``. Before step 1 this answered with the
+    exists fragment."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+
+    async def seed() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(
+            tmp_path / "messagefoundry.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+        try:
+            await store.create_user(
+                user_id="dir-a",
+                username="dir-a",
+                auth_provider=AuthProvider.AD.value,
+                password_generated=False,
+            )
+            await AuthService(store, AuthSettings()).initialize()
+            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    _no_terminal(monkeypatch)
+    assert main(_probe_argv()) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert _ts_string_const("NO_TERMINAL_REFUSAL") in error
+    assert _ts_string_const("ADMIN_EXISTS_REFUSAL") not in error

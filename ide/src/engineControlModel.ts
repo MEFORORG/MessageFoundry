@@ -141,7 +141,10 @@ export function buildBootstrapPlan(opts: {
 // plan ASKS the engine, with a probe: `provision-admin` run with no terminal. It answers "an enabled
 // Administrator already exists" BEFORE it checks for a terminal, and otherwise refuses for want of one.
 // It creates no store and no account either way. The first answer is go-ahead; the second means provision
-// first.
+// first. Since vault BACKLOG #2711 step 1 the first answer means an enabled LOCAL Administrator with a
+// usable password, so a store whose Administrators all sign in through the directory gets the second
+// answer. The modal in `statusBar.ts` still words that case as "no enabled administrator"; rewording it
+// is not done here.
 //
 // The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db` or
 // `--service-config`. In the default layout that is the store `serve` opens. It is NOT when the service

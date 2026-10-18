@@ -191,7 +191,7 @@ def test_the_setter_unstrands_an_administrator_with_no_address(
         asyncio.run(_start(_shipped_posture_app(db, key)))
     assert "no enabled Administrator has a notification address" in str(refused.value)
 
-    # provision-admin cannot fix it: an enabled Administrator now exists.
+    # provision-admin cannot fix it: an enabled local Administrator with a password now exists.
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert (
         main(["provision-admin", "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db)]) == 1

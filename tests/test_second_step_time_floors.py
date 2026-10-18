@@ -34,6 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._fake_directory import DirectoryOf
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
@@ -496,7 +497,10 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
     rp, origin = "t", "http://t"
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+        # require_mfa on, the shipped default. BACKLOG #3061: the enrolment legs ask the
+        # directory about a directory account first.
+        directory = DirectoryOf(_principal("adfloor"), _principal("adfloor2"))
+        service = AuthService(store, AuthSettings(), ldap=directory)  # type: ignore[arg-type]
         await service.initialize()
         out = await service._complete_ad_login(_principal("adfloor"), None, mfa_verified=False)
         assert out.ok and out.token is not None

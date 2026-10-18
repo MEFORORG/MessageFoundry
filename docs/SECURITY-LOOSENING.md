@@ -815,7 +815,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** a session token presented from a **client address it has not verified from**
   can perform a sensitive admin action on the strength of the ordinary step-up window alone, and can
   read message bodies and call the paced writes with no step-up at all (vault BACKLOG #2620). Nothing
-  writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
+  writes `auth.new_address_reverify_required`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
   addresses that rotates between requests (some NAT and VPN concentrators do). With the signal on,
@@ -860,7 +860,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
   of addresses the attacker holds. With the ceremony limit off, a session holder guessing a password at
   re-auth meets no rate limit, only the per-session cap and the account's lockout (each failed re-proof
-  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate.
+  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate. An
+  AD re-bind the engine does not count, such as one the DC ends busy or answers with a referral, is
+  charged to neither the per-session cap nor the lockout, so with the ceremony limit off nothing in
+  the engine bounds those re-binds (BACKLOG #3169). That holds for each value in the table above that
+  turns the ceremony limit off, not only `login_rate_limit_enabled = false`, and a looser value
+  bounds them only as far as it still paces the ceremonies.
 - **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
   application firewall in front of the engine can replace the per-address and all-clients limits, but it
   cannot replace the per-user ceremony limit, which keys on the signed-in user. A modest raise for a
@@ -1313,8 +1318,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Where it is NOT reported, and why:** `messagefoundry security show` reads a settings file and never
   loads the connection graph, so it cannot see these declarations; it says so explicitly in its
   `loosenings_scope` output rather than reporting a settings-only list as if it were the whole posture.
-  `GET /security/posture` carries the same `loosenings_scope` marker in the one case it is blind — an
-  engine with no loaded graph (an embedding, or a query before start); it is `null` on a running engine.
+  `GET /security/posture` carries the same `loosenings_scope` marker when it is blind, on an engine
+  with no loaded graph (an embedding, or a query before start). It carries one too for a
+  channel-scoped reader, whose list is narrowed to its own scope (BACKLOG #3189). It is `null` for an
+  unscoped reader of a running engine.
   The `serve`-time loosening warning fires before the graph is loaded for the same reason — the
   construction gate's own per-connection WARN covers it moments later, at startup, with more detail.
 - **What it cannot do:** it never yields ALLOW. An accepted hop is always a WARN, so it can never become
@@ -1530,12 +1537,23 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
   file, and treat the partner's and the proxy's access logs as holding a secret.
-- **It is never silent:** a WARNING at each construction naming the connection and the parameter
-  names, never a value; a `url-query-credential` line in `messagefoundry check`; and a
-  `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
-  running engine. All three walk outbound connections and `FhirLookup` connections, whose names are
-  prefixed `fhir_lookup:`. The construction WARNING reads the resolved URL. The `check` line and the registry
-  read a literal `url` only, so a URL supplied by `env()` is in the WARNING alone.
+- **It is not silent once the connection is built:** a WARNING naming the connection and the
+  parameter names, never a value. It is logged at least whenever a build check builds the connection
+  (at least `messagefoundry check` when its `build-check` leg runs, and a reload, `dry_run`
+  included) and whenever a connection is built without one (at least a start, an operator start and
+  a connection test). A reload that replaces a running graph skips it on its rebuilds, because that
+  reload's build check has already logged it. It can still appear more than once for one connection,
+  at least on a reload into an engine started without a graph, because that reload runs a start
+  after its build check, and on a start where one `FhirLookup` fails to build. There is also a
+  `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
+  `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
+  outbound connections and `FhirLookup` connections. The WARNING labels a lookup
+  `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
+  prefix. The WARNING reads the resolved URL. The `check` line and the posture entry read a literal
+  `url` only, so a URL supplied by `env()` is in the WARNING alone. A lane the engine has not built
+  (for example `auto_start=False`, or DR-parked) logs no WARNING until it is built or checked, and a
+  `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
+  URL on such a lane appears nowhere meanwhile.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
   know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.

@@ -130,15 +130,24 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
         "duplicate (user_id, label)",
     )
 
-    # Sign-count CAS (the consume_totp_step precedent): True iff stored == expected; a miss is the
-    # clone signal. 0->0 (synced passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) is True
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) is False
+    # Sign-count CAS (the consume_totp_step precedent), answered by the one locked write (BACKLOG
+    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count
+    # (the clone signal), which writes nothing; "gone" when there is no such passkey. 0->0 (synced
+    # passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
+    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) == "moved"
+    assert (
+        await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) == "mismatch"
+    )
     got = await store.get_webauthn_credential("h1")
     assert got.sign_count == 6 and got.last_used_at == 60.0
+    assert (
+        await store.update_webauthn_sign_count("h-none", expected=0, new=1, used_at=62.0) == "gone"
+    )
+    assert await store.get_webauthn_credential("h-none") is None
     for used_at in (70.0, 71.0):
         assert (
-            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at) is True
+            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at)
+            == "moved"
         )
     assert (await store.get_webauthn_credential("h2")).sign_count == 0
 
@@ -147,6 +156,8 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h1") is not None
     assert await store.delete_webauthn_credential("wa-u1", "h1") is True
     assert await store.delete_webauthn_credential("wa-u1", "h1") is False  # already gone
+    # A deleted passkey answers "gone" whatever count is offered, the stored one included.
+    assert await store.update_webauthn_sign_count("h1", expected=6, new=8, used_at=63.0) == "gone"
     assert await store.has_webauthn_credentials("wa-u1") is True  # h2 remains
 
     # delete_all (admin_reset_mfa) returns the removed count.
@@ -183,20 +194,37 @@ async def _assert_totp_contract(store: Any) -> None:
 
     # Secret staging round-trip (cipher-covered column) + clear.
     assert await store.get_totp_secret("totp-u1") is None
-    await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    first_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    assert first_cell is not None
     assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP"
-    await store.set_totp_secret("totp-u1", secret=None, now=3.0)
+    await store.disable_totp("totp-u1", now=3.0)
     assert await store.get_totp_secret("totp-u1") is None
 
     # Enable + recovery codes: single-use consumption is atomic (the double-spend guard).
-    await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
-    assert await store.enable_totp("totp-u1", recovery_code_hashes=["rc1", "rc2"], now=5.0) is True
+    staged_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
+    assert (
+        await store.enable_totp(
+            "totp-u1",
+            expected_secret_cell=staged_cell,
+            recovery_code_hashes=["rc1", "rc2"],
+            now=5.0,
+        )
+        is True
+    )
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is True
     assert set(await store.get_recovery_code_hashes("totp-u1")) == {"rc1", "rc2"}
     # The enable is conditional (BACKLOG #2224): a second confirm that lands once TOTP is on matches
     # no row, so it cannot replace the recovery codes the first one handed out.
-    assert await store.enable_totp("totp-u1", recovery_code_hashes=["loser"], now=5.5) is False
+    assert (
+        await store.enable_totp(
+            "totp-u1",
+            recovery_code_hashes=["loser"],
+            expected_secret_cell=staged_cell,
+            now=5.5,
+        )
+        is False
+    )
     assert set(await store.get_recovery_code_hashes("totp-u1")) == {"rc1", "rc2"}
     assert await store.consume_recovery_code_hash("totp-u1", "rc1", now=6.0) is True
     assert await store.consume_recovery_code_hash("totp-u1", "rc1", now=7.0) is False
@@ -218,12 +246,22 @@ async def _assert_totp_contract(store: Any) -> None:
 
     # The reset race (BACKLOG #2224): an enable that lands after a factor reset cleared the staged
     # secret matches no row, so TOTP is never flagged on over a NULL secret.
-    assert await store.enable_totp("totp-u1", recovery_code_hashes=["late"], now=9.0) is False
+    assert (
+        await store.enable_totp(
+            "totp-u1", recovery_code_hashes=["late"], expected_secret_cell=staged_cell, now=9.0
+        )
+        is False
+    )
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is False
     assert await store.get_totp_secret("totp-u1") is None
     assert await store.get_recovery_code_hashes("totp-u1") == []
-    assert await store.enable_totp("missing-user", recovery_code_hashes=[], now=9.0) is False
+    assert (
+        await store.enable_totp(
+            "missing-user", recovery_code_hashes=[], expected_secret_cell=staged_cell, now=9.0
+        )
+        is False
+    )
 
     # replace_totp_enrolment (ADR 0171 Amendment B, BACKLOG #2226): conditional on TOTP being ON
     # and on the enrolment instant the caller read, so it can never turn TOTP on for an account
@@ -251,8 +289,13 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.get_totp_secret("totp-u1") is None
     assert await audit_rows() == 0
     # On an enabled row it swaps the seed, the codes and the step in one write, with TOTP still on.
-    await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=11.0)
-    assert await store.enable_totp("totp-u1", recovery_code_hashes=["o1", "o2"], now=12.0) is True
+    staged_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=11.0)
+    assert (
+        await store.enable_totp(
+            "totp-u1", expected_secret_cell=staged_cell, recovery_code_hashes=["o1", "o2"], now=12.0
+        )
+        is True
+    )
     assert await store.consume_totp_step("totp-u1", 300) is True  # the old seed's history
     await store.create_session(
         token_hash="totp-u1-session", user_id="totp-u1", expires_at=1e12, auth_mechanism="password"
@@ -285,3 +328,61 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await audit_rows() == 1
 
     await store.delete_user("totp-u1")
+    await _assert_totp_binding_contract(store)
+
+
+async def _assert_totp_binding_contract(store: Any) -> None:
+    """BACKLOG #3025: the enable turns on only the secret the caller verified, on every backend.
+
+    ``set_totp_secret`` returns the stored cell; ``enable_totp`` writes only while the row still
+    holds that cell. A second stage in between makes it refuse, and a write to any other column of
+    the row in between does not."""
+    await store.create_user(
+        user_id="totp-u2",
+        username="totp-bob",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    verified = await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    assert verified is not None
+    # A second begin stages another secret after the first one was verified.
+    other_seed = "JBSWY3DPEHPK3PXP"[::-1]
+    replacing = await store.set_totp_secret("totp-u2", secret=other_seed, now=3.0)
+    assert replacing is not None and replacing != verified
+    assert (
+        await store.enable_totp(
+            "totp-u2", recovery_code_hashes=["x"], expected_secret_cell=verified, now=4.0
+        )
+        is False
+    )
+    user = await store.get_user("totp-u2")
+    assert user is not None and user.totp_enabled is False
+    assert await store.get_totp_secret("totp-u2") == other_seed
+    assert await store.get_recovery_code_hashes("totp-u2") == []
+    # None matches nothing, even with a secret staged.
+    assert (
+        await store.enable_totp("totp-u2", recovery_code_hashes=[], expected_secret_cell=None)
+        is False
+    )
+
+    # The false-refusal trap: writes to OTHER columns between the stage and the enable carry the
+    # stored cell over byte for byte, so the compare still matches.
+    await store.set_user_notify_email("totp-u2", email="bob@example.test", now=5.0)
+    await store.record_login_success("totp-u2", now=6.0)
+    assert (
+        await store.enable_totp(
+            "totp-u2", recovery_code_hashes=["y"], expected_secret_cell=replacing, now=7.0
+        )
+        is True
+    )
+    assert await store.get_totp_secret("totp-u2") == other_seed
+    assert await store.get_recovery_code_hashes("totp-u2") == ["y"]
+
+    # Once TOTP is on, a stage writes nothing and the enabled secret stands.
+    assert await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXP", now=8.0) is None
+    assert await store.get_totp_secret("totp-u2") == other_seed
+    assert await store.set_totp_secret("missing-user", secret="JBSWY3DPEHPK3PXP") is None
+
+    await store.delete_user("totp-u2")
