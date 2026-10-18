@@ -11708,7 +11708,10 @@ class AuthService:
         sidestep). ADR 0197: the TOTP/recovery leg feeds, and every caller is refused by, the
         SECOND-STEP lock only. The
         sign-in lock is the one a caller who knows only the username can set, and a session holder
-        has already passed the step it guards. A locked account is refused before any verify."""
+        has already passed the step it guards. The direct calls on :meth:`verify_mfa` and
+        :meth:`finish_webauthn_assertion` refuse a locked account before any verify; a call through
+        :meth:`_factor_holder_current` can come after the proof was checked, as its own docstring
+        says."""
         if not user.second_step_locked(time.time()):
             return False
         await self._audit(
@@ -11834,8 +11837,7 @@ class AuthService:
         ``event`` with the shared locked detail, and returns a wrong-proof refusal, with
         ``locked`` set when ``report_lock`` is. ``phase``, when given, is added to the
         ``session_lost`` row only, for the reason :meth:`_directory_vouches_for_factor` states. Only
-        revocation is asked of the session, not its expiry; the rotation that follows a factor write
-        refuses an expired one."""
+        revocation is asked of the session, not its expiry."""
         session = await self._load_session(hash_token(token))
         user = (
             None
@@ -12310,12 +12312,10 @@ class AuthService:
         ``locked`` (BACKLOG #3810 finding 4); a local account is not lock-checked here.
 
         **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
-        finding 4), so it can leave a passkey on the authenticator. Not every failure means the
-        server did not store it: a session revoked or lapsed after the last session check above
-        fails at the re-key in :meth:`_elevated`, after ``self._store.add_webauthn_credential``
-        has stored the passkey.
-        ``docs/SECURITY.md``, *A refused registration can leave a passkey on the authenticator*,
-        says which refusals, and that the console sends the user to the account's passkey list
+        finding 4), so it can leave a passkey on the authenticator, and not every failure means the
+        server did not store it. ``docs/SECURITY.md``, *A refused registration can leave a passkey
+        on the authenticator*, states which refusals and how the finish can still fail after the
+        passkey was stored, and that the console sends the user to the account's passkey list
         before deleting anything."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)

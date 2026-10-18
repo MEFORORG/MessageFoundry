@@ -3101,9 +3101,9 @@ engine, so any refusal or failure of the finish request comes after it. That inc
 factor-binding refusal, the login-to-MFA floor, an expired ceremony, a bad label, a lost session,
 a failed verification, a duplicate, a directory account's directory and lock refusals, and the
 route's own refusals (rate limit, stale step-up window, malformed request). **A failed finish does
-not prove the passkey was not stored.** At least a session revoked or lapsed late in the finish,
-after its last session check, leaves the passkey stored while the finish answers a lost session:
-the store asks nothing of the session, and the re-key that follows it is what fails. So the passkey
+not prove the passkey was not stored.** The store asks nothing of the session, and the re-key
+that follows it is what refuses, so at least a session revoked after the finish's last session
+check and before the re-key stores the passkey and then answers a lost session. So the passkey
 page tells the user to check the account's Passkeys list first. A passkey listed there is
 registered, and the user keeps it on the authenticator. Only a credential the authenticator shows
 that is not in that list is a stray the user may delete from the browser's or security key's
@@ -4979,7 +4979,8 @@ before any verification** (`finish_webauthn_assertion` asks `_mfa_lock_refused`,
 lock check the code leg also calls, before it checks anything of the assertion, and it audits
 `auth.webauthn_failed` with `reason=locked`). So the second-step lock is *enforced* on both
 second-factor legs, though the assertion leg does not feed it. The assertion leg is not the only
-writer of that lock row: the enrolment legs write it too for a directory account
+writer of that `auth.webauthn_failed` lock row: at least `finish_webauthn_registration` writes it
+too, for a directory account
 (see *The two enrolment legs ask the same question before a new factor marks the session*).
 
 **Why the lock does not refuse a live session's re-proofs, and what bounds them instead (BACKLOG #1138).**
@@ -5369,8 +5370,11 @@ a dummy value first, so a locked account answers in about the time a real check 
 `messagefoundry/auth/service.py`), `auth.mfa_failed` with `reason=locked` on the TOTP/recovery leg
 (`AuthService.verify_mfa`), `auth.webauthn_failed` with `reason=locked` on the assertion leg
 (`AuthService.finish_webauthn_assertion`). Only the second-step lock refuses those last two legs; the
-sign-in lock refuses neither. Those are not the only legs that write the lock row: the enrolment
-legs write it too for a directory account
+sign-in lock refuses neither. Those are not the only legs that write the lock row: at least the two
+enrolment legs write it too for a directory account, `auth.mfa_failed` from
+`AuthService.confirm_mfa_enrollment` and `auth.webauthn_failed` from
+`AuthService.finish_webauthn_registration`, both through `_mfa_lock_refused` after a confirmed
+directory lookup
 (see *The two enrolment legs ask the same question before a new factor marks the session*). The
 Kerberos and OIDC sign-ins are the exception to
 "before": they read both locks only once the ticket or token has verified and the principal has

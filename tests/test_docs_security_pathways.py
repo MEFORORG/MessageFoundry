@@ -4512,9 +4512,9 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
 
 def test_the_stray_passkey_guidance_sends_the_user_to_the_list_before_deleting() -> None:
     """BACKLOG #3810 finding 4: a failed passkey finish does not prove the passkey was not stored
-    (a session revoked late in the finish fails at the re-key, after the store). RED when
-    SECURITY.md says again that such a passkey is not stored, which would lead a user to delete a
-    registered factor, or stops sending the user to the account's list first."""
+    (the paragraph read here says how). RED when SECURITY.md says again that such a passkey is not
+    stored, which would lead a user to delete a registered factor, or stops sending the user to the
+    account's list first."""
     block = _flat(_doc_text())
     start = block.index("**A refused registration can leave a passkey on the authenticator")
     para = block[start : block.index("Mechanics:", start)]
