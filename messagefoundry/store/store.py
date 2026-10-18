@@ -2090,6 +2090,13 @@ class SessionRecord:
         )
 
 
+#: What :meth:`MessageStore.update_webauthn_sign_count` found, decided under the one locked write on
+#: every backend (BACKLOG #3774): ``"moved"`` (the stored count equalled ``expected`` and now holds
+#: ``new``), ``"mismatch"`` (the passkey exists and holds another count) or ``"gone"`` (no such
+#: passkey). Either miss is a clone signal (ADR 0068 decision 4); the answer only says which.
+SignCountAnswer = Literal["moved", "mismatch", "gone"]
+
+
 @dataclass(frozen=True)
 class WebAuthnCredential:
     """One enrolled WebAuthn passkey (WP-14b, ADR 0068 §4).
@@ -15279,19 +15286,28 @@ class MessageStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). Runs as one guarded UPDATE under the writer lock."""
+        precedent), answering :data:`SignCountAnswer`. On a miss the existence read runs in the
+        SAME write transaction as the guarded UPDATE, under the writer lock and before the commit.
+        The UPDATE takes SQLite's write lock even when it matches no row, so no writer, in this
+        process or another on the same file, can delete the passkey between the miss and the answer
+        (BACKLOG #3774)."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
                 " WHERE credential_id_hash=? AND sign_count=?",
                 (new, used_at, credential_id_hash, expected),
             )
+            answer: SignCountAnswer = "moved"
+            if cur.rowcount <= 0:
+                held = await self._db.execute(
+                    "SELECT 1 FROM webauthn_credentials WHERE credential_id_hash=?",
+                    (credential_id_hash,),
+                )
+                answer = "mismatch" if await held.fetchone() is not None else "gone"
             await self._commit()
-            return cur.rowcount > 0
+            return answer
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
         """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""

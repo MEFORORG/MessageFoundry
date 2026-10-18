@@ -243,6 +243,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     UserAuthzRecord,
     UserChange,
@@ -9173,20 +9174,22 @@ class PostgresStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
-        (no cross-node double-spend)."""
+        precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
+        read from the ``SELECT ... FOR UPDATE`` that locks the row, in the same transaction as the
+        guarded ``UPDATE`` (no cross-node double-spend), so no delete can land between a miss and
+        the answer (BACKLOG #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"
                 " FOR UPDATE",
                 credential_id_hash,
             )
-            if row is None or row["sign_count"] != expected:
-                return False  # consumed by a concurrent assertion — clone signal
+            if row is None:
+                return "gone"
+            if row["sign_count"] != expected:
+                return "mismatch"  # a concurrent assertion moved the counter, or a cloned key
             await conn.execute(
                 "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
                 " WHERE credential_id_hash=$3",
@@ -9194,7 +9197,7 @@ class PostgresStore:
                 used_at,
                 credential_id_hash,
             )
-            return True
+            return "moved"
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
         """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
