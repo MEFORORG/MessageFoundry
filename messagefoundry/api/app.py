@@ -2352,8 +2352,10 @@ async def _compare_start_config(
     (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
     two reads could be recorded as loaded. When the two digests differ, or the first could not be
     taken, the outcome is ``changed_during_load``, and the comparison still runs on the start's own
-    digest, as main's did. The caller also stops the process vouching for that digest. Two reads
-    miss at least two cases: an edit that lands and is reverted between them, and
+    digest, as main's did. The caller stops the process vouching for that digest only when both
+    digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
+    that failed, or two that left out different files, is marked here and still vouched for. Two
+    reads miss at least two cases: an edit that lands and is reverted between them, and
     a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
     source the digests hash.
 
@@ -10709,8 +10711,8 @@ def create_managed_app(
                     before_load, _reason = await engine.fingerprint_bundle(Path(config_dir))
                 except Exception as exc:  # noqa: BLE001 - see the comment above
                     _log.warning(
-                        "the start could not digest its config before the load (%s); it checks "
-                        "no config change",
+                        "the start could not digest its config before the load (%s); its config "
+                        "is still compared, and a change still pages",
                         safe_exc(exc),
                     )
                 loaded = load_config(config_dir)

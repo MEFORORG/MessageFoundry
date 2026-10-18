@@ -680,10 +680,13 @@ def test_an_unguarded_site_of_a_helper_that_failed_under_a_guard_fails_the_load(
     (tmp_path / "b_cfg.py").write_text(
         _guarded_handler("hb", "ImportError", guarded=False), encoding="utf-8"
     )
-    # The failure is re-raised from the helper finder with no frame in the config directory, so
-    # the missing module is not named (vault BACKLOG #3249 names an identifier only where the source
-    # line it was raised from spells it); the type and the bare site's module are.
-    with pytest.raises(WiringError, match="b_cfg.py: ModuleNotFoundError"):
+    # The helper, the bare site's module and the missing module are named, the last because the
+    # helper's line spells it, read from the failure recorded under the guard (vault BACKLOG #3249).
+    with pytest.raises(
+        WiringError,
+        match=r"_optional\.py failed to load \(ModuleNotFoundError at line 1 naming "
+        r"'mefor_no_such_package'.*b_cfg\.py imports it outside",
+    ):
         load_config(tmp_path)
 
 

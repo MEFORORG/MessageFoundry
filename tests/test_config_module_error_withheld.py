@@ -238,3 +238,107 @@ def test_an_odd_syntax_error_does_not_escape(tmp_path: Path) -> None:
     _write(tmp_path, "feed.py", f"raise SyntaxError('x', (123, {NEEDLE!r}, 1, 't'))\n")
     (msg,) = _messages(tmp_path)
     assert NEEDLE not in msg and "SyntaxError at line 1" in msg
+
+
+# --- the Lander's send-back of PR 2370 (01:19Z): each path that still leaked or lost a name ---------
+
+#: Assembled at run time, and an identifier, so it can sit in ``.name`` and in source.
+IDENT = "_".join(["mefor", "planted", "ident", "3249"])
+
+
+def _runtime_spelling(ident: str) -> str:
+    """A Python expression that builds ``ident`` at run time, spelling it in no single token."""
+    head, tail = ident[:6], ident[6:]
+    return f"{head!r} + {tail!r}"
+
+
+def test_a_stale_cached_source_line_does_not_vouch_for_a_run_time_name(tmp_path: Path) -> None:
+    # The first load spells the identifier on line 3, so it is named, and its line is cached. After
+    # an edit the same line computes it; a stale line must not vouch for the run-time value.
+    _write(tmp_path, "feed.py", f"import os\nv = 1\nos.{IDENT}\n")
+    (first,) = _messages(tmp_path)
+    assert f"naming {IDENT!r}" in first
+    _write(tmp_path, "feed.py", f"import os\nv = {_runtime_spelling(IDENT)}\ngetattr(os, v)\n")
+    (second,) = _messages(tmp_path)
+    assert "AttributeError at line 3" in second
+    assert IDENT not in second
+
+
+def test_the_textless_cause_carries_no_name_either(tmp_path: Path) -> None:
+    # import_module puts a RUN-TIME value in .name; the message withholds it, so must the cause.
+    _write(
+        tmp_path,
+        "feed.py",
+        f"import importlib\nimportlib.import_module({_runtime_spelling(IDENT)})\n",
+    )
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path)
+    assert IDENT not in str(ei.value)
+    cause = ei.value.__cause__
+    assert isinstance(cause, ModuleNotFoundError)
+    assert cause.name is None and IDENT not in repr(cause) and not cause.args
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"{IDENT}x = getattr(os, v)",  # inside a longer identifier
+        f"x = getattr(os, v) if {IDENT!r} else 0",  # inside a string literal
+        f"x = getattr(os, v)  # {IDENT}",  # inside a comment
+    ],
+    ids=["identifier", "string", "comment"],
+)
+def test_a_run_time_name_inside_another_token_is_withheld(tmp_path: Path, line: str) -> None:
+    _write(tmp_path, "feed.py", f"import os\nv = {_runtime_spelling(IDENT)}\n{line}\n")
+    (msg,) = _messages(tmp_path)
+    assert "AttributeError at line 3" in msg
+    assert "naming" not in msg
+
+
+def test_a_dotted_attribute_spelled_on_the_line_is_still_named(tmp_path: Path) -> None:
+    _write(tmp_path, "feed.py", f"import os\nx = os.{IDENT}\n")
+    (msg,) = _messages(tmp_path)
+    assert f"naming {IDENT!r}" in msg
+
+
+def test_a_helper_preload_reraise_names_the_helper_and_its_missing_module(tmp_path: Path) -> None:
+    # feed_a guards the optional helper, so its failure is recorded; feed_b imports it unguarded,
+    # and the preload re-raises the recorded failure. Main named the missing module here.
+    _write(tmp_path, "_opt.py", f"import {IDENT}\n")
+    _write(
+        tmp_path,
+        "feed_a.py",
+        """
+        def f():
+            try:
+                import _opt
+            except ImportError:
+                return None
+        """,
+    )
+    _write(tmp_path, "feed_b.py", "def g():\n    import _opt\n")
+    msgs = _messages(tmp_path)
+    (msg,) = [m for m in msgs if "feed_b" in m or "_opt" in m]
+    assert "_opt.py" in msg and "feed_b.py" in msg
+    assert f"naming {IDENT!r}" in msg and "line 1" in msg
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path)
+    # The engine-shard preflight reads the cause's type for its helper advice.
+    assert isinstance(ei.value.__cause__, ImportError)
+    assert ei.value.__cause__.name is None
+
+
+@pytest.mark.parametrize("pseudo", ["<string>", "<frozen mefor_3249>"])
+def test_a_pseudo_filename_frame_is_never_resolved_against_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pseudo: str
+) -> None:
+    # Run from the config dir, `<string>` resolved to a file in it and was named as the failing file.
+    _write(
+        tmp_path,
+        "feed.py",
+        f"x = 1\nexec(compile('raise RuntimeError(1)', {pseudo!r}, 'exec'))\n",
+    )
+    monkeypatch.chdir(tmp_path)
+    (msg,) = _messages(Path("."))
+    assert pseudo not in msg
+    assert "RuntimeError at line 2" in msg
