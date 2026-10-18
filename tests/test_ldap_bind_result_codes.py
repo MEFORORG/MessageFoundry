@@ -135,11 +135,12 @@ def test_every_other_refused_bind_still_judged_the_found_account(
 
 
 @pytest.mark.parametrize("code", [*_UNJUDGED_CODES, RESULT_INVALID_CREDENTIALS])
-def test_the_decoy_bind_keeps_the_lookups_answer_whatever_its_code(
+def test_the_decoy_bind_keeps_the_lookups_answer_on_an_outage_code(
     monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    """The timing-equalizing decoy reads no result code: the lookup already answered, and an
-    outage there would replace "not in the directory" (or "disabled") with "try again later"."""
+    """The timing-equalizing decoy reads no result code but a referral (BACKLOG #3017), which is
+    not parametrized here: the lookup already answered, and an outage there would replace "not in
+    the directory" (or "disabled") with "try again later"."""
     _install_fakes(monkeypatch)
     binds = _bind_ends_with(monkeypatch, code)
     _search_finds_nothing(monkeypatch)

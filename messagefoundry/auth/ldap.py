@@ -1545,7 +1545,7 @@ class LdapAuthenticator:
         and before the bind request is sent, on both branches alike, so such a password reads as a directory error for an absent
         account and a present one. A test pins the healthy-directory path.
 
-        **The decoy reads no result code but a referral, an outage code included (BACKLOG
+        **The decoy reads no result code except a referral; it ignores an outage code (BACKLOG
         #3169).** The real bind refuses one in :data:`_UNJUDGED_BIND_CODES` as the directory not
         answering; here the lookup has already answered, and its answer (absent, disabled,
         undetermined) is what the caller audits. Refusing it would replace that answer with an
@@ -1577,7 +1577,8 @@ class LdapAuthenticator:
                 bound = conn.bind()
             if not bound:
                 # As the real bind does, so a referral answers both branches alike (BACKLOG
-                # #3017). Any other refusal is ignored: this branch always fails the sign-in.
+                # #3017). Any other refusal is ignored, an outage code included (BACKLOG #3169):
+                # this branch always fails the re-bind.
                 _refuse_referral(conn, "user bind")
 
     def _search_user(
@@ -1865,7 +1866,9 @@ class LdapAuthenticator:
                     #
                     # Every error in the decoy is mapped HERE, the same way the real bind's is
                     # below, so an absent and a present account fail alike (BACKLOG #2566, #3017).
-                    # Swallowing it inside _equalizing_bind would tell the two apart.
+                    # Swallowing it inside _equalizing_bind would tell the two apart. A bind result
+                    # code is not such an error: a busy one answers the two apart, by design
+                    # (_equalizing_bind, BACKLOG #3169).
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
                     return DirectoryBind(found.answer)
