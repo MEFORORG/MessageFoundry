@@ -864,6 +864,14 @@ reconciler, is disabled locally, or is deleted. The give-up rules above stop an 
 on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
 reason, such as a sign-out, while the evidence is still pending.
 
+Once an engine has given up resolving the breaker's `ad_reconcile_aborted` instance, the referral's
+instance or `ad_reconcile_held`, it logs a warning when a later trip, referral or hold opens, saying
+it will not resolve that one either. It logs when the condition opens, not on every pass while it
+stands. A condition counts as new once every account behind the last one has left, or has been
+answered for on a pass that judged accounts and did not see the condition. For a hold, the answer
+must not be undetermined. A directory outage, or a probe that gets no answer, ends nothing. The
+probe fault's instance logs no such warning.
+
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
 alert. A directory outage, a pass with nobody signed in, an account that never answers, and
@@ -2362,9 +2370,10 @@ nodes automatically:
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
 **Windows-only.** Engine-managed VIP is a Windows feature at v1, and IPv4 only; IPv6 is deferred on every
-platform. A node that cannot use it keeps the external floating VIP or load balancer described in
-[CLUSTERING.md](CLUSTERING.md) §"Client reconnect". The settings themselves load on any platform, but
-Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
+platform. Every cluster keeps the external floating VIP or load balancer described in
+[CLUSTERING.md](CLUSTERING.md) §"Client reconnect", because nothing in this build binds the address
+(below). The settings themselves load on any platform, but Linux is
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 
 **The engine checks this block at load and does nothing else with it yet.** No code in this build binds,
 releases or announces the address. That controller is a later change, so the engine logs a WARNING at
@@ -2718,9 +2727,9 @@ rung 1): `memory_encryption_self_reported_capability`, `memory_encryption_self_r
 `memory_encryption_self_reported_mechanism` and `memory_encryption_readout_source`. On Linux these come
 from `/proc/cpuinfo` flags (**capability** — "this silicon *can*") and guest device-node presence
 `/dev/sev-guest` / `/dev/tdx_guest` (**activation** — "this guest *is*"), which are deliberately reported
-as **separate fields** and never derived from one another. On **Windows every field is `null`**
-(undeterminable): the in-guest attestation path is an ADR 0152 spike that has not landed, and guessing
-would be worse than saying so.
+as **separate fields** and never derived from one another. On **Windows the three self-reported
+fields are `null`** (undeterminable): ADR 0152's 2026-07-22 Windows spike ruled out a Windows read-out,
+and guessing would be worse than saying so.
 
 **No value of any of these fields satisfies ASVS 11.7.1**, and none may be cited as though it did.
 They are values the **host OS emits about itself**, and 11.7.1 exists precisely because that host may be

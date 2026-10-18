@@ -283,7 +283,9 @@ unchanged. This amendment narrows **only** the install/boundary-enforcement surf
 The owner's 2026-10-16 v1 platform
 [ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target) narrows Ratified
 Decision 7 (container image): the supported v1 install is the non-editable wheel run as a Windows
-service ([SERVICE.md](../SERVICE.md)). The container image, the Minor row of "Engine work required"
-that names it, is built and stays in [`docker/`](../../docker/README.md) as a development and CI
-artifact. The three-tier ownership model, the promotion model and the other ratified decisions are
-unchanged.
+service ([SERVICE.md](../SERVICE.md)). The container image (the last item of the final Minor row
+under "Engine work required") is built, and stays in [`docker/`](../../docker/README.md) as a
+development and CI artifact. The three-tier ownership model, the promotion model and the other
+ratified decisions are unchanged. *(Reworded 2026-10-17 for clarity: the container-image sentence
+previously read "The container image, the Minor row of "Engine work required" that names it, is
+built". The meaning is unchanged.)*

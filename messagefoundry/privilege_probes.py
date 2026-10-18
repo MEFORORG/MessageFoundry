@@ -101,8 +101,9 @@ def _why(exc: BaseException) -> str:
     from messagefoundry.store.keyprovider import KeyProviderError
 
     # The engine's own fail-closed types carry fixed, secret-free text by contract; the cleartext
-    # refusal (BACKLOG #2317) arrives wrapped in one of them. An LdapError from a failed bind carries
-    # ldap3's result line, which names no password. A directory may supply control characters.
+    # refusal (BACKLOG #2317) arrives wrapped in one of them. An LdapError from a failed bind
+    # names the result code or ldap3's error type (BACKLOG #3017), never a password. Control
+    # characters are stripped from every one of these texts all the same.
     if isinstance(exc, (KeyProviderError, SecretProviderError, LdapError, InsecureHopRefused)):
         return strip_control_chars(str(exc))
     name = type(exc).__name__

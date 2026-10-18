@@ -1701,6 +1701,34 @@ class AdminRemoval(StrEnum):
         return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
 
 
+class AdminGrant(StrEnum):
+    """What ``grant_first_admin_unless_admin_exists`` did (BACKLOG #3078)."""
+
+    #: The account now holds Administrator.
+    GRANTED = "granted"
+    #: Another enabled, seal-valid administrator exists, so nothing was written.
+    ADMIN_EXISTS = "admin_exists"
+    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
+    #: disabled or gone, so nothing was written.
+    ACCOUNT_CHANGED = "account_changed"
+
+
+#: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
+#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
+#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
+#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
+#: an unrelated engine write can be what was busy.
+_ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
+_ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF == sqlite3.SQLITE_BUSY
+
+
 #: The last-administrator guard's read (vault BACKLOG #2779): every enabled account holding the
 #: role, each with a flag for whether it is the target. Binds: user id, role id. The ids are
 #: compared in SQL rather than in Python so the guard matches ids exactly as the write's
@@ -2693,6 +2721,40 @@ def totp_enable(
             totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
             updated_at=float(now),
         )
+
+    return apply
+
+
+def first_admin_grant(
+    admin_role_id: str,
+    *,
+    expected_password_hash: str,
+    expected_totp_secret_cell: str | None,
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """What ``grant_first_admin_unless_admin_exists`` writes once the guard passes (BACKLOG
+    #3078): the account holding exactly ``admin_role_id``, only while it is enabled, holds no role,
+    and still holds the credentials the caller wrote. That is the password hash, compared byte for
+    byte, and either no TOTP secret at all (``expected_totp_secret_cell`` ``None``; a secret another
+    run staged but has not enabled counts) or TOTP on with that staged cell.
+
+    Two provisioning runs on one row can interleave before either grant so that one run's password
+    sits beside the other's TOTP; this then writes nothing. A row that already holds a role is
+    refused too, so a second run on a row the first run already granted is never granted over it.
+    What this cannot see is a write landing AFTER a grant committed: the provisioning credential
+    writes before it are not conditional on the row being roleless."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        row = r.row
+        if row.disabled or r.roles or row.password_hash != expected_password_hash:
+            return None
+        if expected_totp_secret_cell is None:
+            if row.totp_enabled or row.totp_secret is not None:
+                return None
+        elif not row.totp_enabled or row.totp_secret != expected_totp_secret_cell:
+            return None
+        return r.with_roles([admin_role_id], assigned_by=assigned_by, now=now)
 
     return apply
 
@@ -15305,6 +15367,56 @@ class MessageStore:
                 assert_never(change)
             await self._commit()
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
+        by SQLite's single writer: a write that lost to one committed after this read fails busy,
+        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
+            try:
+                async with _writer_txn(self._db, self._lock):
+                    cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                    holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                    _, others = await admin_guard_counts(
+                        holders, self._row_sealer, self._read_user_record
+                    )
+                    if others:
+                        await self._db.rollback()
+                        return AdminGrant.ADMIN_EXISTS
+                    if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    await self._commit()
+                return AdminGrant.GRANTED
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc) or attempt == _ADMIN_GRANT_BUSY_ATTEMPTS:
+                    raise
+                log.info(
+                    "sqlite: the first-administrator grant met a busy database (attempt %d of %d);"
+                    " running it again so its re-read decides",
+                    attempt,
+                    _ADMIN_GRANT_BUSY_ATTEMPTS,
+                )
+                await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _delete_user_rows(self, user_id: str) -> None:
         """Delete the account and every row keyed to it. Commits nothing: the caller holds the

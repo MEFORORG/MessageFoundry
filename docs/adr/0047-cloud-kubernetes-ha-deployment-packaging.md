@@ -333,11 +333,11 @@ Owner delegated the open items ("you sort it out / do what is best"); resolved a
 
 > Append-only. It records an owner ruling and does not change the Status line above.
 
-Under the owner's 2026-10-16 v1 platform [ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target), the
-deliverables here that run the Linux engine image are not a supported way to deploy v1: at least the
+Under the owner's 2026-10-16 v1 platform
+[ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target), the deliverables
+here that run the Linux engine image are not a supported way to deploy v1: at least the
 multi-replica reference manifest, the cloud docs' Kubernetes shapes, and an edge relay run as the
 image. The manifests stay in [`docker/`](../../docker/README.md) as development and CI artifacts,
 and CI is unchanged. Deliverables that do not run the image are not narrowed, such as the
-raw-TCP/X12 startup TLS guard. For engine HA on
-Windows, see [CLUSTERING.md](../CLUSTERING.md), and for a SQL Server Always On store,
-[AOAG-DEPLOYMENT.md](../AOAG-DEPLOYMENT.md).
+raw-TCP/X12 startup TLS guard. For engine HA on Windows, see [CLUSTERING.md](../CLUSTERING.md), and
+for a SQL Server Always On store, [AOAG-DEPLOYMENT.md](../AOAG-DEPLOYMENT.md).
