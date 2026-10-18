@@ -29,7 +29,6 @@ import os
 import ssl
 import threading
 import time
-import traceback
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -1021,7 +1020,8 @@ class _AbandonedPass:
     def _hold(self) -> None:
         with crl_reload._PASS_LOCK:
             self.held.set()
-            self._release.wait(10)
+            # Long enough that it never lets go before a test releases it, even on a slow runner.
+            self._release.wait(60)
 
     def start(self) -> None:
         self._thread.start()
@@ -1185,24 +1185,31 @@ async def test_the_idle_runner_runs_no_first_sight_clear_from_its_last_view(
     assert passes == [1]
 
 
-def test_a_kept_read_failure_raised_again_does_not_grow_its_traceback(
+async def test_the_last_view_is_the_last_good_copy_of_this_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The idle branch can raise from its last view every interval. Raising one exception object
-    again adds each raise's frames to the last unless its traceback is dropped first."""
+    """A view whose read of the record failed could only raise again, so it leaves the last good
+    copy in place. A stop ends the run, and a run started next follows only views of its own."""
+    runner = _runner(_Sink())
+    good = _recorded()
+    runner._keep(good)
+    assert runner._last_view is good
 
     def broken_record() -> dict[str, ReloadRefusal]:
         raise RuntimeError("the record could not be read")
 
-    view = crl_reload._PassView()
-    monkeypatch.setattr(crl_reload, "reload_refusals", broken_record)
-    view.take_refusals()
-    depths = []
-    for _ in range(3):
-        with pytest.raises(RuntimeError) as caught:
-            view.refusals()
-        depths.append(len(traceback.extract_tb(caught.value.__traceback__)))
-    assert depths[0] >= 1 and depths == [depths[0]] * 3
+    failed = crl_reload._PassView()
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "reload_refusals", broken_record)
+        failed.take_refusals()
+    assert failed.taken and not failed.copied, "the premise: a read that failed"
+    runner._keep(failed)
+    runner._keep(crl_reload._PassView())
+    runner._keep(None)
+    assert runner._last_view is good, "the last good copy stays"
+
+    await runner.stop()
+    assert runner._last_view is None
 
 
 @pytest.mark.parametrize("final", [True, False], ids=["a-final-verdict", "a-retried-verdict"])
