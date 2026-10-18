@@ -8,6 +8,9 @@ defect, the measurement and the reasoning, and whose unit tests are
 ``scripts/security/audit_all_platforms.py`` wrapper. These tests pin the workflows to that wrapper and
 the wrapper to the one implementation, so the audit cannot quietly return to reading a committed lock
 on a host that evaluates its markers.
+
+It reads engine source (the packaged auditor, over the committed locks), so it runs on the engine
+legs rather than from tests/tooling_manifest.txt: an engine-only change to the auditor must face it.
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ import re
 import pytest
 import yaml
 
-from scripts.security.audit_all_platforms import main, requirement_lines, strip_markers
+import scripts.security.audit_all_platforms as wrapper
+from messagefoundry.security.audit_all_platforms import main, requirement_lines, strip_markers
 from tests._workflow_contexts import ROOT, WORKFLOWS, step_script
 
 #: The locks the required audit step reads, in both jobs that carry it.
@@ -41,8 +45,11 @@ _SCRIPT = "scripts/security/audit_all_platforms.py"
 
 def test_the_wrapper_runs_the_packaged_implementation() -> None:
     """One implementation: the workflows' entry point is the module the adopter's job runs."""
-    for imported in (main, strip_markers, requirement_lines):
-        assert imported.__module__ == "messagefoundry.security.audit_all_platforms", imported
+    assert (wrapper.main, wrapper.strip_markers, wrapper.requirement_lines) == (
+        main,
+        strip_markers,
+        requirement_lines,
+    )
 
 
 @pytest.mark.parametrize("lock", _TREE_LOCKS)
