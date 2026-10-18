@@ -13,8 +13,10 @@ operation made to raise. Four properties are pinned:
 
 * the fault becomes ``LdapError`` with fixed text that names only its type, and the fault is kept
   as the cause;
-* an ``LDAPException`` keeps its own handler and text, even one that is also an ``OSError`` or
-  ``TypeError``. That arm is the control, and it fails if the mapper swallows ldap3's own errors;
+* an ``LDAPException`` keeps its own handler, even one that is also an ``OSError`` or
+  ``TypeError``. That arm is the control, and it fails if the mapper swallows ldap3's own errors.
+  Since BACKLOG #3017 that handler's text names ldap3's type too, in its own form, never ldap3's
+  text;
 * a ``TypeError`` where no socket opens is not mapped, because there it is a defect, and mapping
   it would hide the defect as an outage;
 * an absent account and a present one fail alike on such a fault (ASVS 6.3.8, #1140), so the decoy
@@ -150,14 +152,15 @@ def test_an_ldap3_error_keeps_its_own_handler_and_text(
     monkeypatch: pytest.MonkeyPatch, make: Callable[[], BaseException]
 ) -> None:
     """THE CONTROL. Each of these is an ldap3 error that is also an OSError or a TypeError. It must
-    reach the ldap3 handler, which keeps its own text, and never the fixed socket-fault text."""
+    reach the ldap3 handler, whose text names ldap3's type in its own form (BACKLOG #3017), and
+    never the fixed socket-fault text."""
     _install_fakes(monkeypatch)
     fault = make()
     _faulting(monkeypatch, at="open", fault=fault)
 
     with pytest.raises(LdapError) as err:
         LdapAuthenticator(_ad_settings()).probe_principal("alice")
-    assert str(err.value) == "synthetic ldap3 text"
+    assert str(err.value) == f"AD directory call failed: ldap3 raised {type(fault).__name__}"
     assert err.value.__cause__ is fault
 
 
@@ -185,12 +188,15 @@ def test_authenticate_maps_a_socket_fault(
 def test_authenticate_maps_an_ldap3_error_at_the_user_bind_with_its_own_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control for the arm above: ldap3's own error keeps the ldap3 handler and its text."""
+    """The control for the arm above: ldap3's own error keeps the ldap3 handler, whose text names
+    the type and never ldap3's text (BACKLOG #3017)."""
     _install_fakes(monkeypatch)
     fault = ldap3.core.exceptions.LDAPSocketOpenError("synthetic ldap3 text")
     _faulting(monkeypatch, at="user bind", fault=fault)
 
-    with pytest.raises(LdapError, match="^synthetic ldap3 text$"):
+    with pytest.raises(
+        LdapError, match="^AD directory call failed: ldap3 raised LDAPSocketOpenError$"
+    ):
         LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
 
 
