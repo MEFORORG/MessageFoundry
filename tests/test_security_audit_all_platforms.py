@@ -12,6 +12,7 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -220,6 +221,15 @@ def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.Mo
     monkeypatch.setenv("MEFOR_TEST_AUDIT_SECRET", "marker-not-a-secret")
     monkeypatch.setenv("PIP_TEST_AUDIT_SETTING", "kept")
     assert _run([sys.executable, "-c", _ENV_PROBE]) == 0
+
+
+def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative entry would put the working directory back on a ``-P`` child's ``sys.path``."""
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", str(tmp_path)]))
+    probe = f"import os, sys; sys.exit(os.environ.get('PYTHONPATH') != {str(tmp_path)!r})"
+    assert _run([sys.executable, "-c", probe]) == 0
 
 
 def test_the_module_needs_nothing_outside_the_standard_library() -> None:

@@ -82,7 +82,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import hook_environment, python_module_argv
+from messagefoundry.childenv import engine_environment, hook_environment, python_module_argv
 
 
 def is_requirement_line(line: str) -> bool:
@@ -183,8 +183,10 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
 def _run(cmd: list[str]) -> int:
     # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
     # pip and pip-audit keep the index, proxy and certificate settings they read from the
-    # environment, and an engine secret set on the same runner does not reach them.
-    env = hook_environment()
+    # environment, and an engine secret set on the same runner does not reach them. Built over
+    # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
+    # working directory back on the children's sys.path, which -P keeps off it.
+    env = hook_environment(engine_environment())
     return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - fixed argv, no shell
 
 

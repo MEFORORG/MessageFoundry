@@ -112,7 +112,8 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # adopter's own CI (their remediation clock starts without reading an advisory).
     assert "audit-pin:" in ci
     # Which command runs on which input, and that the lock path verifies hashes and audits a
-    # Windows-only pin, is executed, not read, by test_the_scaffolded_audit_step_*.
+    # Windows-only pin, is executed, not read, by test_the_scaffolded_audit_job_* and
+    # test_a_failed_step_does_not_hide_the_later_audits.
     # SEC-021 (CWE-494): the engine attestation does NOT vouch for the live, unhashed transitive
     # resolve. Without a lock the audit-pin job must WARN that the closure resolves live and
     # recommend an index pin.

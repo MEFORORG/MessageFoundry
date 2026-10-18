@@ -425,7 +425,7 @@ hardening steps (recommended for any PHI-handling adopter):
    ```bash
    # generate (pick one):
    uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock
-   pip-compile --generate-hashes --no-emit-index-url --no-emit-trusted-host --no-emit-find-links -o requirements.lock requirements.txt
+   pip-compile --generate-hashes --no-emit-index-url --no-emit-trusted-host --no-emit-find-links --no-emit-options -o requirements.lock requirements.txt
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```
