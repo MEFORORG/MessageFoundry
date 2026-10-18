@@ -292,9 +292,10 @@ def python_module_argv(
     its own, from site-packages or a ``.pth`` entry. ``-P`` drops the working directory from a
     ``-m`` start, so a source checkout that is not installed cannot be found this way. Nothing
     pins this build either: the first ``messagefoundry`` on the import path answers. The tray's
-    login command is the one user. It passes ``-E`` in ``extra_flags``, so an absolute
+    login command is one user. It passes ``-E`` in ``extra_flags``, so an absolute
     ``PYTHONPATH`` entry naming another copy does not answer that start (vault BACKLOG #2852). The
-    tray it relaunches repeats that ``-E`` (:func:`inherited_interpreter_flags`).
+    tray it relaunches repeats that ``-E`` (:func:`inherited_interpreter_flags`). The other is
+    :mod:`messagefoundry.security.audit_all_platforms`, which starts ``pip`` and ``pip_audit``.
     """
     return [executable or sys.executable, *_flags(extra_flags, inherit), "-m", module]
 

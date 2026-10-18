@@ -65,6 +65,13 @@ def inbound_record_name(name: str) -> str:
     return f"inbound:{name}"
 
 
+def inbound_name_of(record: str) -> str | None:
+    """The inbound connection name in ``record``, read back from :func:`inbound_record_name`'s
+    spelling, or ``None`` when ``record`` names no inbound."""
+    prefix = inbound_record_name("")
+    return record.removeprefix(prefix) if record.startswith(prefix) else None
+
+
 def fhir_lookup_record_name(name: str) -> str:
     """How a record or report names a ``FhirLookup`` connection: ``fhir_lookup:<name>``. Why it is
     prefixed is on :func:`inbound_record_name`."""

@@ -746,6 +746,39 @@ def test_a_route_registered_directly_and_through_an_include_reports_both_paths()
     assert ("GET", "/plain") in rows and ("GET", "/inc/plain") in rows, sorted(rows)
 
 
+def _app_including_a_shared_route_before_registering_it() -> tuple[FastAPI, Route]:
+    shared = Route("/plain", _plain)
+    sub = APIRouter()
+    sub.routes.append(shared)
+    app = FastAPI(openapi_url=None)
+    app.include_router(sub, prefix="/inc")
+    app.router.routes.append(shared)
+    return app, shared
+
+
+def test_a_shared_route_included_before_it_is_registered_reports_both_paths() -> None:
+    app, _ = _app_including_a_shared_route_before_registering_it()
+    rows = _rows_by_key(app)
+    assert ("GET", "/plain") in rows and ("GET", "/inc/plain") in rows, sorted(rows)
+
+
+def test_a_shared_route_included_first_fails_at_the_include_not_the_direct_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3177. A count of direct registrations was spent by whichever context came first, so
+    an include ahead of the direct entry was walked as the direct one, under the unprefixed path,
+    and the direct entry took the blame. The include must fail before anything is yielded for it."""
+    app, shared = _app_including_a_shared_route_before_registering_it()
+    _route_context_hiding(monkeypatch, "starlette_route", empty=True)
+    yielded: list[tuple[object, object]] = []
+    with pytest.raises(ValueError, match="no rebuilt route"):
+        for pair in route_gates._effective_routes(app):
+            yielded.append(pair)
+    assert all(original is not shared for original, _ in yielded), (
+        f"the include's context was walked as the direct entry before the walk refused: {yielded}"
+    )
+
+
 def test_a_shared_route_object_still_fails_by_name_when_the_rebuilt_route_is_renamed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

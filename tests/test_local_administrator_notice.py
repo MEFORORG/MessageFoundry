@@ -2,10 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The start notice when no enabled Administrator can sign in without an outside service.
 
-Vault BACKLOG #2711, step 2. ``provision-admin`` refuses while any enabled Administrator exists,
-whichever kind. So a site whose every Administrator signs in through the directory or a federated
-identity provider has no host command to get back in while that service is down. The engine says so
-at start, and does nothing more: it never refuses.
+Vault BACKLOG #2711, step 2. A site whose every Administrator signs in through the directory or a
+federated identity provider cannot reach the web console while that service is down. The engine
+says so at start, and does nothing more: it never refuses. Since step 1, ``provision-admin`` reads
+the same check: whenever this notice names accounts, they do not block it
+(``tests/test_provision_admin_without_a_local_administrator.py``). It also runs on a store with no
+enabled Administrator, where this notice names nobody, and it can refuse for its own reasons.
 """
 
 from __future__ import annotations

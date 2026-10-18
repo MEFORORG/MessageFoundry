@@ -866,8 +866,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="create the first administrator offline (the engine creates no account on its own)",
         description="Create the first Administrator from the host, against the store the service "
         "uses. The engine creates no account on its own, so nobody can manage a new install until "
-        "this runs. It refuses, before asking for a password, when an enabled Administrator already "
-        "exists or an argument is out of range, and it creates the store only once the password "
+        "this runs. It refuses, before asking for a password, when an enabled local Administrator "
+        "with a usable password already exists or an argument is out of range; a directory or "
+        "federated Administrator does not block it, and it creates the store only once the password "
         "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
         "engine stopped.",
     )
@@ -898,8 +899,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
     # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
-    # too, because an enabled Administrator exists. provision-admin can no longer leave one (BACKLOG
-    # #1138), but a directory account granted the role can, and so can a store an earlier build wrote.
+    # too when a local Administrator with a usable password exists. provision-admin can no longer
+    # leave one (BACKLOG #1138), but a directory account granted the role can, and so can a store an
+    # earlier build wrote.
     # This is the offline exit, on admin-unlock's gate.
     admin_set_notify_email = sub.add_parser(
         "admin-set-notify-email",
@@ -1235,7 +1237,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="on-box deployment acceptance: host checks + store connectivity + end-to-end smoke",
     )
     verify.add_argument(
-        "--config", default="samples/config", help="config modules dir (for the self smoke)"
+        "--config",
+        default="samples/config",
+        help="config modules dir (for the self smoke, and the host.ciphers hop census)",
     )
     verify.add_argument(
         "--service-config",
@@ -7667,6 +7671,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
     the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
     non-empty, because a directory sign-in can fill the table without producing an administrator.
+    Since vault BACKLOG #2711 step 1 that Administrator must be a local one with a usable password
+    (``AuthService.has_self_sufficient_administrator``, ADR 0183 Amendment E): a directory or
+    federated Administrator does not block it, so a site can get back in while that service is down.
 
     **It refuses before it prompts wherever it can, and it creates the store last (ADR 0183 AC-15).**
     The length limits, the keyless gate, the store key's resolution, the trust-anchor and directory
@@ -7676,6 +7683,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     that created the store first left a new store behind, and on a Windows service that store is
     secured to whoever opened it. And a scripted install step, like the IDE's Start flow, reads "an
     enabled Administrator exists" as go-ahead, which it can only do if no password is asked for first.
+    Since vault BACKLOG #2711 step 1 that answer means a local Administrator with a usable password,
+    so a store run only by directory Administrators is offered provisioning too.
     Answering that opens an EXISTING store the way ``serve`` does; an absent SQLite store is not
     created by asking. ``provision_first_administrator`` repeats the blank-name, Administrator and
     policy checks itself, so for those this ordering is a courtesy and not the control. The length
@@ -8090,7 +8099,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     enabled Administrator carries ``notify_email``. ``provision-admin`` used to leave exactly that
     state when run without ``--email``; it requires the flag since BACKLOG #1138. A directory account
     granted the role with no address still leaves it, and so does a store an earlier build wrote.
-    ``provision-admin`` then refuses because an enabled Administrator exists, and the web console
+    ``provision-admin`` then refuses when a local Administrator with a usable password exists
+    (vault BACKLOG #2711), and the web console
     cannot be reached while the engine refuses. This is the exit that trades no control.
 
     **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, and it runs

@@ -369,6 +369,7 @@ _LOADERS: dict[str, frozenset[str]] = {
     # Existence questions: only a bool leaves them, never the unchecked row.
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),
+    "_user_id_held": frozenset({"get_user"}),
     # A count for the holder's notice after a code is spent; it decides nothing.
     "_verify_second_factor": frozenset({"get_recovery_code_hashes"}),
 }

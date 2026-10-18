@@ -185,17 +185,49 @@ the flag to lint your config too.
 
 ### Job 3 — `audit-pin`: "your pin is now vulnerable" tripwire
 
-Runs `pip-audit -r requirements.txt` against the pinned engine and its resolved dependency closure. So a
-vulnerability **disclosed against the version you're pinned to** — after you adopted it — turns *your*
-CI red automatically. Your remediation clock starts without anyone reading an advisory email.
+Runs `pip-audit` against the pinned engine and its resolved dependency closure. So a vulnerability
+**disclosed against the version you're pinned to** — after you adopted it — turns *your* CI red
+automatically. Your remediation clock starts without anyone reading an advisory email.
+
+It runs on a **Windows** runner, because Windows is the engine's only supported deployment platform
+and `pip-audit` evaluates each dependency's environment marker against the runner. A dependency whose
+marker does not match is skipped silently, so on a Linux runner the job would never audit the engine's
+Windows-only dependencies (at least `colorama` and `sspilib`):
+
+- **Always**: `pip-audit -r requirements.txt --desc`, which resolves on Windows the closure your
+  deployment installs. Without a lock the job also warns that the closure resolves live and unhashed.
+- **Hashed `requirements.lock` committed, as well**: the job installs the lock with `--no-deps
+  --require-hashes`, which brings the engine at the bytes you pinned, and runs the engine's own
+  auditor, `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`. That is the
+  code the engine's own required audit runs, and the module documents what it checks. It dry-run
+  installs the lock with `--require-hashes`, then audits **every pin, whatever its marker**.
+  - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
+    rather than fall back to an audit that skips pins.
+  - It runs `pip-audit --strict`, so a pin PyPI cannot look up (a private package) fails the job,
+    and `--ignore-vuln` does not cover that case.
+  - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
+    `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
+    by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each
+    such line, and locks only the platform it runs on, so run it on Windows.
+  - A lock that pins one name at two versions under two markers fails: with the markers removed,
+    `pip-audit` refuses the duplicate.
+  - A requirement that continues onto a line other than a hash, option or comment fails, since a
+    marker there would stay in place.
+- Each command is its own step. The `requirements.txt` audit runs even when the lock install failed,
+  and the lock audit runs even when the `requirements.txt` audit found something; the lock audit
+  needs the auditor the install brings, so a failed install skips it. The job's token is read-only
+  and its checkout keeps no credential, because it runs engine code from the lock.
+- The job does not wait on `verify-engine`, so a failed provenance check does not also silence the
+  tripwire. The engine code it runs comes from your lock's hashes, which bind it to the bytes you
+  locked, not to the wheel `verify-engine` attested.
 
 > `verify-engine` proves *who built* the wheel you pin; `audit-pin` proves *that pin hasn't since gone
 > vulnerable*. Together they cover both halves of the supply-chain question on every PR.
 
 - **Remediate** by bumping the engine pin in `requirements.txt` to a release that fixed it (the engine's
   own fast-response ships fixes promptly — see its `SECURITY.md` dependency-CVE SLA).
-- **Accept a triaged advisory** with `pip-audit --ignore-vuln <ID>` (record why, per your own change
-  control) — e.g. a CVE in a path your config never wires.
+- **Accept a triaged advisory** by appending `--ignore-vuln <ID>` to each audit line that reports it (record
+  why, per your own change control) — e.g. a CVE in a path your config never wires.
 
 ---
 

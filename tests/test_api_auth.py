@@ -21,7 +21,12 @@ from messagefoundry.api.security import ExportStopped, deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
-from messagefoundry.auth.service import AuthService, CurrentPasswordCheck
+from messagefoundry.auth.service import (
+    AuthService,
+    CurrentPasswordCheck,
+    DirectoryRefusal,
+    Elevation,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
@@ -468,6 +473,58 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         # marked the session second-factor-satisfied — the session is now usable. No lockout occurred.
         status = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert status["enabled"] is True and status["required"] is True
+
+
+async def test_the_confirm_route_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061: ``confirm_mfa_enrollment`` asks the directory before it checks a directory
+    account's code, so a refusal never judged the code. RED when ``/me/mfa/confirm`` answers it as
+    the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is pinned
+    in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(directory_refusal=DirectoryRefusal.UNCONFIRMED)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refused)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert "directory could not confirm this account" in r.json()["detail"]
+
+
+async def test_the_confirm_route_says_a_locked_account_is_locked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3810 finding 4: a directory account's enrolment refuses a live second-step lock
+    before the code is checked, and says so with ``locked``. RED when ``/me/mfa/confirm`` answers
+    it as the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is
+    pinned in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _locked(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(locked=True)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _locked)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "account locked; try again later"
 
 
 def _hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:

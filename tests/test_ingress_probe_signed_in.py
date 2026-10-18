@@ -74,12 +74,14 @@ def test_every_setup_failure_reason_matches_the_workflow_parser() -> None:
 
 @pytest.fixture
 def fresh_rig(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Own credential and session holders, put back after (as ``tests/test_rig_admin.py`` does)."""
+    """Own credential, session and spent-step holders, put back after, and no rig variable from the
+    calling shell (as ``tests/test_rig_admin.py`` does)."""
     monkeypatch.setattr(rigadmin, "_credential", rigadmin._HeldAdmin())
     monkeypatch.setattr(rigadmin, "_held", rigadmin._HeldSession())
+    monkeypatch.setattr(rigadmin, "_spent", rigadmin._SpentSteps())
     # Set, then deleted: `rig_admin` publishes a drawn password into the environment itself, and
     # monkeypatch can only undo a variable it has seen.
-    for name in (rigadmin.ADMIN_PASS_ENV, rigadmin.ADMIN_NAME_ENV):
+    for name in (rigadmin.ADMIN_PASS_ENV, rigadmin.ADMIN_NAME_ENV, rigadmin.ADMIN_FACTOR_ENV):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 

@@ -76,9 +76,10 @@ class SecurityEnforcement(str, Enum):  # noqa: UP042
     instance's production *tier* fact (ADR 0017 / this refactor).
 
     * ``enforce`` (the secure default) — the posture GATES **REFUSE** a PHI weakening and the blunt
-      ``MEFOR_ALLOW_INSECURE_TLS`` / ``--allow-insecure-bind`` escapes are **clamped inert**. Byte-
-      identical to the historical ``production=True`` dial position, so a stock prod instance is
-      unchanged and a declared-PHI staging/dev instance now fails closed the same way.
+      ``MEFOR_ALLOW_INSECURE_TLS`` / ``--allow-insecure-bind`` escapes are **clamped inert**; the
+      first is honoured only at ``[security].enforcement = warn``. Byte-identical to the historical
+      ``production=True`` dial position, so a stock prod instance is unchanged and a declared-PHI
+      staging/dev instance now fails closed the same way.
     * ``warn`` — the gates **WARN + audit + continue** and the escapes are **honored**. Byte-identical
       to the historical ``production=False`` dial position (the non-production posture).
 

@@ -12,6 +12,11 @@ The account here is a directory account, the case ADR 0207 Context item 3 names 
 posture: its Kerberos session mints unstamped, and ``begin_webauthn_registration`` accepts it with no
 factor. A local sign-in that owes nothing mints stamped, so it does not reach this gap. All directory
 data is synthetic.
+
+BACKLOG #3061 added a second ask on both enrolment legs, after the directory lookup each awaits.
+The test at the end pins its TOTP mirror on ``confirm_mfa_enrollment``, whose first ask is its
+route's gate; the mirror's tests that need no passkey are in
+``tests/test_enrolment_directory_recheck.py``.
 """
 
 from __future__ import annotations
@@ -26,13 +31,14 @@ pytest.importorskip("webauthn")
 
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
-from messagefoundry.auth import totp  # noqa: E402
+from messagefoundry.auth import reconcile, totp  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe  # noqa: E402
 from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore  # noqa: E402
+from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
+from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 from tests._totp_clock import pin_totp_clock  # noqa: E402
 
@@ -162,6 +168,9 @@ async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a
     assert lost.session_lost is True and lost.ok is False
     assert await store.list_webauthn_credentials(identity.user_id) == []
     assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807: this first guard is audited as the second one is. RED when it is silent.
+    rows = await store.list_audit(action="auth.webauthn_failed")
+    assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
 
 
 async def test_a_session_that_proves_the_existing_factor_first_still_finishes(
@@ -185,3 +194,135 @@ async def test_a_session_that_proves_the_existing_factor_first_still_finishes(
 
     assert enrolled.ok is True
     assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+
+
+async def test_a_totp_bound_during_the_directory_lookup_stops_the_passkey_finish(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061: the directory lookup at finish is a network round trip, AFTER the factor
+    check above. A TOTP confirmed on another session during it must still stop the registration.
+    RED when: ``finish_webauthn_registration`` does not ask ``_factor_binding_is_blocked`` again
+    once the lookup returns, so the passkey binds and the session is promoted without proving the
+    factor the account now holds."""
+    t0 = time.time()
+    pin_totp_clock(monkeypatch, t0)
+    service = await _service(store, require_mfa=False)
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    real_probe = service._probe_principal
+    confirmed: list[str] = []
+
+    async def _probe_while_totp_confirms(user: UserRecord) -> reconcile.Probe:
+        # Restored first: the confirm below runs its own lookup through the same seam.
+        monkeypatch.setattr(service, "_probe_principal", real_probe)
+        confirmed.append(await _enrol_totp_elsewhere(service, t0))
+        return await real_probe(user)
+
+    monkeypatch.setattr(service, "_probe_principal", _probe_while_totp_confirms)
+
+    with pytest.raises(ValueError, match="already has a second factor"):
+        await _finish(service, identity, token, response)
+
+    assert len(confirmed) == 1  # the injection ran inside the lookup, not before it
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+    assert await service.mfa_satisfied(token) is False
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    # Refused as the earlier check refuses: the ceremony is ended, not left for a retry.
+    assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
+
+
+async def test_a_session_revoked_between_the_two_asks_is_lost_not_owing_a_factor(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second ask fails closed on a dead session, as the first does, so it carries the same
+    session guard. RED when: a session revoked after the first ask is told the account "already
+    has a second factor" (it holds none) and an ``auth.mfa_denied`` row is written for it. A LOCAL
+    account, because a directory account's lookup re-reads the session and answers it lost first."""
+    service = await _service(store, require_mfa=False)
+    identity, token, _password = await login_admin(service)
+    response = await _stage_passkey(service, identity, token)
+    real_floor = service._enrolment_too_early
+
+    async def _floor_while_revoked(*args: object, **kwargs: object) -> bool:
+        await store.revoke_session(hash_token(token))
+        return await real_floor(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_enrolment_too_early", _floor_while_revoked)
+
+    lost = await _finish(service, identity, token, response)
+
+    assert lost.session_lost is True and lost.ok is False
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807, the passkey mirror: the code before #3061 reached the rotation here and
+    # audited its failure, so the guard that now answers first leaves a row too. RED when silent.
+    rows = await store.list_audit(action="auth.webauthn_failed")
+    assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
+    # A dead session can never finish the ceremony, so the lost answer ends it.
+    assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
+
+
+# --- the TOTP mirror: confirm_mfa_enrollment ---------------------------------------------------
+
+
+async def _register_passkey_elsewhere(service: AuthService) -> None:
+    """Register a passkey on a SECOND session, which ``finish_webauthn_registration`` stamps."""
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    assert (await _finish(service, identity, token, response)).ok
+
+
+async def test_a_passkey_bound_during_the_directory_lookup_stops_the_totp_confirm(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061, the mirror of the passkey test above: the route's gate asks the
+    factor-binding rule before ``confirm_mfa_enrollment`` runs, and the directory lookup inside it
+    is a network round trip. A passkey bound on another session during it must still stop the
+    confirm. RED when: ``confirm_mfa_enrollment`` does not ask ``_factor_binding_is_blocked`` once
+    the lookup returns, so it spends the step, mints recovery codes, enables TOTP and promotes a
+    session that never proved the passkey the account now holds."""
+    t0 = time.time()
+    pin_totp_clock(monkeypatch, t0)
+    service = await _service(store, require_mfa=False)
+    identity, token = await _sign_in(service)
+    secret = (await service.begin_mfa_enrollment(identity)).secret
+    code = totp.totp(secret, now=t0)
+    minted: list[int] = []
+    real_mint = totp.generate_recovery_codes
+
+    def _counting_mint(count: int) -> list[str]:
+        minted.append(count)
+        return real_mint(count)
+
+    monkeypatch.setattr(totp, "generate_recovery_codes", _counting_mint)
+    real_probe = service._probe_principal
+    bound: list[bool] = []
+
+    async def _probe_while_a_passkey_binds(user: UserRecord) -> reconcile.Probe:
+        # Restored first: the registration below runs its own lookup through the same seam.
+        monkeypatch.setattr(service, "_probe_principal", real_probe)
+        await _register_passkey_elsewhere(service)
+        bound.append(True)
+        return await real_probe(user)
+
+    monkeypatch.setattr(service, "_probe_principal", _probe_while_a_passkey_binds)
+
+    with pytest.raises(ValueError, match="already has a second factor"):
+        await service.confirm_mfa_enrollment(identity, code, token=token)
+
+    assert len(bound) == 1  # the injection ran inside the lookup, not before it
+    assert minted == []  # no recovery codes were minted
+    user = await store.get_user(identity.user_id)
+    assert user is not None and not user.totp_enabled
+    assert await store.get_recovery_code_hashes(identity.user_id) == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is None and session.mfa_verified_at is None
+    assert await service.mfa_satisfied(token) is False
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert {"path": "confirm_mfa_enrollment"} in [json.loads(r["detail"]) for r in rows]
+    # No step was spent: the code's step is still unconsumed.
+    step = totp.verify_totp_step(secret, code, now=t0)
+    assert step is not None and await store.consume_totp_step(identity.user_id, step)

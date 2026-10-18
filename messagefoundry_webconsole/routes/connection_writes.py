@@ -53,6 +53,30 @@ _log = logging.getLogger(__name__)
 #: uncontrollable through the API either way.
 _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
+
+async def _audit_refused_name(core: Any, engine: Any, identity: Identity, request: Request) -> None:
+    """Audit a channel-scoped actor's bulk selection that failed the connection-name rule.
+
+    A channel-scoped actor's attempt on a name it may not reach is a security event. MEASURED when
+    the refusal was unconditional and wrote nothing: a well-formed out-of-scope name wrote one
+    ``auth.channel_denied`` row naming the actor, and a MALFORMED one wrote none, so sending a bad
+    name deleted your own security event. A scope holds only names that pass the rule, so a
+    malformed name is never in scope, and the refusal is audited here instead.
+
+    The row carries no channel (BACKLOG #3031). The name is caller-chosen text that failed the rule,
+    bounded only by the request body, and ``audit_log.channel_id`` would otherwise hold it whole. The
+    actor and the host still identify the attempt, as on the purge confirm page's refusal.
+
+    A failed write is logged and the batch goes on, as it does for a failed target, so the
+    operator still sees which targets were applied."""
+    if identity.allowed_channels is None:
+        return
+    try:
+        await core.audit_channel_denied(engine, identity, None, client_ip(request))
+    except Exception:  # noqa: BLE001 - capture-and-continue; one bad selection never aborts the batch
+        _log.exception("could not audit a channel-scoped actor's malformed bulk selection")
+
+
 # The per-name queue purge POST (`/ui/connections/{name}/purge/{scope}`) is deliberately NOT a
 # registered continuation (vault BACKLOG #2764). It was once auto_retry, but no page renders a form
 # to it -- the console purges through the confirm page below -- so the re-auth auto-submit had become
@@ -122,19 +146,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # bad selection must not abort the rest. After the dedupe, so a selection repeated N
             # times is still one row whether it is valid or not.
             # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
-            #
-            # Applied ONLY for an actor who is not channel-scoped, and that condition is the whole
-            # point. A channel-scoped actor's attempt on a name outside their scope is a security
-            # event the handler records through its own guard, and refusing here returns before it.
-            # MEASURED: a well-formed out-of-scope name writes one auth.channel_denied row naming
-            # the actor; with this check unconditional, a MALFORMED one wrote none -- so sending a
-            # bad name deleted your own security event. That is the defect purge-confirm's
-            # unannotated `dest` exists to avoid, and it must not come back in here.
-            #
-            # Nothing unvalidated reaches anything dangerous on that path: a scope holds only names
-            # that pass the rule, so a malformed name can never be in scope, and the handler denies
-            # and audits it before any store query.
-            if identity.allowed_channels is None and refuse(CONNECTION_RULE, name) is not None:
+            # A channel-scoped actor's refusal is still audited; _audit_refused_name says why.
+            if refuse(CONNECTION_RULE, name) is not None:
+                await _audit_refused_name(core, engine, identity, request)
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -181,9 +195,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 name, req, engine=engine, identity=identity, request=request
             )
         except HTTPException as exc:
-            if (
-                exc.status_code == 409
-            ):  # scope fork (code-first) or a validate-before-persist failure
+            # At least: the scope fork (code-first), a validate-before-persist failure, or a
+            # connections.toml the engine's account cannot write (vault BACKLOG #3106).
+            if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             if exc.status_code == 503:
                 # The route's only 503: the audit log did not record the toggle (vault BACKLOG
@@ -281,8 +295,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             seen_dest.add(value)
             # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
             # value reaching the result table, which the raw append below used to put there.
-            # Same shape and the same channel-scope carve-out as ui_bulk_control above.
-            if identity.allowed_channels is None and refuse(CONNECTION_RULE, value) is not None:
+            # Same shape and the same channel-scope audit as ui_bulk_control above.
+            if refuse(CONNECTION_RULE, value) is not None:
+                await _audit_refused_name(core, engine, identity, request)
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

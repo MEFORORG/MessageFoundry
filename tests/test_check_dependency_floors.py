@@ -37,6 +37,13 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
             "twice>=2.0; python_version >= '3.10'",
             "nofloor",
             "elsewhere>=1.0; sys_platform == 'never'",
+            # BACKLOG #3177: a bare line adds no bound, so the other line's floor stands.
+            "bare",
+            "bare>=1.5",
+            # BACKLOG #3177: the merged specifiers are re-checked, so one line's exclusion of the
+            # floor another line declares leaves no readable floor.
+            "split>=1.0",
+            "split>=0.5,!=1.0",
         )
     )
     assert floors == {
@@ -48,6 +55,8 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
         "excluded": None,
         "twice": Version("2.0"),
         "nofloor": None,
+        "bare": Version("1.5"),
+        "split": None,
     }
 
 
@@ -98,7 +107,8 @@ def test_each_verdict() -> None:
         "missing: declared >=1.0 but not installed",
         "raised-below: installed 1.9, BELOW the declared floor 2.0",
         "stale-raise: listed as raised but installed at its floor 1.0; drop it from --raised",
-        "unreadable: declares no floor this check can read; write it as >=X",
+        "unreadable: declares no floor this check can read; write it as >=X, "
+        "with no specifier for this name excluding X",
         "unknown: listed as raised but declares no floor that applies here",
     ]
 

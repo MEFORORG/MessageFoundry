@@ -4,4 +4,5 @@
   [SYSTEM-REQUIREMENTS.md](../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target),
   and at least the deployment, install, container and early-adopter docs link to it. ADRs 0017, 0047
   and 0149 gain dated amendments. `docker/compose.yaml` and the two Kubernetes reference manifests
-  gain a header line saying they are not a supported v1 deployment. The code, the image, what the manifests deploy, and CI are unchanged.
+  gain a header line saying they are not a supported v1 deployment. The code, the image, what the
+  manifests deploy, and CI are unchanged.

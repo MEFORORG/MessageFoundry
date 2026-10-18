@@ -130,7 +130,7 @@ def _memenc(value: bool | None) -> str:
     Worded "self-reported" in every state, never "enabled"/"compliant"/"verified": the value comes
     from what the host OS says about itself (/proc/cpuinfo flags, guest device presence), and ASVS
     11.7.1 exists because that host may be the adversary. None = undeterminable, which is what
-    Windows reports today (the in-guest attestation path is an ADR 0152 spike that has not landed)."""
+    Windows reports (ADR 0152's 2026-07-22 Windows spike ruled out a Windows read-out)."""
     if value is None:
         return "undeterminable"
     return "self-reported yes" if value else "self-reported no"
@@ -706,6 +706,12 @@ def status(
                 "ul",
                 *[el("li", f"{lo.switch} — {lo.risk}") for lo in posture.loosenings],
             )
+        )
+    if posture.loosenings_scope is not None:
+        # The engine says what the list above leaves out: no loaded graph, or a channel-scoped
+        # reader (BACKLOG #3189). Without it, an empty list would read as a fully hardened engine.
+        security_section.append(
+            el("p", f"Loosenings listed: {posture.loosenings_scope}", class_="banner")
         )
     cluster_tbl = rows_table(
         ["Field", "Value"],

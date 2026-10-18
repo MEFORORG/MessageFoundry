@@ -261,7 +261,11 @@ def _check_forward_proxy_egress(
 
 
 def check_fhir_lookup_allowed(
-    name: str, settings: Mapping[str, Any], egress: EgressSettings
+    name: str,
+    settings: Mapping[str, Any],
+    egress: EgressSettings,
+    *,
+    warn_query_credentials: bool = True,
 ) -> None:
     """Fail-closed egress allowlist for a ``FhirLookup`` (it dials out to an HTTP(S) FHIR host for a live,
     read-only ``fhir_lookup``, ADR 0043). Reuses ``[egress].allowed_http`` — the **exact arm** the FHIR
@@ -272,9 +276,12 @@ def check_fhir_lookup_allowed(
 
     The read arm dials through the same ADR 0126 forward proxy as the FHIR outbound, so it is gated by
     ``[egress].allowed_proxy`` here too — outside the ``allowed_http`` guard below, because that list
-    being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep)."""
+    being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep).
+
+    ``warn_query_credentials`` is as on :func:`check_egress_allowed`."""
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
-    warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
+    if warn_query_credentials:
+        warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
             f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
@@ -315,9 +322,12 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     lands in the partner's and every proxy's access log. The engine's own log lines already drop the
     query (``_peer_label``, ``rest._redact_url``).
 
-    Called from :func:`check_egress_allowed`, the one function every outbound build path runs
-    (check, start, operator start, test), and from :func:`check_fhir_lookup_allowed`, its FhirLookup
-    twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
+    Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
+    least check, start, operator start and test), and from :func:`check_fhir_lookup_allowed`, its
+    FhirLookup twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
+    A reload that replaces a running graph skips it on its rebuilds, because that reload's build
+    check already warned; :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the
+    source of record for where it fires.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")
@@ -335,7 +345,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
         )
 
 
-def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
+def check_egress_allowed(
+    dest: Destination, egress: EgressSettings, *, warn_query_credentials: bool = True
+) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
     exfiltrate PHI. ``build_destination`` runs it on every build (vault BACKLOG #2605). Under the
@@ -346,7 +358,11 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     PHI bodies and keep their own ``[alerts]`` host allowlists.
 
     Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
-    outright (fail-closed); with the list set, the per-list matching below is unchanged."""
+    outright (fail-closed); with the list set, the per-list matching below is unchanged.
+
+    ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
+    refusal. A reload passes it for the rebuild that follows its build check, which has already
+    logged the warning for this reload (vault BACKLOG #2910)."""
     # ADR 0126 forward proxy: an http-family destination may dial through an operator-chosen proxy that
     # receives a Proxy-Authorization credential. Gated by its OWN [egress].allowed_proxy list, BEFORE
     # and independently of the per-transport destination chain below — an empty allowed_http says
@@ -354,7 +370,8 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
     # ASVS 14.2.1: a recorded loosening, never a silent one
-    warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
+    if warn_query_credentials:
+        warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

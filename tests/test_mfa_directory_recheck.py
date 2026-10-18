@@ -28,11 +28,10 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
+from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
-    DirectoryProbe,
-    LdapError,
     LdapReferralError,
 )
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService, DirectoryRefusal
@@ -40,11 +39,15 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import login_admin
+from tests._fake_directory import FakeDirectory as _Directory
 
 _T0 = 1_700_000_000.0
 _T1 = _T0 + totp.DEFAULT_PERIOD
+# Synthetic base32, a second secret for a factor enrolled again during a code check.
+_REPLACING_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 _PRINCIPAL = AdPrincipal(
     username="jdoe",
@@ -54,28 +57,6 @@ _PRINCIPAL = AdPrincipal(
     groups=frozenset(),
     directory_object_id="6f1d3c52-0e0b-4a57-9d52-1c2a3b4c5d6e",
 )
-
-
-class _Directory:
-    """A directory whose answer the test sets. ``unreachable`` raises the connectivity signal."""
-
-    def __init__(self, principal: AdPrincipal) -> None:
-        self.principal = principal
-        self.answer = DirectoryAnswer.FOUND
-        self.unreachable = False
-        #: Raised by the lookup when set: a referral (BACKLOG #2538) or a non-LDAP fault (#2241).
-        self.raises: Exception | None = None
-        self.probes: list[tuple[str, str | None]] = []
-
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-        self.probes.append((username, object_id))
-        if self.unreachable:
-            raise LdapError("synthetic: LDAP socket closed")
-        if self.raises is not None:
-            raise self.raises
-        if self.answer is DirectoryAnswer.FOUND:
-            return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
-        return DirectoryProbe(self.answer)
 
 
 @dataclass
@@ -447,6 +428,30 @@ async def test_a_directory_account_not_demoted_still_renews(
     assert await e.service.has_recent_step_up(verified.token) is True
 
 
+async def test_the_role_test_judges_the_roles_read_after_the_lookup(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3081 item 8: the role test judges the roles of the row read AFTER the lookup. Pinned
+    by a bare role write during the lookup, with no session revocation. That is an instrument, not
+    a production interleaving: every production role writer also revokes the account's sessions.
+    RED when the test compares the roles read before the lookup, which still hold the role the
+    directory took away."""
+    e = await _mapped_session(store, monkeypatch, _OPERATORS, _VIEWERS)
+    e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+    original = e.service._directory_presence
+
+    async def lookup_then_resync(user: Any) -> reconcile.Probe | str:
+        answer = await original(user)
+        await store.set_user_roles(e.user_id, ["viewer"], assigned_by="ad-sync")
+        return answer
+
+    monkeypatch.setattr(e.service, "_directory_presence", lookup_then_resync)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True and verified.token is not None
+
+
 async def test_a_local_account_is_never_role_checked(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -491,6 +496,389 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert refused.locked is True and refused.ok is False
     session = await store.get_session(hash_token(e.token))
     assert session is not None and session.reauth_at is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "lock",
+        "revoke",
+        "disable",
+        "factor-off",
+        "factor-replaced",
+        "factor-replaced-same-stamp",
+        "factor-restamped",
+        "secret-unopenable",
+    ],
+)
+@pytest.mark.parametrize("account", ["directory", "local"])
+async def test_what_lands_during_the_code_check_stops_the_factor_write(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
+) -> None:
+    """BACKLOG #3068, item 2. A revocation, a disable or a factor reset needs no account queue to
+    land, and the code check awaits, so the session, the account and its lock are read again right
+    before the factor is written, for every account. RED when: a change that lands during a good
+    code's check does not stop the write, which would then mark the factor, stamp the window and
+    clear the lockout counters. ``factor-replaced`` turns TOTP off and enrols it again with a new
+    secret, so the row holds a factor again but not the one the code proved; it is audited
+    ``factor_replaced``, apart from a plain disable. ``factor-restamped`` enrols the SAME secret
+    again under a new stamp, so only the stamp tells the enrolments apart. ``secret-unopenable``
+    makes the fresh row's secret fail to open once the code is spent: refused and audited
+    ``factor_unverified``, never raised."""
+    if account == "directory":
+        e = await _enrolled_directory_session(store, monkeypatch)
+        service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
+        secret = e.secret
+    else:
+        service = AuthService(store, _settings())
+        identity, first, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=first
+        )
+        assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+        # A fresh session that still owes its factor, proved by a single-use recovery code.
+        token = await service._issue_session(
+            identity.user_id,
+            None,
+            mfa_verified=False,
+            seed_reauth=False,
+            mechanism=SessionMechanism.PASSWORD,
+            idp_auth_time=None,
+        )
+        user_id, code = identity.user_id, confirmed.recovery_codes[0]
+        secret = enroll.secret
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        if change == "lock":
+            await _lock_second_step(store, user_id)
+        elif change == "revoke":
+            await store.revoke_session(hash_token(token))
+        elif change == "disable":
+            await store.set_user_disabled(user_id, disabled=True)
+        elif change == "secret-unopenable":
+
+            def _refuse(*_args: object) -> str | None:
+                raise CipherError("synthetic: the cell does not open")
+
+            monkeypatch.setattr(store, "open_totp_secret", _refuse)
+        elif change == "factor-restamped":
+            before = await store.get_user(user_id)
+            assert before is not None and before.totp_enrolled_at is not None
+            await store.disable_totp(user_id)
+            cell = await store.set_totp_secret(user_id, secret=secret)
+            assert cell is not None
+            assert await store.enable_totp(
+                user_id,
+                recovery_code_hashes=[],
+                expected_secret_cell=cell,
+                now=before.totp_enrolled_at + 1.0,
+            )
+        else:
+            before = await store.get_user(user_id)
+            assert before is not None
+            await store.disable_totp(user_id)
+            if change.startswith("factor-replaced"):
+                cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+                assert cell is not None
+                # ``-same-stamp`` gives the new enrolment the old one's stamp, so only the secret
+                # tells them apart; the other passes an explicit, different stamp.
+                stamp = before.totp_enrolled_at if change.endswith("same-stamp") else _T1
+                assert stamp is not None
+                assert await store.enable_totp(
+                    user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=stamp
+                )
+        return good
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_something_lands)
+
+    refused = await service.verify_mfa(token, code)
+
+    assert refused.ok is False
+    assert refused.session_lost is (change in ("revoke", "disable"))
+    assert refused.locked is (change == "lock")
+    reason = {
+        "lock": "locked",
+        "factor-off": "factor_removed",
+        "factor-replaced": "factor_replaced",
+        "factor-replaced-same-stamp": "factor_replaced",
+        "factor-restamped": "factor_replaced",
+        "secret-unopenable": "factor_unverified",
+    }.get(change, "session_lost")
+    assert {"reason": reason} in await _audited_mfa_failures(store)
+    session = await store.get_session(hash_token(token))
+    assert session is not None
+    assert session.mfa_verified_at is None and session.reauth_at is None
+    if change == "lock":
+        user = await store.get_user(user_id)
+        assert user is not None and user.second_step_locked_until is not None  # not cleared
+
+
+#: Each case: the change landing during the check, whether the code sent is the correct one, and the
+#: reason it is refused with (``None``: charged as a wrong code).
+_CHANGED_FACTOR_CASES: dict[str, tuple[str, bool, str | None]] = {
+    "factor-off": ("factor-off", True, "factor_removed"),
+    "factor-replaced": ("factor-replaced", True, "factor_replaced"),
+    "factor-replaced-same-stamp": ("factor-replaced-same-stamp", True, "factor_replaced"),
+    "wrong-code-meets-a-change": ("factor-off", False, None),
+    "wrong-code": ("none", False, None),
+}
+
+
+@pytest.mark.parametrize("case", list(_CHANGED_FACTOR_CASES))
+async def test_a_factor_changed_during_the_check_charges_no_lockout(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """BACKLOG #3780 item 1. A self-service disable or re-enrolment takes no queue and clears the
+    recovery codes the check spends, so a CORRECT recovery code whose factor is turned off, or
+    turned off and enrolled again, while the code is checked fails its spend. RED when: that code
+    falls through to the wrong-code branch, which charges the second-step lockout, rather than
+    being refused with its own reason. ``-same-stamp`` gives the new enrolment the old stamp, so
+    only the secret tells them apart. The controls: a WRONG code is charged whether or not a change
+    lands during its check, since it matched nothing."""
+    change, correct, reason = _CHANGED_FACTOR_CASES[case]
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_the_factor_changes(*args: Any, **kwargs: Any) -> bool:
+        # The check holds the row it loaded, so a change landing now is one it cannot see.
+        before = await store.get_user(user_id)
+        assert before is not None
+        if change != "none":
+            await store.disable_totp(user_id)
+        if change.startswith("factor-replaced"):
+            cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+            assert cell is not None
+            stamp = before.totp_enrolled_at if change.endswith("same-stamp") else _T1
+            assert stamp is not None
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=stamp
+            )
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_the_factor_changes)
+    code = confirmed.recovery_codes[0] if correct else "ZZZZ-ZZZZ-ZZZZ"
+
+    refused = await service.verify_mfa(confirmed.token, code)
+
+    assert refused.ok is False and refused.locked is False and refused.session_lost is False
+    user = await store.get_user(user_id)
+    assert user is not None
+    if reason is None:
+        assert user.second_step_failed_attempts == 1
+        return
+    assert {"reason": reason} in await _audited_mfa_failures(store)
+    assert user.second_step_failed_attempts == 0
+    # No plain wrong-code row: the refusal is audited once, with its reason.
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert all(r["detail"] for r in rows)
+
+
+@pytest.mark.parametrize("change", ["reset", "admin-replace"])
+async def test_a_factor_changed_with_the_sessions_revoked_answers_a_lost_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392 at 5d8901d8. An MFA reset, or an administrator's
+    replace, turns the factor off (and enrols a new one) and revokes the sessions, so a CORRECT
+    recovery code checked meanwhile fails its spend on a session that no longer authenticates. RED
+    when: the failed-spend branch answers ``factor_removed`` or ``factor_replaced`` with
+    ``session_lost`` unset, because it skipped the holder re-read the proved branch runs. The code
+    matched, so it is still charged nothing."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    token = confirmed.token
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_an_admin_changes_the_factor(*args: Any, **kwargs: Any) -> bool:
+        # The check holds the row it loaded, so a change landing now is one it cannot see.
+        await store.disable_totp(user_id)
+        if change == "admin-replace":
+            cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+            assert cell is not None
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=_T1
+            )
+        await store.revoke_session(hash_token(token))
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_an_admin_changes_the_factor)
+
+    refused = await service.verify_mfa(token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False and refused.session_lost is True and refused.locked is False
+    failures = await _audited_mfa_failures(store)
+    assert {"reason": "session_lost"} in failures
+    assert {"reason": "factor_removed"} not in failures
+    assert {"reason": "factor_replaced"} not in failures
+    user = await store.get_user(user_id)
+    assert user is not None and user.second_step_failed_attempts == 0
+
+
+#: Each case: what lands with the factor turned off during the check, and what the refusal is:
+#: ``session_lost``, ``locked``, or ``charged`` (the re-read raised, which proves no change).
+_FAILED_SPEND_REREAD_CASES = {
+    "disable": "session_lost",
+    "lock": "locked",
+    "reread-raises": "charged",
+}
+
+
+@pytest.mark.parametrize("change", list(_FAILED_SPEND_REREAD_CASES))
+async def test_the_failed_spend_reread_answers_the_holder_first(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392. A CORRECT recovery code whose factor is turned
+    off during the check fails its spend, and the branch that then asks why reads the session, the
+    account and its lock first. RED when: an account disabled meanwhile answers ``factor_removed``
+    rather than a lost session, a lock landing meanwhile is not answered ``locked``, or either
+    charges the matched code; or when a re-read that raises is not charged (fail closed)."""
+    outcome = _FAILED_SPEND_REREAD_CASES[change]
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        await store.disable_totp(user_id)
+        if change == "disable":
+            await store.set_user_disabled(user_id, disabled=True)
+        elif change == "lock":
+            await _lock_second_step(store, user_id)
+        return await real_verify(*args, **kwargs)
+
+    async def _reread_fails(*_args: Any, **_kwargs: Any) -> object:
+        raise RuntimeError("synthetic: the holder re-read failed")
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_something_lands)
+    if change == "reread-raises":
+        monkeypatch.setattr(service, "_factor_holder_current", _reread_fails)
+
+    refused = await service.verify_mfa(confirmed.token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False
+    assert refused.session_lost is (outcome == "session_lost")
+    assert refused.locked is (outcome == "locked")
+    failures = await _audited_mfa_failures(store)
+    assert {"reason": "factor_removed"} not in failures
+    if outcome == "session_lost":
+        assert {"reason": "session_lost"} in failures
+    user = await store.get_user(user_id)
+    assert user is not None
+    # The lock case's one failure is the lock itself; the code adds none.
+    assert user.second_step_failed_attempts == (0 if outcome == "session_lost" else 1)
+
+
+async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068 (the #2291 class). A directory rename needs no account queue to land, so the
+    success is filed under the name the row holds when the factor is written. RED when: the
+    ``auth.mfa_verified`` row names the account as it was before the rename."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok
+    rows = await store.list_audit(action="auth.mfa_verified")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
+async def test_a_replayed_code_checked_across_a_rename_is_charged_under_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392 at fcac75a5. A replayed code MATCHES but fails its
+    spend with the factor unchanged, so it is charged as a wrong code, and against the row the
+    holder re-read returned: a rename landing during the check must not leave the wrong-code row
+    and the lockout naming the account as it was. RED when: the ``auth.mfa_failed`` row names the
+    old username, or the replay is not charged."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    (second,) = await _more_sessions(e, 1)
+    code = totp.totp(e.secret, now=_T1)
+    assert (await e.service.verify_mfa(e.token, code)).ok
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
+
+    refused = await e.service.verify_mfa(second, code)
+
+    assert refused.ok is False and refused.session_lost is False and refused.locked is False
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == 1
+
+
+async def test_a_secret_that_does_not_open_for_the_check_is_refused_and_spends_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068, review of the merged head. A TOTP cell that does not open before the code is
+    checked is refused ``factor_unverified``, never raised, and the check stops at its TOTP
+    decrypt, so a recovery code sent with it is not spent. RED when: verify_mfa raises
+    ``CipherError``, or the refused recovery code no longer verifies once the cell opens again."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.recovery_codes
+    token = await service._issue_session(
+        identity.user_id,
+        None,
+        mfa_verified=False,
+        seed_reauth=False,
+        mechanism=SessionMechanism.PASSWORD,
+        idp_auth_time=None,
+    )
+    real_open = store.open_totp_secret
+    state = {"broken": True}
+
+    def _sometimes_refuses(*args: Any) -> str | None:
+        if state["broken"]:
+            raise CipherError("synthetic: the cell does not open")
+        return real_open(*args)
+
+    monkeypatch.setattr(store, "open_totp_secret", _sometimes_refuses)
+
+    refused = await service.verify_mfa(token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False and not refused.session_lost and not refused.locked
+    assert {"reason": "factor_unverified"} in await _audited_mfa_failures(store)
+    state["broken"] = False  # the control: the same recovery code still verifies
+    assert (await service.verify_mfa(token, confirmed.recovery_codes[0])).ok
 
 
 async def _more_sessions(e: _Enrolled, count: int) -> list[str]:
