@@ -59,8 +59,9 @@ WebSocket API (FastAPI/uvicorn). The same API serves three deployments without c
 - **Embedded** — another Python program owns the engine in-process via `create_app(engine)`
   (the async test client; embedding). A **UI client is never this** — it's always a separate
   process (or a browser) that reaches the engine only over the HTTP API, never by importing it.
-- **Local daemon** — engine runs as a Windows service / Linux daemon; the web console attaches over
-  the API. See [SERVICE.md](SERVICE.md) for the Windows service setup (NSSM).
+- **Local daemon** — engine runs as a Windows service (Linux is
+  [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target));
+  the web console attaches over the API. See [SERVICE.md](SERVICE.md) for the Windows service setup (NSSM).
 - **Remote** — same API over the network (Phase 2+, with auth/TLS).
 
 We deliberately did **not** start with two separate processes + hand-rolled IPC. The

@@ -196,7 +196,7 @@ conclusion that the reachable on-prem hospital population is effectively zero is
 
 1. **On-premises Windows is capped at rung 1 + rung 2 — an honest Partial — for a procurement/platform
    reason, disclosed.** That is the outcome the plan's Phase 3 anticipated; we take it rather than build
-   toward a platform that is not there.
+   toward a platform that is not there. *(Verdict withdrawn; see* Amendment (2026-10-17)*.)*
 2. **No Windows capability read-out is built, and none should be.** Rung 1 on Windows reports `unknown`
    (every field `null`). The genuine activation signal is Hyper-V CPUID leaf `0x4000000C`, which has no
    Win32 wrapper — reaching it from Python means a C extension or `VirtualAlloc` shellcode, and it is in
@@ -235,6 +235,7 @@ git submodules) or Microsoft's prebuilt Windows platform-checker binary.
   exposed PHI instance, not a refusal — the property is a host property, unsatisfiable on Windows, so a
   default refusal would have hard-stopped working deployments over something no config edit can fix.
   The enforcement path exists (`[security].require_memory_encryption_declaration`) and is opt-in.
+  *(Premise corrected; see* Amendment (2026-10-17)*.)*
 - A **Pass is not achievable by us alone.** It requires the deploying organization to run on
   SEV-SNP/TDX-capable hardware. That is a procurement fact, and stating it plainly in the deployment
   requirements is part of this decision.
@@ -245,6 +246,7 @@ git submodules) or Microsoft's prebuilt Windows platform-checker binary.
   are the shipped posture everywhere; on **on-premises Windows** they are also the *ceiling*, per the
   spike conclusion above. Every deployment therefore sits at Partial-with-a-disclosed-residual until
   either rung 3 lands on a direct-guest-device platform or the deployment moves to one that supports it.
+  *(Verdict withdrawn; see* Amendment (2026-10-17)*.)*
 - The residual after all three rungs is unchanged and must stay disclosed: even under hardware memory
   encryption, plaintext PHI and the unwrapped DEK live in CPython heap during processing, protected
   from the host and hypervisor but not from an attacker who achieves code execution *inside* the
@@ -331,3 +333,38 @@ rather than memory *encryption* — the exact distinction OWASP drew when it del
 **Do nothing and carry the Fail.** Legitimate, and remains the fallback if rung 3 proves infeasible on
 the target platform. One L3-only Fail on a hardware-dependent requirement, honestly disclosed, is
 worth more to a customer questionnaire than a Pass that does not survive scrutiny.
+
+## Amendment (2026-10-17) — the property is not unsatisfiable on Windows
+
+This ADR's *Consequences* bullet on rung 2 calls the property *"unsatisfiable on Windows"*, and the
+index row in [`README.md`](README.md) summarised the 2026-07-22 amendment as *"no operator can satisfy
+the property on Windows"*. That premise is false. The property
+[SYSTEM-REQUIREMENTS.md](../SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment)
+requires is a SEV-SNP or TDX confidential guest, and that page's platform table (verified 2026-07-22)
+marks at least Azure and Azure Local confidential VMs as providing one to a Windows Server guest. The
+spike above found the same mechanism on Azure: a Windows guest under a Microsoft paravisor. What is
+true is narrower:
+
+- the engine cannot observe the property on Windows: rung 1's self-reported fields are all `null`
+  there, and no Windows read-out is built (spike consequence 2);
+- many Windows hosts cannot provide it: per that table, Hyper-V on-premises offers no confidential VM
+  through Windows Server 2025, and ESXi 9.0 does not list Windows as a supported SEV-SNP guest;
+- the gate clears on the operator's declaration, on any host. Since the 2026-07-22 amendment the
+  read-out plays no part, so a `null` Windows read-out never blocks it.
+
+The spike recorded Azure Local only as *"plausibly"* providing the paravisor path, and this amendment
+does not re-verify the table's Azure Local row. Azure alone falsifies the old premise. If the Azure
+Local row holds, an on-premises Windows confidential guest exists, which bears on the spike's blocker
+paragraph (*"the platform does not exist where we deploy"*) and on its decision not to build Windows
+rung 3. Neither is reopened here.
+
+**The verdict wording falls with the premise.** *"An honest Partial"* in the spike's first consequence
+and *"Partial-with-a-disclosed-residual"* under *Consequences* pre-fill a verdict for a deployment.
+SYSTEM-REQUIREMENTS.md's 2026-08-02 correction says that verdict is the deploying site's to determine,
+on its own evidence, and the 2026-08-02 amendment above records the project's own verdict.
+
+**The decision is unchanged, and so is the code.** The refusal stays opt-in. The reason that remains
+is this: on a host that cannot provide the property, a default refusal would leave the operator two
+choices: do not start the engine, or declare a property the host does not have. The engine cannot
+tell such a host from a confidential VM on any platform, because the read-out is a self-report and
+never evidence. The Status line above is unchanged.

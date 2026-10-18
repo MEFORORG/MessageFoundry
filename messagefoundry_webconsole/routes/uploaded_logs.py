@@ -82,7 +82,7 @@ register_ui_action(
 # the whole flow at /ui with both parameters silently gone. ``auto_retry=False`` because it is a GET;
 # ``unlock=True`` so re-auth 303-GET-redirects back here with the parameters intact.
 # KEEP THE OPTIONAL GROUP rather than pinning ``\?index=\d+&to=...``: this form also fullmatches the
-# bare route TEMPLATE, which is what keeps the R1 coverage guard in test_webui.py able to see this
+# bare route TEMPLATE, which is what keeps the R1 coverage guard in test_webui_monitoring.py able to see this
 # entry. A stricter pattern would not match the template and would make that guard silently vacuous
 # here — green, and covering nothing.
 register_ui_action(

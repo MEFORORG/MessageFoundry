@@ -11,9 +11,9 @@ the two bases.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
@@ -232,6 +232,16 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+def _distinct_roles(roles: list[str]) -> list[str]:
+    """A repeated role is one grant (BACKLOG #2733). The store writes it once, so this keeps the
+    audit detail, the security notice and the reply from naming it twice. First-seen order."""
+    return list(dict.fromkeys(roles))
+
+
+#: A request's role list, with each role named once.
+RoleIds = Annotated[list[RoleId], AfterValidator(_distinct_roles)]
+
+
 class UserCreateRequest(RequestModel):
     """``POST /users``. THERE IS NO PASSWORD FIELD (ADR 0197 Amendment A, N-B2 part 1): the engine
     generates the new account's credential and returns it once, in :class:`UserCreatedResponse`.
@@ -246,7 +256,7 @@ class UserCreateRequest(RequestModel):
     #: service refuses a blank value or anything but one plain mailbox, with the check the PATCH
     #: route applies to ``notify_email``.
     email: str = Field(max_length=_NAME_MAX)
-    roles: list[RoleId] = Field(default=[], max_length=64)
+    roles: RoleIds = Field(default=[], max_length=64)
 
 
 class DirectoryUserCreateRequest(RequestModel):
@@ -278,7 +288,7 @@ class UserUpdateRequest(RequestModel):
 
 
 class RolesUpdateRequest(RequestModel):
-    roles: list[RoleId] = Field(max_length=64)
+    roles: RoleIds = Field(max_length=64)
 
 
 class ExpectedFederatedPair(RequestModel):

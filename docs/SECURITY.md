@@ -644,9 +644,10 @@ step that follows the first faster than a person can:
 | Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure, at least: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's gate page with `400` and "That code wasn't accepted" on `POST /ui/mfa`, the re-authentication page with `Invalid code.` on `POST /ui/reauth` with a code, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey assertion (`POST /ui/reauth/webauthn`) and its passkey registration, except a pending session on an account that already holds a factor, which the factor-binding refusal answers first at any elapsed time, audited `auth.mfa_denied`, ending its ceremony (BACKLOG #3014); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
 | A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
-Neither response says anything about timing. On most legs a wrong code gets the same answer either
-side of the floor, so a caller that does not know whether its proof is good cannot tell the refusal
-from a wrong code or a failed IdP proof. The exceptions are listed below. A caller that does know,
+Neither response's text says anything about timing. On most legs a wrong code gets the same answer
+either side of the floor, so by the answer alone a caller that does not know whether its proof is
+good cannot tell the refusal from a wrong code or a failed IdP proof. The exceptions are listed
+below, and response time is a separate tell, also below. A caller that does know,
 such as a script holding the TOTP secret or the authenticator, learns from its first refused proof
 that the floor fired. The floors hide nothing from that caller; they only make it wait. The MFA
 floor charges no lockout and spends no code or passkey challenge, so the person simply submits
@@ -671,6 +672,11 @@ answers also differ either side of the floor, whatever the proof:
   running the floor, and only then consuming the challenge, so a floor refusal still leaves the
   ceremony in flight. That is a change to `finish_webauthn_registration` that BACKLOG #3194 left
   open.
+
+Response time can tell the floor fired where the answer does not, at least on the federated
+step-up. That leg is not padded, and while `oidc_callback_floor_exempt_amr` is empty a too-early
+callback is refused before its code is redeemed, so it answers faster than a refusal after the
+exchange.
 
 The floor
 applies only while the session still owes its factor. A step-up code on a satisfied session is not
@@ -2103,8 +2109,18 @@ the approver, whose `reason` says which (`approvals_disabled` or `operation_not_
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
 runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and the console's Approvals page offers it only Reject,
-with that advice beside it.
+the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
+console's Approvals page keys on.
+
+**`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
+Each pending request carries `release_blocked`, which the release refuses on directly, so the
+two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lists its values and
+what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
+only Reject, or Withdraw on the requester's own row, with a note saying why. A release
+refused for unreadable parameters writes an `approval.params_unreadable` row against the
+approver, which carries no parameters, and one refused as `params_no_requester` writes an
+`approval.params_no_requester` row against the approver. A refusal for a request with no requester
+id, or for an operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
@@ -2121,12 +2137,14 @@ the release still succeeds, because the operation has already run; see the outco
 The 503 means the claim and its row are absent, not merely unconfirmed. When a COMMIT fails, no
 later write can commit them. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
 back explicitly, and discard the connection if that rollback fails too. Postgres ends the
-transaction itself, and its pool rolls a connection back before lending it again. There are at
-least two exceptions, where the row may have committed after all:
+transaction itself, and its pool rolls a connection back before lending it again. There is at
+least one exception, where the row may have committed after all: a COMMIT whose reply is lost on
+the network to Postgres or SQL Server.
 
-- a COMMIT whose reply is lost on the network to Postgres or SQL Server;
-- a SQL Server COMMIT that hits the per-statement `[store].command_timeout`, which the driver
-  reports as an error while the server may still finish the commit.
+The per-statement `[store].command_timeout` is not a second one, by a reading of pyodbc's
+documentation rather than a measurement (vault BACKLOG #3193). pyodbc applies the timeout to each
+cursor's statements, and a commit is a call on the connection, so the timeout does not bound a SQL
+Server COMMIT at all. A COMMIT that stalls is waited on, not abandoned.
 
 A config reload applies the same rule to its own `config_reload` row, inline or released. The graph
 has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
@@ -2141,8 +2159,8 @@ loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` i
 writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
 attempt row with no row after it is not proof the reload was refused or cancelled. At least a
 refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
-alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
-attempt row may have committed after all.
+alone. The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
+row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
@@ -2240,10 +2258,10 @@ is running or owned by another engine shard cancels nothing and writes no `conne
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
-answers **409**: that is at least `approval.too_early`, `approval.stale_requester` and
-`approval.no_longer_gated`. A claim, a rejection or a resolution that the store cannot write with
+answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
+`approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
-error, as listed above.
+error, as stated above.
 
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name.
@@ -2252,34 +2270,48 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
   row's detail;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write. The log line names the actor and the operation;
+- the request or repeat write, including one that reads back as held, as below. The log line names
+  the actor and the operation, or is a WARNING for a held one;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
-For some failed writes the gate logs at ERROR and pages nothing. At least these two:
+For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
+cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
+start tries again.
 
-- a restart cannot move a leftover `executing` row to `interrupted`. The row stays `executing`,
-  and the next start tries again;
-- an outcome's combined write fails, and the status write that follows finds the row already
-  moved. The combined write most likely committed, and only its reply was lost.
+An outcome's combined write can fail while the status write that follows finds the row already
+moved. The combined write most likely committed, and only its reply was lost, so the gate writes
+no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
+after a commit it saw succeed (vault BACKLOG #3193).
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
-ERROR line and no alert for at least three writes. They are the request or repeat write, a
-rejection, and a refusal's row. The gate shields at least the claim, each outcome and a resolution
-from a cancel. Those writes finish on their own, and log and page as above.
+ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
+shields at least the request or repeat write, the claim, each outcome and a resolution from a
+cancel. Those writes finish on their own, and log and page as above.
 
 What this does not cover, at least: a store that refuses READS of the request row or the
-requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
-either. It answers a raw 500, or the request timeout's 503 when the call is cancelled.
+requester's account still answers a raw 500. A request or a repeat whose write fails, and that
+does not read back as held, is not mapped either. It answers a raw 500, or the request timeout's
+503 when the call is cancelled.
 
-**A failed request write can still hold the request, so a retry may file a second one.** The request
-and its `approval.requested` row are one write, as above, so a write that fails before its COMMIT
-holds neither. At least these cases hold the request while the call still fails:
+**A failed request write is read back, and the write outlives its caller (vault BACKLOG #3193).**
+The request and its `approval.requested` row are one write, as above. When that write reports an
+error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
+landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
+WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
+written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
+the write finishes on its own, and the shutdown drain waits for it.
 
-- a COMMIT that lands despite the error, as listed above, such as a lost reply or a driver
-  timeout. Its `approval.requested` row lands with it, though the ERROR line and alert call it lost;
-- a call cancelled while its COMMIT runs, for example by the request timeout. The gate writes no
-  ERROR line and no alert for it;
+A retry can still file a second request. At least these cases leave the request held while the
+call fails or never answers:
+
+- the read-back fails, or finds a row whose seal fails. The gate raises, logs at ERROR and pages.
+  A row whose seal fails can never be released;
+- the read-back finds nothing, and a COMMIT still finishing on the server lands after it. The gate
+  raises, logs at ERROR and pages, saying that most likely nothing is held;
+- a call cancelled while the write runs, for example by the request timeout. The write lands, and
+  the requester gets the timeout's 503 rather than the 202. The gate logs a WARNING naming the
+  request;
 - a repeat whose `approval.request_repeated` row fails. The earlier request it named stays held.
 
 A retry files nothing new when the repeat rule above joins it to the held request. The rule misses
@@ -4711,12 +4743,13 @@ until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
 interaction not having failed. That second term is deliberately **advisory and non-sticky**, and
 *no login path gates on it* (`AuthService.oidc_available`). A transport failure, where no answer
-arrived, sets it, and the next success clears it. Any status the token endpoint answers with, a
+arrived, sets it, and the next code exchange that yields a verified token clears it. Any status the token endpoint answers with, a
 5xx included, leaves it alone, because a caller's bad code can draw one (BACKLOG #1948). So an IdP
 behind a proxy that answers its outage with a 503 keeps the link showing.
 [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
-Amendment E is the source of record for which failures count and what each is audited as. It also
-names the residuals, at least a firewall reset a caller provokes and a misframed JWKS reply. Neither
+Amendment E, as Amendment G narrows it, is the source of record for which failures count and what
+each is audited as. Together they name the residuals, at least a firewall reset a caller provokes.
+Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.
@@ -5273,8 +5306,8 @@ not (see *The console's refusal differs from the JSON floor's* under
 **Per-IP limiter caveat (SEC-024).** The per-client-IP sign-in window is in-process and keyed on the
 caller's source address, so an attacker who can rotate source addresses creates a fresh empty per-IP
 bucket each time and is bounded only by the **global** ceiling. The source IP is already proxy-aware —
-uvicorn runs with `forwarded_allow_ips = settings.api.trusted_proxies` (defaults to `[]` = trust
-nothing), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
+uvicorn runs with `forwarded_allow_ips` built from `settings.api.trusted_proxies` (defaults to `[]`
+= trust nothing; the [`trusted_proxies` row](CONFIGURATION.md) says what is added), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
 in-process per-IP limiter inherently cannot stop pure IP rotation by a **directly-reachable** attacker.
 The anti-guessing controls that survive rotation are the **global sign-in ceiling** plus the
 **per-account argon2 lockout (5 / 15 min)**, applied to **both** the password and the MFA
@@ -5868,7 +5901,9 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Three controls answer it, and they differ in strength:
+Under `enforce`, `serve` and `supervise` refuse to start with the interface on, unless
+`[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). Three further controls
+answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
@@ -5877,8 +5912,11 @@ Three controls answer it, and they differ in strength:
   longer the console-script launcher, which cannot pass an option
   ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
 - **The engine process refuses the script where the interface is still on.** A start through the
-  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
-  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  console script, such as a developer's `messagefoundry serve`, leaves it on unless
+  `PYTHON_DISABLE_REMOTE_DEBUG=1` is set. So the command line installs an audit hook as it
+  starts, for every command (`messagefoundry/remotedebug.py`): the interface can be on in any
+  command, and `serve` or `supervise` runs with it on under `enforcement = warn` or with the
+  acceptance above set. The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
   interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).
