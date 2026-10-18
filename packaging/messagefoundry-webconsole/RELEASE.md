@@ -69,8 +69,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 - [ ] `uv lock` + `uv export` on the engine — the cyclic optional dep
       `messagefoundry[webconsole]` → `messagefoundry-webconsole` → `messagefoundry` resolves once the
       wheel is published. Confirm `requirements.lock` updates and stays in sync (DEP-1).
-- [ ] Run the **DEP-1 audit** (`pip-audit` on the lockfile) and confirm the second distribution is
-      covered — no known-CVE pins.
+- [ ] Run the **DEP-1 audit** with `python scripts/security/audit_all_platforms.py requirements.lock`
+      and confirm the second distribution is covered — no known-CVE pins. Not a bare
+      `pip-audit -r requirements.lock`; `messagefoundry/security/audit_all_platforms.py` says why.
 - [ ] Verify the cyclic optional dep resolves under **both** `uv lock` and plain `pip`.
 
 ## 4. SBOM + publish/mirror wiring
@@ -93,13 +94,20 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] Configure a `messagefoundry-webconsole` **PyPI Trusted Publisher** (pending publisher for the repo
       + `release.yml`) and a `PUBLISH_WEBCONSOLE`-style gate variable, so the job builds + attaches on
-      every release but only publishes to PyPI once you flip the flag (mirrors the harness gating).
+      every release but only publishes to PyPI once you flip the flag. This mirrors the harness
+      gating: the variable gates the upload step alone, so with it unset the release still goes
+      public, and with it set the release goes public only once the upload has run.
 
 ## 6. Tag + publish (the button)
 
 - [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
-- [ ] Publish to **PyPI** via the gated Trusted-Publishing job.
+- [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
+      draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
+      `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`
+      approval is given. Set, the publish refuses while the upload has not run, which is what a
+      "Re-run failed jobs" after setting it would do; re-run the `release-webconsole` job instead,
+      which re-runs the jobs after it.
 
 ## 7. Post-publish verification
 

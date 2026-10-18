@@ -296,8 +296,13 @@ def test_a_directory_administrator_is_accepted(
                 user_id="u-ad", username="ad-admin", auth_provider="ad", password_generated=False
             )
             await store.set_user_roles("u-ad", [Role.ADMINISTRATOR.value], assigned_by="test")
-            await store.set_totp_secret("u-ad", secret=PROVISION_TOTP_SECRET)
-            assert await store.enable_totp("u-ad", recovery_code_hashes=[]) is True
+            staged_cell = await store.set_totp_secret("u-ad", secret=PROVISION_TOTP_SECRET)
+            assert (
+                await store.enable_totp(
+                    "u-ad", expected_secret_cell=staged_cell, recovery_code_hashes=[]
+                )
+                is True
+            )
             # The local one disabled, so the directory Administrator is the sole enabled one.
             local = await store.get_user_by_username(_ADMIN)
             assert local is not None
@@ -625,8 +630,13 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
         user = await store.get_user_by_username(_ADMIN)
         assert user is not None
         await store.disable_totp(user.id)
-        await store.set_totp_secret(user.id, secret=other_seed)
-        assert await store.enable_totp(user.id, recovery_code_hashes=[], now=1.0) is True
+        staged_cell = await store.set_totp_secret(user.id, secret=other_seed)
+        assert (
+            await store.enable_totp(
+                user.id, expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
+            )
+            is True
+        )
 
     def enrol_while_re_enrolled(**_k: object) -> tuple[str, str, float]:
         _with_store(db, re_enrol)

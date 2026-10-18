@@ -1904,17 +1904,36 @@ the same permission set on the same method reds CI until it is listed here.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
-> `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
-> name up. A scoped caller reaches only an inbound in its own scope. Every other name gets one 403,
+> `/test-credential`, `/start`, `/stop` and `/restart`, and the web console's bulk start, stop and
+> restart. All of them resolve the name through one helper, `_resolve_connection` in
+> `messagefoundry/api/app.py` (BACKLOG #3031). It looks the name up among the inbounds first and
+> checks the scope then, and the answer does not depend on that order. A scoped caller reaches only
+> an inbound in its own scope. Every other name gets one 403,
 > one body and one `auth.channel_denied` row: an inbound outside its scope, any outbound, and a
 > name that exists nowhere. That holds even when the caller's scope lists the outbound or the
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
-> With the engine not started there is no graph and no name exists. Every route still checks the
-> scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
-> routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
-> least the Prometheus exposition above lists them.
+> A name that fails the connection-name rule is never in a scope, and its denial row carries no
+> channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
+> console checks the rule before it calls in, and `audit_channel_denied` in
+> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
+> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031).
+> On a deployment with more than one engine shard the same row has a second cause. Each engine
+> shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
+> who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
+> row, for a channel it may reach. The row does not say which engine shard answered. To read one,
+> look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
+> that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
+> by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
+> #3031).
+> With an engine bound but not started there is no graph and no name exists. Every route still
+> checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
+> first three routes and 404 from the control routes, with no denial row. With no engine bound at
+> all, every one of these routes answers 503 `engine not started` before any scope check, the same
+> answer for every name. Names still show elsewhere. At least the Prometheus exposition above
+> lists them.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
@@ -1923,7 +1942,9 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
-> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules.
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
+> `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
+> roles.
 
 > **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
 > own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
@@ -1974,9 +1995,11 @@ the same permission set on the same method reds CI until it is listed here.
 > - `POST /approvals/{approval_id}/approve` checks the requester's channel scope again before it
 >   releases a held request, by the rule the request route used. A held dead-letter replay needs
 >   a scope that still covers its `channel_id`, and a held replay of every channel needs an
->   all-channels requester. A held purge needs a requester who is still all-channels. Otherwise
->   the release answers 409, the request stays pending, and an `approval.stale_requester` row
->   records the reason `requester_out_of_scope`.
+>   all-channels requester. A held purge, and a held config reload, need a requester who is still
+>   all-channels. Otherwise the release answers 409, the request stays pending, and an
+>   `approval.stale_requester` row records the reason `requester_out_of_scope`. The approvals
+>   queue reads the same check when it lists the request, and marks it `release_blocked:
+>   requester_not_authorized` (BACKLOG #3189).
 > - `GET /me/security-events` returns the `auth.*` rows recorded under the caller's username, and
 >   only those at or after the account's `created_at`. So an account does not see rows written
 >   under its name before it existed, such as a failed sign-in or a deleted account's history. The
@@ -2023,10 +2046,31 @@ the same permission set on the same method reds CI until it is listed here.
 >
 > The store reads that take `allowed_channels` require it, so a caller cannot read every channel by
 > leaving it out. A test refuses a literal `allowed_channels=None` on those reads under
-> `messagefoundry/api/`. The table also lists at least three unscoped routes that no
-> backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
-> account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
-> connection.
+> `messagefoundry/api/`. The table's class for routes that no backlog item tracked is empty since
+> BACKLOG #3189 classed its three:
+>
+> - `GET /security/posture` shows a scoped reader a per-connection entry only for an inbound in its
+>   own scope that the graph holds. That covers the loosenings, the static-credential hops and
+>   their opt-outs, and the audit row. `loosenings_scope` and `static_credential_hops_scope` then
+>   say the reading is narrowed, with or without a loaded graph. The audit row carries
+>   `loosenings_scope` too, and the console's status page shows it. The rest is shown whole. Some
+>   of it is operator free text, such as an alert rule's id or an attestation reason, which may
+>   name a connection.
+> - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
+>   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
+>   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
+>   console's user list reads that flag and drops both scope columns for such a reader.
+> - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
+>   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
+>   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
+>   to release a held reload whose requester has been scoped since, as it does for a purge, and
+>   `GET /approvals` marks such a request blocked. `GET /config/provenance` carries
+>   `reload_refused`, the refusal the reload gives this caller, read off the same rule, and the
+>   console's configuration page shows that reason in place of its Reload form.
+>
+> `tests/test_channel_scope_posture_users_reload.py` pins at least the three routes' rules, the
+> queue's prediction for a held reload and purge, `reload_refused`, and the bound on a malformed
+> name in a denial row.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
@@ -2106,15 +2150,24 @@ runs it without a second approver. `GET /approvals` marks such a request `gated:
 the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
 console's Approvals page keys on.
 
-**`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
-Each pending request carries `release_blocked`, which the release refuses on directly, so the
-two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lists its values and
-what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
-only Reject, or Withdraw on the requester's own row, with a note saying why. A release
-refused for unreadable parameters writes an `approval.params_unreadable` row against the
-approver, which carries no parameters, and one refused as `params_no_requester` writes an
-`approval.params_no_requester` row against the approver. A refusal for a request with no requester
-id, or for an operation no longer registered, still writes no row.
+**`GET /approvals` names at least some of the releases the gate refuses whoever approves them
+(vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
+on directly, so where it names a reason the two cannot disagree. It names at least a request with
+no requester id, an operation no longer registered, one dual control no longer gates, unreadable
+parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
+reload, `params_no_requester`), and a requester who no longer holds the authority the operation needs, such as a held
+reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
+#3189). The requester's standing is read when the queue is listed, by the rule the release
+applies, so a change after the listing, or a standing the listing could not read, is met only at
+release. A `null` does not promise a release: at least the self-approval refusal,
+the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
+`PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
+page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
+with a note saying why. A release refused for unreadable parameters writes an
+`approval.params_unreadable` row against the approver, which carries no parameters, and one refused
+as `params_no_requester` writes an `approval.params_no_requester` row against the approver. A
+release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
+a request with no requester id, or for an operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
@@ -2853,14 +2906,22 @@ account `[security].require_mfa` covers, which keeps TOTP because in this releas
 way past the sign-in lock (ADR 0197 Amendment A). Such an account's first factor must be TOTP, too.
 An administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
-A confirm turns TOTP on only while a secret is still staged and TOTP is still off (BACKLOG
-#2224). If a reset clears the secret during the confirm, or another confirm turns TOTP on first,
-the confirm turns nothing on and returns no recovery codes. It ends the session it just rotated and
-answers as a lost session: `401` on `POST /me/mfa/confirm`, and the sign-in page in the web
-console. It is audited `auth.mfa_enroll_refused`, whose `reason` is `secret_cleared`,
-`already_enabled` or `account_gone`, read after the refusal. The check is that some secret is
-staged, not that it is the one the confirm verified: a second enrolment start that re-stages the
-secret inside the same window is not caught by it. With
+A confirm turns TOTP on only while the row still holds the staged secret the confirm verified,
+and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
+`totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
+another confirm turns TOTP on first, or a second enrolment start re-stages a different secret
+inside the same window, the confirm turns nothing on and returns no recovery codes. The refused
+confirm ends the session it just rotated and answers as a lost session: `401` on
+`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited
+`auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
+`secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
+so a `reason` points an operator at the likely cause rather than proving it. The compare is on the
+stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the window
+refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
+`write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
+some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
+stands. The user signs in again and confirms with a code from a later step, passing the same
+step-up as any confirm, because the refused confirm spent its code's step. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to

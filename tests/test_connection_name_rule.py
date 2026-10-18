@@ -110,6 +110,13 @@ def test_non_string_is_not_a_connection_name() -> None:
     assert connection_names.is_connection_name(b"IB") is False
 
 
+def test_an_inbound_record_name_reads_back() -> None:
+    record = connection_names.inbound_record_name("IB_A")
+    assert connection_names.inbound_name_of(record) == "IB_A"
+    assert connection_names.inbound_name_of("IB_A") is None
+    assert connection_names.inbound_name_of(connection_names.fhir_lookup_record_name("F")) is None
+
+
 @_BUILDERS
 @pytest.mark.parametrize("direction", ["inbound", "outbound"])
 @pytest.mark.parametrize("bad", ["A/B", "IB\n", "IB.ADT", "1IB"])

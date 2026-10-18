@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Literal, get_args
 
+import aiosqlite
 import pytest
 from pydantic import ValidationError
 
@@ -62,6 +63,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     MessageStore,
     UserRecord,
+    VerifiedUser,
     audit_row_hash,
 )
 from tests._admin_account import create_local_user_chosen
@@ -2885,8 +2887,8 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
     case in sequence. When both refreshes read the old name at once, the store's compare-and-set
     stops the second one instead (BACKLOG #2290,
     ``test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once``).
-    Driven on the method directly, with ``held`` set as the reconciler reads it, because the pass
-    offers no hook between its plan and its apply.
+    Driven on the method directly, with ``held`` set as the reconciler reads it, so the sign-in
+    lands exactly between the plan and the apply.
     """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
@@ -2898,7 +2900,11 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
 
         caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=held,
+            from_plan=True,
         )
 
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
@@ -2916,20 +2922,135 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
         await store.close()
 
 
-async def test_the_notice_names_the_name_the_row_had_not_the_plans() -> None:
-    """The reconciler's ``old_username`` is the name at PLAN time. A sign-in can rename the row
-    before the plan applies, and the notice must then name what the row was actually called."""
+async def _rename_audits(store: MessageStore) -> list[aiosqlite.Row]:
+    """Every audit row a rename refresh writes, success or refusal."""
+    return [
+        a
+        for action in ("auth.ad_username_refreshed", "auth.ad_username_refresh_conflict")
+        for a in await store.list_audit(action=action, limit=10_000)
+    ]
+
+
+async def test_a_stale_plan_does_not_overwrite_a_newer_sign_in_rename(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3069. The reconciler plans ``jdoe`` -> ``jdoe-married``; before the plan applies, a
+    directory sign-in renames the row to the newer ``jdoe-remarried``; then the plan applies.
+
+    The newer name stays. The stale plan writes nothing, audits nothing and tells nobody, and says
+    why at INFO. Driven through the real pass: the hook is the ``held`` read the pass makes just
+    before it applies each rename, which is the last point between its plan and its apply. Before
+    #3069 the compare-and-set compared on the name just read, so it matched ``jdoe-remarried`` and
+    wrote the plan's older name over it.
+    """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        assert await store.set_user_username(user_id, "jdoe-interim", expected_username="jdoe")
+        load_by_name = service._load_user_by_username
+        signed_in: list[str] = []
+
+        async def _sign_in_renames_first(username: str) -> VerifiedUser | None:
+            if username == "jdoe-married" and not signed_in:
+                signed_in.append(username)
+                assert await store.set_user_username(
+                    user_id, "jdoe-remarried", expected_username="jdoe"
+                )
+            return await load_by_name(username)
+
+        service._load_user_by_username = _sign_in_renames_first  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()  # only the pass's own records, not the sign-in setup's
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert [(r.old_username, r.new_username) for r in plan.renames] == [
+            ("jdoe", "jdoe-married")
+        ]
+        assert signed_in, "the sign-in rename never ran between the plan and the apply"
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-remarried", (
+            "a stale reconciler plan overwrote a newer sign-in rename"
+        )
+        assert not await _rename_audits(store), "a stale plan that wrote nothing still audited"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        skipped = [
+            r
+            for r in caplog.records
+            if r.name == "messagefoundry.auth.service" and "BACKLOG #3069" in r.getMessage()
+        ]
+        assert [r.levelno for r in skipped] == [logging.INFO], "the skipped stale plan was silent"
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_first() -> None:
+    """BACKLOG #3069, the other caller. A pass applies its plan ``jdoe`` -> ``jdoe-married`` between
+    a sign-in's read of the row (still ``jdoe``) and its refresh, which carries the directory's
+    newer ``jdoe-remarried``. The sign-in's name comes from the bind it just made, so it wins: the
+    stale-plan skip is the reconciler's alone, and the login writes, audits and notifies once."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
 
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-remarried",
+            held=None,
+            from_plan=False,
         )
 
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-remarried", (
+            "a sign-in's current directory name lost to an older name a pass wrote"
+        )
+        [refreshed] = [
+            a for a in await _rename_audits(store) if a["action"] == "auth.ad_username_refreshed"
+        ]
+        assert refreshed["actor"] == "jdoe-remarried"
         [notice] = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
-        assert notice.detail["old_username"] == "jdoe-interim"
-        assert notice.detail["new_username"] == "jdoe-married"
+        assert notice.detail["old_username"] == "jdoe-married"
+    finally:
+        await store.close()
+
+
+async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_holds_the_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3069, the ordering half: the stale-plan skip runs BEFORE the ``held`` pre-check.
+
+    The row was renamed to ``jdoe-remarried`` after the plan, and another row now holds the plan's
+    ``jdoe-married``. The plan has no current claim on the row, so a conflict audit and a lockout
+    warning would both be false. Driven on the method directly, so ``held`` can name the other row.
+    """
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        assert await store.set_user_username(user_id, "jdoe-remarried", expected_username="jdoe")
+        await store.create_user(
+            user_id="holder-row",
+            username="jdoe-married",
+            auth_provider="ad",
+            password_generated=False,
+        )
+        held = await store.get_user_by_username("jdoe-married")
+        assert held is not None and held.id == "holder-row"
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=held,
+            from_plan=True,
+        )
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-remarried"
+        assert not await _rename_audits(store), "a stale plan was audited"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a stale plan warned of a lockout"
+        )
     finally:
         await store.close()
 
@@ -2950,7 +3071,11 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
         store.set_user_username = _record_write  # type: ignore[method-assign]
 
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
         )
 
         assert writes == [], "the refresh wrote to a row it had just read as gone"
@@ -2969,16 +3094,25 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
 
 @pytest.mark.parametrize("shape", ["pre_check", "write_race", "write_noop", "row_gone"])
 async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: str) -> None:
-    """BACKLOG #2291. The caller's ``old_username`` is the reconciler's plan-time name, and a
-    sign-in can rename the row before the plan applies. A refusal audited under the plan's name
-    would name an account that no longer exists, so every refusal names what the row holds.
+    """BACKLOG #2291. Every refusal is audited under the name the row holds, as the refresh read it,
+    so the audit names an account an operator can find.
 
-    The row is renamed to ``jdoe-interim`` first and the refresh is passed the stale ``jdoe``.
+    The row is renamed to ``jdoe-interim`` first and the refresh is passed the stale ``jdoe``,
+    driven with ``from_plan=False``: since BACKLOG #3069 the reconciler skips that shape before
+    any refusal, so on its path the two names agree and the actor check could not tell them apart.
     One case per way the refresh refuses after it has read the row; each is asserted to have
-    refused, so none passes by never reaching the branch."""
+    refused, so none passes by never reaching the branch.
+
+    The ``pre_check`` case drives a shape no production caller produces today: a holder passed
+    while the row's name differs from ``old_username``. The reconciler reaches the pre-check in
+    production, but the skip has returned first unless the two names agree. The login passes
+    ``held`` too, but it is always None there (``_complete_ad_login`` refuses a held name first).
+    The case is kept because it pins the method's own contract: a refusal names what the row held,
+    whichever caller passes a holder."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        assert await store.set_user_username(user_id, "jdoe-interim", expected_username="jdoe")
+        holds = "jdoe-interim"
+        assert await store.set_user_username(user_id, holds, expected_username="jdoe")
         held: UserRecord | None = None
         if shape == "pre_check":
             await store.create_user(
@@ -3022,7 +3156,11 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             store.set_user_username = _row_deleted  # type: ignore[method-assign]
 
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=held,
+            from_plan=False,
         )
 
         [conflict] = [
@@ -3031,7 +3169,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             if a["action"] == "auth.ad_username_refresh_conflict"
         ]
         assert json.loads(conflict["detail"])["detected"] == shape
-        assert conflict["actor"] == "jdoe-interim", (
+        assert conflict["actor"] == holds, (
             f"a {shape} refusal audited the caller's stale name, not the one the row held"
         )
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
@@ -3057,7 +3195,11 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
         caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
         caplog.clear()  # only the refresh's own records, not the sign-in setup's
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=stale_held
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=stale_held,
+            from_plan=True,
         )
 
         assert not [
@@ -3083,7 +3225,11 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
         caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
         caplog.clear()  # only the refresh's own records, not the sign-in setup's
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "removed" in warning.getMessage()
@@ -3118,7 +3264,11 @@ async def test_a_lost_write_with_no_holder_left_does_not_warn_of_a_lockout(
         caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
         caplog.clear()  # only the refresh's own records, not the sign-in setup's
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "no row holds the new name" in warning.getMessage()
@@ -3183,10 +3333,14 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
         # one waiting on the barrier for ever. A task group, so if one refresh raises the other is
         # cancelled rather than left pending on the barrier.
         async with asyncio.timeout(10), asyncio.TaskGroup() as tg:
-            for _ in range(2):
+            for from_plan in (False, True):  # a sign-in and a pass
                 tg.create_task(
                     service._refresh_cached_username(
-                        user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+                        user_id=user_id,
+                        old_username="jdoe",
+                        new_username="jdoe-married",
+                        held=None,
+                        from_plan=from_plan,
                     )
                 )
 
@@ -4029,7 +4183,11 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
         refused = _refuse_first(monkeypatch, store, "auth.ad_username_refreshed", refusal)
         with pytest.raises(sqlite3.OperationalError):
             await service._refresh_cached_username(
-                user_id=jdoe.id, old_username="jdoe", new_username="jdoe-new", held=None
+                user_id=jdoe.id,
+                old_username="jdoe",
+                new_username="jdoe-new",
+                held=None,
+                from_plan=False,
             )
         assert refused == ["jdoe-new"]
     finally:

@@ -245,6 +245,11 @@ def test_status_builder_escapes_and_formats() -> None:
     # When reporting is off, the badge says so (no state leaked).
     off = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     assert "reporting is off" in str(status(sys_status, posture, cluster, nodes, dr, off))
+    # BACKLOG #3189: a narrowed or blind loosenings list says so, even when it is empty.
+    assert "Loosenings listed:" not in html
+    narrowed = posture.model_copy(update={"loosenings_scope": "narrowed to your channel scope"})
+    shown = str(status(sys_status, narrowed, cluster, nodes, dr, svc))
+    assert "Loosenings listed: narrowed to your channel scope" in shown
 
 
 # --- L0b: register_ui_action write-action registry (the extensible step-up allow-list) ---------

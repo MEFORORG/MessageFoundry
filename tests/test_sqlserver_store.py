@@ -6226,6 +6226,16 @@ async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
     await attestation_roundtrip(store)
 
 
+async def test_the_config_changed_reason_survives_a_long_node_ss(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)
+
+
 # --- vault BACKLOG #2223: the ServerCertificate pin is enforced under Encrypt=strict (gated) -------
 
 

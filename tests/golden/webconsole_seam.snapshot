@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-6d7dcabe1103f08d
+0b2a8d6524e4acc6
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -236,9 +236,9 @@ messagefoundry.api.auth_models.RolesUpdateRequest: roles
 messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
 messagefoundry.api.auth_models.SecurityEventsList: as_of, events, limit, offset, total
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, roles, username
-messagefoundry.api.auth_models.UserCreatedResponse: auth_provider, channel_scope, channel_scope_source, credential_expires_at, disabled, display_name, email, id, lock_state, must_change_password, notify_email, roles, temp_password, username
+messagefoundry.api.auth_models.UserCreatedResponse: auth_provider, channel_scope, channel_scope_source, channel_scope_withheld, credential_expires_at, disabled, display_name, email, id, lock_state, must_change_password, notify_email, roles, temp_password, username
 messagefoundry.api.auth_models.UserLockState: failed_attempts, lock_cycles, locked_until, second_step_failed_attempts, second_step_lock_cycles, second_step_locked, second_step_locked_until, sign_in_locked
-messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, channel_scope_source, credential_expires_at, disabled, display_name, email, id, lock_state, notify_email, roles, username
+messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, channel_scope_source, channel_scope_withheld, credential_expires_at, disabled, display_name, email, id, lock_state, notify_email, roles, username
 messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email, notify_email
 messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 messagefoundry.api.models.AlertInstanceList: alerts, total, worst_severity
@@ -256,7 +256,7 @@ messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lea
 messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, owns_lease_row, role
 messagefoundry.api.models.ClusterStepdownRequest: force
 messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
-messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded
+messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded, reload_refused
 messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
 messagefoundry.api.models.ConnectionEventList: before_id, events, limit, offset, total
 messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
@@ -321,7 +321,7 @@ messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
 messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
 messagefoundry.api.models.ApprovalResolveRequest.outcome: effects_applied, effects_not_applied
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
-messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable
+messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable, requester_not_authorized
 messagefoundry.api.models.PendingApprovalInfo.status: interrupted, pending
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
 messagefoundry.api.models.StatsResetTarget.role: destination, source

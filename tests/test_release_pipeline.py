@@ -414,7 +414,8 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 
     Since vault BACKLOG #2631 limb 1 the publish runs in `publish-pypi`, which needs `release`. So
     "last" has two halves: the build job ends by handing the files over, after build, leak gate,
-    sign and the GitHub release; and the publish job ends with the engine upload.
+    sign and the GitHub release; and the publish job uploads the toolkit, the engine and, last,
+    the harness (vault BACKLOG #2975).
 
     THE GUARD ITSELF IS SECTION (4b)'s, NOT THIS TEST'S: it parses the YAML, conjoins job and step,
     and covers every publishing step. What stays here is the ORDER.
@@ -440,23 +441,33 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
         at(lambda s: (s.get("with") or {}).get("name") == "pypi-engine", "hand-over"),
     ]
     assert order == sorted(order) and order[-1] == len(steps) - 1, (order, names)
+    # The digests are taken right after the last step that writes a published directory, so every
+    # later step is covered by the publish job's check (vault BACKLOG #2975).
+    digest = at(lambda s: s.get("id") == "pypi-digests", "digest")
+    moved = at(lambda s: s.get("id") == "toolkit-bundle-move", "toolkit bundle move")
+    assert digest == moved + 1, (digest, moved, names)
     assert not any("gh-action-pypi-publish" in str(s.get("uses")) for s in steps), (
         "the build job publishes to PyPI itself; the publish belongs to publish-pypi"
     )
 
     publish = jobs["publish-pypi"]
-    assert needs_of(publish) == ["release"], needs_of(publish)
-    last = publish["steps"][-1]
-    assert str(last.get("name", "")).startswith("Publish to PyPI"), last
-    assert (last.get("with") or {}).get("packages-dir") == "dist-pub/", last
+    assert needs_of(publish) == ["release", "release-harness"], needs_of(publish)
+    dirs = [
+        (s.get("with") or {}).get("packages-dir")
+        for s in publish["steps"]
+        if _is_publish_action(str(s.get("uses") or ""))
+    ]
+    # The toolkit claims its name before the engine names it, and the harness pins the engine, so
+    # the engine sits between them and the harness is last (vault BACKLOG #2975).
+    assert dirs == ["toolkit-dist/", "dist-pub/", "harness-dist/"], dirs
 
 
 # --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
 
 #: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT OR ATTESTING ONE --
-#: the four PyPI publishes (the toolkit's since ADR 0201), the four GitHub-release mutations
+#: the four PyPI publishes (the toolkit's since ADR 0201), the five GitHub-release mutations
 #: (BACKLOG #1584; the fourth, which takes the engine's draft release out of draft, since vault
-#: BACKLOG #2631) and the SLSA
+#: BACKLOG #2631; the fifth, the console's, since vault BACKLOG #2975) and the SLSA
 #: build-provenance attestation (BACKLOG #1805). Pinned as a count so a NEW one cannot be added
 #: without either carrying the guard pair or landing here deliberately. An empty scan must never read
 #: as a pass.
@@ -465,7 +476,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 #: attestation step. Why `python -m sigstore sign` is NOT is stated in the header's "THE DRY-RUN IS
 #: NOT SILENT" paragraph. Read a green here as "a dispatch neither publishes nor attests a release
 #: artifact", never as "a dispatch writes nothing public".
-_EXPECTED_MUTATING_STEPS = 9
+_EXPECTED_MUTATING_STEPS = 10
 
 #: Actions that publish a release artifact, matched as a `uses:` prefix.
 _PUBLISHING_ACTIONS = (
@@ -891,6 +902,13 @@ def test_the_console_version_check_reads_the_console_tag_not_the_engine_tag() ->
     )
 
 
+def _upload_step(job: dict, packages_dir: str) -> dict:
+    """The one PyPI upload step in ``job`` that publishes ``packages_dir``."""
+    found = [s for s in job["steps"] if (s.get("with") or {}).get("packages-dir") == packages_dir]
+    assert len(found) == 1, f"expected one upload of {packages_dir}, found {len(found)}"
+    return found[0]
+
+
 def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
     """Same bar as the engine and harness: OIDC, never an API token, and never on a branch push.
 
@@ -918,8 +936,12 @@ def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
         "the console publish must not use an API token — Trusted Publishing only"
     )
     guard = str(publish.get("if") or "")
-    assert "startsWith(github.ref, 'refs/tags/')" in guard and "vars.PUBLISH_WEBCONSOLE" in guard, (
-        "the console publish must be tag-gated AND variable-gated"
+    assert "startsWith(github.ref, 'refs/tags/')" in guard, "the console publish must be tag-gated"
+    # Variable-gated on the upload STEP, through release-webconsole's output (vault BACKLOG #2975):
+    # gated on the job, an unset variable would skip the job and leave the release a draft.
+    upload_if = str(_upload_step(publish, "webconsole-dist/").get("if"))
+    assert "needs.release-webconsole.outputs.publish-webconsole == 'true'" in upload_if, (
+        "the console upload must be variable-gated"
     )
 
 
@@ -2380,8 +2402,9 @@ def test_the_toolkit_uploads_before_the_engine_from_the_publish_job() -> None:
     toolkit_upload = next(
         i for i, n in enumerate(pnames) if n.startswith("Publish messagefoundry-toolkit")
     )
-    assert toolkit_upload == len(pnames) - 2 and pnames[-1].startswith("Publish to PyPI"), (
-        "the toolkit upload must be the step immediately before the engine's, which stays last"
+    # The full upload order is pinned in section (4).
+    assert pnames[toolkit_upload + 1].startswith("Publish to PyPI"), (
+        "the toolkit upload must be the step immediately before the engine's"
     )
     upload = publish["steps"][toolkit_upload]
     assert upload.get("with", {}).get("packages-dir") == "toolkit-dist/", upload
@@ -3462,11 +3485,14 @@ def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
 #
 # An immutable release refuses any asset change once it is published. So the engine's release is a
 # draft until every job that attaches an asset has run, and then one job publishes it. The console's
-# release is created by one call that carries its one asset. A re-run never uploads to a published
+# release is a draft created by one call that carries its one asset, and its own job publishes it
+# once its upload job has succeeded, which with PUBLISH_WEBCONSOLE unset uploads nothing (vault
+# BACKLOG #2975). A re-run never uploads to a published
 # release. The structural tests hold the shape; the executed tests run each step against a stand-in
 # `gh` that records what it was asked to do.
 
 _PUBLISH_JOB = "publish-github-release"
+_CONSOLE_PUBLISH_JOB = "publish-github-release-webconsole"
 
 
 def _gh_release_jobs(verbs: str) -> set[str]:
@@ -3499,23 +3525,29 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
         for key, job in jobs.items()
         if any("--draft=false" in _executed_shell(str(s.get("run") or "")) for s in job["steps"])
     }
-    # The console job may too: it finishes ITS OWN release when an interrupted create left a draft.
-    assert publishers == {_PUBLISH_JOB, "release-webconsole"}, (
-        f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} (and the "
-        "console job, for its own release) may"
+    # The console's own publish job too, for the console's draft (vault BACKLOG #2975).
+    assert publishers == {_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB}, (
+        f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} and "
+        f"{_CONSOLE_PUBLISH_JOB} may"
     )
-    # The console job may publish only because its own `if:` keeps it off engine tags.
-    console_if = _despace(str(jobs["release-webconsole"].get("if") or ""))
+    # Each may publish only the release of its own tag namespace.
+    console_if = _despace(str(jobs[_CONSOLE_PUBLISH_JOB].get("if") or ""))
     assert "startsWith(github.ref_name,'webconsole-')" in console_if and "||" not in console_if, (
-        "release-webconsole may take a release out of draft, so it must stay on console tags"
+        f"{_CONSOLE_PUBLISH_JOB} takes a release out of draft, so it must stay on console tags"
     )
-    # A status function would run the publish job after a job it needs had FAILED, publishing a
-    # draft with that job's asset missing. The implicit success() is the control.
-    publish_if = str(jobs[_PUBLISH_JOB].get("if") or "")
-    overrides = [
-        f for f in ("always()", "cancelled()", "failure()", "success()") if f in publish_if
-    ]
-    assert not overrides, f"{_PUBLISH_JOB}'s `if:` overrides the needs' success with {overrides}"
+    engine_if = _despace(str(jobs[_PUBLISH_JOB].get("if") or ""))
+    assert "!startsWith(github.ref_name,'webconsole-')" in engine_if and "||" not in engine_if, (
+        f"{_PUBLISH_JOB} takes a release out of draft, so it must stay off console tags"
+    )
+    # A status function would run a publish job after a job it needs had FAILED, publishing a
+    # draft with that job's asset missing, or before its wheel is on PyPI. The implicit success()
+    # is the control.
+    for key in (_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB):
+        publish_if = str(jobs[key].get("if") or "")
+        overrides = [
+            f for f in ("always()", "cancelled()", "failure()", "success()") if f in publish_if
+        ]
+        assert not overrides, f"{key}'s `if:` overrides the needs' success with {overrides}"
     # Every job that attaches to a release, except the console's, which makes its own in one call.
     attaching = _gh_release_jobs("create|upload") - {"release-webconsole"}
     assert attaching >= {"release", "release-harness"}, sorted(attaching)
@@ -3524,9 +3556,35 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
         f"job(s) {late} attach to the engine release but {_PUBLISH_JOB} does not wait on them, so "
         "the release could be published before their asset is on it"
     )
-    assert not _gh_release_jobs("create|upload") & {_PUBLISH_JOB}, (
-        f"{_PUBLISH_JOB} itself attaches an asset; it must only publish"
+    assert not _gh_release_jobs("create|upload") & {_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB}, (
+        "a job that takes a release out of draft itself attaches an asset; it must only publish"
     )
+
+
+def test_the_console_release_is_a_draft_until_its_upload_job_succeeds() -> None:
+    """The console release used to be published by the call that made it, before the `pypi`
+    approval was asked for, so a refused approval left a public release naming a version PyPI
+    lacked (vault BACKLOG #2975). Now it is a draft, published by a job that waits on the upload.
+
+    Mutation: drop `--draft` from the console create, put `--draft=false` back in it, or drop
+    `publish-pypi-webconsole` from the console publish job's `needs:`. Red here.
+    """
+    jobs = _jobs()
+    create = _step_script_by_prefix("Create or update the console GitHub release", "the console")
+    lines = _executed_shell(create).splitlines()
+    creates = [ln for ln in lines if "gh release create" in ln]
+    assert creates and all("--draft" in ln for ln in creates), creates
+    assert not any("--draft=false" in ln for ln in lines), "the console job publishes its own draft"
+    needs = set(needs_of(jobs[_CONSOLE_PUBLISH_JOB]))
+    assert needs >= {"release-webconsole", "publish-pypi-webconsole"}, sorted(needs)
+    # The job itself is not gated on the variable: skipped, it would skip the publisher. The
+    # upload step's gate is pinned by the draft-publisher tests below.
+    upload = jobs["publish-pypi-webconsole"]
+    assert "vars." not in str(upload.get("if")), upload.get("if")
+    # The two draft publishers are one body, held here as the digest checks are.
+    engine = _step_script_by_prefix("Publish the draft GitHub release", "the engine publish")
+    console = _step_script_by_prefix("Publish the draft console GitHub release", "the console")
+    assert engine == console, "the two draft-publish steps differ; they must be one body"
 
 
 #: A stand-in for `gh`. It records each call, answers `release view` from FAKE_RELEASE (absent,
@@ -3547,7 +3605,11 @@ _HARNESS_WHEEL = "messagefoundry_harness-0.0.1-py3-none-any.whl"
 
 
 def _run_release_step(
-    tmp_path: Path, prefix: str, state: str, assets: str = ""
+    tmp_path: Path,
+    prefix: str,
+    state: str,
+    assets: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, list[str]]:
     """Run one release step's ``run:`` block under `bash -e` with the stand-in `gh` first on PATH.
 
@@ -3586,6 +3648,7 @@ def _run_release_step(
         GITHUB_REF_NAME=_TAG,
         GITHUB_REPOSITORY="example/example",
     )
+    env.update(extra_env or {})
     bash = require_bash(tmp_path, env)
     rc, out = _run_leak_gate(bash, work, script, env)
     # A stand-in `gh` that bash cannot find or run would read as the step refusing.
@@ -3612,7 +3675,7 @@ def _uploads(calls: Sequence[str]) -> list[str]:
         # The console: one call creates it with its asset; a re-run touches nothing.
         ("Create or update the console GitHub release", "absent", "", True, ["release create"]),
         ("Create or update the console GitHub release", "published", "", True, []),
-        # An interrupted create left a draft: attach to it (then publish, graded separately).
+        # A re-run on the draft re-attaches to it; the console publish job takes it public.
         ("Create or update the console GitHub release", "draft", "", True, ["release upload"]),
         # A read that fails for any reason but "not found" refuses rather than guessing "absent".
         ("Create or update the GitHub release", "broken", "", False, []),
@@ -3627,7 +3690,7 @@ def _uploads(calls: Sequence[str]) -> list[str]:
         "harness-published-missing-wheel",
         "console-new",
         "console-rerun",
-        "console-interrupted-draft",
+        "console-draft-rerun",
         "engine-read-error",
         "console-read-error",
     ],
@@ -3647,23 +3710,130 @@ def test_no_release_step_uploads_to_a_published_release(
     assert [c.split(" " + _TAG)[0] for c in made] == uploads, f"gh calls: {calls}\n{out}"
     if state == "published":
         assert not made, f"a step uploaded to a published release: {made}"
-    if state == "absent" and "console" not in prefix:
-        assert all("--draft" in c for c in made), f"the engine release was not a draft: {made}"
-    if state == "draft" and "console" in prefix:
-        assert calls[-1] == f"release edit {_TAG} --draft=false", f"draft left unpublished: {calls}"
+    if state == "absent":
+        assert all("--draft" in c for c in made), f"the release was not created a draft: {made}"
+    # Only the two publish jobs take a release out of draft (vault BACKLOG #2975 for the console).
+    assert not any("--draft=false" in c for c in calls), f"a build step published: {calls}"
     if state == "broken":
         assert "refusing to guess" in out and "HTTP 502" in out, out
 
 
+@pytest.mark.parametrize(
+    "prefix", ["Publish the draft GitHub release", "Publish the draft console GitHub release"]
+)
 @pytest.mark.parametrize(("state", "edits"), [("draft", 1), ("published", 0)])
 def test_the_publish_step_publishes_a_draft_and_leaves_a_published_release_alone(
-    tmp_path: Path, state: str, edits: int
+    tmp_path: Path, prefix: str, state: str, edits: int
 ) -> None:
-    rc, out, calls = _run_release_step(tmp_path, "Publish the draft GitHub release", state)
+    rc, out, calls = _run_release_step(tmp_path, prefix, state)
     assert rc == 0, out
     published = [c for c in calls if c == f"release edit {_TAG} --draft=false"]
     assert len(published) == edits, f"gh calls: {calls}"
     assert not _uploads(calls), calls
+
+
+#: Each draft publisher, the job whose gated upload it waits on, that upload's `packages-dir`, the
+#: repository variable that gates it, the distribution, and the build job that reads the variable
+#: first (vault BACKLOG #2975).
+_DRAFT_PUBLISHERS = [
+    (
+        _PUBLISH_JOB,
+        "publish-pypi",
+        "harness-dist/",
+        "PUBLISH_HARNESS",
+        "messagefoundry-harness",
+        "release-harness",
+    ),
+    (
+        _CONSOLE_PUBLISH_JOB,
+        "publish-pypi-webconsole",
+        "webconsole-dist/",
+        "PUBLISH_WEBCONSOLE",
+        "messagefoundry-webconsole",
+        "release-webconsole",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("publisher", "upload_job", "packages_dir", "variable", "distribution", "build_job"),
+    _DRAFT_PUBLISHERS,
+)
+def test_a_draft_publisher_reads_the_variable_again_and_the_upload_outcome(
+    publisher: str,
+    upload_job: str,
+    packages_dir: str,
+    variable: str,
+    distribution: str,
+    build_job: str,
+) -> None:
+    """A "Re-run failed jobs" of the upload job reuses the build job's earlier output, so a variable
+    set since then would skip the upload in a job that succeeds, and the release would go public
+    without it (vault BACKLOG #2975). So the draft publisher, which is outside the `pypi`
+    environment and reads the repository's value, reads the variable when it runs, and the upload
+    job reports whether its gated upload ran. The executed test below runs the refusal.
+
+    Mutation: drop the upload job's `upload-outcome` output or point it at another step, or read
+    the variable from the upload job's output instead of `vars.`. Red here.
+    """
+    jobs = _jobs()
+    upload = _upload_step(jobs[upload_job], packages_dir)
+    assert upload.get("id"), upload
+    outputs = jobs[upload_job].get("outputs") or {}
+    assert outputs.get("upload-outcome") == f"${{{{ steps.{upload['id']}.outcome }}}}", outputs
+    assert not _environment(jobs[publisher]), f"{publisher} would read an environment's copy"
+    # The upload runs only when the build job's reading AND its own fresh read are 'true'.
+    upload_if = _despace(str(upload.get("if")))
+    assert f"needs.{build_job}.outputs." in upload_if, upload_if
+    assert f"vars.{variable}=='true'" in upload_if and "||" not in upload_if, upload_if
+    env = _release_step(jobs[publisher], "--draft=false").get("env") or {}
+    # Compared by Actions, which ignores case, as the upload's gate is.
+    assert env.get("PUBLISH_GATE") == f"${{{{ vars.{variable} == 'true' }}}}", env
+    assert env.get("GATE_NAME") == variable, env
+    assert env.get("DISTRIBUTION") == distribution, env
+    assert env.get("BUILD_JOB") == build_job, env
+    assert env.get("UPLOAD_OUTCOME") == f"${{{{ needs.{upload_job}.outputs.upload-outcome }}}}", env
+    assert upload_job in needs_of(jobs[publisher]), needs_of(jobs[publisher])
+
+
+@pytest.mark.parametrize(
+    "prefix", ["Publish the draft GitHub release", "Publish the draft console GitHub release"]
+)
+@pytest.mark.parametrize(
+    ("gate", "outcome", "ok"),
+    [
+        ("true", "skipped", False),
+        ("true", "", False),
+        ("true", "success", True),
+        # `${{ vars.X == 'true' }}` renders 'true' or 'false', so 'false' is the unset case.
+        ("false", "skipped", True),
+    ],
+    ids=["set-upload-skipped", "set-no-outcome", "set-uploaded", "unset"],
+)
+def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_not_run(
+    tmp_path: Path, prefix: str, gate: str, outcome: str, ok: bool
+) -> None:
+    """EXECUTED. With the variable 'true' and no upload in this run, the release stays a draft and
+    the job fails; unset, a skipped upload still publishes. `set-uploaded` is the positive control.
+    A published release is left alone whatever the variable says, and the job does not fail on it.
+    Mutation: drop the refusal from the step, or move it before the draft check. Red here (vault
+    BACKLOG #2975)."""
+    env = {
+        "PUBLISH_GATE": gate,
+        "UPLOAD_OUTCOME": outcome,
+        "GATE_NAME": "PUBLISH_X",
+        "DISTRIBUTION": "messagefoundry-x",
+        "BUILD_JOB": "build-x",
+    }
+    rc, out, calls = _run_release_step(tmp_path / "draft", prefix, "draft", extra_env=env)
+    published = [c for c in calls if c == f"release edit {_TAG} --draft=false"]
+    assert (rc == 0) is ok, f"exit {rc}:\n{out}\ncalls: {calls}"
+    assert len(published) == (1 if ok else 0), f"gh calls: {calls}"
+    if not ok:
+        assert "PUBLISH_X is 'true'" in out and "re-run the build-x job" in out, out
+    rc, out, calls = _run_release_step(tmp_path / "published", prefix, "published", extra_env=env)
+    assert rc == 0, f"a published release failed the job:\n{out}"
+    assert not any("--draft=false" in c for c in calls), calls
 
 
 # --- (14) every PyPI publish runs in a publish-only job that names `pypi` (vault BACKLOG #2631) ------
@@ -3690,8 +3860,8 @@ def _publish_jobs() -> dict[str, dict]:
         for key, job in _jobs().items()
         if any(_is_publish_action(str(s.get("uses") or "")) for s in job["steps"])
     }
-    # Liveness: the engine-and-toolkit, console and harness publishes.
-    assert len(jobs) >= 3, sorted(jobs)
+    # Liveness: the toolkit-engine-and-harness publish, and the console's.
+    assert len(jobs) >= 2, sorted(jobs)
     return jobs
 
 
@@ -3808,11 +3978,94 @@ def test_the_engine_release_is_published_only_after_the_engine_is_on_pypi() -> N
     assert "publish-pypi" in _upstream(_PUBLISH_JOB), sorted(_upstream(_PUBLISH_JOB))
 
 
+def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_public() -> None:
+    """The harness used to publish from its own job, which `publish-github-release` could not wait
+    on: that job was skipped while PUBLISH_HARNESS was unset, and a skipped need skips the job that
+    needs it. So the engine release could go public before the harness was on PyPI, an engine tag
+    asked for two approvals, and `publish-pypi` did not wait on `release-harness` (vault BACKLOG
+    #2975). Now every engine-tag upload is a step of `publish-pypi`, so one approval covers them
+    (owner ruling 2026-10-16), and the publish job waits on it.
+
+    THE RISK THIS HOLDS: no job upstream of `publish-github-release` may be skipped by a variable,
+    or an unset variable would leave every engine release a draft while this suite stays green.
+    Nothing runs release.yml before a tag, so this structural read is the only check before one.
+
+    Mutation: move the harness publish back to its own job, gate a job upstream of
+    `publish-github-release` on `vars.`. Red here. Section (4) pins `publish-pypi`'s needs.
+    """
+    jobs = _jobs()
+    engine_tag = {
+        key
+        for key, job in _publish_jobs().items()
+        if "!startsWith(github.ref_name,'webconsole-')" in _despace(str(job.get("if") or ""))
+    }
+    assert engine_tag == {"publish-pypi"}, sorted(engine_tag)
+    # The gate is read outside the environment and handed in, so an environment copy cannot turn
+    # the upload on; one that skips it is refused by the draft publisher (vault BACKLOG #2975).
+    harness_if = str(_upload_step(jobs["publish-pypi"], "harness-dist/").get("if"))
+    assert "needs.release-harness.outputs.publish-harness" in harness_if, harness_if
+    assert jobs["release-harness"]["outputs"]["publish-harness"] == "${{ vars.PUBLISH_HARNESS }}"
+    # The walk must cover at least these jobs, or the empty-`gated` check below says nothing about
+    # them. A failure here is a release.yml topology change: update this set, not the gate check.
+    upstream = _upstream(_PUBLISH_JOB) | {_PUBLISH_JOB}
+    expected = {
+        "tag-provenance",
+        "sbom-linux",
+        "sbom-windows",
+        "release",
+        "release-harness",
+        "publish-pypi",
+        _PUBLISH_JOB,
+    }
+    assert len(upstream) >= len(expected), sorted(upstream)
+    assert upstream >= expected, (
+        f"{_PUBLISH_JOB}'s upstream walk lacks {sorted(expected - upstream)}"
+    )
+    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
+    assert not gated, (
+        f"job(s) {gated} upstream of {_PUBLISH_JOB} are gated on a variable; unset, they skip it"
+    )
+
+
+def test_an_unset_publish_webconsole_still_publishes_the_console_release() -> None:
+    """Before vault BACKLOG #2975 an unset PUBLISH_WEBCONSOLE skipped only the upload, and the
+    console release was public. Gated on the upload JOB, the unset variable skipped that job, and a
+    skipped need skipped the console's draft publisher: a green run left a draft. So the console
+    mirrors the harness: the variable gates the upload STEP, read by the build job outside the
+    environment and handed in as an output.
+
+    Mutation: put `vars.PUBLISH_WEBCONSOLE` back on `publish-pypi-webconsole`'s `if:`, or gate any
+    job upstream of the console publisher on a variable. Red here.
+    """
+    jobs = _jobs()
+    # The walk must cover at least these jobs, or the empty-`gated` check below says nothing about
+    # them. A failure here is a release.yml topology change: update this set, not the gate check.
+    upstream = _upstream(_CONSOLE_PUBLISH_JOB) | {_CONSOLE_PUBLISH_JOB}
+    expected = {
+        "tag-provenance",
+        "release-webconsole",
+        "publish-pypi-webconsole",
+        _CONSOLE_PUBLISH_JOB,
+    }
+    assert len(upstream) >= len(expected), sorted(upstream)
+    assert upstream >= expected, (
+        f"{_CONSOLE_PUBLISH_JOB}'s upstream walk lacks {sorted(expected - upstream)}"
+    )
+    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
+    assert not gated, (
+        f"job(s) {gated} upstream of {_CONSOLE_PUBLISH_JOB} are gated on a variable; unset, "
+        "they skip it and the console release stays a draft"
+    )
+    outputs = jobs["release-webconsole"]["outputs"]
+    assert outputs["publish-webconsole"] == "${{ vars.PUBLISH_WEBCONSOLE }}", outputs
+
+
 def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
-    """The chain from the gated files to the published ones: the publish job needs its producer,
-    reads that producer's `pypi-digests` output, and checks it before any publish step; the
-    producer's output comes from its digest step, which digests the directories it hands over;
-    and every directory published was handed over."""
+    """The chain from the gated files to the published ones: the publish job needs each producer,
+    reads each producer's `pypi-digests` output, and checks them together before any publish step;
+    each producer's output comes from its digest step, which digests the directories it hands over;
+    and every directory published was handed over. `publish-pypi` has two producers, `release` and
+    `release-harness`, since vault BACKLOG #2975."""
     jobs = _jobs()
     bodies = set()
     for key, job in _publish_jobs().items():
@@ -3825,55 +4078,74 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
         ]
         assert len(verify) == 1 and verify[0] < min(publishes), (key, verify, publishes)
         bodies.add(steps[verify[0]]["run"])
-        m = re.fullmatch(
-            r"\$\{\{\s*needs\.([\w-]+)\.outputs\.pypi-digests\s*\}\}",
-            str(steps[verify[0]]["env"]["EXPECTED"]),
-        )
-        assert m, steps[verify[0]]["env"]
-        producer = m.group(1)
-        assert producer in needs_of(job), (key, needs_of(job))
-        prod = jobs[producer]
-        assert prod["outputs"]["pypi-digests"] == "${{ steps.pypi-digests.outputs.sha256 }}"
-        digest = next(s for s in prod["steps"] if s.get("id") == "pypi-digests")
-        handover = next(
-            s
-            for s in prod["steps"]
-            if str(s.get("uses") or "").startswith("actions/upload-artifact@")
-            and str((s.get("with") or {}).get("name", "")).startswith("pypi-")
-        )
-        # The files leave only after every gate and smoke check has passed, or a refused archive
-        # would already sit in a 30-day artifact when the job fails (the BACKLOG #1838 class).
-        order = prod["steps"]
-        gates = [
-            i
-            for i, s in enumerate(order)
-            if re.search(r"\bgate\b|^Smoke-check", str(s.get("name", "")), re.IGNORECASE)
-        ]
-        assert gates and order.index(digest) > max(gates), (producer, "hands over before a gate")
-        assert order.index(handover) > order.index(digest), (producer, "uploads before digesting")
-        # No `if:` on either: the implicit success() is what keeps a refused file from leaving.
-        assert "if" not in digest and "if" not in handover, (producer, "the hand-over is guarded")
-        assert not handover.get("continue-on-error") and not digest.get("continue-on-error")
-        handed = set(str(handover["with"]["path"]).split())
-        digested = set(re.findall(r"([\w-]+/)\*", digest["run"]))
-        assert handed == digested, (producer, handed, digested)
-        fetched = next(
+        # One `needs.<producer>.outputs.pypi-digests` per line, and nothing else, because the check
+        # refuses any downloaded file its manifest does not list (vault BACKLOG #2975).
+        expected = str(steps[verify[0]]["env"]["EXPECTED"]).strip().splitlines()
+        producers = []
+        for line in expected:
+            m = re.fullmatch(
+                r"\$\{\{\s*needs\.([\w-]+)\.outputs\.pypi-digests\s*\}\}", line.strip()
+            )
+            assert m, steps[verify[0]]["env"]
+            producers.append(m.group(1))
+        assert producers and len(set(producers)) == len(producers), (key, producers)
+        fetches = [
             s for s in steps if str(s.get("uses") or "").startswith("actions/download-artifact@")
-        )
-        assert fetched["with"]["name"] == handover["with"]["name"], (key, fetched["with"])
-        # WHERE THE FILES LAND. upload-artifact roots an artifact at the common ancestor of its
-        # paths, so ONE directory is stored without its own name, and several top-level ones keep
-        # theirs. Each handed-over directory must land at its own name, or the digest manifest and
-        # `packages-dir` point at nothing on a real tag; a dispatch never downloads, so only this
-        # catches it.
-        target = str(fetched["with"].get("path") or ".").rstrip("/") or "."
-        for directory in handed:
-            name = directory.rstrip("/")
-            landed = target if len(handed) == 1 else f"{target}/{name}".removeprefix("./")
-            assert landed == name, (key, directory, "lands at", landed)
+        ]
+        assert len(fetches) == len(producers), (key, "a download without its digests", fetches)
+        assert all(steps.index(f) < verify[0] for f in fetches), (key, "downloads after the check")
+        published_from: set[str] = set()
+        for producer in producers:
+            published_from |= _check_producer(key, job, jobs, producer, fetches)
         for i in publishes:
-            assert steps[i]["with"]["packages-dir"] in handed, (key, steps[i]["with"])
+            assert steps[i]["with"]["packages-dir"] in published_from, (key, steps[i]["with"])
     assert len(bodies) == 1, "the publish jobs' digest checks differ; they must be one body"
+
+
+def _check_producer(
+    key: str, job: dict, jobs: dict, producer: str, fetches: list[dict]
+) -> set[str]:
+    """One producer's half of the chain; returns the directories it hands over."""
+    assert producer in needs_of(job), (key, needs_of(job))
+    prod = jobs[producer]
+    assert prod["outputs"]["pypi-digests"] == "${{ steps.pypi-digests.outputs.sha256 }}"
+    digest = next(s for s in prod["steps"] if s.get("id") == "pypi-digests")
+    handover = next(
+        s
+        for s in prod["steps"]
+        if str(s.get("uses") or "").startswith("actions/upload-artifact@")
+        and str((s.get("with") or {}).get("name", "")).startswith("pypi-")
+    )
+    # The files leave only after every gate and smoke check has passed, or a refused archive
+    # would already sit in a 30-day artifact when the job fails (the BACKLOG #1838 class).
+    order = prod["steps"]
+    gates = [
+        i
+        for i, s in enumerate(order)
+        if re.search(r"\bgate\b|^Smoke-check", str(s.get("name", "")), re.IGNORECASE)
+    ]
+    assert gates and order.index(digest) > max(gates), (producer, "hands over before a gate")
+    assert order.index(handover) > order.index(digest), (producer, "uploads before digesting")
+    # No `if:` on either: the implicit success() is what keeps a refused file from leaving.
+    assert "if" not in digest and "if" not in handover, (producer, "the hand-over is guarded")
+    assert not handover.get("continue-on-error") and not digest.get("continue-on-error")
+    handed = set(str(handover["with"]["path"]).split())
+    digested = set(re.findall(r"([\w-]+/)\*", digest["run"]))
+    assert handed == digested, (producer, handed, digested)
+    matching = [f for f in fetches if f["with"]["name"] == handover["with"]["name"]]
+    assert len(matching) == 1, (key, producer, "fetched", len(matching), "times")
+    fetched = matching[0]
+    # WHERE THE FILES LAND. upload-artifact roots an artifact at the common ancestor of its
+    # paths, so ONE directory is stored without its own name, and several top-level ones keep
+    # theirs. Each handed-over directory must land at its own name, or the digest manifest and
+    # `packages-dir` point at nothing on a real tag; a dispatch never downloads, so only this
+    # catches it.
+    target = str(fetched["with"].get("path") or ".").rstrip("/") or "."
+    for directory in handed:
+        name = directory.rstrip("/")
+        landed = target if len(handed) == 1 else f"{target}/{name}".removeprefix("./")
+        assert landed == name, (key, directory, "lands at", landed)
+    return handed
 
 
 def _run_verify(tmp_path: Path, files: dict[str, bytes], manifest: str) -> tuple[int, str]:
@@ -3918,8 +4190,20 @@ _MANIFEST = "\n".join(f"{_sha(d)}  {n}" for n, d in _FILES.items())
         ({**_FILES, "dist-pub/extra.whl": b"x\n"}, _MANIFEST, False, "not exactly the gated set"),
         ({"dist-pub/a.whl": _FILES["dist-pub/a.whl"]}, _MANIFEST, False, "toolkit-dist/b.whl"),
         (_FILES, "", False, "handed over no digests"),
+        # Two empty outputs joined by `publish-pypi`'s `|-` block (vault BACKLOG #2975).
+        (_FILES, "\n", False, "handed over no digests"),
+        # Two producers' outputs joined, one ending in a newline (vault BACKLOG #2975).
+        (_FILES, _MANIFEST.replace("\n", "\n\n"), True, "verified 2 file(s)"),
     ],
-    ids=["match", "changed-byte", "extra-file", "missing-file", "no-digests"],
+    ids=[
+        "match",
+        "changed-byte",
+        "extra-file",
+        "missing-file",
+        "no-digests",
+        "joined-empty",
+        "joined-outputs",
+    ],
 )
 def test_the_digest_check_refuses_anything_but_the_gated_files(
     tmp_path: Path, files: dict[str, bytes], manifest: str, ok: bool, needle: str
