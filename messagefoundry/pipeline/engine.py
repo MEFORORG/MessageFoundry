@@ -423,7 +423,7 @@ class ReloadOutcome:
     action:
 
     * **The reload did not happen.** The call RAISES (at least ``ConfigReloadDenied``,
-      ``FileNotFoundError``, ``ConfigDirUnreadable``, ``ConfigDigestMismatch``,
+      ``ConfigDirMissing``, ``ConfigDirUnreadable``, ``ConfigDigestMismatch``,
       ``ConfigDigestUnavailable``, ``WiringError``, or a connector build failure) and returns no
       outcome at all. The previously
       live graph is untouched, so the operator fixes the config and retries.
@@ -1630,6 +1630,14 @@ class Engine:
         if runner is not None and runner.registry.shard_id is not None:
             return f"shard:{runner.registry.shard_id}"
         return None
+
+    @property
+    def filters_its_graph(self) -> bool:
+        """Whether this engine filters each graph it loads down to one engine shard's (``serve
+        --shard``). Until such an engine holds its graph, :attr:`instance_identity` cannot name
+        it; an engine without a filter is never an engine shard. Read by the approval gate's claim
+        owner (BACKLOG #3252)."""
+        return self._registry_filter is not None
 
     def _owned_lanes(self) -> OwnedLanes | None:
         """The ADR 0073 ownership scope for crash recovery — ``None`` (recover globally) unless this
@@ -3004,8 +3012,8 @@ class Engine:
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
         roots is never read. Every refusal propagates, so a hold that release can only refuse is
         never filed: a missing directory, including one gone by the time the digest reads it
-        (``FileNotFoundError``), one that cannot be resolved (:class:`ConfigDirUnreadable`), and one
-        holding a folder or file the digest covers that cannot be read
+        (:class:`ConfigDirMissing`), one that cannot be resolved (:class:`ConfigDirUnreadable`),
+        and one holding a folder or file the digest covers that cannot be read
         (:class:`ConfigDigestUnavailable`, the cause logged at WARNING)."""
         path = await self._existing_reload_target(config_dir)
         digest = await self._content_digest(path)
@@ -3017,7 +3025,7 @@ class Engine:
         """The ADR 0041 D1 content digest of ``path`` alone, for an approval to bind, or ``None``
         when it cannot be taken. It fails closed: a file or folder it covers that cannot be read
         gives ``None``, not the digest of the rest, and a directory that is gone, or whose name no
-        directory can have, when the digest first lists it raises ``FileNotFoundError``. One
+        directory can have, when the digest first lists it raises :class:`ConfigDirMissing`. One
         removed after that listing digests as the files still found (vault BACKLOG #2596).
 
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
@@ -3050,8 +3058,9 @@ class Engine:
 
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
-        :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory or no directory can have its name (``is_missing_directory``), or
+        :meth:`_resolve_reload_target`, and refused with :class:`ConfigDirMissing` (a
+        ``FileNotFoundError``) when it is not a directory or no directory can have its name
+        (``is_missing_directory``), or
         :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
@@ -3060,7 +3069,7 @@ class Engine:
 
     def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
         """:meth:`_existing_reload_target` on a worker thread, in one hop."""
-        from messagefoundry.config.fingerprint import is_missing_directory
+        from messagefoundry.config.fingerprint import ConfigDirMissing, is_missing_directory
 
         try:
             path = self._resolve_reload_target(config_dir)
@@ -3088,8 +3097,11 @@ class Engine:
         else:
             missing = False
         if missing:
-            # Outside the handler, so the error it replaces does not ride __context__.
-            raise FileNotFoundError(f"config directory not found: {config_dir}")
+            # Outside the handler, so the error it replaces does not ride __context__. Its own
+            # type, so the routes map only this to not_found. A plain FileNotFoundError, such as
+            # one a runner start raises, is audited as reason reload_fault, as every other reload
+            # fault is (BACKLOG #3157).
+            raise ConfigDirMissing(f"config directory not found: {config_dir}")
         return path
 
     async def capture_start_provenance(self) -> str | None:
@@ -3208,12 +3220,13 @@ class Engine:
         :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped. The
         digest fails closed (:meth:`_content_digest`): a file or folder it cannot read gives
         :class:`ConfigDigestUnavailable`, and a directory gone since the resolve, when a digest
-        lists it, gives ``FileNotFoundError``. ``None`` binds nothing: an ungated reload, a convergence reload and a
-        dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
+        lists it, gives :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a
+        convergence reload and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
         and no more.
 
-        Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir), ``ConfigDirUnreadable`` (a dir that cannot be resolved),
+        Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
+        (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
+        ``ConfigDirUnreadable`` (a dir that cannot be resolved),
         ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
         environment value file this reload could not read) — the caller maps these to HTTP errors.
@@ -3221,7 +3234,12 @@ class Engine:
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
         run never applies them, so a raise of one of these leaves the running values as they were.
-        A cancellation is not one of them: one that lands after the swap committed keeps the new
+        Any other ``Exception`` is not a refusal. It is a fault inside the reload, at least a bare
+        ``FileNotFoundError`` or a ``PermissionError`` from a first load's runner start or from the
+        swap. One from the swap is raised after its rollback, and one from a step after the swap
+        committed leaves the new graph live. The API reload routes audit such a fault with reason
+        ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
+        and is never audited as a fault: one that lands after the swap committed keeps the new
         values, and so does one during a first load's runner start.
         """
         failures: list[ReloadStepFailure] = []

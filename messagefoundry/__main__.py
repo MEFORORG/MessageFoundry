@@ -401,10 +401,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. Under --project-root, a messagefoundry.toml in a working directory "
-        "other than the project root is not read and stops the environment read. When no "
-        "settings load it falls back to the "
-        "setting's own default (ON) — matching the default engine, never a silent OFF (#230).",
+        "names the instance. When no settings load, the preview falls back to the "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
+        "Under --project-root with no --service-config, check reads the project root's "
+        "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
+        "one in its own working directory; when they differ, each settings check's line names "
+        "the file it read. With neither file, a messagefoundry.toml in the working directory is "
+        "not read, and the settings checks skip and name it. An explicit --service-config is "
+        "read wherever it points, the working directory's file included. Without --project-root, "
+        "a directory named messagefoundry.toml in the working directory, when the upward search "
+        "reaches it, fails the settings checks, as it stops serve.",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(check)
@@ -9909,6 +9915,9 @@ def _check(args: argparse.Namespace) -> int:
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
         allow_empty_config=args.allow_empty_config,
+        # BACKLOG #3063 item 2: _resolve_offline_anchor picked the project root's file, which serve
+        # with the same flags may not read; run_checks names the difference on each settings line.
+        service_config_from_root=args.service_config is None and service_config is not None,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -9931,6 +9940,7 @@ def _connection(args: argparse.Namespace) -> int:
     import os
     from pathlib import Path
 
+    from messagefoundry.checks import INSECURE_BIND_FLAG, insecure_bind_note
     from messagefoundry.config import connections_edit
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.environments import (
@@ -10009,8 +10019,10 @@ def _connection(args: argparse.Namespace) -> int:
             # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
             # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
             trust_anchor_policy=settings.tls.policy(),
-            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
-            # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape,
+            # so pass the settings half serve folds in. This command takes no
+            # --allow-insecure-bind, for the reason `_check_build` in checks.py gives for `check`
+            # (BACKLOG #3063 item 1, a Manager ruling).
             allow_insecure_bind=insecure_bind_escape(settings),
         )
         # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
@@ -10048,6 +10060,11 @@ def _connection(args: argparse.Namespace) -> int:
             advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
         elif BODY_ACKNOWLEDGEMENT_SETTING in message:
             advice = "this edit is then checked against that instance's [security] settings"
+        elif INSECURE_BIND_FLAG in message:
+            # BACKLOG #3063 item 7: the exposure refusal names serve's flag, which this command
+            # does not take (item 1), so say which escape it does read and where it was read from.
+            message = insecure_bind_note(message, "connection")
+            advice = "the cleartext escape is then read from that instance's [security] settings"
         if args.service_config is None and advice is not None:
             # load_settings falls back to ./messagefoundry.toml, so say which case this was.
             local = Path("messagefoundry.toml")

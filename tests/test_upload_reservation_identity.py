@@ -24,7 +24,7 @@ from messagefoundry import uploads as uploads_mod
 from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
-from messagefoundry.uploads import UploadedFileMeta, UploadStore
+from messagefoundry.uploads import UploadedFileMeta, UploadStore, _Observed
 from tests.test_uploads import _GatedLedger, _hold_after_the_sidecar_lands
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
@@ -206,7 +206,7 @@ async def test_a_cancelled_save_removes_its_pair_before_another_save_scans(
     real_observed = store._observed_sync
     armed = False
 
-    def _observed(uploader_id: str) -> tuple[int, int]:
+    def _observed(uploader_id: str) -> _Observed:
         out = real_observed(uploader_id)
         if armed:
             b_scanned.set()

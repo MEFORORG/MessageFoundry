@@ -113,6 +113,9 @@ this line.**
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
   administrator to reset it. No seam change. (vault BACKLOG #2298)
+- **The Approvals page's 503 guidance names no single action.** It said an audit log could not
+  record a release, and it also answered a rejection and, now, a queue the store could not read.
+  It now covers all three and says nothing ran. No seam change. (BACKLOG #3157)
 - **The Approvals page no longer offers Approve on a request the engine always refuses.** It reads
   the engine's new `release_blocked` reason, so a request that predates requester-id attribution,
   or whose operation is no longer registered, or a purge or reload whose parameters name no requester, gets

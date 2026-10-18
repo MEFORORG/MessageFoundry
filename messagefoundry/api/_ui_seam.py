@@ -547,6 +547,21 @@ from typing import Any
 #: 863c08417700e49c). Neither parent's value covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
+#: Vault BACKLOG #2954 merged with main after the entries above: #2954 had moved the digest to
+#: 29c3dad6b850d71e (with #3015), then 620ca34580f8dfda on the tree merged with #2709 and #3029,
+#: and main moved it to 6d7dcabe1103f08d with #3192, #3193 and #3236. The value below was
+#: re-derived with ``--write`` on the merged tree, so it covers every entry above.
+#:
+#: That #2954 branch merged with main again at 440d71aaf (digest da529979e55cb966 on main).
+#: The move is this branch's ``SecurityPosture.undeclared_route_refusals`` field alone; every
+#: other line of the golden matches main's. Re-derived with ``--write`` on the merged tree.
+#:
+#: PR 2359 (vault BACKLOG #2954 with #3252, #3157, #3063 and #3183; the two #2954 entries just
+#: above are that PR's own) merged with main after PR 2377 carried #2954 and #2956 there (main
+#: at 9f279f182, seam digest 5b6fd34b36a52c84; the branch at 40dde1530423fece). Re-derived with
+#: ``--write`` on the merged tree; the digest did not move and the golden matches main's, because
+#: #2954's field was this branch's only seam change and main already carries it.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

@@ -2230,13 +2230,25 @@ the requested directory. If the audit log refuses that row, the route answers **
 loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
 writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
 attempt row with no row after it is not proof the reload was refused or cancelled. At least a
-refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
-alone. The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
+refusal, a fault or a cancellation whose own row then fails leaves it alone. An unexpected fault
+in the reload now writes a `reload_fault` row after it (BACKLOG #3157). The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
 row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
+`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
+included, and released, any error the reload raises that none of the other reasons names is
+`reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
+missing config directory writes. The row does not claim the old graph is still serving: at least a
+fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
+which is. At least these write no such row: a DR activation's reload, and a row whose own write
+fails, which is logged. A cluster convergence reload records such a fault with reason
+`reload_error` instead (vault BACKLOG #3109). A cancellation is not a fault: an applied reload's
+writes `config_reload_interrupted`, and a cancelled dry run or digest capture writes nothing. An
+inline reload answers **500** with a generic detail for `reload_fault`; a released one answers 422,
+the approve route's answer for a release the engine did not run. A trust-anchor check that the
 store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
 `store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
 reason is written only for an anchor that passed them. An anchor they refuse is still
@@ -2360,10 +2372,21 @@ ERROR line and no alert for at least two writes: a rejection, and a refusal's ro
 shields at least the request or repeat write, the claim, each outcome and a resolution from a
 cancel. Those writes finish on their own, and log and page as above.
 
-What this does not cover, at least: a store that refuses READS of the request row or the
-requester's account still answers a raw 500. A request or a repeat whose write fails, and that
-does not read back as held, is not mapped either. It answers a raw 500, or the request timeout's
-503 when the call is cancelled.
+A store that refuses a READ on the approval routes answers 503 for at least the queue, the request
+row and the requester's `users` row (BACKLOG #3157). The gate logs it at ERROR, at most once per
+five minutes for each kind of read, and pages nothing, because a read loses no audit row. Nothing
+is decided or run.
+The queue's own read of each requester's `users` row, which predicts a refusal (BACKLOG
+#3189), is the exception: a fault there leaves that requester's requests with no prediction, the
+queue still answers, and the fault is logged at ERROR once per requester on every listing. Approving
+the request reads the row again and answers 503 as above.
+
+What this does not cover, at least: a request or a repeat whose write fails, and that does not
+read back as held, is not mapped. It answers a raw 500, or the request timeout's 503 when the call
+is cancelled. At least these reads are not mapped either, and can answer a raw 500: the
+requester's roles and scope, which the release reads through the auth service, and the
+open-request read a reload or purge makes before its step-up to answer a repeat. A read that fails
+on a programming defect, rather than a store fault, is raised as it is.
 
 **A failed request write is read back, and the write outlives its caller (vault BACKLOG #3193).**
 The request and its `approval.requested` row are one write, as above. When that write reports an
@@ -2482,6 +2505,12 @@ row claimed before the column existed has no owner, and the first process to sta
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
 unsupported anyway. For the same reason, build one app per engine: a second app over the same
 engine runs the reconcile again and would take the first one's live releases for leftovers.
+
+An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
+graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
+the first queue read that finds the owner known runs it, over rows claimed before the app started
+(BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
+that owner for the app's life, so start the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

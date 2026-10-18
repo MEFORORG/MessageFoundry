@@ -8016,7 +8016,11 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
     if not directory.is_dir():
-        raise FileNotFoundError(f"config directory not found: {directory}")
+        # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
+        # moved away after the reload's own check still answers as missing (BACKLOG #3157).
+        from messagefoundry.config.fingerprint import ConfigDirMissing
+
+        raise ConfigDirMissing(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
     # The digest is read just before the modules run (vault BACKLOG #2724).

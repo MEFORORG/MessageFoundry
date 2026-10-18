@@ -18,6 +18,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
+import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision
 
 from messagefoundry.api import create_app
@@ -328,6 +329,27 @@ async def test_no_bound_gate_is_a_503_page(engine: Engine) -> None:
         assert r.status_code == 503
         assert "Dual control is not available" in r.text
         assert "approval workflow is not available" in r.text
+
+
+async def test_a_queue_the_store_cannot_read_is_a_503_page(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3157: the list now answers a failed store read as 503, so the 503 guidance serves
+    the list, a release and a rejection, and names none of them alone."""
+    service = await auth_service(engine)
+    await provision(service, "admin", [Role.ADMINISTRATOR.value])
+
+    async def _refuse(*_a: object, **_k: object) -> None:
+        raise OSError("PROBE: the store refuses reads")
+
+    async with _client(engine, service, _ON) as admin:
+        await cookie_login(admin, "admin")
+        monkeypatch.setattr(engine.store, "list_pending_approvals", _refuse)
+        r = await admin.get("/ui/approvals")
+    assert r.status_code == 503
+    assert "a store it could not read" in r.text
+    assert "could not read the approval queue" in r.text
+    assert "release or rejection" in r.text
 
 
 async def test_an_unknown_id_is_a_404_page_and_a_malformed_one_is_refused(engine: Engine) -> None:
