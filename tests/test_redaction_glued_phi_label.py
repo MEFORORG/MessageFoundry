@@ -532,7 +532,10 @@ def _consumer_routes() -> dict[str, tuple[str, str]]:
 
 
 def test_no_consumer_prints_a_value_main_hid() -> None:
-    printed = [route for route, (out, value) in _consumer_routes().items() if value in out]
+    # The table holds four routes, one per consumer above; the floor fails if it is emptied or cut.
+    routes = _consumer_routes()
+    assert len(routes) >= 4
+    printed = [route for route, (out, value) in routes.items() if value in out]
     assert not printed
     with _rule_off():
         assert not [route for route, (out, value) in _consumer_routes().items() if value in out]
