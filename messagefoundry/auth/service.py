@@ -408,36 +408,52 @@ _NEW_IP_PER_SESSION_MAX = 8
 # its repeats share the interval.
 _NEW_IP_REPEAT_LOG_SECONDS = 60.0
 _NEW_IP_OVER_CAP_LOG_MAX = 64
-# The first-sighting set holds only an address's canonical text with no scope id. Anything else
-# (text that does not parse, or an IPv6 address with a scope id, whose text after the "%" is the
-# sender's) is remembered as the one sentinel below. So the set is at most
-# _NEW_IP_OVER_CAP_LOG_MAX keys of at most this length, for each of _NEW_IP_DEDUP_MAX sessions.
-# The same length bounds the address a past-the-cap WARNING writes.
+# The first-sighting set holds only an address's canonical text, with any IPv6 scope id dropped,
+# because the text after the "%" is the sender's. Text that does not parse is remembered as the
+# one sentinel below. So the set is at most _NEW_IP_OVER_CAP_LOG_MAX keys of at most an address's
+# length, for each of _NEW_IP_DEDUP_MAX sessions. This length bounds the address a past-the-cap
+# WARNING writes.
 _NEW_IP_LOG_KEY_MAX = 64
 _NEW_IP_UNPARSED_LOG_KEY = "unparsed"
 
 
 def _over_cap_log_key(address_key: str) -> str:
     """The bounded key the log throttle remembers for a past-the-cap address (vault BACKLOG
-    #3052): the address's canonical text when it parses with no scope id, else one sentinel."""
-    if len(address_key) > _NEW_IP_LOG_KEY_MAX or "%" in address_key:
-        return _NEW_IP_UNPARSED_LOG_KEY
+    #3052): ``address_key``, a :func:`_host_key` result, with any IPv6 scope id dropped, so
+    link-local peers on a direct bind (``fe80::a%eth0``, ``fe80::b%eth0``) stay distinct
+    (vault BACKLOG #3773 item 2). Text that does not parse is one sentinel."""
+    if len(address_key.partition("%")[0]) > _NEW_IP_LOG_KEY_MAX:
+        return _NEW_IP_UNPARSED_LOG_KEY  # longer than any address, so skip the parse
     try:
-        ipaddress.ip_address(address_key)
+        parsed = ipaddress.ip_address(address_key)
     except ValueError:
         return _NEW_IP_UNPARSED_LOG_KEY
-    return address_key
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.scope_id is not None:
+        parsed = ipaddress.IPv6Address(int(parsed))
+    return str(parsed)
 
 
 @dataclass
 class _NewIpLogState:
     """One session's new-address log throttle (vault BACKLOG #3052 item 16): when it last wrote an
-    interval line, how many lines it has held back since, and the bounded keys of the past-the-cap
-    addresses whose first sighting it has already logged (:func:`_over_cap_log_key`)."""
+    interval line, how many lines it has held back since, the bounded keys of the past-the-cap
+    addresses whose first sighting it has already logged (:func:`_over_cap_log_key`), and the
+    timer that writes the held-back count when the interval ends with no later line (vault
+    BACKLOG #3773 item 1)."""
 
     last_line: float | None = None
     suppressed: int = 0
     over_cap_logged: set[str] = field(default_factory=set)
+    flush_handle: asyncio.TimerHandle | None = None
+
+    def take_held_back(self) -> int:
+        """The count held back, which the line carrying it reports; starts it over and cancels
+        the timer, so summing ``held_back`` counts each held-back line once."""
+        if self.flush_handle is not None:
+            self.flush_handle.cancel()
+            self.flush_handle = None
+        held_back, self.suppressed = self.suppressed, 0
+        return held_back
 
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
@@ -2905,7 +2921,12 @@ class AuthService:
     async def close_background(self) -> None:
         """The shutdown drain (BACKLOG #2216): :meth:`drain_background` with ``close=True`` and
         the :data:`_BACKGROUND_DRAIN_SECONDS` bound. The API lifespan calls it; so must any app
-        that owns its engine some other way, before it stops the engine."""
+        that owns its engine some other way, before it stops the engine.
+
+        It first writes every new-address log count still held back, whose timers would not run
+        after the loop stops (vault BACKLOG #3773 item 1)."""
+        for state in self._new_ip_logged.values():
+            self._write_new_ip_held_back(state, "the engine is shutting down")
         await self.drain_background(timeout=_BACKGROUND_DRAIN_SECONDS, close=True)
 
     async def drain_background(self, *, timeout: float | None = None, close: bool = False) -> None:
@@ -10106,20 +10127,25 @@ class AuthService:
         is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because that line is its
         only record; it is remembered by :func:`_over_cap_log_key`, so every address that maps to
         the sentinel shares one first sighting. Any other line is an interval line, due at most
-        once per ``_NEW_IP_REPEAT_LOG_SECONDS``, and it starts the held-back count over. A line held
-        back writes a DEBUG line with the count, and the next WARNING carries it, so a suppressed
-        repeat is not silent at INFO either. The refusal never depends on it. Per process and
-        bounded, so an eviction can only ever write extra lines, never hide a refusal."""
+        once per ``_NEW_IP_REPEAT_LOG_SECONDS``. A line held back writes a DEBUG line with the
+        count, and a WARNING carries it, so a suppressed repeat is not silent at INFO either. That
+        is the next line this returns a number for, or a line of the count's own
+        (:meth:`_write_new_ip_held_back`) when the interval ends with no later line, when the
+        session re-verifies, when its record is evicted, or at shutdown (vault BACKLOG #3773
+        item 1). Whichever line carries the count starts it over, so summing ``held_back`` counts
+        each held-back line once. The refusal never depends on it. Per process and bounded."""
         state = self._new_ip_logged.get(token_hash)
         if state is None:
             if len(self._new_ip_logged) >= _NEW_IP_DEDUP_MAX:
-                self._new_ip_logged.pop(next(iter(self._new_ip_logged)))
+                self._drop_new_ip_log_state(
+                    next(iter(self._new_ip_logged)), "its record was evicted"
+                )
             state = self._new_ip_logged[token_hash] = _NewIpLogState()
         if over_cap_key is not None and len(state.over_cap_logged) < _NEW_IP_OVER_CAP_LOG_MAX:
             log_key = _over_cap_log_key(over_cap_key)
             if log_key not in state.over_cap_logged:
                 state.over_cap_logged.add(log_key)
-                return state.suppressed
+                return state.take_held_back()
         now = time.monotonic()
         if state.last_line is not None and now - state.last_line < _NEW_IP_REPEAT_LOG_SECONDS:
             state.suppressed += 1
@@ -10128,10 +10154,47 @@ class AuthService:
                 "suppressed=%d since the last interval line",
                 state.suppressed,
             )
+            if state.flush_handle is None:
+                state.flush_handle = asyncio.get_running_loop().call_later(
+                    state.last_line + _NEW_IP_REPEAT_LOG_SECONDS - now,
+                    self._new_ip_interval_ended,
+                    state,
+                )
             return None
-        held_back, state.suppressed = state.suppressed, 0
         state.last_line = now
-        return held_back
+        return state.take_held_back()
+
+    def _new_ip_interval_ended(self, state: _NewIpLogState) -> None:
+        """The timer :meth:`_new_ip_log_due` sets when it holds a line back: once the session's
+        interval ends with no later line, write the count still held back as an interval line of
+        its own (vault BACKLOG #3773 item 1). Every line that carries the count cancels the timer,
+        so this runs only when none did. The timer holds the state itself, so a token rotation,
+        which moves the state to the new hash, keeps it."""
+        state.flush_handle = None
+        state.last_line = time.monotonic()
+        self._write_new_ip_held_back(state, "the session's interval ended with no later line")
+
+    def _drop_new_ip_log_state(self, token_hash: str, reason: str) -> None:
+        """Drop a session's log throttle, writing what it still holds back first (vault BACKLOG
+        #3773 item 1). Every site that drops one goes through here, so no drop loses a count."""
+        state = self._new_ip_logged.pop(token_hash, None)
+        if state is not None:
+            self._write_new_ip_held_back(state, reason)
+
+    @staticmethod
+    def _write_new_ip_held_back(state: _NewIpLogState, reason: str) -> None:
+        """Write the count of new-address WARNING lines ``state`` holds back, if any, and start it
+        over (vault BACKLOG #3773 item 1). Each line held back stood for a refused request that
+        main logged one WARNING for, so the count is not dropped with the state."""
+        held_back = state.take_held_back()
+        if not held_back:
+            return
+        _log.warning(
+            "new-address re-verify refusals the per-session throttle held back, written now "
+            "because %s: held_back=%d",
+            reason,
+            held_back,
+        )
 
     def _restart_new_ip_dedupe(self, token_hash: str) -> None:
         """Start the new-address dedupe over for a session that just re-anchored, so an address
@@ -10142,8 +10205,9 @@ class AuthService:
         re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
         back."""
         self._new_ip_seen.pop(token_hash, None)
-        # The log throttle starts over too, so the first repeat after a re-anchor logs.
-        self._new_ip_logged.pop(token_hash, None)
+        # The log throttle starts over too, so the first repeat after a re-anchor logs. What it
+        # still holds back is written first (vault BACKLOG #3773 item 1).
+        self._drop_new_ip_log_state(token_hash, "the session re-verified")
 
     async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).

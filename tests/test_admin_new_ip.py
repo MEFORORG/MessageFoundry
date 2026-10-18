@@ -14,8 +14,10 @@ are no-ops (the request and the session share one address).
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -25,6 +27,7 @@ import pytest
 from _totp_clock import pin_totp_clock
 from fastapi import Depends, FastAPI, Request
 
+import messagefoundry.auth.service as service_module
 from messagefoundry.api import create_app
 from messagefoundry.api.security import (
     require_reauth_only,
@@ -291,12 +294,13 @@ async def test_the_past_cap_first_sighting_record_is_bounded() -> None:
         for i in range(200):
             junk = f"not-an-address-{i}-" + "x" * 500
             assert await service.flag_new_client_ip(token, junk, path="/users") is True
-        # An IPv6 scope id is the sender's text, short or long, so it is the sentinel as well
-        # (review round 2: "::%<text>" parses as an address).
+        # An IPv6 scope id is the sender's text, short or long, so the key drops it (review round
+        # 2: "::%<text>" parses as an address; vault BACKLOG #3773 item 2: dropping it rather than
+        # folding to the sentinel keeps link-local peers distinct).
         for scoped in ("fe80::1%" + "s" * (2 * _NEW_IP_LOG_KEY_MAX), "::%\n<evil>"):
             assert await service.flag_new_client_ip(token, scoped, path="/users") is True
         state = service._new_ip_logged[hash_token(token)]
-        assert state.over_cap_logged == {_NEW_IP_UNPARSED_LOG_KEY}
+        assert state.over_cap_logged == {_NEW_IP_UNPARSED_LOG_KEY, "fe80::1", "::"}
         for i in range(2 * _NEW_IP_OVER_CAP_LOG_MAX):
             assert await service.flag_new_client_ip(token, f"10.4.{i}.1", path="/users") is True
         assert len(state.over_cap_logged) == _NEW_IP_OVER_CAP_LOG_MAX
@@ -348,8 +352,8 @@ async def test_a_held_back_warning_writes_a_debug_count(caplog: pytest.LogCaptur
     """RED when: a WARNING the throttle holds back leaves no line at all (vault BACKLOG #3052
     review finding 4). Each held-back repeat writes a DEBUG line with the count held back since the
     session's last interval line, and the next WARNING carries the count as ``held_back``, so it
-    shows at INFO too. A past-the-cap first sighting carries it without starting it over; the next
-    interval line does start it over (review round 2)."""
+    shows at INFO too. A past-the-cap first sighting carries it and starts it over, so summing
+    ``held_back`` counts each held-back line once (vault BACKLOG #3773 item 1)."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
@@ -376,14 +380,172 @@ async def test_a_held_back_warning_writes_a_debug_count(caplog: pytest.LogCaptur
             assert any(r.getMessage().endswith("held_back=3") for r in caplog.records)
             assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
             assert counts() == ["1"]
-            # Past the cap, a first sighting carries the count and does not start it over.
+            # Past the cap, a first sighting carries the count and starts it over.
             for i in range(_NEW_IP_PER_SESSION_MAX):
                 assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users")
             caplog.clear()
             assert await service.flag_new_client_ip(token, "10.6.6.6", path="/users") is True
             assert any("held_back=1 seen_ip=10.6.6.6" in r.getMessage() for r in caplog.records)
             assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
-            assert counts() == ["2"]
+            assert counts() == ["1"]
+    finally:
+        await store.close()
+
+
+def _refusals_on_record(records: list[logging.LogRecord]) -> int:
+    """How many refused new-address requests the WARNING lines account for: each per-request line
+    is one, and every line's ``held_back`` adds the requests held back before it."""
+    total = 0
+    for record in records:
+        if record.levelno < logging.WARNING:
+            continue
+        message = record.getMessage()
+        if "already flagged" in message or "past the per-session" in message:
+            total += 1
+        if "held_back=" in message:
+            total += int(message.split("held_back=")[1].split()[0])
+    return total
+
+
+async def test_a_trailing_burst_is_counted_when_the_interval_ends(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: repeats the throttle holds back, with no later request from the session, are never
+    written at WARNING (vault BACKLOG #3773 item 1). Main wrote a WARNING for each refused request,
+    so once the interval ends the WARNING lines must account for every one of them, whatever the
+    timing of the burst."""
+    monkeypatch.setattr(service_module, "_NEW_IP_REPEAT_LOG_SECONDS", 0.2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(5):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            # The flush is due at most 0.2 s after the last interval line, so it runs first.
+            await asyncio.sleep(0.6)
+        assert _refusals_on_record(caplog.records) == 5
+        assert service._new_ip_logged[hash_token(token)].suppressed == 0
+    finally:
+        await store.close()
+
+
+async def test_summing_held_back_counts_each_refusal_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: a past-the-cap first sighting reports the held-back count without starting it
+    over, so the next interval line reports the same lines again (vault BACKLOG #3773 item 1)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        for i in range(_NEW_IP_PER_SESSION_MAX + 1):
+            assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
+        refused = 0
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(4):
+                assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
+                refused += 1
+            assert await service.flag_new_client_ip(token, "10.6.6.6", path="/users") is True
+            refused += 1
+            state = service._new_ip_logged[hash_token(token)]
+            assert state.last_line is not None
+            state.last_line -= _NEW_IP_REPEAT_LOG_SECONDS + 1
+            assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
+            refused += 1
+        assert _refusals_on_record(caplog.records) == refused
+    finally:
+        await store.close()
+
+
+async def test_a_reanchor_writes_the_held_back_count(caplog: pytest.LogCaptureFixture) -> None:
+    """RED when: a re-verification drops the session's log throttle with lines still held back,
+    so those refusals are never written at WARNING (vault BACKLOG #3773 item 1)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(4):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            service._restart_new_ip_dedupe(hash_token(token))
+        assert _refusals_on_record(caplog.records) == 4
+        assert hash_token(token) not in service._new_ip_logged
+    finally:
+        await store.close()
+
+
+async def test_an_evicted_throttle_writes_the_held_back_count(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the oldest session's log throttle is evicted with lines still held back, so those
+    refusals are never written at WARNING (vault BACKLOG #3773 item 1)."""
+    monkeypatch.setattr(service_module, "_NEW_IP_DEDUP_MAX", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(4):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            for i in range(service_module._NEW_IP_DEDUP_MAX):
+                service._new_ip_log_due(f"other-session-{i}")
+        assert hash_token(token) not in service._new_ip_logged
+        assert _refusals_on_record(caplog.records) == 4
+    finally:
+        await store.close()
+
+
+async def test_shutdown_writes_the_held_back_count(caplog: pytest.LogCaptureFixture) -> None:
+    """RED when: the shutdown drain leaves lines held back unwritten, so a burst in the engine's
+    last interval is never written at WARNING (vault BACKLOG #3773 item 1)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(4):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            await service.close_background()
+        assert _refusals_on_record(caplog.records) == 4
+    finally:
+        await store.close()
+
+
+async def test_link_local_peers_past_the_cap_stay_distinct(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: every IPv6 address with a scope id shares the one sentinel, so a second link-local
+    peer on a direct bind (``fe80::b%eth0`` after ``fe80::a%eth0``) gets no first sighting of its
+    own (vault BACKLOG #3773 item 2). The scope id is the sender's text, so the key drops it
+    rather than keeping it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        for i in range(_NEW_IP_PER_SESSION_MAX + 1):
+            assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
+        # An interval line first, so a peer that shared a first sighting would be held back.
+        assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for peer in ("fe80::a%eth0", "fe80::b%eth0"):
+                assert await service.flag_new_client_ip(token, peer, path="/users") is True
+        lines = [r.getMessage() for r in caplog.records if "past the per-session" in r.getMessage()]
+        assert len(lines) == 2
+        assert lines[0].endswith("seen_ip=fe80::a%eth0")
+        assert lines[1].endswith("seen_ip=fe80::b%eth0")
+        state = service._new_ip_logged[hash_token(token)]
+        assert state.over_cap_logged == {"fe80::a", "fe80::b"}
     finally:
         await store.close()
 
