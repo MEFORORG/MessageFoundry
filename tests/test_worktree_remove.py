@@ -605,9 +605,17 @@ def _write_tombstone(fx: Fixture, number: str = "1000000", **over: object) -> Pa
 def test_the_tombstone_fixture_is_the_shape_the_writer_writes() -> None:
     """The tests below are only about the real tombstone if they write the record the writer writes."""
     src = _TOMBSTONE_WRITER.read_text(encoding="utf-8")
-    for field in (r'branch\s*=\s*""', r'worktree\s*=\s*""', r"tombstone\s*=\s*\$true"):
-        assert re.search(field, src), (
-            f"the tombstone writer no longer sets {field}; re-check remove.ps1"
+    # Only the record's own hashtable counts, so a comment or help line naming a field cannot pass.
+    block = re.search(r"\$record = \[ordered\]@\{(.*?)^\}", src, re.DOTALL | re.MULTILINE)
+    assert block, "the tombstone writer no longer builds `$record = [ordered]@{...}`"
+    fields = (
+        r'^\s*branch\s*=\s*""\s*$',
+        r'^\s*worktree\s*=\s*""\s*$',
+        r"^\s*tombstone\s*=\s*\$true\s*$",
+    )
+    for field in fields:
+        assert re.search(field, block.group(1), re.MULTILINE), (
+            f"the tombstone record no longer sets {field}; re-check remove.ps1"
         )
 
 

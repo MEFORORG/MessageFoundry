@@ -37,7 +37,8 @@
     owns(), which also returns False on an empty branch. remove.ps1's orphan guard refuses over any
     record naming no worktree, so it matches this one by its `tombstone`, `worktree` and `branch` fields
     instead; its Read-RecordFile says how, and changing those three fields here makes it refuse again.
-    So no session is ever told it holds this number, and no removal is refused over it.
+    So no session is ever told it holds this number. A copy of remove.ps1 older than that match still
+    refuses over this record: run the copy from an up-to-date checkout rather than overriding.
 
     IT REFUSES A CLONE WHOSE OWN ALLOCATOR IS STILL LIVE. The vault clone's alloc.ps1 still accepts
     `-Kind backlog` and is where backlog numbers are allocated now. A tombstone there would push its
