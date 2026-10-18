@@ -2699,8 +2699,7 @@ shows. A local account is never looked up.
 The lock refusal reads as a lock, not as a wrong code, since the code or passkey was never
 checked (BACKLOG #3810 finding 4): `POST /me/mfa/confirm` answers **403** `account locked; try
 again later`, and the account page's two enrolment finishes show `Account locked. Try again
-later.`, the words `/ui/reauth` shows. A locked directory account is also refused when it begins a
-passkey registration, before the browser makes a credential. On either account kind, a session
+later.`, the words `/ui/reauth` shows. On either account kind, a session
 found gone at either factor-binding ask of the passkey finish, or at the TOTP confirm's second
 one, is a lost session audited as the leg's failure event with `reason=session_lost` and
 `phase=enroll` (BACKLOG #3807), the row a directory account's re-read writes.
@@ -3006,8 +3005,7 @@ factor-binding refusal, the login-to-MFA floor, an expired ceremony, a bad label
 a failed verification, a duplicate, a directory account's directory and lock refusals, and the
 route's own refusals (rate limit, stale step-up window, malformed request). That passkey is not
 stored, so it cannot sign in. The passkey page says the user may delete it from the browser's or
-security key's passkey list. A second-step lock, which outlasts a ceremony, is refused at begin
-instead, before anything is made.
+security key's passkey list.
 
 Mechanics: ceremony challenges are **first-party 64-byte CSPRNG values**, single-use, 120 s TTL, staged
 in a bounded process-local cache (multi-node LBs need session affinity — the failure message says so).

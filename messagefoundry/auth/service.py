@@ -11843,10 +11843,6 @@ class AuthService:
         "authenticator app again from the account page"
     )
 
-    #: The refusal :meth:`begin_webauthn_registration` raises for a directory account under a
-    #: second-step lock (BACKLOG #3810 finding 4), in the words the console shows for a lock.
-    ACCOUNT_LOCKED = "Account locked. Try again later."
-
     async def begin_webauthn_registration(
         self, identity: Identity, *, token: str, rp_id: str, rp_name: str
     ) -> str:
@@ -11855,9 +11851,7 @@ class AuthService:
         stolen pre-MFA cookie must never bind an attacker's passkey). Raises :class:`ValueError`
         for an unknown account; a full challenge cache raises
         :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly). Accepts a
-        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason,
-        and raises :class:`ValueError` with :attr:`ACCOUNT_LOCKED` for one under a second-step lock,
-        audited ``auth.webauthn_failed`` with the shared locked detail (BACKLOG #3810 finding 4)."""
+        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason."""
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
@@ -11865,15 +11859,6 @@ class AuthService:
         # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
         if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
             raise FactorEnrolmentRequired()
-        # BACKLOG #3810 finding 4: the finish refuses a directory account's second-step lock, and
-        # any refusal there comes after the authenticator made a credential the server never
-        # stores. A lock outlasts the ceremony, so it is refused here first, before the browser
-        # makes anything. Only a directory account, as at the finish; a local account is not
-        # lock-checked at enrolment. The finish keeps its check for a lock set during the ceremony.
-        if user.auth_provider == AuthProvider.AD.value and await self._mfa_lock_refused(
-            user, client=None, event="auth.webauthn_failed"
-        ):
-            raise ValueError(self.ACCOUNT_LOCKED)
         existing = await self._verified_passkeys(user)
         if existing is None:
             raise ValueError("no such user")
@@ -11931,8 +11916,7 @@ class AuthService:
         **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
         finding 4), so it leaves a passkey the server never stored. ``docs/SECURITY.md``, *A
         refused registration can leave a passkey on the authenticator*, says which refusals and
-        what the console tells the user. A second-step lock is also refused at
-        :meth:`begin_webauthn_registration`, before any credential is made."""
+        what the console tells the user."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:

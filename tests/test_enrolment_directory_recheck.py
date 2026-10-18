@@ -367,32 +367,6 @@ async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
     assert {"reason": "locked"} in await _audited(store, "auth.webauthn_failed")
 
 
-async def test_a_second_step_locked_directory_account_is_refused_before_the_passkey_is_made(
-    store: MessageStore,
-) -> None:
-    """BACKLOG #3810 finding 4: any refusal at the finish comes after the authenticator made its
-    credential, and a lock outlasts the ceremony, so the begin refuses a locked directory account
-    before the browser makes anything. RED when the begin stages options for it. A local account is
-    not lock-checked at enrolment, so it is the control."""
-    pytest.importorskip("webauthn")
-    s = await _directory_sign_in(store)
-    await _lock_second_step(store, s.identity.user_id)
-
-    with pytest.raises(ValueError, match="Account locked"):
-        await s.service.begin_webauthn_registration(
-            s.identity, token=s.token, rp_id=_RP, rp_name="MessageFoundry"
-        )
-
-    assert s.service._webauthn_challenges.peek((hash_token(s.token), "register")) is None
-    assert {"reason": "locked"} in await _audited(store, "auth.webauthn_failed")
-    service = AuthService(store, _settings())
-    identity, token, _password = await login_admin(service)
-    await _lock_second_step(store, identity.user_id)
-    assert await service.begin_webauthn_registration(
-        identity, token=token, rp_id=_RP, rp_name="MessageFoundry"
-    )
-
-
 async def test_a_session_revoked_between_the_two_totp_asks_is_lost_not_owing_a_factor(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
