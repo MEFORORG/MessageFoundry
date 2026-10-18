@@ -83,8 +83,9 @@ _MAX_GZIP_MEMBERS: Final = 16
 _HEAD_BYTES: Final = 64 * 1024
 #: Media types a browser renders as HTML. Such a renderer parses an inline ``<svg>`` as a live
 #: element, so such a label, like an SVG label, makes an ``svg`` start tag past leading text markup
-#: rather than data (BACKLOG #3257). At least these; a type left off is treated as data. Each is one
-#: ``api/app.py`` names as browser-active beside its inert-type allow-list.
+#: rather than data (BACKLOG #3257). At least these; a type left off is treated as data. Besides the
+#: two HTML types, ``text/x-html`` and ``application/hta`` are ones ``api/app.py`` names as
+#: browser-active beside its inert-type allow-list.
 _HTML_TYPES: Final = frozenset(
     {"text/html", "application/xhtml+xml", "text/x-html", "application/hta"}
 )
@@ -607,8 +608,8 @@ def _vet_markup(label: str | None, body: bytes) -> bytes:
     first = _FIRST_CONTENT_BYTE_RE.search(body)
     if first is None or first.group() != b"<":
         # The label is checked first, so a body under a data label costs no head copy.
-        if _label_renders_markup(label):
-            _refuse_if_tagged(_plain_head(body, first) or b"")
+        if first is not None and _label_renders_markup(label):
+            _refuse_if_tagged(body[first.start() : first.start() + _HEAD_BYTES])
         return body
     if _label_names_svg(label) or _root_is_svg(body):
         return sanitize_svg(body)

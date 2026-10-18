@@ -580,18 +580,18 @@ wrong. See the correction below.
 *Amended 2026-10-16 (BACKLOG #3257):* the first rule read *"No SVG reader renders anything else"*,
 and bytes that were not markup were served with no scan at all. So leading text before
 `<svg onload=...>` passed, under an SVG label too, and a browser reading such a body as HTML would
-run it. *Amended again 2026-10-17 (BACKLOG #3257, the Lander's send-back of PR 2346, as the batch
-Manager dispatched it):* the refusal
-applies only under a label a browser renders as SVG or HTML: one that names `svg` in any case, such
-as `image/svg+xml` or `image/svg+xml-compressed`, and `text/html` or `application/xhtml+xml`. Under
-any other label, such as `text/plain`, `application/json`, an HL7 type, a PDF, an image, DICOM or
-`application/octet-stream`, a quoted `<svg>` is data, and the body is served as it was before this
-amendment. An earlier version refused it under every label, which refused valid traffic. The scan
-reads only that 64 KiB head, the same span a gzip body's scan reads (step 3 of the correction
+run it. The refusal applies only under a stored label a browser renders as SVG or HTML: a media
+type that names `svg` in any case, and at least `text/html`, `application/xhtml+xml`,
+`text/x-html` and `application/hta`. Under any other label, such as `text/plain`,
+`application/json`, an HL7 type, a PDF, an image, DICOM or `application/octet-stream`, a quoted
+`<svg>` is data, and the body is served as stored (the Lander's send-back of PR 2346, as the
+batch Manager dispatched it). Refusing it under every label would have refused valid traffic. The
+scan reads only that 64 KiB head, the same span a gzip body's scan reads (step 3 of the correction
 below), so a large body is never copied whole. The download's pre-check has no label, so it reads
 the same head and sends a body with a tag there to the sanitizer, which decides by label; a body
 with no tag there stays off the thread pool unless its leading noise runs past a head. The scan
-looks for the tag only, never the SVG namespace name. It also reads the tag spelled through an ISO-2022-JP escape sequence, which decodes to
+looks for the tag only, never the SVG namespace name. It also reads the tag spelled through an
+ISO-2022-JP escape sequence, which decodes to
 nothing; unlike markup, such a body is not refused for the escape byte alone, since most binaries
 hold it. What the scan does not reach, past the head included, rests on the inert-type allow-list:
 every type it declares is served as an attachment with `nosniff`, and none is SVG or HTML.
@@ -779,13 +779,16 @@ declares or names the SVG namespace without using it is served.
     chance, such as a compressed PDF stream under such a label. Under any other label such a body
     is served.
 - *Added 2026-10-17 (BACKLOG #3257):* the label is the stored one, and at least two paths keep the
-  refusal from reaching an HTML or SVG body. Detach stores a body under an `+xml` label, such as
-  `image/svg+xml` or `application/xhtml+xml`, whose first byte is not `<` as
-  `application/octet-stream` (`attachment_mime_agrees`), so under those labels the refusal reaches
-  only a body stored another way; it does reach `text/html`, the other HTML types and SVG labels
-  without `+xml`, such as `image/svg`. And an HL7 ED value stores only OBX-5.2, so an HTML
-  document sent as type `TEXT` with subtype `HTML` is stored as `TEXT` and treated as data.
-  Both rest on the inert-type allow-list, like every body the scan does not refuse.
+  refusal from reaching an HTML or SVG body. Detach, the only writer of attachments, stores a body
+  under a `+xml` label, such as `image/svg+xml` or `application/xhtml+xml`, as
+  `application/octet-stream` when its first byte is not `<`, gzip included
+  (`attachment_mime_agrees`). So under those labels the refusal never fires for a stored body; it
+  fires under `text/html`, the other HTML types and SVG labels without `+xml`, such as
+  `image/svg`. And an HL7 ED value stores only OBX-5.2, so an HTML document sent as type `TEXT`
+  with subtype `HTML` is stored as `TEXT` and treated as data. The label is the sender's, so a
+  sender can choose a data label to opt out, and the first writer's label governs every later
+  linkage of the same content-addressed bytes. All of these rest on the inert-type allow-list,
+  like every body the scan does not refuse.
 - *Added 2026-10-16 (BACKLOG #3257):* the download's pre-check, which runs on the event loop, now
   reads the first 64 KiB past leading noise of every plain body that is not markup, a copy of at
   most 64 KiB, scanned only when it holds a `<`. A body whose head holds an `svg` start tag, or

@@ -887,8 +887,8 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The gzip head scan covers :data:`_HEAD_BYTES` from the first byte past leading noise,
-    so leading whitespace does not shorten it: the head pass reads on to exactly a full head past the noise, and never
-    to the bound (BACKLOG #1129). A tag that ends inside that window is refused, and one just past
+    so leading whitespace does not shorten it: the head pass reads on to exactly a full head past
+    the noise, and never to the bound (BACKLOG #1129). A tag that ends inside that window is refused, and one just past
     it is served, which is the recorded trade (BACKLOG #3257). A tag the window's end cuts is judged
     on what the window holds: ``<svg`` is refused as if the tag went on, ``<sv`` is past the head.
     The bounds are shrunk so the bodies stay small; the trade is the same at 64 KiB."""
@@ -972,8 +972,8 @@ def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
 ) -> None:
     """A body that is only noise for the head is read up to the bound. If its first content byte
     lies so near the bound that no full head fits past it, the tag scan cannot see a full head, so
-    a body under an SVG or HTML label is refused rather than cleared (BACKLOG #3257). The control starts its content early
-    enough to leave a full head, and is served."""
+    a body under an SVG or HTML label is refused rather than cleared (BACKLOG #3257). The control
+    starts its content early enough to leave a full head, and is served under the same label."""
     monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     near = _gz(b" " * 4000 + b"%PDF-1.4 " + b"A" * 8192)
