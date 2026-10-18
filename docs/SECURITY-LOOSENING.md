@@ -111,7 +111,7 @@ leaves the engine.
 | | `allow_unencrypted_phi` | `false` |
 | | `allow_unencrypted_phi_under_strict_enforcement` | `false` |
 | In-use data protection | `memory_encryption_operator_declared` | `false` (ADR 0152 — *not* a loosening: it ASSERTS a host property rather than giving one up. Its absence on an exposed PHI instance warns at every start) |
-| | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property that cannot be satisfied on Windows) |
+| | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property most Windows hosts cannot provide: a Windows guest gets it only as an Azure or Azure Local confidential VM ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment))) |
 | Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
@@ -1111,9 +1111,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
 > wording too. A range in the other family gets the range wording.
 >
-> The check parses each entry the way uvicorn does, strictly. An entry with host bits set, such as
-> `10.1.2.3/0`, would become a literal in uvicorn that matches no peer, so the load refuses it
-> ([BACKLOG #2488](BACKLOG.md)).
+> The check reads each entry with the same parser as the load, and skips an entry the load
+> refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
+> `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With
@@ -1898,7 +1899,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **A start under a tool that injects a `sitecustomize` through `PYTHONPATH` does refuse**, unless
   an installed package records that file. Some debuggers and tracing agents work this way.
 - **What the shipped service launches report:** the Windows installer and the container image
-  start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
+  ([not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)) start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
   its virtual environment owned by root, and the engine runs as another user, so it does not
   report `startup_directory_writable`. **On Windows that entry depends on the install.** The
   installer does not change the permissions of the virtual environment, so the reading follows

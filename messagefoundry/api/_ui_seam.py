@@ -470,6 +470,11 @@ from typing import Any
 #: refused at mount rather than meeting a value it has no note for. Re-derived with ``--write``
 #: from 71c27581e7c9f921.
 #:
+#: Vault BACKLOG #3192 merged with main after BACKLOG #2709 landed there (PR 2341, digest
+#: 344979df3bd2c662 on main). Main moved the seam by that merge alone: the route-gate table and
+#: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
+#: merged tree; the digest did not move, so the value below covers every entry above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

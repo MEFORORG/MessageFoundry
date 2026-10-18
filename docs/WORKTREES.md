@@ -1219,7 +1219,8 @@ contract.
 
 **No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
 `Bash` that refuses the bad shape. This repo has guards built that way: at least the three
-handlers on the `^(Bash|PowerShell)$` matcher in `.claude/settings.json`,
+guards the one `^(Bash|PowerShell)$` handler in `.claude/settings.json` runs through
+[`shell-guard-dispatch.ps1`](../scripts/hooks/shell-guard-dispatch.ps1):
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1),
 [`block-unbounded-fs-scan.ps1`](../scripts/hooks/block-unbounded-fs-scan.ps1) and
 [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). The last sat

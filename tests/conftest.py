@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests import _process_guard as process_guard
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._qt_cycles import collect_qobjects_in_cycles
@@ -794,6 +795,19 @@ def _no_allocation_records_in_the_checkout() -> Iterator[None]:
             "A correct write goes under <git-common-dir>/mefor-coord/, which is inside .git.\n"
             "A relative or empty base lands it in the process cwd, where `git add -A` can commit it.\n"
             f"Leaked (now removed):\n  {detail}"
+        )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Runs in the xdist controller and in every worker, so each pytest process's children die with
+    # it on Windows, an os._exit from pytest-timeout included. tests/_process_guard.py says why.
+    if process_guard.install() is None and sys.platform == "win32":
+        config.issue_config_time_warning(
+            pytest.PytestWarning(
+                "the Windows process guard could not set up its job, so a process a test starts "
+                "can outlive this pytest process; the proctree warning in the log says why"
+            ),
+            stacklevel=2,
         )
 
 
