@@ -582,8 +582,8 @@ class ApprovalGate:
         rows to the name captured in the params. Folding a second person into the first one's
         request would let their ask ride on someone else's standing, and point their 202 at a
         request they do not own and could release as its checker. An approver sees both requests,
-        each with its own requester. Two of the three gated operations capture the requester in
-        their params already, so for them the params would differ anyway.
+        each with its own requester. All three gated operations capture the requester in their
+        params (the purge since vault BACKLOG #3217), so the params would differ anyway.
 
         Every approver sees ``params`` in the queue; :class:`~messagefoundry.api.models.PendingApprovalInfo`
         states what they may carry (BACKLOG #2458)."""

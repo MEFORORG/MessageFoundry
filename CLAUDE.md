@@ -330,7 +330,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge outside the two cases in the 2026-10-07 note below (owner ruling 2026-10-07), or without the two safeguards that follow it. Decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge outside the two cases in the 2026-10-07 note below (owner ruling 2026-10-07), or without the three safeguards that follow it. Decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES CODE. OWNER RULING 2026-09-29, IN SESSION.** The
@@ -350,12 +350,23 @@ In both, re-read the head SHA right before arming, and check that the review cov
 is a push after arming that merges with no review. GitHub's docs name at least two events that
 disable auto-merge: a push by an account *"without write permissions"*, and a base-branch switch.
 A write-access push is neither, so auto-merge stays armed. The vault's `main` needs no approval. On
-the engine, arming while required checks are pending sets a deferred request. That request is not
-yet a queue entry, so the same window opens.
+the engine, arming while any required context is pending sets a deferred request. **A required
+context with no check run on the head yet is pending**, even when every run listed so far is
+green. On engine PR 2232 on 2026-10-11 that is what happened twice: the `CI gate` roll-up had not
+started at either attempt. That request is not yet a queue entry, so the same window opens.
 
-1. Arm only once required checks are green. On the engine, `gh pr merge <N> --match-head-commit
-   <sha>` then enqueues directly, with no deferred window. On the vault, add `--auto` and the
-   merge-method flag, because gh refuses a no-queue merge without one when no terminal is attached.
+1. Arm only once every required context in branch protection's live list has a COMPLETED,
+   SUCCESSFUL result on the head you re-read, as a check run or a commit status. Read the list from
+   the API, never from memory or `.github/required-contexts.txt`. On the engine, run `gh pr merge
+   <N> --match-head-commit <sha>`. On the vault, add `--auto` and the merge-method flag, because gh
+   refuses a no-queue merge without one when no terminal is attached. Then read back through
+   GraphQL the PR's `merged`, `mergeQueueEntry` and `autoMergeRequest`, never
+   `PullRequest.mergeQueue`, which names the target queue whether or not the PR is in it. Merged,
+   or on the engine an entry with a null `autoMergeRequest`, is the goal. A non-null
+   `autoMergeRequest`, on either repository, is a deferred request: disarm it, read it back as
+   null, and wait for the missing context, or triage it if it went red. None of the three means
+   nothing is queued: the call was refused or the queue evicted the PR. Read the command's output
+   and the checks again, and re-run only once this step's condition holds.
 2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
    updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
    Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as
@@ -686,7 +697,7 @@ mypy --platform linux --explicit-package-bases tests   # CI runs it on linux. BA
 mypy --platform linux scripts/asvs   # the ASVS verifier and writer, strict. BACKLOG #2276
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
 # open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 

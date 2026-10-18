@@ -40,6 +40,9 @@ operational notes.
 >    [ADR 0088](adr/0088-apiclient-service-cli-extraction.md)) — the operator UI is the browser web
 >    console served at `/ui`, and PySide6 now backs only the standalone test harness, so the host-side
 >    client of §5 is the Qt-free `apiclient` (today the harness), not a desktop console.
+> 4. **v1 scope (2026-10-16).** The image runs Linux, which is
+>    [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
+>    Read the topology guidance here as guidance for that unsupported image.
 
 ---
 

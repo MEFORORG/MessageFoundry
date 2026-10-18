@@ -290,7 +290,7 @@ register_ui_action(
 # `is_unlock_action` fullmatch the RAW value — so a path-only pattern would match nothing and
 # dead-end the flow at /ui with the selection silently gone.
 # KEEP THE OPTIONAL GROUP rather than pinning `\?to=...`: this form also fullmatches the bare route
-# TEMPLATE, which is what keeps the coverage guard in test_webui.py able to see this entry.
+# TEMPLATE, which is what keeps the coverage guard in test_webui_monitoring.py able to see this entry.
 # The re-auth mints the resend grant (vault BACKLOG #2625), which the POST behind the page spends.
 register_ui_action(
     r"^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$",

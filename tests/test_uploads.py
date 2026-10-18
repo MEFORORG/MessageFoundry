@@ -869,15 +869,19 @@ class _RecordingLedger:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
     ) -> bool:
-        if files < 0:
-            self.metas_at_release.append(len(list(self.root.glob("*.meta"))))
         return True
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        self.metas_at_release.append(len(list(self.root.glob("*.meta"))))
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        return None
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         return (1, 0)
@@ -1038,21 +1042,10 @@ async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file
     releasing, finish = asyncio.Event(), asyncio.Event()
 
     class _SlowReleaseLedger(_RecordingLedger):
-        async def reserve_upload_quota(
-            self,
-            uploader_id: str,
-            *,
-            files: int,
-            size_bytes: int,
-            max_files: int = 0,
-            max_total_bytes: int = 0,
-        ) -> bool:
-            if files < 0:
-                releasing.set()
-                await finish.wait()
-            return await super().reserve_upload_quota(
-                uploader_id, files=files, size_bytes=size_bytes
-            )
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            releasing.set()
+            await finish.wait()
+            await super().release_upload_quota(reservation_id)
 
     ledger = _SlowReleaseLedger(root)
     store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
@@ -1097,24 +1090,30 @@ class _GatedLedger:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
     ) -> bool:
-        if files < 0 and self.hold == "release":
-            await self._pause()
         applied = await self.store.reserve_upload_quota(
             uploader_id,
-            files=files,
+            reservation_id,
             size_bytes=size_bytes,
             max_files=max_files,
             max_total_bytes=max_total_bytes,
         )
-        if files > 0 and self.hold == "reserve":
+        if self.hold == "reserve":
             await self._pause()
         return applied
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        if self.hold == "release":
+            await self._pause()
+        await self.store.release_upload_quota(reservation_id)
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        await self.store.touch_upload_quota(reservation_id)
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         return await self.store.upload_quota_in_flight(uploader_id)
@@ -1281,26 +1280,27 @@ async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
 
 
-async def test_a_reserve_that_fails_while_cancelled_is_logged_and_not_blindly_released(
+async def test_a_reserve_that_fails_while_cancelled_is_logged_and_released_by_its_id(
     tmp_path: Path, ledger_db: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A reserve whose outcome is unknown is not paid back: a release here could subtract a
-    sibling shard's live slot and let an upload past the cap. It is logged instead. The ledger
-    keeping ``(1, 2)`` is the control that no release ran."""
+    """A reserve whose outcome is unknown is paid back by its own id (vault BACKLOG #3180). Before
+    the reservation had an identity a release here could subtract a sibling shard's live slot, so
+    the slot was left to leak; now the release deletes this save's row and nothing else. Red
+    before #3180: the ledger kept ``(1, 2)`` in flight."""
 
     class _CommitThenFail(_GatedLedger):
         async def reserve_upload_quota(
             self,
             uploader_id: str,
+            reservation_id: str,
             *,
-            files: int,
             size_bytes: int,
-            max_files: int = 0,
-            max_total_bytes: int = 0,
+            max_files: int,
+            max_total_bytes: int,
         ) -> bool:
             await super().reserve_upload_quota(
                 uploader_id,
-                files=files,
+                reservation_id,
                 size_bytes=size_bytes,
                 max_files=max_files,
                 max_total_bytes=max_total_bytes,
@@ -1324,7 +1324,7 @@ async def test_a_reserve_that_fails_while_cancelled_is_logged_and_not_blindly_re
     assert "reserve for u-op failed while the upload was being cancelled" in caplog.text
     # Logged once, by this module. An asyncio.shield wait also handed it to the loop's handler.
     assert "shielded future" not in caplog.text, caplog.text
-    assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
 
 
 async def test_a_refused_removal_keeps_the_pair_and_logs_the_audit_gap(

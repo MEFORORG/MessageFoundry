@@ -1105,8 +1105,13 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
-    ) -> int: ...
+        audit: OperatorAudit[int],
+    ) -> int:
+        """``audit`` is REQUIRED (vault BACKLOG #3217), so every caller has to say what the purge
+        records, and the row it returns commits in the cancel's own transaction. It is not a
+        guarantee that a row is written: an :data:`OperatorAudit` may return ``None``, which records
+        nothing. The API's purge paths both return a ``connection_purge`` row for every call."""
+        ...
 
     # --- read helpers (API / console) ----------------------------------------
     # Row sequences are returned as Sequence[Row] (covariant) so a backend may return its own row
@@ -1376,15 +1381,20 @@ class QueueStore(StoreLifecycle, Protocol):
         """
         ...
 
+    # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The
+    # row is appended in the mutation's own transaction, and only when the change applied, so a
+    # failed append changes nothing and an unknown or resolved id writes no row.
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         """Acknowledge a live instance (``open``/``acknowledged`` → ``acknowledged``), recording
         ``acked_by``/``acked_at``. Idempotent. Returns ``True`` iff a non-resolved instance with this id
         existed (so the API 404s a resolved/unknown id)."""
         ...
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         """Resolve a live instance (``open``/``acknowledged`` → ``resolved``), recording ``resolved_at``.
         Returns ``True`` iff a non-resolved instance with this id existed."""
         ...
@@ -1397,7 +1407,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Windowed suspend (#143, ADR 0044 amendment): set ``suspended_until`` on a live instance so its
         NOTIFICATIONS are muted until that epoch. **Notification-only** — status/count/visibility are
@@ -1407,7 +1417,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Clear a windowed suspend (#143) so re-alerts resume immediately. Idempotent. Returns the
         updated instance, or ``None`` if unknown / already resolved."""
@@ -1479,57 +1489,71 @@ class QueueStore(StoreLifecycle, Protocol):
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
-        decision: the caller decides after reserving, from :meth:`upload_quota_in_flight` plus a
-        fresh disk scan (BACKLOG #1941).
+        """Atomically reserve ONE in-flight upload slot for ``uploader_id``, named
+        ``reservation_id``; return whether it applied. The cross-process half of the per-uploader
+        upload quota, and not the whole decision: the caller decides after reserving, from
+        :meth:`upload_quota_in_flight` plus a fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
         scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
         hold N independent locks and each can overshoot the budget by one file. Every shard sits on
         the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
-        past one shard), so this row is authoritative for all of them.
+        past one shard), so these rows are authoritative for all of them.
 
         **What is counted here, and what is not.** The files already ON DISK are counted by the
         caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
         closes is only the uploads IN FLIGHT on other shards — reserved but not yet landed, so
         invisible to any scan. The caller passes its remaining HEADROOM (cap minus what its scan
-        observed) as ``max_files`` / ``max_total_bytes``; this method holds only the in-flight sum.
+        observed) as ``max_files`` / ``max_total_bytes``; the store holds only the in-flight rows.
 
-        ``files > 0`` reserves: the post-add in-flight totals must fit inside the headroom or nothing
-        is written and this returns ``False`` (fail-closed — a caller that forgets the headroom
-        arguments gets the 0 defaults and is refused). ``files <= 0`` releases, always applies,
-        clamps at zero, ignores the headroom arguments and returns ``True``.
+        **One row per reservation (vault BACKLOG #3180).** The reserve applies only if the
+        uploader's live reservations plus this one fit inside the headroom; otherwise nothing is
+        written and this returns ``False``. A headroom that cannot fit one slot is refused before
+        the store is touched. The caller mints ``reservation_id``, so it can pay the slot back with
+        :meth:`release_upload_quota` even when it never learned whether the reserve committed.
 
-        ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
-        and its slot would otherwise consume the uploader's budget forever. A row with no activity
-        for longer than ``stale_after`` seconds is reset to zero before the add. Activity is an
-        applied reserve or any release, and both move the row's clock to now, never backwards, so a
-        host whose clock lags cannot age a row a sibling keeps fresh. Which clock "now" is, per
-        backend, is stated in ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256). A release of zero
-        files and zero bytes is therefore a pure touch, which is how a live save keeps its slot
-        past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
-        process holds. When it does reclaim a live one, it can only restore the pre-ledger
+        ``stale_after`` bounds a leak: a process killed between reserve and release never releases.
+        Before the add, every reservation of this uploader whose own clock is older than
+        ``stale_after`` seconds is deleted. Each reservation has its own clock, which only its own
+        reserve and :meth:`touch_upload_quota` move, so a leaked slot is reclaimed once its window
+        passes however active the uploader stays. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256). A live save keeps its slot by
+        touching it (BACKLOG #2648). When the reclaim does take a live slot, it can only restore the pre-ledger
         behaviour (an overshoot bounded by the number of concurrent writers), never something
         worse."""
         ...
 
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """Pay back the reservation ``reservation_id`` by deleting its row (vault BACKLOG #3180).
+
+        Idempotent, and it touches no other reservation, so it is safe after a reserve whose outcome
+        is unknown: a reserve that never committed leaves no row, and this deletes nothing."""
+        ...
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """Move the reservation's clock to now, never backwards, so a slow save keeps its slot past
+        ``stale_after`` (BACKLOG #2648). A no-op once the reservation is released or reclaimed.
+        Never backwards, so a touch after the clock is stepped back cannot make a reservation look
+        older than its last stamp. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256)."""
+        ...
+
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
-        when the uploader has no row. A plain read that writes nothing.
+        when the uploader has no reservation. A plain read that writes nothing.
 
         The caller reserves, THEN reads this, THEN scans the disk (BACKLOG #1941). That order is what
         makes the cross-shard quota hold; ``messagefoundry.uploads.UploadQuotaError`` carries the
-        argument. Read raw on purpose, with no staleness reset: a reset here could only drop
-        reservations, which lets an upload through, never refuses one."""
+        argument. Read raw on purpose, with no staleness filter: dropping a reservation here could
+        only let an upload through, never refuse one."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
@@ -3073,7 +3097,7 @@ class StoreNotFoundError(RuntimeError):
         super().__init__(
             message
             or f"no SQLite store at {path}: refusing to create one "
-            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+            "(check [store].path or --db; `python -P -X disable-remote-debug -m messagefoundry serve` creates the store on its first run)"
         )
 
     @classmethod
@@ -3095,7 +3119,7 @@ class StoreNotFoundError(RuntimeError):
                 "schema_meta table this login can see, and this command does not build one (check "
                 f"[store].database and {where}. Under [store].schema_management = 'external', the "
                 f"default, a DBA builds the store with `{PROVISION_SCHEMA_COMMAND}`; under 'auto', "
-                "`messagefoundry serve` builds it on its first run)"
+                "`python -P -X disable-remote-debug -m messagefoundry serve` builds it on its first run)"
             ),
         )
 
@@ -3563,7 +3587,7 @@ async def provision_store_schema(
     refusing keeps this command from creating a file at a path it was merely pointed at (#1780)."""
     if settings.backend is StoreBackend.SQLITE:
         raise ValueError(
-            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "the sqlite store builds its own schema when `python -P -X disable-remote-debug -m messagefoundry serve` first opens it; "
             f"`{PROVISION_SCHEMA_COMMAND}` applies to the sqlserver and postgres backends only"
         )
     return await _server_store_class(settings.backend).provision_schema(settings, posture=posture)

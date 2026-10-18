@@ -12,6 +12,11 @@ on its own and writes its own outcome row. A DR retry meets the coordinator's lo
 first call's outcome, not a half-applied state. A config reload retry is a second reload: it waits
 on the runner's reload lock and then runs again.
 
+The uploaded-log routes use it too (vault BACKLOG #3178). An upload's ``upload.create`` row is
+written as an outliving operation once the file is stored, and a row that fails removes the file.
+A delete runs its unlink and its ``upload.delete`` row as one. So a deadline no longer leaves a
+stored file with no creation row, or a removed one with no delete row.
+
 It is the same shape as :func:`~messagefoundry.api.approvals._outlive_caller`, which it reuses, rather
 than an exemption from the deadline: an exempt route would hold its worker for as long as it ran,
 which is the thing the deadline exists to stop. The web console's ``/ui`` routes call the same

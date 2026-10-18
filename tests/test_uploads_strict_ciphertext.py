@@ -210,6 +210,9 @@ def test_rotate_key_seals_a_refused_upload_and_it_reads_again(
     assert main(["rotate-key", "--db", str(db)]) == 0
     out = capsys.readouterr().out
     assert "sealed 1 plaintext uploaded file(s)" in out
+    # BACKLOG #3240 counts an upload sealed across two runs in both, so the note must not let an
+    # operator read every extra count as a planted file.
+    assert "counts in both" in out
     assert _PHI_NAME not in out
 
     for suffix in (".meta", ".blob"):
