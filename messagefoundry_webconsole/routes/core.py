@@ -129,14 +129,10 @@ _DIRECTORY_DEMOTED_ERROR = (
 def _directory_refusal_error(elevation: Elevation) -> str | None:
     """The text for ``Elevation.directory_refusal``, or ``None`` when no directory refused.
 
-    Read with ``getattr`` so an engine that predates the field degrades. The console ships as a
-    separately versioned wheel. When the first such field was added the seam digest recorded
-    ``verify_mfa``'s signature but not ``Elevation``'s fields, so an older engine would pass the
-    handshake and then raise ``AttributeError`` here. The digest records those fields since BACKLOG
-    #2015, so such an engine now ships a different seam; the fallback stays as a second guard. The
-    ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
-    """
-    refusal = getattr(elevation, "directory_refusal", None)
+    Read directly: this module imports ``DirectoryRefusal`` from the engine, and the seam digest
+    records ``Elevation``'s fields (BACKLOG #2015), so no engine without the field can pair with
+    this console."""
+    refusal = elevation.directory_refusal
     if refusal is None:
         return None
     if refusal is DirectoryRefusal.DEMOTED:

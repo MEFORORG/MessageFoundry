@@ -221,7 +221,7 @@ async def test_a_lookup_that_raises_refuses_the_renewal_rather_than_failing(
 
     refused = await e.service.verify_mfa(e.token, code)
 
-    assert refused.ok is False and refused.directory_unconfirmed is True
+    assert refused.ok is False and refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     session = await store.get_session(hash_token(e.token))
     assert session is not None and session.revoked_at is None and session.reauth_at is None
     user = await store.get_user(e.user_id)
@@ -275,7 +275,7 @@ async def test_a_row_with_no_directory_id_is_refused_unasked(
 
     refused = await e.service.verify_mfa(e.token, code)
 
-    assert refused.ok is False and refused.directory_unconfirmed is True
+    assert refused.ok is False and refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert refused.session_lost is False
     assert e.directory.probes == []  # never a name-only probe
     assert {
@@ -305,7 +305,7 @@ async def test_a_confirmed_directory_accounts_wrong_code_still_feeds_the_lockout
 
     wrong = await e.service.verify_mfa(e.token, "000000")
 
-    assert wrong.ok is False and wrong.directory_unconfirmed is False
+    assert wrong.ok is False and wrong.directory_refusal is None
     user = await store.get_user(e.user_id)
     assert user is not None and user.second_step_failed_attempts == 1
     assert user.failed_attempts == 0
@@ -333,7 +333,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
-    assert refused.locked is True and refused.directory_unconfirmed is False
+    assert refused.locked is True and refused.directory_refusal is None
     assert e.directory.probes == []
 
 
@@ -401,6 +401,33 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_renewal(
     # The code was never checked: once the directory gives the groups back, the same code verifies.
     e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_OPERATORS, _VIEWERS}))
     assert (await e.service.verify_mfa(e.token, code)).ok is True
+
+
+async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3082: a role map that fails its seal grants nothing, so every stored role would read
+    as lost. That is no demotion: nothing changed in the directory, and a new sign-in takes its
+    roles from the same failing map. So the refusal is UNCONFIRMED, whose text never says to sign
+    out, and the audit row names the map.
+
+    RED when the seal failure is refused as DEMOTED, which tells the operator to sign out."""
+    e = await _mapped_session(store, monkeypatch, _OPERATORS, _VIEWERS)
+    # The map fails its seal check (BACKLOG #2592). This store holds no sealing key, so the check is
+    # failed directly, as tests/test_role_seal.py does.
+    from messagefoundry.auth import service as service_module
+
+    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+    assert await e.service._ad_roles_for_groups([_OPERATORS]) == set(), "control: it fails"
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    assert {
+        "reason": DIRECTORY_UNCONFIRMED,
+        "outcome": "directory_role_map_unsealed",
+    } in await _audited_mfa_failures(store)
 
 
 @pytest.mark.parametrize(
@@ -591,7 +618,7 @@ async def test_a_directory_account_with_no_directory_configured_is_refused(
 
     refused = await unwired.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
-    assert refused.ok is False and refused.directory_unconfirmed is True
+    assert refused.ok is False and refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert {"reason": DIRECTORY_UNCONFIRMED, "outcome": "not_configured"} in (
         await _audited_mfa_failures(store)
     )

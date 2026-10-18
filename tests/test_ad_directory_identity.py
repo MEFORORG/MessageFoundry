@@ -42,7 +42,7 @@ from messagefoundry.auth.ldap import (
     object_guid_filter_value,
 )
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
-from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
+from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService, DirectoryRefusal
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -1590,7 +1590,7 @@ async def test_a_re_bind_on_a_row_with_no_directory_id_is_refused_unasked() -> N
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
         # Carried so a caller says the directory could not confirm the account, not "wrong password".
-        assert elevation.directory_unconfirmed is True
+        assert elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 0, "the password was sent to the directory for an id-less row"
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1613,7 +1613,7 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
-        assert elevation.directory_unconfirmed is True
+        assert elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1633,7 +1633,7 @@ async def test_a_refused_re_bind_keyed_on_the_rows_id_is_counted() -> None:
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not elevation.ok
-        assert elevation.directory_unconfirmed is False  # judged and wrong, so "wrong" is true
+        assert elevation.directory_refusal is None  # judged and wrong, so "wrong" is true
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         assert directory.keys == [GUID_A_TEXT]
@@ -1665,7 +1665,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         directory = _RebindDirectory(own)
         service, identity, token = await _reauth_session(store, directory)
         wrong = await service.reauth(identity, "synthetic-wrong", token=token)
-        assert not wrong.ok and wrong.directory_unconfirmed is False
+        assert not wrong.ok and wrong.directory_refusal is None
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         good = await service.reauth(identity, "synthetic-good", token=token)
@@ -1695,7 +1695,7 @@ async def test_an_unreachable_directory_re_bind_is_unconfirmed_and_uncounted() -
         directory = _UnreachableRebindDirectory(None)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
-        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1762,7 +1762,7 @@ async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
         directory = _RebindDirectory(None, answer)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
-        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
         assert any(f'"reason": "{reason}"' in d for d in await _reauth_rows(store))
@@ -1783,7 +1783,7 @@ async def test_an_empty_re_bind_password_is_refused_unasked_and_uncharged() -> N
         for _ in range(6):
             elevation = await service.reauth(identity, "", token=token)
             assert not elevation.ok and elevation.token is None
-            assert elevation.directory_unconfirmed is False
+            assert elevation.directory_refusal is None
             assert not elevation.session_lost
         assert directory.binds == 0, "an empty password reached the directory"
         row = await store.get_user(identity.user_id)

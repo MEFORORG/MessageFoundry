@@ -343,7 +343,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
     refused = await _finish(p)
 
     assert refused.ok is False
-    assert refused.directory_unconfirmed is False
+    assert refused.directory_refusal is None
     assert p.directory.probes == []
 
 
@@ -381,7 +381,7 @@ async def test_what_lands_during_the_lookup_is_honoured(
 
     refused = await _finish(p)
 
-    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.ok is False and refused.directory_refusal is None
     # A lock leaves the token authenticating; a revocation or a disable does not.
     assert refused.session_lost is (change != "lock")
     session = await store.get_session(hash_token(p.token))

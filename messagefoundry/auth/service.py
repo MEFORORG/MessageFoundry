@@ -736,7 +736,7 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: :meth:`AuthService.finish_webauthn_assertion` (BACKLOG #2239) refuse a directory account with
 #: when the directory does not confirm it is present and enabled. Written into the
 #: ``auth.mfa_failed`` or ``auth.webauthn_failed`` audit row beside the probe's outcome, and carried
-#: on ``Elevation.directory_unconfirmed``. The code or assertion is never checked and nothing is
+#: on ``Elevation.directory_refusal``. The code or assertion is never checked and nothing is
 #: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
@@ -749,6 +749,13 @@ EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a c
 #: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes. The federated
 #: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
+
+#: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
+#: account when the AD group-to-role map fails its seal (BACKLOG #2592), so no role can be judged.
+#: Not :data:`DIRECTORY_ROLES_DEMOTED`: nothing changed in the directory, a new sign-in takes its
+#: roles from the same failing map, and the fix is an administrator re-saving the map (BACKLOG
+#: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
+DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
 
 class DirectoryRefusal(Enum):
@@ -767,7 +774,8 @@ class DirectoryRefusal(Enum):
 
 def _directory_refusal(outcome: str) -> DirectoryRefusal:
     """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role is a demotion, and every
-    other outcome, an outage included, is an account the directory did not confirm."""
+    other outcome, an outage or a role map that failed its seal included, is an account the
+    directory did not confirm."""
     if outcome == DIRECTORY_ROLES_DEMOTED:
         return DirectoryRefusal.DEMOTED
     return DirectoryRefusal.UNCONFIRMED
@@ -981,12 +989,6 @@ class Elevation:
     def ok(self) -> bool:
         """Elevated: a new session token was minted. See the class docstring for the three states."""
         return self.token is not None
-
-    @property
-    def directory_unconfirmed(self) -> bool:
-        """A directory refused the account and the proof was never checked, for either cause.
-        Derived from :attr:`directory_refusal`, so the two cannot disagree."""
-        return self.directory_refusal is not None
 
 
 @dataclass(frozen=True)
@@ -1784,7 +1786,7 @@ class _Reproof:
     #: ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
     #: A directory re-proof the directory could not decide, so no password was judged and nothing
-    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_unconfirmed`` so a caller
+    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_refusal`` so a caller
     #: does not report the password as wrong.
     directory_unconfirmed: bool = False
 
@@ -8650,6 +8652,12 @@ class AuthService:
         is reported: a failing map grants nothing from any of its pairs, because the seal covers
         the set, so a pair added outside the store cannot be told from the rest. The map is read
         in one statement, so an honest write cannot tear the read."""
+        sealed = await self._sealed_ad_map(name)
+        return sealed if sealed is not None else AdMap(name)
+
+    async def _sealed_ad_map(self, name: str) -> AdMap | None:
+        """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
+        that must tell a failing map from an honestly empty one. The failure is still reported."""
         current = await self._store.get_ad_map(name)
         if ad_map_seal_ok(self._store.row_sealer(), current):
             return current
@@ -8658,7 +8666,7 @@ class AuthService:
             f"the {name} failed its integrity check and grants nothing",
             {"kind": ADSET_KIND, "map": name},
         )
-        return AdMap(name)
+        return None
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
@@ -11213,7 +11221,12 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(answer.groups):
+        role_map = await self._sealed_ad_map(AD_ROLE_MAP)
+        if role_map is None:
+            # Every stored role would read as lost, and telling the account to sign in again
+            # would cost it the session for nothing (BACKLOG #3082).
+            return DIRECTORY_ROLE_MAP_UNSEALED
+        if not set(fresh.role_ids) <= role_map.values_for(answer.groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 
