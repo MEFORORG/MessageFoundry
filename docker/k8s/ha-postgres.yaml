@@ -6,6 +6,8 @@
 # Kubernetes. It is a SIBLING of the single-node k8s/statefulset.yaml (which stays the SQLite, replicas:1
 # baseline) — use THIS one only for multi-node HA against a managed/external Postgres. Read
 # docs/CLOUD-DEPLOYMENT.md (the Postgres-led cloud guide) and docs/CLOUD-PHI-HIPAA.md before running it.
+# NOT A SUPPORTED V1 DEPLOYMENT (the image runs Linux). See
+# docs/SYSTEM-REQUIREMENTS.md, "Linux is not a supported v1 deployment target".
 #
 # Why this is a Deployment, not a StatefulSet, and why there is NO PVC here:
 #   The engine's durability lives in the EXTERNAL Postgres store (the staged queue + leader lease are in

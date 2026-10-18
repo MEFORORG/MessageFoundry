@@ -113,6 +113,7 @@ Three ownership tiers — keeping them separate is the whole design:
 
 ## 2. Prerequisites
 
+- A **Windows** engine host. Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 - **Python 3.14+** on each engine host (the engine requires 3.14+).
 - **git**, plus a **private git host** — GitHub (private repo), GitLab, Azure DevOps, Bitbucket, or a
   self-hosted server. Nothing about MessageFoundry requires a public repo; your config repo is yours.
@@ -128,11 +129,16 @@ Three ownership tiers — keeping them separate is the whole design:
 
 ## 3. Step 1 — Install the engine (a pinned, read-only dependency)
 
-On each host, create a virtual environment and install the engine at a **pinned version**:
+On each host, create a virtual environment and install the engine at a **pinned version**. The block
+below is the general shape, in PowerShell. For the Windows service, the supported v1 install, build
+the environment where only administrators can write instead, as
+[SERVICE.md](SERVICE.md#install-the-engine-where-only-administrators-can-write) shows. The service
+installer refuses a venv that anyone but administrators can write, as a `.venv` in your own folder
+usually is.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1                 # Linux/macOS: . .venv/bin/activate
+.\.venv\Scripts\Activate.ps1                 # development only, on Linux/macOS: . .venv/bin/activate
 pip install "messagefoundry==0.5.1"          # pin the exact version (core runtime only)
 ```
 
