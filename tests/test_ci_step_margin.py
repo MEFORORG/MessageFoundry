@@ -16,6 +16,7 @@ from, re-reading was 0-for-7 at catching a wrong number.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 from pathlib import Path
@@ -1178,7 +1179,9 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
     two Windows caps are sized from an anchor in ci.yml's engine note rather than from their rows,
     so they carry the floor only.
 
-    Re-falsified at the 2026-10-13 re-measure, against the 28:07 row: `step_timeout` set to 36
+    Re-falsified at the 2026-10-18 re-measure, against the 33:33 row: `step_timeout` set to 43
+    (43:00 / 33:33 = 1.282x) went RED on the floor, and set to 47 went RED on the rule. Restored
+    both times. At the 2026-10-13 re-measure, against the 28:07 row: `step_timeout` set to 36
     (36:00 / 28:07 = 1.280x) went RED on the floor, and set to 39 went RED on the rule. Restored
     both times. The original record, at the 2026-10-07 row:
     Falsified by setting ubuntu's `step_timeout` to 31 against its 24:36 row (31:00 / 24:36 =
@@ -1210,6 +1213,97 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
                 f"and ceil_minute(1.35x) of that, floored at 5:00, is "
                 f"{sized_cap_minutes(recorded)}m. Move the cap and the row together."
             )
+
+
+_POOL_EVENTS = ("merge_group", "pull_request", "push", "workflow_dispatch")
+
+
+def test_a_row_that_names_a_pool_file_is_that_pool_s_worst_passing_run() -> None:
+    """A row whose `source` names a committed pool file must be derivable from it.
+
+    The 2026-10-18 ubuntu re-measure committed its whole pool, one line per job execution, so its
+    `max_passing` and run count can be re-checked rather than re-read. Unchecked, the file is a
+    second hand-typed copy that can drift from the row.
+
+    The `keep` column is not trusted: each line's label is re-derived from its step conclusion and
+    duration, so a passing execution relabelled out of the pool reds here even when the maximum it
+    hides is not the recorded one. The runs listed, per event, must equal the counts the row
+    states, and the pool must hold merge_group and pull_request runs, because the gate's RE-SIZE
+    line asks for a pool that keeps the runs that did not land. A row binds only the file its
+    source names in the fixed phrase "is a line of <file>", never a file it mentions as a
+    predecessor's pool, and a row that names a pool file without binding one reds rather than
+    skipping.
+
+    Falsified 2026-10-18: the row's `max_passing` set to 33:32 went RED on the maximum, its n set to
+    466 went RED on the count, a 33:33 `row` line relabelled `no-row` went RED on the label, every
+    pull_request line deleted went RED on the per-event count, and the binding phrase reworded went
+    RED on the binding. Restored each time.
+    """
+    checked = 0
+    for row in load_baselines(_BASELINE_FILE):
+        bound = re.findall(r"is a line of (step_margin_pool_[\w.-]+?\.tsv)", row.source)
+        mentioned = re.findall(r"step_margin_pool_[\w.-]+?\.tsv", row.source)
+        assert bound or not mentioned, (
+            f"{row.leg}: its source names {mentioned} but binds none with 'is a line of <file>', "
+            "so the committed pool would go unchecked"
+        )
+        for name in bound:
+            path = _BASELINE_FILE.parent / name
+            lines = path.read_text(encoding="utf-8").splitlines()
+            body = csv.DictReader(
+                (line for line in lines if not line.startswith("#")), delimiter="\t"
+            )
+            worst: dict[str, int] = {}
+            events: dict[str, str] = {}
+            seen: dict[str, set[tuple[str, str]]] = {}
+            for i, line in enumerate(body):
+                events[line["run_id"]] = line["event"]
+                secs = int(line["step_s"]) if line["step_s"] else None
+                stamp = (line["step_conclusion"], line["step_s"])
+                if line["step_conclusion"] == "success" and secs is not None and secs >= 60:
+                    derived = {"row"}
+                elif secs is not None and secs < 60 and line["step_conclusion"] != "skipped":
+                    derived = {"dropped-under-60s"}
+                else:
+                    derived = {"no-row"}
+                if secs is not None and stamp in seen.get(line["run_id"], set()):
+                    derived.add("dropped-rerun-copy")
+                assert line["keep"] in derived, (
+                    f"{name} line {i + 1} (run {line['run_id']}) is labelled {line['keep']!r}, "
+                    f"but its step conclusion and duration give {sorted(derived)}"
+                )
+                if secs is not None:
+                    seen.setdefault(line["run_id"], set()).add(stamp)
+                if line["keep"] == "row" and secs is not None:
+                    worst[line["run_id"]] = max(worst.get(line["run_id"], 0), secs)
+            listed = re.search(
+                r"(\d+) runs \(merge_group (\d+), pull_request (\d+), push (\d+), "
+                r"workflow_dispatch (\d+)\)",
+                row.source,
+            )
+            assert listed, f"{row.leg}: the source states no per-event run count to check {name}"
+            per_event = [sum(1 for e in events.values() if e == ev) for ev in _POOL_EVENTS]
+            assert [int(g) for g in listed.groups()] == [len(events), *per_event], (
+                f"{row.leg}: {name} lists {len(events)} runs, per event {per_event} in the order "
+                f"{_POOL_EVENTS}; the source states {listed.group(0)!r}"
+            )
+            assert per_event[0] and per_event[1], (
+                f"{name} holds no merge_group or no pull_request run, so it drops the runs that "
+                "did not land"
+            )
+            assert worst, f"{name} holds no row, so it cannot be the pool behind {row.leg}"
+            assert max(worst.values()) == row.max_passing_seconds, (
+                f"{row.leg}: {name}'s worst passing row is {format_clock(max(worst.values()))}, "
+                f"but the row records {format_clock(row.max_passing_seconds)}"
+            )
+            stated = re.findall(r"\bn=(\d+) \(merge_group", row.source)
+            assert stated == [str(len(worst))], (
+                f"{row.leg}: {name} has {len(worst)} runs with a row; the row's source states "
+                f"{stated}"
+            )
+            checked += 1
+    if not checked:
+        pytest.skip("no row binds a committed pool file")
 
 
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
