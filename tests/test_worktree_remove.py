@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -571,6 +572,105 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
     allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
     assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
+
+
+# --- BACKLOG #1829: the retired-allocator tombstone ------------------------------------------------
+#
+# Why remove.ps1 skips this one ownerless record is in its Read-RecordFile comment.
+
+_TOMBSTONE_WRITER = SCRIPT.parents[1] / "coord" / "tombstone-retired-backlog-allocator.ps1"
+_ABSENT = object()  # a field the record leaves out entirely
+
+
+def _tombstone_record(**over: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "number": "1000000",
+        "kind": "backlog",
+        "title": "RETIRED ALLOCATOR TOMBSTONE (BACKLOG #1829).",
+        "branch": "",
+        "worktree": "",
+        "claimed": "2026-09-26T07:40:31.8261737-05:00",
+        "tombstone": True,
+    }
+    record.update(over)
+    return {k: v for k, v in record.items() if v is not _ABSENT}
+
+
+def _write_tombstone(fx: Fixture, number: str = "1000000", **over: object) -> Path:
+    f = _alloc_dir(fx) / f"{number}.json"
+    f.write_text(json.dumps(_tombstone_record(number=number, **over)), encoding="utf-8")
+    return f
+
+
+def test_the_tombstone_fixture_is_the_shape_the_writer_writes() -> None:
+    """The tests below are only about the real tombstone if they write the record the writer writes."""
+    src = _TOMBSTONE_WRITER.read_text(encoding="utf-8")
+    for field in (r'branch\s*=\s*""', r'worktree\s*=\s*""', r"tombstone\s*=\s*\$true"):
+        assert re.search(field, src), (
+            f"the tombstone writer no longer sets {field}; re-check remove.ps1"
+        )
+
+
+def test_the_tombstone_alone_does_not_refuse_a_removal(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_tombstone(fx)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(wt)
+
+
+def test_the_tombstone_does_not_hide_a_real_at_risk_allocation(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_tombstone(fx)
+    _write_alloc(fx, "9106", wt)
+
+    proc = run(fx, "-Name", "alpha", "-Force")
+    assert proc.returncode != 0, "the tombstone skip let a real at-risk allocation through"
+    assert "9106" in proc.stderr
+    assert "1000000" not in proc.stderr, "the tombstone was still reported as unreadable"
+    assert fx.is_registered(wt)
+
+
+_NEAR_MISSES: dict[str, dict[str, object]] = {
+    "1000001": {"tombstone": "true"},
+    "1000002": {"tombstone": 1},
+    "1000003": {"tombstone": False},
+    "1000004": {"tombstone": _ABSENT},
+    "1000005": {"worktree": _ABSENT},
+    "1000006": {"worktree": None},
+    "1000007": {"worktree": " "},
+    "1000008": {"branch": "b"},
+    "1000009": {"branch": _ABSENT},
+}
+
+
+def test_an_ownerless_record_that_is_not_exactly_the_tombstone_still_refuses(fx: Fixture) -> None:
+    """FAIL-CLOSED IS KEPT. Only the writer's exact shape is skipped; each near miss stays a
+    cannot-tell, and -Force still does not cover it. The guard lists every unreadable record in one
+    refusal, so one run checks every shape, and the real tombstone beside them is the control."""
+    wt = fx.add("alpha")
+    _write_tombstone(fx)
+    for number, over in _NEAR_MISSES.items():
+        _write_tombstone(fx, number, **over)
+
+    proc = run(fx, "-Name", "alpha", "-Force")
+    assert proc.returncode != 0, "removal proceeded past every near-tombstone"
+    for number, over in _NEAR_MISSES.items():
+        assert f"{number}.json" in proc.stderr, f"near-tombstone {over!r} was skipped"
+    assert "1000000.json" not in proc.stderr, "the real tombstone was reported as unreadable"
+    assert fx.is_registered(wt)
+
+
+def test_a_malformed_record_beside_the_tombstone_still_refuses(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_tombstone(fx)
+    (_alloc_dir(fx) / "9107.json").write_text("{not json", encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha", "-Force")
+    assert proc.returncode != 0, "removal proceeded past a record it could not read"
+    assert "9107" in proc.stderr
+    assert fx.is_registered(wt)
 
 
 @pytest.mark.parametrize("args", [(), ("-Force",)], ids=["bare", "force-only"])

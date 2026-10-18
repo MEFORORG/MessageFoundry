@@ -32,10 +32,12 @@
     clone, which has its own registry and never sees this record.
 
     THE RECORD IS INERT TO EVERY OTHER READER, and that is by its shape. `worktree` and `branch` are
-    empty. Every reader of this registry keys on `worktree` and skips a record whose value is empty or
-    does not match: remove.ps1's orphan guard, seat.ps1's allocation list, precompact-reprime.ps1,
-    alloc.ps1 -List, and ledger_check.py's owns(), which also returns False on an empty branch. So no
-    session is ever told it holds this number, and no removal is refused over it.
+    empty. At least these readers key on `worktree` and skip a record whose value is empty or does not
+    match: seat.ps1's allocation list, precompact-reprime.ps1, alloc.ps1 -List, and ledger_check.py's
+    owns(), which also returns False on an empty branch. remove.ps1's orphan guard refuses over any
+    record naming no worktree, so it matches this one by its `tombstone`, `worktree` and `branch` fields
+    instead; its Read-RecordFile says how, and changing those three fields here makes it refuse again.
+    So no session is ever told it holds this number, and no removal is refused over it.
 
     IT REFUSES A CLONE WHOSE OWN ALLOCATOR IS STILL LIVE. The vault clone's alloc.ps1 still accepts
     `-Kind backlog` and is where backlog numbers are allocated now. A tombstone there would push its
