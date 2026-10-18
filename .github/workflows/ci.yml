@@ -634,10 +634,11 @@ jobs:
       # reading and every execution in it live ONCE, in this leg's row of
       # scripts/ci/step_margin_baseline.toml and the pool file beside it; this note carries the sizing.
       #
-      # THE GATE'S RE-SIZE LINE SAID 41:00. THE POOL SAYS 46:00. That line sized from the one run it
-      # saw: ceil_minute(1.35 x 1813.6s) is 41. The rule sizes from the pool's worst passing row, and
-      # the pool keeps the runs that did not land. Its worst is 33:33, PR 2344's pull-request run
-      # 38992644994 on 2026-10-17, which the gate reddened at 1.133x and nothing re-measured.
+      # THE RE-SIZE LINE ON THE EJECTION SAID 41:00. THE POOL SAYS 46:00. Each RE-SIZE line sizes
+      # from its own run: ceil_minute(1.35 x 1813.6s) is 41. The rule sizes from the pool's worst
+      # passing row, and the pool keeps the runs that did not land. Its worst is 33:33, PR 2344's
+      # pull-request run 38992644994 on 2026-10-17, which the gate reddened at 1.133x. That run's own
+      # RE-SIZE line already gave 46:00, and nothing re-measured the row then.
       # ceil_minute(1.35 x 33:33) = ceil(45.29) = 46:00. At 41:00 that row would still be LOW
       # (1.222x). That run printed `40388 passed` in 2002.95s, fewer tests than the `42050 passed` in
       # 1805.15s of the 30:14 ejection, so it is a slow runner rather than a larger suite. The rule
@@ -649,7 +650,9 @@ jobs:
       # on this leg is 3:13 and its worst pre-pytest setup over every conclusion is 3:03 (both run
       # 39081455225), under the 5:22 setup the 2026-08 rows below use. The overhead rule applied to
       # that 3:13 alone would give 5 and a job cap of 51; whether to shrink the 12 is left open, as it
-      # was on 2026-10-13. On the 5:22 the nesting gap is 58:00 - 5:22 - 46:00 = 6:38.
+      # was on 2026-10-13, and 51 would not hold the 5-minute refused-subjects step after a pytest step
+      # that used its whole cap. On the 5:22 the nesting gap is 58:00 - 5:22 - 46:00 = 6:38; on the
+      # 6:18 setup the 2026-10-13 pool measured, it is 58:00 - 6:18 - 46:00 = 5:42.
       #
       # At 46:00 the gate reds a run over 2123.1s (35:23.1), 5.5 percent over the worst pooled run.
       # By the day a run was created, this leg's median rose from 23:45 on 2026-10-13 to 27:20 on
@@ -657,14 +660,15 @@ jobs:
       #
       # THE TWO WINDOWS ROWS ARE LEFT TO #3515. From the same job reads, their worst passing steps in
       # this window are 37:10 (windows-2022) and 45:30 (windows-2025, push run 39099609761); the
-      # second is over the 55:00 caps' 42:19 red line, so that leg can still red a passing suite.
+      # second is over the 55:00 caps' 42:19 red line, and that run's gate step failed with the suite
+      # passing (job 117593065787), so that leg already reds passing suites.
       #
       # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, TO 38:00 / JOB 50:00 (SUPERSEDED
       # 2026-10-18, ABOVE).
       # Merge-group run 38372578370 (PR 2301) reddened this leg at 26:13 of 34:00 (1.297x) with
       # `37755 passed, 1197 skipped`, and the queue ejected it. The pool, its n and its
-      # uncensored-on-evidence reading live ONCE, in this leg's row of
-      # scripts/ci/step_margin_baseline.toml; this note carries the sizing.
+      # uncensored-on-evidence reading live ONCE, in the 2026-10-13 row that
+      # scripts/ci/step_margin_baseline.toml keeps whole in a comment; this note carries the sizing.
       #
       # THE EJECTION WAS NOT THE WORST RUN IN ITS POOL, SO THE CAP IS 38 AND NOT 36. The gate's
       # RE-SIZE annotation on that run computed 36:00 from its own 26:13. The pool's worst passing
