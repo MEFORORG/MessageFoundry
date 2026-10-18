@@ -45,6 +45,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -234,10 +235,11 @@ async def test_each_refused_request_writes_its_own_warning(
 ) -> None:
     """RED when: a refused request from a new address writes no WARNING of its own, as under the
     per-session throttle vault BACKLOG #3052 item 16 proposed and then declined: a throttle loses
-    records the operator relies on (vault BACKLOG #3773), and log volume is the logging layer's
+    records an operator would rely on (vault BACKLOG #3773), and log volume is the logging layer's
     job. N refused requests on one session write N lines: each repeat from an address already
     reported, and each request past the per-session cap, which carries the address because it
-    writes no audit row. No line adds an audit row or a notice."""
+    writes no audit row. That address is the sender's text on a proxied hop, so a line break in it
+    is escaped. No line adds an audit row or a notice."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
@@ -250,7 +252,8 @@ async def test_each_refused_request_writes_its_own_warning(
         for seen in reported:
             assert await service.flag_new_client_ip(token, seen, path="/users") is True
         repeats = 7
-        past_cap = ["10.5.5.5", "10.5.5.5", "10.6.6.6", "10.5.5.5", "10.7.7.7"]
+        forged = "10.8.8.8\nforged line"
+        past_cap = ["10.5.5.5", "10.5.5.5", "10.6.6.6", "10.5.5.5", "10.7.7.7", forged]
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             for _ in range(repeats):
                 assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
@@ -265,7 +268,10 @@ async def test_each_refused_request_writes_its_own_warning(
         assert len(warnings) == repeats + len(past_cap)
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
-        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == past_cap
+        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
+            scrub_log_argument(seen) for seen in past_cap
+        ]
+        assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
         assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
             reported

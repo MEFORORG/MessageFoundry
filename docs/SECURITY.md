@@ -3088,11 +3088,6 @@ alone:
    first address past that, because the check runs on every sensitive request. So a replayed
    token, retrying from one address or alternating between several, is force-stepped-up each time
    but cannot inflate the audit log / notifications (BACKLOG #2159).
-   Each such refused request writes its own WARNING line, a repeat and a request past
-   the cap alike; the line past the cap carries the address, since no row does. A
-   per-session throttle on those lines was proposed and declined (vault BACKLOG #3052
-   item 16): it would lose records the operator relies on, and log volume is the
-   logging layer's job.
    **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
    ruling 2026-10-16, "Accept, doc only").** The record that enforces it is `_new_ip_seen` on
    `AuthService`. It maps each session's token hash to the addresses already flagged, and it lives
@@ -3111,6 +3106,12 @@ alone:
    `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
    in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
    `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
+   **Every refused request writes its own WARNING line**, a repeat from a reported address and a
+   request past the cap alike; the line past the cap carries the address, since no row does. A
+   per-session throttle on those lines was proposed and declined (vault BACKLOG #3052 item 16):
+   it would lose records an operator would rely on, and log volume is the logging layer's job.
+   That layer bounds volume by rotation and by its forwarding queue, so a sustained replay loop
+   can still push older lines out of the log; the audit rows above are the durable record.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have

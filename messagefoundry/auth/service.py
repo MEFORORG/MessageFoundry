@@ -10281,7 +10281,7 @@ class AuthService:
         log — so a token replayed in a tight loop, from one address or alternating between several,
         cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
         precedent). Each such request writes its own WARNING line: a per-session throttle on it
-        would lose records the operator relies on, and log volume is the logging layer's job
+        would lose records an operator would rely on, and log volume is the logging layer's job
         (vault BACKLOG #3052 item 16, declined). One epoch audits at most
         ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
         carrying ``cap_reached`` for the first address past that, because this runs on every
