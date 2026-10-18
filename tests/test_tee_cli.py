@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -508,6 +509,50 @@ def _harden(path: Path, grant: str) -> None:
     )
 
 
+def _opens_for_writing(path: Path) -> bool:
+    """Whether this process can open ``path`` for writing. ``r+b`` neither creates nor truncates."""
+    try:
+        with path.open("r+b"):
+            return True
+    except PermissionError:
+        return False
+
+
+def _token_report() -> str:
+    """This process's groups and privileges, for a message saying why a hardening did not hold."""
+    return _win_run("whoami.exe", "/groups", "/priv", "/fo", "list")
+
+
+class AllowOnlyListDidNotDeny(UserWarning):
+    """A list granting this account only read still let this process open the file for writing."""
+
+
+def _deny_writing(path: Path, scratch: Path) -> None:
+    """Make ``path`` a file this process cannot write, and prove it before the test relies on it.
+
+    An R-only grant was not enough on the hosted Windows runners (run 39066524803, both legs): the
+    process there is an elevated administrator, and a list granting the account read only still
+    let the write through. An explicit deny entry for this account's SID is checked against the
+    whole token, elevated or not, before any allow entry. The rights it denies leave READ_CONTROL
+    and SYNCHRONIZE alone, so the file can still be read and its list saved.
+    """
+    _harden(path, "R")
+    if _opens_for_writing(path):
+        warnings.warn(
+            f"{path.name}: an R-only list let this process open it for writing; the deny entry "
+            f"is what makes it unwritable here. DACL {_sddl_of(path, scratch)}",
+            AllowOnlyListDidNotDeny,
+            stacklevel=2,
+        )
+    _win_run("icacls.exe", str(path), "/deny", f"*{_own_sid()}:(WD,AD,WEA,WA)")
+    # Precondition: a host where even this does not deny the token fails here, naming why, and
+    # not in the product assert that follows.
+    assert not _opens_for_writing(path), (
+        f"{path.name} is still writable by this process after the deny entry. "
+        f"DACL {_sddl_of(path, scratch)}\n{_token_report()}"
+    )
+
+
 @_WINDOWS_ACLS
 @pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 @pytest.mark.parametrize("trailing_separator", [False, True], ids=["plain", "trailing-separator"])
@@ -625,7 +670,7 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
         os.link(other, out)
     else:
         out.write_text("untouched\n", encoding="utf-8")
-    _harden(out, "R")
+    _deny_writing(out, scratch)
     hardened = _sddl_of(out, scratch)
     # A str, since Path itself would drop the separator before the CLI saw it.
     named = str(out) + os.sep if name == "trailing-separator" else str(out)
