@@ -196,8 +196,9 @@ the route takes a body.
   case can also write an `auth.temp_password_expired` audit row. `AuthService.identity_for_token`
   is the full list. A caller this lookup refuses gets 401 before the body is read.
 - A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
-  body from a caller with no session. A route with no gate and no declaration is refused before
-  its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
+  body from a caller with no session. A route with no gate and no declaration, built by the
+  app's route class and registered on the app, is refused before its body is read, as described
+  below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
@@ -222,12 +223,20 @@ body, the early sign-in check above still answers before it. A route passes in o
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
 every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
-names the route's path template, never the request, and says how many refusals came since the
-previous line. Refusals after a burst's last line stay in that count. They reach the log only with
-a later refusal of the same route, a minute or more after the last line. No API reads the count,
-and a restart loses it. On a body-taking route built by the app's route class, the
-refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
-the gate is correct.
+names the route by its path template, never the request, and says how many refusals came since the
+previous line. The name is meant to be the key `GET /security/posture` reports the route under,
+include prefix included (vault BACKLOG #2956); `_logged_key` in `messagefoundry/api/security.py`
+says where the two can still differ. Refusals after a burst's last line stay in that count. They reach the log only with
+a later refusal of the same route, a minute or more after the last line. `GET /security/posture`
+reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed by path template
+(vault BACKLOG #2954). It is the count of the process that answered; under engine shards each
+process has its own. `undeclared_route_refusal_counts` in `messagefoundry/api/security.py` says
+what each key means, including `<unknown>`, and what the walk misses. The count is not persisted,
+and a restart loses it. On a body-taking route built by the app's route class and registered on
+the app, the refusal comes before the body is read. An undeclared route on an included router,
+even one built with that class, can answer first with the body parser's **422** or **400**: the
+class docstring says when. The check asks only that a route declared a gate. It does not check
+that the gate is correct.
 
 - A route whose gate is nested inside another dependency, or added only by `include_router`, is
   refused. That is the safe side.
