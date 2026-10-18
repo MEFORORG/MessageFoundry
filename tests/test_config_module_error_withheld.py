@@ -371,3 +371,19 @@ def test_a_symlinked_helper_keeps_its_line_and_name(tmp_path: Path) -> None:
         pytest.skip("this account cannot create symlinks")
     msgs = _messages(cfg)
     assert any(f"at line 1 naming {IDENT!r}" in m and "_opt.py" in m for m in msgs), msgs
+
+
+def test_a_helper_symlinked_from_another_folder_is_named(tmp_path: Path) -> None:
+    # A real config module beside one shared helper linked in from elsewhere.
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write(shared, "_common.py", "x = 1\nraise RuntimeError(1)\n")
+    _write(cfg, "feed.py", "import _common\n")
+    try:
+        (cfg / "_common.py").symlink_to(shared / "_common.py")
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+    (msg,) = _messages(cfg)
+    assert "RuntimeError in _common.py at line 2" in msg

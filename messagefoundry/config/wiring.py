@@ -7958,7 +7958,7 @@ class _HelperImporter:
                 # load. Names only, never the exception text (CLAUDE.md section 9).
                 self._failed[name] = (
                     _textless_import_error(exc),
-                    _failure_detail((self._dir / f"{name}.py").resolve().parent, f"{name}.py", exc),
+                    _failure_detail(self._dir.resolve(), f"{name}.py", exc),
                 )
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
@@ -9006,7 +9006,7 @@ def _module_failure(path: Path, exc: BaseException) -> str:
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary."""
     return (
         f"error loading config module {path.name}: "
-        f"{_failure_detail(path.resolve().parent, path.name, exc)} ({_WITHHELD})"
+        f"{_failure_detail(path.parent.resolve(), path.name, exc)} ({_WITHHELD})"
     )
 
 
@@ -9031,7 +9031,8 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
             if seen[name]:
                 located = (name, frame_line)
     detail = type(exc).__name__
-    if located is None:
+    # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
+    if located is None or not isinstance(located[1], int):
         return detail
     source_file, line = located
     if Path(source_file).name != own_file:
@@ -9108,7 +9109,9 @@ def _in_dir(filename: str, directory: Path) -> bool:
     if not candidate.is_absolute():
         return False
     try:
-        return candidate.resolve().parent == directory
+        # The folder, not the file, is resolved: a config file may be a symlink into another folder
+        # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
+        return candidate.parent.resolve() == directory
     except (OSError, ValueError):
         return False
 
@@ -9148,7 +9151,13 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
             if isinstance(exc, WiringError):
                 raise
             raise WiringError(f"error loading config module {path.name}: {exc}") from exc
-        withheld = WiringError(_module_failure(path, exc))
+        try:
+            withheld = WiringError(_module_failure(path, exc))
+        except Exception:  # noqa: BLE001 - a fault building the detail must not escape with `exc`
+            # chained as its context; the type alone is still a withheld diagnostic.
+            withheld = WiringError(
+                f"error loading config module {path.name}: {type(exc).__name__} ({_WITHHELD})"
+            )
         # An import failure keeps a textless stand-in of its type as the cause, because the
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
