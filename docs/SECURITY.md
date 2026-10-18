@@ -2998,13 +2998,9 @@ at once, before the session, the account, the lock and the passkey set are read 
 passkey whose set fails its seal writes it after that one set read and still before the rest. So
 at least these cannot suppress it: a holder ending their own session, a disable, a lock, a passkey
 delete, or a store error landing after the write. The refusal then also carries that change's own
-reason. One path is narrower: when the account, loaded afresh for that set read, does not load
-although its row still exists (for example its seal check losing a race to a rename or a rebind),
-the set is read only after the session, the account and the lock. A set failing its seal there, or
-a store error in that read, still writes the one clone row. At least these leave none on that path:
-a revocation, a disable or a lock found first, an account that again fails to load
-(`reason=session_lost`), a store error in that re-read, and a passkey delete through the sealed
-path that lands before the late set read.
+reason. When the account, loaded afresh for that set read, does not load, the clone row is
+written there, once and before any other read, because the engine cannot then tell a deleted passkey
+from a tampered or racing account and engine main alerts on every miss, so an occasional false clone alert is preferred to a silent miss.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,

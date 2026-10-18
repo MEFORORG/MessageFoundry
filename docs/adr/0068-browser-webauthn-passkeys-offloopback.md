@@ -655,7 +655,8 @@ tree records the approval itself, so nothing here quotes the owner.
 exception now holds: a miss on a passkey that no longer exists. A self-service passkey delete takes
 no account queue, and an MFA reset deletes every passkey before it revokes the sessions, so either
 can land during an assertion and fail its compare-and-set. That miss is no evidence of a cloned
-authenticator, so it writes no `auth.webauthn_clone_suspected` row. The assertion is still
+authenticator, so it writes no `auth.webauthn_clone_suspected` row while the account still loads
+(the path below where it does not is the exception). The assertion is still
 refused, audited `auth.webauthn_failed` with reason `factor_removed`, or `session_lost` when the
 session or the account went with it.
 
@@ -669,13 +670,10 @@ path, which proves no holder's delete, so the clone row is written and the refus
 `factor_unverified`, or the reason the holder re-read gives when it refuses first. That set is read
 before the holder re-read, from the account loaded afresh, and the row is written before a store
 error in it is raised, so a revocation, a disable, a lock or that error cannot remove this signal
-either. One path is narrower: when that fresh load returns nothing although the account row still
-exists (for example its seal check losing a race to a rename or a rebind), the set is read only
-after the holder re-read. A set failing its seal there, or a store error in that read, still writes
-the one clone row. At least these leave none on that path: a revocation, a disable or a lock the
-holder re-read finds first, an account that again fails to load there (refused `session_lost`), a
-store error in that re-read, and a passkey delete through the sealed path that lands before the late
-set read. A cancel inside either set read writes none. `mismatch` means the
+either. When that fresh load returns nothing, the clone row is written there, once and before
+any other read, because the engine cannot then tell a deleted passkey from a tampered or racing
+account and engine main alerts on every miss, so an occasional false clone alert is preferred to a silent miss. A cancel before the row is
+written writes none. `mismatch` means the
 passkey still
 existed and held another count, so it writes the clone row at once, before any other read. A
 delete, a session revocation, a disable or a lock that lands after that write cannot remove the
