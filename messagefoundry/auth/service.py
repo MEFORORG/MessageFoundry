@@ -7672,7 +7672,8 @@ class AuthService:
 
         ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its audit writes go
         through :meth:`_audit_reconciler_row`. The login path leaves it off, so there a refused
-        write still fails the sign-in, as it always has.
+        write still fails the sign-in, as it always has. It also lets a store fault on the ``held``
+        re-read skip the rename rather than raise (BACKLOG #3070; the reason is at that read).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -7914,10 +7915,11 @@ class AuthService:
                 if not audit_soft:
                     raise
                 _log.warning(
-                    "AD account %s: reading the holder of its new directory name raised %s, so its "
-                    "rename was not applied on this pass; a later pass that probes it retries it "
-                    "(BACKLOG #3070)",
+                    "AD account %s: re-reading the holder of its new directory name (account %s "
+                    "held it at the first read) raised %s, so its rename was not applied on this "
+                    "pass; a later pass that probes it retries it (BACKLOG #3070)",
                     user_id,
+                    held.id,
                     type(exc).__name__,
                 )
                 return

@@ -3557,6 +3557,7 @@ async def test_a_store_fault_on_the_holder_re_read_skips_only_that_rename(
         assert json.loads(refreshed["detail"])["user_id"] == ids[applied]
         [logged] = [r.getMessage() for r in caplog.records if "BACKLOG #3070" in r.getMessage()]
         assert ids[skipped] in logged and "OperationalError" in logged
+        assert "other-holder" in logged, "the skip line dropped the holder the first read saw"
         assert [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED] == [applied]
     finally:
         await store.close()
