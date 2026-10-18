@@ -2690,13 +2690,13 @@ once the code has been checked, which is also logged, and a passkey set that fai
 TOTP secret that does not open for the check itself is refused the same way, before any code is
 read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
 turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
-change clears what the check spends, so the code fails its spend; before the wrong-code branch
-charges the second-step counter, the account is read again, and a factor turned off or replaced
-since the check began is refused with `reason=factor_removed` or `reason=factor_replaced` and
-charged nothing. A wrong code that meets the same change is refused the same way, uncharged; the
-change is the holder's own self-service disable or re-enrolment, behind the step-up, or an
-administrator's. A row that cannot be read, or a secret that does not open, proves no change and
-is charged as a wrong code. The passkey leg re-reads whether or not its
+change can leave the check nothing to spend, so the code fails its spend. Only a code that
+MATCHED the factor is asked further: the account is read again, and a factor turned off or
+replaced since the check began is refused with `reason=factor_removed` or
+`reason=factor_replaced` and charged nothing. A code that matched nothing is a wrong code and is
+charged unread, whatever lands meanwhile. A matched code is still charged when the row cannot be
+read, the secret does not open, or the re-read raises: none of those proves a change. The
+passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers
@@ -2984,7 +2984,10 @@ cannot turn a miss on a passkey that still existed into a confirmed-gone one. A 
 refused as `auth.webauthn_failed` with `reason=factor_removed`, or `reason=session_lost` when the
 session or the account went with it. An MFA reset gives `reason=session_lost` once its revocation
 has landed, and `reason=factor_removed` before. So a genuine counter race followed by a delete
-that lands BEFORE the write leaves no clone row; that is accepted. A mismatch writes the clone row
+that lands BEFORE the write leaves no clone row; that is accepted. One case keeps the signal on a
+gone passkey: when the passkey set read after the write fails its seal, the row may have gone
+outside the store's sealed write path, so the clone row is written and the refusal is
+`reason=factor_unverified`. A mismatch writes the clone row
 at once, before the session, the account, the lock and the passkey set are read again. So a
 holder ending their own session cannot suppress it, and nor can a disable, a lock, a passkey
 delete or a store error landing after the write. The refusal then also carries that change's own

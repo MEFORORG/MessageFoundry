@@ -663,7 +663,10 @@ session or the account went with it.
 answers `moved`, `mismatch` or `gone` under one locked write on every backend: on SQLite the
 existence read runs in the guarded UPDATE's own write transaction, before its commit; on PostgreSQL
 and SQL Server the answer is the row-locking `SELECT ... FOR UPDATE` / `UPDLOCK` read that the
-UPDATE follows in one transaction. Only `gone` is exempt. `mismatch` means the passkey still
+UPDATE follows in one transaction. Only `gone` is exempt, and not when the account's passkey set,
+read after the write, fails its seal: the row may then have gone outside the store's sealed write
+path, which proves no holder's delete, so the clone row is written and the refusal is
+`factor_unverified`. `mismatch` means the passkey still
 existed and held another count, so it writes the clone row at once, before any other read. A
 delete, a session revocation, a disable or a lock that lands after that write cannot remove the
 signal, and nor can a store error in the reads that follow it.
@@ -673,8 +676,8 @@ still held in a separate read after the miss, so a delete landing between the tw
 a passkey that had existed into a confirmed-gone one and dropped the clone row.
 
 A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
-whether or not the passkey is later deleted. AC-4 is unchanged. Section 4 is left as written and
-dated by this amendment.
+whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as
+written; the only edit there is a dated pointer to this amendment.
 
 **Who decided.** The exception was built under BACKLOG #3068 (engine PR 2392). The ledger rows
 #3774 and #3777, filed at the Lander's request on 2026-10-17, ask that it be decided atomically and

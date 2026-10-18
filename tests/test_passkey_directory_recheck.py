@@ -791,6 +791,38 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
         await store.close()
 
 
+async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -> None:
+    """BACKLOG #3774, ADR 0068 amendment of 2026-10-17. The write answers ``gone``, but the row
+    left outside the store's sealed write path, so the account's set fails its seal: that proves no
+    holder's delete. RED when: no ``auth.webauthn_clone_suspected`` row is written, or the refusal
+    reads ``factor_removed`` rather than ``factor_unverified``. Keyed, so the seal can fail."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _the_row_goes_unsealed(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            await store._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+            await store._db.commit()
+            answer = await real_update(*args, **kwargs)
+            assert answer == "gone"
+            return answer
+
+        store.update_webauthn_sign_count = _the_row_goes_unsealed  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        failures = await _audited_assertion_failures(store)
+        assert {"reason": "factor_unverified"} in failures
+        assert {"reason": "factor_removed"} not in failures
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() -> None:
     """BACKLOG #3068, the ``factor_unverified`` branch on its own. A set that fails its seal once the
     sign count has moved says nothing about the passkey, so the factor write is refused as
