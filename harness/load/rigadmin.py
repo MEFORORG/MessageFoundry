@@ -265,8 +265,9 @@ def provision(
 
     ``env`` and ``cwd`` are the ones the rig's ``serve`` runs under, so the child loads the same
     settings and opens the same store. Returns ``True`` when it created the account and ``False``
-    when the store already had an enabled Administrator. Raises :class:`RigAdminError` on any other
-    refusal, carrying the command's own words.
+    when the store already had an enabled local Administrator with a usable password. Raises
+    :class:`RigAdminError` on any other refusal, carrying the command's own words, including the
+    rig's own refusal of a store whose enabled Administrators all need an outside service.
 
     The child is this file, run with ``-P`` so its directory is not put on ``sys.path``:
     ``harness/load`` holds modules named like standard-library ones.
@@ -379,8 +380,9 @@ def _keep_the_narrow_rule(cli: Any) -> None:
     store has no enabled Administrator of any kind. The engine adds no flag for this.
 
     It wraps the command's one :class:`~messagefoundry.auth.service.AuthService`, built by
-    ``_build_provision_auth_service``, so both the pre-prompt refusal and the write ask the wider
-    question first, against the store the command has open at that moment.
+    ``_build_provision_auth_service``, against the store the command has open at that moment. The
+    pre-prompt refusal asks the shipped check and then the wider one. The write asks the wider one
+    before the shipped write runs, so a refused store is never written.
     """
     build = cli._build_provision_auth_service
 

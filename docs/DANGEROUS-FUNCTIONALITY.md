@@ -1004,8 +1004,9 @@ password from a terminal and takes it no other way. A test rig has no terminal. 
 function with one that returns a password the rig holds. It also wraps the command's
 `_build_provision_auth_service`, so the service it builds refuses any store that holds an enabled
 Administrator (vault BACKLOG #2711). On that service it replaces `provision_refusal` and
-`provision_first_administrator` with wrappers that ask the shipped check first. That only narrows
-the command. It then calls the shipped
+`provision_first_administrator` with wrappers. The pre-prompt refusal asks the shipped check and
+then the rig's. The write asks the rig's check before the shipped write runs, so a refused store is
+never written. That only narrows the command. It then calls the shipped
 command's `main`. The rest of `provision-admin` runs as shipped.
 
 What holds it:

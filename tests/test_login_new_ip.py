@@ -1191,6 +1191,31 @@ async def test_an_admin_reset_clears_the_known_address_record(reset: str, client
         await store.close()
 
 
+async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -> None:
+    """vault BACKLOG #2946 on the directory branch of ``admin_reset_mfa``, which issues no
+    credential: the record is still emptied down to the reset's marker row.
+
+    RED when: the clear runs only on the local branch, where a credential is issued."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        await store.create_user(
+            user_id="id-dir",
+            username="dir-user",
+            auth_provider="ad",
+            password_hash=None,
+            password_generated=False,
+        )
+        await store.remember_login_address("id-dir", "10.1.1.1", now=time.time())
+        assert await store.list_known_login_addresses("id-dir", since=0.0) == ["10.1.1.1"]
+        assert await service.admin_reset_mfa("id-dir", actor="boss") is None
+        assert await store.list_known_login_addresses("id-dir", since=0.0) == [
+            service_module._LOGIN_ADDRESS_RESET_MARKER
+        ]
+    finally:
+        await store.close()
+
+
 async def test_revoke_all_keeps_the_known_address_record() -> None:
     """Revoking every session is routine, so it clears nothing (owner ruling 2026-10-16)."""
     store = await MessageStore.open(":memory:")
