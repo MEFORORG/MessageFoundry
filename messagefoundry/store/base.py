@@ -68,6 +68,7 @@ from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -2567,6 +2568,7 @@ class AuthStore(Protocol):
         admin_role_id: str,
         expected_password_hash: str,
         expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
@@ -2575,7 +2577,10 @@ class AuthStore(Protocol):
 
         One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
         than ``user_id`` only when its record passes its integrity seal, as
-        :meth:`remove_unless_last_admin` counts them. When any is counted it writes nothing and
+        :meth:`remove_unless_last_admin` counts them, and ``counts_as_admin`` passes its ``users``
+        row. The auth service passes the predicate its ``provision-admin`` refusal reads, so only
+        an administrator that signs in with a local password counts (vault BACKLOG #2711 step 1,
+        owner ruling B258-R4); a directory one does not. When any is counted it writes nothing and
         returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
         account is enabled, holds no role, and still holds the credentials the caller wrote:
         ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is

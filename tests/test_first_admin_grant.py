@@ -39,6 +39,7 @@ from tests._admin_account import provision_totp
 from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
     assert_first_admin_grant_contract,
+    assert_grant_counts_only_a_local_administrator_that_signs_in,
     enabled_admins,
     grant,
     provisioned_row,
@@ -63,6 +64,12 @@ async def store() -> AsyncIterator[MessageStore]:
 
 async def test_the_grant_contract_holds_on_sqlite(store: MessageStore) -> None:
     await assert_first_admin_grant_contract(store)
+
+
+async def test_the_grant_counts_only_a_local_administrator_that_signs_in_on_sqlite(
+    store: MessageStore,
+) -> None:
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
 
 
 async def test_two_concurrent_grants_leave_one_administrator(store: MessageStore) -> None:

@@ -191,6 +191,7 @@ from messagefoundry.store.store import (
     AdMapChange,
     AdMapSql,
     AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -13625,6 +13626,7 @@ class SqlServerStore:
         admin_role_id: str,
         expected_password_hash: str,
         expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
@@ -13652,6 +13654,7 @@ class SqlServerStore:
                         holders,
                         self._row_sealer,
                         lambda holder: self._read_user_record(cur, holder, lock=False),
+                        counts_as_admin,
                     )
                     if others:
                         await conn.rollback()  # nothing written; releases the applock

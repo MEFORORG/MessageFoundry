@@ -164,6 +164,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     UserAuthzRecord,
     UserRecord,
+    UserRow,
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
@@ -3191,12 +3192,13 @@ class AuthService:
         """
         return await self._other_enabled_admin_exists()
 
-    def _signs_in_without_an_outside_service(self, user: VerifiedUser, now: float) -> bool:
+    def _signs_in_without_an_outside_service(self, user: UserRecord | UserRow, now: float) -> bool:
         """True iff ``user`` is a local account holding a password the login gate would still
         accept: not a must-change credential past its deadline (:meth:`_credential_lapsed`). A
         directory account needs the directory (a federated binding is only ever on one), and a
         local row with no hash, or an expired temporary one, cannot sign in at all. Enabled and the
-        role are the caller's to check."""
+        role are the caller's to check. It takes a raw ``UserRow`` too, for the first-administrator
+        grant's in-transaction guard (``counts_as_admin``), which checks the seal itself."""
         if user.auth_provider != AuthProvider.LOCAL.value or user.password_hash is None:
             return False
         return not self._credential_lapsed(user, now)
@@ -3553,6 +3555,9 @@ class AuthService:
             admin_role_id=Role.ADMINISTRATOR.value,
             expected_password_hash=password_hash,
             expected_totp_secret_cell=staged_cell,
+            # vault BACKLOG #2711 step 1: the guard counts what the refusal above counts, so a
+            # directory Administrator does not refuse the grant any more than it refused the run.
+            counts_as_admin=partial(self._signs_in_without_an_outside_service, now=time.time()),
             assigned_by=actor,
         )
         if grant is AdminGrant.ADMIN_EXISTS:
@@ -3765,7 +3770,7 @@ class AuthService:
             return None
         return password_changed_at + hours * 3600.0
 
-    def _credential_lapsed(self, user: UserRecord, now: float) -> bool:
+    def _credential_lapsed(self, user: UserRecord | UserRow, now: float) -> bool:
         """Whether ``user`` holds an admin-issued must-change credential past its deadline at ``now``.
 
         The sign-in gate's own test, over :meth:`initial_credential_deadline`, for a session opened

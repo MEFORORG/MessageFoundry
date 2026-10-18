@@ -805,13 +805,15 @@ this notice stays silent, as before.
 - The IDE's Start probe now reads a directory-only store as "needs an Administrator". Its modal
   still words that as "no enabled administrator".
 
-**The race of vault BACKLOG #3078 is not fixed here, and not lengthened.** The check is still a
-separate read before the writes, so two runs with different usernames can both pass it. The
-widening adds no step between the check and the role write. It does let the check pass on more
-stores: those whose Administrators all need an outside service. On such a store, a directory
-Administrator who is signed in could create a local one from the web console during the run. The
-store would then hold two. Each was made by someone with authority to make one. #3078's fix is
-where the check and the write become one step.
+**The race of vault BACKLOG #3078 is closed by the guarded grant, which counts what this
+amendment counts.** The store's `grant_first_admin_unless_admin_exists` repeats the check in the
+role write's own transaction, under the last-administrator guard's lock, so of two runs with
+different usernames the one whose grant commits second is refused. The service hands that guard
+the same predicate the refusal reads (`_signs_in_without_an_outside_service`), so it counts only
+an enabled local Administrator with a usable password, and a directory or federated one refuses
+the grant no more than it refused the run. A directory Administrator who is signed in could still
+create a local one from the web console during the run, by a role write that takes no lock. The
+store would then hold two. Each was made by someone with authority to make one.
 
 **New acceptance criterion.**
 

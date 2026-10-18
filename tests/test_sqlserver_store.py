@@ -830,6 +830,16 @@ async def test_first_admin_grant_contract(store) -> None:
     await assert_first_admin_grant_contract(store)
 
 
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on SQL Server: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
     """BACKLOG #3078 on SQL Server: two grants to two accounts on two pooled connections, at once.
     The last-administrator guard's applock serializes them; one is refused."""
