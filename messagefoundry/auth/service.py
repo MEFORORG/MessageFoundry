@@ -852,7 +852,8 @@ EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a c
 #: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
 #: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
 #: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes. The federated
-#: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154).
+#: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154), and so does the
+#: password re-bind, as the ``auth.reauth`` row's ``reason`` (BACKLOG #3081).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
@@ -1055,9 +1056,12 @@ class Elevation:
     #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
     #: row's own (BACKLOG #2027). Set by :meth:`AuthService.finish_webauthn_assertion` on the same
     #: answers as ``verify_mfa`` (BACKLOG #2239), and by :meth:`AuthService.confirm_mfa_enrollment`
-    #: and :meth:`AuthService.finish_webauthn_registration` on them too (BACKLOG #3061). In every
-    #: case the proof was never checked and
-    #: nothing was charged. It qualifies the wrong-proof state: the token still authenticates, and
+    #: and :meth:`AuthService.finish_webauthn_registration` on them too (BACKLOG #3061). Each of
+    #: those also sets it on an account that lost a role in the directory since sign-in
+    #: (``directory_roles_demoted``). In every case nothing was charged, and the proof was never
+    #: checked, except on a demoted account's re-bind (BACKLOG #3081): the bind proved the password
+    #: right, and the account was refused for its roles, so a retry is refused again until a new
+    #: sign-in re-syncs them. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must say the directory could not confirm the account rather than call the code,
     #: the password or the passkey wrong. The cause goes to the audit row (``reason`` on
     #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``) and never
@@ -1860,13 +1864,15 @@ class _Reproof:
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
     cleared: bool = False
-    #: A closed-set slug for an uncounted directory refusal that judged no password (BACKLOG #2027):
-    #: at least a row with no id, or any :class:`_DirectoryRebind` reason. Written onto the
+    #: A closed-set slug for an uncounted directory refusal: at least one that judged no password
+    #: (BACKLOG #2027), a row with no id or any :class:`_DirectoryRebind` reason, and one that judged
+    #: it right on an account the directory has demoted (``directory_roles_demoted``, #3081), or
+    #: whose row moved to another directory object during the bind. Written onto the
     #: ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
-    #: A directory re-proof the directory could not decide, so no password was judged and nothing
-    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_unconfirmed`` so a caller
-    #: does not report the password as wrong.
+    #: A directory re-proof the directory could not vouch for, so nothing was charged: it could not
+    #: judge the password, or the account lost a role there (#3081); ``reason`` says why. Carried
+    #: to ``Elevation.directory_unconfirmed`` so a caller does not report the password as wrong.
     directory_unconfirmed: bool = False
 
 
@@ -1882,10 +1888,15 @@ class _DirectoryRebind:
     ``directory_identity_conflict`` (``None`` whether or not the bind succeeded).
     ``not_in_directory`` means no entry for the row's id, an entry that does not read the id
     back, or more than one entry for it (vault BACKLOG #2778). Since BACKLOG #2434 a disabled entry
-    and an unreadable account state have their own slugs, read from the bind's own lookup."""
+    and an unreadable account state have their own slugs, read from the bind's own lookup.
+
+    ``groups`` is the bound principal's groups on a ``True`` verdict, and empty otherwise. The bind
+    resolved them anyway, so :meth:`AuthService._reproof_serialized` judges a demotion on them at no
+    extra directory read (BACKLOG #3081)."""
 
     verdict: bool | None
     reason: str | None = None
+    groups: frozenset[str] = frozenset()
 
 
 def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | None:
@@ -5680,10 +5691,10 @@ class AuthService:
             )
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
-        # (#2240). Inline rather than through that helper, because its probe would change this
-        # leg's not_in_directory reason. Only a LOST role refuses; refusing writes nothing, and the
-        # reconciler or the next sign-in re-syncs the roles. Read after the directory round trip,
-        # as before, through the loader (BACKLOG #2592).
+        # (#2240), through the one shared comparison. Not through that helper, because its probe
+        # would change this leg's not_in_directory reason. Only a LOST role refuses; refusing
+        # writes nothing, and the reconciler or the next sign-in re-syncs the roles. Read after the
+        # directory round trip, as before, through the loader (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await self._step_up_refused(
@@ -5694,7 +5705,7 @@ class AuthService:
                 lost=True,
                 extra=floor_marker,
             )
-        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
+        if await self._directory_roles_lost(fresh.role_ids, principal.groups):
             return await self._step_up_refused(
                 DIRECTORY_ROLES_DEMOTED,
                 actor=actor,
@@ -9357,6 +9368,21 @@ class AuthService:
         once for a whole pass."""
         return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
 
+    async def _directory_roles_lost(self, role_ids: Iterable[str], groups: Iterable[str]) -> bool:
+        """Whether a stored role in ``role_ids`` is not among the roles ``groups`` map to: the
+        demotion test every directory step-up leg refuses on with :data:`DIRECTORY_ROLES_DEMOTED`
+        (BACKLOG #2240, #2154, #3081), shared by every leg that refuses on it (BACKLOG #3081 item
+        6). This docstring is where the rule's reasons live.
+
+        Only a LOST role counts: an added role leaves the account holding fewer roles than the
+        directory grants, not more. Roles are compared by id, not by permission, so a move from one
+        role to another counts even when the new role grants more. Channel scope is not compared.
+        At least three role decisions ask a different question and do not call this: sign-in and
+        the reconciler ask whether the roles CHANGED at all, because they re-sync or revoke, and
+        :meth:`identity_for_cert_user_id` keeps the stored roles still mapped, because it narrows
+        rather than refuses."""
+        return not set(role_ids) <= await self._ad_roles_for_groups(groups)
+
     async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
         """The channels the AD group-to-channel map gives ``groups``; none when the map fails its
         seal, which withdraws a directory-set scope rather than widening one."""
@@ -10161,6 +10187,9 @@ class AuthService:
         nothing here writes to the directory. A directory that cannot be asked, or that cannot find
         the principal, is a refusal but NOT a failure, on the account or the session: counting an
         outage would lock every operator who tried to step up while a domain controller was down.
+        A right password on an account that lost a role in the directory since sign-in is refused
+        as ``directory_roles_demoted`` and is not a failure either (BACKLOG #3081); nor does it
+        reset the budget or the counter, because nothing was granted.
 
         ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
         reset the session's budget and the account counter. The account counter resets only at FULL
@@ -10249,6 +10278,7 @@ class AuthService:
             return _Reproof(ok=False, session_gone=True, user=user)
         verdict: bool | None
         reason: str | None = None
+        groups: frozenset[str] = frozenset()
         if directory:
             if not user.directory_object_id:
                 # BACKLOG #2027, ADR 0184 AC-5. The re-bind finds its entry by the row's id, and a
@@ -10261,7 +10291,7 @@ class AuthService:
                 rebind = await self._reauth_ad(
                     user.username, password, object_id=user.directory_object_id
                 )
-                verdict, reason = rebind.verdict, rebind.reason
+                verdict, reason, groups = rebind.verdict, rebind.reason, rebind.groups
         else:
             verdict = user.password_hash is not None and await self._argon2(
                 verify_password, user.password_hash, password
@@ -10303,6 +10333,25 @@ class AuthService:
             )
         if current is None:
             return _Reproof(ok=False, user=user)
+        if directory:
+            # BACKLOG #3081: the test the code, passkey and IdP legs apply (#2240, #2154), on the
+            # groups the bind just resolved and the roles of the row read AFTER it, as those legs
+            # read theirs. The groups vouch only for the object the bind was keyed on, so a row
+            # whose id or provider moved during the round trip is refused rather than judged on
+            # another object's groups, as identity_for_cert_user_id refuses it. The password was
+            # right, so nothing is charged or registered, and the session's budget and the account
+            # counter are left as they were. It refuses and writes nothing: the reconciler or the
+            # next sign-in re-syncs the roles.
+            refusal: str | None = None
+            if (
+                current.directory_object_id != user.directory_object_id
+                or current.auth_provider != user.auth_provider
+            ):
+                refusal = DIRECTORY_IDENTITY_CONFLICT
+            elif await self._directory_roles_lost(current.role_ids, groups):
+                refusal = DIRECTORY_ROLES_DEMOTED
+            if refusal is not None:
+                return _Reproof(ok=False, user=current, reason=refusal, directory_unconfirmed=True)
         if not clear:
             # The password-change leg: nothing rotates here, and a change refused by policy leaves the
             # session as it was, budget included.
@@ -10348,7 +10397,10 @@ class AuthService:
         """Step-up re-verification (ASVS 7.5.3): re-prove the caller's credential and, on success,
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
-        re-bind** against the directory so AD operators aren't locked out. A session the federated
+        re-bind** against the directory so AD operators aren't locked out, and a good re-bind on an
+        account that lost a role in the directory since sign-in is refused as
+        :data:`DIRECTORY_ROLES_DEMOTED`, uncharged, as the code and passkey legs refuse it
+        (BACKLOG #3081). A session the federated
         login minted is refused before either (see the first branch): it steps up at the IdP through
         :meth:`complete_oidc_step_up`. Always audited.
 
@@ -10448,7 +10500,8 @@ class AuthService:
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
                     "session_revoked": proof.session_revoked,
-                    # A refusal that judged no credential names itself (BACKLOG #2027). Only when
+                    # A refusal that judged no credential names itself (BACKLOG #2027), and so does
+                    # a right password on a demoted account (directory_roles_demoted, #3081). Only when
                     # set, so every other row keeps its shape.
                     **({"reason": proof.reason} if proof.reason is not None else {}),
                 }
@@ -10734,7 +10787,9 @@ class AuthService:
             return _DirectoryRebind(None, "directory_unavailable")
         if bind.principal is not None:
             mismatch = _directory_answer_mismatch(bind.principal, object_id)
-            return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
+            if mismatch:
+                return _DirectoryRebind(None, mismatch)
+            return _DirectoryRebind(True, groups=bind.principal.groups)
         if bind.answer is DirectoryAnswer.FOUND:
             # Found by the row's own id, so the bind that failed was judged against this account:
             # it counts. A bind the DC ended busy, unavailable, unwillingToPerform or
@@ -12239,12 +12294,10 @@ class AuthService:
 
         **A present account that lost a role in the directory is refused too (BACKLOG #2240).** Its
         stored roles must all be among the roles its current groups map to, the same pair the
-        reconciler diffs. Otherwise a demoted operator would renew its window, or clear the MFA
-        gate, with roles it no longer holds until the reconciler's role pass. Only a lost role
-        refuses: an added role leaves the account holding fewer roles than the directory grants, not
-        more. Roles are compared by id, not by permission, so a move from one role to another
-        refuses even when the new role grants more. This refuses and writes nothing; the reconciler
-        or the next sign-in re-syncs the roles. Channel scope is not compared here.
+        reconciler diffs, by :meth:`_directory_roles_lost`, whose docstring gives the rule.
+        Otherwise a demoted operator would renew its window, or clear the MFA gate, with roles it
+        no longer holds until the reconciler's role pass. This refuses and writes nothing; the
+        reconciler or the next sign-in re-syncs the roles.
         """
         answer = await self._directory_presence(user)
         if not isinstance(answer, reconcile.Probe):
@@ -12255,7 +12308,7 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(answer.groups):
+        if await self._directory_roles_lost(fresh.role_ids, answer.groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 

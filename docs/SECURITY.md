@@ -2866,9 +2866,22 @@ roles, and refuses when a stored role is not among them. It refuses only; the se
 was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
 `reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
 takes the roles the current groups grant.
-Channel scope is not compared on this leg either. At least the
-password re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) and the enrolment legs do
-not compare roles yet.
+Channel scope is not compared on this leg either.
+
+**The password re-bind makes the same role test (BACKLOG #3081).** A good re-bind (`POST
+/me/reauth` and the `/ui/reauth` password leg) returns the account's current groups with the bind,
+so the test costs no extra directory read. The engine maps them to roles and refuses when a stored
+role is not among them, reading the stored roles after the bind returns, as the other legs read
+theirs. A row whose directory object id or provider moved during the bind is refused as
+`directory_identity_conflict` instead, because the groups vouch only for the object the bind was
+keyed on. The password was right, so the refusal is charged to
+neither the lockout nor the session's re-proof budget, and clears neither. No window is renewed, no
+action-bound grant is minted, and no roles are written. The `auth.reauth` row carries
+`reason=directory_roles_demoted`, and the caller gets the answer for a directory that could not
+confirm the account: 403 on `POST /me/reauth`. A retry is refused the same way until a new sign-in
+re-syncs the roles; those words do not say so yet. Channel scope is not compared on this leg either. The enrolment legs make the
+test too, through the code leg's directory check (BACKLOG #3061). The code, passkey, IdP and
+re-bind legs call one shared comparison rather than each writing it out.
 
 **The password re-bind gives the code and passkey legs' answer when the directory could not judge
 the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
@@ -5085,7 +5098,11 @@ Every other refused bind is counted: each other result code ldap3 decodes, stron
 included, though it judges no password either, and a refused bind whose result holds no integer code.
 A correct password the DC refuses anyway, for example because the domain account is locked or its
 password has expired, **is** counted. AD answers both with invalidCredentials (49), and the engine
-reads the bind's result code, never its diagnostic text. **What bounds the uncounted re-binds:** none
+reads the bind's result code, never its diagnostic text. A bind that accepts the password is not
+counted when the leg then refuses it, because the account lost a role in the directory since
+sign-in or its row moved to another directory object during the bind: it needed the right
+password, so it opens no guessing window (BACKLOG #3081, the re-bind role-test paragraph).
+**What bounds the uncounted re-binds:** none
 is charged to the row or the session, so while the DC answers that way the per-session cap does not
 bound them and only the per-actor budget does. The settings that turn that budget off or loosen it
 are listed once, in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced). A value there that turns the ceremony limit off

@@ -741,7 +741,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         session's re-proof budget, and toward the account lockout unless the sign-in lock is already
         live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
         Neither account lock refuses it. A directory re-bind the directory could not judge is also a
-        403, saying so, and charges nothing (BACKLOG #2027).
+        403, saying so, and charges nothing (BACKLOG #2027), as is a right password on an account
+        the directory has demoted since sign-in (BACKLOG #3081).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -784,8 +785,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
-                # call a password wrong that was never checked. Same words as /auth/mfa-verify's
-                # directory refusal; the precise reason is on the audit row only.
+                # call a password wrong that was never checked; or (BACKLOG #3081) it judged it
+                # right on an account it has demoted. Same words as /auth/mfa-verify's directory
+                # refusal; the precise reason is on the audit row only.
                 raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
