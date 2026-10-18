@@ -198,38 +198,64 @@ def test_suite_names_are_read_one_per_line(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
     """A ``Get-TlsCipherSuite`` on ``PATH`` or in the account's Documents modules must not answer:
-    the module is imported by its ``$PSHOME`` path and its exported command object is run, so the
-    name is never looked up through command discovery. Nor is any other command: the path is built
-    and tested with .NET calls, and ``Import-Module`` is named by its module."""
+    the module is imported by its ``$PSHOME`` path and its exported command object is run. Nor may
+    any other command be found by a bare name; ``_SUITES_COMMAND``'s comment says why."""
     command = cipher_policy._SUITES_COMMAND
-    assert "$p = [IO.Path]::Combine($PSHOME, 'Modules', 'TLS')" in command
-    assert "if (-not [IO.Directory]::Exists($p))" in command
+    assert '$p = "$PSHOME\\Modules\\TLS"' in command
     assert (
         "Microsoft.PowerShell.Core\\Import-Module -Name $p -PassThru -ErrorAction Stop" in command
     )
-    assert "$c = $m.ExportedCommands['Get-TlsCipherSuite']" in command
-    assert command.endswith("(& $c).Name")
+    assert command.endswith("(& $m.ExportedCommands['Get-TlsCipherSuite']).Name")
+    # Every mention of the cmdlet's name is a quoted key on the imported module, never a call.
+    assert command.count("Get-TlsCipherSuite") == command.count("'Get-TlsCipherSuite'")
     # Only an absent module folder or cmdlet exits "not on this host"; a failed import stops.
     assert command.count(f"exit {cipher_policy._NO_CMDLET_EXIT}") == 2
-    assert f"exit {cipher_policy._WRONG_MODULE_EXIT}" in command
     for bare in ("Join-Path", "Test-Path", "Get-Command", "Select-Object", "ForEach-Object"):
         assert bare not in command
 
 
-def test_a_command_from_another_module_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The wrong-module exit is a broken reading, never "not on this host" and never a PASS."""
-    _powershell_returns(monkeypatch, cipher_policy._WRONG_MODULE_EXIT, _WIN_AEAD[0])
-    with pytest.raises(ProbeFailed, match=f"exited {cipher_policy._WRONG_MODULE_EXIT}"):
-        cipher_policy._windows_enabled_suites()
+_POWERSHELL = ("WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+def _run_powershell(
+    text: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    from messagefoundry.childenv import system_tool_environment
+    from messagefoundry.service_status import _system_exe
+
+    return subprocess.run(
+        [_system_exe(*_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", text],
+        env={**system_tool_environment(), **(env or {})},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_the_command_runs_in_constrained_language_mode() -> None:
+    """WDAC or AppLocker script enforcement runs ``-Command`` text in Constrained Language Mode,
+    which refuses a static .NET call; the probe text must still read the suites there."""
+    clm = "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; "
+    done = _run_powershell(clm + cipher_policy._SUITES_COMMAND)
+    assert done.returncode == 0, done.stderr[:300]
+    lines = [ln.strip() for ln in done.stdout.splitlines() if ln.strip()]
+    assert lines and all(cipher_policy._SCHANNEL_SUITE_NAME.fullmatch(ln) for ln in lines)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_a_missing_module_folder_exits_not_on_this_host() -> None:
+    text = cipher_policy._SUITES_COMMAND.replace("Modules\\TLS", "Modules\\NoSuchTlsModule")
+    assert text != cipher_policy._SUITES_COMMAND
+    assert _run_powershell(text).returncode == cipher_policy._NO_CMDLET_EXIT
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="parses with Windows PowerShell's parser")
 def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
-    """PowerShell's own parser lists every command the text names. Each must carry its module,
-    because a bare name can resolve through ``PATH``; the command object the text runs with ``&``
-    has no name and is left out. Planting a bare ``Join-Path`` back in must be caught."""
-    from messagefoundry.childenv import system_tool_environment
-    from messagefoundry.service_status import _system_exe
+    """PowerShell's own parser lists every command the text names. The only name allowed is the
+    Core-qualified ``Import-Module``; the command object run with ``&`` has no name. Planting a
+    bare ``Join-Path`` back in must be caught."""
 
     def command_names(text: str) -> list[str]:
         script = tmp_path / "probe.ps1.txt"
@@ -242,27 +268,17 @@ def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
             "$n -is [Management.Automation.Language.CommandAst] }, $true)) "
             "{ $n = $c.GetCommandName(); if ($n) { [Console]::Out.WriteLine($n) } }"
         )
-        done = subprocess.run(
-            [
-                _system_exe("WindowsPowerShell", "v1.0", "powershell.exe"),
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                lister,
-            ],
-            env={**system_tool_environment(), "MF_PROBE_TEXT": str(script)},
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
+        done = _run_powershell(lister, {"MF_PROBE_TEXT": str(script)})
+        assert done.returncode == 0, done.stderr[:300]
         return done.stdout.split()
 
-    names = command_names(cipher_policy._SUITES_COMMAND)
-    assert names == ["Microsoft.PowerShell.Core\\Import-Module"]
+    assert command_names(cipher_policy._SUITES_COMMAND) == [
+        "Microsoft.PowerShell.Core\\Import-Module"
+    ]
     planted = cipher_policy._SUITES_COMMAND.replace(
-        "[IO.Path]::Combine($PSHOME, 'Modules', 'TLS')", "Join-Path $PSHOME 'Modules\\TLS'"
+        '"$PSHOME\\Modules\\TLS"', "(Join-Path $PSHOME 'Modules\\TLS')"
     )
+    assert planted != cipher_policy._SUITES_COMMAND
     assert [n for n in command_names(planted) if "\\" not in n] == ["Join-Path"]
 
 
@@ -299,23 +315,22 @@ def test_the_powershell_command_runs_on_this_host() -> None:
 
 
 _PLANTED_SUITE = "TLS_PLANTED_AES_256_GCM_SHA384"
-#: Every command the probe's script could name and resolve through ``PATH``: the two helpers the
-#: Lander found shadowed, and the one cmdlet it still calls, though Core cmdlets are not shadowed.
+#: At least the two helpers the Lander found shadowed, and the cmdlet the probe still calls.
 _PLANTED_COMMANDS = ("Join-Path", "Test-Path", "Import-Module")
+#: The probe text as it stood at the hold: bare ``Join-Path`` and ``Test-Path``. The positive
+#: control, so the plant is shown to run where a bare name is looked up.
+_SHADOWABLE_COMMAND = (
+    "$p = Join-Path $PSHOME 'Modules\\TLS'; "
+    f"if (-not (Test-Path -LiteralPath $p)) {{ exit {cipher_policy._NO_CMDLET_EXIT} }}; "
+    "$m = Import-Module -Name $p -PassThru -ErrorAction Stop; "
+    "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name"
+)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="plants .cmd files for Windows PowerShell")
-def test_commands_planted_on_path_cannot_answer_for_the_probe(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The Lander's hold on PR 2406: a ``Join-Path.cmd`` and a ``Test-Path.cmd`` on ``PATH``
-    shadowed the script's helpers, because the probe's environment has no ``PSModulePath`` and so
-    the cmdlets' own module does not load ahead of them. They pointed the import at a planted TLS
-    module, and the probe printed one fake AEAD suite and exited 0, a PASS.
-
-    The plants here do the same, and each also writes a marker when it runs, so the test does not
-    depend on this host's execution policy letting the planted module load. No plant may run, and
-    the probe must return what it returns unplanted, or refuse; never the planted suite."""
+def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Put ``.cmd`` files named for the probe's commands first on ``PATH``, each of which writes a
+    marker into the returned folder when it runs, so a run is seen whatever this host's execution
+    policy does to the planted module the ``Join-Path`` one points at."""
     fake_module = tmp_path / "fake" / "TLS"
     fake_module.mkdir(parents=True)
     (fake_module / "TLS.psm1").write_text(
@@ -333,16 +348,42 @@ def test_commands_planted_on_path_cannot_answer_for_the_probe(
             f'@echo off\r\ntype nul > "{ran / name}"\r\necho {answers[name]}\r\n',
             encoding="ascii",
         )
-    real = cipher_policy._windows_enabled_suites()
     monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
+    return ran
+
+
+def _suites_or_refused() -> list[str] | None:
     try:
-        spoofable: list[str] | None = cipher_policy._windows_enabled_suites()
+        return cipher_policy._windows_enabled_suites()
     except ProbeFailed:
-        spoofable = None  # refused: an ERROR row, never a PASS
+        return None  # refused: an ERROR row, never a PASS
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="plants .cmd files for Windows PowerShell")
+def test_commands_planted_on_path_cannot_answer_for_the_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Lander's hold on PR 2406 (``_SUITES_COMMAND``'s comment). No plant may run, and the
+    probe must return what it returns unplanted, or refuse; never the planted suite."""
+    real = cipher_policy._windows_enabled_suites()
+    ran = _plant_on_path(monkeypatch, tmp_path)
+    spoofable = _suites_or_refused()
     assert sorted(p.name for p in ran.iterdir()) == [], "a command planted on PATH ran"
     if spoofable is not None:
         assert _PLANTED_SUITE not in spoofable
         assert spoofable == real
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="plants .cmd files for Windows PowerShell")
+def test_the_plants_run_where_a_bare_name_is_looked_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Positive control for the test above: with the text as it stood at the hold, the same
+    plants run. Without this, a plant that stopped working would leave that test green."""
+    ran = _plant_on_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(cipher_policy, "_SUITES_COMMAND", _SHADOWABLE_COMMAND)
+    _suites_or_refused()
+    assert {"Join-Path", "Test-Path"} <= {p.name for p in ran.iterdir()}
 
 
 _A, _B = _WIN_AEAD
