@@ -3265,7 +3265,8 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
 
 
 async def _refresh_with_stale_held(service: AuthService, store: MessageStore, user_id: str) -> None:
-    """Run the refresh as the reconciler does, with a ``held`` naming ``gone-holder``: a record of
+    """Run the refresh as the reconciler does (``audit_soft`` on, BACKLOG #3018), with a ``held``
+    naming ``gone-holder``: a record of
     another row that held the name when the caller read it, and holds it no more (BACKLOG #3070)."""
     row = await store.get_user(user_id)
     assert row is not None
@@ -3275,6 +3276,7 @@ async def _refresh_with_stale_held(service: AuthService, store: MessageStore, us
         new_username="jdoe-married",
         held=replace(row, id="gone-holder", username="jdoe-married"),
         from_plan=True,
+        audit_soft=True,
     )
 
 
@@ -3386,11 +3388,9 @@ async def test_a_pass_whose_holder_read_went_stale_writes_the_rename(
         assert [a["action"] for a in await _rename_audits(store)] == [
             "auth.ad_username_refreshed"
         ], "a stale held read in the pass filed a conflict"
-        assert not [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "already held" in r.getMessage()
-        ], "a stale held read in the pass warned of a lockout"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a stale held read in the pass warned"
+        )
         assert len([e for e in notifier.sent if e.event_type == USERNAME_CHANGED]) == 1
     finally:
         await store.close()
@@ -3409,8 +3409,8 @@ async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since
         hooked: list[str] = []
 
         async def _sign_in_renames_first(username: str) -> VerifiedUser | None:
-            if not hooked:
-                hooked.append(username)
+            hooked.append(username)
+            if len(hooked) == 1:
                 assert await store.set_user_username(user_id, username, expected_username="jdoe")
             return await load_by_name(username)
 
@@ -3420,7 +3420,7 @@ async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since
 
         await _refresh_with_stale_held(service, store, user_id)
 
-        assert hooked == ["jdoe-married"], "the refresh never re-read the holder"
+        assert hooked == ["jdoe-married"], "expected exactly one holder re-read, and nothing else"
         after = await store.get_user(user_id)
         assert after is not None and after.username == "jdoe-married"
         assert not await _rename_audits(store), "this row filed a conflict against itself"

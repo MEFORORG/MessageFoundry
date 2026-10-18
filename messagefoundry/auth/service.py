@@ -7677,9 +7677,10 @@ class AuthService:
         both must resolve the collision case the same way. Two copies of this decision would be two
         policies, and the one that ran less often would be the one nobody noticed drifting.
 
-        ``held`` is the row holding ``new_username`` when the caller read it, and a hint rather than
-        the verdict: the rule for it is at the ``held`` pre-check below (BACKLOG #3070), and only
-        there. ``held=None`` costs no read, which saves the login caller one; it **provably**
+        ``held`` is the row holding ``new_username`` when the caller read it. One naming another
+        row is re-checked, not trusted: the rule is at the ``held`` pre-check below (BACKLOG
+        #3070). ``held=None`` skips that pre-check, so a holder appearing after the caller's read is
+        caught only by the write's guard. The login caller passes None because it **provably**
         already has the answer.
         ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
         it exists with a different id -- so the login path reaches this method only with
@@ -7891,10 +7892,13 @@ class AuthService:
             # it is no conflict. A verified holder load, not one statement, but only when the
             # caller's read named another row.
             #
-            # NOT CLOSED HERE: a holder that fails its seal reads as None, here as at the caller's
-            # read and the two write-path holder reads below, so it is not reported as a lockout.
-            # That is one gap across all four reads and wants one holder lookup that keeps the seal
-            # state, not a special case on this read.
+            # NOT CLOSED HERE: a holder that fails its seal reads as None at this re-read, at the
+            # reconciler's own ``held`` read, and at least at the two write-path holder reads
+            # below. So the write's guard stops the rename and the write-path refusal logs that no
+            # row holds the new name and a later pass retries it, which is false while that holder
+            # stays seal-failed. The login's caller read (``_lookup_by_username``) keeps the seal
+            # state and refuses. The gap wants one holder lookup that keeps the seal state for the
+            # reconciler's reads, not a special case on this one.
             current = await self._load_user_by_username(new_username)
             if current is not None and current.id != user_id:
                 await _refuse(current.id, "pre_check", before.username)
