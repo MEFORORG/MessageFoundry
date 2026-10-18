@@ -135,9 +135,8 @@ class OdbcHops:
 
     found: tuple[str, ...] = ()
     unknown: str | None = None
-
-
-_NO_CONFIGURATION = OdbcHops(unknown="the check was handed no configuration")
+    #: What was read to reach "no hop", named in the SKIP detail.
+    judged: str = "the configuration"
 
 
 def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
@@ -163,23 +162,32 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
         )
     try:
         hops = odbc_hops()
-        if not hops.found and hops.unknown is None:
-            return CheckResult(
-                rid,
-                title,
-                Status.SKIP,
-                "this configuration takes no ODBC hop (no SQL Server store, DATABASE connection, "
-                "DatabaseRef or DatabaseLookup), so the host policy does not reach one",
-            )
+    except Exception as exc:  # a census failure the census did not foresee: it read nothing
+        hops = OdbcHops(
+            unknown=f"the hop census raised {type(exc).__name__}: {codec_safe_str(exc)}"
+        )
+    if not hops.found and hops.unknown is None:
+        return CheckResult(
+            rid,
+            title,
+            Status.SKIP,
+            f"no ODBC Driver 18 hop in {hops.judged} (no SQL Server store, DATABASE connection, "
+            "DatabaseRef or DatabaseLookup), so the host policy does not reach one",
+        )
+    try:
         reading = cipher_policy.read_host_cipher_policy()
     except Exception as exc:  # a reading the probe mapping did not foresee: the check broke
-        return CheckResult(
+        reading = CheckResult(
             rid,
             title,
             Status.ERROR,
             f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
         )
-    if hops.found or reading.status not in FAILING:
+    if hops.found:
+        hop_text = "ODBC hops: " + ", ".join(hops.found)
+        evidence = f"{hop_text}; {reading.evidence}" if reading.evidence else hop_text
+        return CheckResult(rid, title, reading.status, reading.detail, evidence=evidence)
+    if reading.status not in FAILING:
         return reading
     return CheckResult(
         rid,
@@ -483,7 +491,7 @@ def run_host_checks(
     *,
     ports: dict[str, int],
     writable_dir: Path,
-    odbc_hops: Callable[[], OdbcHops] = lambda: _NO_CONFIGURATION,
+    odbc_hops: Callable[[], OdbcHops],
 ) -> list[CheckResult]:
     """Run every host/environment check and return their results (order is stable).
 

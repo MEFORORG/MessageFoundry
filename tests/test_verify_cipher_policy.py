@@ -9,6 +9,7 @@ Windows-only test runs the real PowerShell command."""
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 import subprocess
 import sys
@@ -465,7 +466,7 @@ def test_the_last_ssl_module_line_wins(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert section == "system_default_sect"
 
 
-@pytest.mark.parametrize("module_line", ["ssl", "ssl.0", "s"])
+@pytest.mark.parametrize("module_line", ["ssl", "ssl.0", "s", ".0"])
 def test_a_shorter_ssl_module_stem_is_manual(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module_line: str
 ) -> None:
@@ -476,9 +477,7 @@ def test_a_shorter_ssl_module_stem_is_manual(
     assert "may read as ssl_conf" in r.detail
 
 
-@pytest.mark.parametrize(
-    "module_line", ["ssl_confx", "ssl_conf_x", "ssl_conf.x.y", "providers", ".0"]
-)
+@pytest.mark.parametrize("module_line", ["ssl_confx", "ssl_conf_x", "ssl_conf.x.y", "providers"])
 def test_other_module_lines_do_not_name_the_ssl_module(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module_line: str
 ) -> None:
@@ -718,9 +717,11 @@ _A_HOP = checks.OdbcHops(found=("the [store] backend is sqlserver",))
 def test_a_configured_hop_reports_the_reading_as_it_is(
     monkeypatch: pytest.MonkeyPatch, reading: Status
 ) -> None:
-    """A host that takes an ODBC hop keeps every reading, FAIL included."""
+    """A host that takes an ODBC hop keeps every reading, FAIL included, and names the hop."""
     stub = _with_pyodbc(monkeypatch, reading)
-    assert checks.check_host_cipher_policy(lambda: _A_HOP) is stub
+    r = checks.check_host_cipher_policy(lambda: _A_HOP)
+    assert (r.status, r.detail) == (stub.status, stub.detail)
+    assert r.evidence == "ODBC hops: the [store] backend is sqlserver; stub evidence"
 
 
 def test_pyodbc_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -732,9 +733,9 @@ def test_pyodbc_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) ->
 
     _with_pyodbc(monkeypatch, Status.FAIL)
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", must_not_run)
-    r = checks.check_host_cipher_policy(lambda: checks.OdbcHops())
+    r = checks.check_host_cipher_policy(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
-    assert "no ODBC hop" in r.detail
+    assert "no ODBC Driver 18 hop in the graph in 'cfg'" in r.detail
 
 
 @pytest.mark.parametrize(
@@ -768,32 +769,78 @@ def test_the_hop_census_is_not_taken_without_pyodbc(monkeypatch: pytest.MonkeyPa
     assert checks.check_host_cipher_policy(must_not_run).status is Status.SKIP
 
 
-def test_a_census_that_raises_is_an_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_census_that_raises_leaves_the_configuration_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken census read nothing, so a FAIL reading cannot be pinned on this host."""
+
     def boom() -> checks.OdbcHops:
         raise RuntimeError("census broke")
 
-    _with_pyodbc(monkeypatch, Status.PASS)
+    _with_pyodbc(monkeypatch, Status.FAIL)
     r = checks.check_host_cipher_policy(boom)
-    assert r.status is Status.ERROR and "RuntimeError: census broke" in r.detail
+    assert r.status is Status.MANUAL
+    assert "hop census raised RuntimeError: census broke" in r.detail
+
+
+def test_a_raising_read_under_an_unknown_configuration_is_manual(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(platform: str | None = None) -> CheckResult:
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(checks, "_can_import", lambda module: True)
+    monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", boom)
+    r = checks.check_host_cipher_policy(lambda: checks.OdbcHops(unknown="no config dir"))
+    assert r.status is Status.MANUAL and "ValueError: unexpected" in r.detail
 
 
 def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:
     return next(r for r in results if r.id == "host.ciphers")
 
 
+def _isolate_settings(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> Path:
+    """No ``./messagefoundry.toml`` and no ``MEFOR_STORE_*`` variable from this machine reach
+    the run; returns an empty service config file, which loads as the defaults."""
+    monkeypatch.chdir(cwd)
+    for name in [n for n in os.environ if n.upper().startswith("MEFOR_STORE_")]:
+        monkeypatch.delenv(name)
+    toml = cwd / "service.toml"
+    toml.write_text("", encoding="utf-8")
+    return toml
+
+
 def test_verify_on_a_host_with_pyodbc_and_no_hop_does_not_fail(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The finding as the Lander measured it, end to end: ``verify`` with pyodbc importable, the
-    default SQLite store and a config graph with no DATABASE connection read FAIL and exit 1. The
-    graph here is empty, which loads as a graph with no hop. The policy reading is a FAIL, as on a
-    stock Windows 11 host, so only the hop gate can turn the row away from it."""
+    """The finding as the Lander measured it, end to end: ``verify`` with pyodbc importable, a
+    SQLite store and a config graph with no DATABASE connection read FAIL and exit 1. The graph
+    here is empty, which loads as a graph with no hop. The policy reading is a FAIL, as on a stock
+    Windows 11 host, so only the hop gate can turn the row away from it."""
     from messagefoundry.verify.runner import run_verify
 
+    service = _isolate_settings(monkeypatch, tmp_path)
+    graph = tmp_path / "config"
+    graph.mkdir()
     _with_pyodbc(monkeypatch, Status.FAIL)
-    monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
-    row = _host_ciphers_row(run_verify(config_dir=str(tmp_path), sections=["host"]))
+    results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
+    row = _host_ciphers_row(results)
     assert row.status is Status.SKIP, row.detail
+
+
+def test_verify_without_a_service_config_reports_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no service config read, the store could be SQL Server, so "no hop" is not known."""
+    from messagefoundry.verify.runner import run_verify
+
+    _isolate_settings(monkeypatch, tmp_path)
+    graph = tmp_path / "config"
+    graph.mkdir()
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    row = _host_ciphers_row(run_verify(config_dir=str(graph), sections=["host"]))
+    assert row.status is Status.MANUAL, row.detail
+    assert "no service config was read" in row.detail
 
 
 def test_verify_with_no_config_dir_reports_manual(
@@ -801,9 +848,12 @@ def test_verify_with_no_config_dir_reports_manual(
 ) -> None:
     from messagefoundry.verify.runner import run_verify
 
+    service = _isolate_settings(monkeypatch, tmp_path)
     _with_pyodbc(monkeypatch, Status.FAIL)
-    monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
-    row = _host_ciphers_row(run_verify(config_dir=str(tmp_path / "absent"), sections=["host"]))
+    results = run_verify(
+        config_dir=str(tmp_path / "absent"), service_config=str(service), sections=["host"]
+    )
+    row = _host_ciphers_row(results)
     assert row.status is Status.MANUAL, row.detail
     assert "no config dir" in row.detail
 
@@ -816,10 +866,22 @@ def _registry_with(monkeypatch: pytest.MonkeyPatch, **parts: Any) -> None:
     )
 
 
-def _hops(config_dir: Path, *, settings: Any = None) -> checks.OdbcHops:
+def _hops(
+    config_dir: Path, *, settings: Any = None, service_config: str | None = "service.toml"
+) -> checks.OdbcHops:
     from messagefoundry.verify.runner import _odbc_hops
 
-    return _odbc_hops(settings, str(config_dir))
+    return _odbc_hops(settings, service_config, str(config_dir))
+
+
+def _database(dialect: str | None = None) -> Any:
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection
+
+    settings = {} if dialect is None else {"dialect": dialect}
+    return OutboundConnection(
+        name="x", spec=ConnectionSpec(type=ConnectorType.DATABASE, settings=settings)
+    )
 
 
 def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -832,12 +894,12 @@ def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_
         ReferenceSpec,
     )
 
-    def outbound(kind: ConnectorType) -> OutboundConnection:
-        return OutboundConnection(name="x", spec=ConnectionSpec(type=kind, settings={}))
-
+    file_outbound = OutboundConnection(
+        name="x", spec=ConnectionSpec(type=ConnectorType.FILE, settings={})
+    )
     _registry_with(
         monkeypatch,
-        outbound={"OB_DB": outbound(ConnectorType.DATABASE), "OB_F": outbound(ConnectorType.FILE)},
+        outbound={"OB_DB": _database(), "OB_SQL": _database("SQLServer"), "OB_F": file_outbound},
         references={
             "REF_DB": ReferenceSpec("REF_DB", ReferenceSourceSpec("database", {})),
             "REF_F": ReferenceSpec("REF_F", ReferenceSourceSpec("file", {})),
@@ -846,20 +908,42 @@ def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_
     )
     assert _hops(tmp_path).found == (
         "DATABASE connection OB_DB",
+        "DATABASE connection OB_SQL",
         "DatabaseRef reference set REF_DB",
         "DatabaseLookup LK",
     )
 
 
-def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No hop in the graph: "none" when the settings loaded, unknown when they did not, because
-    the store could then be SQL Server."""
+def test_a_generic_dialect_connection_alone_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A generic ODBC driver brings its own TLS, so the SChannel or OpenSSL policy read here may
+    not be the one it takes; neither "hop" nor "no hop" is known."""
     from messagefoundry.config.settings import ServiceSettings
 
+    _registry_with(monkeypatch, outbound={"OB_PG": _database("generic")})
+    hops = _hops(tmp_path, settings=ServiceSettings())
+    assert not hops.found
+    assert hops.unknown is not None and "OB_PG uses a generic ODBC driver" in hops.unknown
+
+
+def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No hop in the graph: "none" when the settings were read from a file, unknown when they did
+    not load or came from the defaults alone, because the store could then be SQL Server."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
     _registry_with(monkeypatch)
-    assert _hops(tmp_path, settings=ServiceSettings()) == checks.OdbcHops()
+    hops = _hops(tmp_path, settings=ServiceSettings())
+    assert (hops.found, hops.unknown) == ((), None)
+    assert repr(str(tmp_path)) in hops.judged
     unknown = _hops(tmp_path).unknown
     assert unknown is not None and "settings did not load" in unknown
+    unknown = _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown
+    assert unknown is not None and "no service config was read" in unknown
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    assert _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown is None
 
 
 def test_a_sql_server_store_is_a_hop_without_the_graph(
@@ -880,7 +964,7 @@ def test_a_sql_server_store_is_a_hop_without_the_graph(
     )
 
 
-def test_a_graph_that_does_not_load_is_unknown(
+def test_a_graph_that_does_not_load_is_unknown_and_says_why(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from messagefoundry.config import wiring
@@ -890,12 +974,14 @@ def test_a_graph_that_does_not_load_is_unknown(
 
     monkeypatch.setattr(wiring, "load_config", broken)
     unknown = _hops(tmp_path).unknown
-    assert unknown is not None and "WiringError" in unknown
+    assert unknown is not None and "did not load: bad graph" in unknown
 
 
 def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _hide_pyodbc(monkeypatch)
-    results = checks.run_host_checks(ports={"MLLP": 2575}, writable_dir=tmp_path)
+    results = checks.run_host_checks(
+        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+    )
     assert "host.ciphers" in {r.id for r in results}
 
 

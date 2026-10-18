@@ -782,16 +782,24 @@ what the programs it starts may still write is listed once, in
 `messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
 engine runs as, with the same environment, after the reboot on Windows.
 
-**It reads the policy only where an ODBC hop is configured.** It needs `pyodbc` installed in the
-Python that runs `verify`, found on the import path without being imported. It then asks whether
-the configuration takes an ODBC hop: a `sqlserver` store backend in the service settings, or a
-DATABASE connection, a `DatabaseRef` reference set or a `DatabaseLookup` in the `--config` graph.
-The graph is loaded only when the store is not already a hop. With no hop configured the row
-SKIPs, so a host that only has `pyodbc` installed does not fail on a policy nothing of it uses.
-Where the settings or the graph could not be read, for example with no `--config` directory, the
-row still reads the policy, but a FAIL or ERROR reading is reported as MANUAL with the reading in
-its detail: whether it applies is not known. Run `verify` with `--config` and `--service-config`
-to get a FAIL that counts.
+**It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
+installed in the Python that runs `verify`, found on the import path without being imported. It
+then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
+settings, or a SQL Server dialect DATABASE connection, a `DatabaseRef` reference set or a
+`DatabaseLookup` in the `--config` graph. A hop found names itself in the row's evidence. The graph
+is loaded only when the store is not already a hop, and loading it runs the config modules, as the
+self smoke does, so `--section host` runs them too. With no hop configured the row SKIPs and names
+what it read, so a host that only has `pyodbc` installed does not fail on a policy nothing of it
+uses.
+
+The answer is unknown where at least one of these holds: the graph did not load or there is no
+`--config` directory; the service settings did not load; they came from the defaults alone, with
+no `--service-config`, no `./messagefoundry.toml` and no `MEFOR_STORE_BACKEND`, because the store
+could then be SQL Server; or the only DATABASE connection uses the generic dialect, whose driver
+brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
+MANUAL with the reading in its detail. Run `verify` with `--config` and `--service-config` naming
+the deployment's own, to get a FAIL that counts. With no `--config`, the folder read is
+`samples/config` under the working directory, which is not the deployment's graph.
 
 It runs the commands of this step. It differs from them in at least the ways named here:
 

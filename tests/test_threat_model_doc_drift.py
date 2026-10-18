@@ -329,8 +329,10 @@ _SHELL_TOKENS: tuple[str, ...] = (
     "ShellExecute",
 )
 #: The command-line flags that hand an interpreter script text to run: PowerShell's ``-Command``,
-#: ``-CommandWithArgs`` and ``-EncodedCommand``, and cmd.exe's ``/c``. A start that passes one runs
-#: a shell whatever its argv form, so it is a shell site too. These live in a string literal, the
+#: ``-CommandWithArgs`` and ``-EncodedCommand``, cmd.exe's ``/c``, ``/k`` and ``/r``, a POSIX
+#: shell's ``-c`` inside a short cluster such as ``-lc``, and ``--eval``. A start that passes one
+#: runs a shell whatever its argv form, so it is a shell site too. At least these; not every
+#: interpreter's flag is here. These live in a string literal, the
 #: one place ``_SHELL_TOKENS`` cannot look, because ``_code_only`` blanks every literal before that
 #: scan reads it. So they are a pattern over literals instead (:func:`_script_text_sites`).
 #:
@@ -346,7 +348,8 @@ _SCRIPT_TEXT_FLAGS: tuple[str, ...] = (
     *("encodedcommand"[:n] for n in range(2, len("encodedcommand") + 1)),
 )
 _SCRIPT_TEXT_FLAG_RE = re.compile(
-    r"(?i)(?:^|\s)(?:--?|/)(?:" + "|".join(_SCRIPT_TEXT_FLAGS) + r")(?=\s|$)"
+    r"(?:^|\s)(?:(?i:(?:--?|/)(?:" + "|".join(_SCRIPT_TEXT_FLAGS) + r")|/[kr]|--?eval)"
+    r"|-[a-z]{1,3}c)(?=\s|$)"
 )
 _ALLOWED_SHELL_SITES: dict[str, str] = {
     "pipeline/dr.py": "[dr].takeover_hook / release_hook run via create_subprocess_shell",
@@ -1197,6 +1200,10 @@ def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
         "run(f'powershell.exe -NoProfile -Command {text}')",
         "PARAMS = '/s /c \"' + line",
         'run(["python", "-c", text])',
+        'run(["bash", "-lc", script])',
+        'run(["cmd.exe", "/K", line])',
+        'run(["cmd.exe", "/r", line])',
+        'run(["node", "--eval", text])',
     ],
 )
 def test_the_script_text_scan_fires(source: str) -> None:

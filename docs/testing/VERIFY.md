@@ -37,7 +37,7 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 
 | Section | What it does |
 |---|---|
-| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; the host cipher policy those ODBC hops take (`host.ciphers`: AEAD-only suites, TLS 1.0/1.1 off; reports only, SKIP where `pyodbc` is not installed or no ODBC hop is configured; statuses in [DEPLOY-SERVER-DB.md section 5.4](../DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition)); listener ports bindable (+ firewall = MANUAL); store/working dir **already exists and is** writable (+ service-account ACLs = MANUAL); every `sc.exe` spawn passes `CREATE_NO_WINDOW` (no-flash; Windows-only, SKIP elsewhere). |
+| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; the host cipher policy those ODBC hops take (`host.ciphers`: AEAD-only suites, TLS 1.0/1.1 off; reports only; when it reads the policy, and its statuses, are in [DEPLOY-SERVER-DB.md section 5.4](../DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition)); listener ports bindable (+ firewall = MANUAL); store/working dir **already exists and is** writable (+ service-account ACLs = MANUAL); every `sc.exe` spawn passes `CREATE_NO_WINDOW` (no-flash; Windows-only, SKIP elsewhere). |
 | **store** | Opens the **already-existing** configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes**. A SQLite store the engine has never created is a FAIL, not a PASS. Run once per backend the box is pointed at. |
 | **smoke** | `self` (default) routes a synthetic HL7 through your config via dry-run — **no store, no network, no side effects**; `live` MLLP-sends one synthetic message to the running engine and confirms an **AA ACK**; `none` skips. Add **`--check-disposition`** (+ `--service-config`) to also poll the store and **FAIL unless the message reached `PROCESSED`** (a new `smoke.disposition` row). |
 | **manual** | Echoes the human-only steps (AD/Kerberos login, TOTP MFA, API bind+TLS, NSSM service, end-to-end disposition in the console) as MANUAL with instructions. |
@@ -62,7 +62,7 @@ these things still write:
 | What | When | What it writes |
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
-| `host.ciphers` | every host run on Windows where `pyodbc` is installed, unless the configuration was read and takes no ODBC hop | nothing of its own; the Windows PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
+| `host.ciphers` | a host run on Windows that reads the policy (DEPLOY-SERVER-DB.md section 5.4 says when) | nothing of its own; the Windows PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
 | `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 

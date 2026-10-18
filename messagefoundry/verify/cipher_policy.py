@@ -376,7 +376,7 @@ def _names_the_ssl_module(name: str) -> bool:
     stem = name.rsplit(".", 1)[0]
     if stem == _SSL_MODULE:
         return True
-    if stem and _SSL_MODULE.startswith(stem):
+    if _SSL_MODULE.startswith(stem):  # an empty stem matches the first module registered
         raise _not_followed(f"the module name {name!r}, which OpenSSL may read as {_SSL_MODULE}")
     return False
 
