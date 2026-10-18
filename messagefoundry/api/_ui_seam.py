@@ -560,7 +560,8 @@ from typing import Any
 #: Vault BACKLOG #2954 (and #2956, which builds on it) merged with main after the #3189 / #3031
 #: entries above landed there (main at 440d71aaf, seam digest da529979e55cb966). #2956 moves no
 #: seam field itself. Re-derived with ``--write`` on that merged tree to 40dde1530423fece, which
-#: covered the entries above it at the time, not the #3316 or #3082 entries above it now.
+#: covered the entries above it at the time. It does not cover at least the #3316, #3082 and
+#: batch 257 (#3260) entries above it now.
 #:
 #: Vault BACKLOG #2954 / #2956 merged with main again after BACKLOG #3316 landed there (main at
 #: fc0d05e1b, seam digest 8b2fa06dd4c4938b; the branch at 40dde1530423fece). The #3316 entry

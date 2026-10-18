@@ -5697,15 +5697,17 @@ class AuthService:
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
         # (#2240), through the one shared comparison. Not through that helper, because its probe
-        # would change this leg's not_in_directory reason. Only a LOST role refuses; refusing
-        # writes nothing, and the reconciler or the next sign-in re-syncs the roles. Read after the
-        # directory round trip, as before, through the loader (BACKLOG #2592).
+        # would change this leg's not_in_directory reason. Only a LOST role refuses, or a role map
+        # that fails its seal, as DIRECTORY_ROLE_MAP_UNSEALED rather than a demotion (BACKLOG
+        # #3082). Refusing writes nothing; for a lost role the reconciler or the next sign-in
+        # re-syncs the roles. Read after the directory round trip, as before, through the loader
+        # (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await refuse("session_gone", lost=True)
-        lost = await self._directory_roles_lost(fresh.role_ids, principal.groups)
-        if lost is not None:
-            return await refuse(lost)
+        refusal = await self._directory_roles_lost(fresh.role_ids, principal.groups)
+        if refusal is not None:
+            return await refuse(refusal)
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
