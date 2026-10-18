@@ -528,10 +528,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # second confirm TOTP is already on, so the operator signs in with it, not enrols.
             return login_redirect_response()
         if elevation.token is None:
-            # A wrong code, or the login-to-MFA floor, which answers "Invalid code." on purpose
-            # (BACKLOG #2389). Two other refusals checked no code, so that answer would be false
-            # for them: the directory could not vouch for a directory account (BACKLOG #3061), or
-            # a second-step lock, said in /ui/reauth's words (BACKLOG #3810 finding 4).
+            # A wrong code answers "Invalid code.". So does the login-to-MFA floor, on purpose,
+            # though it refuses before the code is checked (BACKLOG #2389). Two other refusals also
+            # check no code, and for them that answer would be false: the directory could not
+            # vouch for a directory account (BACKLOG #3061), or a second-step lock, said in
+            # /ui/reauth's words (BACKLOG #3810 finding 4).
             error = _refusal_error(elevation, "Invalid code.")
             return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
