@@ -104,18 +104,38 @@ def test_trusted_proxies_host_bits_entry_is_refused_from_the_file(tmp_path: Path
 def test_trusted_proxies_host_bits_entry_is_refused_from_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #2488: the env form. ``MEFOR_API_TRUSTED_PROXIES`` is split on the path separator
-    before the validator runs, so each split entry meets the same strict parse. IPv4 only: on
-    Linux the separator is ``:``, which would split an IPv6 entry first."""
+    """BACKLOG #2488: the env form. ``MEFOR_API_TRUSTED_PROXIES`` is split on commas before the
+    validator runs, so each split entry meets the same strict parse."""
     monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
     env = {"MEFOR_API_TLS_TERMINATED_UPSTREAM": "true"}
-    refused = os.pathsep.join(["10.0.0.7", "10.0.0.1/24"])
+    refused = "10.0.0.7,10.0.0.1/24"
     with pytest.raises(ValidationError, match=re.escape("'10.0.0.1/24' has host bits set")):
         load_settings(environ={**env, "MEFOR_API_TRUSTED_PROXIES": refused})
     # Control: the network it meant loads through the same path.
-    accepted = os.pathsep.join(["10.0.0.7", "10.0.0.0/24"])
+    accepted = "10.0.0.7, 10.0.0.0/24"
     s = load_settings(environ={**env, "MEFOR_API_TRUSTED_PROXIES": accepted})
     assert s.api.trusted_proxies == ["10.0.0.7", "10.0.0.0/24"]
+
+
+def test_trusted_proxies_and_ws_origins_from_env_keep_their_colons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3042: both lists were split on ``os.pathsep``, which is ``:`` on POSIX, so an IPv6
+    proxy entry and an origin with a port came apart there. They split on commas now, as
+    ``MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS`` does, on every platform.
+
+    Mutation: put the two keys back on ``_split_roots``. Red on Linux: the IPv6 entry is shredded
+    into pieces the strict parse refuses; on Windows, the whole string is one entry."""
+    monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
+    s = load_settings(
+        environ={
+            "MEFOR_API_TLS_TERMINATED_UPSTREAM": "true",
+            "MEFOR_API_TRUSTED_PROXIES": "fd00::7, 10.0.0.7,fe80::/64",
+            "MEFOR_API_WS_ALLOWED_ORIGINS": "https://ops.example.test:8443,https://b.example.test",
+        }
+    )
+    assert s.api.trusted_proxies == ["fd00::7", "10.0.0.7", "fe80::/64"]
+    assert s.api.ws_allowed_origins == ["https://ops.example.test:8443", "https://b.example.test"]
 
 
 def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:

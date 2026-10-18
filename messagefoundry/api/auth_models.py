@@ -11,9 +11,9 @@ the two bases.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
@@ -137,6 +137,10 @@ class UserSummary(BaseModel):
     roles: list[str]
     #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
     #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
+    #: ``GET /users`` sends this and ``channel_scope_source`` only to a ``users:manage`` caller, the
+    #: tier ``GET /users/{id}/channel-scope`` reads on (BACKLOG #3189). Everyone else gets ``None``
+    #: for both and ``channel_scope_withheld`` True, so a reader never has to tell "no scope set"
+    #: from "not shown to you" by re-deriving the rule.
     channel_scope: list[str] | None = None
     #: Who last wrote ``channel_scope`` (BACKLOG #1958): ``"ad"`` for the AD login sync,
     #: ``"manual"`` for an administrator, ``None`` when no scope writer has run. The rule it decides
@@ -144,6 +148,11 @@ class UserSummary(BaseModel):
     #: a directory scope makes it manual. Typed ``str`` rather than the store's ``Literal`` so an
     #: older client reading a newer engine tolerates a value it has not learned yet.
     channel_scope_source: str | None = None
+    #: True when this summary leaves ``channel_scope`` and ``channel_scope_source`` out because the
+    #: caller may not read them (BACKLOG #3189), as ``AuditList.withheld`` does for rows. Both are then
+    #: ``None`` whatever is stored. False means they are the stored values, ``None`` included, and a
+    #: ``None`` scope then denies. REQUIRED, so every summary says which of the two a ``None`` means.
+    channel_scope_withheld: bool
     #: BACKLOG #1141 (ASVS 6.4.5): while the account still holds an admin-issued must-change
     #: credential, the Unix instant it stops working. The create-user response and the console's
     #: user page carry it, both behind users:manage, so the administrator who conveys the initial
@@ -225,6 +234,16 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+def _distinct_roles(roles: list[str]) -> list[str]:
+    """A repeated role is one grant (BACKLOG #2733). The store writes it once, so this keeps the
+    audit detail, the security notice and the reply from naming it twice. First-seen order."""
+    return list(dict.fromkeys(roles))
+
+
+#: A request's role list, with each role named once.
+RoleIds = Annotated[list[RoleId], AfterValidator(_distinct_roles)]
+
+
 class UserCreateRequest(RequestModel):
     """``POST /users``. THERE IS NO PASSWORD FIELD (ADR 0197 Amendment A, N-B2 part 1): the engine
     generates the new account's credential and returns it once, in :class:`UserCreatedResponse`.
@@ -239,7 +258,7 @@ class UserCreateRequest(RequestModel):
     #: service refuses a blank value or anything but one plain mailbox, with the check the PATCH
     #: route applies to ``notify_email``.
     email: str = Field(max_length=_NAME_MAX)
-    roles: list[RoleId] = Field(default=[], max_length=64)
+    roles: RoleIds = Field(default=[], max_length=64)
 
 
 class DirectoryUserCreateRequest(RequestModel):
@@ -271,7 +290,7 @@ class UserUpdateRequest(RequestModel):
 
 
 class RolesUpdateRequest(RequestModel):
-    roles: list[RoleId] = Field(max_length=64)
+    roles: RoleIds = Field(max_length=64)
 
 
 class ExpectedFederatedPair(RequestModel):
