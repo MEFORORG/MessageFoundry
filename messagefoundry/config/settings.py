@@ -3341,7 +3341,9 @@ class AuthSettings(_Section):
     # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
     # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
-    ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
+    # seconds — bound each LDAP response read (bind + search), and all the pages of the paged
+    # nested group search together (vault BACKLOG #3696)
+    ad_receive_timeout: float = 10.0
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) -------------------------------
     # Disabling an account in AD does NOT terminate its live engine session: once an opaque token is

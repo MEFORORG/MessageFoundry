@@ -12,8 +12,9 @@ All calls here are **synchronous**; :class:`~messagefoundry.auth.service.AuthSer
 so the only bound on an unresponsive domain controller is the pair of finite ``ldap3`` timeouts every
 ``Server``/``Connection`` here is constructed with — ``[auth].ad_connect_timeout`` (the TCP connect) and
 ``[auth].ad_receive_timeout`` (each LDAP response read), both defaulting to 10 s (ASVS 13.1.3). ldap3's
-own defaults are ``None`` on both, i.e. wait forever. ``ldap3``/``spnego`` are imported lazily so a
-local-only deployment never touches them.
+own defaults are ``None`` on both, i.e. wait forever. The paged nested group search also spends one
+``ad_receive_timeout`` across all its pages (:func:`_search_paged`, BACKLOG #3696).
+``ldap3``/``spnego`` are imported lazily so a local-only deployment never touches them.
 
 **No referral is followed, and one is refused** (BACKLOG #2530); :func:`_refuse_referral` says why.
 **A search that ends with any result code but success is refused too** (BACKLOG #3010), never read
@@ -1174,7 +1175,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
             for page in range(_MAX_PAGES):
                 remaining = deadline - _monotonic()
                 if remaining <= 0:
-                    break
+                    break  # refused after the with, outside the except that abandons
                 cap(remaining)
                 _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
                 entries.extend(conn.entries)
@@ -1216,7 +1217,7 @@ def _receive_timeout_capped(conn: Any) -> Iterator[Callable[[float], None]]:
     ``settimeout`` governs every read that follows on every OS; the ``SO_RCVTIMEO`` ldap3 also sets
     applies only to a blocking socket. Never lengthens it. A connection with no socket, such as a
     test double, is left alone. ldap3 closes the socket and drops it when a read fails, so the
-    restore reads the socket again and tolerates one already closed.
+    restore tolerates one already closed.
     """
     sock = getattr(conn, "socket", None)
     original = sock.gettimeout() if sock is not None else None
@@ -1228,8 +1229,7 @@ def _receive_timeout_capped(conn: Any) -> Iterator[Callable[[float], None]]:
     try:
         yield cap
     finally:
-        current = getattr(conn, "socket", None)
-        if current is sock and sock is not None:
+        if sock is not None:
             with contextlib.suppress(OSError):
                 sock.settimeout(original)
 
@@ -1244,7 +1244,9 @@ def _abandon_paging(
     A finding of BACKLOG #3010's review. ``cookie`` is the newest non-empty one the directory sent;
     with none, it never held state for this search and nothing is sent. Best effort: the search is
     refused whatever this answers, so a failed abandon is not raised: a refusal of it is warned once
-    by :func:`_search`, and an ldap3 error from it is logged at debug level. It costs one more round trip, which can take up to ``[auth].ad_receive_timeout``.
+    by :func:`_search`, and an ldap3 error from it is logged at debug level. It costs one more
+    round trip, whose reads wait at most what the paged search's deadline had left when the
+    refused page was asked for (BACKLOG #3696).
     """
     import ldap3
 

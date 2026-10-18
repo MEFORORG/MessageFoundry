@@ -676,6 +676,10 @@ def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout() ->
     assert all(value is not None and value <= 10.0 for value in conn.socket.set), "never lengthened"
 
 
+_ENTRY = object()
+"""One entry, repeated: the entry-cap tests count entries and never read one."""
+
+
 def _pages_of(total: int, size: int) -> list[dict[str, Any]]:
     """``total`` entries in pages of ``size``, as a directory with that MaxPageSize returns them:
     a cookie on every page but the last, which carries an empty one."""
@@ -683,7 +687,7 @@ def _pages_of(total: int, size: int) -> list[dict[str, Any]]:
     return [
         _page(
             RESULT_SUCCESS,
-            [object() for _ in range(count)],
+            [_ENTRY] * count,
             b"" if n == len(counts) - 1 else f"synthetic-cookie-{n}".encode(),
         )
         for n, count in enumerate(counts)
