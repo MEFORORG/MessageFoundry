@@ -61,6 +61,7 @@ from messagefoundry.auth.ldap import (
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
+    LdapUndecodableError,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -375,6 +376,30 @@ def _unreached_directory(exc: Exception) -> bool:
     return (isinstance(exc.errno, int) and exc.errno in _UNREACHED_ERRNOS) or (
         isinstance(winerror, int) and winerror in _UNREACHED_WINERRORS
     )
+
+
+def _fault_probe(user: UserRecord, exc: Exception) -> reconcile.Probe:
+    """``user``'s probe read as :attr:`~reconcile.ProbeOutcome.FAULT` (BACKLOG #3100).
+
+    Logs at :data:`_PROBE_FAULT_LOG_LEVEL` on every probe, by account name, so the alert's operator
+    can find the account. The line names the exception type only: the message can quote a directory
+    value, which ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
+    The level is WARNING for the reconciler and step-up. The certificate path lowers it to DEBUG in
+    its own task's context (BACKLOG #2316): it probes per request, not per pass, and logs the fault
+    per account at most once a minute instead (``_note_cert_probe_fault``).
+    ``AuthService._probe_principal`` says which errors reach this, and why each is a fault.
+    """
+    kind = type(exc).__name__
+    _PROBE_FAULT_KIND.set(kind)
+    _log.log(
+        _PROBE_FAULT_LOG_LEVEL.get(),
+        "directory probe of %s raised %s; read as a probe fault, so this account's "
+        "sessions are not revoked and its step-up is refused while this repeats",
+        user.username,
+        kind,
+    )
+    _log.debug("directory probe of %s raised", user.username, exc_info=exc)
+    return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.FAULT, detail=kind)
 
 
 #: Outcomes the directory itself gave. Any of them ends a logged outage.
@@ -6473,6 +6498,17 @@ class AuthService:
             return reconcile.Probe(
                 user.id, user.username, reconcile.ProbeOutcome.REFERRED, detail=str(exc)
             )
+        except LdapUndecodableError as exc:
+            # Vault BACKLOG #3696 item 2. Ahead of LdapError, which it subclasses. ldap3 could not
+            # decode what the directory sent, on any read this probe makes: the service bind, the
+            # user search or a page of the group search. Before #3010 that fault escaped ldap.py
+            # as ldap3's own KeyError or TypeError and reached the broad arm below, which reads
+            # FAULT and pages; read as UNAVAILABLE it would page nobody, and a directory that sends
+            # it on every pass would stop this account's revocation with no page. The directory
+            # answered, so it is not an outage. FAULT never strikes or revokes, as below. A bind
+            # answered with a referral is not this: ldap.py raises LdapReferralError for it, which
+            # the arm above reads as REFERRED (vault BACKLOG #3697 step 2).
+            return _fault_probe(user, exc)
         except LdapError as exc:
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
             # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
@@ -6518,27 +6554,9 @@ class AuthService:
             # account, so it must not strike; and UNDETERMINED would move the ADR 0195 hold. The
             # price is that an account whose entry raises every time is never revoked by the
             # reconciler while that lasts, so its sessions run to the absolute cap, which is the only
-            # bound. The alert makes the gap visible rather than silent; it limits nothing. This
-            # also logs at WARNING on every
-            # probe, by name, so the alert's operator can find the account. CancelledError is not
-            # an Exception. The WARNING names the type only: the message can quote a directory
-            # value, which ldap.py never logs. The traceback, with the message, goes to DEBUG for
-            # diagnosis. The certificate path lowers this to DEBUG in its own task's context
-            # (BACKLOG #2316): it probes per request, not per pass, and logs the fault per account
-            # at most once a minute instead (`_note_cert_probe_fault`).
-            kind = type(exc).__name__
-            _PROBE_FAULT_KIND.set(kind)
-            _log.log(
-                _PROBE_FAULT_LOG_LEVEL.get(),
-                "directory probe of %s raised %s; read as a probe fault, so this account's "
-                "sessions are not revoked and its step-up is refused while this repeats",
-                user.username,
-                kind,
-            )
-            _log.debug("directory probe of %s raised", user.username, exc_info=True)
-            return reconcile.Probe(
-                user.id, user.username, reconcile.ProbeOutcome.FAULT, detail=kind
-            )
+            # bound. The alert makes the gap visible rather than silent; it limits nothing.
+            # `_fault_probe` says what it logs. CancelledError is not an Exception.
+            return _fault_probe(user, exc)
         principal = probe.principal
         if principal is None:
             return reconcile.Probe(user.id, user.username, _REFUSED_OUTCOMES[probe.answer])
