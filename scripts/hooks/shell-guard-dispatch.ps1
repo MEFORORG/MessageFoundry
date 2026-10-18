@@ -40,10 +40,11 @@
     because a guard that ran long after a deny could push the hook past its timeout, and a hook
     that times out lets the command run -- an already-reached deny turned into an allow. The cost
     is that a command two guards would refuse shows one reason, and the retry shows the other.
-    A guard that leaves $LASTEXITCODE at 2 is read as Claude Code's blocking exit and passed on;
-    its stderr already went to this process's stderr. In-process, `exit 2` and a native command
-    that exited 2 look the same, so a guard that runs one would block here where it allowed
-    alone: a false deny, which is the visible direction. The guards wired today run none.
+    A guard's `exit 2` is read as Claude Code's blocking exit and passed on; its stderr already
+    went to this process's stderr. An exit is told apart from a native command's code by `$?`:
+    measured 2026-10-17, `$?` after `& script` is false only when the script ran `exit N` with N
+    non-zero, and stays true after a git call that failed or a Write-Error. $LASTEXITCODE alone
+    cannot tell them apart, and worktree_gate.ps1 runs git.
     A non-deny decision (`ask`, `allow`) is kept, the first one wins, and it is written once every
     guard has run.
 
@@ -53,12 +54,32 @@
     error Claude Code showed for a separate guard process that failed to start or crashed, so a
     broken guard is still reported rather than silently off.
 
-    ORDER IS THE SETTINGS FILE'S, AND THE BOUNDED GUARD GOES FIRST. block-blanket-git-stage.ps1
-    refuses an over-long payload, so placing it first keeps a huge payload from reaching the two
-    guards that parse whatever they are given. That guard's own read stops at its cap, but THIS
-    file reads all of stdin first, so on the wired path the read itself is not bounded; only the
-    parse is. The timeout in settings.json is the three guards' former per-guard timeouts summed,
-    so a run in which every guard finishes inside its old budget still finishes inside this one.
+    `--user-hook=worktree_gate` RUNS THE GATE THE ACCOUNT INSTALLED, AND PROVES IT RAN, PER CALL.
+    It names ~/.claude/hooks/worktree_gate.ps1, where scripts/worktree/install-gate.ps1 puts the
+    gate, and runs it only when this account DELEGATES it: the account's settings.json
+    ($env:CLAUDE_CONFIG_DIR, else ~/.claude) contains `shell-guard-proof`, which the installer
+    writes into the account's own Bash|PowerShell entry. That entry still runs for every call, in
+    parallel with this file. It stands down only when it finds, in
+    <account>/shell-guard-proof/, a proof named by THIS call's tool_use_id, written after it started
+    waiting, holding this session's id. This file writes that proof (`<tool_use_id>.ok`) only when
+    the gate it ran for this payload finished normally with nothing on stdout -- a silent allow.
+    Anything else (a decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which
+    tells the entry to stop waiting and run the gate itself. So a missing, failing or slow copy of
+    this file leaves the account's entry running the gate; install-gate.ps1 says how it waits.
+    `<session id>.session` tells the entry that this session's dispatcher runs the gate at all, so
+    a project without this file costs no wait. It is a hint, never a proof: forged or stale, it
+    only makes the entry wait before running the gate. An account that does not delegate runs the
+    gate itself, and this file skips it.
+
+    ORDER IS THE SETTINGS FILE'S: THE WORKTREE GATE FIRST, THEN THE BOUNDED GUARD. The account's
+    entry is waiting on the gate's proof, so the gate must not queue behind guards that could use
+    up the wait. It parsed whatever it was given when it ran alone, so going first costs it
+    nothing. block-blanket-git-stage.ps1 comes next: it refuses an over-long payload, which keeps a
+    huge payload from the two guards after it that parse whatever they are given. That guard's own
+    read stops at its cap, but THIS file reads all of stdin first, so on the wired path the read
+    itself is not bounded; only the parse is. The timeout in settings.json is the guards' former
+    per-guard timeouts summed, so a run in which every guard finishes inside its old budget still
+    finishes inside this one.
 
     WIRING IS NOT ASSERTED HERE ON PURPOSE. Which guards run is a property of settings.json.
     ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -79,35 +100,124 @@ function Write-ShellGuardFailure([string]$Path, [string]$Why) {
     [Console]::Error.WriteLine("shell-guard-dispatch: guard '$Path' failed open: $Why")
 }
 
+$ShellGuardHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$ShellGuardAccount = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $ShellGuardHome '.claude' }
+$ShellGuardProofDir = Join-Path $ShellGuardAccount 'shell-guard-proof'
+# The same patterns the account's bash entry uses, so both name the same files; a payload they read
+# differently only costs the entry its wait.
+$ShellGuardSession = if ($ShellGuardPayload -cmatch '"session_id"\s*:\s*"(?<v>[A-Za-z0-9-]{1,100})"') { $Matches['v'] } else { $null }
+$ShellGuardCall = if ($ShellGuardPayload -cmatch '"tool_use_id"\s*:\s*"(?<v>[A-Za-z0-9_-]{1,100})"') { $Matches['v'] } else { $null }
+# Scoping is dynamic, so a guard reading $Matches before its own first match would see ours.
+$Matches = $null
+
+function Write-ShellGuardProof([string]$Kind) {
+    # Kind 'ok' stands the account's entry down for this call; 'run' tells it to run the gate now.
+    if (-not $ShellGuardSession -or -not $ShellGuardCall) { return }
+    try {
+        $final = Join-Path $ShellGuardProofDir "$ShellGuardCall.$Kind"
+        $part = "$final.$PID.tmp"
+        # Written whole, then renamed, so the entry never reads a half-written proof.
+        [System.IO.File]::WriteAllText($part, "$ShellGuardSession`n")
+        [System.IO.File]::Move($part, $final)
+    } catch {
+        # No proof only costs the entry its own run of the gate.
+        [Console]::Error.WriteLine("shell-guard-dispatch: could not write the gate's proof: $($_.Exception.Message)")
+    }
+}
+
+function Clear-ShellGuardProofs {
+    # Every call leaves files behind, so prune at most every 10 minutes: proofs and waits older
+    # than that, and session hints older than 30 days. A session older than that only waits.
+    try {
+        $stamp = Join-Path $ShellGuardProofDir 'pruned'
+        $calls = [DateTime]::UtcNow.AddMinutes(-10)
+        # A missing stamp reads as 1601, so it prunes.
+        if ([System.IO.File]::GetLastWriteTimeUtc($stamp) -gt $calls) { return }
+        [System.IO.File]::WriteAllText($stamp, '')
+        $sessions = [DateTime]::UtcNow.AddDays(-30)
+        foreach ($f in [System.IO.Directory]::GetFiles($ShellGuardProofDir)) {
+            $cutoff = if ($f.EndsWith('.session')) { $sessions } else { $calls }
+            if ([System.IO.File]::GetLastWriteTimeUtc($f) -lt $cutoff) {
+                try { [System.IO.File]::Delete($f) } catch { $null = $_ }
+            }
+        }
+    } catch {
+        $null = $_
+    }
+}
+
 $ShellGuardFailed = $false
 $ShellGuardKept = $null
 # With no arguments the parameter is $null, and @($null) is one empty entry, not none.
 foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
-    if (-not (Test-Path -LiteralPath $ShellGuardPath -PathType Leaf)) {
-        Write-ShellGuardFailure $ShellGuardPath 'no such file'
+    # Non-null only for the gate: the proof its run leaves for the account's entry.
+    $ShellGuardProof = $null
+    if ($ShellGuardPath -ceq '--user-hook=worktree_gate') {
+        $ShellGuardPath = Join-Path $ShellGuardHome '.claude/hooks/worktree_gate.ps1'
+        $ShellGuardHint = if ($ShellGuardSession) { Join-Path $ShellGuardProofDir "$ShellGuardSession.session" } else { $null }
+        $ShellGuardDelegated = $false
+        try {
+            $ShellGuardDelegated = [System.IO.File]::ReadAllText((Join-Path $ShellGuardAccount 'settings.json')).Contains('shell-guard-proof')
+        } catch {
+            # No readable account settings: nothing delegates, so the gate is not this run's.
+            $null = $_
+        }
+        if (-not $ShellGuardDelegated) {
+            # An entry still waiting on this session's hint is told to stop waiting.
+            if ($ShellGuardHint -and (Test-Path -LiteralPath $ShellGuardHint)) {
+                Write-ShellGuardProof 'run'
+                try { [System.IO.File]::Delete($ShellGuardHint) } catch { $null = $_ }
+            }
+            continue
+        }
+        $ShellGuardProof = 'run'
+        if ($ShellGuardHint) {
+            try {
+                $null = [System.IO.Directory]::CreateDirectory($ShellGuardProofDir)
+                if (-not (Test-Path -LiteralPath $ShellGuardHint)) { [System.IO.File]::WriteAllText($ShellGuardHint, '') }
+                Clear-ShellGuardProofs
+            } catch {
+                [Console]::Error.WriteLine("shell-guard-dispatch: could not record the session hint: $($_.Exception.Message)")
+            }
+        }
+    } elseif ($ShellGuardPath.StartsWith('--')) {
+        Write-ShellGuardFailure $ShellGuardPath 'unknown option'
         $ShellGuardFailed = $true
         continue
     }
-    $ShellGuardBuffer = [System.IO.StringWriter]::new()
-    $global:LASTEXITCODE = 0
     try {
-        [Console]::SetIn([System.IO.StringReader]::new($ShellGuardPayload))
-        [Console]::SetOut($ShellGuardBuffer)
-        $null = & $ShellGuardPath
-    } catch {
-        Write-ShellGuardFailure $ShellGuardPath $_.Exception.Message
-        $ShellGuardFailed = $true
-        continue
+        if (-not (Test-Path -LiteralPath $ShellGuardPath -PathType Leaf)) {
+            Write-ShellGuardFailure $ShellGuardPath 'no such file'
+            $ShellGuardFailed = $true
+            continue
+        }
+        $ShellGuardBuffer = [System.IO.StringWriter]::new()
+        $global:LASTEXITCODE = 0
+        try {
+            [Console]::SetIn([System.IO.StringReader]::new($ShellGuardPayload))
+            [Console]::SetOut($ShellGuardBuffer)
+            $null = & $ShellGuardPath
+            $ShellGuardCompleted = $?
+        } catch {
+            Write-ShellGuardFailure $ShellGuardPath $_.Exception.Message
+            $ShellGuardFailed = $true
+            continue
+        } finally {
+            [Console]::SetOut($ShellGuardStdout)
+        }
+        if (-not $ShellGuardCompleted) {
+            if ($LASTEXITCODE -eq 2) { exit 2 }
+            Write-ShellGuardFailure $ShellGuardPath "exit code $LASTEXITCODE"
+            $ShellGuardFailed = $true
+            continue
+        }
+        $ShellGuardOutput = $ShellGuardBuffer.ToString()
+        # A silent allow, and nothing else, is the gate's verdict the account's entry may stand on.
+        if ($ShellGuardProof -and -not $ShellGuardOutput) { $ShellGuardProof = 'ok' }
     } finally {
-        [Console]::SetOut($ShellGuardStdout)
+        # Every way out of the gate's run -- continue, exit 2, a throw -- writes its proof first.
+        if ($ShellGuardProof) { Write-ShellGuardProof $ShellGuardProof }
     }
-    if ($LASTEXITCODE -eq 2) { exit 2 }
-    if ($LASTEXITCODE -ne 0) {
-        Write-ShellGuardFailure $ShellGuardPath "exit code $LASTEXITCODE"
-        $ShellGuardFailed = $true
-        continue
-    }
-    $ShellGuardOutput = $ShellGuardBuffer.ToString()
     if (-not $ShellGuardOutput.Trim()) { continue }
     $ShellGuardVerdict = $null
     try {

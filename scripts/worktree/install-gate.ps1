@@ -1148,6 +1148,83 @@ if ((Get-GateHash $GateDst) -ne $checkedSha) {
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
 
+# THE SHELL MATCHER RUNS THE GATE UNLESS IT HOLDS PROOF THAT THE GATE ALREADY RAN FOR THIS CALL.
+# A project whose settings.json passes `--user-hook=worktree_gate` to
+# scripts/hooks/shell-guard-dispatch.ps1 runs this gate inside the one pwsh it starts for its own
+# guards. Hooks run in parallel, so this entry cannot see that run; it waits for its proof instead.
+# The proof is <account>/shell-guard-proof/<tool_use_id>.ok, holding the session id, which the
+# dispatcher writes only after the gate it ran for this very payload allowed it silently. This entry
+# stands down only when that file exists, holds this session's id, and is NEWER than the
+# <tool_use_id>.wait file this entry wrote when it began waiting. In every other case it runs the
+# gate itself, as it did before:
+#   * no dispatcher ran (another project, an old checkout, a missing or broken dispatcher): no
+#     proof, so the wait ends and the gate runs;
+#   * the dispatcher's gate denied, decided, exited or threw: it writes <tool_use_id>.run, and the
+#     gate runs here at once;
+#   * the dispatcher is slow: the wait ends after 20 s and the gate runs here;
+#   * a proof written before this call's wait began (a stale file, or one planted for an id read
+#     early from the transcript) fails the NEWER-than test, and the gate runs.
+# A tool_use_id is new for every call, so a proof cannot be reused for another. What this does not
+# stop is a process that sits waiting for this call's .wait file and writes the .ok at once; that is
+# a deliberate evasion running under the same user, which can edit this settings file outright.
+#
+# <session id>.session is the dispatcher's hint that this session's project runs the gate. Without
+# it the entry does not wait at all, so a project with no dispatcher pays nothing. The hint never
+# stands the gate down: forged or stale, it only buys a wait before the gate runs. The project's own
+# settings.json must also carry `--user-hook=worktree_gate`, for the same reason.
+#
+# TIMEOUTS, AND WHY A FAILURE HERE BLOCKS. The wait is 20 s at most and the hook's timeout is 60 s, so
+# the gate keeps at least 40 s after the longest wait, against the 15 s this entry used to give it.
+# onFailure = block makes this entry's OWN failure a refusal, not a silent allow: if bash cannot
+# start, or the entry and the gate together run past 60 s, the call is blocked rather than left
+# ungated. That is stricter than before, when a gate past 15 s failed open; it now blocks, and only
+# past 40 s. A gate that crashes still fails open, as it always did, because the entry maps the
+# gate's exit other than 0 or 2 to an allow with a systemMessage saying so; a blocking exit 2 is
+# passed on. The gate is not wrapped in `timeout` or captured with $(...): measured, each added
+# about 0.2 s of wall time to every call that runs the gate here. (A bare `timeout` is worse than
+# slow: a bash started without Git's /usr/bin on PATH resolved it to C:\Windows\System32\
+# timeout.exe, which exited 1 without running the gate.)
+#
+# COST, measured 2026-10-17 on mefordev01; the PR that added this records the instrument and numbers.
+# The wait reads with `read -t` on a pseudo-terminal nobody writes to, which sleeps without starting
+# a process; where /dev/ptmx cannot be opened, the entry runs the gate at once.
+# Single-quoted in bash below, so a quote in the profile path is closed, escaped and reopened.
+$gateForBash = $GateDst.Replace('\', '/').Replace("'", "'\''")
+$shellEntry = @'
+# worktree_gate.ps1 for shell tool calls: stands down only on this call's shell-guard-proof.
+# scripts/worktree/install-gate.ps1 says why each check is here.
+g='__GATE__'
+IFS= read -r -d '' in
+d=${CLAUDE_CONFIG_DIR:-$USERPROFILE/.claude}/shell-guard-proof
+if [[ $in =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]{1,100})\" ]]; then
+  s=${BASH_REMATCH[1]}
+  if [[ -e $d/$s.session && $in =~ \"tool_use_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]{1,100})\" ]]; then
+    t=${BASH_REMATCH[1]} ps=
+    { IFS= read -r -d '' ps < "$CLAUDE_PROJECT_DIR/.claude/settings.json"; } 2>/dev/null
+    if [[ $ps == *--user-hook=worktree_gate* ]] && { : > "$d/$t.wait" && exec {w}<>/dev/ptmx; } 2>/dev/null; then
+      e=$(( ${EPOCHREALTIME//[!0-9]/} + 20000000 ))
+      for (( i = 0; i < 400; i++ )); do
+        if [[ -e $d/$t.ok ]]; then
+          p=
+          IFS= read -r p < "$d/$t.ok"
+          [[ $d/$t.ok -nt $d/$t.wait && $p == "$s" ]] && exit 0
+          break
+        fi
+        [[ -e $d/$t.run ]] && break
+        (( ${EPOCHREALTIME//[!0-9]/} < e )) || break
+        read -t 0.05 -u "$w"
+      done
+      exec {w}>&-
+    fi
+  fi
+fi
+pwsh -NoProfile -File "$g" <<< "$in"
+r=$?
+(( r == 0 || r == 2 )) && exit "$r"
+printf '{"systemMessage":"worktree_gate.ps1 exited %s and failed open for this call"}\n' "$r"
+exit 0
+'@.Replace('__GATE__', $gateForBash).Replace("`r`n", "`n")
+
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
 # matched here NEVER FIRES -- the hook is simply not invoked for that tool, and nothing says so. Rule 3
 # shipped in exactly that state. tests/test_install_gate_wiring.py now asserts that every tool the script
@@ -1165,14 +1242,21 @@ if ($EnterWorktreeGate) {
 }
 
 $entries = foreach ($m in $matchers) {
+    $hook = [ordered]@{
+        type          = "command"
+        command       = $command
+        timeout       = 15
+        statusMessage = "Checking worktree gate"
+    }
+    if ($m -ceq "Bash|PowerShell") {
+        $hook.command = $shellEntry
+        $hook.shell = "bash"
+        $hook.timeout = 60
+        $hook.onFailure = "block"
+    }
     [ordered]@{
         matcher = $m
-        hooks   = @([ordered]@{
-            type          = "command"
-            command       = $command
-            timeout       = 15
-            statusMessage = "Checking worktree gate"
-        })
+        hooks   = @($hook)
     }
 }
 
