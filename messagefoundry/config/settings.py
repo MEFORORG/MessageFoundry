@@ -3341,8 +3341,8 @@ class AuthSettings(_Section):
     # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
     # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
-    # seconds — bound each LDAP response read (bind + search), and all the pages of the paged
-    # nested group search together (vault BACKLOG #3696)
+    # seconds — bound each LDAP response read (bind + search); also the paged group search's
+    # overall deadline (auth/ldap.py _search_paged, vault BACKLOG #3696)
     ad_receive_timeout: float = 10.0
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) -------------------------------
@@ -8635,7 +8635,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
             (
                 "ad_receive_timeout",
-                "the LDAP response-read timeout (applied rounded up to a whole second)",
+                "the LDAP response-read timeout and the paged group search's overall deadline "
+                "(each applied rounded up to a whole second)",
             ),
         ):
             value, default = getattr(auth, field), _auth_default(field)

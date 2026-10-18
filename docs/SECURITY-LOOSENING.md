@@ -763,11 +763,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > row in the table above gives what the load refuses.
 - **What you lose:** each directory call runs in a worker thread until the domain controller answers
   or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
-  wait on several connects and reads, each bounded on its own. With a longer timeout, a controller
+  wait on several connects and reads, each bounded on its own. `ad_receive_timeout` is also the
+  deadline the pages of the nested group search share, so raising it lengthens that search too
+  (vault BACKLOG #3696). With a longer timeout, a controller
   that has stopped answering holds each thread longer, so stalled calls tie up the thread pool that
   sign-in shares for longer.
 - **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
-  for a healthy round trip.
+  for a healthy round trip, or for a healthy nested group search of the largest account.
 - **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
   how many start per window, not how many are held, and a session recheck does not pass it. So
   raise the timeout only as far as the measured round trip needs.

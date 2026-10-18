@@ -31,7 +31,7 @@ import ssl
 import struct
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from types import FrameType
@@ -1143,95 +1143,124 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
     is never used as the whole. Unpaged, an account in more groups than the cap would end the
     nested group search with sizeLimitExceeded, which that refusal turns into a failed sign-in.
 
-    **A first page with no readable control is the whole answer**: the control is sent
-    non-critical, so a directory may ignore it, and that answer either is complete or ends with a
-    code :func:`_refuse_unanswered` refuses. **A later page with none is refused**: the directory
-    was paging, and a page that does not say whether it is the last cannot be read as the last.
+    **A first page with no readable control is the whole answer**, under the entry cap below: the
+    control is sent non-critical, so a directory may ignore it, and that answer either is complete
+    or ends with a code :func:`_refuse_unanswered` refuses. **A later page with none is refused**:
+    the directory was paging, and a page that does not say whether it is the last cannot be read
+    as the last.
 
     **All the pages share one deadline, ``budget`` seconds** (BACKLOG #3696 item 3). Each page's
-    reads wait at most what is left of it (:func:`_receive_timeout_capped`), and no page is asked
-    for once it is spent: the search is refused. Without it, every page could take the whole
-    ``[auth].ad_receive_timeout``, so the bound was that times the page count. The bound is on the
-    wait between bytes, not on one page's total, so a directory sending a page a byte at a time
-    can overrun it by up to one page; the deadline then refuses the next.
+    reads wait at most what is left of it (:class:`_SocketTimeoutCap`), and no page is asked for
+    once it is spent. A read that waits out the deadline, or a deadline spent between pages, is
+    refused as ``deadline spent``. Without it, every page could take the whole
+    ``[auth].ad_receive_timeout``, so the bound was that times the page count. What the bound
+    does not cover is in ``docs/CONNECTIONS.md``, the Active Directory row of the timeout table.
 
     **More than :data:`_MAX_PAGED_ENTRIES` entries refuses the search** (BACKLOG #3696 item 4),
-    whatever size the directory's pages are; :data:`_MAX_PAGES` is a backstop behind it.
+    whatever size the directory's pages are, one page included; :data:`_MAX_PAGES` is a backstop.
 
     **A refused search is abandoned** (:func:`_abandon_paging`) once the directory has sent a
     cookie, so it need not hold the paging state until its own timeout. Not after a response ldap3
     could not decode: the stream may be out of step after one, so no abandon is sent on it, and
-    the directory holds the paging state until its own timeout or the connection ends. **Nor when
-    the deadline is spent**: an abandon is one more round trip, which would break the bound. The
+    the directory holds the paging state until its own timeout or the connection ends. **Nor once
+    the deadline is spent**: an abandon is one more round trip, so it gets only what is left. The
     caller unbinds the connection as its block ends (``_service_session``), and that drops the
     state too.
     """
+    import ldap3
+
     entries: list[Any] = []
     cookie: bytes | None = None  # what the next page is asked with
     newest: bytes | None = None  # the newest non-empty cookie the directory sent
     deadline = _monotonic() + budget
-    with _receive_timeout_capped(conn) as cap:
-        try:
-            for page in range(_MAX_PAGES):
-                remaining = deadline - _monotonic()
-                if remaining <= 0:
-                    break  # refused after the with, outside the except that abandons
-                cap(remaining)
+    timeout = _SocketTimeoutCap(conn)
+    out_of_time = False
+
+    def spent() -> LdapUnansweredError:
+        nonlocal out_of_time
+        out_of_time = True
+        return _paging_refused(
+            operation, "deadline spent", f"did not finish paging within {budget:g} s"
+        )
+
+    try:
+        for page in range(_MAX_PAGES):
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise spent()
+            shortened = timeout.cap(remaining)
+            try:
                 _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
-                entries.extend(conn.entries)
-                cookie = _paged_cookie(conn)
-                if cookie is None and page:
-                    raise _paging_refused(
-                        operation, "paging control lost", "dropped the paging control"
-                    )
-                if len(entries) > _MAX_PAGED_ENTRIES:
-                    # Only this page's cookie is live: after a last page the directory holds no
-                    # state, and an older cookie would ask it to drop state it already dropped.
-                    newest = None
-                    raise _paging_refused(
-                        operation,
-                        "too many entries",
-                        f"returned more than {_MAX_PAGED_ENTRIES:,} entries",
-                    )
-                if not cookie:
-                    return entries
-                newest = cookie
-            else:
+            except ldap3.core.exceptions.LDAPSocketReceiveError as exc:
+                # ldap3 merges the socket's own exception into its class, so a read that waited
+                # out the deadline rather than the receive timeout is a TimeoutError here.
+                if shortened and isinstance(exc, TimeoutError):
+                    raise spent() from exc
+                raise
+            entries.extend(conn.entries)
+            cookie = _paged_cookie(conn)
+            if cookie is None and page:
                 raise _paging_refused(
-                    operation, "too many pages", f"was still paging after {_MAX_PAGES} pages"
+                    operation, "paging control lost", "dropped the paging control"
                 )
-        except (LdapUnansweredError, LdapReferralError):
+            if len(entries) > _MAX_PAGED_ENTRIES:
+                # Only this page's cookie is live: after a last page the directory holds no
+                # state, and an older cookie would ask it to drop state it already dropped.
+                newest = None
+                raise _paging_refused(
+                    operation,
+                    "too many entries",
+                    f"returned more than {_MAX_PAGED_ENTRIES:,} entries",
+                )
+            if not cookie:
+                return entries
+            newest = cookie
+        raise _paging_refused(
+            operation, "too many pages", f"was still paging after {_MAX_PAGES} pages"
+        )
+    except (LdapUnansweredError, LdapReferralError):
+        remaining = deadline - _monotonic()
+        if not out_of_time and remaining > 0:
             # The refusing page was read, so the stream is in step and a cookie in it is readable.
+            timeout.cap(remaining)
             _abandon_paging(conn, operation, _paged_cookie(conn) or newest, kwargs)
-            raise
-    raise _paging_refused(operation, "deadline spent", f"did not finish paging within {budget:g} s")
+        raise
+    finally:
+        timeout.restore()
 
 
-@contextlib.contextmanager
-def _receive_timeout_capped(conn: Any) -> Iterator[Callable[[float], None]]:
-    """Yield ``cap(seconds)``, which shortens ``conn``'s socket receive timeout to at most
-    ``seconds``, and restore the timeout the socket had when the block ends.
+class _SocketTimeoutCap:
+    """Shortens ``conn``'s socket receive timeout for a paged search, and restores it after.
 
     BACKLOG #3696 item 3. ldap3 applies ``receive_timeout`` once, when it opens the socket, through
     ``socket.settimeout``, which leaves the socket non-blocking under Python's own poll, so a later
     ``settimeout`` governs every read that follows on every OS; the ``SO_RCVTIMEO`` ldap3 also sets
-    applies only to a blocking socket. Never lengthens it. A connection with no socket, such as a
-    test double, is left alone. ldap3 closes the socket and drops it when a read fails, so the
-    restore tolerates one already closed.
+    applies only to a blocking socket. A connection with no socket, such as a test double, is left
+    alone.
     """
-    sock = getattr(conn, "socket", None)
-    original = sock.gettimeout() if sock is not None else None
 
-    def cap(seconds: float) -> None:
-        if sock is not None:
-            sock.settimeout(seconds if original is None else min(original, seconds))
+    def __init__(self, conn: Any) -> None:
+        self._sock: Any = getattr(conn, "socket", None)
+        self._original: float | None = self._sock.gettimeout() if self._sock is not None else None
 
-    try:
-        yield cap
-    finally:
-        if sock is not None:
-            with contextlib.suppress(OSError):
-                sock.settimeout(original)
+    def cap(self, seconds: float) -> bool:
+        """Bound each read to at most ``seconds``, never longer than the socket's own timeout.
+        Returns whether ``seconds`` is now the bound, rather than that timeout."""
+        if self._sock is None:
+            return False
+        shortened = self._original is None or seconds < self._original
+        self._sock.settimeout(seconds if shortened else self._original)
+        return shortened
+
+    def restore(self) -> None:
+        """Put the socket's own timeout back. ldap3 closes the socket when a read fails, and
+        ``settimeout`` on a closed one raises, which is logged and is no fault: nothing reads it."""
+        if self._sock is None:
+            return
+        try:
+            self._sock.settimeout(self._original)
+        except OSError as failed:
+            logger.debug("AD socket timeout restore after a paged search: %s", _type_name(failed))
 
 
 def _abandon_paging(
@@ -1245,8 +1274,8 @@ def _abandon_paging(
     with none, it never held state for this search and nothing is sent. Best effort: the search is
     refused whatever this answers, so a failed abandon is not raised: a refusal of it is warned once
     by :func:`_search`, and an ldap3 error from it is logged at debug level. It costs one more
-    round trip, whose reads wait at most what the paged search's deadline had left when the
-    refused page was asked for (BACKLOG #3696).
+    round trip, whose reads wait at most what is left of the paged search's deadline, and it is
+    not sent once that is spent (BACKLOG #3696).
     """
     import ldap3
 
@@ -1875,12 +1904,12 @@ class LdapAuthenticator:
             # A search the directory did not finish raises here (BACKLOG #3010), never a shorter
             # group list.
             # Paged, so an account in more groups than the directory's unpaged cap still resolves.
-            # All the pages together get one [auth].ad_receive_timeout, so paging no longer
-            # multiplies the wait by the page count (BACKLOG #3696 item 3).
+            # All the pages together get one [auth].ad_receive_timeout, rounded up as every read
+            # here is, so paging no longer multiplies the wait (BACKLOG #3696 item 3).
             groups = _search_paged(
                 conn,
                 "group search",
-                budget=self._s.ad_receive_timeout,
+                budget=_ldap3_receive_timeout(self._s.ad_receive_timeout),
                 search_base=self._s.ad_group_search_base,
                 search_filter=f"(member:{_MATCHING_RULE_IN_CHAIN}:={_escape_filter(user_dn)})",
                 search_scope=ldap3.SUBTREE,

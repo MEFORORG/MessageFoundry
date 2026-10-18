@@ -663,17 +663,56 @@ def test_pages_each_inside_the_receive_timeout_but_past_the_deadline_together_ar
     assert [r.levelname for r in caplog.records if "within 10 s" in r.getMessage()] == ["WARNING"]
 
 
-def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout() -> None:
+@pytest.mark.parametrize(
+    ("own", "bound"),
+    [(120.0, _BUDGET), (10.0, 10.0)],
+    ids=["deadline-shorter-than-the-socket", "never-lengthened"],
+)
+def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout(
+    own: float, bound: float
+) -> None:
+    """Each page's reads are capped at the shorter of the deadline and the socket's own timeout,
+    and the socket gets its own back when the search ends."""
     conn = _PagedConn(
         [
             _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
             _page(RESULT_SUCCESS, [object()], b""),
         ]
     )
-    conn.socket = _FakeSocket(10.0)
+    conn.socket = _FakeSocket(own)
     assert len(ldap_module._search_paged(conn, "group search", budget=_BUDGET)) == 2
-    assert conn.socket.timeout == 10.0
-    assert all(value is not None and value <= 10.0 for value in conn.socket.set), "never lengthened"
+    *capped, restored = conn.socket.set
+    assert len(capped) == 2
+    assert all(value is not None and bound - 1 < value <= bound for value in capped)
+    assert restored == own == conn.socket.timeout
+
+
+@pytest.mark.parametrize(
+    ("page_seconds", "abandoned"),
+    [(6.0, [b"synthetic-cookie-1"]), (11.0, [])],
+    ids=["refused-inside-the-deadline-is-abandoned", "refused-past-it-is-not"],
+)
+def test_a_refused_page_is_abandoned_only_inside_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, page_seconds: float, abandoned: list[bytes]
+) -> None:
+    """The abandon is one more round trip, so it gets only what is left of the deadline, and is
+    not sent once the deadline is spent."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+    conn = _PagedConn(
+        [
+            _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
+            _page(RESULT_BUSY, [], None),
+        ],
+        on_page=lambda: setattr(clock, "now", clock.now + page_seconds / 2),
+    )
+    conn.socket = _FakeSocket(20.0)
+    with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)"):
+        ldap_module._search_paged(conn, "group search", budget=10.0)
+    assert _abandoned_with(conn) == abandoned
+    if abandoned:  # the abandon's reads got what was left: 10 - 6
+        assert conn.socket.set[-2] == pytest.approx(4.0)
+    assert conn.socket.timeout == 20.0
 
 
 _ENTRY = object()
@@ -1059,23 +1098,31 @@ def test_real_ldap3_refuses_a_group_search_whose_second_page_is_busy() -> None:
     assert b"synthetic-cookie-1" in dc.searches[2]
 
 
-def test_real_ldap3_times_out_a_page_that_would_outrun_the_deadline() -> None:
-    """BACKLOG #3696 item 3 through a real socket. Each page takes 0.7 s, inside the 1 s receive
-    timeout, so before the deadline both pages were read. Now the second page's read may wait only
-    the 0.3 s the deadline has left, and times out as ldap3's own receive error, which every caller
-    maps to :class:`LdapError`."""
+def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3696 item 3 through a real socket. The second page takes 1.5 s, inside the 2 s
+    receive timeout, so before the deadline it was read. The first page spends all but 0.2 s of
+    the deadline on the engine's clock, so the second page's read may wait only that, and times
+    out. The timeout is refused as the deadline, not passed on as one slow read."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
 
-    def slow(raw: bytes) -> list[_Reply]:
-        time.sleep(0.7)
+    def answer(raw: bytes) -> list[_Reply]:
+        if b"synthetic-cookie-1" in raw:
+            time.sleep(1.5)
+        else:
+            clock.now += 1.8  # before the reply is sent, so before the engine reads it
         return _two_pages(raw)
 
     with (
-        _scripted_dc(slow, ad_receive_timeout=1.0) as (dc, authenticator),
+        _scripted_dc(answer, ad_receive_timeout=2.0) as (dc, authenticator),
         _service_conn(authenticator) as conn,
-        pytest.raises(ldap3.core.exceptions.LDAPSocketReceiveError),
+        pytest.raises(LdapUnansweredError, match="did not finish paging within 2 s") as refused,
     ):
         authenticator._resolve_groups(conn, _USER_DN, [])
-    assert len(dc.searches) == 2
+    assert isinstance(refused.value.__cause__, ldap3.core.exceptions.LDAPSocketReceiveError)
+    assert len(dc.searches) == 2, "no abandon past the deadline"
 
 
 # --- sign-in: a directory error, not an unknown user ---------------------------------------------
