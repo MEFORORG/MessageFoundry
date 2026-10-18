@@ -654,9 +654,9 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
 
 
 def test_an_unbind_error_never_replaces_the_refusal() -> None:
-    """Round-one review finding. The decoy bind swallows an ``LDAPException`` and the real bind
-    maps it, so an unbind failing after an undecodable bind would tell an absent account from a
-    present one. After a clean block, the unbind's error still propagates."""
+    """Round-one review finding. Both bind branches answer with the block's own exception, so an
+    unbind failing after an undecodable bind must not replace it on one branch only. After a
+    clean block, the unbind's error still propagates."""
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
     conn = SimpleNamespace(unbind=_raise(unbind_fault))
     refusal = LdapUndecodableError("synthetic refusal")

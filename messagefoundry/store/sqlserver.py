@@ -190,6 +190,7 @@ from messagefoundry.store.store import (
     AdMap,
     AdMapChange,
     AdMapSql,
+    AdminGrant,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -268,6 +269,7 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
@@ -13618,6 +13620,54 @@ class SqlServerStore:
                 await self._rollback_or_discard(conn)
                 raise
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. It takes the last-administrator guard's ``_ADMIN_GUARD_LOCK`` before the
+        read, so two grants, or a grant and a removal, never both read before either writes."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    # Opens the transaction the applock attaches to; see remove_unless_last_admin.
+                    await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
+                    await cur.fetchall()
+                    await self._applock(cur, _ADMIN_GUARD_LOCK)
+                    await cur.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                    holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                    _, others = await admin_guard_counts(
+                        holders,
+                        self._row_sealer,
+                        lambda holder: self._read_user_record(cur, holder, lock=False),
+                    )
+                    if others:
+                        await conn.rollback()  # nothing written; releases the applock
+                        return AdminGrant.ADMIN_EXISTS
+                    if await self._write_user(cur, user_id, change) is None:
+                        await conn.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    await self._commit(conn)
+            except Exception:
+                # BACKLOG #1940, as in remove_unless_last_admin.
+                await self._rollback_or_discard(conn)
+                raise
+        return AdminGrant.GRANTED
 
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:

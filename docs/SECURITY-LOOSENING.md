@@ -815,7 +815,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** a session token presented from a **client address it has not verified from**
   can perform a sensitive admin action on the strength of the ordinary step-up window alone, and can
   read message bodies and call the paced writes with no step-up at all (vault BACKLOG #2620). Nothing
-  writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
+  writes `auth.new_address_reverify_required`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
   addresses that rotates between requests (some NAT and VPN concentrators do). With the signal on,

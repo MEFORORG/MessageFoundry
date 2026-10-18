@@ -532,7 +532,8 @@ def test_security_event_types_are_derived_from_the_notifications_module() -> Non
     """Row 12's catalogue, bound to code — the one enumerated column that was hand-typed.
 
     That is exactly where the wrong token shipped: the row named ``admin_new_ip`` (a fragment of the
-    ``[auth].admin_new_ip_step_up`` CONFIG KEY), while the event type is ``admin_action_new_ip``.
+    ``[auth].admin_new_ip_step_up`` CONFIG KEY), while the event type was another name. It is
+    ``new_address_reverify_required`` since vault BACKLOG #3052.
     """
     from messagefoundry.auth import notifications
 

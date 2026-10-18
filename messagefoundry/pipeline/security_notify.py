@@ -25,7 +25,6 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
-    ADMIN_NEW_IP,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
@@ -37,6 +36,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NEW_ADDRESS_REVERIFY,
     NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
@@ -92,7 +92,7 @@ _SUBJECTS = {
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
     NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
-    ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
+    NEW_ADDRESS_REVERIFY: "A sensitive action on your MessageFoundry account from a new location",
     LOGIN_NEW_IP: "New MessageFoundry sign-in from a new location",
     ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
 }
@@ -151,10 +151,10 @@ _DESCRIPTIONS = {
         "One of your single-use recovery codes was accepted as a second factor. That code is now "
         "spent and cannot be used again."
     ),
-    ADMIN_NEW_IP: (
-        "A sensitive administrative action on your account was attempted from a client address that "
-        "differs from your session's last verified address. It was required to re-verify before "
-        "proceeding."
+    NEW_ADDRESS_REVERIFY: (
+        "A sensitive request on your account (an administrative action, a message read or a "
+        "state-changing request) came from a client address that differs from your "
+        "session's last verified address. It was required to re-verify before proceeding."
     ),
     ACCOUNT_CREATED: (
         "An administrator created this account and set this address to receive its security notices."
@@ -420,7 +420,7 @@ def _build_body(event: SecurityEvent) -> str:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
             lines.append("Roles: " + ", ".join(str(r) for r in roles))
-    if event.event_type == ADMIN_NEW_IP and event.detail.get("cap_reached"):
+    if event.event_type == NEW_ADDRESS_REVERIFY and event.detail.get("cap_reached"):
         # vault BACKLOG #2159: past this notice the session reports no further new addresses until
         # it re-verifies, so silence after it must not read as "no more new locations".
         lines.append(

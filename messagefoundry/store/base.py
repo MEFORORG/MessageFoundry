@@ -67,6 +67,7 @@ from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
+    AdminGrant,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -2552,11 +2553,46 @@ class AuthStore(Protocol):
         this process: the server backends take a transaction-scoped lock before the read, because
         each engine shard serves its own API over one unified store (ADR 0063). So two removals
         that each see two administrators cannot both pass, which a check in one await and a write
-        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
-        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
-        do not come through here and were never guarded: they take roles on the directory's word.
-        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
-        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        in the next allowed. A write that only ADDS an administrator cannot empty the set, so it
+        needs this lock only when it is itself guarded, as the first-administrator grant
+        (:meth:`grant_first_admin_unless_admin_exists`, BACKLOG #3078) is. An unguarded role write
+        that adds one, such as :meth:`set_user_roles`, takes no lock. The directory-driven role
+        writes (the AD sign-in sync and the session reconciler) do not come through here and were
+        never guarded: they take roles on the directory's word. ``DISABLE`` and ``SET_ROLES`` leave
+        the account's sessions for the caller to revoke after; ``DELETE``, like
+        :meth:`delete_user`, removes them with the account."""
+        ...
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator exists
+        (BACKLOG #3078). ``provision_first_administrator``'s grant.
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
+        than ``user_id`` only when its record passes its integrity seal, as
+        :meth:`remove_unless_last_admin` counts them. When any is counted it writes nothing and
+        returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
+        account is enabled, holds no role, and still holds the credentials the caller wrote:
+        ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
+        ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
+        writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
+        compare on the seal lost to a concurrent write, answer the same.
+
+        **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
+        on the same database**, under the same lock, not only in this process. So two provisioning
+        runs with different usernames, each of which saw no administrator, cannot both be granted:
+        the one whose grant commits second reads the first and is refused. SQLite has no such lock
+        across processes and relies on its single writer instead; its implementation re-runs the
+        transaction a bounded number of times when the write fails busy, and raises past that bound
+        rather than answering a refusal."""
         ...
 
     async def set_user_channel_scope(
