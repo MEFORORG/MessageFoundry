@@ -986,8 +986,13 @@ async def test_the_alert_resolves_once_no_hop_holds_the_file(pki: _Pki) -> None:
     assert sink.kinds() == ["refused", "applied"]
 
 
-async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _Pki) -> None:
-    """With no CRL load recorded the runner starts no pass, so the idle branch must resolve."""
+@pytest.mark.parametrize("busy", [False, True], ids=["the-lock-free", "the-lock-busy"])
+async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(
+    pki: _Pki, busy: bool
+) -> None:
+    """With no CRL load recorded the runner starts no pass, so the idle branch must resolve. It
+    does so also while a pass an earlier runner's stop abandoned holds the lock, and this runner
+    has run no pass of its own: nothing stands either way. Only the free lock prunes the record."""
     sink = _Sink()
     passes: list[int] = []
     # A stand-in pass that touches no record, so only the idle branch can clear the refusal.
@@ -998,16 +1003,22 @@ async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _P
     loaded_crls.record_reload_refusal(pki.crl, refusal)
     runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)], _recorded())
     assert sink.kinds() == ["refused"] and not loaded_crls.has_held_copies()
-
-    runner.start()
+    abandoned = _AbandonedPass()
+    if busy:
+        abandoned.start()
     try:
-        # Before the stop, which resolves too.
-        await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
-        assert sink.kinds() == ["refused", "applied"]
-        assert passes == [], "no pass ran: the idle branch resolved it"
-        assert reload_refusals() == {}
+        runner.start()
+        try:
+            # Before the stop, which resolves too.
+            await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
+            assert sink.kinds() == ["refused", "applied"]
+            assert passes == [], "no pass ran: the idle branch resolved it"
+            assert crl_reload._PASS_LOCK.locked() is busy, "the premise"
+            assert (reload_refusals() == {}) is not busy, "pruned only once the lock was free"
+        finally:
+            await runner.stop()
     finally:
-        await runner.stop()
+        abandoned.release()
     assert sink.kinds() == ["refused", "applied"]
 
 
@@ -1090,13 +1101,17 @@ class _ClearRefusedOnce(_Sink):
 
 @pytest.mark.parametrize("busy", [True, False], ids=["the-lock-busy", "the-lock-free"])
 async def test_while_no_hop_holds_a_crl_nothing_stands_whoever_holds_the_lock(
-    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch, busy: bool
+    pki: _Pki,
+    clock: _Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    busy: bool,
 ) -> None:
     """Vault BACKLOG #3543. While no hop holds any CRL no refusal stands, so the idle branch
     sends no reminder and resolves every alert still open. While a pass an earlier runner's stop
     abandoned holds the lock, the branch decides the same: the free lock is the control that both
-    paths agree. Neither reads the record. The sink refuses the first clear, so that clear is owed, and a
-    later idle interval retries it."""
+    paths agree. The sink refuses the first clear, so that clear is owed, and a later idle
+    interval retries it."""
     sink = _ClearRefusedOnce()
     refusal = ReloadRefusal((1, 2), "why", RESTART)
     passes: list[int] = []
@@ -1113,6 +1128,7 @@ async def test_while_no_hop_holds_a_crl_nothing_stands_whoever_holds_the_lock(
     )
     runner = _runner(sink, interval_seconds=0.01, reload=reload, reminder_seconds=300)
     ticks = _count_calls(monkeypatch, "_forget_all")
+    caplog.set_level(logging.INFO, logger="messagefoundry.pipeline.crl_reload")
     runner.start()
     try:
         await until(lambda: len(ticks) >= 3, "three idle intervals")
@@ -1121,7 +1137,9 @@ async def test_while_no_hop_holds_a_crl_nothing_stands_whoever_holds_the_lock(
             "the clear the sink refused is retried, and lands"
         )
         assert not runner._alerted
-        assert reads == [1], "only the pass read the record: the idle branch read nothing"
+        assert reads == [1], (
+            "crl_reload's reload_refusals ran for the pass alone, not the idle branch"
+        )
         if abandoned is not None:
             assert crl_reload._PASS_LOCK.locked(), "the premise: decided while the lock was held"
     finally:
@@ -1129,15 +1147,18 @@ async def test_while_no_hop_holds_a_crl_nothing_stands_whoever_holds_the_lock(
             abandoned.release()
         await runner.stop()
     assert passes == [1] and sink.kinds() == ["refused", "applied"]
+    resolved = [r.getMessage() for r in caplog.records if "is resolved" in r.getMessage()]
+    assert resolved and all(m.endswith(": no hop holds any CRL") for m in resolved), resolved
 
 
-async def test_the_idle_runner_runs_no_first_sight_clear_while_another_pass_holds_the_lock(
+async def test_the_idle_runner_runs_no_first_sight_clear(
     pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A first-sight clear needs the judgment of a pass the loop has just run, and the idle
     branch runs none. Here the pass judged a file and raised, so it ran none either, and the file
     is still unseen. The idle branch resolves the alert it has open, the control that it ran, and
-    sends nothing for the judged file, with the lock busy and then free."""
+    sends nothing for the judged file. The lock is busy and then free, the two ways the idle
+    branch was ever reached, though neither changes what it decides."""
     sink = _Sink()
     refusal = ReloadRefusal((1, 2), "why", RESTART)
     judged = str(tmp_path / "judged.pem")

@@ -1064,10 +1064,11 @@ class CrlReloadRunner:
 
     **It resolves that alert with ``crl_reload_applied``, and only on evidence.** A pass returns
     no outcome for a file it could not read, and none when it failed, while the refusal still
-    stands. So a missing outcome clears nothing: the alert is resolved only once the refusal is
-    gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`), as read
-    under the pass lock by this runner's own pass (:class:`_PassView`). That is when the file was
-    applied, when it was put back to the bytes the hops hold, and when no hop holds it any more.
+    stands. So a missing outcome clears nothing. After a pass, the alert is resolved only once the
+    refusal is gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`),
+    as read under the pass lock by this runner's own pass (:class:`_PassView`). That is when the
+    file was applied, when it was put back to the bytes the hops hold, and when no hop holds it
+    any more. The idle branch resolves on the evidence that no hop holds any CRL (below), and
     :meth:`stop` resolves what is still open, because a restart rebuilds every context from the
     file and nothing later would clear it.
 
@@ -1179,10 +1180,10 @@ class CrlReloadRunner:
             if self._skip_when_idle and not has_held_copies():
                 _forget_all()
                 # Nothing stands, whether or not that could take the lock (the class docstring).
-                self._guarded(
-                    "follow the record",
-                    functools.partial(self._follow_record, _PassView.nothing_stands()),
+                follow = functools.partial(
+                    self._follow_record, _PassView.nothing_stands(), why="no hop holds any CRL"
                 )
+                self._guarded("follow the record", follow)
                 continue
             outcomes: object = None
             view = _PassView()
@@ -1300,11 +1301,17 @@ class CrlReloadRunner:
                     log.exception("crl_reload: could not report a refused file; will retry")
         self._follow_record(view, refused)
 
-    def _follow_record(self, view: _PassView, judged: Collection[str] = ()) -> None:
+    def _follow_record(
+        self,
+        view: _PassView,
+        judged: Collection[str] = (),
+        *,
+        why: str = "the refusal no longer stands",
+    ) -> None:
         """Bring the open alerts in line with the refusal record as ``view`` holds it: resolve
-        each one whose refusal the record no longer holds, then remind about the rest that are due
-        (:meth:`_remind`). ``judged`` holds the path keys whose refusal this pass judged; with no
-        pass, none.
+        each one whose refusal the record no longer holds, logged with ``why``, then remind about
+        the rest that are due (:meth:`_remind`). ``judged`` holds the path keys whose refusal this
+        pass judged; with no pass, none.
 
         The record, never the outcomes: a file the pass could not read and a pass that failed
         both return no outcome while the refusal stands. The pass clears the record when every
@@ -1323,7 +1330,7 @@ class CrlReloadRunner:
             for what, key in self._sink_failing
             if (key in cleared if what in _CLEARS else key in standing)
         }
-        self._resolve(cleared, "the refusal no longer stands")
+        self._resolve(cleared, why)
         self._remind(standing, judged)
 
     def _resolve(self, keys: Sequence[str], why: str) -> None:
