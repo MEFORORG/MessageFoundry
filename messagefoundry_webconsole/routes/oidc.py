@@ -2,7 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """W4-5 (ADR 0142): the browser federated-login legs — OIDC authorization-code + PKCE, default-OFF.
 
-Three routes, all unauthenticated, modelled closely on ``routes/sso.py``:
+The sign-in legs, all unauthenticated, modelled closely on ``routes/sso.py``. ``POST
+/ui/reauth/oidc``, the authenticated step-up leg, is registered here too and is not one of
+them:
 
 * ``GET /ui/oidc/start`` renders the ASVS 3.7.3 "you are leaving this site" interstitial and stages
   **nothing** — when the IdP is inside ``[security].organization_domains`` it delegates straight to
@@ -11,9 +13,9 @@ Three routes, all unauthenticated, modelled closely on ``routes/sso.py``:
   ``__Host-`` cookie, and 303s the browser to the IdP.
 * ``GET /ui/oidc/callback`` re-binds cookie + ``state``, redeems the code, and lands the session.
 
-**Registration is self-gating.** ``register`` returns before declaring either route unless
-``[auth].oidc_enabled`` is set, so with federation off the two paths are not in the route table at all
-and ``tests/golden/ui_routes.txt`` is unchanged — that unchanged golden IS the AC-1 proof.
+**Registration is self-gating.** ``register`` returns before declaring any of its routes unless
+``[auth].oidc_enabled`` is set, so with federation off none of its paths is in the route table
+at all and ``tests/golden/ui_routes.txt`` is unchanged — that unchanged golden IS the AC-1 proof.
 
 Two deliberate departures a reviewer will want to check rather than "fix":
 

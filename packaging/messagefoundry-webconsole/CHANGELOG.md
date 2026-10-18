@@ -140,6 +140,13 @@ this line.**
   `auth.channel_denied` row naming the operator and host, but the row carries no channel. It used to
   carry the submitted text whole, bounded only by the request size. The page now answers such a
   selection "not a valid connection name", as it does for any other operator. (vault BACKLOG #3031)
+- **A `/ui` request whose `Sec-Fetch-Site` lines disagree is refused.** It answers `403` on any
+  method. The fetch-metadata middleware used to keep the last such line while the same-origin
+  check read the first, so the two could judge different values of one request. Both now refuse
+  it with the same reason. A browser sends the header once, and repeated lines that carry one
+  value are judged as that value, so no browser request changes. Seam only: the gate helpers it
+  edits are hashed into the seam since BACKLOG #2709, so the supported digest moved.
+  (vault BACKLOG #3316)
 - **A session revoke that ends nothing is audited, with your address.** The revoke button on
   `/ui/account/sessions` now passes the request's address to the engine, which writes one
   `auth.session_revoke_missed` row when the id names no session or another account's. The notice
@@ -174,14 +181,14 @@ this line.**
   standard defines.
   A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
   there. A browser that sends neither header on its own form POST could not sign in with a
-  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
-  not measured about such a browser. A
-  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
-  accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
-  not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET
-  /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped.
-  The complete rule is the table in the `assert_same_origin` docstring
-  (`messagefoundry_webconsole/_auth.py`). No seam change. (BACKLOG #1116, #1124)
+  password or submit any `/ui` form, sign-out included; `docs/BROWSER-SUPPORT.md` says what is
+  and is not measured about such a browser. A script that drives `/ui` must now send `Origin`.
+  The CSP report sink `/ui/csp-report`, which changes nothing, still accepts a report with
+  neither. A GET is not held to this: the sign-in GETs deliberately not blocked for missing fetch
+  metadata, under owner rulings R4 and R4b of 2026-09-28, are listed in the `Origin` row of
+  `docs/BROWSER-SUPPORT.md`. The rule for one line of each header is the table in the
+  `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which also names what
+  the table does not cover. No seam change. (BACKLOG #1116, #1124)
 - **The user page's self-target refusals are audited, with your address.** Reset-password,
   reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
   engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.

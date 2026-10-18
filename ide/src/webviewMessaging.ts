@@ -313,8 +313,17 @@ export const SCRIPT_BANNER_ID = "mf-script-not-started";
 /** The banner only the un-nonced CSP canary can reveal. */
 export const CSP_BANNER_ID = "mf-csp-not-enforced";
 
+// The banner box, named once. The script banner zeroes these while it waits and its keyframes give
+// them back, so both the shown style and the keyframes are built from the same values and cannot
+// drift apart.
+const BANNER_MARGIN = "0 0 8px";
+const BANNER_PADDING_Y = "6px";
+const BANNER_PADDING_X = "10px";
+const BANNER_BORDER_WIDTH = "1px";
+
 const BANNER_STYLE =
-  "margin:0 0 8px;padding:6px 10px;border:1px solid var(--vscode-inputValidation-warningBorder,#b89500);" +
+  `margin:${BANNER_MARGIN};padding:${BANNER_PADDING_Y} ${BANNER_PADDING_X};` +
+  `border:${BANNER_BORDER_WIDTH} solid var(--vscode-inputValidation-warningBorder,#b89500);` +
   "background:var(--vscode-inputValidation-warningBackground,transparent)";
 
 /**
@@ -329,14 +338,24 @@ const BANNER_STYLE =
  * While it waits the banner is also COLLAPSED to no height, so a healthy panel is not drawn with a
  * banner-sized gap that closes when the script runs. The keyframes restore the box. Only lengths
  * and `visibility` are animated, which every engine in the `engines.vscode` range interpolates.
+ *
+ * `overflow:hidden` and the height cap therefore stay on the SHOWN banner too: `max-height:none` is
+ * not a length, so the cap is a length too tall to clip the message. It must allow two `em` for
+ * every character of the banner's text, enough if each character wrapped onto its own line at a
+ * line height up to 2; `startup-banners.test.ts` measures the rendered text against it, so a longer
+ * message fails there rather than being cut off. `overflow-wrap:anywhere` makes a narrow panel wrap
+ * a long word rather than cut it off at the side. The text stays a literal in the markup below,
+ * because the browser-support doc test reads it from this source.
  */
 const SCRIPT_BANNER_DELAY_SECONDS = 1;
+const SCRIPT_BANNER_MAX_HEIGHT = "500em";
 const SCRIPT_BANNER_DELAY_STYLE =
-  "max-height:0;overflow:hidden;padding-top:0;padding-bottom:0;border-width:0;margin:0;" +
+  "max-height:0;overflow:hidden;overflow-wrap:anywhere;padding-top:0;padding-bottom:0;border-width:0;margin:0;" +
   `visibility:hidden;animation:mf-banner-show 0s linear ${SCRIPT_BANNER_DELAY_SECONDS}s forwards`;
 const SCRIPT_BANNER_KEYFRAMES =
-  "@keyframes mf-banner-show { to { max-height: 40em; padding-top: 6px; padding-bottom: 6px; " +
-  "border-width: 1px; margin: 0 0 8px; visibility: visible; } }";
+  `@keyframes mf-banner-show { to { max-height: ${SCRIPT_BANNER_MAX_HEIGHT}; ` +
+  `padding-top: ${BANNER_PADDING_Y}; padding-bottom: ${BANNER_PADDING_Y}; ` +
+  `border-width: ${BANNER_BORDER_WIDTH}; margin: ${BANNER_MARGIN}; visibility: visible; } }`;
 
 /**
  * The two banners and the CSP canary, as markup for the top of a panel's `<body>`.
