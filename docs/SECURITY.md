@@ -2142,7 +2142,11 @@ attempt row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
+`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. A
+`FileNotFoundError` raised inside the reload, such as by a runner start or swap, is `reload_fault`,
+never `not_found`, which only a missing config directory writes (BACKLOG #3157). An inline reload,
+a dry run included, answers **500** with a generic detail for it; a released one answers 422, as
+every refused release does. A trust-anchor check that the
 store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
 `store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
 reason is written only for an anchor that passed them. An anchor they refuse is still

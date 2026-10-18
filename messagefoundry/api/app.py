@@ -2020,9 +2020,12 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDigestMismatch,
     ConfigDigestUnavailable,
     ConfigDirUnreadable,
-    # Not FileNotFoundError: a runner start or swap that raises one is a fault, not a missing
-    # directory, and must not be audited and answered as not_found (BACKLOG #3157 item 3).
     ConfigDirMissing,
+    # A plain FileNotFoundError, such as one a runner start or swap raises, is a fault, not a
+    # missing directory: it is audited with reason reload_fault and answered 500 with the generic
+    # detail, never as not_found (BACKLOG #3157 item 3). ConfigDirMissing, its subclass, stays
+    # not_found; _audit_refused_reload tests it first.
+    FileNotFoundError,
     WiringError,
 )
 
@@ -2078,7 +2081,9 @@ async def _audit_refused_reload(
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A directory
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
-    engine logged why at WARNING.
+    engine logged why at WARNING. Any other ``FileNotFoundError``, such as one a runner start or
+    swap raised, is a fault inside the reload rather than a missing directory: it writes reason
+    ``reload_fault``, is logged at ERROR, and answers 500 with a generic detail (BACKLOG #3157).
 
     The inline route and the dual-control executor share this, so a held reload whose directory
     vanished or left the reload roots before its release is refused and recorded the way an inline
@@ -2106,6 +2111,17 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
+    elif isinstance(exc, FileNotFoundError):
+        # BACKLOG #3157: the directory is there (ConfigDirMissing is tested above), so this is a
+        # fault inside the reload, such as a file the runner opened while starting or swapping. It
+        # escaped as a raw 500 with no outcome row.
+        _log.error(
+            "config reload failed (fault): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+            exc_info=exc,
+        )
+        action, detail["reason"] = "config_reload_failed", "reload_fault"
+        status, answer = 500, "the reload failed inside the engine; see the engine log"
     elif isinstance(exc, ConfigDigestMismatch):
         # A hold that took no digest is told apart, so nobody goes looking for an edit that
         # never happened.
