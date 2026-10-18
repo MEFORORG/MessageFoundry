@@ -5983,20 +5983,14 @@ async def settle_transit_bound_attestation(
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
-    audit, prev, key, mac = read.mac_check
-    seq = audit["seq"]
-    if mac is None:
-        expected = _audit_row_mac(audit, prev, key, None)
-    else:
-        try:
-            expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
-        except CipherError as exc:
-            return replace(
-                attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
-            )
-    if expected is None or not hmac.compare_digest(
-        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
-    ):
+    seq = read.mac_check[0]["seq"]
+    try:
+        verified = await _audit_row_mac_verifies(*read.mac_check)
+    except CipherError as exc:
+        return replace(
+            attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
+        )
+    if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
         )
@@ -6050,6 +6044,24 @@ async def _transit_attestation_audit_gap(
         audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(attestation.audit_hash)
     ):
         return f"audit row {seq} carries a different hash than the attestation recorded"
+    return await _audit_row_mac_check(audit, seq, fetch, mac_keys=mac_keys, mac_fn=mac_fn)
+
+
+async def _audit_row_mac_check(
+    audit: Mapping[str, Any],
+    seq: int,
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+    only_key_id: str | None = None,
+) -> str | tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None]:
+    """Why audit row ``seq`` (already read as ``audit``) cannot be MAC-checked here, or the inputs
+    of that check: ``(audit row, previous row hash, key, MAC provider)``. It reads the previous
+    row's hash and the opening row of ``seq``'s key range, so it walks no chain.
+
+    With ``only_key_id`` a row in any other range is refused: a keyless one, which anyone who can
+    write the table can recompute, and one under a retired key still in the keyring."""
     prev: object = ""
     if seq > 1:
         before = await fetch("SELECT row_hash FROM audit_log WHERE seq = ?", (seq - 1,))
@@ -6068,6 +6080,8 @@ async def _transit_attestation_audit_gap(
     elif opening is not None and opening["action"] == AUDIT_KEY_EPOCH_ACTION:
         parsed = parse_audit_epoch(opening["detail"])
         key_id = parsed[0] if parsed is not None else None
+    if only_key_id is not None and key_id != only_key_id:
+        return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
     if key_id is None:
         # A keyless chain walks as plain SHA-256, and only a process holding no key walks it so,
@@ -6080,6 +6094,95 @@ async def _transit_attestation_audit_gap(
     # A plain dict, so the row outlives the cursor and the read that produced it.
     columns = ("seq", *_AUDIT_CHAINED_COLUMNS, "row_hash")
     return ({c: audit[c] for c in columns}, prev, secret[0], secret[1])
+
+
+@runtime_checkable
+class KeyedAuditEvidenceStore(Protocol):
+    """The store slice that reads one audit row back only once its MAC verifies (vault BACKLOG
+    #3750 item 33). All three shipped backends implement it; the engine narrows with
+    ``isinstance``, and a store that does not implement it gives no evidence."""
+
+    async def audit_anchor(self) -> tuple[int, str]: ...
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """The newest ``action`` row by ``actor`` with a sequence number above ``after_seq``, when
+        its MAC verifies under the ACTIVE audit key; ``None`` when there is none, it does not
+        verify, it is under a retired key, or the store holds no key. It checks that one row, not
+        the chain: a row that verifies was sealed by a holder of the key, at that sequence
+        number."""
+        ...
+
+
+#: The verified evidence check :func:`read_newest_keyed_audit_row` gathers inside one read and
+#: :func:`settle_newest_keyed_audit_row` completes: ``(audit row, previous row hash, key, MAC
+#: provider)``, or ``None`` when there is nothing to check.
+type KeyedAuditRowCheck = tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None] | None
+
+
+async def read_newest_keyed_audit_row(
+    fetch: TransitAttestationFetch,
+    *,
+    action: str,
+    actor: str,
+    after_seq: int,
+    active_key_id: str | None,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> KeyedAuditRowCheck:
+    """The read half of ``newest_keyed_audit_row`` on all three backends (vault BACKLOG #3750 item
+    33): the newest ``action`` row by ``actor`` numbered above ``after_seq``, with what its MAC
+    check needs. ``None`` when there is no such row, or when it is not sealed under
+    ``active_key_id``, the key a new range opens under: a keyless row or one under a retired key
+    is no evidence. With no active key it reads nothing. Every query is portable and every value
+    a bound parameter. It makes no MAC call; pass the result to
+    :func:`settle_newest_keyed_audit_row` once the read is released."""
+    if active_key_id is None:
+        return None
+    audit = await fetch(
+        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
+        " WHERE seq = (SELECT MAX(seq) FROM audit_log WHERE action = ? AND actor = ? AND seq > ?)",
+        (action, actor, after_seq),
+    )
+    if audit is None:
+        return None
+    seq = _strict_int(audit["seq"])
+    # Matched again here, exactly: a padding or case-folding collation must not widen the query.
+    if seq is None or seq <= after_seq or audit["action"] != action or audit["actor"] != actor:
+        return None
+    found = await _audit_row_mac_check(
+        audit, seq, fetch, mac_keys=mac_keys, mac_fn=mac_fn, only_key_id=active_key_id
+    )
+    return None if isinstance(found, str) else found
+
+
+async def settle_newest_keyed_audit_row(check: KeyedAuditRowCheck) -> dict[str, Any] | None:
+    """The row ``check`` names, as a plain dict, when its MAC verifies under the audit key of its
+    range; ``None`` otherwise, including when Transit refuses the call. It costs one MAC, run off
+    the event loop for a MAC provider, compared in constant time."""
+    if check is None:
+        return None
+    try:
+        verified = await _audit_row_mac_verifies(*check)
+    except CipherError:
+        return None
+    return dict(check[0]) if verified else None
+
+
+async def _audit_row_mac_verifies(
+    audit: Mapping[str, Any], prev: object, key: bytes | None, mac: AuditMacFn | None
+) -> bool:
+    """Whether ``audit``'s stored hash is the MAC it should carry, chained from ``prev``: one MAC,
+    run off the event loop for a MAC provider (a blocking Vault call), compared in constant time.
+    A MAC provider's refusal raises :class:`~messagefoundry.store.crypto.CipherError`."""
+    if mac is None:
+        expected = _audit_row_mac(audit, prev, key, None)
+    else:
+        expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
+    return expected is not None and hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
+    )
 
 
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
@@ -14237,6 +14340,30 @@ class MessageStore:
         if row is None:  # the insert above ran under the writer lock, so this is unreachable
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See :class:`KeyedAuditEvidenceStore`. The rows are read in one ``_read()`` snapshot; the
+        MAC runs after it is released."""
+        async with self._read() as db:
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                cur = await db.execute(sql, params)
+                return cast("Mapping[str, Any] | None", await cur.fetchone())
+
+            check = await read_newest_keyed_audit_row(
+                fetch,
+                action=action,
+                actor=actor,
+                after_seq=after_seq,
+                active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+            )
+        return await settle_newest_keyed_audit_row(check)
 
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
     # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
