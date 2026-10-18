@@ -860,7 +860,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
   of addresses the attacker holds. With the ceremony limit off, a session holder guessing a password at
   re-auth meets no rate limit, only the per-session cap and the account's lockout (each failed re-proof
-  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate.
+  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate. An
+  AD re-bind the engine does not count, such as one the DC ends busy or answers with a referral, is
+  charged to neither the per-session cap nor the lockout, so with the ceremony limit off nothing in
+  the engine bounds those re-binds (BACKLOG #3169). That holds for each value in the table above that
+  turns the ceremony limit off, not only `login_rate_limit_enabled = false`, and a looser value
+  bounds them only as far as it still paces the ceremonies.
 - **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
   application firewall in front of the engine can replace the per-address and all-clients limits, but it
   cannot replace the per-user ceremony limit, which keys on the signed-in user. A modest raise for a
