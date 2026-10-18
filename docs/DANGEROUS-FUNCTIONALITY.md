@@ -259,7 +259,7 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
-| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when `pyodbc` is installed | argument list |
+| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when `pyodbc` is installed, unless the configuration was read and takes no ODBC hop | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
 | `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |
@@ -341,6 +341,13 @@ administrator. The install action does the same with an elevated `powershell.exe
 environment name into its command line. What holds both: the code refuses a service name or
 environment name with any character outside a short safe set, before it builds the line. It also
 pins `cmd.exe`, `net.exe` and `powershell.exe` to the system directory.
+
+**The host cipher read gives PowerShell script text.** On Windows, `verify/cipher_policy.py` starts
+the system-directory `powershell.exe` with `-Command` and a script, so PowerShell parses and runs
+that text, as a shell runs a shell string. The script is a constant in the module: no host data,
+setting or message reaches it, and it calls `Get-TlsCipherSuite` through the system TLS module
+imported by its path, never by name. Its argument list is still the form in the table above. The
+site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
 
 The install line also carries the installer script's path, which is not checked the same way. The
 code finds `scripts/service/install-service.ps1` beside the installed package and runs it as

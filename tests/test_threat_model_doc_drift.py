@@ -69,6 +69,8 @@ from types import MappingProxyType
 
 import pytest
 
+from tests._ast_sites import code_strings, parse_source
+
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
 _TOOLKIT = _ROOT / "messagefoundry_toolkit"
@@ -326,9 +328,33 @@ _SHELL_TOKENS: tuple[str, ...] = (
     "os.system",
     "ShellExecute",
 )
+#: The command-line flags that hand an interpreter script text to run: PowerShell's ``-Command``,
+#: ``-CommandWithArgs`` and ``-EncodedCommand``, and cmd.exe's ``/c``. A start that passes one runs
+#: a shell whatever its argv form, so it is a shell site too. These live in a string literal, the
+#: one place ``_SHELL_TOKENS`` cannot look, because ``_code_only`` blanks every literal before that
+#: scan reads it. So they are a pattern over literals instead (:func:`_script_text_sites`).
+#:
+#: PowerShell reads a flag without case, after ``-``, ``--`` or ``/``, and takes any prefix of its
+#: name, so every prefix of ``command`` is here, ``c`` included, which is also Python's ``-c``.
+#: ``-EncodedCommand``'s prefixes start at ``en``, with its ``ec`` alias: the bare ``-e`` is left
+#: out, because Python's ``-E`` is that flag without case, and two engine starts pass it.
+_SCRIPT_TEXT_FLAGS: tuple[str, ...] = (
+    *("command"[:n] for n in range(1, len("command") + 1)),
+    "commandwithargs",
+    "cwa",
+    "ec",
+    *("encodedcommand"[:n] for n in range(2, len("encodedcommand") + 1)),
+)
+_SCRIPT_TEXT_FLAG_RE = re.compile(
+    r"(?i)(?:^|\s)(?:--?|/)(?:" + "|".join(_SCRIPT_TEXT_FLAGS) + r")(?=\s|$)"
+)
 _ALLOWED_SHELL_SITES: dict[str, str] = {
     "pipeline/dr.py": "[dr].takeover_hook / release_hook run via create_subprocess_shell",
     "service.py": "elevated cmd.exe / powershell.exe via ShellExecuteW|ExW 'runas'",
+    "verify/cipher_policy.py": (
+        "verify's host cipher read: the pinned System32 powershell.exe given fixed -Command text "
+        "with no host data in it (BACKLOG #3277)"
+    ),
 }
 
 #: Token types that carry prose rather than code: comments, string literals, and the literal text
@@ -554,6 +580,16 @@ def _scanned_py_files() -> Mapping[str, Path]:
 
 def _scanned_code() -> dict[str, str]:
     return {key: _code_text(path) for key, path in _scanned_py_files().items()}
+
+
+@functools.cache
+def _source_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _scanned_source() -> dict[str, str]:
+    """Each scanned module's whole text, literals kept, for :func:`_script_text_sites`."""
+    return {key: _source_text(path) for key, path in _scanned_py_files().items()}
 
 
 # --- 1. structure -------------------------------------------------------------------------------
@@ -1098,6 +1134,20 @@ def _shell_sites(code: dict[str, str]) -> set[str]:
     return {key for key, text in code.items() if any(token in text for token in _SHELL_TOKENS)}
 
 
+def _passes_script_text(source: str) -> bool:
+    """Whether a string literal in ``source`` carries a flag of :data:`_SCRIPT_TEXT_FLAGS`.
+
+    Prose is skipped as :func:`~tests._ast_sites.code_strings` skips it; comments are not in the
+    tree at all. A literal anywhere else counts, an error message included: this errs toward a
+    site, which a reviewer then clears by name."""
+    return any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in code_strings(parse_source(source)))
+
+
+def _script_text_sites(sources: Mapping[str, str]) -> set[str]:
+    """The keys of ``sources`` (module key to whole text) that pass an interpreter script text."""
+    return {key for key, text in sources.items() if _passes_script_text(text)}
+
+
 def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     """Locks the corrected 15.1.5 claim: shell/elevation execution lives ONLY where documented.
 
@@ -1106,7 +1156,7 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     launches an elevated ``cmd.exe``/``powershell.exe``. The doc now names both as deliberate
     exceptions with their own guards; a NEW shell site anywhere else must add a row.
     """
-    found = _shell_sites(_scanned_code())
+    found = _shell_sites(_scanned_code()) | _script_text_sites(_scanned_source())
     expected = set(_ALLOWED_SHELL_SITES)
     unexpected = sorted(found - expected)
     assert not unexpected, (
@@ -1119,6 +1169,53 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
         "a documented shell-execution site disappeared — remove/rewrite its THREAT-MODEL.md "
         f"15.1.5 row in the same change: {vanished}"
     )
+
+
+def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
+    """The PR 2406 send-back, finding 6: a PowerShell ``-Command`` start is a shell site.
+
+    Its flag is a string literal, which the token scan never reads, so that scan alone does not
+    see the start; the literal scan does."""
+    assert "verify/cipher_policy.py" not in _shell_sites(_scanned_code())
+    assert "verify/cipher_policy.py" in _script_text_sites(_scanned_source())
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'run(["powershell.exe", "-Command", text])',
+        'run(["pwsh", "-c", text])',
+        'run(["powershell.exe", "-COMMAND", text])',
+        'run(["powershell.exe", "-Comm", text])',
+        'run(["pwsh", "--command", text])',
+        'run(["powershell.exe", "/Command", text])',
+        'run(["pwsh", "-CommandWithArgs", text])',
+        'run(["pwsh", "-cwa", text])',
+        'run(["powershell.exe", "-EncodedCommand", blob])',
+        'run(["pwsh", "-ec", blob])',
+        'run(["powershell.exe", "-enc", blob])',
+        "run(f'powershell.exe -NoProfile -Command {text}')",
+        "PARAMS = '/s /c \"' + line",
+        'run(["python", "-c", text])',
+    ],
+)
+def test_the_script_text_scan_fires(source: str) -> None:
+    assert _passes_script_text(source), source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"""Runs powershell.exe -Command, never by name."""',
+        "# powershell.exe -Command text\nrun(argv)",
+        'run([python, "-E", "-I", script])',
+        'run(["powershell.exe", "-NoProfile", "-File", path])',
+        'run(["tool", "-Compress", "-cert", path])',
+        'run(["tool", "-command-file"])',
+    ],
+)
+def test_the_script_text_scan_spares(source: str) -> None:
+    assert not _passes_script_text(source), source
 
 
 def test_checks_py_only_names_os_system_as_a_lint_string() -> None:
