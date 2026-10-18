@@ -14,6 +14,7 @@ first deny winning, and that one guard's scope, failure or absence cannot change
 
 from __future__ import annotations
 
+import atexit
 import functools
 import json
 import os
@@ -557,18 +558,23 @@ _GATE_PLACEHOLDER = "C:/mefor-test-gate-placeholder/worktree_gate.ps1"
 _WAIT = "+ 20000000 ))"
 
 
+def _scratch() -> Path:
+    """A temp directory removed when the test process exits, for the module-wide caches below."""
+    path = Path(tempfile.mkdtemp())
+    atexit.register(shutil.rmtree, path, True)
+    return path
+
+
 @functools.cache
 def _entry_command() -> str:
-    command = str(
-        _installed_shell_entry(Path(tempfile.mkdtemp()), Path(_GATE_PLACEHOLDER))["command"]
-    )
+    command = str(_installed_shell_entry(_scratch(), Path(_GATE_PLACEHOLDER))["command"])
     assert command.count(_GATE_PLACEHOLDER) == 1 and command.count(_WAIT) == 1, command
     return command
 
 
 @functools.cache
 def _bash() -> str:
-    return require_bash(Path(tempfile.mkdtemp()))
+    return require_bash(_scratch())
 
 
 class _Entry:
@@ -582,7 +588,7 @@ class _Entry:
             self.command = self.command.replace(_WAIT, f"+ {wait_us} ))")
         self.shell = _bash()
 
-    def start(self) -> subprocess.Popen[str]:
+    def start(self, raw: str | None = None) -> subprocess.Popen[str]:
         proc = subprocess.Popen(
             [self.shell, "-c", self.command],
             stdin=subprocess.PIPE,
@@ -592,7 +598,7 @@ class _Entry:
             env={**os.environ, **self.world.env},
         )
         assert proc.stdin is not None
-        proc.stdin.write(_payload())
+        proc.stdin.write(_payload() if raw is None else raw)
         proc.stdin.close()
         return proc
 
@@ -728,8 +734,8 @@ def test_with_no_answer_the_wait_ends_and_the_gate_runs(tmp_path: Path) -> None:
     ("gate", "code", "message"),
     [
         ("[Console]::Error.WriteLine('gate blocks'); exit 2", 2, None),
-        ("exit 1", 0, "exited 1"),
-        ("throw 'broken gate'", 0, "exited 1"),
+        ("exit 1", 0, "(exit 1)"),
+        ("throw 'broken gate'", 0, "(exit 1)"),
     ],
     ids=["exit-2", "exit-1", "throws"],
 )
@@ -745,3 +751,71 @@ def test_the_gate_s_own_exit_keeps_its_old_meaning(
         assert "gate blocks" in done.stderr
     else:
         assert message in json.loads(done.stdout)["systemMessage"]
+
+
+def test_the_entry_and_the_dispatcher_read_the_same_ids_from_any_key_layout(tmp_path: Path) -> None:
+    """Both sides parse the ids themselves, in two languages. Key order and spacing that JSON allows
+    must not make them name different files, or the entry waits out its 20 s on every call."""
+    world = _World(tmp_path)
+    entry = _Entry(world)
+    _hinted(world)
+    raw = (
+        '{"tool_use_id" :  "' + _CALL + '", "tool_name": "Bash", "tool_input": '
+        '{"command": "echo \\"tool_use_id\\": \\"toolu_fake\\""}, "session_id":"' + _SID + '"}'
+    )
+    assert json.loads(raw)["tool_use_id"] == _CALL
+    with spawn_burst("test_shell_guard_dispatch id layout"):
+        waiting = entry.start(raw)
+        dispatched = _proc(_dispatch_argv([USER_GATE]), raw, burst=True, env=world.env)
+        began = time.monotonic()
+        out, err = waiting.communicate(timeout=120)
+    assert dispatched.returncode == 0, dispatched.stderr
+    assert waiting.returncode == 0 and out == "", (out, err)
+    assert world.runs() == 1, "the entry stood down on the dispatcher's proof"
+    assert time.monotonic() - began < 15
+
+
+def test_the_real_gate_decides_in_the_dispatcher_exactly_as_it_does_alone(tmp_path: Path) -> None:
+    """The proof is only as good as this: the shipped gate, run in-process by the dispatcher,
+    reaches the verdict it reaches as its own process, and leaves .ok only for a silent allow."""
+    world = _World(tmp_path, gate=None)
+    shutil.copyfile(_ROOT / "scripts" / "hooks" / "worktree_gate.ps1", world.gate)
+    repo = tmp_path / "GitRepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    # The gate's default allowlist sits beside it, under the fake USERPROFILE.
+    (world.gate.parent / "worktree-gate.repos.txt").write_text(
+        "# governed\n" + str(repo) + "\n", encoding="utf-8"
+    )
+    commands = [
+        "git status",
+        "echo hello",
+        "git config core.hooksPath /dev/null",
+        f"git -C {repo} reset --hard",
+    ]
+    denies = 0
+    for n, (tool, command) in enumerate((t, c) for t in ("Bash", "PowerShell") for c in commands):
+        call = f"toolu_real{n}"
+        raw = json.dumps(
+            {
+                "session_id": _SID,
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": {"command": command},
+                "tool_use_id": call,
+            }
+        )
+        alone = _proc(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(world.gate)], raw, env=world.env
+        )
+        inside = _proc(_dispatch_argv([USER_GATE]), raw, env=world.env)
+        # Parsed, not byte-compared: the gate builds its deny from a hashtable, and .NET seeds
+        # string hashing per process, so two processes can order the same keys differently.
+        assert inside.returncode == alone.returncode, (tool, command, inside.stderr)
+        assert _decision(inside.stdout) == _decision(alone.stdout), (tool, command)
+        silent = alone.returncode == 0 and not alone.stdout
+        assert world.proof("ok", call).exists() == silent, (tool, command)
+        assert world.proof("run", call).exists() != silent, (tool, command)
+        denies += _decision(alone.stdout) is not None
+    assert denies >= 2, "the control: the corpus must reach the gate's deny in both shells"

@@ -1174,13 +1174,19 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 # settings.json must also carry `--user-hook=worktree_gate`, for the same reason.
 #
 # TIMEOUTS, AND WHY A FAILURE HERE BLOCKS. The wait is 20 s at most and the hook's timeout is 60 s, so
-# the gate keeps at least 40 s after the longest wait, against the 15 s this entry used to give it.
+# the gate keeps about 40 s after the longest wait (less bash's own start), against the 15 s this
+# entry used to give it. On a box loaded enough that the dispatcher's gate outlasts the wait, this
+# entry's gate runs beside it, and a call whose two runs pass 60 s is blocked.
 # onFailure = block makes this entry's OWN failure a refusal, not a silent allow: if bash cannot
 # start, or the entry and the gate together run past 60 s, the call is blocked rather than left
 # ungated. That is stricter than before, when a gate past 15 s failed open; it now blocks, and only
 # past 40 s. A gate that crashes still fails open, as it always did, because the entry maps the
 # gate's exit other than 0 or 2 to an allow with a systemMessage saying so; a blocking exit 2 is
-# passed on. The gate is not wrapped in `timeout` or captured with $(...): measured, each added
+# passed on. That mapping cannot tell a gate crash from a gate that never started (pwsh missing, or
+# the here-string's temp file refused), so both fail open with the same message. A missing pwsh failed
+# open before too; a refused here-string is new, since the old entry read Claude Code's stdin itself.
+# `set +o posix` first: in POSIX mode a redirection error on `:` or `exec` would end the shell with
+# status 1, which onFailure turns into a refusal of every call. The gate is not wrapped in `timeout` or captured with $(...): measured, each added
 # about 0.2 s of wall time to every call that runs the gate here. (A bare `timeout` is worse than
 # slow: a bash started without Git's /usr/bin on PATH resolved it to C:\Windows\System32\
 # timeout.exe, which exited 1 without running the gate.)
@@ -1197,6 +1203,7 @@ $gateForBash = $GateDst.Replace('\', '/').Replace("'", "'\''")
 $shellEntry = @'
 # worktree_gate.ps1 for shell tool calls: stands down only on this call's shell-guard-proof.
 # scripts/worktree/install-gate.ps1 says why each check is here.
+set +o posix
 g='__GATE__'
 IFS= read -r -N 2147483647 in
 d=${CLAUDE_CONFIG_DIR:-$USERPROFILE/.claude}/shell-guard-proof
@@ -1226,7 +1233,7 @@ fi
 pwsh -NoProfile -File "$g" <<< "$in"
 r=$?
 (( r == 0 || r == 2 )) && exit "$r"
-printf '{"systemMessage":"worktree_gate.ps1 exited %s and failed open for this call"}\n' "$r"
+printf '{"systemMessage":"worktree_gate.ps1 did not complete (exit %s); this call went ahead ungated"}\n' "$r"
 exit 0
 '@.Replace('__GATE__', $gateForBash).Replace("`r`n", "`n")
 

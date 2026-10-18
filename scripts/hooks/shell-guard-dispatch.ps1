@@ -59,17 +59,13 @@
     gate, and runs it only when this account DELEGATES it: the account's settings.json
     ($env:CLAUDE_CONFIG_DIR, else ~/.claude) contains `shell-guard-proof`, which the installer
     writes into the account's own Bash|PowerShell entry. That entry still runs for every call, in
-    parallel with this file. It stands down only when it finds, in
-    <account>/shell-guard-proof/, a proof named by THIS call's tool_use_id, written after it started
-    waiting, holding this session's id. This file writes that proof (`<tool_use_id>.ok`) only when
-    the gate it ran for this payload finished normally with nothing on stdout -- a silent allow.
-    Anything else (a decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which
-    tells the entry to stop waiting and run the gate itself. So a missing, failing or slow copy of
-    this file leaves the account's entry running the gate; install-gate.ps1 says how it waits.
-    `<session id>.session` tells the entry that this session's dispatcher runs the gate at all, so
-    a project without this file costs no wait. It is a hint, never a proof: forged or stale, it
-    only makes the entry wait before running the gate. An account that does not delegate runs the
-    gate itself, and this file skips it.
+    parallel with this file, and stands down only on this file's proof for the same call; the
+    conditions it checks are stated once, in install-gate.ps1. This file's half: it writes
+    <account>/shell-guard-proof/<tool_use_id>.ok, holding the session id, only when the gate it ran
+    for this payload finished normally with nothing on stdout -- a silent allow. Anything else (a
+    decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which tells the entry to
+    run the gate itself now. It also writes the `<session id>.session` hint the entry waits on. An
+    account that does not delegate runs the gate itself, and this file skips it.
 
     ORDER IS THE SETTINGS FILE'S: THE WORKTREE GATE FIRST, THEN THE BOUNDED GUARD. The account's
     entry is waiting on the gate's proof, so the gate must not queue behind guards that could use
