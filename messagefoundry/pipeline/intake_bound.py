@@ -61,6 +61,7 @@ __all__ = [
     "disk_resume_at",
     "intake_alert_subject",
     "process_alert_subject",
+    "shorten_with_checksum",
 ]
 
 log = logging.getLogger(__name__)
@@ -114,10 +115,32 @@ def disk_resume_at(floor_bytes: int) -> int:
 #: so a node label too long to fit is shortened to a prefix plus a checksum of the whole label.
 INTAKE_SUBJECT_MAX_LENGTH = 200
 
-#: Hex digits of the CRC-32 that stands in for the tail of a node label too long to fit. A checksum,
-#: not a cryptographic digest: the label is the operator's own setting, so it only has to tell two
-#: honest labels apart, never resist a forged one.
-_NODE_DIGEST_HEX = 8
+#: Hex digits of the CRC-32 that stands in for the part of a text :func:`shorten_with_checksum`
+#: cuts. A checksum, not a cryptographic digest: every text it shortens is the operator's own
+#: setting (a node label, a CRL path), so it only has to tell two honest texts apart, never resist a
+#: forged one.
+_CHECKSUM_HEX = 8
+
+
+def shorten_with_checksum(text: str, limit: int, *, keep_tail: bool = False) -> str:
+    """``text`` when it is at most ``limit`` characters, else a form at most that long that stands
+    for it: the head of ``text``, ``~`` and a checksum of the whole text, or with ``keep_tail``,
+    ``~``, the checksum, ``~`` and the tail. The same text always gives the same result, and two
+    texts with one head (or tail) almost never do. The one shortening rule for alert subjects
+    (vault BACKLOG #3543): a node label keeps its head, a CRL path its tail, which holds the file
+    name. ``limit`` is assumed to leave room for the checksum.
+
+    binascii, not zlib: the same CRC-32, and this module reads no archive or compressed stream.
+    ``backslashreplace``, so a text with a lone surrogate still gets a checksum instead of
+    raising."""
+    if len(text) <= limit:
+        return text
+    digest = f"{binascii.crc32(text.encode('utf-8', 'backslashreplace')):0{_CHECKSUM_HEX}x}"
+    if keep_tail:
+        # Sliced from a start index, never ``text[-n:]``: n = 0 would keep the whole text.
+        start = len(text) - max(0, limit - _CHECKSUM_HEX - len("~~"))
+        return f"~{digest}~{text[start:]}"
+    return f"{text[: max(0, limit - _CHECKSUM_HEX - len('~'))]}~{digest}"
 
 
 def intake_alert_subject(reason: str, node: str | None = None) -> str:
@@ -146,13 +169,7 @@ def process_alert_subject(base: str, node: str | None = None) -> str:
     every caller's is, and the same inputs always give the same subject."""
     if node is None:
         return base
-    subject = f"{base}@{node}"
-    if len(subject) <= INTAKE_SUBJECT_MAX_LENGTH:
-        return subject
-    # binascii, not zlib: the same CRC-32, and this module reads no archive or compressed stream.
-    digest = f"{binascii.crc32(node.encode('utf-8')):0{_NODE_DIGEST_HEX}x}"
-    keep = INTAKE_SUBJECT_MAX_LENGTH - len(base) - len("@~") - _NODE_DIGEST_HEX
-    return f"{base}@{node[: max(0, keep)]}~{digest}"
+    return f"{base}@{shorten_with_checksum(node, INTAKE_SUBJECT_MAX_LENGTH - len(base) - len('@'))}"
 
 
 class IntakeBoundMonitor:

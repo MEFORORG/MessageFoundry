@@ -401,7 +401,8 @@ class AlertSink(Protocol):
         ``remedy_class`` is
         a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
         on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
-        still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed
+        still on the old copy at the last pass that reported the refusal, so a reminder carries
+        the latest count, not the one first raised. ``remedy`` is the engine's own fixed
         sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
         start would refuse the file too, until one of its CRLs takes effect.
 
@@ -409,8 +410,8 @@ class AlertSink(Protocol):
         in the engine log and is never passed here. Not a connection-scoped event: one CRL file
         can serve many hops, and the colon keeps ``name`` outside the connection-name grammar.
 
-        Raised once per file version, as the reload's ERROR line is logged: again only when the
-        file's bytes change or the reason does. Emitted on the event loop by
+        Raised at once for each file version, as the reload's ERROR line is logged, and again
+        as a reminder while that refusal stands (vault BACKLOG #3543). Emitted on the event loop by
         :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`;
         :meth:`crl_reload_applied` is its auto-resolving inverse."""
         ...
@@ -423,9 +424,14 @@ class AlertSink(Protocol):
 
         Emits **no** notification (a recovery needs no page); it exists so durable alert-state
         (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
-        ``name``. Raised only for an alert this runner raised, and only once the refusal is gone
-        from the record: a pass that could not read the file, or that failed, clears nothing. A
-        process that dies without stopping leaves its alert open, for an operator to resolve."""
+        ``name``. Raised for an alert this runner raised once the refusal is gone from the record:
+        a pass that could not read the file, or that failed, clears nothing. Also raised once
+        per held file outside a CA bundle, at the first pass that judges it with no refusal
+        standing, whether or not any alert is open: such a call can resolve nothing, at start or
+        later. It clears an alert an earlier run under the same identity left open, by dying
+        without stopping or because its clear at stop failed (vault BACKLOG #3543). An alert for
+        a file no hop holds now, or one raised under another identity, such as an unpinned
+        cluster node's, stays open for an operator."""
         ...
 
     def secret_rotation_due(
