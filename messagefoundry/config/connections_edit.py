@@ -139,8 +139,12 @@ def locked(config_dir: str | Path) -> Iterator[None]:
     :func:`upsert_connection` and :func:`remove_connection` take it themselves. A caller whose
     read-modify-write starts earlier, as the engine's flag toggle does with :func:`list_connections`,
     wraps the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event
-    loop. A holder that does not let go within the timeout raises :class:`WiringError`."""
-    with atomic_edit.edit_lock(_path(config_dir), busy_error=WiringError):
+    loop. A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
+    directory the file system will not let this account write (root-owned or read-only), which the
+    API answers 409 rather than 500 (vault BACKLOG #3106)."""
+    with atomic_edit.edit_lock(
+        _path(config_dir), busy_error=WiringError, refused_error=WiringError
+    ):
         yield
 
 
@@ -392,4 +396,6 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
         with validating_candidate(config_dir, candidate):
             validate(config_dir)
 
-    atomic_edit.replace_validated(path, data, check)
+    # A candidate the file system will not let this account create is a WiringError like any other
+    # refused edit (vault BACKLOG #3106); an error from the replace onward still propagates.
+    atomic_edit.replace_validated(path, data, check, refused_error=WiringError)

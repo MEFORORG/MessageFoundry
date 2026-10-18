@@ -56,7 +56,7 @@ on its own.
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
-| 4 | Starting processes | 11 modules | Varies, see below |
+| 4 | Starting processes | 12 modules | Varies, see below |
 | 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
@@ -249,7 +249,7 @@ debugging on, because a launcher passes no interpreter option.
 
 ## 4. The engine starts processes
 
-11 modules start a process. The reason differs at each, and so does the form of the start:
+12 modules start a process. The reason differs at each, and so does the form of the start:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
@@ -261,6 +261,7 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
+| `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
 | `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |
@@ -1004,19 +1005,29 @@ password from a terminal and takes it no other way. A test rig has no terminal. 
 function with one that returns a password the rig holds. It then calls the shipped command's
 `main`. The rest of `provision-admin` runs as shipped.
 
+When the rig also holds an authenticator key, for a leg whose engine requires MFA (vault BACKLOG
+#2796), two more functions of the same module are replaced. `_enrol_totp_at_terminal` returns that
+key and a code computed from it, where the shipped one shows a new key on the console and reads a
+code back. `_show_recovery_codes_once` shows the recovery codes nowhere and returns `False`, as the
+shipped one does when the console cannot show them. The shipped command still checks the code,
+spends its step and writes the key.
+
 What holds it:
 
 - The swap runs only in a `rigadmin provision` process, and changes nothing on disk. Either
   `provision` started that process as a child, or a workflow step ran the command itself.
-- No engine module imports the harness, so no shipped command gains a password path.
-- The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable. The process takes
-  it out of its own environment before any engine code runs.
+- No engine module imports the harness, so no shipped command gains a password path or an
+  authenticator input.
+- The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable, and the key from
+  `MEFOR_RIG_ADMIN_TOTP_KEY`. The process takes both out of its own environment before any engine
+  code runs.
 - The shipped command refuses a store that already has an enabled Administrator, and the swap
   does not change that.
 
 What it means: on a store with no enabled Administrator, whoever can run the harness with access
-to that store can create one with no terminal and no authenticator app. The swap passes
-`--no-totp`, and sets `MEFOR_SECURITY_REQUIRE_MFA=false` in that process.
+to that store can create one with no terminal. With no key, the swap passes `--no-totp` and sets
+`MEFOR_SECURITY_REQUIRE_MFA=false` in that process, so the account has no authenticator app. With a
+key, the account's second factor is a key the caller chose rather than one the engine drew.
 
 **Parsing.** Section 7's six patterns, run over the harness, find these modules:
 

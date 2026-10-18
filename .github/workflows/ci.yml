@@ -3596,9 +3596,10 @@ jobs:
     needs: changes
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
-    # A GUESS, stated as one: the ubuntu job has no job cap and no measured duration to size from.
-    # This bounds a hang below GitHub's 6-hour default and should be re-sized from the first runs.
-    timeout-minutes: 90
+    # About 3x the slower of the first measured runs, run 39059057328 (2026-10-17): 7m43s on
+    # windows-2022 and 4m58s on windows-2025. This bounds a hang well below GitHub's 6-hour default;
+    # re-size it from fresh runs if the suite grows.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -3751,11 +3752,13 @@ jobs:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and every API read after that
           # carries that account's session (harness/load/rigadmin.py). Two settings follow:
-          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
-          #     no other way, so the rig account has none. The bind is loopback.
+          #   require_mfa ON, as shipped -- THIS RIG LEG STARTS THE ENGINE WITH MFA REQUIRED (vault
+          #     BACKLOG #2796). The rig account is enrolled with an authenticator key the run block
+          #     draws, and signs in with password and code in one request. The other rig legs keep
+          #     require_mfa off; docs/LOAD-TESTING.md, "Rigs sign in", says why.
           #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
           #     account-security notices. The gate reads configuration only; nothing listens there.
-          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_SECURITY_REQUIRE_MFA: "true"
           MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
           MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
           MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
@@ -3831,8 +3834,16 @@ jobs:
           # that needs it and is never exported, so the engine's own environment never holds it.
           rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
           echo "::add-mask::$rig_pw"
-          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
-          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
+          # Its authenticator key, a base32 TOTP secret drawn the same way and handled the same way:
+          # masked, handed only to `provision` and the sign-in, never exported. provision-admin takes
+          # no key as input; rigadmin replaces its terminal enrolment in the provisioning child only.
+          rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+          echo "::add-mask::$rig_totp"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+            python -m harness.load.rigadmin provision --db ./load-ci.db
+          # Vault BACKLOG #2700: this leg runs under `enforce`, which refuses a start with the
+          # interpreter's remote debugging on. Start the interpreter as the service does.
+          python -I -X disable-remote-debug -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
           # The certificate is minted during startup, so a miss on the first turns is ordinary --
@@ -3844,12 +3855,22 @@ jobs:
           set +e
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
-            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
-            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's. It signs
+            # in ONCE, and first waits for a TOTP step to open, up to about 31 s; _code_in_a_fresh_step
+            # in harness/load/rigadmin.py says why.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+              python -m harness.load.rigadmin run \
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
+            # The engine's start-up census warns about a covered account with no authenticator app
+            # (ADR 0197). With MFA required and the rig account enrolled, it must not. This reads
+            # an absence only: a census that never ran, or logged elsewhere, would pass it too.
+            if grep -q "hold a chosen password and no authenticator app" engine.log; then
+              echo "::error::the engine started with MFA required and named an account with no authenticator app"
+              rc=1
+            fi
           else
             # FAIL ON THE REAL CONDITION RATHER THAN 30s LATER ON A DERIVED ONE. The loop above used to
             # end in `|| sleep 0.5`, which made it incapable of failing the step: a never-ready engine
@@ -3977,9 +3998,9 @@ jobs:
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
-          # that account's session (harness/load/rigadmin.py). require_mfa is off because
-          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
-          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because this leg
+          # supplies no authenticator key, so the rig account has none; docs/LOAD-TESTING.md, "Rigs
+          # sign in", says why. This leg is at `warn` (below), where the notification gate that an
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_FANOUT: "8"
@@ -5245,8 +5266,8 @@ jobs:
           #   * The password is drawn for this run and masked before anything can echo it. Hex cannot
           #     spell a word on the engine's password deny-list. `-e NAME` with no value makes docker
           #     read it from this shell, so it is on no command line.
-          #   * require_mfa is off because provision-admin enrols an authenticator app at a terminal
-          #     and offers no other way, so the rig account has none. The bind is loopback.
+          #   * require_mfa is off because this leg supplies no authenticator key, so the rig account
+          #     has none; docs/LOAD-TESTING.md, "Rigs sign in", says why. The bind is loopback.
           #   * The [alerts] channel is there because, with sign-in on, an enforcing start refuses
           #     without a way to send account-security notices. The gate reads configuration only.
           rig_pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
@@ -5411,6 +5432,15 @@ jobs:
             exit 1
           fi
           echo "the engine's uid cannot create a file in $site"
+          # The config directory too (vault BACKLOG #3106 item 3): the engine executes every *.py
+          # there, and the image keeps /config root-owned so its own uid cannot add one. The same
+          # write control above, in a writable place, is what makes this refusal mean something. The
+          # container runs without --read-only, so the refusal comes from ownership, not the mount.
+          if docker exec mefor touch /config/planted-by-smoke.py; then
+            echo "FAIL: the engine's uid created a file in /config"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in /config"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |

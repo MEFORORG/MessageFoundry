@@ -288,10 +288,13 @@ def test_an_in_body_helper_that_fails_to_import_fails_the_load(tmp_path: Path) -
     a dead-lettered message per run."""
     (tmp_path / "_route_helper.py").write_text("raise RuntimeError('helper broke')\n")
     _write(tmp_path / "cfg.py", _IN_BODY_HANDLER)
-    with pytest.raises(WiringError, match="helper broke"):
+    with pytest.raises(WiringError, match="RuntimeError in _route_helper.py"):
         load_config(tmp_path)
     diags = validate_config(tmp_path)
-    assert any("helper broke" in d.message and (d.file or "").endswith("cfg.py") for d in diags)
+    assert any(
+        "RuntimeError in _route_helper.py" in d.message and (d.file or "").endswith("cfg.py")
+        for d in diags
+    )
 
 
 def test_after_the_load_no_helper_file_is_run(tmp_path: Path) -> None:
@@ -488,7 +491,7 @@ def test_a_failed_load_leaves_no_helper_in_sys_modules(tmp_path: Path) -> None:
     (tmp_path / "_ok.py").write_text("VALUE = 1\n", encoding="utf-8")
     _write(tmp_path / "cfg.py", "import _ok\nraise RuntimeError('boom')\n")
     before = set(sys.modules)
-    with pytest.raises(WiringError, match="boom"):
+    with pytest.raises(WiringError, match="RuntimeError at line 2"):
         load_config(tmp_path)
     assert not {name for name in set(sys.modules) - before if "__ok_" in name}
 
@@ -559,7 +562,7 @@ def test_a_failed_reload_keeps_the_live_graphs_helpers(tmp_path: Path) -> None:
         + "\nraise RuntimeError('broken reload')\n",
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="broken reload"):
+    with pytest.raises(WiringError, match="cfg.py: RuntimeError at line"):
         load_config(tmp_path)
     assert sys.modules[helper_name] is live_helper
     assert sys.modules[cfg_name] is live_cfg
@@ -650,7 +653,7 @@ def test_a_failed_module_leaves_no_queued_scan_for_the_next(tmp_path: Path) -> N
     (tmp_path / "a_cfg.py").write_text("import _h\nraise RuntimeError('a broke')\n")
     (tmp_path / "b_cfg.py").write_text(_OUTBOUND, encoding="utf-8")
     diags = validate_config(tmp_path)
-    assert any("a broke" in d.message for d in diags), diags  # positive control
+    assert any("a_cfg.py: RuntimeError" in d.message for d in diags), diags  # positive control
     assert all(not (d.file or "").endswith("b_cfg.py") for d in diags), diags
 
 
@@ -677,7 +680,13 @@ def test_an_unguarded_site_of_a_helper_that_failed_under_a_guard_fails_the_load(
     (tmp_path / "b_cfg.py").write_text(
         _guarded_handler("hb", "ImportError", guarded=False), encoding="utf-8"
     )
-    with pytest.raises(WiringError, match="mefor_no_such_package"):
+    # The helper, the bare site's module and the missing module are named, the last because the
+    # helper's line spells it, read from the failure recorded under the guard (vault BACKLOG #3249).
+    with pytest.raises(
+        WiringError,
+        match=r"_optional\.py failed to load \(ModuleNotFoundError at line 1 naming "
+        r"'mefor_no_such_package'.*b_cfg\.py imports it outside",
+    ):
         load_config(tmp_path)
 
 

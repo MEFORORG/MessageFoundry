@@ -6,6 +6,7 @@ import * as path from "path";
 
 import {
   HOLD_OPEN_SCRIPT,
+  INTERPRETER_OPTIONS,
   PROBE_EMAIL,
   PROBE_USERNAME,
   buildAdminProbeInvocation,
@@ -18,6 +19,7 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  serveCommandLine,
   validateProvisionEmail,
   type AdminDetails,
   type AdminProbeResult,
@@ -45,7 +47,9 @@ suite("engine control — the serve invocation is the ADR-blessed command, RUN n
   test("serve is launched with --config only — no --db/--env/--port override (TOML stays authority)", () => {
     const inv = buildServeInvocation({ python: "C:\\ws\\.venv\\Scripts\\python.exe", configDir: "samples/config" });
     assert.strictEqual(inv.command, "C:\\ws\\.venv\\Scripts\\python.exe");
-    assert.deepStrictEqual(inv.args, ["-m", "messagefoundry", "serve", "--config", "samples/config"]);
+    assert.deepStrictEqual(inv.args, [
+      "-P", "-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", "samples/config",
+    ]);
     // The whole point of ADR 0110 §5's caution: no store/env override that could fork the user's engine.
     assert.ok(!inv.args.includes("--db"), "must not override the store — the service TOML is the authority");
     assert.ok(!inv.args.includes("--env"), "must not override the environment — the service TOML is the authority");
@@ -58,7 +62,36 @@ suite("engine control — the serve invocation is the ADR-blessed command, RUN n
   });
 
   test("the preflight imports serve's own early module (so a missing pydantic is caught)", () => {
-    assert.deepStrictEqual(preflightArgs(), ["-c", "import messagefoundry.config.models"]);
+    assert.deepStrictEqual(preflightArgs(), [
+      "-P", "-X", "disable-remote-debug", "-c", "import messagefoundry.config.models",
+    ]);
+  });
+
+  test("the preflight, provision-admin and serve take the same interpreter options", () => {
+    // -P keeps the working directory off the import path, so all three import the same engine.
+    const n = INTERPRETER_OPTIONS.length;
+    const serve = buildServeInvocation({ python: "python", configDir: "c" }).args.slice(0, n);
+    assert.deepStrictEqual(serve, ["-P", "-X", "disable-remote-debug"]);
+    const provision = buildProvisionInvocation({ python: "p", username: "a", email: "a@b.test" });
+    for (const args of [
+      preflightArgs(),
+      provision.args,
+      buildHeldInvocation(provision).args,
+      buildAdminProbeInvocation({ python: "p" }).args,
+    ]) {
+      assert.deepStrictEqual(args.slice(0, n), serve);
+    }
+  });
+
+  test("the copied start command is the Start argv as one line", () => {
+    const inv = buildServeInvocation({ python: "python", configDir: "samples/config" });
+    assert.strictEqual(serveCommandLine("samples/config"), ["python", ...inv.args].join(" "));
+    assert.strictEqual(
+      serveCommandLine("samples/config"),
+      "python -P -X disable-remote-debug -m messagefoundry serve --config samples/config",
+    );
+    // A path with a space stays one argument when the line is pasted.
+    assert.ok(serveCommandLine("my configs/prod").endsWith('--config "my configs/prod"'));
   });
 });
 
@@ -240,6 +273,7 @@ suite("engine control — the provision-admin invocations carry no credential (W
     });
     assert.strictEqual(inv.command, "C:\\ws\\.venv\\Scripts\\python.exe");
     assert.deepStrictEqual(inv.args, [
+      ...INTERPRETER_OPTIONS,
       "-m",
       "messagefoundry",
       "provision-admin",
@@ -278,7 +312,7 @@ suite("engine control — the provision-admin invocations carry no credential (W
     const inner = buildProvisionInvocation({ python: "py", username: "alice", email: "alice@example.test" });
     const held = buildHeldInvocation(inner);
     assert.strictEqual(held.command, "py");
-    assert.deepStrictEqual(held.args, ["-c", HOLD_OPEN_SCRIPT, ...inner.args]);
+    assert.deepStrictEqual(held.args, [...INTERPRETER_OPTIONS, "-c", HOLD_OPEN_SCRIPT, ...inner.args]);
     // It re-runs the SAME interpreter with the argv after -c, waits for Enter, and keeps the exit code.
     assert.ok(HOLD_OPEN_SCRIPT.includes("subprocess.call([sys.executable, *sys.argv[1:]])"));
     assert.ok(HOLD_OPEN_SCRIPT.includes("input(") && HOLD_OPEN_SCRIPT.includes("sys.exit(rc)"));
@@ -294,6 +328,7 @@ suite("engine control — the provision-admin invocations carry no credential (W
   test("the probe asks provision-admin with --json and no password", () => {
     const inv = buildAdminProbeInvocation({ python: "python" });
     assert.deepStrictEqual(inv.args, [
+      ...INTERPRETER_OPTIONS,
       "-m",
       "messagefoundry",
       "provision-admin",

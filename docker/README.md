@@ -64,11 +64,13 @@ interpreter it starts.
   writable. Code planted there would run at every interpreter start. Uid 10001 owns only
   `/var/lib/mefor`; `/config` is root-owned too.
 
-Two things undo this, and the engine reports both:
+Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options. It then reports
-  `interpreter_not_isolated` and `remote_debug_enabled`.
+  in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
+  start, because remote debugging is on (vault BACKLOG #2700). Under `warn`, or with
+  `[security].allow_remote_debugging`, it reports `interpreter_not_isolated` and
+  `remote_debug_enabled`.
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
   reports `startup_directory_writable` when its account can write there.
@@ -109,9 +111,11 @@ Under **rootless Docker or Podman, or userns-remap**, a host root owner appears 
 as an unprivileged uid and is refused; leave the files owned by your own user there, which maps to
 root inside.
 
-**What a root-owned config gives up.** The engine's own config editors (the web console's connection
-toggle, code-set and alert edits) write into the config directory, so they cannot write a root-owned
-one, just as they cannot write a read-only mount.
+**What a root-owned config gives up.** The engine's own editors that write into the config
+directory (at least the web console's connection toggle, and the connection, code-set and `impact`
+rename editors on the command line) cannot write a root-owned one, just as they cannot write a
+read-only mount. The toggle answers 409, naming `connections.toml` and the file system's refusal,
+and leaves the file unchanged; change the flag in the config source and rebuild or remount instead.
 
 **Pass `--read-only` on a plain `docker run`.** [`compose.yaml`](compose.yaml) and both Kubernetes
 manifests set a read-only root file system; a bare `docker run` does not. The engine writes only

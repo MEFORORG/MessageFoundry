@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Command-line entrypoint for the MessageFoundry engine + IDE tooling.
 
-    messagefoundry serve     --config ./samples/config --db ./messagefoundry.db   # run engine + API
+    python -P -X disable-remote-debug -m messagefoundry serve --config ./samples/config --db ./messagefoundry.db  # engine + API
     messagefoundry validate  --config ./samples/config --json                     # report problems
     messagefoundry graph     --config ./samples/config --json                     # the wired graph
     messagefoundry dryrun    --config ./samples/config --messages ./msgs --json   # run, don't send
@@ -22,9 +22,13 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 from __future__ import annotations
 
 from messagefoundry.remotedebug import (
+    REMOTE_DEBUG_ACCEPTANCE,
+    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
+    RemoteDebugPosture,
     install_remote_debug_guard,
     remote_debug_loosening,
     remote_debug_posture,
+    remote_debug_refusal,
 )
 
 # Vault BACKLOG #2742: the hook that refuses an injected script goes in HERE, at import, ahead of
@@ -2479,6 +2483,43 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
     return True
 
 
+def _remote_debug_audit(
+    settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
+) -> str | None:
+    """The WARNING-level ``AUDIT:`` line for a refusal :data:`REMOTE_DEBUG_ACCEPTANCE` lifts, or
+    None where there is nothing to lift (vault BACKLOG #2700). The sibling acceptances of an
+    enforced start gate write one too, so the lift is never silent."""
+    if (
+        not enforcing
+        or not settings.security.allow_remote_debugging
+        or remote_debug_refusal(posture) is None
+    ):
+        return None
+    return (
+        f"AUDIT: permitted to {what} under enforcement = enforce with the interpreter's remote "
+        f"debugging (PEP 768) enabled in this process, because {REMOTE_DEBUG_ACCEPTANCE} = true. "
+        "See docs/SECURITY-LOOSENING.md."
+    )
+
+
+def _remote_debug_refused(
+    settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
+) -> bool:
+    """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
+    refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
+    Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
+    if audit is not None:
+        logging.getLogger(__name__).warning("%s", audit)
+        return False
+    refused = remote_debug_refusal(posture) if enforcing else None
+    if refused is None:
+        return False
+    print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
+    return True
+
+
 #: How long uvicorn waits, at a stop, for open connections and their requests to finish before it
 #: cancels them and runs the lifespan teardown (BACKLOG #3256). The whole stop shares NSSM's
 #: AppStopMethodConsole window (scripts/service/install-service.ps1) with that teardown and
@@ -2657,6 +2698,9 @@ def _serve(args: argparse.Namespace) -> int:
     startup_refused = startup_refusal(startup)
     if startup_refused is not None and enforcing:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
+        return 2
+    _remote_debug_reading = remote_debug_posture()
+    if _remote_debug_refused(settings, _remote_debug_reading, enforcing=enforcing, what="start"):
         return 2
 
     # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
@@ -2889,6 +2933,13 @@ def _serve(args: argparse.Namespace) -> int:
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
     _log_static_credential_outcome(sc_outcome)
+    # Vault BACKLOG #2700: the remote-debugging acceptance's AUDIT line, for the same reason.
+    if (
+        _rd_audit := _remote_debug_audit(
+            settings, _remote_debug_reading, enforcing=enforcing, what="start"
+        )
+    ) is not None:
+        logging.getLogger(__name__).warning("%s", _rd_audit)
     # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
     # configured, so to bare stderr only. Logged again here, under the settings logger they came
     # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
@@ -4875,7 +4926,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # The supervisor has no API and builds no loosening list, so its own reading is reported here.
     # Each shard reports its own through `serve`.
     security_lines: list[tuple[str, str]] = []
-    remote_debug = remote_debug_loosening(remote_debug_posture())
+    remote_debug_reading = remote_debug_posture()
+    remote_debug = remote_debug_loosening(remote_debug_reading)
     if remote_debug is not None:
         security_lines.append(remote_debug)
         logging.getLogger(__name__).warning(
@@ -4960,6 +5012,18 @@ def _supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
+    # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    if _remote_debug_refused(
+        settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
+    ):
+        return 2
+    if settings.security.allow_remote_debugging:
+        accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
+        security_lines.append(accepted)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *accepted
+        )
     # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
     # `serve` makes next, at the same place among its gates. Without it here, a file another
     # account can write would refuse every engine shard, and the supervisor would only restart
@@ -5098,6 +5162,15 @@ def _supervise(args: argparse.Namespace) -> int:
                 "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
                 "forwarder.)",
                 *security_line,
+            )
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        if (
+            fleet_audit := _remote_debug_audit(
+                settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
+            )
+        ) is not None:
+            logging.getLogger(__name__).warning(
+                "%s (Logged again for the off-box forwarder.)", fleet_audit
             )
 
     try:
@@ -5677,7 +5750,7 @@ def _init(args: argparse.Namespace) -> int:
     print("\nNext steps:")
     print("  pip install -r requirements.txt        # the pinned engine (a read-only dependency)")
     print("  messagefoundry check --config config --messages messages/sets")
-    print("  messagefoundry serve --config config --env dev")
+    print("  python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev")
     return 0
 
 
@@ -7041,7 +7114,7 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
         # Checked here rather than caught from the call: a ValueError arm around the driver call would
         # also swallow the driver's own ValueErrors, unredacted and without the database named.
         return _emit_error(
-            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "the sqlite store builds its own schema when `python -P -X disable-remote-debug -m messagefoundry serve` first opens it; "
             "`messagefoundry store provision-schema` applies to the sqlserver and postgres "
             "backends only",
             as_json=args.json,

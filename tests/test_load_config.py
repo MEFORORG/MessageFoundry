@@ -181,7 +181,9 @@ def test_results_and_other_hubs_route(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_invalid_transform_mode_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_LOAD_TRANSFORM", "turbo")
-    with pytest.raises(ValueError, match="MEFOR_LOAD_TRANSFORM"):
+    # The harness helper raises it, so its text is withheld (vault BACKLOG #3249); the type and
+    # the helper's name are what reach the author.
+    with pytest.raises(ValueError, match="ValueError in _shape.py"):
         load_config(_CONFIG)
 
 

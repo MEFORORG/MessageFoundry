@@ -27,7 +27,8 @@ frame is one case. A cylinder is the message store.
 ### Single node
 
 This picture answers what runs on the one server and names its main network hops. The engine runs as
-the Windows service `MessageFoundry`, which NSSM starts with `messagefoundry serve`
+the Windows service `MessageFoundry`, which NSSM starts with
+`python -I -X disable-remote-debug -m messagefoundry serve`
 ([`SERVICE.md`](SERVICE.md)). The API and the web console at `/ui` live in that same process and
 bind `127.0.0.1` port `8765` by default. The message store is a local SQLite file by default.
 

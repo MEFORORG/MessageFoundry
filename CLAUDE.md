@@ -364,9 +364,10 @@ started at either attempt. That request is not yet a queue entry, so the same wi
    `PullRequest.mergeQueue`, which names the target queue whether or not the PR is in it. Merged,
    or on the engine an entry with a null `autoMergeRequest`, is the goal. A non-null
    `autoMergeRequest`, on either repository, is a deferred request: disarm it, read it back as
-   null, and wait for the missing context, or triage it if it went red. None of the three means
-   nothing is queued: the call was refused or the queue evicted the PR. Read the command's output
-   and the checks again, and re-run only once this step's condition holds.
+   null, then wait for the missing context, or triage that context if it went red. Not merged, no
+   entry and a null request means nothing is queued, for example because the call silently
+   no-opped, was refused, or the queue evicted the PR. Read the command's output and the checks
+   again, and re-run only once this step's condition holds.
 2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
    updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
    Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as
@@ -697,7 +698,7 @@ mypy --platform linux --explicit-package-bases tests   # CI runs it on linux. BA
 mypy --platform linux scripts/asvs   # the ASVS verifier and writer, strict. BACKLOG #2276
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
 # open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 

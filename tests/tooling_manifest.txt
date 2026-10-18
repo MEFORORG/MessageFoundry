@@ -27,7 +27,6 @@ tests/test_adr_index_coverage.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_attribution_trailer_check.py
-tests/test_audit_all_platforms.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
 tests/test_asvs_anchor_report.py
@@ -230,6 +229,7 @@ tests/test_worktree_remove_path.py
 tests/test_worktree_remove_in_use.py
 tests/test_worktree_remove.py
 tests/test_worktree_remove_scratch.py
+tests/test_worktree_remove_recent_work.py
 tests/test_worktree_rescue.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py

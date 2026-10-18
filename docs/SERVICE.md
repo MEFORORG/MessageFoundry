@@ -1,8 +1,9 @@
 # Running the engine as a Windows service
 
 MessageFoundry runs as a long-lived background service via
-[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the existing
-`messagefoundry serve` command: it starts the engine on boot, restarts it on crash,
+[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the engine's
+`serve` command, run as `python -I -X disable-remote-debug -m messagefoundry serve`: it starts
+the engine on boot, restarts it on crash,
 and captures its output to rotating log files. Stopping the service sends Ctrl+C so the
 engine drains its connections cleanly (the ASGI lifespan calls `engine.stop()`).
 
@@ -89,7 +90,7 @@ and TrustedInstaller, may write them. So at least `Everyone`, `Authenticated Use
 `BUILTIN\Users` and the user who owns a checkout are refused. It also refuses an install with no `messagefoundry` folder in
 its `Lib\site-packages`, or with an `__editable__` file for it. That is an editable install, which
 imports the engine from a checkout. **A service can no longer run from a checkout.** To try the
-engine from one, run `messagefoundry serve` from a prompt.
+engine from one, run `python -P -X disable-remote-debug -m messagefoundry serve` from a prompt.
 
 ## Install
 
@@ -107,7 +108,7 @@ engine finds it runs as an NSSM service, `serve` and `supervise` refuse to start
 `messagefoundry.toml` from the working directory. Pass `-ServiceConfig <path>`, or put
 `messagefoundry.toml` where the installer looks for it, which the Defaults table below names. With
 neither, the installer refuses. A service that sets everything through its environment still needs
-the file; an empty one will do. `messagefoundry serve` from a prompt needs no flag. The engine knows it is
+the file; an empty one will do. A start from a prompt needs no `--service-config`. The engine knows it is
 the service when `nssm.exe` is the first process above it other than Python and the
 `messagefoundry` launcher. A start it cannot place, such as one under a wrapper between NSSM and the
 interpreter, is not refused. `messagefoundry/serviceenv.py` says what the reading covers.
@@ -491,9 +492,14 @@ What that changes for you:
   install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
-- **`messagefoundry serve` from a prompt still works**, for development. It is not isolated, and
-  the engine says so at start (`interpreter_not_isolated`, `remote_debug_enabled`). To run by hand
-  what the service runs, use the command above.
+- **`messagefoundry serve` from a prompt refuses to start under `enforce`**, because remote
+  debugging is on in it (vault BACKLOG #2700, owner ruling 2026-10-16). Run by hand what the
+  service runs, the command above. A developer loop that needs the console script sets
+  `PYTHON_DISABLE_REMOTE_DEBUG=1`, or, failing that, `[security].allow_remote_debugging = true`,
+  which is reported as a loosening
+  ([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md)). Such a start is not isolated either, and
+  the engine says so (`interpreter_not_isolated`, and `remote_debug_enabled` under the
+  acceptance).
 - **The engine's Python children are isolated when the engine is.** The sandbox worker and each
   engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
   reaches none of them. A `serve` from a prompt is not isolated, and neither are its children.
@@ -678,6 +684,35 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the layout also depends on at least these, which it does not check: every directory above the
     config directory is writable only by root; a file that is a link points into such a directory;
     and the file system reports real owners and modes (a network mount may synthesize them).
+    - **Why the loader does not walk the directories above it (vault BACKLOG #3106).** The trust
+      anchor check, `anchor_path.posix_path_verdict`, does walk them: it reads every directory from
+      `/` down to the file, follows each link and reads its target's directories too, and reads the
+      file system type of each. Here that walk would refuse a config directory whose parent another
+      account can write, or a module that is a link into such a directory. It is not taken here, at
+      least for these reasons. It answers *indeterminate* for any file system outside its short
+      allowlist (`POSIX_TRUSTED_FS` in `messagefoundry/auth/anchor_path.py`), such as a CIFS, NFS,
+      FUSE or 9p mount, and for one whose type it cannot read. The loader then has to choose
+      between refusing every start from such a file system and passing what the walk could not
+      vouch for, and that choice has not been made. A Kubernetes ConfigMap or projected volume
+      reaches each file through two links (`<file>` to `..data/<file>`, and `..data` to a dated
+      folder the kubelet swaps on update), and that layout has not been measured against the walk.
+      It has not been measured against the current check either (see `docker/README.md`). And the
+      POSIX check is shared: the `serve` start check of the settings and value files
+      (`assert_trusted_start_paths`) runs the same code, so adding the walk there changes what
+      every start refuses, and adding it to the config load alone gives the two checks different
+      answers to one question.
+    - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
+      any directory above the config directory can rename that directory and put a link or another
+      directory in its place. A substitute put there after the check runs unchecked, and one put
+      there before it passes when it is a link to any directory owned by root or by the engine's
+      own account that is not group- or world-writable, such as the engine's data directory.
+      Nothing here detects either. An account that can write the directory a link points into can
+      replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
+      every directory on the path. It does not look inside the directory, so also run `ls -lR` on
+      the config directory, which lists at least its `codesets` and `environments` folders, and
+      run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
+      account for the config directory itself, with no group or other write bit. The shipped
+      image's `/config` sits directly under `/`, which is root-owned.
   - **The cache folder is checked because it runs.** Python's source loader runs a matching
     `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
     the check did not read could run under a source it passed (vault BACKLOG #2596).
