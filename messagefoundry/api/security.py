@@ -513,8 +513,8 @@ def client_ip(conn: HTTPConnection) -> str | None:
     one from that scope rather than read the scope a second way (BACKLOG #2289).
 
     Behind a declared trusted proxy this already resolves to the real client:
-    uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
-    defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
+    uvicorn runs with ``forwarded_allow_ips`` built from ``settings.api.trusted_proxies`` (``__main__.py``,
+    ``uvicorn_trusted_hosts``; defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
     residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
     rotation by a directly-reachable attacker (SEC-024). The real brute-force bounds are the global
     ceiling and the per-account lockout, applied to both the password and the MFA factor.

@@ -1,8 +1,9 @@
 # Running the engine as a Windows service
 
 MessageFoundry runs as a long-lived background service via
-[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the existing
-`messagefoundry serve` command: it starts the engine on boot, restarts it on crash,
+[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the engine's
+`serve` command, run as `python -I -X disable-remote-debug -m messagefoundry serve`: it starts
+the engine on boot, restarts it on crash,
 and captures its output to rotating log files. Stopping the service sends Ctrl+C so the
 engine drains its connections cleanly (the ASGI lifespan calls `engine.stop()`).
 
@@ -89,7 +90,7 @@ and TrustedInstaller, may write them. So at least `Everyone`, `Authenticated Use
 `BUILTIN\Users` and the user who owns a checkout are refused. It also refuses an install with no `messagefoundry` folder in
 its `Lib\site-packages`, or with an `__editable__` file for it. That is an editable install, which
 imports the engine from a checkout. **A service can no longer run from a checkout.** To try the
-engine from one, run `messagefoundry serve` from a prompt.
+engine from one, run `python -P -X disable-remote-debug -m messagefoundry serve` from a prompt.
 
 ## Install
 
@@ -107,7 +108,7 @@ engine finds it runs as an NSSM service, `serve` and `supervise` refuse to start
 `messagefoundry.toml` from the working directory. Pass `-ServiceConfig <path>`, or put
 `messagefoundry.toml` where the installer looks for it, which the Defaults table below names. With
 neither, the installer refuses. A service that sets everything through its environment still needs
-the file; an empty one will do. `messagefoundry serve` from a prompt needs no flag. The engine knows it is
+the file; an empty one will do. A start from a prompt needs no `--service-config`. The engine knows it is
 the service when `nssm.exe` is the first process above it other than Python and the
 `messagefoundry` launcher. A start it cannot place, such as one under a wrapper between NSSM and the
 interpreter, is not refused. `messagefoundry/serviceenv.py` says what the reading covers.
@@ -491,9 +492,14 @@ What that changes for you:
   install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
-- **`messagefoundry serve` from a prompt still works**, for development. It is not isolated, and
-  the engine says so at start (`interpreter_not_isolated`, `remote_debug_enabled`). To run by hand
-  what the service runs, use the command above.
+- **`messagefoundry serve` from a prompt refuses to start under `enforce`**, because remote
+  debugging is on in it (vault BACKLOG #2700, owner ruling 2026-10-16). Run by hand what the
+  service runs, the command above. A developer loop that needs the console script sets
+  `PYTHON_DISABLE_REMOTE_DEBUG=1`, or, failing that, `[security].allow_remote_debugging = true`,
+  which is reported as a loosening
+  ([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md)). Such a start is not isolated either, and
+  the engine says so (`interpreter_not_isolated`, and `remote_debug_enabled` under the
+  acceptance).
 - **The engine's Python children are isolated when the engine is.** The sandbox worker and each
   engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
   reaches none of them. A `serve` from a prompt is not isolated, and neither are its children.

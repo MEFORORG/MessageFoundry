@@ -50,7 +50,12 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from dataclasses import replace
 from functools import partial
 from time import perf_counter
@@ -250,6 +255,7 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     approval_update,
+    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -276,6 +282,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -300,6 +307,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -358,6 +366,21 @@ _RESET_LANE_CHUNK = 500
 # handed to that statement's own call and not waited for at all. In a narrow race (a call dispatched
 # but not yet inside the gate) the close can still queue behind a call, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
+
+# BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
+# change may wait for a pooled connection (SqlServerStore._acquire_after_commit). Longer than an
+# ordinary borrow, because nothing retries that write and failing it after the change committed
+# leaves the change half done; still finite, because an unbounded pool wait is the defect
+# acquire_timeout exists to remove (BACKLOG #1052). 2 gives 60 s at the 30 s default: long enough
+# to ride out a burst that saturates the pool, and at most half of the API's request deadline
+# (DEFAULT_REQUEST_TIMEOUT_SECONDS), so at the defaults the borrow itself gives up, as a
+# StoreAcquireTimeout the rotation's fail-closed branch catches, before the deadline cancels it; a
+# cancellation skips that branch. The margin covers the borrow only. The branch then makes ordinary
+# borrows of its own (two revokes and an audit row), so on a pool that stays wedged they can be
+# refused, or the deadline can still cancel the request before the branch answers. The test pins
+# the margin. A fixed multiple rather than a new setting, so the one knob an operator tunes moves
+# both limits together.
+_AFTER_COMMIT_ACQUIRE_FACTOR = 2
 
 
 def _drain_detached_close(fut: asyncio.Future[None]) -> None:
@@ -783,9 +806,12 @@ _MSSQL_APPROVAL_INSERT: Final = (
     " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
 )
+#: Reports through ``OUTPUT``, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283),
+#: rather than ``cursor.rowcount`` (vault BACKLOG #3193).
 _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
-    " seal = ? WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+    " seal = ? OUTPUT inserted.id"
+    " WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -2440,6 +2466,15 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
+    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a passkey can
+    # never be written for an account that does not exist. No cascade, as on those two: at least
+    # delete_user and remove_unless_last_admin clear the account's passkeys first, through
+    # _delete_user_rows, and a delete that skipped it would be refused here. WITH NOCHECK so a
+    # store already holding an orphaned passkey row still opens; the key refuses every later one.
+    # ix_webauthn_credentials_user above serves the key's check on a user delete.
+    """IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL
+        ALTER TABLE webauthn_credentials WITH NOCHECK
+            ADD CONSTRAINT fk_webauthn_credentials_user FOREIGN KEY (user_id) REFERENCES users(id)""",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
     # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
     # among them. The primary key serves the signal's one read. `address` is BIN2 so key equality is
@@ -4847,8 +4882,7 @@ class SqlServerStore:
 
     # --- helpers -------------------------------------------------------------
 
-    @asynccontextmanager
-    async def _acquire(self) -> AsyncIterator[Any]:
+    def _acquire(self) -> AbstractAsyncContextManager[Any]:
         """Acquire a pooled connection with the configured command (statement) timeout applied.
 
         ``[store].connect_timeout`` is only the *login* timeout, and it reaches the driver as
@@ -4861,8 +4895,8 @@ class SqlServerStore:
         timeout was ever applied — a hung statement then held its queue/messages row X-locks forever.
 
         B11: the perf_counter pair records the acquire WAIT time (the PRIMARY pool-wait wall signal)
-        into the acquire-wait histogram. Every store DB call funnels through here (the single _acquire
-        chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
+        into the acquire-wait histogram. Every store DB call funnels through :meth:`_borrow` (the
+        single chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
         acquired connection or its release.
 
@@ -4874,12 +4908,45 @@ class SqlServerStore:
         transient stage failure. The ``async with pool.acquire()`` became an explicit
         acquire/release only because the bound has to sit between the two; aioodbc's context manager
         does nothing on exit but ``await pool.release(conn)`` (0.5.0 ``utils.py:86-103``), and the
-        ADR 0159 ordering below is preserved exactly — the quarantine still runs BEFORE the release,
-        which is what makes a poisoned connection unlendable."""
+        ADR 0159 ordering in :meth:`_borrow` is preserved exactly — the quarantine still runs BEFORE
+        the release, which is what makes a poisoned connection unlendable.
+
+        **One borrow has a longer bound, on purpose:** :meth:`_acquire_after_commit` (BACKLOG
+        #3023)."""
+        return self._borrow(self._settings.acquire_timeout)
+
+    def _acquire_after_commit(self) -> AbstractAsyncContextManager[Any]:
+        """:meth:`_acquire` with a LONGER acquire limit, for a session write that FOLLOWS a write its
+        caller has already committed (BACKLOG #3023): ``_AFTER_COMMIT_ACQUIRE_FACTOR`` times
+        ``[store].acquire_timeout``, whose comment says why that multiple. Everything else :meth:`_acquire` does is
+        kept: the call gate, the command timeout, the ADR 0159 quarantine before the release, and the
+        acquire-wait histogram.
+
+        ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
+        password, a disabled account, a changed role, a completed factor ceremony. By the time they
+        run, that change is committed, and nothing retries them, so a pool shortage at the ordinary
+        limit would fail them after it. The longer limit lets a shortage that clears within it pass.
+        It is still a limit, so the wait is always bounded: at it the borrow raises
+        ``StoreAcquireTimeout`` like any other, and a refused rotation then fails closed in
+        ``AuthService._rotate_session_hash``. The Postgres store's ``_after_commit_txn`` (BACKLOG
+        #2283) waits without a limit; this one does not.
+
+        The limit is derived from ``acquire_timeout``, never from ``command_timeout``, so a
+        ``command_timeout`` of 0, which lifts the statement limit on every store call, leaves this
+        wait bounded, as long as ``acquire_timeout`` is, which its validator requires to be > 0.
+        The same callers make other bounded writes after their change commits,
+        such as stamps and audit rows, and those can still fail at the ordinary limit. Callers with
+        no earlier write, such as "sign out everywhere else", wait the same way. The wait holds
+        whatever lock its caller holds, such as a ceremony's per-account lock, for up to the longer
+        limit, and a rotation's fail-closed revokes run under that lock after it. ``tests/test_store_pool_acquire_timeout.py`` pins which methods reach this borrow."""
+        return self._borrow(self._settings.acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR)
+
+    @asynccontextmanager
+    async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
+        """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
+        store borrows from its pool. ``timeout`` is the acquire limit, never ``None``."""
         t0 = perf_counter()
-        conn = await acquire_pooled(
-            self._pool, timeout=self._settings.acquire_timeout, backend="sqlserver"
-        )
+        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
             _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
@@ -12061,6 +12128,28 @@ class SqlServerStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Each read is its own pooled statement; a row that changes between
+        them fails its MAC check, which gives no evidence."""
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+            return await self._fetchone(sql, params)
+
+        check = await read_newest_keyed_audit_row(
+            fetch,
+            action=action,
+            actor=actor,
+            after_seq=after_seq,
+            active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+            mac_keys=self._audit_mac_keys,
+            mac_fn=self._audit_mac_fn,
+        )
+        return await settle_newest_keyed_audit_row(check)
+
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
@@ -12649,7 +12738,7 @@ class SqlServerStore:
         await cur.execute(
             _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
         )
-        return int(cur.rowcount) > 0
+        return bool(await cur.fetchall())
 
     async def _open_under_audit_applock(self, cur: Any) -> None:
         """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
@@ -13294,11 +13383,12 @@ class SqlServerStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
-        material, not a secret — excluded from cipher + rekey). A duplicate ``(user_id, label)``
-        raises pyodbc's IntegrityError via ``ux_webauthn_label`` — the caller renders it as the
-        same "label already in use" error as its pre-check (the concurrent-enroll race, ADR 0068
-        §4). The account is re-sealed over its new passkey digest in the same transaction (BACKLOG
-        #2592)."""
+        material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
+        for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
+        already held (the primary key) and an account that does not exist
+        (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
+        re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
+        over its new passkey digest in the same transaction (BACKLOG #2592)."""
         await self._write_passkeys_txn(
             cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
         )
@@ -13529,6 +13619,11 @@ class SqlServerStore:
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
+        # BACKLOG #2733: hold the account row first, as every passkey write does
+        # (_read_user_record). Otherwise an enrolment committing between the passkey delete and the
+        # users delete below would fail fk_webauthn_credentials_user and the whole delete with it.
+        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        await cur.fetchall()
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
@@ -14138,10 +14233,17 @@ class SqlServerStore:
         return updated if written else None
 
     async def _write_session_txn(
-        self, token_hash: str, change: Callable[[SessionRecord], SessionRecord]
+        self,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+        *,
+        after_commit: bool = False,
     ) -> SessionRecord | None:
-        """:meth:`_write_session` in a transaction of its own, committed before it returns."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
+        passes it."""
+        borrow = self._acquire_after_commit() if after_commit else self._acquire()
+        async with borrow as conn, self._cursor(conn) as cur:
             try:
                 updated = await self._write_session(cur, token_hash, change)
                 await self._commit(conn)
@@ -14205,9 +14307,10 @@ class SqlServerStore:
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
-        clustered-PK row move is width-safe."""
+        clustered-PK row move is width-safe. The borrow is :meth:`_acquire_after_commit`'s, for the
+        reason it gives (BACKLOG #3023)."""
         rotated = await self._write_session_txn(
-            token_hash, lambda s: replace(s, token_hash=new_token_hash)
+            token_hash, lambda s: replace(s, token_hash=new_token_hash), after_commit=True
         )
         return rotated is not None
 
@@ -14242,9 +14345,10 @@ class SqlServerStore:
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
-        ``create_session`` takes them in."""
+        ``create_session`` takes them in. The borrow is :meth:`_acquire_after_commit`'s, for the
+        reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
                 await self._bump_session_epoch(cur, user_id)
                 if except_token_hash is None:

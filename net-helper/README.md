@@ -128,10 +128,11 @@ records why it never ships inside the wheel. No release publishes the helper yet
 
 ### Only Windows nodes can use it
 
-Engine-managed VIP is Windows-only, and so is the helper. A Linux or containerized deployment keeps an
-external floating VIP or load balancer in front of the cluster instead. That path stays fully supported,
-and [CLUSTERING.md](../docs/CLUSTERING.md#client-reconnect--a-floating-vip--lb-health-check-is-required)
-describes it.
+Engine-managed VIP is Windows-only, and so is the helper. A cluster that does not use it keeps an
+external floating VIP or load balancer in front of the cluster instead. That path stays fully
+supported, and [CLUSTERING.md](../docs/CLUSTERING.md#client-reconnect--a-floating-vip--lb-health-check-is-required)
+describes it. A Linux host or a container cannot run the helper, and Linux is
+[not supported for v1](../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 
 ### Keep the helper's files where only administrators can write
 

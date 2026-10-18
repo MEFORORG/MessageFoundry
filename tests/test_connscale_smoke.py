@@ -66,6 +66,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -96,6 +97,7 @@ from tests._connscale_ports import (
     reserve_api_and_sink_bases,
     reserve_contiguous_ports,
 )
+from tests._proc_tree import cmdline_of, kill_all, tree_of, wait_until
 
 pytestmark = pytest.mark.timeout(120)  # the per-test 60s default is too tight for two engine spawns
 
@@ -709,6 +711,57 @@ def test_the_run_reports_overall_success(smoke_report: ConnScaleReport) -> None:
     """The runner's own verdict, kept separate from the individual properties above: this can red
     while every property passes (or the reverse), and merging the two hid which had happened."""
     assert smoke_report.result_ok and smoke_report.exit_code == 0
+
+
+def _connscale_engines_under_this_process() -> list[str]:
+    """Command lines of every ``serve --config harness/config/connscale`` descended from pytest."""
+    lines = (cmdline_of(p) for p in tree_of(os.getpid())[1:])
+    return [
+        line
+        for line in lines
+        if line
+        and " serve " in f" {line} "
+        and "harness/config/connscale" in line.replace("\\", "/")
+    ]
+
+
+def test_no_engine_OUTLIVES_the_sweep(smoke_report: ConnScaleReport) -> None:
+    """Every engine the sweep spawned is gone once it returns. Measured 2026-10-17: 54 connscale
+    engines from 9 worktrees, up to 16.5 hours old, held ports and temp dirs on a developer box.
+    ``tests/test_engine_node_process_tree.py`` covers the owner dying first; this covers the sweep's
+    own teardown, on the real engine.
+
+    ARMED FIRST: a stand-in carrying the same command line must be SEEN by the census, or a zero
+    below would only mean the census cannot see an engine."""
+    decoy_mark = "mefor-connscale-decoy"
+    decoy = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "serve",
+            "harness/config/connscale",
+            decoy_mark,
+        ]
+    )
+
+    def no_decoy_left() -> bool:
+        found = [p for p in tree_of(os.getpid())[1:] if decoy_mark in (cmdline_of(p) or "")]
+        kill_all(found)
+        return not found
+
+    try:
+        armed = _connscale_engines_under_this_process()
+    finally:
+        # Every process carrying the mark, until a pass finds none: a venv launcher starts its
+        # child after a moment, so one snapshot of the decoy's tree can miss it, and a dying decoy
+        # must not read below as a leaked engine.
+        wait_until(no_decoy_left, 30)
+        decoy.wait(timeout=30)
+    assert armed, "could not arm: the census did not see a stand-in connscale engine"
+    assert smoke_report.records, "the sweep ran no step, so no engine could have leaked"
+    survivors = _connscale_engines_under_this_process()
+    assert not survivors, "THE SWEEP LEFT ENGINES RUNNING:\n" + "\n".join(survivors)
 
 
 @pytest.mark.skipif(sys.platform != "win32" and sys.platform != "linux", reason="OS FD probe path")

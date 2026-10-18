@@ -7,6 +7,8 @@
 # + plaintext_upstream_hop_acknowledged=true + web_console_public_address; that section has the full
 # block), the "k8s-preferred" pattern
 # and the right home for mTLS + OCSP-must-staple revocation.
+# NOT A SUPPORTED V1 DEPLOYMENT (the image runs Linux). See
+# docs/SYSTEM-REQUIREMENTS.md, "Linux is not a supported v1 deployment target".
 #
 # CONFIG IS BAKED INTO THE IMAGE, not mounted, to match ADR 0017's immutable, byte-identical
 # multi-instance model. The engine (uid 10001) refuses a config dir or module owned by any uid other than

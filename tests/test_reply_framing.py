@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.auth.oidc_http import IdpReplyCutShortError, IdpReplyUnusableError
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import FHIR, Rest, Soap
@@ -395,10 +396,12 @@ def test_a_repeated_chunked_coding_is_named_as_such() -> None:
 # Not an outbound connection, but the same stdlib reader on a reply the engine asked for. The token
 # leg raises TokenRefusedError, a FlowError: a misframed reply is the endpoint answering, so it
 # does not mark the IdP unavailable (BACKLOG #1948, ADR 0142 Amendment E). The JWKS leg raises an
-# http.client.HTTPException, which reaches the (OSError, ValueError, HTTPException) arm in
-# auth/service.py and, read as transport, still marks the IdP; the amendment names that residual.
-# The JWKS leg must NOT raise JwksError: claims.py retypes that as ClaimsError("unknown_kid"), a
-# token-verification reject. These tests pin the types, not the service mapping.
+# IdpReplyError, an http.client.HTTPException, which reaches the (OSError, ValueError,
+# HTTPException) arm in auth/service.py. A misframed reply is IdpReplyUnusableError, an answer
+# that does not mark the IdP; one cut short is IdpReplyCutShortError, a transport failure
+# (BACKLOG #3221, ADR 0142 Amendment G). The JWKS leg must NOT raise JwksError: claims.py retypes
+# that as ClaimsError("unknown_kid"), a token-verification reject. These tests pin the types; the
+# service mapping is pinned in tests/test_oidc_idp_flag_transport_only.py.
 
 _TOKEN_JSON = b'{"id_token": "x.y.z"}'
 
@@ -445,7 +448,7 @@ def test_oidc_jwks_fetch_refuses_ambiguous_framing() -> None:
     raw = _json_reply(b"Transfer-Encoding: gzip\r\nContent-Length: 3\r\n")
     with (
         _serve(raw) as url,
-        pytest.raises(http.client.HTTPException, match="ambiguously") as raised,
+        pytest.raises(IdpReplyUnusableError, match="ambiguously") as raised,
     ):
         jwks_fetcher(url, urllib.request.build_opener())()
     assert not isinstance(raised.value, (JwksError, ValueError))
@@ -982,7 +985,7 @@ def test_oidc_jwks_fetch_refuses_malformed_framing(shape: str) -> None:
 
     with (
         _serve(_OIDC_BAD[shape]) as url,
-        pytest.raises(http.client.HTTPException, match="ambiguously") as raised,
+        pytest.raises(IdpReplyUnusableError, match="ambiguously") as raised,
     ):
         jwks_fetcher(url, urllib.request.build_opener())()
     assert not isinstance(raised.value, (JwksError, ValueError))
@@ -1035,7 +1038,17 @@ def test_oidc_jwks_fetch_refuses_a_body_short_of_its_content_length() -> None:
     from messagefoundry.auth.oidc_http import jwks_fetcher
 
     raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
-    with _serve(raw) as url, pytest.raises(http.client.HTTPException, match="declared length"):
+    with _serve(raw) as url, pytest.raises(IdpReplyCutShortError, match="declared length"):
+        jwks_fetcher(url, urllib.request.build_opener())()
+
+
+def test_oidc_jwks_fetch_reads_a_chunked_body_cut_short_as_cut_short() -> None:
+    """BACKLOG #3221: a chunked JWKS body cut mid-chunk is a transport failure, as on the token
+    leg, so it must not fall to the family arm and read as an unusable answer."""
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _OK + b"Transfer-Encoding: chunked\r\n\r\n50\r\nhello"
+    with _serve(raw) as url, pytest.raises(IdpReplyCutShortError, match="cut short"):
         jwks_fetcher(url, urllib.request.build_opener())()
 
 
@@ -1053,7 +1066,7 @@ def test_both_oidc_reads_retype_the_whole_refusal_family(monkeypatch: pytest.Mon
     raw = _json_reply(b"Content-Length: %d\r\n" % len(_TOKEN_JSON))
     with _serve(raw) as url, pytest.raises(oidc.FlowError):
         _exchange(url)
-    with _serve(raw) as url, pytest.raises(http.client.HTTPException):
+    with _serve(raw) as url, pytest.raises(IdpReplyUnusableError):
         oidc_http.jwks_fetcher(url, urllib.request.build_opener())()
 
 

@@ -5533,7 +5533,8 @@ _AUDIT_ROWS_PER_PROCESS = 25
 
 #: Bound on ONE appender's wait, sized to stay under the suite's own ``--timeout=60`` watchdog (the
 #: gated ``postgres-store`` job adds no ``--timeout=`` of its own, so the pyproject value is what
-#: binds). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
+#: binds; the advisory ``postgres-store-windows`` twin passes 120, so 60 is the tighter of the
+#: two and the one to size against). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
 #: hard-exits the interpreter, which orphans both children AND takes the rest of this file's tests
 #: down with it. A bound above the watchdog would be dead code.
 _APPENDER_TIMEOUT_SECONDS = 30.0
@@ -5764,9 +5765,11 @@ async def test_audit_events_and_security_events_page_by_offset_pg(store) -> None
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "pg")
+    await check_keyed_audit_evidence(store, "pg")
     await check_security_events_paging(store, "pg")
     await check_connection_event_paging(store, "pg")
