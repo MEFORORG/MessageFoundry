@@ -769,8 +769,8 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     message = (
         f"AD answered the {operation} with a referral to {hosts}; the engine does not follow "
         "referrals, because ldap3 would re-send the bind credentials there without the pinned CA "
-        "(BACKLOG #2530). This usually means a configured search base lies in another domain of "
-        "the forest; use a base in this domain controller's own domain, or a global catalog, "
+        "(BACKLOG #2530). This usually means a configured DN or search base lies in another "
+        "domain of the forest; use one in this domain controller's own domain, or a global catalog, "
         "which carries universal-group membership only (ADR 0180 Amendment F)."
     )
     raise _referral_error(operation, message)
@@ -791,6 +791,8 @@ _UNANSWERED_HINTS: dict[int, str] = {
     "account cannot see it.",
     34: " invalidDNSyntax usually means a configured DN is not a distinguished name, such as a UPN "
     "or DOMAIN\\user.",
+    49: " invalidCredentials on the service-account bind usually means [auth].ad_bind_dn or its "
+    "password is wrong.",
     50: " insufficientAccessRights means the service account may not read it.",
 }
 
@@ -966,9 +968,8 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     ``close`` closes the socket the failed read was on, where nothing else will. Only the service
     account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
     when it raises no caller holds the connection to unbind. A search does not need it (BACKLOG
-    #3010): every caller holding a searched connection unbinds it when its block ends,
-    ``authenticate`` and ``probe_principal`` through ``_service_session`` (BACKLOG #3017) and
-    ``read_bind_account`` in a ``finally``.
+    #3010): every caller holding a searched connection unbinds it when its block ends, through
+    ``_service_session`` (BACKLOG #3017).
     """
     import ldap3
 
@@ -1219,7 +1220,11 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
     directory's diagnostic message, and the sign-in callers write this text into
     ``auth.login_error``. It differs from :func:`_socket_faults_as_ldap_error`'s text, so a reader
     can tell an ldap3 error from a bare socket fault.
+
+    The text is kept for diagnosis in a DEBUG traceback only, which is what tells a pinned-CA
+    mismatch from a refused port or a name-lookup miss.
     """
+    logger.debug("AD directory call failed", exc_info=exc)
     return LdapError(f"AD directory call failed: ldap3 raised {type(exc).__name__}")
 
 
@@ -1276,10 +1281,10 @@ def _released(conn: Any) -> Iterator[None]:
     """Unbind ``conn`` when the block ends, however it ends.
 
     An ldap3 error from the unbind never replaces an exception the block raised (BACKLOG #3010).
-    The decoy bind swallows an ``LDAPException`` and the real bind maps it to :class:`LdapError`, so
-    an unbind failing after an undecodable bind would otherwise answer an absent account and a
-    present one differently. After a block that raised nothing, the unbind's error propagates as
-    before.
+    The block's own exception is the answer both bind branches give, so an unbind failing after an
+    undecodable bind must not replace it on one branch only, or an absent account and a present
+    one would answer differently. After a block that raised nothing, the unbind's error propagates
+    as before.
     """
     import ldap3
 
@@ -1456,8 +1461,10 @@ class LdapAuthenticator:
         try:
             yield svc
         finally:
-            with contextlib.suppress(ldap3.core.exceptions.LDAPException):
+            try:
                 svc.unbind()
+            except ldap3.core.exceptions.LDAPException as failed:
+                logger.debug("AD service-account unbind failed: %s", _type_name(failed))
 
     def _equalizing_bind(self, password: str) -> None:
         """Do the password-verifying bind's work for a principal that does not exist, and discard it.
@@ -1478,9 +1485,11 @@ class LdapAuthenticator:
         that a bind against a DN that does not exist would not read as a directory error. It never
         does: every ``Connection`` here keeps ldap3's default ``raise_exceptions=False``, so a bind
         the directory refuses, ``invalidCredentials`` included, returns ``False`` and raises
-        nothing. ldap3 2.9.1's simple bind raises only when it cannot ask (no user or no password,
-        neither possible here) or when the connection fails. A test pins the healthy-directory
-        path.
+        nothing. ldap3 2.9.1's simple bind raises when the connection fails, and when it cannot
+        ask: no user or no password, neither possible here, or a password SASLprep (RFC 4013)
+        refuses, such as one holding a control character. That last raises before anything is
+        sent, on both branches alike, so such a password reads as a directory error for an absent
+        account and a present one. A test pins the healthy-directory path.
 
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
         PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
@@ -1501,8 +1510,13 @@ class LdapAuthenticator:
         )
         # Labelled as the real bind is, and released the same way, so an undecodable answer
         # fails both branches with the same text (_ldap3_call, _released).
-        with _released(conn), _ldap3_call("user bind"):
-            conn.bind()  # result deliberately ignored — this branch always fails the login
+        with _released(conn):
+            with _ldap3_call("user bind"):
+                bound = conn.bind()
+            if not bound:
+                # As the real bind does, so a referral answers both branches alike (BACKLOG
+                # #3017). Any other refusal is ignored: this branch always fails the sign-in.
+                _refuse_referral(conn, "user bind")
 
     def _search_user(
         self,
@@ -1831,8 +1845,9 @@ class LdapAuthenticator:
     ) -> AdPrincipal | None:
         """Look a user up + resolve groups *without* a password. Uses the service-account bind only.
 
-        For Kerberos, where SSO already proved the identity, and for the federated legs. The ADR 0079
-        session reconciler calls :meth:`probe_principal`, which this is with the answer dropped.
+        At least for Kerberos, where SSO already proved the identity, the federated legs and
+        ``create_directory_account``. The ADR 0079 session reconciler calls
+        :meth:`probe_principal`, which this is with the answer dropped.
 
         **``object_id`` WINS WHEN GIVEN, and choosing here rather than at the call site is the point
         (BACKLOG #1532).** ``username`` is a label a directory may reassign; ``objectGUID`` is not. A

@@ -96,6 +96,20 @@ def test_a_failed_second_connect_answers_an_absent_and_a_present_account_alike(
     assert texts["absent"] == texts["present"], texts
 
 
+def test_a_referred_bind_answers_an_absent_and_a_present_account_alike() -> None:
+    """The real bind refuses a referral its bind answer carries, so the decoy must too, or a
+    referring directory would answer NOT_FOUND for an absent account only (review round 1)."""
+    texts: dict[str, str] = {}
+    for branch, uac in (("absent", None), ("present", "512")):
+        with pytest.MonkeyPatch.context() as mp:
+            _install_fakes(mp, refer="bind")
+            _shape_search(mp, uac=uac)
+            with pytest.raises(LdapReferralError) as err:
+                LdapAuthenticator(_ad_settings()).authenticate("ghost", _PASSWORD)
+            texts[branch] = str(err.value)
+    assert texts["absent"] == texts["present"], texts
+
+
 def test_a_wrong_user_name_on_a_healthy_directory_is_a_failed_sign_in() -> None:
     """THE GUARD the swallow existed for, through a real ldap3 stack. The directory refuses the
     decoy's DN with invalidCredentials, which ldap3 returns as ``False`` and never raises, so the
@@ -264,6 +278,7 @@ def test_any_other_service_bind_refusal_names_its_result_code() -> None:
     assert str(err.value).startswith(
         "AD ended the service-account bind with result code 49 (invalidCredentials)"
     )
+    assert "[auth].ad_bind_dn or its password is wrong" in str(err.value)
     assert dc.searches == []
 
 
