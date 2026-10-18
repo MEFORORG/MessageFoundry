@@ -131,7 +131,7 @@ def _sighted_pass(runner: CrlReloadRunner) -> list[ReloadOutcome]:
     return outcomes
 
 
-def _unreadable(_path: str) -> tuple[int, int, int]:
+def _stamp_denied(_path: str) -> tuple[int, int, int]:
     """A stand-in for ``crl_reload._stamp`` on a file the engine may not read."""
     raise PermissionError(13, "Permission denied")
 
@@ -782,7 +782,7 @@ async def test_a_reminder_follows_the_record_when_the_pass_cannot_read_the_file(
     pki.crl.write_bytes(_expired(pki))
     _pass(runner)
 
-    monkeypatch.setattr(crl_reload, "_stamp", _unreadable)
+    monkeypatch.setattr(crl_reload, "_stamp", _stamp_denied)
     clock.now += 300
     assert _pass(runner) == [], "the control: no outcome at all"
     assert len(sink.refused()) == 2
@@ -802,7 +802,7 @@ async def test_a_refusal_judged_every_pass_is_not_reminded_about_unjudged(
     assert waiting.refusal is not None and not waiting.refusal.sticky  # the premise
 
     with monkeypatch.context() as patched:
-        patched.setattr(crl_reload, "_stamp", _unreadable)
+        patched.setattr(crl_reload, "_stamp", _stamp_denied)
         clock.now += 900
         _pass(runner)
         _pass(runner)
@@ -829,7 +829,7 @@ async def test_a_refusal_judged_every_pass_is_reminded_about_only_from_the_pass_
     assert _pass(runner), "a pass that judged the same version again, before the reminder"
 
     with monkeypatch.context() as patched:
-        patched.setattr(crl_reload, "_stamp", _unreadable)
+        patched.setattr(crl_reload, "_stamp", _stamp_denied)
         clock.now += 240
         assert _pass(runner) == [], "the reminder falls due at a pass that judged nothing"
         assert len(sink.refused()) == 1, "no reminder from an earlier pass's judgment"
@@ -1003,7 +1003,7 @@ async def test_a_file_the_pass_cannot_read_resolves_nothing(
     assert refused.refusal is not None and refused.refusal.sticky is final
 
     with monkeypatch.context() as patched:
-        patched.setattr(crl_reload, "_stamp", _unreadable)
+        patched.setattr(crl_reload, "_stamp", _stamp_denied)
         for _ in range(3):
             assert _pass(runner) == [], "no outcome at all for the unreadable file"
         # The control: the refusal is still on record, which is what the runner reads.
@@ -1168,7 +1168,7 @@ async def test_the_first_sight_clear_waits_for_a_pass_that_judged_the_file(
     def boom(*_args: object) -> None:
         raise RuntimeError("the triage failed")
 
-    for name, broken in (("_triage", boom), ("_stamp", _unreadable)):
+    for name, broken in (("_triage", boom), ("_stamp", _stamp_denied)):
         with monkeypatch.context() as patched:
             patched.setattr(crl_reload, name, broken)
             assert _sighted_pass(runner) == []
@@ -1226,7 +1226,7 @@ async def test_the_first_sight_clear_reads_what_its_own_pass_judged(
     change it: the clear must still see a pass that judged nothing."""
     hop = pki.outbound_hop()
     key = crl_path_key(pki.crl)
-    monkeypatch.setattr(crl_reload, "_stamp", _unreadable)
+    monkeypatch.setattr(crl_reload, "_stamp", _stamp_denied)
     unread: list[bool] = []
     sink = _Sink()
 
@@ -1272,7 +1272,7 @@ async def test_an_unreadable_pass_does_not_end_a_failing_streak(
         reload_replaced_crls()
         failing[0] = False
         with monkeypatch.context() as patched:
-            patched.setattr(crl_reload, "_stamp", _unreadable)
+            patched.setattr(crl_reload, "_stamp", _stamp_denied)
             reload_replaced_crls()
         failing[0] = True
         reload_replaced_crls()
@@ -1283,6 +1283,41 @@ async def test_an_unreadable_pass_does_not_end_a_failing_streak(
         failing[0] = True
         reload_replaced_crls()
         assert logged() == 2
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_file_the_reload_cannot_read_is_not_judged_at_first_sight(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3543, review findings 2 and 3, where the reload itself reads the file. With
+    its stamp unchanged since the triage last read it, the triage hands the reload no bytes, and
+    the reload reads them. A file that still stats but cannot be read there judged nothing, so it
+    must not clear an earlier run's alert. Here no refusal stands, because the reload before it
+    failed, so only that rule holds the clear back."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+
+    def boom(*_args: object) -> None:
+        raise RuntimeError("the reload failed")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "_reload_path", boom)
+        assert _sighted_pass(runner) == []  # the triage read the bytes; the reload failed
+    assert reload_refusals() == {}, "the premise: no refusal stands"
+
+    def denied(_self: Path) -> bytes:
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "read_bytes", denied)
+        assert _sighted_pass(runner) == []
+        assert crl_path_key(pki.crl) in crl_reload._UNREADABLE, "the reload's own read failed"
+    assert sink.events == [] and runner._seen_held == set()
+
+    (applied,) = _sighted_pass(runner)  # the control: a pass that reads it judges it
+    assert applied.reloaded == 1 and sink.kinds() == ["applied"]
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 

@@ -958,6 +958,7 @@ _RETRIED_BY = {
     _RAISED: "the next pass tries again",
     _REMINDED: "the next reminder tries again",
     _RESOLVED: "the next pass, or the stop, tries again",
+    _CLEARED: "the next pass, or the stop, tries again",
 }
 
 
@@ -1016,8 +1017,8 @@ class CrlReloadRunner:
     #3543).** Its alerts were open in the alert list and in no runner's memory. A process with
     the same identity builds every context afresh, from the file as it is then. So the first
     time a pass of this runner's loop judges a held file and no refusal stands for it, the runner
-    resolves that file's subject, once (:meth:`_clear_on_first_sight`). That reaches only a file this process still
-    holds, under a subject it still uses. An alert for a file no hop holds now, or one raised
+    resolves that file's subject, once (:meth:`_clear_on_first_sight`). That reaches only a file
+    this process still holds, under a subject it still uses. An alert for a file no hop holds now, or one raised
     under an identity that changes on every start (an unpinned cluster node), stays open for an
     operator to resolve in the alert list."""
 
@@ -1157,8 +1158,10 @@ class CrlReloadRunner:
         ``judged`` holds the files the pass just run judged, by path key, with the path it read
         each by (:meth:`_judged_pass`). For each one this runner has not judged yet, with no
         refusal standing and no alert of this runner's open: raise ``crl_reload_applied`` for its
-        subject. Every context was built from the file as it is, and the pass read the file and
-        found nothing to refuse, so a refusal alert left open under this subject is false. Only
+        subject. Every context was built from the file as it is, and the pass found nothing to
+        refuse in its bytes, so a refusal alert left open under this subject is false. The pass
+        reads those bytes, or finds by the file's size, modification time and file id that they
+        are the ones it last read. Only
         those files: one the pass could not read or failed on is no evidence, and nor is one a hop
         began to hold while the pass ran. Each waits for a pass that judged it. A copy from a CA
         bundle is never judged, as the pass leaves it out (:func:`_held_by_path`): no refusal is
@@ -1281,8 +1284,9 @@ class CrlReloadRunner:
         A WARNING, except for a clear sent in case an earlier run left an alert open
         (:data:`_CLEARED`). That one is sent for every held file, so most resolve nothing, and a
         WARNING per file would send an operator after refusals that never existed. So it says
-        that there may be no such alert, at INFO. The stop's WARNING still names any clear left
-        owed."""
+        that there may be no such alert, at INFO. A clean stop's WARNING names any clear still
+        owed. A process that dies before it stops leaves only this INFO line, and any alert the
+        clear was for stays open in the alert list, as one does for a file no hop holds now."""
         if (what, key) in self._sink_failing:
             return
         self._sink_failing.add((what, key))
@@ -1292,7 +1296,7 @@ class CrlReloadRunner:
                 "alert an earlier run of this process left open; there may be no such alert, "
                 "and %s",
                 key,
-                _RETRIED_BY[_RESOLVED],
+                _RETRIED_BY[what],
                 exc_info=True,
             )
             return
