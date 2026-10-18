@@ -211,6 +211,9 @@ Windows-only dependencies (at least `colorama` and `sspilib`):
     such line, and locks only the platform it runs on, so run it on Windows.
   - A lock that pins one name at two versions under two markers fails: with the markers removed,
     `pip-audit` refuses the duplicate.
+- Each command is its own step, and each step after the lock install runs even when an earlier one
+  failed, so a failed install or one audit's finding never hides the other audit's result. The job's
+  token is read-only and its checkout keeps no credential, because it runs engine code from the lock.
 - The job does not wait on `verify-engine`, so a failed provenance check does not also silence the
   tripwire. The engine code it runs comes from your lock's hashes, which bind it to the bytes you
   locked, not to the wheel `verify-engine` attested.

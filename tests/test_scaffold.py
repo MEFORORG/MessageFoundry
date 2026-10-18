@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -147,9 +148,12 @@ def _write_step(scaffolded_ci: tuple[str, Path, dict[str, Any]], job: str, name:
     """Write the ``run`` script of step ``name`` in ``job`` to disk and return its path."""
     _, root, jobs = scaffolded_ci
     [step] = [s for s in jobs[job]["steps"] if s.get("name") == name]
-    script = root / f"{job}.sh"
+    return _write_script(root / f"{job}.sh", str(step["run"]))
+
+
+def _write_script(script: Path, run: str) -> Path:
     # Bytes, so Windows does not turn each newline into CRLF, which bash would read as part of a line.
-    script.write_bytes(str(step["run"]).encode("utf-8"))
+    script.write_bytes(run.encode("utf-8"))
     return script
 
 
@@ -158,7 +162,7 @@ def _run_step(
 ) -> subprocess.CompletedProcess[str]:
     """Run ``script`` in ``work`` with each of ``stubs`` first on PATH and ``env_extra`` set."""
     stub_dir = work.parent / "stubs"
-    stub_dir.mkdir()
+    stub_dir.mkdir(exist_ok=True)
     for name, body in stubs.items():
         (stub_dir / name).write_bytes(body)
         (stub_dir / name).chmod(0o755)
@@ -295,18 +299,23 @@ def test_the_scaffolded_verify_step_checks_the_gh_version(
     assert (_WEAK_PIN in output) is warns, output
 
 
-_AUDIT_STEP = "Audit the pinned engine + deps against advisories"
-
-#: Stands in for ``python``: logs its argv, and hands the engine's auditor to the real interpreter
-#: through ``_AUDIT_RECORDER``, so the packaged module's own logic runs on the job's input.
+#: Stands in for ``python``: logs its argv, fails when it matches ``$FAIL_ON``, and hands the engine's
+#: auditor to the real interpreter through ``_AUDIT_RECORDER``, so the packaged module's own logic
+#: runs on the job's input.
 _PYTHON_STUB = (
     b"#!/usr/bin/env bash\n"
     b'printf "python %s\\n" "$*" >> "$STUB_LOG"\n'
+    b'if [ -n "$FAIL_ON" ] && [ "$*" = "$FAIL_ON" ]; then exit 1; fi\n'
     b'if [ "$1 $2 $3" = "-P -m messagefoundry.security.audit_all_platforms" ]; then\n'
     b'  shift 3; exec "$REAL_PYTHON" "$AUDIT_RECORDER" "$@"\n'
     b"fi\n"
 )
-_PIP_AUDIT_STUB = b'#!/usr/bin/env bash\nprintf "pip-audit %s\\n" "$*" >> "$STUB_LOG"\n'
+#: Logs its argv and, like a pip-audit with a finding, fails when ``$PIP_AUDIT_FINDS`` is set.
+_PIP_AUDIT_STUB = (
+    b"#!/usr/bin/env bash\n"
+    b'printf "pip-audit %s\\n" "$*" >> "$STUB_LOG"\n'
+    b'if [ -n "$PIP_AUDIT_FINDS" ]; then exit 1; fi\n'
+)
 
 #: The packaged ``main`` with a runner that passes the install check and saves what pip-audit reads.
 _AUDIT_RECORDER = """\
@@ -333,15 +342,31 @@ urllib3==1.26.0 ; sys_platform == 'linux' \\
     --hash=sha256:cccc
 """
 
+_LOCK_PRESENT = "hashFiles('requirements.lock') != ''"
 
-def _run_audit_step(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path, lock: str | None
-) -> tuple[list[str], Path, str]:
-    """Run the audit step in a repo with or without ``lock``.
+#: GitHub's rule for each step condition the job uses, as ``(an earlier step failed, lock present)
+#: -> runs``. A condition with no status function means ``success() && ...``. A condition not listed
+#: fails the run, so the job cannot grow a condition this table does not model.
+_STEP_RUNS: dict[str | None, Callable[[bool, bool], bool]] = {
+    None: lambda failed, lock: not failed,
+    f"${{{{ {_LOCK_PRESENT} }}}}": lambda failed, lock: not failed and lock,
+    "${{ hashFiles('requirements.lock') == '' }}": lambda failed, lock: not failed and not lock,
+    "${{ !cancelled() }}": lambda failed, lock: True,
+    f"${{{{ !cancelled() && {_LOCK_PRESENT} }}}}": lambda failed, lock: lock,
+}
 
-    Returns the stub log, the copy pip-audit was handed, and the step's output.
+
+def _run_audit_job(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]],
+    tmp_path: Path,
+    lock: str | None,
+    fail_env: dict[str, str] | None = None,
+) -> tuple[list[str], Path, str, list[str]]:
+    """Run the audit job's ``run`` steps in order, as GitHub decides which run.
+
+    Returns the stub log, the copy pip-audit was handed, the output, and the steps that failed.
     """
-    script = _write_step(scaffolded_ci, "audit-pin", _AUDIT_STEP)
+    bash, root, jobs = scaffolded_ci
     work = tmp_path / "work"
     work.mkdir()
     (work / "requirements.txt").write_text("messagefoundry==0.5.1\n", encoding="utf-8")
@@ -355,12 +380,32 @@ def _run_audit_step(
         "REAL_PYTHON": Path(sys.executable).as_posix(),
         "AUDIT_RECORDER": recorder.as_posix(),
         "AUDITED": audited.as_posix(),
+        "FAIL_ON": "",
+        "PIP_AUDIT_FINDS": "",
+        **(fail_env or {}),
     }
     stubs = {"python": _PYTHON_STUB, "pip-audit": _PIP_AUDIT_STUB}
-    proc = _run_step(scaffolded_ci[0], script, work, stubs, env)
-    output = proc.stdout + proc.stderr
-    assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
-    return log.read_text(encoding="utf-8").splitlines(), audited, output
+    output, failed = "", []
+    for i, step in enumerate(jobs["audit-pin"]["steps"]):
+        if "run" not in step:
+            continue
+        if not _STEP_RUNS[step.get("if")](bool(failed), lock is not None):
+            continue
+        script = _write_script(tmp_path / f"step{i}.sh", str(step["run"]))
+        proc = _run_step(bash, script, work, stubs, env)
+        output += proc.stdout + proc.stderr
+        if proc.returncode:
+            failed.append(step["name"])
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return calls, audited, output, failed
+
+
+_LOCK_CALLS = [
+    "python -m pip install --no-deps --require-hashes -r requirements.lock",
+    "python -m pip install pip-audit",
+    "pip-audit -r requirements.txt --desc",
+    "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",
+]
 
 
 def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
@@ -369,42 +414,63 @@ def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
     """Windows is the only supported deployment platform, and pip-audit evaluates markers on the host.
 
     It does not wait on verify-engine, so a failed provenance check does not silence the tripwire.
+    It runs engine code from the lock, so its token reads only and its checkout keeps no credential.
     """
     audit = scaffolded_jobs[1]["audit-pin"]
     assert audit["runs-on"] == "windows-latest"
     assert audit["defaults"] == {"run": {"shell": "bash"}}
     assert "needs" not in audit and "if" not in audit
     assert 0 < audit["timeout-minutes"] < 360
+    for job in ("audit-pin", "check"):
+        assert scaffolded_jobs[1][job]["permissions"] == {"contents": "read"}, job
+        [checkout] = [
+            s for s in scaffolded_jobs[1][job]["steps"] if "checkout" in s.get("uses", "")
+        ]
+        assert checkout["with"] == {"persist-credentials": False}, job
 
 
-def test_the_scaffolded_audit_step_audits_every_pin_of_a_lock(
+def test_the_scaffolded_audit_job_audits_every_pin_of_a_lock(
     scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
     """With a lock, requirements.txt is still audited, and the engine's auditor un-gates a
     Windows-only pin and a Linux-only one alike."""
-    calls, audited, output = _run_audit_step(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
-    assert calls == [
-        "python -m pip install --no-deps --require-hashes -r requirements.lock",
-        "python -m pip install pip-audit",
-        "pip-audit -r requirements.txt --desc",
-        "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",
-    ]
+    calls, audited, output, failed = _run_audit_job(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
+    assert (calls, failed) == (_LOCK_CALLS, [])
     text = audited.read_text(encoding="utf-8")
     assert "sspilib==0.6.0 \\\n" in text and "urllib3==1.26.0 \\\n" in text
     assert ";" not in text
     assert "::warning::" not in output
 
 
-def test_the_scaffolded_audit_step_without_a_lock_audits_requirements_txt(
+@pytest.mark.parametrize(
+    ("fail_env", "fails"),
+    [
+        ({"FAIL_ON": _LOCK_CALLS[0].removeprefix("python ")}, "Install the locked engine"),
+        ({"PIP_AUDIT_FINDS": "1"}, "Audit requirements.txt"),
+    ],
+)
+def test_a_failed_step_does_not_hide_the_later_audits(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]],
+    tmp_path: Path,
+    fail_env: dict[str, str],
+    fails: str,
+) -> None:
+    """A failed lock install, or a finding on requirements.txt, still lets every later command run."""
+    calls, _, _, failed = _run_audit_job(scaffolded_ci, tmp_path, _ADOPTER_LOCK, fail_env)
+    assert calls == _LOCK_CALLS
+    assert [name.startswith(fails) for name in failed] == [True], failed
+
+
+def test_the_scaffolded_audit_job_without_a_lock_audits_requirements_txt(
     scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
     """The control: the engine-only default is resolved and audited by pip-audit on the runner."""
-    calls, audited, output = _run_audit_step(scaffolded_ci, tmp_path, None)
+    calls, audited, output, failed = _run_audit_job(scaffolded_ci, tmp_path, None)
     assert calls == [
         "python -m pip install pip-audit",
         "pip-audit -r requirements.txt --desc",
     ]
-    assert not audited.exists()
+    assert not audited.exists() and not failed
     # SEC-021: the unhashed default warns that the closure resolves live.
     assert "::warning::No requirements.lock" in output
 

@@ -233,8 +233,13 @@ jobs:
     # though the dependency may have been skipped.
     if: ${{ always() && needs.verify-engine.result != 'failure' && needs.verify-engine.result != 'cancelled' }}
     runs-on: ubuntu-latest
+    # It runs engine code, so the token reads only, and the checkout keeps no credential.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -266,32 +271,44 @@ jobs:
   # and UNHASHED, so the step WARNS and recommends an index pin (--index-url / PIP_CONSTRAINT) against
   # dependency-confusion. Generate the lock over YOUR closure (see the README "Transitive
   # supply-chain" section).
+  #
+  # One step per command, and each after the first runs even when an earlier one failed
+  # (`!cancelled()`), so a failed install or one audit's finding never hides the other audit's result.
+  # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
   audit-pin:
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - name: Audit the pinned engine + deps against advisories
+      # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
+      # dependencies win any version they share.
+      - name: Install the locked engine for its auditor
+        if: ${{ hashFiles('requirements.lock') != '' }}
+        run: python -m pip install --no-deps --require-hashes -r requirements.lock
+      - name: Warn when the transitive resolve is not hash-pinned
+        if: ${{ hashFiles('requirements.lock') == '' }}
         run: |
-          if [ -f requirements.lock ]; then
-            # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
-            # dependencies win any version they share.
-            python -m pip install --no-deps --require-hashes -r requirements.lock
-            python -m pip install pip-audit
-            pip-audit -r requirements.txt --desc
-            python -P -m messagefoundry.security.audit_all_platforms requirements.lock
-          else
-            echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
-            echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
-            python -m pip install pip-audit
-            pip-audit -r requirements.txt --desc
-          fi
+          echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
+          echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
+      - name: Install pip-audit
+        if: ${{ !cancelled() }}
+        run: python -m pip install pip-audit
+      - name: Audit requirements.txt as Windows resolves it
+        if: ${{ !cancelled() }}
+        run: pip-audit -r requirements.txt --desc
+      - name: Audit every pin of requirements.lock, whatever its marker
+        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        run: python -P -m messagefoundry.security.audit_all_platforms requirements.lock
 """
 
 _GITIGNORE = """\
