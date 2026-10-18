@@ -561,6 +561,56 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
+@pytest.mark.parametrize("change", ["factor-off", "factor-replaced", "none"])
+async def test_a_factor_changed_during_the_check_charges_no_lockout(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 1. A self-service disable or re-enrolment takes no queue and clears the
+    recovery codes the check spends, so a CORRECT recovery code whose factor is turned off, or
+    turned off and enrolled again, while the code is checked fails its spend. RED when: that code
+    falls through to the wrong-code branch, which charges the second-step lockout, rather than
+    being refused with its own reason. ``none`` is the control: a wrong code with nothing changed
+    is still charged."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    user_id = identity.user_id
+    real_consume = store.consume_recovery_code_hash
+
+    async def _consume_after_the_factor_changes(*args: Any, **kwargs: Any) -> bool:
+        if change != "none":
+            await store.disable_totp(user_id)
+        if change == "factor-replaced":
+            cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+            assert cell is not None
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=_T1
+            )
+        return await real_consume(*args, **kwargs)
+
+    monkeypatch.setattr(store, "consume_recovery_code_hash", _consume_after_the_factor_changes)
+    code = confirmed.recovery_codes[0] if change != "none" else "ZZZZ-ZZZZ-ZZZZ"
+
+    refused = await service.verify_mfa(confirmed.token, code)
+
+    assert refused.ok is False and refused.locked is False and refused.session_lost is False
+    user = await store.get_user(user_id)
+    assert user is not None
+    if change == "none":
+        assert user.second_step_failed_attempts == 1
+        return
+    reason = "factor_removed" if change == "factor-off" else "factor_replaced"
+    assert {"reason": reason} in await _audited_mfa_failures(store)
+    assert user.second_step_failed_attempts == 0
+    # No plain wrong-code row: the refusal is audited once, with its reason.
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert all(r["detail"] for r in rows)
+
+
 async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

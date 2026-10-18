@@ -8518,6 +8518,28 @@ class AuthService:
             return None
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
+    def _totp_enrolment_moved(
+        self, verified: _TotpEnrolment | None, now: VerifiedUser
+    ) -> str | None:
+        """Why the TOTP factor :meth:`verify_mfa` checked a code against is no longer the one row
+        ``now`` holds, or ``None`` when it still is: ``"factor_removed"`` (turned off),
+        ``"factor_unverified"`` (either reading's cell does not open) or ``"factor_replaced"``
+        (enrolled again, told apart by the stamp or the opened secret). BACKLOG #3068, #3780. A
+        stamp that differs proves a re-enrolment without opening the cell, so the decrypt runs only
+        when the stamps agree."""
+        if not now.totp_enabled:
+            return "factor_removed"
+        if verified is None:
+            return "factor_unverified"
+        if verified[0] != now.totp_enrolled_at:
+            return "factor_replaced"
+        enrolment_now = self._totp_enrolment(now)
+        if verified is None or enrolment_now is None:
+            return "factor_unverified"
+        if not _same_totp_enrolment(verified, enrolment_now):
+            return "factor_replaced"
+        return None
+
     async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
         (BACKLOG #2592), which is reported like a failing record and denies every passkey
@@ -10977,14 +10999,7 @@ class AuthService:
                 # no longer holds. It is spent by now, so the refusal is audited with its reason.
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
-                enrolment_now = self._totp_enrolment(fresh) if fresh.totp_enabled else None
-                refusal: str | None = None
-                if not fresh.totp_enabled:
-                    refusal = "factor_removed"
-                elif verified_enrolment is None or enrolment_now is None:
-                    refusal = "factor_unverified"
-                elif not _same_totp_enrolment(verified_enrolment, enrolment_now):
-                    refusal = "factor_replaced"
+                refusal = self._totp_enrolment_moved(verified_enrolment, fresh)
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
@@ -11048,6 +11063,24 @@ class AuthService:
                     # and passkey legs take no queue, so on those that race stays open.
                     await self._mark_login_address_known(user.id, client)
                 return elevation
+            # BACKLOG #3780 item 1: a self-service disable or re-enrolment takes no queue, and either
+            # clears the recovery codes the check spends, so a CORRECT code whose factor was turned
+            # off or replaced during the check can land here. That is no guess, so it is refused
+            # with its own reason and charges nothing to the second-step lockout; a wrong code that
+            # meets the same change is refused the same way. A row gone or unreadable, or a cell
+            # that no longer opens, proves no change and is charged as before (fail closed).
+            after = await self._load_user(user.id)
+            change = (
+                None if after is None else self._totp_enrolment_moved(verified_enrolment, after)
+            )
+            if change in ("factor_removed", "factor_replaced"):
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": change}),
+                    client=client,
+                )
+                return Elevation()
             # Wrong code: register the failure through the SAME machinery the password path uses, so
             # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
             # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
@@ -11990,31 +12023,24 @@ class AuthService:
                 client=client,
             )
             return Elevation()
-        moved = await self._store.update_webauthn_sign_count(
+        answer = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         )
-        standing: _PasskeyHeld | None = None
-        if not moved:
-            # A compare-and-set miss is a clone signal (ADR 0068 decision 4) unless the passkey is
-            # confirmed gone: a self-service delete takes no queue, and an MFA reset deletes every
-            # passkey before it revokes the sessions, so either fails this compare-and-set too
-            # (BACKLOG #3068). Asked BEFORE the holder re-read below, and answered whatever that
-            # re-read finds, so ending one's own session, a disable or a lock landing mid-flight
-            # cannot suppress the signal. A set whose seal fails proves nothing either way, so it
-            # keeps the signal, and so does a question that raises: the row is written on the way
-            # out, so a store error in the reads cannot drop it.
-            try:
-                standing = await self._passkey_held(user, cred)
-            finally:
-                if standing in (None, "held", "unverified"):
-                    # Written now, under the name loaded before the write, so an exception in the
-                    # re-read below cannot drop the signal either.
-                    await self._audit(
-                        "auth.webauthn_clone_suspected",
-                        actor=user.username,
-                        detail=_json({"label": cred.label}),
-                        client=client,
-                    )
+        if answer == "mismatch":
+            # A compare-and-set miss is a clone signal (ADR 0068 decision 4, as amended 2026-10-17)
+            # unless the passkey is confirmed gone. A self-service delete takes no queue, and an MFA
+            # reset deletes every passkey before it revokes the sessions, so either fails this
+            # compare-and-set too (BACKLOG #3068). "gone" and "mismatch" are told apart by the SAME
+            # locked write that missed (BACKLOG #3774), so a delete landing after the miss cannot
+            # turn a miss on a passkey that still existed into a confirmed-gone one. Written now,
+            # before any other read, so neither the holder re-read below, a store error in it, nor
+            # ending one's own session, a disable or a lock landing mid-flight can drop the signal.
+            await self._audit(
+                "auth.webauthn_clone_suspected",
+                actor=user.username,
+                detail=_json({"label": cred.label}),
+                client=client,
+            )
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
@@ -12029,19 +12055,21 @@ class AuthService:
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
-        if standing is None:
-            # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so
-            # the passkey that signed may be gone. Asked after the holder re-read, as the last read
-            # before the factor write.
-            standing = await self._passkey_held(user, cred)
+        # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so
+        # the passkey that signed may be gone. Asked after the holder re-read, as the last read
+        # before the factor write.
+        standing = await self._passkey_held(user, cred)
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
             return await self._assertion_refused(user, client, "session_lost", session_lost=True)
+        if answer == "gone":
+            # Confirmed gone by the write itself, whatever the set reads now.
+            return await self._assertion_refused(user, client, "factor_removed")
         if standing != "held":
             reason = "factor_removed" if standing == "removed" else "factor_unverified"
             return await self._assertion_refused(user, client, reason)
-        if not moved:
+        if answer == "mismatch":
             return Elevation()  # the clone signal, audited above
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
@@ -12079,10 +12107,10 @@ class AuthService:
         #3068). ``"held"``, or why not: ``"account_gone"`` when the account row no longer exists,
         ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the answer
         cannot be trusted: the set fails its seal, or the account row still exists but does not
-        load (its own seal fails, or its lookup keys changed). That says nothing about this passkey,
-        so a sign-count miss keeps its clone signal. The account is asked only on a miss, since
-        a set read of a deleted account fails its seal on a keyed store and is empty on a keyless
-        one. This re-check compares every credential, each in constant time (ASVS 11.2.4, as the
+        load (its own seal fails, or its lookup keys changed). It decides the refusal only; whether a
+        sign-count miss is a clone signal is the write's own answer (BACKLOG #3774). The account is
+        asked only on a miss, since a set read of a deleted account fails its seal on a keyed store
+        and is empty on a keyless one. This re-check compares every credential, each in constant time (ASVS 11.2.4, as the
         delete path does); the lookup that first picked ``cred`` does not."""
         held = await self._verified_passkeys(user)
         if held is not None:

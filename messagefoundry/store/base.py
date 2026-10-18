@@ -104,6 +104,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RoleGrant,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
     UserRecord,
@@ -2365,9 +2366,13 @@ class AuthStore(Protocol):
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 
+    # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey
+    # exists and holds another count) or ``"gone"`` (no such passkey) under ONE locked write on every
+    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Only ``"gone"``
+    # is not a clone signal (ADR 0068 decision 4, as amended 2026-10-17).
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool: ...
+    ) -> SignCountAnswer: ...
 
     # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
     # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
