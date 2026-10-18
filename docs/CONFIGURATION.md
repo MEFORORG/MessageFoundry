@@ -826,7 +826,8 @@ resolves an alert the last run left open. After that, the engine resolves the ne
 three on its own, until it restarts again.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
-  least once. An account the pass just revoked still counts as an answer here.
+  least once. An account the pass just revoked still counts as an answer here, but a pass that
+  revokes every signed-in account resolves nothing.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
@@ -863,9 +864,12 @@ WARNING lines that name each faulting account stop.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
-on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
-reason, such as a sign-out, while the evidence is still pending.
+reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle
+session. An idle session stays a candidate after `[security].sign_out_after_idle_minutes` until
+the reaper deletes it, which is at least 10 minutes and up to about 70 minutes past that limit. At
+the default settings, idle expiry is the likeliest of these. The give-up rules above stop an alert
+resolving on the accounts that remain. The cost is a missed resolve when an account leaves for an
+ordinary reason, such as a sign-out or an idle session, while the evidence is still pending.
 
 Once an engine has given up resolving the breaker's `ad_reconcile_aborted` instance, the referral's
 instance or `ad_reconcile_held`, it logs a warning when a later trip, referral or hold opens, saying
@@ -1672,6 +1676,13 @@ started together, can each raise it; the alert list folds them into one instance
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
 - A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
   when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
+- A toggle whose row fails, is not recorded within 10 seconds, or is cancelled by a shutdown is
+  refused, and the engine tries to put `connections.toml` back as it was (vault BACKLOG #2945).
+  The API answers a failed or late row 503. The next start reports a config change whenever the disk and the newest
+  row still disagree, which happens in at least these cases: another edit changed the file in the
+  meantime, and it is left as that edit wrote it and logged; the engine could not read, lock or
+  write the file to put it back; the process stopped before the row; or the store committed the
+  row after all, after the 10 seconds or before it reported its failure.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - Any fingerprint change raises the alert. The markers below add detail to the page, as its
@@ -1703,14 +1714,17 @@ started together, can each raise it; the alert list folds them into one instance
   #2257).
 - A reload can swap the graph after a start loads it and before its `config_loaded` row is written;
   on a cluster node, the convergence loop does this. The row still names the graph the start
-  loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its
-  `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
-  passes over it to the reload's own row.
-- A start that could not take that snapshot still starts, with comparison `no_start_digest`. Its
-  row is degraded with the `start_snapshot` step. Its `dir`, counts and `loosenings` are `null`,
-  and it has no `fingerprint` key at all. A start that could not tell whether a reload swapped its
-  graph names its own graph, degraded with the `start_swap_check` step and `loosenings` `null`. A
-  later start passes over both rows.
+  loaded, with its comparison and its `loosenings`, which are read off that graph (vault BACKLOG
+  #3076). It is marked `superseded` and `baseline_unchecked`. A later start passes over it to the
+  reload's own row.
+- A start that could not take that snapshot still starts, and still compares the digest its load
+  took, so a changed config still raises `config_changed` (vault BACKLOG #3076). Its row is
+  degraded with the `start_snapshot` step and marked `baseline_unchecked`. Its `dir`, counts and
+  `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
+  could not tell whether a reload swapped its graph names its own graph, degraded with the
+  `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
+  next start raises `config_changed` again for the same change, unless a flag toggle or reload row
+  lands in between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
@@ -1718,6 +1732,21 @@ started together, can each raise it; the alert list folds them into one instance
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
   partial fingerprint is a baseline like any other. The row names the fingerprint that reload
   took, and is marked `superseded` when a later reload or flag toggle moved the engine on first.
+- On a cluster, a reload row carries `config_version`, the shared version the reload applied
+  (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
+  convergence row carries the version the node converged on. An operator reload whose bump failed
+  carries none. A follower's row records the bytes that node loaded, not the operator's digest.
+- A convergence reload that fails writes a `config_reload_failed` row under the same actor, or
+  `config_reload_denied` when its directory is outside the reload roots (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
+  engine process writes each distinct row once per version: rows that differ in action, `reason`
+  or `error` are each written once, and a fault that writes the same row as an earlier one writes
+  nothing. A row the audit log refuses is tried again on the next failure. The record is per
+  process, so a node that restarts, or another node, writes its own. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
+  reason is the one an operator's refused reload records, or `reload_error` with the fault's type
+  name.
+- A convergence row the audit log refuses is logged at ERROR and raises no alert. An operator
+  reload's lost row raises none either, but the operator's answer names an `audit` step. A
+  convergence reload has no answer to name it in.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
@@ -1908,7 +1937,8 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
-CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
 ran the signature check with that key, and the check failed. Where several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
@@ -1928,13 +1958,17 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
-  the CRL's authority key identifier, where it carries one. This is the usual case when the peer
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
+  the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
+  CRL's authority key identifier, where it carries one. This is the usual case when the peer
   sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
   handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
-  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
-  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
-  the WARNING, and then failed its handshake with `CRL signature failure`.
+  in white space, at least: around a value, which was measured, and in a run of spaces inside one,
+  by OpenSSL's source. OpenSSL treats those two names as one, so it still judges peers by that
+  CRL, and a badly signed CRL of that kind starts with the WARNING and then fails its handshake
+  with `CRL signature failure`. A name that differs in a letter outside ASCII, case included, is
+  another name to OpenSSL too. The name a CRL's authority key identifier may carry for the CA's
+  issuer is compared the same way as the issuer name.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
@@ -2001,7 +2035,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A long path is shortened to a checksum and its tail; `path` holds it whole. |
 | `path` | the file's absolute path, case kept. A relative path in a setting appears here in its absolute form |
 | `remedy_class` | a short token for what to do next; see the next table |
-| `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
+| `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
 | `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
 
@@ -2025,13 +2059,28 @@ belong to the CRL expiry alert too. This event carries none of them.
 The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
 no remedy sentence.
 
-**One alert per file version.** The engine raises the alert when it first refuses a version of the
-file. It raises it again only when the file's bytes change or the reason does, which is the rule the
-ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
-applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
-first updates the open alert and does not page again. So a page can name an older class than the
-alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
-hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+**A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
+when it first refuses a version of the file, and at once again when the file's bytes change or the
+reason does, which is the rule the ERROR line follows. While a refusal stands it then raises the
+alert again as a reminder, as `intake_paused` reminds, with the same fields. A reminder goes at the
+first reload pass five minutes or more after the last try, so they come five to six minutes apart. This replaced
+the rule of one alert per file version, under which a page that was throttled, muted or resolved
+by hand was never sent again. Each reminder is another occurrence of the alert, as an
+`intake_paused` reminder is, so a rule's count-based `escalate` tiers climb while the refusal
+stands. Neither acknowledging the alert nor resolving it by hand stops the reminders; suspending
+it mutes their pages. While the engine cannot read the file, a
+reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
+again every pass gets a reminder only from a reload pass that judged it again, and none while the
+engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer` and
+one that carries `start_refuses`: such a refusal can name a time that has passed, or lift on its
+own. A read that hangs
+rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
+reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
+refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
+alert and does not page again. So a page can name an older class than the alert list shows, until
+the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the
+engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
+follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
@@ -2046,7 +2095,11 @@ rule's `event_type`. The engine raises it once the refusal no longer stands on t
 
 A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
 engine also resolves its open alerts when it stops, because a restart builds every hop from the
-file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+file. An engine that dies without stopping leaves its alert open (vault BACKLOG #3543). Its next
+start under the same identity resolves it at the first reload pass that judges the file, if a
+hop still holds the file and the engine refuses nothing in it. Resolve any other in the alert list: one for a file no hop
+holds now, and one raised under an identity that changes on every start, as an unpinned cluster
+node's does. A
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
 event.
 

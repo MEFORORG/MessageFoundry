@@ -17,6 +17,7 @@ The route walk's own tests for the same blind spots are in ``tests/test_route_ga
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 import logging
@@ -266,7 +267,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _answers(app: FastAPI) -> dict[tuple[str, str], tuple[int, str]]:
     """``(status, body)`` an anonymous caller gets from every HTTP row of ``app``."""
     answers: dict[tuple[str, str], tuple[int, str]] = {}
-    rows = [r for r in route_gates.route_rows(app) if r.method != route_gates.WS_METHOD]
+    # A mount is probed below with a file under it; every other synthetic label is not sent.
+    rows = [
+        r
+        for r in route_gates.route_rows(app)
+        if r.method == route_gates.MOUNT_METHOD or r.method not in route_gates.NON_HTTP_METHODS
+    ]
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         for row in rows:
@@ -605,6 +611,95 @@ def test_the_count_reads_an_included_websocket_and_a_route_served_under_two_temp
         "/zz/a/x, /zz/b/x": 3,
         "/zz/inc/sock": 1,
     }
+
+
+def test_the_log_line_names_each_refusal_by_the_key_the_posture_reports(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2956 item 2. The refusal's log line named a route by its own template, which
+    for an included API route lacks the include's prefix, so the line could name a path the app does
+    not serve while ``GET /security/posture`` keyed the same refusals by the prefixed template. The
+    line now names each refusal by the posture's key: the prefixed template, every template of a
+    route served under several, and :data:`UNKNOWN_ROUTE_KEY` when the scope named no route."""
+    monkeypatch.setattr(security_module, "_UNKNOWN_ROUTE_REFUSALS", security_module._RefusalTally())
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 0.0)
+    app = create_app(allow_no_auth=True)
+    prefixed = APIRouter()
+
+    @prefixed.get("/undeclared/{item_id}")
+    async def included_undeclared(item_id: str) -> dict[str, str]:
+        return {"ok": item_id}
+
+    app.include_router(prefixed, prefix="/zz/prefixed")
+    twice = APIRouter()
+
+    @twice.get("/x")
+    async def undeclared_twice() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.include_router(twice, prefix="/zz/a")
+    app.include_router(twice, prefix="/zz/b")
+    sockets = APIRouter()
+
+    @sockets.websocket("/sock")
+    async def ws_undeclared(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    app.include_router(sockets, prefix="/zz/inc")
+    refusals = "messagefoundry.api.security"
+    with caplog.at_level(logging.ERROR, logger=refusals):
+        with TestClient(app) as client:
+            assert client.get("/zz/prefixed/undeclared/SECRET-MRN").status_code == 403
+            assert client.get("/zz/b/x").status_code == 403
+            with (
+                pytest.raises(WebSocketDisconnect),
+                client.websocket_connect("/zz/inc/sock"),
+            ):
+                pass
+        # A refusal with no matched route in its scope: FastAPI always sets one, so this is driven
+        # straight through the dependency.
+        with pytest.raises(HTTPException):
+            asyncio.run(security_module.refuse_undeclared_route(HTTPConnection({"type": "http"})))
+    lines = [r.getMessage() for r in caplog.records if r.name == refusals]
+    named = [line.removeprefix("refused route ").split(": it has no gate")[0] for line in lines]
+    assert named == [
+        "/zz/prefixed/undeclared/{item_id}",
+        "/zz/a/x, /zz/b/x",
+        "/zz/inc/sock",
+        security_module.UNKNOWN_ROUTE_KEY,
+    ], lines
+    assert sorted(named) == sorted(security_module.undeclared_route_refusal_counts(app.routes))
+    assert "SECRET-MRN" not in "".join(lines)
+
+
+def test_a_failed_key_walk_names_the_route_by_its_own_template_and_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2956 item 2. The key is worked out by walking the app's routes while the
+    refusal runs. That walk is a diagnostic, so a failure in it must not turn the refusal into an
+    error, and the refusal must still write its line."""
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 0.0)
+    app = create_app(allow_no_auth=True)
+    prefixed = APIRouter()
+
+    @prefixed.get("/undeclared")
+    async def included_undeclared() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.include_router(prefixed, prefix="/zz/prefixed")
+
+    def broken_walk(routes: object) -> object:
+        raise RuntimeError("a synthetic walk failure")
+
+    refusals = "messagefoundry.api.security"
+    with TestClient(app) as client:
+        monkeypatch.setattr(security_module, "iter_route_contexts", broken_walk)
+        with caplog.at_level(logging.WARNING, logger=refusals):
+            assert client.get("/zz/prefixed/undeclared").status_code == 403
+    lines = [r.getMessage() for r in caplog.records if r.name == refusals]
+    assert any("could not work out the posture key" in line for line in lines), lines
+    assert any(line.startswith("refused route /undeclared:") for line in lines), lines
 
 
 def test_a_declaration_needs_a_reason() -> None:

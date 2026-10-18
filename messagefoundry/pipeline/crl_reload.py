@@ -45,7 +45,8 @@ count read then races the lazy loading of a hashed root directory, and nothing f
 undone anyway. A refusal is logged at ERROR once per file version and recorded, so the expiry monitor
 says why the hop's copy is still old. The old copy keeps its ``crl_expiry`` alert. That alert speaks
 only once the held copy nears its ``nextUpdate``, so :class:`CrlReloadRunner` also raises
-``crl_reload_refused`` for the refusal itself, once per file version (vault BACKLOG #2904).
+``crl_reload_refused`` for the refusal itself, at once for each file version (vault BACKLOG #2904),
+and again as a reminder while that refusal stands (vault BACKLOG #3543).
 
 **One refusal is reported per file, the strongest.** Hops holding one file can need different things.
 A file to fix outranks a restart, and both outrank a wait (:data:`_PRECEDENCE`), because waiting would
@@ -92,17 +93,19 @@ public CA certificates, never key material or message content.
 from __future__ import annotations
 
 import asyncio
-import binascii
 import contextlib
+import contextvars
 import datetime
+import enum
 import functools
 import gc
 import logging
+import math
 import os
 import ssl
 import threading
 import time
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
@@ -129,8 +132,8 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.intake_bound import process_alert_subject
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
 
@@ -248,10 +251,6 @@ def _remedy_class(remedy: str) -> str:
 #: label inside its own cap, which sits under the SQL Server store's 256-character
 #: ``alert_instance.connection`` column.
 ALERT_PATH_MAX_LENGTH = 120
-#: Hex digits of the CRC-32 that stands in for the head of a longer path. A checksum, not a
-#: cryptographic digest: the path is the operator's own setting, so it only has to tell two
-#: honest paths apart.
-_PATH_DIGEST_HEX = 8
 
 
 def reload_alert_subject(path: str | os.PathLike[str], node: str | None = None) -> str:
@@ -268,13 +267,7 @@ def reload_alert_subject(path: str | os.PathLike[str], node: str | None = None) 
 
     The colon keeps the subject outside the connection-name grammar, so no rule's default
     control target can read it as a connection."""
-    key = crl_path_key(path)
-    if len(key) > ALERT_PATH_MAX_LENGTH:
-        # binascii, not zlib, as in process_alert_subject. backslashreplace, so a path with a
-        # lone surrogate still gets a checksum instead of raising.
-        digest = binascii.crc32(key.encode("utf-8", "backslashreplace"))
-        tail = key[-(ALERT_PATH_MAX_LENGTH - _PATH_DIGEST_HEX - len("~~")) :]
-        key = f"~{digest:0{_PATH_DIGEST_HEX}x}~{tail}"
+    key = shorten_with_checksum(crl_path_key(path), ALERT_PATH_MAX_LENGTH, keep_tail=True)
     return process_alert_subject(f"crl_reload:{key}", node)
 
 
@@ -484,6 +477,70 @@ _FAILED: dict[str, str] = {}
 _LABELS: dict[str, tuple[tuple[int, int], str]] = {}
 
 
+class _PassView:
+    """What one pass of a :class:`CrlReloadRunner` saw, for the runner's loop to decide from.
+
+    ``judged`` holds each file the pass judged, by path key, with the path it read the file by.
+    :meth:`take_refusals` copies the refusal record, which is written only under
+    :data:`_PASS_LOCK`. A real pass fills both in the worker thread, in the same hold of that lock
+    as its own writes, before it releases it. The other views judge nothing: the idle branch's,
+    which holds no refusal and reads nothing (:meth:`nothing_stands`), and an injected
+    ``reload``'s, copied by :meth:`CrlReloadRunner._judged_pass` in a hold of its own. The loop
+    reads a view only once it is filled, and decides from it alone, never from the pass state
+    above or the live record, which a pass abandoned by an earlier runner's
+    :meth:`~CrlReloadRunner.stop` may still be changing."""
+
+    def __init__(self) -> None:
+        self.judged: dict[str, str] = {}
+        self._refusals: dict[str, ReloadRefusal] | None = None
+        self._unread: Exception | None = None
+
+    @classmethod
+    def nothing_stands(cls) -> _PassView:
+        """A view that judged nothing and holds no refusal, read from nothing."""
+        view = cls()
+        view._refusals = {}
+        return view
+
+    @property
+    def taken(self) -> bool:
+        """Whether the refusal record was read for this view, or its read failed."""
+        return self._refusals is not None or self._unread is not None
+
+    def take_refusals(self) -> None:
+        """Copy the refusal record now, under :data:`_PASS_LOCK`. A failure is kept, not raised:
+        :meth:`refusals` raises it again on the loop, in the step that needs the record, which is
+        guarded there and logs it once per failing streak of its type and message."""
+        try:
+            self._refusals = reload_refusals()
+        except Exception as exc:  # noqa: BLE001 - kept, and raised again by refusals()
+            # Without its traceback, whose frames would keep the pass's contexts alive in a cycle
+            # through this view until a collection.
+            self._unread = exc.with_traceback(None)
+
+    def refusals(self) -> dict[str, ReloadRefusal]:
+        """The refusal record as this view copied it, by path key."""
+        if self._unread is not None:
+            raise self._unread
+        if self._refusals is None:
+            raise RuntimeError("the pass took no copy of the refusal record")
+        return self._refusals
+
+
+#: Where a pass records what it saw (:class:`_PassView`). Set only by
+#: :meth:`CrlReloadRunner._judged_pass`, around its own call of the pass. Elsewhere ``None``, and
+#: the pass records into a mapping nobody reads.
+_PASS_VIEW: contextvars.ContextVar[_PassView | None] = contextvars.ContextVar(
+    "crl_reload_pass_view", default=None
+)
+
+
+class _Unread(enum.Enum):
+    """A file this pass could not stat or read, so nothing about it was judged."""
+
+    UNREAD = enum.auto()
+
+
 def _read_path(pairs: Sequence[tuple[ssl.SSLContext, HeldCrl]]) -> str:
     """The path to read: as configured, case kept. The key is case-folded on Windows."""
     return pairs[0][1].file_path
@@ -536,15 +593,16 @@ class _Change:
 
 def _triage(
     key: str, pairs: Sequence[tuple[ssl.SSLContext, HeldCrl]]
-) -> ReloadRefusal | _Change | None:
-    """``None`` when every context holds the file as it is (or it cannot be read), a sticky
-    :class:`ReloadRefusal` when those bytes were refused already, else the :class:`_Change`."""
+) -> ReloadRefusal | _Change | _Unread | None:
+    """``None`` when every context holds the file as it is, a sticky :class:`ReloadRefusal` when
+    those bytes were refused already, ``_Unread.UNREAD`` when the file cannot be read, else the
+    :class:`_Change`."""
     path = _read_path(pairs)
     try:
         stamp = _stamp(path)
     except OSError as exc:
         _unreadable(key, path, exc)
-        return None
+        return _Unread.UNREAD
     seen = _SEEN.get(key)
     pem: bytes | None = None
     if seen is not None and seen[0] == stamp:
@@ -553,7 +611,7 @@ def _triage(
     elif (read := _read(key, path, stamp)) is not None:
         pem, fingerprint = read
     else:
-        return None
+        return _Unread.UNREAD
     if all(held.fingerprint == fingerprint for _, held in pairs):
         clear_reload_refusal(key)
         return None
@@ -606,14 +664,16 @@ def _reload_path(
     change: _Change,
     now: float,
     max_reloads: int,
-) -> ReloadOutcome | None:
-    """Bring every context in ``pairs`` that holds an older copy of the file up to the file."""
+) -> ReloadOutcome | _Unread | None:
+    """Bring every context in ``pairs`` that holds an older copy of the file up to the file.
+
+    ``None`` when every context holds it already, and ``_Unread.UNREAD`` when it cannot be read."""
     path = _read_path(pairs)
     pem, fingerprint = change.pem, change.fingerprint
     if pem is None:
         # A retried refusal whose file is unchanged: read the bytes the triage did not.
         if (read := _read(key, path)) is None:
-            return None
+            return _Unread.UNREAD
         pem, fingerprint = read
     stale = [(ctx, held) for ctx, held in pairs if held.fingerprint != fingerprint]
     if not stale:
@@ -794,8 +854,8 @@ def _finish(
     if prior is None or prior.reason != reason:
         # Once per file version: a retried pass repeats every minute, and the monitor carries it.
         # The runner raises ``crl_reload_refused`` by the same rule, from the outcome returned
-        # here. Not from this function: it runs in a worker thread, and a notifier's alert-state
-        # write needs the event loop.
+        # here, and then reminds while the refusal stands. Not from this function: it runs in a
+        # worker thread, and a notifier's alert-state write needs the event loop.
         log.error(
             "crl_reload: refused to apply the replaced CRL file to %d running TLS context(s), "
             "which keep the copy they hold: %s. %s",
@@ -830,8 +890,19 @@ def _failed(key: str, exc: Exception) -> None:
         log.error("crl_reload: could not check %s for a replacement", key, exc_info=exc)
 
 
-def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
+def _record_judgment(
+    key: str, pairs: Sequence[tuple[ssl.SSLContext, HeldCrl]], judged: dict[str, str]
+) -> None:
+    """Record that this pass judged the file at ``key``. A failure on it has then ended, so the
+    same failure later is a new streak, logged with its traceback again. A file the pass could not
+    read is never recorded here: that judges nothing."""
+    _FAILED.pop(key, None)
+    judged[key] = _read_path(pairs)
+
+
+def _pending(judged: dict[str, str]) -> tuple[dict[str, _Change], list[ReloadOutcome]]:
     """The held paths whose file needs a reload, and an outcome for each one refused already.
+    Each file judged here, rather than by the reload after it, is recorded in ``judged``.
 
     A function of its own so the contexts it reads are released when it returns, before the
     collection that may follow it."""
@@ -845,13 +916,17 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
         except Exception as exc:
             _failed(key, exc)
             continue
+        if verdict is _Unread.UNREAD:
+            continue
+        if isinstance(verdict, _Change):
+            pending[key] = verdict  # judged once the reload has run on it
+            continue
+        _record_judgment(key, pairs, judged)
         if isinstance(verdict, ReloadRefusal):
             # A verdict the reload treats as final is not judged again, so the count is taken
             # here: the contexts that do not hold the refused bytes.
             kept = sum(held.fingerprint != verdict.fingerprint for _, held in pairs)
             refused.append(ReloadOutcome(_read_path(pairs), 0, verdict, kept))
-        elif verdict is not None:
-            pending[key] = verdict
     return pending, refused
 
 
@@ -866,8 +941,8 @@ def _prune(held: Collection[str]) -> None:
 
 def _forget_all() -> None:
     """:func:`_prune` everything, when no hop holds any CRL. Never waits on the pass lock: it runs
-    on the event loop, and a pass abandoned by :meth:`CrlReloadRunner.stop` may still hold it, in
-    which case the next pass prunes instead."""
+    on the event loop, and a pass abandoned by :meth:`CrlReloadRunner.stop` may still hold it. Then
+    it prunes nothing, and a later interval tries again."""
     if not _PASS_LOCK.acquire(blocking=False):
         return
     try:
@@ -883,40 +958,82 @@ def reload_replaced_crls(
 
     Synchronous and blocking (file reads, CRL parsing, a context load), so the engine runs it in a
     worker thread. Returns one :class:`ReloadOutcome` per file some context held an older copy of. A
-    failure on one file is logged and does not stop the others."""
-    now = time.time() if now is None else now
+    failure on one file is logged and does not stop the others.
+
+    Each file it judged, and the refusal record as it leaves it, is recorded in the
+    :class:`_PassView` that :data:`_PASS_VIEW` points to, if any."""
+    view = _PASS_VIEW.get()
+    judged: dict[str, str] = {} if view is None else view.judged
     with _PASS_LOCK:
-        pending, outcomes = _pending()
-        if not pending:
+        # Once the lock is held: a pass queued behind one an earlier runner's stop abandoned may
+        # have waited minutes, and judges expiry and effect by the time it runs.
+        now = time.time() if now is None else now
+        try:
+            pending, outcomes = _pending(judged)
+            if not pending:
+                return outcomes
+            if not all(change.retry for change in pending.values()):
+                # A context in a reference cycle stays in the weak registry until collected.
+                # Collect only when a file has newly changed, as the expiry monitor does before
+                # its scan, and not on every retry of a refusal time can lift.
+                gc.collect()
+            current = _held_by_path()
+            for key, change in pending.items():
+                if key not in current:
+                    continue
+                try:
+                    outcome = _reload_path(key, current[key], change, now, max_reloads)
+                except Exception as exc:
+                    _failed(key, exc)
+                    continue
+                if outcome is _Unread.UNREAD:
+                    continue
+                _record_judgment(key, current[key], judged)
+                if outcome is not None:
+                    outcomes.append(outcome)
             return outcomes
-        if not all(change.retry for change in pending.values()):
-            # A context in a reference cycle stays in the weak registry until collected. Collect
-            # only when a file has newly changed, as the expiry monitor does before its scan, and
-            # not on every retry of a refusal time can lift.
-            gc.collect()
-        current = _held_by_path()
-        for key, change in pending.items():
-            if key not in current:
-                continue
-            try:
-                outcome = _reload_path(key, current[key], change, now, max_reloads)
-            except Exception as exc:
-                _failed(key, exc)
-                continue
-            _FAILED.pop(key, None)
-            if outcome is not None:
-                outcomes.append(outcome)
-    return outcomes
+        finally:
+            if view is not None:
+                # Before the lock is released, so no other pass has written the record since.
+                # Also when the pass raised: what it recorded before then stands.
+                view.take_refusals()
+
+
+#: The reminder clock, a module name so a test can move it without moving the event loop's.
+_monotonic = time.monotonic
+
+#: The sink calls :class:`CrlReloadRunner` makes, as a failure's log line names each, with what
+#: tries it again.
+_RAISED, _REMINDED, _RESOLVED = "raised", "sent as a reminder", "resolved"
+#: A clear sent in case an earlier run left an alert open
+#: (:meth:`CrlReloadRunner._clear_on_first_sight`). It may resolve nothing, so a failure of it is
+#: logged in words of its own (:meth:`CrlReloadRunner._sink_failed`).
+_CLEARED = "cleared for an earlier run"
+#: The calls that clear an alert, owed while the alert awaits its clear.
+_CLEARS = frozenset({_RESOLVED, _CLEARED})
+_RETRIED_BY = {
+    _RAISED: "the next pass tries again",
+    _REMINDED: "the next reminder tries again",
+    _RESOLVED: "the next pass, or the stop, tries again",
+    _CLEARED: "the next pass, or the stop, tries again",
+}
+
+
+def _version(refusal: ReloadRefusal | None) -> tuple[tuple[int, int], str] | None:
+    """The file version a refusal is for: the refused bytes and the reason."""
+    return None if refusal is None else (refusal.fingerprint, refusal.reason)
 
 
 class _Alerted(NamedTuple):
-    """A refusal :class:`CrlReloadRunner` has raised ``crl_reload_refused`` for and not resolved."""
+    """An alert :class:`CrlReloadRunner` holds open: a refusal it raised ``crl_reload_refused``
+    for, or a subject an earlier run of this process may have left open
+    (:meth:`~CrlReloadRunner._clear_on_first_sight`), whose ``outcome`` carries no refusal."""
 
-    #: The file as the pass read it, for the clear's log line and payload.
-    path: str
-    #: The refused bytes and the reason: together, the file version the alert was raised for.
-    fingerprint: tuple[int, int]
-    reason: str
+    #: The latest outcome for the version raised, so a reminder carries the latest count. Its
+    #: path is the file as the pass read it, for the clear's log line and payload.
+    outcome: ReloadOutcome
+    #: When the next reminder is due, on :data:`_monotonic`'s clock.
+    remind_at: float
 
 
 class CrlReloadRunner:
@@ -926,21 +1043,49 @@ class CrlReloadRunner:
     must not also stop revocations reaching a running hop. Not leader-gated: each process holds its
     own contexts.
 
-    **It raises ``crl_reload_refused`` for a refused file (vault BACKLOG #2904).** Once per file
-    version, by the rule the pass logs its ERROR by: again only when the file's bytes change or
+    **It raises ``crl_reload_refused`` for a refused file (vault BACKLOG #2904).** At once for
+    each file version, by the rule the pass logs its ERROR by: when the file's bytes change or
     the refusal's reason does. The pass runs in a worker thread, so the alert is raised here,
     on the event loop, from the outcomes the pass returns. ``alert_sink`` defaults to a
     :class:`~messagefoundry.pipeline.alerts.LoggingAlertSink`, as the expiry monitor's does.
     ``node`` names this process in the alert subject (:func:`reload_alert_subject`).
 
+    **And again every ``reminder_seconds`` while that refusal stands (vault BACKLOG #3543, owner
+    ruling 2026-10-13).** One alert per file version left a page that was throttled, muted or
+    resolved by hand never sent again. So the runner reminds, as ``intake_paused`` does, and
+    from the same constant by default
+    (:data:`~messagefoundry.pipeline.alerts.REMINDER_SECONDS`). It reads the refusal record for
+    that, not the outcomes, so for a verdict the reload treats as final a pass that could not
+    read the file still reminds. A verdict it judges again every pass can carry a time that has
+    since passed, so that one is reminded about only at a pass that judged it again, from that
+    pass's outcome. A reminder
+    repeats the version raised, with the latest count, and only while the record holds that
+    version; a newer version is raised from its own outcome instead.
+
     **It resolves that alert with ``crl_reload_applied``, and only on evidence.** A pass returns
     no outcome for a file it could not read, and none when it failed, while the refusal still
-    stands. So a missing outcome clears nothing: the alert is resolved only once the refusal is
-    gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`). That is
-    when the file was applied, when it was put back to the bytes the hops hold, and when no hop
-    holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
-    every context from the file and nothing later would clear it. A process that dies without
-    stopping leaves its alerts open, for an operator to resolve in the alert list."""
+    stands. So a missing outcome clears nothing. After a pass, the alert is resolved only once the
+    refusal is gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`),
+    as read under the pass lock by this runner's own pass (:class:`_PassView`). That is when the
+    file was applied, when it was put back to the bytes the hops hold, and when no hop holds it
+    any more. The idle branch resolves on the evidence that no hop holds any CRL (below), and
+    :meth:`stop` resolves what is still open, because a restart rebuilds every context from the
+    file and nothing later would clear it.
+
+    **While no hop holds any CRL, nothing stands.** The idle branch then runs no pass. It resolves
+    every alert still open, retries a clear the sink refused, ends every streak no longer owed,
+    and sends no reminder and no first-sight clear. It reads nothing from the record: no context
+    is left for a refusal in it to be about. It prunes the record when it can take the pass lock
+    without waiting (:func:`_forget_all`), and decides the same when it cannot.
+
+    **A process that died without stopping is cleared up after, where it can be (vault BACKLOG
+    #3543).** Its alerts were open in the alert list and in no runner's memory. A process with
+    the same identity builds every context afresh, from the file as it is then. So the first
+    time a pass of this runner's loop judges a held file and no refusal stands for it, the runner
+    resolves that file's subject, once (:meth:`_clear_on_first_sight`). That reaches only a file
+    this process still holds, under a subject it still uses. An alert for a file no hop holds now, or one raised
+    under an identity that changes on every start (an unpinned cluster node), stays open for an
+    operator to resolve in the alert list."""
 
     def __init__(
         self,
@@ -952,8 +1097,10 @@ class CrlReloadRunner:
         skip_when_idle: bool = True,
         alert_sink: AlertSink | None = None,
         node: str | None = None,
+        reminder_seconds: float = REMINDER_SECONDS,
     ) -> None:
         self._interval = interval_seconds
+        self._reminder_seconds = reminder_seconds
         self._reload = reload or functools.partial(reload_replaced_crls, max_reloads=max_reloads)
         # With no CRL load recorded there is nothing to reload, so no worker thread is started.
         self._skip_when_idle = skip_when_idle
@@ -963,12 +1110,18 @@ class CrlReloadRunner:
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._node = node
         # Per path key, the refusal already alerted. A pass returns a refused outcome every
-        # minute, so this is what keeps the alert to one per file version. It is also the set of
-        # alerts this runner has open. Touched only on the event loop.
+        # minute, so this is what spaces the alert to its reminders. It is also the set of
+        # alerts this runner has open, and of the clears for an earlier run it still owes, which
+        # carry no refusal (:meth:_clear_on_first_sight). Touched only on the event loop.
         self._alerted: dict[str, _Alerted] = {}
-        # The sink calls now failing, as (what, path key): one WARNING per failing streak of each,
-        # not one a pass.
+        # The sink calls now failing, as (what, path key): one log line per failing streak of
+        # each, not one a pass.
         self._sink_failing: set[tuple[str, str]] = set()
+        # Path keys the loop has seen held and judged for an alert a dead process left open
+        # (:meth:`_clear_on_first_sight`), each once.
+        self._seen_held: set[str] = set()
+        # Per report step, the failure last logged (:meth:`_guarded`).
+        self._report_failing: dict[str, str] = {}
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -1011,8 +1164,8 @@ class CrlReloadRunner:
         if self._alerted:
             # Said here every time, whatever streak is open: no later pass will try again.
             log.warning(
-                "crl_reload: %d refused-reload alert(s) could not be resolved at stop; resolve "
-                "them in the alert list: %s",
+                "crl_reload: %d refused-reload alert(s), or clear(s) for an earlier run, could "
+                "not be resolved at stop; resolve any open in the alert list: %s",
                 len(self._alerted),
                 ", ".join(sorted(self._alerted)),
             )
@@ -1026,13 +1179,16 @@ class CrlReloadRunner:
                 return
             if self._skip_when_idle and not has_held_copies():
                 _forget_all()
-                # No pass runs, so nothing else would resolve an alert for a file no hop holds
-                # now. Read from the record all the same: _forget_all skips a held pass lock.
-                self._resolve_cleared()
+                # Nothing stands, whether or not that could take the lock (the class docstring).
+                follow = functools.partial(
+                    self._follow_record, _PassView.nothing_stands(), why="no hop holds any CRL"
+                )
+                self._guarded("follow the record", follow)
                 continue
             outcomes: object = None
+            view = _PassView()
             try:
-                outcomes = await asyncio.to_thread(self._reload)
+                outcomes = await asyncio.to_thread(self._judged_pass, view)
             except Exception:
                 log.exception("crl_reload pass failed; will retry next interval")
             if self._stop.is_set():
@@ -1041,28 +1197,121 @@ class CrlReloadRunner:
                 return
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
-            self._report(outcomes)
+            self._guarded("report", functools.partial(self._report, outcomes, view))
+            # After the report, so a refusal this pass recorded counts as standing.
+            if isinstance(outcomes, list):  # a pass that raised is no evidence about any file
+                self._guarded(
+                    "first-sight clear", functools.partial(self._clear_on_first_sight, view)
+                )
 
-    def _report(self, outcomes: object) -> None:
-        """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
-        resolve the alerts whose refusal no longer stands.
+    def _judged_pass(self, view: _PassView) -> object:
+        """Run the pass, in the worker thread, recording what it saw in ``view``
+        (:class:`_PassView`), and return what it returned.
+
+        The pass fills ``view`` under its lock, and the loop reads it only once this returns. So
+        each decision the loop makes from a pass, the first-sight clear and following the record,
+        reads that pass's own view: the files it judged, and the refusal record as it left it.
+        None reads the pass state (:data:`_SEEN`, :data:`_UNREADABLE`, :data:`_FAILED`) or the
+        live record, which a pass abandoned by an earlier runner's :meth:`stop` may still be
+        changing. An injected ``reload`` that runs no real pass judges nothing, so its passes
+        clear nothing at first sight, and takes no reading of the record. So the record is read
+        here once it returns, under the pass lock, in this thread."""
+        token = _PASS_VIEW.set(view)
+        try:
+            return self._reload()
+        finally:
+            _PASS_VIEW.reset(token)
+            if not view.taken:
+                with _PASS_LOCK:
+                    view.take_refusals()
+
+    def _clear_on_first_sight(self, view: _PassView) -> None:
+        """Resolve, once per held file, an alert a process that died before this one left open.
+
+        ``view`` holds the files the pass just run judged, by path key, with the path it read
+        each by, and the refusal record as that pass left it (:meth:`_judged_pass`). For each
+        file this runner has not judged yet, with no
+        refusal standing and no alert of this runner's open: raise ``crl_reload_applied`` for its
+        subject. Every context was built from the file as it is, and the pass found nothing to
+        refuse in its bytes, so a refusal alert left open under this subject is false. The pass
+        reads those bytes, or finds by the file's size, modification time and file id that they
+        are the ones it last read. Only
+        those files: one the pass could not read or failed on is no evidence, and nor is one a hop
+        began to hold while the pass ran. Each waits for a pass that judged it. A copy from a CA
+        bundle is never judged, as the pass leaves it out (:func:`_held_by_path`): no refusal is
+        ever raised for one. A clear the sink refuses stays open, so the next pass or the stop
+        tries it again.
+
+        The subject is held as an open alert with no refusal, so :meth:`_resolve` clears it as it
+        clears any other, and a refusal raised for that file later simply replaces it."""
+        unseen = {key: path for key, path in view.judged.items() if key not in self._seen_held}
+        if not unseen:
+            return
+        standing = view.refusals()
+        # A file this run has alerted is left alone: its own raise and clear cover the subject.
+        # One refused with no alert of its own yet, because the raise failed, is judged again at
+        # the next pass: should the refusal end first, the subject still needs this clear.
+        self._seen_held.update(key for key in unseen if key in self._alerted)
+        seeded = [key for key in unseen if key not in standing and key not in self._alerted]
+        self._seen_held.update(seeded)
+        for key in seeded:
+            self._alerted[key] = _Alerted(ReloadOutcome(unseen[key], 0, None), math.inf)
+        self._resolve(seeded, "any alert an earlier run of this process left open")
+
+    def _guarded(self, step: str, report: Callable[[], None]) -> None:
+        """Run one report step so that nothing it raises ends the loop (vault BACKLOG #3543).
+
+        Broad on purpose, as for the pass: the loop is what applies revocations to running hops,
+        and a report is only about them. Each outcome and each sink call is guarded inside the
+        report already; this catches the rest, such as a failure reading the refusal record. The
+        next pass reports again. The traceback is logged once per failing streak of each step,
+        as the runner's other failures are, and a step that succeeds ends its streak."""
+        try:
+            report()
+        except Exception as exc:
+            seen = f"{type(exc).__name__}: {exc}"
+            if self._report_failing.get(step) != seen:
+                self._report_failing[step] = seen
+                log.exception("crl_reload: the %s step failed; will retry next interval", step)
+            return
+        self._report_failing.pop(step, None)
+
+    def _report(self, outcomes: object, view: _PassView) -> None:
+        """Bring the alerts in line with one pass. Raise ``crl_reload_refused`` for each refusal
+        in ``outcomes`` not alerted yet, and keep the latest outcome of each version alerted
+        already. Then follow the record as that pass left it in ``view``
+        (:meth:`_follow_record`): resolve the alerts whose
+        refusal no longer stands, and remind about the rest whose reminder is due. So every
+        call can page, and how often this is called bounds nothing: the reminder's own clock
+        spaces the reminders.
 
         ``outcomes`` is whatever the pass returned. An injected ``reload`` may return anything,
         and a pass that raised returns nothing, so only a list of :class:`ReloadOutcome` is read.
         Each outcome is guarded on its own: one of an odd shape must not end the loop that
-        applies revocations, nor hold back the outcomes after it or the clears."""
+        applies revocations, nor hold back the outcomes after it or the clears. A refusal this
+        pass returned an outcome for counts as judged by it, for :meth:`_remind`."""
+        refused: set[str] = set()
         for outcome in outcomes if isinstance(outcomes, list) else ():
             if isinstance(outcome, ReloadOutcome) and outcome.refusal is not None:
                 try:
-                    self._raise_refused(outcome, outcome.refusal)
+                    refused.add(self._raise_refused(outcome, outcome.refusal))
                 except Exception:
                     # Broad on purpose, as for the pass. A sink that raises is handled inside;
                     # this is an outcome the report itself could not read.
                     log.exception("crl_reload: could not report a refused file; will retry")
-        self._resolve_cleared()
+        self._follow_record(view, refused)
 
-    def _resolve_cleared(self) -> None:
-        """Resolve every open alert whose refusal the record no longer holds.
+    def _follow_record(
+        self,
+        view: _PassView,
+        judged: Collection[str] = (),
+        *,
+        why: str = "the refusal no longer stands",
+    ) -> None:
+        """Bring the open alerts in line with the refusal record as ``view`` holds it: resolve
+        each one whose refusal the record no longer holds, logged with ``why``, then remind about
+        the rest that are due (:meth:`_remind`). ``judged`` holds the path keys whose refusal this
+        pass judged; with no pass, none.
 
         The record, never the outcomes: a file the pass could not read and a pass that failed
         both return no outcome while the refusal stands. The pass clears the record when every
@@ -1071,54 +1320,123 @@ class CrlReloadRunner:
         log again."""
         if not self._alerted and not self._sink_failing:
             return
-        standing = reload_refusals()
+        standing = view.refusals()
         cleared = [key for key in self._alerted if key not in standing]
         # End a streak whose call is no longer owed, so the next failure for that file is logged
-        # again. A raise is owed while the refusal stands; a clear while its alert awaits one.
+        # again. A raise or a reminder is owed while the refusal stands; a clear while its alert
+        # awaits one.
         self._sink_failing = {
             (what, key)
             for what, key in self._sink_failing
-            if (key in standing if what == "raised" else key in cleared)
+            if (key in cleared if what in _CLEARS else key in standing)
         }
-        self._resolve(cleared, "the refusal no longer stands")
+        self._resolve(cleared, why)
+        self._remind(standing, judged)
 
     def _resolve(self, keys: Sequence[str], why: str) -> None:
         """Raise ``crl_reload_applied`` for each alert in ``keys``, and forget the ones raised."""
         for key in keys:
-            path = self._alerted[key].path
+            outcome = self._alerted[key].outcome
+            # A clear for an earlier run is sent for every held file, with or without an alert
+            # open, so it is not reported as resolving one, nor as failing to.
+            raised = outcome.refusal is not None
             try:
                 self._alert_sink.crl_reload_applied(
-                    reload_alert_subject(key, self._node), path=path
+                    reload_alert_subject(key, self._node), path=outcome.path
                 )
             except Exception:
                 # Broad on purpose, as in _raise_refused. Kept as open, so the next pass or the
                 # stop retries the clear.
-                self._sink_failed("resolved", key)
+                self._sink_failed(_RESOLVED if raised else _CLEARED, key)
                 continue
-            self._sink_failing.discard(("resolved", key))
+            self._sink_failing -= {(what, key) for what in _CLEARS}
             del self._alerted[key]
-            log.info("crl_reload: the refused-reload alert for %s is resolved: %s", path, why)
-
-    def _sink_failed(self, what: str, key: str) -> None:
-        """One WARNING per failing streak of one call for one file, from inside the ``except``
-        that caught the failure. Per call and per file, so one file's success does not restart
-        another's streak, and one standing failure does not hide a new one."""
-        if (what, key) not in self._sink_failing:
-            self._sink_failing.add((what, key))
-            log.warning(
-                "crl_reload: the refused-reload alert for %s could not be %s; the next pass, or "
-                "the stop, tries again",
-                key,
-                what,
-                exc_info=True,
+            log.log(
+                logging.INFO if raised else logging.DEBUG,
+                "crl_reload: the refused-reload alert for %s is resolved: %s",
+                outcome.path,
+                why,
             )
 
-    def _raise_refused(self, outcome: ReloadOutcome, refusal: ReloadRefusal) -> None:
+    def _sink_failed(self, what: str, key: str) -> None:
+        """One log line per failing streak of one call for one file, from inside the ``except``
+        that caught the failure. Per call and per file, so one file's success does not restart
+        another's streak, and one standing failure does not hide a new one.
+
+        A WARNING, except for a clear sent in case an earlier run left an alert open
+        (:data:`_CLEARED`). That one is sent for every held file, so most resolve nothing, and a
+        WARNING per file would send an operator after refusals that never existed. So it says
+        that there may be no such alert, at INFO. A clean stop's WARNING names any clear still
+        owed. A process that dies before it stops leaves only this INFO line, and any alert the
+        clear was for stays open in the alert list, as one does for a file no hop holds now."""
+        if (what, key) in self._sink_failing:
+            return
+        self._sink_failing.add((what, key))
+        if what == _CLEARED:
+            log.info(
+                "crl_reload: could not send the clear for %s that resolves any refused-reload "
+                "alert an earlier run of this process left open; there may be no such alert, "
+                "and %s",
+                key,
+                _RETRIED_BY[what],
+                exc_info=True,
+            )
+            return
+        log.warning(
+            "crl_reload: the refused-reload alert for %s could not be %s; %s",
+            key,
+            what,
+            _RETRIED_BY[what],
+            exc_info=True,
+        )
+
+    def _raise_refused(self, outcome: ReloadOutcome, refusal: ReloadRefusal) -> str:
+        """Raise ``crl_reload_refused`` for ``outcome`` unless its version is alerted already, and
+        return the file's path key."""
         key = crl_path_key(outcome.path)
-        version = (refusal.fingerprint, refusal.reason)
         known = self._alerted.get(key)
-        if known is not None and (known.fingerprint, known.reason) == version:
-            return  # this version of the file is alerted already
+        if known is not None and _version(known.outcome.refusal) == _version(refusal):
+            # This version is alerted already. Keep its latest count for the next reminder.
+            self._alerted[key] = known._replace(outcome=outcome)
+        elif self._send_refused(key, outcome, refusal, _RAISED):
+            self._alerted[key] = _Alerted(outcome, self._next_reminder())
+        return key
+
+    def _remind(self, standing: Mapping[str, ReloadRefusal], judged: Collection[str]) -> None:
+        """Raise ``crl_reload_refused`` again for each open alert whose reminder is due, while the
+        record still holds the version it was raised for (vault BACKLOG #3543).
+
+        A refusal the reload judges again every pass can carry a time (a wait, ``start_refuses``)
+        that has since passed. So it is reminded about only when the pass just run judged it,
+        which ``judged`` says, and the reminder carries that pass's outcome. A judgment from an
+        earlier pass is not enough: the file may have become unreadable since. A final verdict
+        needs no such pass.
+
+        Spaced from the attempt, as ``intake_paused`` spaces its reminders, so a sink that refuses
+        one is not called again every pass. Read after the call returns: the notifier stamps its
+        own cooldown inside the call, so a window measured from before it could close a moment
+        early and land the next reminder inside that cooldown, where it is throttled."""
+        now = _monotonic()
+        for key, alerted in self._alerted.items():
+            refusal = alerted.outcome.refusal
+            if refusal is None or now < alerted.remind_at:
+                continue
+            if _version(standing.get(key)) != _version(refusal):
+                continue  # resolved above, or a newer version its own outcome raises
+            if not refusal.sticky and key not in judged:
+                # Not judged by this pass, such as while the file cannot be read: its time may
+                # have passed. Due again at the next pass that judges it.
+                continue
+            self._send_refused(key, alerted.outcome, refusal, _REMINDED)
+            self._alerted[key] = alerted._replace(remind_at=self._next_reminder())
+
+    def _next_reminder(self) -> float:
+        return _monotonic() + self._reminder_seconds
+
+    def _send_refused(
+        self, key: str, outcome: ReloadOutcome, refusal: ReloadRefusal, what: str
+    ) -> bool:
+        """Call the sink's ``crl_reload_refused`` for ``outcome``. False when the sink raised."""
         token = _remedy_class(refusal.remedy)
         try:
             self._alert_sink.crl_reload_refused(
@@ -1132,8 +1450,10 @@ class CrlReloadRunner:
             )
         except Exception:
             # Broad on purpose: a sink must never raise, and a broken one must not end the loop
-            # that applies revocations. Not recorded as alerted, so the next pass retries it.
-            self._sink_failed("raised", key)
-            return
-        self._sink_failing.discard(("raised", key))
-        self._alerted[key] = _Alerted(outcome.path, *version)
+            # that applies revocations. A raise is not recorded as alerted, so the next pass
+            # retries it; a reminder is tried again at the next reminder.
+            self._sink_failed(what, key)
+            return False
+        # One sink call either way, so either success ends both streaks.
+        self._sink_failing -= {(_RAISED, key), (_REMINDED, key)}
+        return True

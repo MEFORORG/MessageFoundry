@@ -174,7 +174,7 @@ def test_a_reload_row_defect_after_the_swap_reports_the_audit_step(
                 engine,
                 actor="alice",
                 failed_steps=["references"],
-                loaded=app_module._UNKNOWN_LOADED,
+                loaded=None,
             )
         )
     assert failures == ["references", app_module._RELOAD_AUDIT_STEP]

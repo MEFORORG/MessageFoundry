@@ -196,8 +196,9 @@ the route takes a body.
   case can also write an `auth.temp_password_expired` audit row. `AuthService.identity_for_token`
   is the full list. A caller this lookup refuses gets 401 before the body is read.
 - A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
-  body from a caller with no session. A route with no gate and no declaration is refused before
-  its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
+  body from a caller with no session. A route with no gate and no declaration, built by the
+  app's route class and registered on the app, is refused before its body is read, as described
+  below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
@@ -222,16 +223,20 @@ body, the early sign-in check above still answers before it. A route passes in o
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
 every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
-names the route's path template, never the request, and says how many refusals came since the
-previous line. Refusals after a burst's last line stay in that count. They reach the log only with
+names the route by its path template, never the request, and says how many refusals came since the
+previous line. The name is meant to be the key `GET /security/posture` reports the route under,
+include prefix included (vault BACKLOG #2956); `_logged_key` in `messagefoundry/api/security.py`
+says where the two can still differ. Refusals after a burst's last line stay in that count. They reach the log only with
 a later refusal of the same route, a minute or more after the last line. `GET /security/posture`
 reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed by path template
 (vault BACKLOG #2954). It is the count of the process that answered; under engine shards each
 process has its own. `undeclared_route_refusal_counts` in `messagefoundry/api/security.py` says
 what each key means, including `<unknown>`, and what the walk misses. The count is not persisted,
-and a restart loses it. On a body-taking route built by the app's route class, the
-refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
-the gate is correct.
+and a restart loses it. On a body-taking route built by the app's route class and registered on
+the app, the refusal comes before the body is read. An undeclared route on an included router,
+even one built with that class, can answer first with the body parser's **422** or **400**: the
+class docstring says when. The check asks only that a route declared a gate. It does not check
+that the gate is correct.
 
 - A route whose gate is nested inside another dependency, or added only by `include_router`, is
   refused. That is the safe side.
@@ -2251,15 +2256,14 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
 
-**An inline or released reload's `config_reload` row names that reload's own config (vault
-BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
-the digest it took before the swap. The row is written after the swap, so a second reload or a
-connection flag toggle can move the engine on first. The row then still names its own config, but
-is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
-compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+**An inline, released or cluster convergence reload's `config_reload` row names that reload's own
+config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
+connection counts and the digest it took before the swap. The row is written after the swap, so a
+second reload or a connection flag toggle can move the engine on first. The row then still names
+its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
+it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
-runs just before the write, so a change after it is not caught. A cluster convergence reload's
-row is still read from the engine's live state when it is written.
+runs just before the write, so a change after it is not caught.
 
 **A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
@@ -2890,7 +2894,23 @@ not the permissions they grant. So a move from one role to another refuses, even
 grants more. A lookup whose groups map to no role refuses every directory account that holds a
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs.
+`directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
+map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
+account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion: nothing
+changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
+the map again. So it is never told to sign out.
+
+**The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
+cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
+it at once, because it writes the roles the current groups grant. A later try on the same session
+clears it only if the groups are restored in the directory, and once the reconciliation pass
+re-syncs the roles it also revokes the account's sessions. Every other directory refusal, an outage
+included, is told to try again later or ask an administrator, and never to sign out: a new sign-in
+would fail the same way, and the working session would be gone. The engine carries the two cases as
+`Elevation.directory_refusal`; the texts are `_DIRECTORY_DEMOTED_DETAIL` and
+`_DIRECTORY_UNCONFIRMED_DETAIL` in `api/auth_routes.py`, and the console shows the same fixes. The
+password re-bind makes the role test too (below), so it gives a demoted account the first. Neither
+text names a group, a role or a directory detail.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now maps the groups that lookup returns to
@@ -2909,9 +2929,11 @@ theirs. A row whose directory object id or provider moved during the bind is ref
 keyed on. The password was right, so the refusal is charged to
 neither the lockout nor the session's re-proof budget, and clears neither. No window is renewed, no
 action-bound grant is minted, and no roles are written. The `auth.reauth` row carries
-`reason=directory_roles_demoted`, and the caller gets the answer for a directory that could not
-confirm the account: 403 on `POST /me/reauth`. A retry is refused the same way until a new sign-in
-re-syncs the roles; those words do not say so yet. Channel scope is not compared on this leg either. The enrolment legs make the
+`reason=directory_roles_demoted`, and the caller gets the demotion answer: 403 on `POST /me/reauth`,
+telling it to sign out and sign in again (BACKLOG #3082); what else clears that refusal is in the
+paragraph on telling the caller the fix, above. A role map that fails its seal is refused as
+`directory_role_map_unsealed` and gets the answer for a directory that could not confirm the
+account, as on the other legs. Channel scope is not compared on this leg either. The enrolment legs make the
 test too, through the code leg's directory check (BACKLOG #3061). The code, passkey, IdP and
 re-bind legs call one shared comparison rather than each writing it out.
 
@@ -3776,8 +3798,8 @@ slack.
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184) | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
-| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback, except on a loopback bind with `trusted_proxies` set, where there is none and no `Origin` matches, BACKLOG #2217) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, on any method. Or a non-matching `Origin`, on any method, where no `Sec-Fetch-Site` line has settled the request. A **write** that names no provenance the check recognises also fails closed (BACKLOG #1116, #1124). That is at least a write with **neither header present**, and a write whose `Sec-Fetch-Site` is a non-empty value other than the four the Fetch Metadata standard defines. A GET is not held to that fail-closed part. The complete rule, by method, `Sec-Fetch-Site` and `Origin`, is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`). A test drives the function over every row of that table, and the rule is not restated here | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free. The CSP report sink `POST /ui/csp-report` reads `Sec-Fetch-Site` only and still accepts a request with neither. The neither-header refusal is for writes: three sign-in GETs are deliberately not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28. `GET /ui/sso` and `GET /ui/oidc/callback` never run this check, and `GET /ui/oidc/start` with its interstitial skipped runs it as a GET, by the GET rows of that table | on | `[security].web_console_public_address` |
-| Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
+| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback, except on a loopback bind with `trusted_proxies` set, where there is none and no `Origin` matches, BACKLOG #2217) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, on any method. Or a non-matching `Origin`, on any method, where no `Sec-Fetch-Site` line has settled the request. A **write** that names no provenance the check recognises also fails closed (BACKLOG #1116, #1124). That is at least a write with **neither header present**, and a write whose `Sec-Fetch-Site` is a non-empty value other than the four the Fetch Metadata standard defines. A GET is not held to that fail-closed part. The rule for one line of each header, by method, is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which also names what the table does not cover. A test drives the function over every row of that table, on the `Host`-fallback posture, and the rule is not restated here | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free. The CSP report sink `POST /ui/csp-report` reads `Sec-Fetch-Site` only and still accepts a request with neither. The neither-header refusal is for writes. The sign-in GETs deliberately not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28, are listed once, in the `Origin` row of `docs/BROWSER-SUPPORT.md`, which a test holds to the GET routes that `routes/sso.py` and `routes/oidc.py` register | on | `[security].web_console_public_address` |
+| Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122**. Also refused, before any of the above, on every method and path: `Sec-Fetch-Site` lines that carry different values, which the route-level check refuses too (vault BACKLOG #3316) | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
 
@@ -3787,7 +3809,8 @@ listener start, a refusal isolates that one listener and the rest of the graph c
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
 reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
-keep its old graph, log the refusal and retry each interval.
+keep its old graph, log the refusal and retry each interval. It would also write a
+`config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
 started. It gates an `auto_start` listener outside its schedule window, because the scheduler binds
@@ -5732,7 +5755,7 @@ under `monitoring:diagnose`, and a lock alert there would show lock state to a r
 withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
 `[alerts].security_signals = false`, or a threshold of `0`, is absent from
 `GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
-records its loosenings as unknown, such as one a cluster convergence reload superseded.
+records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

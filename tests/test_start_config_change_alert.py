@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import textwrap
 from pathlib import Path
 from typing import Any, cast
@@ -39,7 +40,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
-from messagefoundry.config.wiring import load_config
+from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, config_changed_detail
@@ -500,9 +501,12 @@ async def test_a_snapshot_that_cannot_be_taken_never_blocks_the_start(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """vault BACKLOG #2838, under #2597 step 5: the start's config snapshot is audit only, so a
-    fault taking it never refuses a start. The start checks nothing, as a start with no digest
-    does, and serves. Its row names no graph, even after a reload swapped one in, and a later
-    start passes over it and reports the change against the older baseline."""
+    fault taking it never refuses a start, and it serves. Its row names no graph, even after a
+    reload swapped one in, and a later start passes over it.
+
+    The start still compares the digest its load took (vault BACKLOG #3076 item 5), read before
+    ``engine.start()`` can run a reload, so new bytes still page on every start of a crash loop.
+    It compared nothing before, with ``no_start_digest``."""
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)  # the baseline
     _edit(cfg)
@@ -524,16 +528,22 @@ async def test_a_snapshot_that_cannot_be_taken_never_blocks_the_start(
         patch.setattr(Engine, "start", _start_then_swap)
         rows = await _start(tmp_path, cfg)  # asserts the graph is serving
     assert len(calls) == 1, "control: the lifespan's read ran, and the row did not read again"
-    assert alerts == [], "a start that checked nothing raises nothing"
+    edited = config_fingerprint(cfg)
+    assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts] == [(edited, before)], (
+        "the load's own digest is compared, not the one the later reload put live"
+    )
     assert len(rows) == 2
     row = rows[-1]
-    assert row["comparison"] == "no_start_digest" and row["baseline_unchecked"] is True
+    assert row["comparison"] == "compared" and row["changed"] is True
+    assert row["baseline_unchecked"] is True, "a row that names no graph is still no baseline"
     assert row["degraded"] is True and row["failed_steps"] == ["start_snapshot"]
     assert "fingerprint" not in row, "the reloaded digest is not named as the start's"
     assert (row["dir"], row["inbound"], row["outbound"], row["loosenings"]) == (None,) * 4
+    # A null engine-shard id reads as a whole-graph start on a --shard process (#3076 item 6).
+    assert "shard" not in row
 
     rows = await _start(tmp_path, cfg)
-    assert len(alerts) == 1, "the next start passes over the degraded row"
+    assert len(alerts) == 2, "the next start passes over the degraded row"
     assert rows[-1]["previous_fingerprint"] == before
 
 
@@ -541,7 +551,8 @@ async def test_a_swap_check_that_faults_never_blocks_the_start(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """vault BACKLOG #2838: the row's swap check is audit only too. A fault in it leaves the row
-    naming the start's snapshot, degraded and no baseline, and claims no reload ran."""
+    naming the start's snapshot, degraded and no baseline, and claims no reload ran. Its
+    loosenings stand, since they are read off the snapshot's graph (vault BACKLOG #3076)."""
 
     def _swapped(self: Any, engine: Engine) -> bool:
         raise RuntimeError("synthetic swap-check fault")
@@ -551,7 +562,8 @@ async def test_a_swap_check_that_faults_never_blocks_the_start(
     row = rows[-1]
     assert row["fingerprint"] == config_fingerprint(cfg)
     assert row["degraded"] is True and row["failed_steps"] == ["start_swap_check"]
-    assert row["baseline_unchecked"] is True and row["loosenings"] is None
+    assert row["baseline_unchecked"] is True
+    assert isinstance(row["loosenings"], list) and row["loosenings"]
     assert "superseded" not in row, "a check that faulted saw no reload"
 
 
@@ -568,6 +580,17 @@ def _add_a_connection_pair(cfg: Path, tmp_path: Path) -> None:
         )
 
 
+def _add_a_cleartext_hop(cfg: Path) -> None:
+    """An outbound that declares a cleartext hop, so the graph it joins names ``cleartext_accepted``
+    among its loosenings. Nothing is sent to it."""
+    with (cfg / "cfg.py").open("a", encoding="utf-8") as fh:
+        fh.write(
+            "from messagefoundry import Tcp\n"
+            "outbound('TCP-OUT_T_CLEAR', Tcp(host='127.0.0.1', port=9), cleartext_accepted=True, "
+            "cleartext_reason='synthetic test hop')\n"
+        )
+
+
 async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_the_start(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
@@ -577,7 +600,11 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     itself superseded, so the next start on the reloaded bytes compares against the convergence
     reload's own row and raises no false config_changed. No sibling row is needed for that: the
     initiator's row may be missing, and this node's row still names the bytes it converged on
-    (vault BACKLOG #3076)."""
+    (vault BACKLOG #3076).
+
+    The row keeps the start's loosenings, read off the graph the start loaded (vault BACKLOG
+    #3076 item 4, #3109 item 6). They were ``None`` before. The reloaded graph adds a cleartext
+    hop, so a list read off the live graph would name it."""
     start_digest = config_fingerprint(cfg)
     await _start(tmp_path, cfg)  # the baseline, so this start makes a real comparison
     seen: dict[str, Any] = {}
@@ -586,7 +613,8 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     async def _start_then_converge(self: Engine) -> None:
         await real_start(self)
         _add_a_connection_pair(cfg, tmp_path)  # the sibling's change, on the shared directory
-        await self._converge_reload()  # what ConfigConvergenceRunner calls on a version bump
+        _add_a_cleartext_hop(cfg)  # one more loosening, only in the reloaded graph
+        await self._converge_reload(1)  # what ConfigConvergenceRunner calls on a version bump
         # This node's own row for the reload, written by the lifespan's hook (vault BACKLOG #3076).
         reload_rows = await self.store.list_audit(action="config_reload")
         seen["actors"] = [r["actor"] for r in reload_rows]
@@ -602,7 +630,7 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     assert reloaded_digest != start_digest
     assert seen == {
         "fingerprint": reloaded_digest,
-        "counts": (2, 2),
+        "counts": (2, 3),
         "actors": ["system:cluster-convergence"],
     }
     row = rows[-1]
@@ -611,7 +639,8 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     assert row["comparison"] == "compared" and row["changed"] is False
     assert row["previous_fingerprint"] == start_digest
     assert row["superseded"] is True and row["baseline_unchecked"] is True
-    assert row["loosenings"] is None, "the reader sees only the reloaded graph"
+    assert isinstance(row["loosenings"], list), "the start's own list, not None"
+    assert "cleartext_accepted" not in row["loosenings"], "read off the start's graph"
     assert alerts == []
 
     monkeypatch.setattr(Engine, "start", real_start)
@@ -620,13 +649,19 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     assert rows[-1]["comparison"] == "compared"
     assert rows[-1]["previous_fingerprint"] == reloaded_digest
     assert "superseded" not in rows[-1], "control: an undisturbed start is not marked"
+    assert "cleartext_accepted" in rows[-1]["loosenings"], "control: the reloaded graph names it"
 
 
 async def test_the_reload_route_row_still_names_the_reloaded_graph(
     tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
 ) -> None:
-    """Control for vault BACKLOG #2838: the reload route passes no snapshot, so its config_reload
-    row names what the reload put live, read at the write."""
+    """Control for vault BACKLOG #2838: the reload route's config_reload row names the graph that
+    reload put live, built from its own outcome (vault BACKLOG #2257), while the start's row still
+    names the start's graph. A single node carries no ``config_version``.
+
+    It also holds what ``test_start_config_loaded_row.py`` checked of a reload row, which it
+    overlapped (vault BACKLOG #3076 item 6): the node is the start's, and the row has no
+    ``loosenings``."""
     start_digest = config_fingerprint(cfg)
     app = _app(tmp_path, cfg)
     async with app.router.lifespan_context(app), _client(app) as c:
@@ -642,12 +677,89 @@ async def test_the_reload_route_row_still_names_the_reloaded_graph(
     row = json.loads(rows[0]["detail"])
     assert list(row)[:6] == ["dir", "shard", "node", "inbound", "outbound", "dry_run"]
     assert (row["dir"], row["shard"], row["node"], row["dry_run"]) == (str(live), None, node, False)
+    assert row["dir"] == str(cfg.resolve()), "control: the directory the route was given"
     assert row["fingerprint"] == config_fingerprint(cfg) != start_digest
     assert (row["inbound"], row["outbound"]) == (2, 2)
     assert "superseded" not in row and "baseline_unchecked" not in row
+    assert "config_version" not in row and "loosenings" not in row
     # Control: the start's own row, written before the reload, names the start's graph.
     assert start["fingerprint"] == start_digest
     assert (start["inbound"], start["outbound"]) == (1, 1)
+    assert start["node"] == row["node"]
+
+
+async def test_a_convergence_row_names_its_own_reload_when_the_engine_moves_on_first(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3076 item 3, #3109 item 4: a convergence reload's row is built from that
+    reload's outcome, as an operator reload's is. A flag toggle or an operator reload can move the
+    engine on between the swap and the row. The row then still names the bytes this node converged
+    on, under the convergence actor, and marks itself superseded, so it is no baseline. It was read
+    off the live engine before, and named the other change's digest as the convergence's."""
+    other = {"fingerprint": "e" * 64, "scheme": FINGERPRINT_SCHEME, "files": 1}
+    real = Engine.reload_detail
+
+    async def _reload_then_move_on(self: Engine, *a: Any, **kw: Any) -> Any:
+        outcome = await real(self, *a, **kw)
+        self.loaded_config_fingerprint = dict(other)  # what a flag toggle does, before the row
+        return outcome
+
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        _add_a_connection_pair(cfg, tmp_path)
+        with monkeypatch.context() as patch:
+            patch.setattr(Engine, "reload_detail", _reload_then_move_on)
+            await engine._converge_reload(7)
+        live = (engine.loaded_config_fingerprint or {}).get("fingerprint")
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    assert live == other["fingerprint"], "control: the engine moved on before the row"
+    assert len(reload_rows) == 1 and reload_rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(reload_rows[0]["detail"])
+    assert row["fingerprint"] == config_fingerprint(cfg) != other["fingerprint"]
+    assert (row["inbound"], row["outbound"]) == (2, 2)
+    assert row["config_version"] == 7, "the shared version it converged on (vault BACKLOG #3109)"
+    assert row["superseded"] is True and row["baseline_unchecked"] is True
+
+
+async def test_a_failed_convergence_writes_one_failed_row_per_version(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109 items 2 and 3: a convergence reload that raises writes a
+    config_reload_failed row under the convergence actor, with the version it could not converge
+    on. The runner retries that version every tick, so a retry writes nothing more; the next
+    version writes its own. A fault that is no reload refusal is recorded by its type name. It
+    wrote no row at all before."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None
+        running = rr.registry
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        for version in (2, 2, 3):  # a retry of 2, as the runner's next tick makes, then 3
+            with pytest.raises(WiringError):
+                await engine._converge_reload(version)
+
+        async def _boom(self: Engine, *a: Any, **kw: Any) -> Any:
+            raise RuntimeError("synthetic: a fault that is no reload refusal")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Engine, "reload_detail", _boom)
+            with pytest.raises(RuntimeError):
+                await engine._converge_reload(4)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+        reloads = await engine.store.list_audit(action="config_reload")
+        assert rr.registry is running, "control: the node kept its running graph"
+    assert reloads == [], "control: no reload applied"
+    rows = [(r["actor"], json.loads(r["detail"])) for r in reversed(failed)]
+    assert [a for a, _ in rows] == ["system:cluster-convergence"] * 3
+    assert [d["config_version"] for _, d in rows] == [2, 3, 4]
+    assert [d["reason"] for _, d in rows] == ["invalid_config", "invalid_config", "reload_error"]
+    assert rows[-1][1]["error"] == "RuntimeError"
+    for _, d in rows:
+        assert d["initiator"] == "cluster_convergence"
+        assert (d["requested"], d["dry_run"]) == (None, False)
 
 
 async def test_a_convergence_row_with_no_digest_is_passed_over(
@@ -667,7 +779,7 @@ async def test_a_convergence_row_with_no_digest_is_passed_over(
 
         with monkeypatch.context() as patch:
             patch.setattr(Engine, "fingerprint_bundle", _no_digest)
-            await engine._converge_reload()
+            await engine._converge_reload(1)
         reload_rows = await engine.store.list_audit(action="config_reload")
     assert len(reload_rows) == 1
     row = json.loads(reload_rows[0]["detail"])
@@ -720,7 +832,7 @@ async def test_a_convergence_reload_writes_the_row_the_next_start_compares_again
     async with app.router.lifespan_context(app):
         engine: Engine = app.state.engine
         _add_a_connection_pair(cfg, tmp_path)  # a sibling's change, on the shared directory
-        await engine._converge_reload()  # what ConfigConvergenceRunner calls on a version bump
+        await engine._converge_reload(1)  # what ConfigConvergenceRunner calls on a version bump
         reload_rows = await engine.store.list_audit(action="config_reload")
         node = engine.coordinator.node_id
     converged_digest = config_fingerprint(cfg)
@@ -731,6 +843,7 @@ async def test_a_convergence_reload_writes_the_row_the_next_start_compares_again
     row = json.loads(reload_rows[0]["detail"])
     assert list(row)[:6] == ["dir", "shard", "node", "inbound", "outbound", "dry_run"]
     assert row["initiator"] == "cluster_convergence" and row["node"] == node
+    assert row["config_version"] == 1, "the shared version it converged on (vault BACKLOG #3109)"
     assert row["fingerprint"] == converged_digest and (row["inbound"], row["outbound"]) == (2, 2)
     assert "baseline_unchecked" not in row and "degraded" not in row
 
@@ -1014,6 +1127,158 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
     }
 
 
+@pytest.mark.parametrize("fault", ["refusal", "other"])
+async def test_a_failed_convergence_row_the_store_refused_is_written_on_the_next_pass(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    fault: str,
+) -> None:
+    """vault BACKLOG #3109: the version is marked reported only once its config_reload_failed row
+    lands. A store that refuses the first write leaves it unmarked, so the runner's next pass
+    writes it, and the pass after that writes nothing more. Before, the first pass marked it and
+    the lost row was never written. Both writers are covered: a refusal's and another fault's."""
+    real_record = MessageStore.record_audit
+    refused: list[str] = []
+
+    async def _refuse_once(self: MessageStore, action: str, *a: Any, **kw: Any) -> Any:
+        if action == "config_reload_failed" and not refused:
+            refused.append(action)
+            raise RuntimeError("synthetic: the audit store is not answering")
+        return await real_record(self, action, *a, **kw)
+
+    async def _boom(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise RuntimeError("synthetic: a fault that is no reload refusal")
+
+    expected: type[Exception] = WiringError if fault == "refusal" else RuntimeError
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        with monkeypatch.context() as patch:
+            patch.setattr(MessageStore, "record_audit", _refuse_once)
+            if fault == "other":
+                patch.setattr(Engine, "reload_detail", _boom)
+            for _ in range(3):  # the first row is refused, the second pass writes it
+                with pytest.raises(expected):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    assert refused == ["config_reload_failed"], "control: the first write was refused"
+    assert len(failed) == 1, "written on the second pass, and not again on the third"
+    assert json.loads(failed[0]["detail"])["config_version"] == 2
+
+
+async def test_alternating_faults_on_one_version_write_one_row_each_and_then_nothing(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: the runner retries a failing version every tick, and the fault can
+    alternate, as on a flaky share. Each distinct row is written once for the version and then
+    never again, however the faults interleave. Keyed on the last fault alone, A, B, A, B wrote a
+    row on every tick."""
+
+    async def _boom(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise RuntimeError("synthetic: a fault that is no reload refusal")
+
+    real = Engine.reload_detail
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        for tick in range(6):  # invalid config, engine fault, invalid config, ...
+            with monkeypatch.context() as patch:
+                patch.setattr(Engine, "reload_detail", _boom if tick % 2 else real)
+                with pytest.raises(WiringError if tick % 2 == 0 else RuntimeError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    reasons = sorted(json.loads(r["detail"])["reason"] for r in failed)
+    assert reasons == ["invalid_config", "reload_error"], "one row each, then nothing"
+
+
+async def test_two_causes_that_write_the_same_row_write_it_once(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: two different bad configs fail the same version with different causes,
+    a syntax error and then a name nobody defined. Both write the same row, reason
+    ``invalid_config``, so it is written once. Keyed on the cause, each wrote a row that could
+    not be told from the other."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        # The loader withholds the module's own error and chains none (BACKLOG #3249), so the
+        # control reads the cause off the refusal's text, which names its type.
+        causes: list[str] = []
+        for body in ("this is not python (", "name_nobody_defined\n"):
+            (cfg / "cfg.py").write_text(body, encoding="utf-8")
+            with pytest.raises(WiringError) as raised:
+                await engine._converge_reload(2)
+            causes.append(str(raised.value))
+        assert "SyntaxError" in causes[0] and "NameError" in causes[1], (
+            f"control: the two faults differ in cause ({causes})"
+        )
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["detail"])["reason"] == "invalid_config"
+
+
+async def test_a_refused_convergence_logs_no_warning_beside_the_runners_error(
+    tmp_path: Path, cfg: Path, caplog: pytest.LogCaptureFixture, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: the convergence runner logs each failed pass at ERROR, so the refusal
+    writer logs its own line at DEBUG for that reload. A WARNING per retry would repeat the same
+    refusal every interval. The row is still written."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        with caplog.at_level(logging.DEBUG, logger="messagefoundry.api.app"):
+            for _ in range(2):
+                with pytest.raises(WiringError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    refusals = [r for r in caplog.records if r.getMessage().startswith("config reload failed")]
+    assert refusals, "control: the refusal was logged"
+    assert {r.levelno for r in refusals} == {logging.DEBUG}
+    assert len(failed) == 1
+
+
+async def test_a_convergence_refused_for_a_store_fault_logs_no_warning_either(
+    tmp_path: Path,
+    cfg: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+) -> None:
+    """vault BACKLOG #3109 meets BACKLOG #3091: a trust-anchor check the store stops is refused as
+    ``store_unavailable``, and on a convergence reload that refusal also logs at DEBUG. Stood in for
+    by the WiringError the settings preflight raises, caused by AnchorStoreUnavailable."""
+    from messagefoundry.auth.trust_anchors import AnchorStoreUnavailable
+
+    async def _store_fault(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise WiringError("synthetic: a trust-anchor check") from AnchorStoreUnavailable(
+            "synthetic: the store refused the audit read"
+        )
+
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with (
+            caplog.at_level(logging.DEBUG, logger="messagefoundry.api.app"),
+            monkeypatch.context() as patch,
+        ):
+            patch.setattr(Engine, "reload_detail", _store_fault)
+            for _ in range(2):
+                with pytest.raises(WiringError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    refusals = [
+        r for r in caplog.records if r.getMessage().startswith("config reload failed (store")
+    ]
+    assert refusals, "control: the refusal was logged"
+    assert {r.levelno for r in refusals} == {logging.DEBUG}
+    assert [json.loads(r["detail"])["reason"] for r in failed] == ["store_unavailable"]
+
+
 # --- vault BACKLOG #2944, items 4 to 6 -----------------------------------------------------------
 
 
@@ -1192,7 +1457,7 @@ async def test_a_convergence_row_with_a_partial_digest_is_a_baseline(
         engine: Engine = app.state.engine
         with monkeypatch.context() as m:
             _unreadable(m, "cfg.py")
-            await engine._converge_reload()
+            await engine._converge_reload(1)
         reload_rows = await engine.store.list_audit(action="config_reload")
     row = json.loads(reload_rows[0]["detail"])
     assert row[UNREADABLE_FILES_KEY] == ["cfg.py"] and "baseline_unchecked" not in row
@@ -1287,6 +1552,36 @@ async def test_an_edit_that_lands_during_the_start_load_pages(
     assert (alerts[0]["fingerprint"], alerts[0]["previous_fingerprint"]) == (after, before)
     assert alerts[0]["comparison"] == "changed_during_load"
     assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
+
+
+async def test_a_start_with_no_snapshot_stops_vouching_for_a_directory_that_moved(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """The merge of this PR's no-snapshot fallback (vault BACKLOG #3076) with main's during-load
+    test (vault BACKLOG #2944): the test judges the digest the start compared. RED when it is
+    handed the missing snapshot, which reads as nothing moved, so the process went on vouching
+    for a digest that may name bytes it never loaded."""
+    await _start(tmp_path, cfg)
+
+    def _no_snapshot(cls: type[Any], engine: Engine) -> Any:
+        raise RuntimeError("synthetic snapshot fault")
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module._LoadedConfig, "read", classmethod(_no_snapshot))
+        m.setattr(app_module, "load_config", _load_then_edit)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            provenance_after = engine.loaded_config_fingerprint
+            unchecked_after = engine.config_baseline_unchecked
+    assert [a["comparison"] for a in alerts] == ["changed_during_load"], "control: it paged"
+    assert provenance_after is None, "the digest may name bytes the process never loaded"
+    assert unchecked_after is True
 
 
 async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(

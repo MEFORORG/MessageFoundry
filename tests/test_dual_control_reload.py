@@ -604,11 +604,11 @@ async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: E
     marks itself superseded too. The toggle is stood in for by the rebind it performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
-    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
     engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
-    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]
     assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
@@ -926,12 +926,12 @@ async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
-    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
-    loses the row before its detail is built and logs the actor alone."""
+    attempt row an ungated reload writes first. The fake engine has no coordinator, so the first
+    one loses the row before its detail is built and logs the actor alone."""
     lost_actions: list[str] = []
     sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR, loaded=None)
         with pytest.raises(HTTPException) as refused:
             await _audit_reload_attempt(
                 _AUDIT_DOWN,
@@ -2082,15 +2082,13 @@ class _SlowAudit:
 
 def _slow_writer(writer: str, store: _SlowAudit) -> tuple[Any, str]:
     """The writer under test over a fake engine, and the action it writes."""
-    from messagefoundry.api.app import _UNKNOWN_LOADED
-
     fake = cast(Engine, SimpleNamespace(store=store, coordinator=SimpleNamespace(node_id=None)))
     if writer == "refusal":
         refused = _audit_refused_reload(
             fake, ConfigDirMissing("gone"), actor="alice", requested="/cfg", dry_run=False
         )
         return refused, "config_reload_failed"
-    return _record_reload_audit(fake, actor="alice", loaded=_UNKNOWN_LOADED), "config_reload"
+    return _record_reload_audit(fake, actor="alice", loaded=None), "config_reload"
 
 
 async def _drain_mid_write(op: Any, store: _SlowAudit) -> None:
@@ -2129,7 +2127,7 @@ async def test_a_shutdown_drain_does_not_cut_a_reload_row_short(
 async def test_a_write_the_store_cancels_itself_is_a_failed_row_not_a_cancel() -> None:
     """Nobody cancelled the reload, so its row helper reports a lost row, as it promises, rather
     than letting a CancelledError escape into a caller nobody cancelled."""
-    from messagefoundry.api.app import _RELOAD_AUDIT_STEP, _UNKNOWN_LOADED
+    from messagefoundry.api.app import _RELOAD_AUDIT_STEP
 
     async def _cancelled_by_the_store(*_a: Any, **_k: Any) -> None:
         raise asyncio.CancelledError
@@ -2141,7 +2139,7 @@ async def test_a_write_the_store_cancels_itself_is_a_failed_row_not_a_cancel() -
             coordinator=SimpleNamespace(node_id=None),
         ),
     )
-    steps = await _record_reload_audit(fake, actor="alice", loaded=_UNKNOWN_LOADED)
+    steps = await _record_reload_audit(fake, actor="alice", loaded=None)
     assert steps == [_RELOAD_AUDIT_STEP]
 
 
