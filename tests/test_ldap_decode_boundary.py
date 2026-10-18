@@ -242,12 +242,9 @@ def _assert_referred_bind(exc: BaseException, operation: str) -> None:
 
 
 def test_a_service_bind_answered_with_a_referral_is_a_referral() -> None:
-    """Before D3b it read as an undecodable response, an outage the reconciler pages nobody for.
-    THE PREMISE first: the bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
-    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
-        dc,
-        authenticator,
-    ):
+    """Before D3b it read as an undecodable response, not as a referral. THE PREMISE first: the
+    bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
+    with _bad_bind_dc(_REFERRAL_BIND) as (dc, authenticator):
         with pytest.raises(KeyError) as bare:
             _bare_bind(dc.port)
         assert bare.value.args == (3,)
@@ -279,21 +276,10 @@ def test_a_user_bind_answered_with_a_referral_fails_a_present_and_an_absent_acco
 
 
 async def test_the_reconciler_reads_a_referred_service_bind_as_referred() -> None:
-    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's."""
-    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
-        dc,
-        authenticator,
-    ):
-        store = await MessageStore.open(":memory:")
-        try:
-            settings = _ad_settings(
-                ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
-            )
-            service = AuthService(store, settings, ldap=authenticator)
-            user = SimpleNamespace(id="u-1", username="alice", directory_object_id=None)
-            probe = await service._probe_principal(user)  # type: ignore[arg-type]
-        finally:
-            await store.close()
+    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's or the
+    probe fault's, and its detail names no referred host."""
+    with _bad_bind_dc(_REFERRAL_BIND) as (dc, authenticator):
+        probe = await _probe_through_the_reconciler(authenticator, dc.port)
     assert probe.outcome is ProbeOutcome.REFERRED
     assert probe.detail is not None and _REFERRED not in probe.detail
 
