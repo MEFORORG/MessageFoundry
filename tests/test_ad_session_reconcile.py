@@ -586,6 +586,23 @@ def test_a_pass_of_referrals_and_failures_is_a_referral_not_an_outage() -> None:
     assert tripped.aborted == "mass_revoke_breaker" and not tripped.judged_nothing
 
 
+def test_a_referred_probe_is_not_a_readable_answer_for_the_hold() -> None:
+    """BACKLOG #3100 item 6. Today's rule, pinned so it cannot move unseen: a REFERRED probe is not
+    counted readable, so a lone undetermined account beside only referrals is held, not struck.
+    The control: a PRESENT answer beside it is readable, so the lone account strikes. A referral on
+    the group search came after the user search read ``userAccountControl``, so whether such a
+    referral should count is open under item 9; changing it changes this test on purpose.
+
+    RED when: REFERRED counts toward the hold's ``r``."""
+    lone = reconcile.Probe("u", "u", U)
+    beside_referral = _plan([lone, reconcile.Probe("r", "r", R)], prior_strikes={"u": 1})
+    assert beside_referral.readable == 0 and beside_referral.hold
+    assert beside_referral.held == ("u",) and beside_referral.revocations == ()
+    beside_answer = _plan([lone, reconcile.Probe("ok", "ok", P)], prior_strikes={"u": 1})
+    assert beside_answer.readable == 1 and not beside_answer.hold
+    assert [r.user_id for r in beside_answer.revocations] == ["u"]
+
+
 F = reconcile.ProbeOutcome.FAULT
 
 
@@ -925,6 +942,11 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
         # alert instance's reason, and the setting is what the page exists to name.
         assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
         assert "revoked nothing" in alert and "circuit breaker" not in alert
+        # BACKLOG #3100 items 4 and 6. The detail says what a referral costs: a disabled account
+        # behind the base is not revoked while it lasts. That sentence falls past the 200
+        # characters the alert instance keeps; the notifier's detail carries it. No account named.
+        assert "never revoked while it is referred" in alert
+        assert "jdoe" not in alert and "asmith" not in alert
         audit = await store.list_audit()
         referred = _referred_rows(audit)
         expected = {
@@ -1096,6 +1118,72 @@ async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_the_accounts
         await store.close()
 
 
+async def test_revoking_an_account_signed_in_at_a_referral_forfeits_the_clear_on_that_pass() -> (
+    None
+):
+    """BACKLOG #3100 item 6, the revocation-loop forfeit. ``asmith`` is signed in at the referral
+    and takes its first strike on that pass. The base is fixed, and the next pass reads ``jdoe`` PRESENT and
+    revokes ``asmith`` on its second strike. ``asmith`` was never read PRESENT, so that pass is no
+    evidence the referral cleared, although every account it leaves signed in reads clean.
+
+    RED when: the revocation loop does not forfeit, so the pass that revokes ``asmith`` marks
+    ``referral_clear`` itself, before the next pass's attrition check could forfeit it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({n: _principal(n) for n in ("jdoe", "asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = {n: await _signed_in_ad_user(service, store, n) for n in ("jdoe", "asmith")}
+        assert tokens["asmith"] is not None
+        assert await service.identity_for_token(tokens["asmith"]) is not None
+
+        ldap.referring = {"jdoe"}
+        del ldap.present["asmith"]
+        referral = await service.reconcile_directory_sessions()
+        assert referral.referred and referral.revocations == ()  # asmith's first strike
+
+        ldap.referring.clear()
+        plan = await service.reconcile_directory_sessions()
+        assert [r.username for r in plan.revocations] == ["asmith"]
+        assert await service.identity_for_token(tokens["asmith"]) is None
+        assert not plan.referral_clear
+        assert service.directory_reconcile_referral is not None
+    finally:
+        await store.close()
+
+
+async def test_a_referral_does_not_clear_while_an_account_signed_in_since_has_no_answer() -> None:
+    """BACKLOG #3100 item 6, coverage on the referral clear. ``asmith`` signs in after the referral,
+    so it was never marked, and its first probe cannot reach the directory. The pass reads ``jdoe``
+    PRESENT, but it has no answer for ``asmith``, which the same base may refer. The control: once
+    ``asmith`` answers, the referral clears.
+
+    RED when: the referral clear does not need an answer on record for every signed-in account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({n: _principal(n) for n in ("jdoe", "asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+
+        ldap.referring = {"jdoe"}
+        assert (await service.reconcile_directory_sessions()).referred
+        await _signed_in_ad_user(service, store, "asmith")
+
+        ldap.referring.clear()
+        ldap.unreachable = {"asmith"}
+        unread = await service.reconcile_directory_sessions()
+        assert unread.aborted is None and unread.unavailable == 1
+        assert not unread.referral_clear
+        assert service.directory_reconcile_referral is not None
+
+        ldap.unreachable.clear()
+        read = await service.reconcile_directory_sessions()
+        assert read.referral_clear and service.directory_reconcile_referral is None
+    finally:
+        await store.close()
+
+
 async def test_a_referral_beside_an_outage_judges_what_answered_and_pages() -> None:
     """Referral, outage and answer in one pass. The answer is judged; the referral pages; the
     outage leaves its account's strike alone. With the answer removed, referral plus outage alone
@@ -1162,6 +1250,8 @@ async def test_a_breaker_trip_beside_a_referral_keeps_both_conditions_apart() ->
         referral = service.directory_reconcile_referral
         assert referral is not None and referral.startswith("LDAP referral")
         assert "ad_group_search_base" in referral[:200] and "The pass revoked nothing" in referral
+        # BACKLOG #3100 item 2. Both texts count the same probes, referred ones included.
+        assert "of the 12 signed-in" in breaker and "1 of 12 signed-in" in referral
         audit = await store.list_audit()
         assert any(a["action"] == "auth.ad_reconcile_aborted" for a in audit)
         # Newest first: the tripped pass, then the first pass, which only struck.
