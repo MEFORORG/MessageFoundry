@@ -12081,8 +12081,10 @@ class AuthService:
             # cannot drop the signal, and a store error in these reads writes it before it is
             # raised. The account is read afresh first: the row read before the write still
             # covers the deleted passkey, so its digest would fail every sealed delete into the
-            # seal's reload path. An account that does not load is no passkey-set question; the
-            # holder re-read answers it as a lost session.
+            # seal's reload path. An account row that still exists but does not load (its seal
+            # check lost a race to a rename or a rebind) leaves the set unasked here, so the set
+            # read after the holder re-read owes the same row; on that path a refusal by the
+            # holder re-read comes first and writes none (BACKLOG #3774).
             try:
                 owner = await self._load_user(user.id)
                 if owner is not None:
@@ -12093,6 +12095,8 @@ class AuthService:
                 raise
             if standing == "unverified":
                 await self._clone_suspected(user, cred, client)
+        # A gone answer whose set was not asked above: its clone row, if owed, is not written yet.
+        gone_unasked = answer == "gone" and standing is None
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked whatever the write answered,
@@ -12110,13 +12114,24 @@ class AuthService:
         if standing is None:
             # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue,
             # so the passkey that signed may be gone. Asked after the holder re-read, as the last
-            # read before the factor write. A gone answer whose account loaded was asked above.
-            standing = await self._passkey_held(user, cred)
+            # read before the factor write. A gone answer whose account loaded was asked above;
+            # one whose account did not is asked here, and a store error writes its clone row
+            # before it is raised, as the read above does.
+            try:
+                standing = await self._passkey_held(user, cred)
+            except Exception:
+                # Not BaseException, as above.
+                if gone_unasked:
+                    await self._clone_suspected(user, cred, client)
+                raise
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
             return await self._assertion_refused(user, client, "session_lost", session_lost=True)
         if standing == "unverified":
+            if gone_unasked:
+                # The gone answer's set fails its seal, so the miss keeps its clone signal.
+                await self._clone_suspected(user, cred, client)
             return await self._assertion_refused(user, client, "factor_unverified")
         if answer == "gone" or standing != "held":
             # Confirmed gone by the write itself, or by the set read after it.

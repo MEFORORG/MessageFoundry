@@ -667,8 +667,13 @@ UPDATE follows in one transaction. Only `gone` is exempt, and not when the accou
 read after the write, fails its seal: the row may then have gone outside the store's sealed write
 path, which proves no holder's delete, so the clone row is written and the refusal is
 `factor_unverified`, or the reason the holder re-read gives when it refuses first. That set is read
-before the holder re-read, and the row is written before a store error in it is raised, so a
-revocation, a disable, a lock or that error cannot remove this signal either. `mismatch` means the
+before the holder re-read, from the account loaded afresh, and the row is written before a store
+error in it is raised, so a revocation, a disable, a lock or that error cannot remove this signal
+either. One path is narrower: when that fresh load returns nothing although the account row still
+exists (its seal check losing a race to a rename or a rebind), the set is read only after the holder
+re-read. A set failing its seal there, or a store error in that read, still writes the one clone
+row, but a revocation, a disable or a lock the holder re-read finds first refuses with its own
+reason and writes none. A cancelled request writes none on either path. `mismatch` means the
 passkey still
 existed and held another count, so it writes the clone row at once, before any other read. A
 delete, a session revocation, a disable or a lock that lands after that write cannot remove the

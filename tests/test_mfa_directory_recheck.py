@@ -756,6 +756,36 @@ async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
 
 
+async def test_a_replayed_code_checked_across_a_rename_is_charged_under_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392 at fcac75a5. A replayed code MATCHES but fails its
+    spend with the factor unchanged, so it is charged as a wrong code, and against the row the
+    holder re-read returned: a rename landing during the check must not leave the wrong-code row
+    and the lockout naming the account as it was. RED when: the ``auth.mfa_failed`` row names the
+    old username, or the replay is not charged."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    (second,) = await _more_sessions(e, 1)
+    code = totp.totp(e.secret, now=_T1)
+    assert (await e.service.verify_mfa(e.token, code)).ok
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
+
+    refused = await e.service.verify_mfa(second, code)
+
+    assert refused.ok is False and refused.session_lost is False and refused.locked is False
+    rows = await store.list_audit(action="auth.mfa_failed")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == 1
+
+
 async def test_a_secret_that_does_not_open_for_the_check_is_refused_and_spends_nothing(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
