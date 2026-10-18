@@ -519,6 +519,13 @@ ci-quality = [
     "pytest-timeout>=2.3.1",
 ]
 
+[tool.uv]
+# LOCK-ONLY hold, never published metadata. PySide6 6.12 adds the pyside6-pdf and pyside6-webengine
+# wheels to the harness closure, and docs/RISKY-COMPONENTS.md, security/risky-component-readings.json
+# and security/bundled-code-survey.json hold no reading or survey answer for either, so
+# tests/test_risky_component_designation.py refuses the lock. Lift this in the PR that adds them.
+constraint-dependencies = ["pyside6<6.12"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Run the whole suite on ONE shared asyncio event loop (tests AND fixtures). pytest-asyncio's default
