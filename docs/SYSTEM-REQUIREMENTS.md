@@ -56,10 +56,11 @@ only the host can. On a host that does not provide it:
 - an **exposed** PHI instance **warns at every start** until the decision is recorded —
   `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
   provides it. The engine **starts either way**: this is a host property, not a config error, and a
-  Windows engine VM is listed as getting it only as an Azure or Azure Local confidential VM (table below, verified
-  2026-07-22), so refusing by default would stop a Windows engine on Windows Server Hyper-V over
-  something its operator cannot change. An estate that has standardized on confidential-computing hosts can make the missing
-  declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
+  Windows engine VM is listed as getting it only as an Azure or Azure Local confidential VM (table
+  below, verified 2026-07-22), so refusing by default would stop a Windows engine on Windows Server
+  Hyper-V over something its operator cannot change. An estate that has standardized on
+  confidential-computing hosts can make the missing declaration fatal with
+  `[security].require_memory_encryption_declaration = true` (default `false`).
   Unexposed instances ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)'s
   exposure rule, as amended 2026-10-06) are **silent — but not exempt**, and no instance is spared as
   synthetic ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). The warning is keyed on exposure to
@@ -118,15 +119,19 @@ own thorough testing. That covers at least the POSIX branches in the security co
 hardening and a systemd unit. It is too much for v1. Linux support may return after v1; no date is
 set.
 
-The ruling changes the support statement, not the code or CI:
+The ruling changes the support statement, not the code:
 
 - The engine keeps its POSIX code paths, and the [`docker/`](../docker/README.md) tree (image,
   compose file, Kubernetes manifests, smoke test) stays as a development and CI artifact.
 - CI keeps its Linux legs. A green Linux leg is not evidence that a Linux deployment works.
-- Some CI jobs run only on Linux hosted runners, at least the SQL Server and PostgreSQL store jobs.
-  On Windows that leaves a gap. `selfhosted-win2025-sql.yml` covers SQL Server only, and has no
-  runner known to be registered ([CI-SELFHOSTED-RUNNER.md](CI-SELFHOSTED-RUNNER.md)). The PostgreSQL
-  store has no Windows CI leg.
+- Some CI jobs run only on Linux hosted runners, at least the SQL Server store and the load tests,
+  and on Windows that leaves a gap. CI exercises the PostgreSQL store on Linux (PostgreSQL 16,
+  gating) and, since the ruling, as an advisory leg that does not block a merge, on hosted Windows
+  Server 2022 and 2025 against the runner images' preinstalled PostgreSQL 14 and 17. SQL Server is
+  exercised on Linux containers only; there is no running Windows SQL Server CI leg.
+  `selfhosted-win2025-sql.yml` would be one, but has no runner known to be registered
+  ([CI-SELFHOSTED-RUNNER.md](CI-SELFHOSTED-RUNNER.md)). How each leg reaches the merge gate is in
+  [CI.md](CI.md#the-ci-gate-roll-up).
 
 ## Runtime
 
@@ -194,10 +199,10 @@ is **not** disciplined:
 
 ### Check it on Linux
 
-Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target); this check is for
-a Linux host outside that support, such as a development box. On a systemd host, run `timedatectl`. A healthy host shows `System clock synchronized: yes` and
-`NTP service: active`. Where chrony is the time service, `chronyc tracking` shows the current
-offset, and a healthy host shows a `Leap status` of `Normal`.
+Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target); this check is for a Linux
+host outside that support, such as a development box. On a systemd host, run `timedatectl`. A healthy host
+shows `System clock synchronized: yes` and `NTP service: active`. Where chrony is the time service,
+`chronyc tracking` shows the current offset, and a healthy host shows a `Leap status` of `Normal`.
 
 ### The engine can check at start, if you ask it to
 
@@ -215,8 +220,8 @@ query to the peer, so the host must be able to reach the peer on UDP port 123.
 | Database | Status | Driver / prerequisite |
 |---|---|---|
 | **SQLite (WAL)** | ✅ Default, bundled — single-node | None (`aiosqlite`, in-process) |
-| **PostgreSQL 13+** | ✅ Production | `messagefoundry[postgres]` extra (`asyncpg` — no OS dependency; ships compiled wheels) |
-| **Microsoft SQL Server 2022 / 2025** | ✅ Production | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server** (18.5+ covers both majors). Read-Committed Snapshot Isolation (RCSI) recommended. SQL Server 2025 requires an AVX-capable CPU. |
+| **PostgreSQL 13+** | ✅ Production ([CI coverage](#linux-is-not-a-supported-v1-deployment-target)) | `messagefoundry[postgres]` extra (`asyncpg` — no OS dependency; ships compiled wheels) |
+| **Microsoft SQL Server 2022 / 2025** | ✅ Production ([CI coverage](#linux-is-not-a-supported-v1-deployment-target)) | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server** (18.5+ covers both majors). Read-Committed Snapshot Isolation (RCSI) recommended. SQL Server 2025 requires an AVX-capable CPU. |
 | MySQL / Oracle | ⛔ Not supported (roadmap) | — |
 
 > The embedded SQLite store needs no setup and suits pilots and single-node deployments. A
@@ -320,7 +325,11 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 > [TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), measured on a GitHub-hosted `ubuntu-latest` runner.
 > Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). That file's Windows
 > Server 2025 engine-shard run also measured one process on SQLite at ~50 msg/s, inside the Standard band.
-> The High single-node and engine-shard rows had a Windows engine host.
+> The High single-node and engine-shard rows had a Windows engine host. The High row's run says so in
+> its [`environment.txt`](benchmarks/results/2026-07-03-adr0066-pooled-atscale/environment.txt). The
+> ~165 msg/s run ran on that Windows Server 2025 box. The shared SQL Server soak ran on the AWS rig that
+> [THROUGHPUT-STATUS-2026-07-10.md](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §8, *Rig sizing*,
+> records as all Windows.
 
 **Reading the tiers — and checking the arithmetic**
 

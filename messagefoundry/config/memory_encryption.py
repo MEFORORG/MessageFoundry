@@ -24,9 +24,10 @@ confidential-computing platform. Conflating the two is the single most likely wa
 misused, so :class:`MemoryEncryptionReadout` refuses to fuse them into one boolean, and no code path
 here ever infers activation from a CPU model or a CPU flag.
 
-**Windows reports nothing.** ADR 0152 makes the Windows in-guest attestation path a time-boxed spike
-that has not landed. Rather than guess, every field is ``None`` (undeterminable) there. That is the
-honest answer on the platform this engine primarily ships on, and it is deliberately *not* softened.
+**Windows reports nothing.** ADR 0152's documentation-only Windows spike ran on 2026-07-22 and
+decided that no Windows read-out is built (*Windows rung 3 — spike conclusion*, consequence 2).
+Rather than guess, every reading is ``None`` (undeterminable) there. That is the honest answer on
+the only platform v1 supports, and it is deliberately *not* softened.
 
 Pure and stdlib-only: no engine state, no configuration, no network, and no I/O beyond reading the
 platform files named above. Never raises — an unreadable platform yields ``None``, never an
@@ -184,8 +185,9 @@ def platform_memory_encryption_readout() -> MemoryEncryptionReadout:
 
     Linux reads two independent sources — ``/proc/cpuinfo`` flags for *capability* and the guest
     device nodes for *activation* — and never derives one from the other. Every other platform,
-    Windows included, returns all-``None``: ADR 0152 makes the Windows in-guest path a spike that has
-    not landed, and inventing an answer there would be worse than admitting we do not know.
+    Windows included, returns all-``None``: ADR 0152's Windows spike (2026-07-22) decided that no
+    Windows read-out is built, and inventing an answer there would be worse than admitting we
+    do not know.
 
     **Known false negatives, stated rather than hidden:** a SEV-SNP guest whose ``sev-guest`` kernel
     driver is not loaded, a container whose ``/dev`` does not map the node, and an Azure Linux
@@ -197,8 +199,9 @@ def platform_memory_encryption_readout() -> MemoryEncryptionReadout:
 
     Never raises."""
     if sys.platform != "linux":
-        # Not "no memory encryption" — "this build does not know how to look". Windows is the ADR
-        # 0152 spike; macOS/BSD are not deployment targets. Either way, None, never False.
+        # Not "no memory encryption" — "this build does not look". On Windows the decision not to
+        # look is settled (ADR 0152's spike); the value stays undeterminable. macOS/BSD are not
+        # deployment targets. Either way, None, never False.
         return MemoryEncryptionReadout(
             capability=None,
             active=None,

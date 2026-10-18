@@ -13,8 +13,9 @@ the **Windows / virtualization admins** who place the VMs. This is the on-prem "
 [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md) and sketched in
 [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §2.3, now realized for Windows Server VMs.
 
-**Windows Server + SQL Server only.** This document does not cover PostgreSQL HA (streaming
-replication, managed-PG failover); see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) for that path.
+**Windows Server + SQL Server only.** This document does not cover PostgreSQL HA. For engine HA on a
+PostgreSQL store, see [`CLUSTERING.md`](CLUSTERING.md), which leaves the database's own HA to the
+database tier. No MessageFoundry guide covers that tier for PostgreSQL in a v1 deployment.
 
 ---
 
