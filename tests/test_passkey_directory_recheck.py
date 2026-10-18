@@ -584,12 +584,14 @@ async def test_what_lands_before_the_factor_write_is_honoured(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
-async def test_an_account_deleted_mid_assertion_on_a_keyed_store_is_a_lost_session() -> None:
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_an_account_deleted_mid_assertion_is_a_lost_session(keyed: bool) -> None:
     """On a keyed store an account gone also fails its passkey set's seal re-read. RED when: the
     miss answers as a wrong proof rather than a lost session, or writes other than one
     ``auth.webauthn_clone_suspected`` row: a gone answer whose account does not load writes one,
-    since the engine cannot tell a deleted account from a racing one (BACKLOG #3774)."""
-    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    since a missing account row does not say why it is missing (BACKLOG #3774)."""
+    cipher = make_cipher(generate_key()) if keyed else None
+    store = await MessageStore.open(":memory:", cipher=cipher)
     try:
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
@@ -932,8 +934,8 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
 
 
 #: Each case: whether the passkey leaves through the store's sealed delete (else outside it, so the
-#: set fails its seal), what the request answers (a refusal reason, ``"raises"`` or
-#: ``"cancelled"``), and how many clone rows it writes.
+#: set fails its seal; only the cases that reach a set read consult it), what the request answers (a
+#: refusal reason, ``"raises"`` or ``"cancelled"``), and how many clone rows it writes.
 _UNLOADED_GONE_CASES: dict[str, tuple[bool, str, int]] = {
     "holder-revoked": (False, "session_lost", 1),
     "holder-disabled": (False, "session_lost", 1),
@@ -945,6 +947,7 @@ _UNLOADED_GONE_CASES: dict[str, tuple[bool, str, int]] = {
     "set-removed": (True, "factor_removed", 1),
     "set-read-cancelled": (False, "cancelled", 1),
     "load-cancelled": (False, "cancelled", 0),
+    "account-deleted-after-load": (True, "session_lost", 1),
 }
 
 
@@ -956,8 +959,10 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
     racing account; engine main alerts on every miss, so the clone row is written right there, once,
     whatever follows. RED when: a holder re-read that refuses or raises, an account that fails to
     load again, or a sealed delete the late set read finds leaves no ``auth.webauthn_clone_suspected``
-    row, which is what 146be6e1 gave, or any case writes two. The control: a cancel before the row is
-    written writes none, while a cancel after it leaves it. Keyed, so the seal can fail."""
+    row, which is what 146be6e1 gave, or any case writes two. An account deleted after a fresh load
+    that did succeed writes one too, so the outcome does not hang on when the delete landed. The
+    control: a cancel before the row is written writes none, while a cancel after it leaves it.
+    Keyed, so the seal can fail."""
     sealed, outcome, clone_rows = _UNLOADED_GONE_CASES[case]
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
@@ -969,7 +974,7 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
         state = {"written": False, "unloaded": False}
 
         async def _gone(*args: Any, **kwargs: Any) -> SignCountAnswer:
-            # The holder change lands first, so its own user-row write cannot re-seal the set.
+            # The holder change lands first, so a user-row write cannot re-seal the set.
             if case == "holder-revoked":
                 await store.revoke_session(hash_token(token))
             elif case == "holder-disabled":
@@ -991,6 +996,12 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
 
         async def _load_fails_after_the_write(*args: Any, **kwargs: Any) -> Any:
             again = case == "account-fails-to-load-again"
+            if case == "account-deleted-after-load":
+                loaded = await real_load(*args, **kwargs)
+                if state["written"] and not state["unloaded"]:
+                    state["unloaded"] = True
+                    await store.delete_user(user_id)
+                return loaded
             if state["written"] and (not state["unloaded"] or again):
                 state["unloaded"] = True
                 if case == "load-cancelled":
@@ -1032,7 +1043,10 @@ async def test_a_gone_passkey_whose_account_does_not_load_writes_one_clone_row(c
         rows = await store.list_audit(action="auth.webauthn_clone_suspected")
         assert len(rows) == clone_rows
         session = await store.get_session(hash_token(token))
-        assert session is None or session.mfa_verified_at is None
+        if case == "account-deleted-after-load":
+            assert session is None or session.mfa_verified_at is None
+        else:
+            assert session is not None and session.mfa_verified_at is None
     finally:
         await store.close()
 

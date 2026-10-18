@@ -656,9 +656,8 @@ exception now holds: a miss on a passkey that no longer exists. A self-service p
 no account queue, and an MFA reset deletes every passkey before it revokes the sessions, so either
 can land during an assertion and fail its compare-and-set. That miss is no evidence of a cloned
 authenticator, so it writes no `auth.webauthn_clone_suspected` row while the account still loads
-(the path below where it does not is the exception). The assertion is still
-refused, audited `auth.webauthn_failed` with reason `factor_removed`, or `session_lost` when the
-session or the account went with it.
+and holds it. The assertion is still refused, audited `auth.webauthn_failed` with reason
+`factor_removed`, or `session_lost` when the session or the account went with it.
 
 **Gone is decided by the write that missed, never by a later read.** `update_webauthn_sign_count`
 answers `moved`, `mismatch` or `gone` under one locked write on every backend: on SQLite the
@@ -670,12 +669,12 @@ path, which proves no holder's delete, so the clone row is written and the refus
 `factor_unverified`, or the reason the holder re-read gives when it refuses first. That set is read
 before the holder re-read, from the account loaded afresh, and the row is written before a store
 error in it is raised, so a revocation, a disable, a lock or that error cannot remove this signal
-either. When that fresh load returns nothing, the clone row is written there, once and before
-any other read, because the engine cannot then tell a deleted passkey from a tampered or racing
-account and engine main alerts on every miss, so an occasional false clone alert is preferred to a silent miss. A cancel before the row is
-written writes none. `mismatch` means the
-passkey still
-existed and held another count, so it writes the clone row at once, before any other read. A
+either. When the account, read afresh for that set read, does not load or is gone, the clone
+row is written there, once and before any other read, because a missing account row does not say
+whether the account was deleted, tampered with or lost a race, and the engine wrote the row on
+every miss before this exception, so a false clone row is preferred to a missing one. A cancel before the row is written writes none.
+`mismatch` means the passkey still existed and held another count, so it writes the clone row at
+once, before any other read. A
 delete, a session revocation, a disable or a lock that lands after that write cannot remove the
 signal, and nor can a store error in the reads that follow it.
 
@@ -689,4 +688,7 @@ written; the only edit there is a dated pointer to this amendment.
 
 **Who decided.** The exception was built under BACKLOG #3068 (engine PR 2392). The ledger rows
 #3774 and #3777, filed at the Lander's request on 2026-10-17, ask that it be decided atomically and
-recorded here. No owner ruling is recorded for it.
+recorded here. No owner ruling is recorded for it. The clone row on a gone answer whose account
+does not load or is gone was set by the batch 259 Manager's ruling on PR 2392 on 2026-10-17, to
+keep the signal the engine gave before this exception; no owner ruling is recorded for that
+either.

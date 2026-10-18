@@ -12090,11 +12090,12 @@ class AuthService:
             except Exception:
                 await self._clone_suspected(user, cred, client)
                 raise
-            if owner is None or standing == "unverified":
-                # A gone answer whose account does not load writes the clone row here, once and
-                # whatever follows: the engine cannot then tell a deleted passkey from a tampered
-                # or racing account, and engine main alerts on every miss, so an occasional false
-                # clone alert is preferred to a silent miss (BACKLOG #3774).
+            if owner is None or standing in ("unverified", "account_gone"):
+                # A gone answer whose account does not load, or is gone, writes the clone row here,
+                # once and whatever follows: a missing account row does not say whether the account
+                # was deleted, tampered with or lost a race, and the engine wrote the row on every
+                # miss before this exception, so a false clone row is preferred to a missing one
+                # (BACKLOG #3774).
                 await self._clone_suspected(user, cred, client)
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
@@ -12164,8 +12165,9 @@ class AuthService:
         ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the answer
         cannot be trusted: the set fails its seal, or the account row still exists but does not
         load (its own seal fails, or its lookup keys changed). It decides the refusal; whether a
-        sign-count miss is a clone signal is the write's own answer (BACKLOG #3774), save that a set
-        failing its seal keeps the signal on a passkey the write found gone. The account is asked
+        sign-count miss is a clone signal is the write's own answer (BACKLOG #3774), save that on a
+        passkey the write found gone, a set failing its seal or an account gone keeps the signal, as
+        an account that does not load does. The account is asked
         only when the set does not hold ``cred``, since a set read of a deleted account fails its
         seal on a keyed store and is empty on a keyless one. This re-check compares every
         credential, each in constant time (ASVS 11.2.4, as the delete path does); the lookup that
