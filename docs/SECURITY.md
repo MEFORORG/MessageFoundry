@@ -2983,14 +2983,17 @@ updated via a strict compare-and-set** — a regression or a concurrent same-cou
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
 normal for synced passkeys). Every compare-and-set miss writes that row once, as soon as the
 store answers and before any other read, and its detail names the store's answer as
-`sign_count_answer`: `mismatch` (the passkey held another count) or `gone` (the passkey was deleted
-during the assertion, for example by its holder or an MFA reset), decided under one locked write on
+`sign_count_answer`: `mismatch` (the passkey held another count) or `gone` (no passkey row was
+left, whether its holder or an MFA reset deleted it, or it left outside the store's sealed write
+path, which the refusal below tells apart as `reason=factor_unverified`), decided under one locked
+write on
 every backend (BACKLOG #3068, #3774; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
 amendment of 2026-10-17). So at least these cannot suppress it: a holder ending their own session, a
-disable, a lock, a passkey delete, or a store error landing after the write. A gone passkey is then
-refused as `auth.webauthn_failed` with `reason=factor_removed`, `reason=factor_unverified` when the
-passkey set read after the write fails its seal, or `reason=session_lost` when the session or the
-account went with it; an MFA reset gives `reason=session_lost` once its revocation has landed, and
+disable, a lock, a passkey delete, or a store error landing after the write. The reasons a gone
+passkey is then refused with, audited `auth.webauthn_failed`, include at least
+`reason=factor_removed`, `reason=factor_unverified` when the passkey set read after the write fails
+its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
+an MFA reset gives `reason=session_lost` once its revocation has landed, and
 `reason=factor_removed` before.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor

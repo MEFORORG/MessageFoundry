@@ -159,7 +159,6 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     RoleRow,
     SessionRecord,
-    SignCountAnswer,
     UserAuthzRecord,
     UserRecord,
     VerifiedUser,
@@ -12158,7 +12157,7 @@ class AuthService:
         cred: WebAuthnCredential,
         client: str | None,
         *,
-        answer: SignCountAnswer,
+        answer: Literal["mismatch", "gone"],
     ) -> None:
         """Audit ``auth.webauthn_clone_suspected`` for passkey ``cred``, the clone signal
         :meth:`finish_webauthn_assertion` writes on every sign-count compare-and-set miss (ADR 0068

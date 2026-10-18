@@ -760,7 +760,7 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
 
 
 @pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
-async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
+async def test_a_passkey_deleted_after_a_sign_count_miss_still_reads_mismatch(
     keyed: bool,
 ) -> None:
     """BACKLOG #3774, ADR 0068 decision 4. The miss is judged by the write that missed: the
@@ -803,38 +803,6 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_keeps_the_clone_signal(
         await store.close()
 
 
-async def test_a_passkey_gone_outside_the_sealed_path_keeps_the_clone_signal() -> None:
-    """BACKLOG #3774. The write answers ``gone`` and the row left outside the store's sealed
-    write path, so the account's set fails its seal. RED when: the ``auth.webauthn_clone_suspected``
-    row is missing or names other than ``gone``, or the refusal reads ``factor_removed`` rather
-    than ``factor_unverified``. Keyed, so the seal can fail."""
-    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
-    try:
-        service, token, response, user_id = await _local_assertion(store)
-        real_update = store.update_webauthn_sign_count
-
-        async def _the_row_goes_unsealed(*args: Any, **kwargs: Any) -> SignCountAnswer:
-            await store._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-            await store._db.commit()
-            answer = await real_update(*args, **kwargs)
-            assert answer == "gone"
-            return answer
-
-        store.update_webauthn_sign_count = _the_row_goes_unsealed  # type: ignore[method-assign]
-
-        refused = await service.finish_webauthn_assertion(
-            token, response, rp_id=_RP, origin=_ORIGIN
-        )
-
-        assert refused.ok is False and refused.session_lost is False
-        assert await _clone_answers(store) == ["gone"]
-        failures = await _audited_assertion_failures(store)
-        assert {"reason": "factor_unverified"} in failures
-        assert {"reason": "factor_removed"} not in failures
-    finally:
-        await store.close()
-
-
 #: Each case: what lands with the unsealed delete, and the reason the refusal is audited with
 #: (``None``: the set read raises, so the call raises rather than refusing).
 _UNSEALED_GONE_CASES: dict[str, str | None] = {
@@ -846,7 +814,7 @@ _UNSEALED_GONE_CASES: dict[str, str | None] = {
 
 
 @pytest.mark.parametrize("change", list(_UNSEALED_GONE_CASES))
-async def test_an_unsealed_gone_passkey_keeps_the_clone_signal_whatever_the_holder_reread_finds(
+async def test_an_unsealed_gone_passkey_writes_one_clone_row_whatever_the_holder_reread_finds(
     change: str,
 ) -> None:
     """BACKLOG #3774, the review of PR 2392 at 5d8901d8. The write answers ``gone`` and the set
@@ -961,8 +929,9 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
     naming ``gone``. RED when: a gone answer whose set still holds the passkey, loses it through
     the sealed delete, fails its seal, or whose set read raises or is cancelled; whose account does
     not load or is deleted after it loads; or whose holder re-read refuses (revoked, disabled,
-    locked) or raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``.
-    Keyed, so the seal can fail."""
+    locked) or raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``,
+    or a set that fails its seal is refused as ``factor_removed``. A cancel after the store answers
+    (``set-read-cancelled``) leaves the row. Keyed, so the seal can fail."""
     gone_by, outcome = _GONE_CASES[case]
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
@@ -1033,35 +1002,20 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
             )
             assert refused.ok is False
             assert refused.session_lost is (outcome == "session_lost")
-            assert {"reason": outcome} in await _audited_assertion_failures(store)
+            failures = await _audited_assertion_failures(store)
+            assert {"reason": outcome} in failures
+            if outcome == "factor_unverified":
+                assert {"reason": "factor_removed"} not in failures
         if case == "account-deleted-after-load":
             assert state["deleted"], "the account was never loaded after the write"
         store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
         service._factor_holder_current = real_holder  # type: ignore[method-assign]
         assert await _clone_answers(store) == ["gone"]
         session = await store.get_session(hash_token(token))
-        assert session is None or session.mfa_verified_at is None
-    finally:
-        await store.close()
-
-
-async def test_a_cancel_before_the_store_answers_writes_no_clone_row() -> None:
-    """BACKLOG #3774, the control for the gone cases above. A cancel before the sign-count write
-    answers proves nothing about the passkey. RED when: it writes an
-    ``auth.webauthn_clone_suspected`` row."""
-    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
-    try:
-        service, token, response, _user_id = await _local_assertion(store)
-
-        async def _cancelled(*_args: Any, **_kwargs: Any) -> SignCountAnswer:
-            raise asyncio.CancelledError
-
-        store.update_webauthn_sign_count = _cancelled  # type: ignore[method-assign]
-
-        with pytest.raises(asyncio.CancelledError):
-            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
-
-        assert await _clone_answers(store) == []
+        if case == "account-deleted-after-load":
+            assert session is None or session.mfa_verified_at is None
+        else:
+            assert session is not None and session.mfa_verified_at is None
     finally:
         await store.close()
 

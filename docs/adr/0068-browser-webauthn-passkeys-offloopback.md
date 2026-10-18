@@ -663,17 +663,22 @@ passkey deleted during the assertion from a counter that held another value.
 **When it is written.** Once per assertion, as soon as the store answers and before any other read
 or refusal, so a session revocation, a disable, a lock, a passkey delete or a store error in the
 reads that follow cannot drop it. A cancel before the row is written writes none. The assertion is
-then refused, and no refusal writes a second clone row. A gone passkey is refused as
-`auth.webauthn_failed` with reason `factor_removed`, `factor_unverified` when the passkey set read
-after the write fails its seal, or `session_lost` when the session or the account went with it.
+then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
+with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
+the passkey set read after the write fails its seal, `session_lost` when the session or the
+account went with it, and `locked` when a second-step lock landed; a store error in those reads
+raises instead.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
 queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
 during an assertion and fail its compare-and-set with nothing cloned. An earlier build of this
 change exempted such a miss when it judged the passkey gone. Each review round found a path on
 which that exemption alerted less than the engine had before it, so the exemption was withdrawn: a
-false clone row on a deleted passkey is preferred to a missing one, and the recorded answer lets an
-operator discount it.
+false clone row on a deleted passkey is preferred to a missing one. `gone` alone does not show a
+holder's delete: a passkey row removed outside the store's sealed write path, or with its account,
+answers `gone` too. Before discounting a `gone` row, read the same request's refusal: a
+`factor_unverified` refusal, with an `integrity.authority_seal_failed` row for the account's
+passkeys, means the row did not leave through the store.
 
 A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
 whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as
