@@ -588,8 +588,9 @@ from typing import Any
 #: #2954's field was this branch's only seam change and main already carries it.
 #:
 #: The batch 257 branch (vault BACKLOG #3260 and its siblings, at 9dffd8fa7f1c4ba2) merged with
-#: main again after BACKLOG #3082 (PR 2373) and PR 2359 landed there (main at 501bfdcf5, seam
-#: digest 5b6fd34b36a52c84). Neither parent's value covered both, so the move comes from the merge.
+#: main again after BACKLOG #3082 (PR 2373) and #2954 (PR 2377) moved main's seam (main at
+#: 501bfdcf5, seam digest 5b6fd34b36a52c84; PR 2359 moved no seam field). Neither parent's value
+#: covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is

@@ -895,6 +895,20 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
         assert not out.ok and out.reason == DIRECTORY_ROLE_MAP_UNSEALED
         assert out.error and "sign out" not in out.error.lower(), out.error
         assert "administrator" in out.error, out.error
+        # The row comes from the bound refuse partial, so it carries the flow's address fields as
+        # the demotion arm's row does (vault BACKLOG #3145 item 4). Pins the merge of main's #3082
+        # reason with that partial.
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert rows == [
+            {
+                "ok": False,
+                "provider": "ad",
+                "mech": "oidc",
+                "reason": DIRECTORY_ROLE_MAP_UNSEALED,
+                "start_client": "10.0.0.9",
+                "client_moved": False,
+            }
+        ], rows
         await _assert_untouched(service, token)
     finally:
         await store.close()
