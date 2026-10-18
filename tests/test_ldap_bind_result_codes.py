@@ -48,6 +48,7 @@ from messagefoundry.auth.ldap import (
     LdapError,
     LdapUnansweredError,
 )
+from messagefoundry.auth.service import DirectoryRefusal
 from tests.test_ad_user_account_control import _signed_in_estate
 from tests.test_ldap_referrals import _BIND_RESPONSE, _tlv
 from tests.test_ldap_search_result_codes import (
@@ -222,7 +223,7 @@ async def test_a_busy_re_bind_is_not_counted_toward_the_engine_lockout(
 ) -> None:
     """Closing step 1. RED when the re-bind charges the row, or audits it as a wrong password."""
     elevation, failed, details, charged = await _rebind_after(monkeypatch, code)
-    assert not elevation.ok and elevation.directory_refusal is not None
+    assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert failed == 0, f"a bind ended with {code} ({name}) was counted as a wrong password"
     assert charged == 0, f"a bind ended with {code} ({name}) was charged to the session"
     assert any('"reason": "directory_unavailable"' in d for d in details), details
@@ -330,6 +331,6 @@ async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(
         raise LDAPSessionTerminatedByServerError("session terminated by server")
 
     elevation, failed, details, charged = await _rebind_after(monkeypatch, bind)
-    assert not elevation.ok and elevation.directory_refusal is not None
+    assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert failed == 0 and charged == 0
     assert any('"reason": "directory_unavailable"' in d for d in details), details

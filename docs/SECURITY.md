@@ -2893,8 +2893,8 @@ keyed on. The password was right, so the refusal is charged to
 neither the lockout nor the session's re-proof budget, and clears neither. No window is renewed, no
 action-bound grant is minted, and no roles are written. The `auth.reauth` row carries
 `reason=directory_roles_demoted`, and the caller gets the demotion answer: 403 on `POST /me/reauth`,
-telling it to sign out and sign in again (BACKLOG #3082). A retry is refused the same way until a
-new sign-in re-syncs the roles. A role map that fails its seal is refused as
+telling it to sign out and sign in again (BACKLOG #3082); what else clears that refusal is in the
+paragraph on telling the caller the fix, above. A role map that fails its seal is refused as
 `directory_role_map_unsealed` and gets the answer for a directory that could not confirm the
 account, as on the other legs. Channel scope is not compared on this leg either. The enrolment legs make the
 test too, through the code leg's directory check (BACKLOG #3061). The code, passkey, IdP and

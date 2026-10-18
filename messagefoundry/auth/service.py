@@ -1099,7 +1099,7 @@ class Elevation:
     #: checked, except on a demoted account's re-bind (BACKLOG #3081): the bind proved the password
     #: right, and the account was refused for its roles, so a retry is refused again until a new
     #: sign-in re-syncs them. It qualifies the wrong-proof state: the token still authenticates, and
-    #: the caller must say the directory could not confirm the account rather than call the code,
+    #: the caller must name the directory's refusal, by the fix below, rather than call the code,
     #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
     #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
     #: gets only which fix clears it: :attr:`DirectoryRefusal.DEMOTED` for a lost role, which a new

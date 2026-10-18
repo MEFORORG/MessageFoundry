@@ -33,6 +33,7 @@ from messagefoundry.auth.service import (
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
+    DirectoryRefusal,
     Elevation,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -165,7 +166,11 @@ async def _assert_totp_refused_and_unspent(t: _TotpStaged, outcome: str) -> None
     s = t.signed
     refused = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
     assert refused.ok is False
-    assert refused.directory_refusal is not None
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     assert refused.recovery_codes == ()
     assert t.minted == []  # no recovery codes were minted
@@ -499,7 +504,11 @@ async def _assert_passkey_refused_and_unspent(p: _PasskeyStaged, outcome: str) -
     s = p.signed
     refused = await _register(p)
     assert refused.ok is False
-    assert refused.directory_refusal is not None
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     assert await s.store.list_webauthn_credentials(s.identity.user_id) == []  # nothing stored
     session = await s.store.get_session(hash_token(s.token))

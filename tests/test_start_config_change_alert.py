@@ -1554,6 +1554,36 @@ async def test_an_edit_that_lands_during_the_start_load_pages(
     assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
 
 
+async def test_a_start_with_no_snapshot_stops_vouching_for_a_directory_that_moved(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """The merge of this PR's no-snapshot fallback (vault BACKLOG #3076) with main's during-load
+    test (vault BACKLOG #2944): the test judges the digest the start compared. RED when it is
+    handed the missing snapshot, which reads as nothing moved, so the process went on vouching
+    for a digest that may name bytes it never loaded."""
+    await _start(tmp_path, cfg)
+
+    def _no_snapshot(cls: type[Any], engine: Engine) -> Any:
+        raise RuntimeError("synthetic snapshot fault")
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module._LoadedConfig, "read", classmethod(_no_snapshot))
+        m.setattr(app_module, "load_config", _load_then_edit)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            provenance_after = engine.loaded_config_fingerprint
+            unchecked_after = engine.config_baseline_unchecked
+    assert [a["comparison"] for a in alerts] == ["changed_during_load"], "control: it paged"
+    assert provenance_after is None, "the digest may name bytes the process never loaded"
+    assert unchecked_after is True
+
+
 async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:

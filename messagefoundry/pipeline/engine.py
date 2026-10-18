@@ -2724,7 +2724,12 @@ class Engine:
                 # what it wrote; otherwise the write lands with no row and no undo.
                 try:
                     _after, _vouched, landed = await work
-                except Exception:  # noqa: BLE001 - the write refused or failed, so nothing landed
+                except Exception as exc:  # noqa: BLE001 - the write refused or failed: nothing landed
+                    log.warning(
+                        "config write %s cancelled; the write itself had failed: %s",
+                        action,
+                        safe_exc(exc),
+                    )
                     raise asyncio.CancelledError from None
                 undone = await asyncio.to_thread(_undo_write, config_dir, landed)
                 log.warning(
@@ -2771,9 +2776,10 @@ class Engine:
                     raise
                 if deadline.expired():
                     log.warning(
-                        "config write %s refused: its audit row was not recorded within %g s",
+                        "config write %s refused: its audit row was not recorded within %g s (%s)",
                         action,
                         bound,
+                        safe_exc(exc),
                     )
                     raise ConfigWriteAuditTimeout(bound, undone=undone) from None
                 log.error(

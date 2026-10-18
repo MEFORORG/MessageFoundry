@@ -162,7 +162,8 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 _log = logging.getLogger(__name__)
 
 #: What ``/auth/mfa-verify``, ``/me/reauth`` and ``/me/mfa/confirm`` say when a directory refused
-#: the account, so the proof was never checked (BACKLOG #2023, #2027, #3061). One text per fix,
+#: the account: the proof was never checked, or, on a demoted account's re-bind, it was checked and
+#: the account was refused for its roles (BACKLOG #2023, #2027, #3061, #3081). One text per fix,
 #: chosen by ``Elevation.directory_refusal`` (BACKLOG #3082): an account the directory did not
 #: confirm, an outage included, is told to try later or ask an administrator, never to sign out,
 #: since a new sign-in fails the same way and the working session would be lost. A lost role is told

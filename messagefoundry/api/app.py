@@ -2655,14 +2655,14 @@ async def _compare_start_config(
 
 
 def _moved_during_load(
-    before_load: Mapping[str, object] | None, loaded: _LoadedConfig | None
+    before_load: Mapping[str, object] | None, after_load: Mapping[str, object] | None
 ) -> bool:
     """Whether two digests over the same files, one just before the start's load and one just
     after it, differ: bytes did change in between (vault BACKLOG #2944). Not every
     ``changed_during_load``: a digest that failed, or two that left out different files (a passing
     antivirus lock), say nothing changed."""
     before = digest_coverage(before_load)
-    after = digest_coverage(loaded.fingerprint if loaded is not None else None)
+    after = digest_coverage(after_load)
     return (
         before is not None
         and after is not None
@@ -11050,19 +11050,22 @@ def create_managed_app(
                 # written. So the next start pages again for the same change, unless a flag toggle
                 # or reload row lands in between and becomes the baseline. A repeat page on a
                 # degraded start is the safe side of that trade.
-                start_outcome, start_config = await _compare_start_config(
-                    engine,
+                # The digest compared is the one the during-load test judges too, so a start with
+                # no snapshot still stops vouching for a directory that moved under its load.
+                compared = (
                     start_loaded.fingerprint
                     if start_loaded is not None
-                    else engine.loaded_config_fingerprint,
-                    before_load=before_load,
+                    else engine.loaded_config_fingerprint
+                )
+                start_outcome, start_config = await _compare_start_config(
+                    engine, compared, before_load=before_load
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 # The outcome alone decides it, by design (vault BACKLOG #3076 item 6): a start
                 # row that names no snapshot, or that a reload superseded, is no baseline itself,
                 # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if _moved_during_load(before_load, start_loaded):
+                if _moved_during_load(before_load, compared):
                     # The digest may name bytes this process never loaded, so the provenance route
                     # and a DR activation must not vouch for it (vault BACKLOG #2944). Its flag
                     # rows then carry no digest, so they are marked unchecked too: a later start

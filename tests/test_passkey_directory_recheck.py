@@ -454,7 +454,7 @@ async def test_a_staged_ceremony_is_peeked_not_taken_before_the_lookup(
     the assertion it refused cannot verify once the directory answers."""
     p = await _directory_session_owing_a_passkey(store)
     p.directory.answer = DirectoryAnswer.DISABLED
-    assert (await _finish(p)).directory_refusal is not None
+    assert (await _finish(p)).directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert p.service._webauthn_challenges.peek((hash_token(p.token), "assert")) is not None
 
     p.directory.answer = DirectoryAnswer.FOUND
@@ -479,7 +479,7 @@ async def test_an_oidc_minted_session_is_checked_too(store: MessageStore) -> Non
 
     refused = await p.service.finish_webauthn_assertion(oidc, response, rp_id=_RP, origin=_ORIGIN)
 
-    assert refused.directory_refusal is not None
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]
     session = await store.get_session(hash_token(oidc))
     assert session is not None and session.mfa_verified_at is None

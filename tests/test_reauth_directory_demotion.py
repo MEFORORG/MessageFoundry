@@ -182,6 +182,28 @@ async def test_the_re_bind_judges_the_roles_read_after_the_bind(
     assert elevation.ok and elevation.token is not None
 
 
+async def test_a_role_map_that_fails_its_seal_is_no_demotion_on_the_re_bind(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3082 on the re-bind leg (#3081): a failing role map grants nothing, so every stored
+    role would read as lost, but a new sign-in reads the same map. The refusal is
+    ``directory_role_map_unsealed`` and its fix is UNCONFIRMED, never sign out. RED when the
+    re-bind calls it a demotion."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.auth.service import DIRECTORY_ROLE_MAP_UNSEALED
+
+    s = await _signed_in(store, _OPERATORS, _VIEWERS)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+
+    refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert not refused.ok and refused.token is None and refused.session_lost is False
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    reasons = await _reauth_reasons(store)
+    assert any(f'"reason": "{DIRECTORY_ROLE_MAP_UNSEALED}"' in d for d in reasons), reasons
+    assert not any(f'"reason": "{DIRECTORY_ROLES_DEMOTED}"' in d for d in reasons), reasons
+
+
 async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
