@@ -404,17 +404,83 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: Vault BACKLOG #2709: the digest now covers each console route's gate. The vault BACKLOG #2581
+#: entry above records the gap: the console calls ``dr_activate`` and ``dr_release`` in process,
+#: which never runs their gates, so the console route's own gate is the only one on that path. That
+#: change moved the gate and not the digest, so a console wheel that kept the session-only gate
+#: pinned the same digest and passed the handshake. The snapshot now records what the console
+#: installs on the app: each route's top-level dependencies, gates included, with their own source
+#: and the values they captured, and its mounts, middleware and ``app.state`` hooks.
+#: ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` lists at least what that
+#: misses, such as module-level data a gate reads. A change to a route's gate moves the digest, so a
+#: console built before it is refused at mount. A new console route moves it too, so a console
+#: change that adds or re-gates a route now needs an engine with the new seam. The released console
+#: 0.4.0 was already refused before this change, by unrelated seam moves; this is the guard against
+#: the next gate change that moves nothing else.
+#:
+#: Vault BACKLOG #3192: ``PendingApprovalInfo`` gained ``release_blocked``, typed by the new alias
+#: ``ReleaseBlocked``, which the Approvals page reads to stop offering Approve on a row the gate
+#: always refuses. The page imports the alias, so a newer console fails at import on an older
+#: engine; an older console on this engine is refused at mount. The digest moved because the DTO
+#: surface grew.
+#:
+#: Vault BACKLOG #2709 merged with vault BACKLOG #3192: each branch moved the digest on its own
+#: (#2709 to 589456358a5fe441, #3192 to bd77ef41628d287c). The value below was re-derived with
+#: ``--write`` on the merged tree, so it covers both: the route-gate section and the grown DTO.
+#:
+#: Vault BACKLOG #2709, review repair: the route-gate table also records the qualified name of each
+#: engine function a gate reaches by a plain global name, follows names in nested code at any depth,
+#: reads a ``functools.wraps`` wrapper's source from the function it wraps, and its section is
+#: retitled to say it holds more than gates. The digest moved from ``589456358a5fe441``; the value
+#: below was re-derived on the tree merged with main.
+#:
+#: Vault BACKLOG #2709's review repair merged with vault BACKLOG #3192: re-derived with ``--write``
+#: on the merged tree, so the value below covers both.
+#:
 #: BACKLOG #3015: ``ReloadResult`` gained ``restart_required``, the settings trust anchors a
 #: restart must apply. The console's reload result and approval pages read it by attribute, so it
 #: forces a bump. Re-derived on batch/b260-c, the tree merged with BACKLOG #3091, #3105 and #2731,
 #: none of which moved it. The value below covers all four.
+#:
+#: Vault BACKLOG #2709 merged with BACKLOG #3015: each moved the digest on its own (#2709 to
+#: ca9d9d31c1e53c1b, #3015 to fe903ffc23dbda0d on main). The value below was re-derived with
+#: ``--write`` on the merged tree, so it covers both.
+#:
+#: Vault BACKLOG #2709, second review repair: every layer of a ``functools.wraps`` chain is read,
+#: its own body and the helpers it calls, and a function outside the engine and console packages
+#: is no longer recorded, since a standard-library name can differ by platform. The digest moved
+#: from the merged value 6d97ea22c90b73a4.
+#:
+#: Vault BACKLOG #3192 merged with the #2709 branch, whose digest was 0b41a33c5d9e66b8: the value
+#: below was re-derived with ``--write`` on the merged tree, so it covers every entry above.
+#:
+#: Vault BACKLOG #2709 merged with BACKLOG #3029: each moved the digest on its own (#2709 to
+#: 0b41a33c5d9e66b8, #3029 to b86ce593ab8a43a4 on main). #3029 added no entry here; its move is
+#: ``AuthService.logout`` returning ``LogoutOutcome`` where it returned ``None``. The console
+#: ignores that return value, so no call breaks in either skew direction. The value below was
+#: re-derived with ``--write`` on the merged tree, so it covers both.
+#:
+#: Vault BACKLOG #3192 / #3193 / #3236 merged with the #2709 branch again, after that branch took
+#: main's #3029 (digests 0cd684e3f53d2469 and 344979df3bd2c662). The value below was re-derived
+#: with ``--write`` on the merged tree, so it covers every entry above.
+#:
+#: Vault BACKLOG #3192 review repair: ``ReleaseBlocked`` gained ``params_no_requester``, a held
+#: purge or reload whose params name no requester, which the gate now refuses before its claim (vault BACKLOG
+#: #3217). The Approvals page keys a note on every value, so an older console on this engine is
+#: refused at mount rather than meeting a value it has no note for. Re-derived with ``--write``
+#: from 71c27581e7c9f921.
+#:
+#: Vault BACKLOG #3192 merged with main after BACKLOG #2709 landed there (PR 2341, digest
+#: 344979df3bd2c662 on main). Main moved the seam by that merge alone: the route-gate table and
+#: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
+#: merged tree; the digest did not move, so the value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b86ce593ab8a43a4"
+ENGINE_UI_SEAM: str = "6d7dcabe1103f08d"
 
 
 @dataclass(frozen=True, slots=True)

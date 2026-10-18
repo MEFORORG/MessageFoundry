@@ -258,6 +258,7 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     approval_update,
+    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -285,6 +286,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -309,6 +311,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -2517,7 +2520,7 @@ class PostgresStore:
         ``_fetchall``/``_fetchone``/``_execute`` convenience trio, which were routed through here for
         exactly that reason — they called ``self._pool.fetch(...)``, which acquires inside asyncpg with
         no timeout, so leaving them outside would have left the class open while looking closed. It is
-        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._acquire``,
+        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._borrow``,
         which is that backend's sole borrow site,
         this is not yet a single chokepoint — do not describe it as one, and check
         ``tests/test_store_pool_acquire_timeout.py`` (which pins the set of borrows that bypass it)
@@ -8408,6 +8411,35 @@ class PostgresStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Its reads share one borrow and one read-only REPEATABLE READ
+        snapshot; the MAC runs after both are released."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                parts = sql.split("?")
+                numbered = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], 1))
+                row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
+                return row
+
+            check = await read_newest_keyed_audit_row(
+                fetch,
+                action=action,
+                actor=actor,
+                after_seq=after_seq,
+                active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+            )
+        return await settle_newest_keyed_audit_row(check)
+
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
@@ -9076,10 +9108,12 @@ class PostgresStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
-        material, not a secret — excluded from the store cipher). A duplicate ``(user_id, label)``
-        raises asyncpg's UniqueViolationError — the caller renders it as the same "label already in
-        use" error as its pre-check (the concurrent-enroll race, ADR 0068 §4). The account is
-        re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        material, not a secret — excluded from the store cipher). asyncpg raises
+        UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
+        and ForeignKeyViolationError for an account that does not exist; the caller tells them
+        apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
+        BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
+        transaction (BACKLOG #2592)."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)

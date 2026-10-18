@@ -135,8 +135,8 @@ your own hardware and working around the pieces §2 lists as not built yet. If t
 Consolidate these before you install anything:
 
 - [ ] **Python 3.14+** on the engine host.
-- [ ] **OS:** Windows is the primary supported/serviced platform (NSSM); the engine itself is
-      cross-platform Python.
+- [ ] **OS:** Windows, the only supported v1 deployment platform (Windows service via NSSM). Linux
+      is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 - [ ] **Administrator/elevation** on the host if you will install the Windows service.
 - [ ] **Outbound network access** for the service installer to download the SHA-256-pinned NSSM
       binary. Offline, pass `-NssmPath` with the win64 `nssm.exe` from `nssm-2.24.zip`. A copy
@@ -288,7 +288,7 @@ directory:
 
 ```powershell
 cd ./my-config-repo
-python -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
 ```
 
 `serve` flags and their precedence (**CLI > `MEFOR_<SECTION>_<KEY>` env > `messagefoundry.toml` >

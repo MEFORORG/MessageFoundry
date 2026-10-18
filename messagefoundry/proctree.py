@@ -159,6 +159,21 @@ def kill_on_close_job(process_handle: int, *, who: str) -> int | None:
     return int(handle)
 
 
+def adopt_current_process(*, who: str) -> int | None:
+    """Put the calling process in a fresh kill-on-close job; return the job handle, or ``None`` off
+    Windows or when the job could not be set up (logged under ``who``).
+
+    Every process the caller starts afterwards joins the job, so those processes end when the caller
+    does, ``os._exit`` included. Work handed to a process outside the tree still escapes, as the
+    module docstring says. That holds only while nothing else has the handle: hold it, never close
+    it, and let the process exit close it. A caller already in a job gets a nested one (Windows 8
+    and later)."""
+    if sys.platform != "win32":
+        return None
+    # GetCurrentProcess's pseudo-handle, (HANDLE)-1: it names the caller and needs no closing.
+    return kill_on_close_job(-1, who=who)
+
+
 def terminate_job(job: int) -> None:
     """Terminate every process in ``job`` (the child and its whole tree) and close the handle."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type-checker / non-Windows

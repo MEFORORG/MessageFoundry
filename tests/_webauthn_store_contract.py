@@ -4,7 +4,8 @@
 
 Deliberately **extra-free** (ADR 0068 §4 / decision 4): this module imports NOTHING from the
 optional ``webauthn`` extra — it exercises only ``AuthStore`` methods and the
-``WebAuthnCredential`` record — so the live Postgres/SQL Server suites can import it *inside their
+``WebAuthnCredential`` record, and judges a refusal with the service's own extra-free
+``_is_integrity_refusal`` — so the live Postgres/SQL Server suites can import it *inside their
 test functions* and run the parity contract on CI legs that install ``.[dev,postgres]`` /
 ``.[dev,sqlserver]`` **without** the webauthn extra. (A module-level
 ``pytest.importorskip("webauthn")`` anywhere on this path would silently skip parity on exactly
@@ -19,8 +20,10 @@ invoked from the SQLite suite (``tests/test_webauthn_store.py``) and both live s
 from __future__ import annotations
 
 import secrets
+from collections.abc import Awaitable
 from typing import Any
 
+from messagefoundry.auth.service import _is_integrity_refusal
 from messagefoundry.store.store import WebAuthnCredential
 
 #: A base64url credential id at WebAuthn's maximum raw size (1023 bytes -> ~1364 chars) — the
@@ -54,6 +57,19 @@ def _cred(
         created_at=created_at,
         last_used_at=None,
     )
+
+
+async def _assert_integrity_refused(write: Awaitable[object], what: str) -> None:
+    """``write`` fails with a refusal the service recognises as an integrity refusal: the one
+    predicate it uses, so this contract pins exactly what finish_webauthn_registration relies on."""
+    try:
+        await write
+    except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
+        assert _is_integrity_refusal(exc), (
+            f"{what} raised {type(exc).__name__}, not an integrity refusal"
+        )
+    else:
+        raise AssertionError(f"{what} was accepted")
 
 
 async def _assert_webauthn_store_contract(store: Any) -> None:
@@ -109,17 +125,10 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     # error (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc.IntegrityError) — the
     # service catches it and renders "label already in use". Same label on ANOTHER user is fine.
     await store.add_webauthn_credential(_cred("wa-u2", "yubikey", id_hash="h3", created_at=40.0))
-    try:
-        await store.add_webauthn_credential(
-            _cred("wa-u1", "yubikey", id_hash="h-dup", created_at=50.0)
-        )
-    except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
-        name = type(exc).__name__ + "".join(t.__name__ for t in type(exc).__mro__)
-        assert "Integrity" in name or "UniqueViolation" in name, (
-            f"duplicate label raised {type(exc).__name__}, not an integrity violation"
-        )
-    else:
-        raise AssertionError("duplicate (user_id, label) was silently accepted")
+    await _assert_integrity_refused(
+        store.add_webauthn_credential(_cred("wa-u1", "yubikey", id_hash="h-dup", created_at=50.0)),
+        "duplicate (user_id, label)",
+    )
 
     # Sign-count CAS (the consume_totp_step precedent): True iff stored == expected; a miss is the
     # clone signal. 0->0 (synced passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
@@ -150,6 +159,14 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h-big") is None
     assert await store.get_webauthn_credential("h3") is None
     assert await store.has_webauthn_credentials("wa-u2") is False
+
+    # BACKLOG #2733: a passkey for an account that does not exist is refused by the user foreign
+    # key on every backend. SQL Server lacked the key, so this write once committed an orphan there.
+    await _assert_integrity_refused(
+        store.add_webauthn_credential(_cred("wa-u2", "orphan", id_hash="h-orphan")),
+        "a passkey for an account that does not exist",
+    )
+    assert await store.get_webauthn_credential("h-orphan") is None
 
 
 async def _assert_totp_contract(store: Any) -> None:
