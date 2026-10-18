@@ -7891,16 +7891,32 @@ class AuthService:
             # it is no conflict. A verified holder load, not one statement, but only when the
             # caller's read named another row.
             #
-            # NOT CLOSED HERE: a holder that fails its seal reads as None at this re-read, at the
-            # reconciler's own ``held`` read, and at least at the two write-path holder reads
-            # below. So the write's guard stops the rename and the write-path refusal logs that no
-            # row holds the new name and a later pass retries it, which is false while that holder
-            # stays seal-failed. The login's caller read (``_lookup_by_username``) keeps the seal
-            # state and refuses. The gap wants one holder lookup that keeps the seal state for the
-            # reconciler's reads, not a special case on this one.
-            current = await self._load_user_by_username(new_username)
-            if current is not None and current.id != user_id:
-                await _refuse(current.id, "pre_check", before.username)
+            # A holder that fails its seal at this re-read still holds the name, so it is refused
+            # as the caller's read would have been, with the lockout warning, not left to the
+            # write-path refusal's "a later pass retries it", which is false while that holder
+            # stays seal-failed. Its id is not verified, so the audit names ``held``, the last
+            # verified holder. NOT CLOSED HERE: the reconciler's own ``held`` read, and at least
+            # the two write-path holder reads below, still read a seal-failed holder as None.
+            #
+            # A store fault on this re-read skips this one rename for this pass rather than
+            # raising: the caller is the reconciler's rename loop, and a raise would end the pass
+            # before the renames after this one. Nothing was written; a later pass that probes
+            # the account retries it. The cached store-error tuple, so a fault never imports a
+            # driver on the event loop.
+            try:
+                current = await self._lookup_by_username(new_username)
+            except _session_write_errors() as exc:
+                _log.warning(
+                    "AD account %s: reading the holder of its new directory name raised %s, so its "
+                    "rename was not applied on this pass; a later pass that probes it retries it "
+                    "(BACKLOG #3070)",
+                    user_id,
+                    type(exc).__name__,
+                )
+                return
+            if current.refused or (current.user is not None and current.user.id != user_id):
+                holder_id = held.id if current.user is None else current.user.id
+                await _refuse(holder_id, "pre_check", before.username)
                 return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
