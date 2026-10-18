@@ -1785,7 +1785,8 @@ async def test_a_pass_with_a_referral_or_fault_beside_clean_answers_marks_no_cle
 
     RED when: a pass with a referral or a fault beside other answers marks a clear."""
     record = {"a": PRESENT, "b": PRESENT, "c": PRESENT}
-    assert await _marked(_CLEAN_TWO, record) == (True, True)  # the control, on these inputs
+    # The control: the same record, on a pass that left ``c`` in the budget remainder instead.
+    assert await _marked(replace(_CLEAN_TWO, probed=2), record) == (True, True)
     assert await _marked(plan, record) == (False, False)
     # The referral's own clear, on a process whose pass saw a referral and whose marked accounts
     # have all read PRESENT since: only the referral or the fault in this pass stops it.

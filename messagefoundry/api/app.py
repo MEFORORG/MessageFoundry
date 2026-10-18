@@ -9836,8 +9836,10 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     new. **The one statement of why each condition has its own source** (BACKLOG #3100 item 13):
     its own source gives it its own instance, throttle and detail, so acknowledging or suspending
     one standing condition must not silence a later breaker trip, referral or fault, and one
-    detail cannot hide another. An ``[alerts]`` rule keyed on the event type alone still matches all of them; a rule
-    whose source pattern matches one label and not the others keeps them apart.
+    detail cannot hide another. An ``[alerts]`` rule keyed on the event type alone still matches
+    all of them; a rule whose source pattern matches one label and not the others keeps them
+    apart. The hold is not one of them: ``ad_reconcile_held`` is raised under the breaker's
+    source, so only its event type keeps it apart from the breaker.
 
     A probe fault (BACKLOG #3100) is not an outage either: the engine could not read what the
     directory returned for an account, and that account is left unrevoked while it lasts. Any pass
@@ -9855,8 +9857,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
     Each standing alert but the probe fault's also gets its inverse, which pages nobody and
-    resolves the open instance
-    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
+    resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
