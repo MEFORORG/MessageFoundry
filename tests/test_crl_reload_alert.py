@@ -115,20 +115,35 @@ def _runner(sink: object, **kw: Any) -> CrlReloadRunner:
 
 
 def _pass(runner: CrlReloadRunner, **kw: Any) -> list[ReloadOutcome]:
-    """One real pass, and the runner's report of it, as ``_run`` does after its await."""
-    outcomes = reload_replaced_crls(**kw)
-    runner._report(outcomes)
+    """One real pass, and the runner's report of it from what that pass saw, as ``_run`` does
+    after its await."""
+    view = crl_reload._PassView()
+    token = crl_reload._PASS_VIEW.set(view)
+    try:
+        outcomes = reload_replaced_crls(**kw)
+    finally:
+        crl_reload._PASS_VIEW.reset(token)
+    runner._report(outcomes, view)
     return outcomes
 
 
 def _sighted_pass(runner: CrlReloadRunner) -> list[ReloadOutcome]:
     """One real pass through the runner's own wrapper, its report and the first-sight clear from
-    what that pass judged, as ``_run`` does after its await."""
-    outcomes, judged = runner._judged_pass()
+    what that pass saw, as ``_run`` does after its await."""
+    view = crl_reload._PassView()
+    outcomes = runner._judged_pass(view)
     assert isinstance(outcomes, list)
-    runner._report(outcomes)
-    runner._clear_on_first_sight(judged)
+    runner._report(outcomes, view)
+    runner._clear_on_first_sight(view)
     return outcomes
+
+
+def _recorded() -> crl_reload._PassView:
+    """The refusal record as it stands now, as a pass that judged nothing would leave it, for a
+    test that writes the record itself and reports outcomes of its own."""
+    view = crl_reload._PassView()
+    view.take_refusals()
+    return view
 
 
 def _stamp_denied(_path: str) -> tuple[int, int, int]:
@@ -308,7 +323,7 @@ async def test_a_remedy_the_class_map_does_not_hold_sends_a_token_and_no_sentenc
     refusal = ReloadRefusal((1, 2), "a reason", "an unlisted remedy naming CN=someone")
     loaded_crls.record_reload_refusal(pki.crl, refusal)
 
-    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 3)])
+    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 3)], _recorded())
 
     (payload,) = sink.refused()
     assert (payload["remedy_class"], payload["remedy"]) == ("other", "")
@@ -421,7 +436,7 @@ async def test_the_runner_raises_from_the_loop_thread_not_the_pass_thread(pki: _
 async def test_a_pass_that_returns_no_outcomes_raises_nothing(returned: object) -> None:
     """The injected ``reload`` is typed to return anything, and two older tests return None."""
     sink = _Sink()
-    _runner(sink)._report(returned)
+    _runner(sink)._report(returned, _recorded())
     assert sink.events == []
 
 
@@ -478,13 +493,15 @@ async def test_each_failing_sink_call_has_its_own_streak(
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
         for _ in range(3):
-            runner._report(outcomes)  # A's raise fails every time; B's raise lands once
+            runner._report(
+                outcomes, _recorded()
+            )  # A's raise fails every time; B's raise lands once
         assert (warned("raised"), warned("resolved")) == (1, 0)
         assert sink.kinds() == ["refused"]
 
         loaded_crls.clear_reload_refusal(b)  # B is cleared, and its clear now fails too
         for _ in range(3):
-            runner._report(outcomes[:1])
+            runner._report(outcomes[:1], _recorded())
         assert (warned("raised"), warned("resolved")) == (1, 1)
 
 
@@ -570,7 +587,9 @@ async def test_a_report_that_raises_does_not_end_the_loop(
         return [ReloadOutcome(path, 0, refusal, 1)]
 
     runner = _runner(sink, interval_seconds=0.01, reload=reload, skip_when_idle=idle)
-    runner._report([ReloadOutcome(path, 0, refusal, 1)])  # one open alert, so clears read
+    runner._report(
+        [ReloadOutcome(path, 0, refusal, 1)], _recorded()
+    )  # one open alert, so clears read
     reads: list[int] = []
 
     def broken_record() -> dict[str, ReloadRefusal]:
@@ -607,13 +626,15 @@ async def test_a_streak_ends_once_its_call_is_no_longer_owed(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
         for expected in (1, 2):
             loaded_crls.record_reload_refusal(path, refusal)
-            runner._report(outcomes)
-            runner._report(outcomes)
+            runner._report(outcomes, _recorded())
+            runner._report(outcomes, _recorded())
             failures = [r for r in caplog.records if "could not be raised" in r.getMessage()]
             assert len(failures) == expected, "one WARNING per streak"
             assert crl_path_key(path) in failures[-1].getMessage(), "and it names the file"
             loaded_crls.clear_reload_refusal(path)
-            runner._report([])  # the refusal is gone, so the failed raise is no longer owed
+            runner._report(
+                [], _recorded()
+            )  # the refusal is gone, so the failed raise is no longer owed
     assert sink.events == []
 
 
@@ -657,7 +678,7 @@ async def test_the_stop_warnings_list_of_files_survives_the_log_redaction(
     runner = _runner(sink)
     for path in paths:
         loaded_crls.record_reload_refusal(path, refusal)
-    runner._report([ReloadOutcome(path, 0, refusal, 1) for path in paths])
+    runner._report([ReloadOutcome(path, 0, refusal, 1) for path in paths], _recorded())
     sink.down = True
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
@@ -973,7 +994,7 @@ async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _P
     )
     refusal = ReloadRefusal((1, 2), "why", RESTART)
     loaded_crls.record_reload_refusal(pki.crl, refusal)
-    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)])
+    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)], _recorded())
     assert sink.kinds() == ["refused"] and not loaded_crls.has_held_copies()
 
     runner.start()
@@ -986,6 +1007,46 @@ async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _P
     finally:
         await runner.stop()
     assert sink.kinds() == ["refused", "applied"]
+
+
+async def test_the_idle_runner_decides_nothing_while_another_pass_holds_the_lock(
+    pki: _Pki,
+) -> None:
+    """The record is written only under the pass lock. While a pass an earlier runner's stop
+    abandoned holds it, the record is that pass's to change, so the idle branch decides nothing
+    from it, and resolves once it can read the record under the lock itself."""
+    sink = _Sink()
+    passes: list[int] = []
+    runner = CrlReloadRunner(
+        interval_seconds=0.01, reload=lambda: passes.append(1), alert_sink=sink
+    )
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    loaded_crls.record_reload_refusal(pki.crl, refusal)
+    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)], _recorded())
+    loaded_crls.clear_reload_refusal(pki.crl)  # the abandoned pass's write
+    assert sink.kinds() == ["refused"] and not loaded_crls.has_held_copies()
+    ticks: list[int] = []
+    forget_all = crl_reload._forget_all
+
+    def counted() -> crl_reload._PassView | None:
+        ticks.append(1)
+        return forget_all()
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(crl_reload, "_forget_all", counted)
+        crl_reload._PASS_LOCK.acquire()  # the abandoned pass, still running
+        runner.start()
+        try:
+            try:
+                await until(lambda: len(ticks) >= 3, "three idle intervals")
+                assert sink.kinds() == ["refused"], "nothing decided while the lock is held"
+            finally:
+                crl_reload._PASS_LOCK.release()
+            # The control: the same branch resolves once it can take the lock.
+            await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
+        finally:
+            await runner.stop()
+    assert passes == [] and sink.kinds() == ["refused", "applied"]
 
 
 @pytest.mark.parametrize("final", [True, False], ids=["a-final-verdict", "a-retried-verdict"])
@@ -1031,7 +1092,7 @@ async def test_a_pass_that_fails_resolves_nothing(
     with monkeypatch.context() as patched:
         patched.setattr(crl_reload, "_triage", boom)
         assert _pass(runner) == [], "a failure on the file is logged and returns no outcome"
-        runner._report(None)  # what _run reports when the whole pass raised
+        runner._report(None, _recorded())  # what _run reports when the whole pass raised
         assert crl_path_key(pki.crl) in reload_refusals()
         assert sink.kinds() == ["refused"]
 
@@ -1245,6 +1306,55 @@ async def test_the_first_sight_clear_reads_what_its_own_pass_judged(
 
     assert all(unread), "the premise: each pass found the file unreadable"
     assert sink.events == []
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+class _RaiseDown(_Sink):
+    """A sink whose ``crl_reload_refused`` raises and whose inverse lands, so a refusal stays
+    unalerted and only the first-sight clear could resolve its subject."""
+
+    def _record(self, kind: str, name: str, payload: dict[str, Any]) -> None:
+        if kind == "refused":
+            raise RuntimeError("sink down for the raise")
+        super()._record(kind, name, payload)
+
+
+@pytest.mark.parametrize("raise_lands", [True, False], ids=["follow-the-record", "first-sight"])
+async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
+    pki: _Pki, raise_lands: bool
+) -> None:
+    """Vault BACKLOG #3543, review of 585270cd3. Every write to the refusal record is made under
+    the pass lock, and a pass an earlier runner's stop abandoned may still be making one. So the
+    loop decides from the record as its own pass left it, read under that lock in the worker
+    thread, and never from the live record. Here each pass refuses the file, and the refusal is
+    then cleared under the loop, after the pass returned, as such a pass would clear it.
+
+    With the raise landing, following the record must not resolve the alert just raised. With
+    the raise failing, the refusal has no alert of this runner's, and the first-sight clear must
+    not resolve its subject."""
+    hop = pki.outbound_hop()
+    sink = _Sink() if raise_lands else _RaiseDown()
+    refused: list[bool] = []
+
+    def reload() -> list[ReloadOutcome]:
+        outcomes = reload_replaced_crls()
+        refused.append(crl_path_key(pki.crl) in reload_refusals())
+        loaded_crls.clear_reload_refusal(pki.crl)  # another pass's write, after this one returned
+        return outcomes
+
+    runner = _runner(sink, interval_seconds=0.01, reload=reload)
+    pki.crl.write_bytes(_expired(pki))
+    runner.start()
+    try:
+        await until(lambda: len(refused) >= 4, "four passes that refused the file")
+        # Before the stop, which resolves whatever is still open.
+        kinds = sink.kinds()
+    finally:
+        await runner.stop()
+
+    assert all(refused), "the premise: each pass refused the file and recorded the refusal"
+    assert sink.threads, "the control: the runner tried to raise the refusal"
+    assert kinds == (["refused"] if raise_lands else [])
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
