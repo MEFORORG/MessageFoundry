@@ -2362,9 +2362,10 @@ nodes automatically:
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
 **Windows-only.** Engine-managed VIP is a Windows feature at v1, and IPv4 only; IPv6 is deferred on every
-platform. A node that cannot use it keeps the external floating VIP or load balancer described in
-[CLUSTERING.md](CLUSTERING.md) §"Client reconnect". The settings themselves load on any platform, but
-Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
+platform. Every cluster keeps the external floating VIP or load balancer described in
+[CLUSTERING.md](CLUSTERING.md) §"Client reconnect", because nothing in this build binds the address
+(below). The settings themselves load on any platform, but Linux is
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 
 **The engine checks this block at load and does nothing else with it yet.** No code in this build binds,
 releases or announces the address. That controller is a later change, so the engine logs a WARNING at
@@ -2718,9 +2719,9 @@ rung 1): `memory_encryption_self_reported_capability`, `memory_encryption_self_r
 `memory_encryption_self_reported_mechanism` and `memory_encryption_readout_source`. On Linux these come
 from `/proc/cpuinfo` flags (**capability** — "this silicon *can*") and guest device-node presence
 `/dev/sev-guest` / `/dev/tdx_guest` (**activation** — "this guest *is*"), which are deliberately reported
-as **separate fields** and never derived from one another. On **Windows every field is `null`**
-(undeterminable): the in-guest attestation path is an ADR 0152 spike that has not landed, and guessing
-would be worse than saying so.
+as **separate fields** and never derived from one another. On **Windows the three self-reported
+fields are `null`** (undeterminable): ADR 0152's 2026-07-22 Windows spike ruled out a Windows read-out,
+and guessing would be worse than saying so.
 
 **No value of any of these fields satisfies ASVS 11.7.1**, and none may be cited as though it did.
 They are values the **host OS emits about itself**, and 11.7.1 exists precisely because that host may be

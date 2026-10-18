@@ -34,7 +34,7 @@ establishes that the off-loopback security controls are already built; this is p
 
 | Image | Build | Use |
 |---|---|---|
-| **slim (default)** | `docker build -f docker/Dockerfile -t messagefoundry .` | Core engine + SQLite store. The default for most adopters. |
+| **slim (default)** | `docker build -f docker/Dockerfile -t messagefoundry .` | Core engine + SQLite store. The build's default target. |
 | **`-sqlserver`** | `docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .` | Adds the OS-level Microsoft ODBC Driver 18 + `[sqlserver]` extra — needed **only** for the SQL Server store or the DATABASE / `db_lookup` connectors. |
 
 Both are multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**

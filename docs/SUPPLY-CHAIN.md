@@ -207,9 +207,9 @@ the current set.
 
 The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The release
 ships both. The Windows SBOM covers the core runtime of the supported v1 install, a Windows service
-([SERVICE.md](SERVICE.md)). The Linux SBOM covers a `pip install` on Linux, which is
-[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target). The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
-the way a Windows install does.
+([SERVICE.md](SERVICE.md)). The Linux SBOM covers a `pip install` on Linux, which is [not supported for
+v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target). The Windows SBOM is built on
+a Windows runner, because only a Windows interpreter picks packages the way a Windows install does.
 
 Neither SBOM is built by the job that signs. Each comes from its own job with read-only access, one on
 Linux and one on Windows, so no package install runs beside the signing identity. The release job
