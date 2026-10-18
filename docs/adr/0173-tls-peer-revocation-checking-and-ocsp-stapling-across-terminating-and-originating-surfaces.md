@@ -1056,7 +1056,7 @@ of the list above:
 
 | Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Grade |
 |---|---|---|---|---|
-| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*); see the finding below. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
@@ -1153,6 +1153,40 @@ when using strict encryption." `docs/ASVS-L2-PHASE0-CHANGES.md` is the record of
 says the pin has not been measured on this posture. What it means for revocation: if the driver
 does apply the pin, the exact match replaces the standard checks, the trust chain among them
 (*documentation*). That branch would then have no chain for a revocation check to walk.
+
+**Amendment 2026-10-17 -- decision: the store pins the SQL Server certificate under
+`Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
+`connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
+`Encrypt=yes`, and both stay inside the last-wins tail (*code*). The reason: on the Driver 18.7 build
+tested, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+`Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
+keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
+BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
+decisions too:
+
+1. **No silent fall back.** Strict encryption is TDS 8.0, which SQL Server 2022 and later speak, and
+   2022 is the engine's supported floor. A server that cannot speak it refuses the connection. The
+   engine never retries with `Encrypt=yes`, because that is the shape that left the pin unenforced.
+2. **The escaped dev posture is unchanged.** Where `trust_server_certificate` or `encrypt = false`
+   is escaped, the string carries no pin and no `strict`, so strict cannot quietly turn
+   verification back on.
+3. **The pin is an exact match, and the engine does not count it as a revocation control.**
+   It does not change the grade of the SQL Server store row in the table above. That row stays a
+   named gap by owner ruling R6.
+4. **The engine checks the pin's validity period itself.** Under strict the driver's own chain,
+   host-name and expiry checks do not apply to a pin match (*documentation*), so the engine refuses,
+   at each store open, a pin that is expired or not yet valid, refuses at load a file that is a
+   bundle or a CA certificate that signs others, watches the pin's expiry with its certificate-expiry monitor, and, since the pin is
+   then the connection's only trust anchor, applies the trust-anchor ACL and path checks to it
+   (*code*).
+
+The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
+it is skipped in CI and the Linux reading is not yet taken.
+
+The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
+`ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
+amendment.
 
 **The counts, after this note.** The counts paragraph above covers the table above, and this note
 leaves it as written. *(Corrected 2026-10-11: that paragraph has since been edited once, for

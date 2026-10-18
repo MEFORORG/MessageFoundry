@@ -35,6 +35,7 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  serveCommandLine,
   storeLessStartPrompt,
   validateProvisionEmail,
   validateProvisionUsername,
@@ -175,6 +176,14 @@ export class EngineStatusBar implements vscode.Disposable {
   /** The current link — for the menu and for tests. Staleness is applied so a stale green never leaks. */
   currentLink(): EngineLink {
     return withStaleness(this.link, Date.now());
+  }
+
+  /** Repaint from the current link. The hover's actions come from {@link controlContext}, whose
+   *  `canControl` reads workspace trust, so a trust grant calls this (vault BACKLOG #3166). */
+  repaint(): void {
+    if (!this.disposed) {
+      this.render();
+    }
   }
 
   private render(): void {
@@ -1010,7 +1019,7 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
       // the authority on which store and which environment this engine is.
-      const cmd = `python -m messagefoundry serve --config ${configDir()}`;
+      const cmd = serveCommandLine(configDir());
       await vscode.env.clipboard.writeText(cmd);
       logAction("copy start command", cmd);
       void vscode.window.showInformationMessage(

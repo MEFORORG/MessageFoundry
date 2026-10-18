@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests import _process_guard as process_guard
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._qt_cycles import collect_qobjects_in_cycles
@@ -583,6 +584,35 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: not_a_service)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
+    """Stand down the start-up refusal for remote debugging (vault BACKLOG #2700) in the
+    in-process ``serve`` and ``supervise`` runs, and yield the real gate.
+
+    That gate reads the PROCESS, and a plain ``pytest`` run has the interpreter's remote
+    debugging on, so under the shipped ``enforce`` every in-process start would stop there,
+    whatever gate the test is about. Autouse for that reason, like the config-source
+    read above: it is a fact about the test runner, not about any scenario. A test whose subject
+    is the gate takes :func:`remote_debug_start_gate`. A subprocess start is not covered."""
+    from messagefoundry import __main__ as cli
+
+    real = cli._remote_debug_refused
+    with pytest.MonkeyPatch.context() as patch:
+        # setattr raises on a missing name, so a renamed gate fails here rather than going unstubbed.
+        patch.setattr(cli, "_remote_debug_refused", lambda *args, **kwargs: False)
+        yield real
+
+
+@pytest.fixture
+def remote_debug_start_gate(
+    monkeypatch: pytest.MonkeyPatch, _remote_debug_start_gate_stood_down: Callable[..., bool]
+) -> None:
+    """Put the real remote-debugging start gate back for one test (vault BACKLOG #2700)."""
+    monkeypatch.setattr(
+        "messagefoundry.__main__._remote_debug_refused", _remote_debug_start_gate_stood_down
+    )
+
+
 @pytest.fixture
 def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #1967: an enforcing start refuses a warn-only retention tier with neither a window nor
@@ -794,6 +824,19 @@ def _no_allocation_records_in_the_checkout() -> Iterator[None]:
             "A correct write goes under <git-common-dir>/mefor-coord/, which is inside .git.\n"
             "A relative or empty base lands it in the process cwd, where `git add -A` can commit it.\n"
             f"Leaked (now removed):\n  {detail}"
+        )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Runs in the xdist controller and in every worker, so each pytest process's children die with
+    # it on Windows, an os._exit from pytest-timeout included. tests/_process_guard.py says why.
+    if process_guard.install() is None and sys.platform == "win32":
+        config.issue_config_time_warning(
+            pytest.PytestWarning(
+                "the Windows process guard could not set up its job, so a process a test starts "
+                "can outlive this pytest process; the proctree warning in the log says why"
+            ),
+            stacklevel=2,
         )
 
 

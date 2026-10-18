@@ -20,7 +20,8 @@ on:
   schedule:
     # Nightly (03:17 UTC — off the top-of-hour rush) run of the HEAVY POST-MERGE legs: the load
     # smokes (load-test, load-test-sqlserver x2 majors), the server-DB suites (sqlserver-store x2
-    # majors, postgres-store), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
+    # majors, postgres-store; its advisory Windows twin postgres-store-windows, x2 SKUs, was
+    # never per-push), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
     # all used to run on EVERY push to main (~16 auto-merges/day re-validating content whose PR run
     # had just passed); the nightly cadence + the PR path-gates (`changes`) keep the same coverage
     # at a fraction of the runs. `gh workflow run ci.yml --ref main` (workflow_dispatch) still runs
@@ -335,7 +336,7 @@ jobs:
       # from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1280,7 +1281,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2137,7 +2138,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2625,17 +2626,19 @@ jobs:
           # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
           # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
           # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
-          # decided by that output and by nothing else -- docker-smoke, ide, tooling and
-          # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
+          # decided by that output and by nothing else -- docker-smoke, ide, tooling,
+          # packaging-build and postgres-store-windows, via `docker`, `ide`, `tooling`, `packaging`
+          # and `serverdb` below. So `serverdb=false` DOES keep postgres-store-windows out of the
+          # queue, which is intended: that leg is advisory, and in the queue it could stop nothing.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 14 jobs -- it
+          # answer. "Names merge_group nowhere" ALONE is true of EIGHT of this file's 15 jobs -- it
           # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
           # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
-          # decided by anything emitted here. Scanned over all 14 job blocks rather than sampled, and
+          # decided by anything emitted here. Scanned over all 15 job blocks rather than sampled, and
           # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
-          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
-          # this paragraph, and the FOUR named above.
+          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the EIGHT of
+          # this paragraph, and the FIVE named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
           # fails outright if either half of this predicate stops removing anything, which is the
@@ -2757,7 +2760,9 @@ jobs:
           # both server legs run (BACKLOG #2337).
           # test_postgres_store.py and test_sqlserver_store.py import auth/service.py directly since
           # PR 2335; they reached it earlier through tests/_session_seal_contract.py, unchecked.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
+          # Vault BACKLOG #2223: the SQL Server store open runs the pin checks in pki.py and in
+          # auth/trust_anchors.py and auth/anchor_path.py, and test_sqlserver_store.py imports pki.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3045,7 +3050,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3381,7 +3386,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3565,6 +3570,149 @@ jobs:
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
+  # The Postgres store suite on HOSTED WINDOWS, the only supported v1 deployment platform (owner
+  # ruling 2026-10-16). `postgres-store` above runs on ubuntu only, so before this job the store
+  # backend had no automatic leg on the OS v1 ships on. Same test files, pytest flags (bar the
+  # per-test timeout below) and MEFOR_STORE_* env as that job, and its triggers minus merge_group.
+  # The OS and the server differ, and with the server its major, locale and the image's own
+  # machine-wide PGUSER/PGPASSWORD, so a Windows-only red is not attributable to the OS alone.
+  #
+  # THE SERVER IS THE ONE THE RUNNER IMAGE PREINSTALLS, not a container: hosted Windows runners
+  # cannot run Linux service containers. The runner-images readmes (images/windows/
+  # Windows2022-Readme.md and Windows2025-Readme.md in actions/runner-images, read 2026-10-17) list
+  # PostgreSQL 14 on windows-2022 and 17 on windows-2025, service `postgresql-x64-<major>`, stopped
+  # and disabled, PGBIN set, superuser `postgres` with password `root`. Neither is the 16 the ubuntu
+  # leg pins, and the image is not pinned: the first step prints the exact version it got.
+  #
+  # NOT REQUIRED, NOT IN `ci-gate`'s `needs`, AND NOT IN THE MERGE QUEUE; docs/CI.md, "The `CI
+  # gate` roll-up", says why. tests/test_ci_postgres_windows_leg.py pins the test files and their
+  # env to the ubuntu job's. `--timeout=120` is the `test` matrix's Windows per-test value; the
+  # ubuntu job inherits pyproject's 60.
+  #
+  # Fork guard as on windows-service-smoke: 2x-billed Windows minutes are free here (public) and
+  # billed to a fork's owner.
+  postgres-store-windows:
+    name: postgres store (${{ matrix.os }})
+    needs: changes
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ${{ matrix.os }}
+    # About 3x the slower of the first measured runs, run 39059057328 (2026-10-17): 7m43s on
+    # windows-2022 and 4m58s on windows-2025. This bounds a hang well below GitHub's 6-hour default;
+    # re-size it from fresh runs if the suite grows.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    defaults:
+      run:
+        shell: bash  # Git Bash, so the pytest steps read as the ubuntu job's do
+    # The ubuntu job's step env, once. The password is a throwaway set by the first step below.
+    env:
+      MEFOR_TEST_POSTGRES: "1"
+      MEFOR_STORE_BACKEND: postgres
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
+      MEFOR_STORE_SERVER: localhost
+      MEFOR_STORE_PORT: "5432"
+      MEFOR_STORE_DATABASE: messagefoundry
+      MEFOR_STORE_USERNAME: postgres
+      MEFOR_STORE_PASSWORD: mefor
+      # The preinstalled server is reached over loopback without TLS, as the ubuntu container is, so
+      # the same trusted-network dev/test escape applies.
+      MEFOR_STORE_ENCRYPT: "false"
+      MEFOR_ALLOW_INSECURE_TLS: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the preinstalled PostgreSQL and create the database
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          # The image's documented password; the image-wide PGPASSWORD goes stale after the ALTER.
+          PGPASSWORD: root
+        run: |
+          $svc = @(Get-Service -Name 'postgresql-x64-*')
+          if ($svc.Count -ne 1) { throw "expected one postgresql-x64-* service, found $($svc.Count)" }
+          Set-Service -InputObject $svc[0] -StartupType Manual
+          Start-Service -InputObject $svc[0]
+          if (-not $env:PGBIN -or -not (Test-Path "$env:PGBIN\psql.exe")) {
+            throw "the runner image no longer provides PostgreSQL at PGBIN='$env:PGBIN'; re-read its readme"
+          }
+          $port = $env:MEFOR_STORE_PORT
+          & "$env:PGBIN\pg_isready.exe" -h localhost -p $port -t 60
+          if ($LASTEXITCODE -ne 0) { throw "pg_isready exited $LASTEXITCODE" }
+          & "$env:PGBIN\psql.exe" -h localhost -p $port -U $env:MEFOR_STORE_USERNAME -d postgres `
+            -v ON_ERROR_STOP=1 `
+            -c "SELECT version()" `
+            -c "CREATE DATABASE $env:MEFOR_STORE_DATABASE" `
+            -c "ALTER ROLE $env:MEFOR_STORE_USERNAME PASSWORD '$env:MEFOR_STORE_PASSWORD'"
+          if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + postgres extras)
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
+
+      - name: Run the Postgres store suite (against the real DB)
+        run: pytest --timeout=120 tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
+
+      - name: Run the failover-LOAD test (two nodes, kill the primary mid-load, against the real DB)
+        run: pytest --timeout=120 tests/test_load_failover_postgres.py -v
+
+      - name: Run the throughput-lever backend invariants on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_claim_fifo_heads.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+          tests/test_stage_dispatcher.py
+          tests/test_pooled_rider.py
+          tests/test_uploads_shard_quota_interleave.py
+
+      - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
+        env:
+          # Why 4, and not smaller: the ubuntu job's step of the same name.
+          MEFOR_STORE_POOL_SIZE: "4"
+        run: pytest --timeout=120 tests/test_connscale_postgres.py -v
+
+      - name: Run the RTE capture / re-ingress loop on real Postgres (ADR 0013/0016)
+        run: pytest -v --timeout=120 tests/test_x12_rte.py
+
+      - name: Run the failover + engine-shard recovery suites on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_cluster_failover_postgres.py
+          tests/test_shard_recovery_postgres.py
+
+      - name: Run the DR seed-gate + backup suites on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_dr_server_seed_gate_postgres.py
+          tests/test_backup_runner_server_db_postgres.py
+          tests/test_dr7_server_config_only_backup_postgres.py
+
+      - name: Run the store-principal privilege preflight on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_store_privilege_preflight.py
+          tests/test_store_privilege_schema_split.py
+
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (signed
   # in, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
   # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
@@ -3590,7 +3738,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3604,11 +3752,13 @@ jobs:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and every API read after that
           # carries that account's session (harness/load/rigadmin.py). Two settings follow:
-          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
-          #     no other way, so the rig account has none. The bind is loopback.
+          #   require_mfa ON, as shipped -- THIS RIG LEG STARTS THE ENGINE WITH MFA REQUIRED (vault
+          #     BACKLOG #2796). The rig account is enrolled with an authenticator key the run block
+          #     draws, and signs in with password and code in one request. The other rig legs keep
+          #     require_mfa off; docs/LOAD-TESTING.md, "Rigs sign in", says why.
           #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
           #     account-security notices. The gate reads configuration only; nothing listens there.
-          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_SECURITY_REQUIRE_MFA: "true"
           MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
           MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
           MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
@@ -3684,8 +3834,16 @@ jobs:
           # that needs it and is never exported, so the engine's own environment never holds it.
           rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
           echo "::add-mask::$rig_pw"
-          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
-          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
+          # Its authenticator key, a base32 TOTP secret drawn the same way and handled the same way:
+          # masked, handed only to `provision` and the sign-in, never exported. provision-admin takes
+          # no key as input; rigadmin replaces its terminal enrolment in the provisioning child only.
+          rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+          echo "::add-mask::$rig_totp"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+            python -m harness.load.rigadmin provision --db ./load-ci.db
+          # Vault BACKLOG #2700: this leg runs under `enforce`, which refuses a start with the
+          # interpreter's remote debugging on. Start the interpreter as the service does.
+          python -I -X disable-remote-debug -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
           # The certificate is minted during startup, so a miss on the first turns is ordinary --
@@ -3697,12 +3855,22 @@ jobs:
           set +e
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
-            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
-            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's. It signs
+            # in ONCE, and first waits for a TOTP step to open, up to about 31 s; _code_in_a_fresh_step
+            # in harness/load/rigadmin.py says why.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+              python -m harness.load.rigadmin run \
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
+            # The engine's start-up census warns about a covered account with no authenticator app
+            # (ADR 0197). With MFA required and the rig account enrolled, it must not. This reads
+            # an absence only: a census that never ran, or logged elsewhere, would pass it too.
+            if grep -q "hold a chosen password and no authenticator app" engine.log; then
+              echo "::error::the engine started with MFA required and named an account with no authenticator app"
+              rc=1
+            fi
           else
             # FAIL ON THE REAL CONDITION RATHER THAN 30s LATER ON A DERIVED ONE. The loop above used to
             # end in `|| sleep 0.5`, which made it incapable of failing the step: a never-ready engine
@@ -3817,7 +3985,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3830,9 +3998,9 @@ jobs:
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
-          # that account's session (harness/load/rigadmin.py). require_mfa is off because
-          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
-          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because this leg
+          # supplies no authenticator key, so the rig account has none; docs/LOAD-TESTING.md, "Rigs
+          # sign in", says why. This leg is at `warn` (below), where the notification gate that an
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_FANOUT: "8"
@@ -3961,7 +4129,9 @@ jobs:
   # day); the nightly keeps both Server SKUs covered daily and workflow_dispatch
   # re-validates a specific merge on demand.
   windows-service-smoke:
-    name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
+    # One expression for the os slot, so the check-list name keeps the shape ci-gate's CHECK_NAMES
+    # table holds, "windows service smoke (*, py*)". An account leg reads "(windows-2025, localsystem, py3.14)".
+    name: windows service smoke (${{ matrix.account && format('{0}, {1}', matrix.os, matrix.account) || matrix.os }}, py${{ matrix.python-version }})
     # This repo only: it spins up 2x-billed hosted Windows runners on BOTH Server SKUs, which is free
     # here (public) and billed to the owner of a fork. Nightly schedule + manual dispatch only. ci-gate
     # `needs` this job, but a `skipped` leg counts as a pass there, so gating it off a fork cannot wedge
@@ -3974,9 +4144,20 @@ jobs:
         # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
         # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
         # is push/dispatch-only, so the Windows minutes cost no PR time.
+        #
+        # vault BACKLOG #2702: account legs install the service under an account other than its own
+        # virtual account, which the installer gives SID type none. Each must start, take a message
+        # and run with exactly the privilege list the installer writes. One Server SKU each.
+        # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
+        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
+        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #     - { os: windows-2025, python-version: "3.14", account: localuser }
+        # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
           - { os: windows-2022, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.14" }
+          - { os: windows-2025, python-version: "3.14", account: localsystem }
     defaults:
       run:
         shell: pwsh
@@ -3991,6 +4172,12 @@ jobs:
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
       SMOKE_NSSM_CACHED_EXE: C:\mefor-ci-cache\nssm-2.24-win64\nssm.exe
+      # vault BACKLOG #2702: virtual (the installer's default), localsystem or localuser. Steps
+      # that hold for one account only name it in their `if:`.
+      SMOKE_ACCOUNT: ${{ matrix.account || 'virtual' }}
+      # The local user the localuser leg creates. Its password is drawn at run time and never
+      # leaves the step outputs, masked.
+      SMOKE_LOCAL_USER: mefor-svc
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -4027,7 +4214,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -4091,6 +4278,28 @@ jobs:
           "::add-mask::$drawn"
           "password=$drawn" >> $env:GITHUB_OUTPUT
 
+      # vault BACKLOG #2702, the localuser leg: a local account for the service to run as, made for
+      # this run on a runner that is thrown away after it. The password is drawn here and masked
+      # before anything can echo it, the way the rig password above is. The server's complexity
+      # policy wants three of upper case, lower case, digits and symbols, and hex alone is two, so
+      # the drawn hex is wrapped in characters of the other two kinds. The installer grants the
+      # account "Log on as a service" itself; this step creates it and nothing else.
+      - name: Create the local service account (localuser leg)
+        id: svc
+        if: env.SMOKE_ACCOUNT == 'localuser'
+        run: |
+          $drawn = (& python -c "import secrets; print('Mf-' + secrets.token_hex(24) + '-Q9')").Trim()
+          if (-not $drawn) { throw "could not draw the local service account's password" }
+          "::add-mask::$drawn"
+          # New-LocalUser is a Windows PowerShell module, so it runs there. The password reaches it
+          # through this process's environment, never a command line.
+          $env:SMOKE_LOCAL_USER_PASSWORD = $drawn
+          powershell -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; $s = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force; New-LocalUser -Name $env:SMOKE_LOCAL_USER -Password $s -PasswordNeverExpires -AccountNeverExpires -Description "windows-service-smoke run-as account" | Out-Null'
+          $made = $LASTEXITCODE
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD
+          if ($made -ne 0) { throw "could not create the local account $env:SMOKE_LOCAL_USER (exit $made)" }
+          "password=$drawn" >> $env:GITHUB_OUTPUT
+
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
       # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
@@ -4106,7 +4315,24 @@ jobs:
           NSSM_CACHE_HIT: ${{ github.event_name == 'merge_group' && steps.nssm-cache.outputs.cache-hit || 'false' }}
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
+          SMOKE_LOCAL_USER_PASSWORD: ${{ steps.svc.outputs.password }}
         run: |
+          # vault BACKLOG #2702: the account this leg runs the service as. $account is what the
+          # installer is handed; $grantee is the name the grants below write for it, SYSTEM's SID
+          # for LocalSystem. The installer itself writes no named grant for LocalSystem.
+          $account = @{}
+          $grantee = "NT SERVICE\MessageFoundry"
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") {
+            $account['AllowLocalSystem'] = $true
+            $grantee = "*S-1-5-18"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"
+            $account['ServiceAccount'] = $grantee
+            $account['ServiceAccountPassword'] = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force
+          } elseif ($env:SMOKE_ACCOUNT -ne "virtual") {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD -ErrorAction SilentlyContinue
           # The checkout's editable launcher, for `gen-key` below. The service does not run it.
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
@@ -4128,12 +4354,13 @@ jobs:
           # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape. It also locks
           # environments\, the value file's folder, which `serve` now refuses to read when Users can
           # write it (vault BACKLOG #2626). -Config is named because it no longer has a default.
-          # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
+          # #224: on the virtual-account legs, NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
           # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
           # gate for that flip: it proves the virtual account is granted config-read (RX, via the
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
-          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
-          # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
+          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. The
+          # account legs (vault BACKLOG #2702) add -AllowLocalSystem or -ServiceAccount through
+          # @account, set at the top of this script.
           # Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
           # --service-config. This rig sets everything through the service's environment, so the
           # file is empty. It sits in a folder of its own outside the checkout, so -LockConfigDir
@@ -4145,7 +4372,7 @@ jobs:
           $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached @account
           # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
           # settings file at start. So run the check `serve` runs on the file and its folder, and
           # fail here, by name, rather than as a service that never comes up.
@@ -4156,10 +4383,10 @@ jobs:
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
           # to add for any directory a File connection writes. The installer grants the data
           # directory itself; the "Verify the service token" step below shows a directory with
-          # no such grant is refused.
+          # no such grant is refused. The account legs write the same grant for their own account.
           foreach ($d in "in", "dev-inbox", "out") {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
-            & icacls $d /grant "NT SERVICE\MessageFoundry:(OI)(CI)M" | Out-Null
+            & icacls $d /grant "${grantee}:(OI)(CI)M" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "could not grant the service account on '$d' (icacls exit $LASTEXITCODE)" }
           }
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
@@ -4210,8 +4437,11 @@ jobs:
           # local user can read, so the key reaches it the way docs/SERVICE.md says first: a DPAPI
           # key file, made from the same key while it is in this shell, and readable by the
           # service's virtual account. The service is registered above, so that account exists.
+          # An account leg grants its own account; LocalSystem needs none, since the file always
+          # names SYSTEM.
           $storeKeyFile = "C:\ProgramData\MessageFoundry\store.key.dpapi"
-          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile"" --grant-account ""NT SERVICE\MessageFoundry"" 2>&1"
+          $keyGrant = if ($env:SMOKE_ACCOUNT -eq "localsystem") { "" } else { " --grant-account ""$grantee""" }
+          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile""$keyGrant 2>&1"
           $protected = $LASTEXITCODE
           Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
           if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
@@ -4549,7 +4779,9 @@ jobs:
       #    running afterwards, so the stop step below still has a running service to stop.
       #
       # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
-      # does not set the restricted SID for those, and no leg installs under them. Nor is a real
+      # does not set the restricted SID for those, so this step runs on the virtual-account legs
+      # only; the next step reads the account legs (localsystem; localuser is wired, not listed), and
+      # no leg runs a gMSA. Nor is a real
       # network share: the probe's credential is made up, so it runs the logon and the
       # impersonation and never the SMB hop, which the far end checks and this token does not.
       #
@@ -4571,6 +4803,7 @@ jobs:
       # probe's report is checked for the account as well, so a set that did change it goes red.
       # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
       - name: "Verify the service token is restricted (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT == 'virtual'
         run: |
           # Two commands below exit non-zero on a run that worked, and say so where they are
           # called. Set here so that never depends on the runner's default for this preference.
@@ -4716,6 +4949,81 @@ jobs:
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 
+      # vault BACKLOG #2702, the account legs. The installer gives LocalSystem and a local user the
+      # same one-entry RequiredPrivileges list as the virtual account, and SID type none, with a
+      # warning. The health and message steps above show the engine still starts and takes a
+      # message under that list. This step shows the list took: it reads the registration, then the
+      # token of the service's root process and of the engine's processes under it, through service_token_probe.py
+      # check-privileges, whose control is this shell. It does not put the probe in the engine's
+      # place: with SID type none there is no write restriction for it to show.
+      #
+      # IF THE LOCALSYSTEM LEG CANNOT START OR SERVE with SeChangeNotifyPrivilege alone, that is a
+      # finding about the privilege list and not a flake. Do not widen the list to make it pass;
+      # read the service logs and report it.
+      - name: "Verify the service token under another account (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT != 'virtual'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $privilege = "SeChangeNotifyPrivilege"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
+          function Assert-Native([string]$What) {
+            if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+          }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $sidType = (& sc.exe qsidtype MessageFoundry | Out-String); Assert-Native "sc.exe qsidtype MessageFoundry"
+          $privs = (& sc.exe qprivs MessageFoundry | Out-String); Assert-Native "sc.exe qprivs MessageFoundry"
+          "===== sc.exe qsidtype MessageFoundry ====="; $sidType
+          "===== sc.exe qprivs MessageFoundry ====="; $privs
+          $none = '(?m)SID_TYPE\s*:\s*NONE\s*$'
+          # CONTROL: the other two values must NOT match, or the pattern matches everything.
+          foreach ($not in "SERVICE_SID_TYPE:  RESTRICTED", "SERVICE_SID_TYPE:  UNRESTRICTED") {
+            if ($not -match $none) { throw "CONTROL FAILED: '$not' reads as NONE, so the pattern proves nothing" }
+          }
+          if ($sidType -notmatch $none) { throw "the service SID type is not NONE, which is what the installer writes for this account" }
+          $listed = @([regex]::Matches($privs, 'Se[A-Za-z]+Privilege') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+          if (($listed -join ',') -ne $privilege) {
+            throw "the registration lists [$($listed -join ', ')], not exactly $privilege"
+          }
+
+          # --- 2. the running engine's token -------------------------------------------------------
+          # The SID of the account this leg asked for, so a service that runs as some other account
+          # under the same registration fails on the user.
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $accountSid = "S-1-5-18" }
+          else {
+            $accountSid = ([Security.Principal.NTAccount]"$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER").Translate(
+              [Security.Principal.SecurityIdentifier]).Value
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
+          "the Service Control Manager runs MessageFoundry as $($svc.StartName); this leg expects $accountSid"
+          # Every process under the service's root, the walk the token step above makes: the venv's
+          # python.exe starts the interpreter that runs the engine as a child of its own.
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @($all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId })
+          $frontier = $tree
+          while ($frontier.Count -gt 0) {
+            $frontier = @(foreach ($parent in $frontier) {
+              $all | Where-Object {
+                ([int]$_.ParentProcessId -eq [int]$parent.ProcessId) -and
+                ($_.CreationDate -ge $parent.CreationDate) -and
+                (@($tree | ForEach-Object { [int]$_.ProcessId }) -notcontains [int]$_.ProcessId)
+              }
+            })
+            $tree += $frontier
+          }
+          $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
+          # The same names the token step above reads, the launcher's included.
+          $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
+            $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
+          })
+          if (-not ($procs | Where-Object { $_.Name -eq "python.exe" })) {
+            throw "no python.exe runs under the service, so the engine's own token was not read"
+          }
+          $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
+          & python $probe check-privileges --account-sid $accountSid --privilege $privilege --control-pid $PID @pids
+          Assert-Native "the token check on the running service"
+
       # BACKLOG #2747: THE STOP'S EXIT CODE IS NOT THIS STEP'S RESULT. This step used to be the stop
       # command alone, so that command's exit code decided it. In job 111525536301 (windows-2022,
       # 2026-10-04) it printed "Unexpected status SERVICE_RUNNING in response to STOP control" and
@@ -4832,14 +5140,17 @@ jobs:
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the service smoke went red.
       # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
+      #
+      # The three arms run on the virtual-account legs only: each installs the default account
+      # itself, so on an account leg it would repeat what those legs already measure.
       - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
 
       - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-start-first
@@ -4854,13 +5165,13 @@ jobs:
       # nobody named -- the retired default coming back -- and reds the arm. It reds the way the two
       # arms above do: an ::error annotation per failure, then RED lines and a throw.
       - name: Store access, auth on -- start first, then provision, end to end (ADR 0183 Wave 2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
-        if: always()
+        if: ${{ always() && env.SMOKE_ACCOUNT == 'virtual' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -4874,7 +5185,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          # The account is in the name: two legs share a Server SKU, and an artifact name must be unique.
+          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}-${{ env.SMOKE_ACCOUNT }}
           path: C:\ProgramData\MessageFoundry\logs\
           if-no-files-found: ignore
 
@@ -4954,8 +5266,8 @@ jobs:
           #   * The password is drawn for this run and masked before anything can echo it. Hex cannot
           #     spell a word on the engine's password deny-list. `-e NAME` with no value makes docker
           #     read it from this shell, so it is on no command line.
-          #   * require_mfa is off because provision-admin enrols an authenticator app at a terminal
-          #     and offers no other way, so the rig account has none. The bind is loopback.
+          #   * require_mfa is off because this leg supplies no authenticator key, so the rig account
+          #     has none; docs/LOAD-TESTING.md, "Rigs sign in", says why. The bind is loopback.
           #   * The [alerts] channel is there because, with sign-in on, an enforcing start refuses
           #     without a way to send account-security notices. The gate reads configuration only.
           rig_pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
@@ -5120,6 +5432,15 @@ jobs:
             exit 1
           fi
           echo "the engine's uid cannot create a file in $site"
+          # The config directory too (vault BACKLOG #3106 item 3): the engine executes every *.py
+          # there, and the image keeps /config root-owned so its own uid cannot add one. The same
+          # write control above, in a writable place, is what makes this refusal mean something. The
+          # container runs without --read-only, so the refusal comes from ownership, not the mount.
+          if docker exec mefor touch /config/planted-by-smoke.py; then
+            echo "FAIL: the engine's uid created a file in /config"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in /config"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |
@@ -5383,8 +5704,9 @@ jobs:
       # smoke only where its `github.repository` clause ALSO holds, so on a fork it skips in the queue
       # for the same cost reason it skips on a pull request. They are ENUMERATED here rather than
       # called "the heavy legs" because that phrase is not single-valued in this file: the `schedule`
-      # block at the top and the `changes` nightly arm both use it for SIX jobs, docker-smoke
-      # included, and docker-smoke is the one job this sentence would be false for.
+      # block at the top and the `changes` nightly arm both use it for SEVEN jobs, docker-smoke and
+      # postgres-store-windows included, and those two are the jobs this sentence would be false
+      # for: neither names merge_group, and neither is in this job's `needs`.
       #
       # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
       # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE

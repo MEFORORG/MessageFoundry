@@ -11,6 +11,9 @@ deny-by-default egress, full audit — are **already built** ([`docs/PHI.md`](PH
 **cloud-infrastructure process** the adopter owns: a BAA, HIPAA-eligible services, KMS at-rest, region
 pinning, private networking, and no public MLLP ingress.
 
+> **Its Kubernetes guidance is not supported for v1.** The pods run the Linux container image
+> ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
+
 > **Standards baseline.** This doc is written against the **currently in-force HIPAA Security Rule** (45
 > CFR Part 164, Subpart C — §164.308 administrative, §164.310 physical, §164.312 technical safeguards). A
 > **2025 NPRM** proposed a stricter floor (mandatory encryption, network segmentation, asset inventory,

@@ -36,9 +36,11 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
   installing anything box-globally into the OS trust store, on the secure posture only (`encrypt = true`,
   `trust_server_certificate = false`). **Postgres:** a **CA-bundle** PEM (chain + hostname still checked) —
   the make-before-break-friendly path. **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate`
-  keyword, which pins the **leaf** cert (an exact-cert match — see the leaf-pin rotation caveat in §5.3);
-  for CA-chain rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected
-  for SQLite; a missing file fails loud at load.
+  keyword, which pins the **leaf** cert (an exact-cert match — see the leaf-pin rotation caveat in §5.3).
+  The engine sends it with `Encrypt=strict`, so it needs SQL Server 2022 or later; why, and what else
+  it needs, is in the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md). For CA-chain
+  rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected for
+  SQLite; a missing file fails loud at load.
 - `[store].pool_size` — see *Pool sizing* below.
 
 > _Filled by staging:_ a minimal `[store]` block for each backend (Postgres DSN; SQL Server ODBC).
@@ -505,7 +507,7 @@ validation to succeed, the database's certificate must chain to a CA the host al
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
 | **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). | Never. |
 
 ### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
 
@@ -558,7 +560,10 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 chains to the already-trusted CA. Just roll it before expiry. **Caveat — leaf pinning:** if you pinned
 the *leaf* instead of the CA (PostgreSQL `ssl_root_cert` pointed at the server cert itself; or SQL
 Server ODBC 18.1+ `ServerCertificate=<file>` leaf-pin), a leaf rotation **breaks validation** until you
-update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations make-before-break.
+update the pin in lockstep. On SQL Server that is a window in which every new store connection
+is refused. On PostgreSQL, pin the **CA**, not the leaf, to keep rotations
+make-before-break. The SQL Server pin is an exact match, so a CA file there matches nothing; on SQL
+Server, use the machine-store CA import (§5.2) for make-before-break rotation.
 
 > Windows-box gate: §5.2's machine-store import + §5.3's SQL Server steps run on the deployment host
 > (LocalMachine store), not on hosted CI. Validate them on the target Windows box / the dogfood box.
@@ -697,6 +702,10 @@ unconfigured host, which reads as healthy.
   SChannel equivalent of it.
 
 #### Linux: the host OpenSSL configuration binds the driver (measured)
+
+Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target);
+this applies only to a Linux engine host outside that support, such as the container image. The
+v1 platform is the Windows half above, whose cipher-suite result is **unmeasured**.
 
 **Measured: the OpenSSL configuration decides which suites and versions the driver offers.** An
 earlier reading held that the driver might use a suite list of its own. On the rig below, it did not.

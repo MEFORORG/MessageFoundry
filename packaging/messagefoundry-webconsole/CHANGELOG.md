@@ -65,9 +65,16 @@ this line.**
   `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
+- **The reload pages say what a reload left undone.** The inline reload result page and the
+  approval page for a released reload show a banner for a degraded follow-on step and for each
+  settings trust anchor that takes a restart; before, both reached only the JSON answer. Seam
+  change: `ReloadResult` carries `restart_required`. (`BACKLOG #3015`)
 
 ### Changed
 
+- **Linux is not a supported v1 deployment target.** The package drops the
+  `Operating System :: POSIX :: Linux` classifier, matching the engine
+  ([why](../../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
 - **Seam only: the engine's posture model grew.** `SecurityPosture` gains
   `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
   renders nothing new, but the field is on the seam it pins, so the supported digest moved.
@@ -78,6 +85,15 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the seam digest covers each console route's gate.** The engine's seam snapshot now
+  records what this console installs: each route's top-level dependencies, gates included, with
+  their own source and captured settings, and its mounts, middleware and WebSocket authorizer
+  (vault `BACKLOG #2709`). No console route changed, but the supported digest moved. A console
+  release that adds a route, changes a route's gate, or edits a console helper a gate calls by
+  plain name now moves the seam too, so it needs an
+  engine that ships the new value. The released 0.4.0, whose DR routes sit on the session alone,
+  passed the handshake of engines from PR 1910 up to engine PR 1940, whose unrelated seam move
+  refuses it; this change guards the next gate change that moves nothing else.
 - **Each group input on the AD group page shows an example full DN.** The placeholder reads
   `CN=MF-Admins,OU=Groups,DC=example,DC=com`, since both maps refuse a short name. Nothing is
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
@@ -94,9 +110,36 @@ this line.**
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
   administrator to reset it. No seam change. (vault BACKLOG #2298)
+- **The Approvals page no longer offers Approve on a request the engine always refuses.** It reads
+  the engine's new `release_blocked` reason, so a request that predates requester-id attribution,
+  or whose operation is no longer registered, or a purge or reload whose parameters name no requester, gets
+  only the reject and a note saying why, as an ungated or unreadable one already did. Each note
+  names the button beside it, Withdraw or Reject. Seam change: `PendingApprovalInfo` gained
+  `release_blocked`. (vault BACKLOG #3192)
 
 ### Security
 
+- **The users list shows channel scopes only to an administrator.** The engine now sends each
+  account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
+  and Scope source columns for any other reader rather than showing every account as "(none)".
+  The page reads the engine's `channel_scope_withheld` flag rather than deciding the rule itself,
+  so this console needs an engine that sends it, and refuses an older one at startup.
+  (vault BACKLOG #3189)
+- **The configuration page offers no reload the engine will refuse.** For a channel-scoped
+  deployer, whose reload the engine refuses after the step-up is spent, `/ui/config` shows the
+  engine's reason in place of the Reload form. The engine computes the rule. (vault BACKLOG #3189)
+- **The Approvals page stops offering Approve on a request whose requester lost the authority it
+  needs**, such as a held reload or purge whose requester has since been channel-scoped. Every
+  approver was refused such a release. (vault BACKLOG #3189, #3192)
+- **The status page says when its loosenings list is incomplete.** It now shows the engine's
+  `loosenings_scope` note under the security posture, so a list narrowed to a channel-scoped
+  reader's scope, or read with no connection graph loaded, no longer reads as the whole posture.
+  (vault BACKLOG #3189)
+- **The bulk control and bulk purge pages no longer write a malformed name into the audit log.** A
+  channel-scoped operator's selection that is not a valid connection name is still recorded as an
+  `auth.channel_denied` row naming the operator and host, but the row carries no channel. It used to
+  carry the submitted text whole, bounded only by the request size. The page now answers such a
+  selection "not a valid connection name", as it does for any other operator. (vault BACKLOG #3031)
 - **The passkey registration finish draws on the per-actor ceremony budget.**
   `POST /ui/account/webauthn/verify` now charges the same budget as `POST /ui/account/mfa/verify`,
   and answers a throttle with a JSON 429 the page can show. No seam change. (BACKLOG #3014)
@@ -191,6 +234,9 @@ this line.**
   change: the console imports `alert_directory_administrator_granted` from `api.security`. (vault
   BACKLOG #2610)
 
+- **A domain entry with a leading dot matches nothing.** The interstitial check stripped the
+  dot, so `.hospital.example` from a caller other than settings covered the domain. Settings refuse
+  such an entry at load, so the strip only ever widened a match. No seam change. (BACKLOG #3075)
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
   address.** The interstitial check matched every entry on a label boundary. So a host that merely
   ended in a listed address would have counted as covered. The engine still accepts a canonical

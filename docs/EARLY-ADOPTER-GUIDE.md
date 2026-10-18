@@ -135,8 +135,8 @@ your own hardware and working around the pieces §2 lists as not built yet. If t
 Consolidate these before you install anything:
 
 - [ ] **Python 3.14+** on the engine host.
-- [ ] **OS:** Windows is the primary supported/serviced platform (NSSM); the engine itself is
-      cross-platform Python.
+- [ ] **OS:** Windows, the only supported v1 deployment platform (Windows service via NSSM). Linux
+      is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 - [ ] **Administrator/elevation** on the host if you will install the Windows service.
 - [ ] **Outbound network access** for the service installer to download the SHA-256-pinned NSSM
       binary. Offline, pass `-NssmPath` with the win64 `nssm.exe` from `nssm-2.24.zip`. A copy
@@ -181,9 +181,9 @@ pip install "messagefoundry==0.5.1"        # pin the exact engine version (core 
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> **WARNING: Early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
+> **WARNING: Early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.5.0`) resolves today; earlier releases, back to the `0.1.0rc1`
+> launch. The exact-pin command above resolves today; earlier releases, back to the `0.1.0rc1`
 > pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
 > organization's **private index**.
 
@@ -288,7 +288,7 @@ directory:
 
 ```powershell
 cd ./my-config-repo
-python -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
 ```
 
 `serve` flags and their precedence (**CLI > `MEFOR_<SECTION>_<KEY>` env > `messagefoundry.toml` >

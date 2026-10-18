@@ -848,6 +848,8 @@ _MUST_CHOOSE = frozenset(
         # PYTHON* names, plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF).
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
         ("verify/cipher_policy.py", "_openssl_suites", "subprocess.run"),
+        # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
+        ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }
 )
 

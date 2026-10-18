@@ -671,6 +671,73 @@ def test_frame_reader_crlf_terminator_byte_at_a_time() -> None:
     assert out == [data]
 
 
+def test_frame_reader_marks_only_an_interchanges_own_line_ends_as_trailer_only() -> None:
+    # vault BACKLOG #2938: up to two CR/LF bytes after a completed interchange are its ending, so a
+    # listener's frame deadline must not start on them. Mirrors the FrameDecoder test in
+    # tests/test_listener_admission.py.
+    data = interchange().encode("utf-8")
+    reader = X12FrameReader()
+    assert list(reader.feed(data)) == [data]
+    assert not reader.trailer_only, "a read that completed an interchange is not trailer-only"
+    assert list(reader.feed(b"\r")) == []
+    assert reader.trailer_only, "the CR after the IEA terminator"
+    assert list(reader.feed(b"\n")) == []
+    assert reader.trailer_only, "the LF of a CR LF ending"
+    # CONTROL: a third line-end byte is past the allowance, so it is noise like any other byte.
+    assert list(reader.feed(b"\r")) == []
+    assert not reader.trailer_only
+    # CONTROL: a byte that is not a line end ends the allowance for what follows it too.
+    assert list(reader.feed(data)) == [data]
+    assert list(reader.feed(b"Z")) == []
+    assert not reader.trailer_only
+    assert list(reader.feed(b"\n")) == []
+    assert not reader.trailer_only
+    # A line end that arrived with the interchange uses up part of the allowance.
+    assert list(reader.feed(data + b"\r")) == [data]
+    assert list(reader.feed(b"\n")) == []
+    assert reader.trailer_only
+    assert list(reader.feed(b"\n")) == []
+    assert not reader.trailer_only
+    # Both line ends in one read of their own.
+    assert list(reader.feed(data)) == [data]
+    assert list(reader.feed(b"\r\n")) == []
+    assert reader.trailer_only
+    # An empty read is not trailer-only, and holds no byte to end the allowance with.
+    assert list(reader.feed(data)) == [data]
+    assert list(reader.feed(b"")) == []
+    assert not reader.trailer_only
+    assert list(reader.feed(b"\r")) == []
+    assert reader.trailer_only
+    # CONTROL: three in one read are past the allowance.
+    assert list(reader.feed(data)) == [data]
+    assert list(reader.feed(b"\r\n\r")) == []
+    assert not reader.trailer_only
+    # Decided when feed() is called, before its generator runs, so it never describes a past read.
+    assert list(reader.feed(data)) == [data]
+    reader.feed(b"Z")  # not iterated
+    assert not reader.trailer_only
+    # Before any interchange there is nothing for a line end to end.
+    fresh = X12FrameReader()
+    assert list(fresh.feed(b"\r\n")) == []
+    assert not fresh.trailer_only
+    # A CR+LF segment terminator is the interchange's own, so the allowance starts after it.
+    crlf = interchange(term="\r\n").encode("utf-8")
+    assert list(fresh.feed(crlf)) == [crlf]
+    assert list(fresh.feed(b"\r\n")) == []
+    assert fresh.trailer_only
+
+
+def test_frame_reader_trailer_bytes_still_reach_the_noise_buffer() -> None:
+    # The flag only observes. The line ends still sit in the 2-byte noise tail, so the leftover
+    # reading the reuse path takes from the buffer, and the next interchange's framing, are unchanged.
+    data = interchange().encode("utf-8")
+    reader = X12FrameReader()
+    assert list(reader.feed(data + b"\r\n")) == [data]
+    assert reader._buf == b"\r\n"
+    assert list(reader.feed(data)) == [data]
+    assert not reader.in_frame
+
+
 def test_integrity_group_and_transaction_mismatches() -> None:
     # GS06/GE02 control-number mismatch.
     assert any("GE02" in p for p in check_integrity(interchange().replace("GE*1*1~", "GE*1*9~")))

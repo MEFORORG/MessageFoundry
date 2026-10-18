@@ -470,6 +470,14 @@ Two read/diagnostic endpoints back the console's connection view (auth + per-cha
 > before parsing if it exceeds **16 MiB** or **10,000 segments** (`ERROR` disposition + AR NAK),
 > bounding both the tolerant peek and the strict (hl7apy) validation paths.
 
+> **One message per outbound frame.** An MLLP delivery refuses a payload that opens with `MSH` and
+> holds a second `MSH` line, CR or LF line ends alike: a Handler that returned two messages in one
+> `Send`. It is a permanent failure with code `multiple-messages`, dead-lettered at once, with text
+> that carries no message content. A batch member holding two messages is dead-lettered alone, and
+> a shadow (`simulate`) outbound records the same. To send a batch, use outbound batch aggregation
+> (ADR 0082), whose `BHS` envelope this rule never refuses. See
+> [ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md).
+
 ### Raw TCP — `Tcp(...)`
 
 A raw-TCP transport (source **and** destination) with **configurable delimiter framing**, built to
@@ -484,7 +492,7 @@ the bytes.
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
 | `port` | both | — (required) | bind/connect port |
 | `framing` | both | `"stx_etx"` | framing **preset**: `"stx_etx"` (`0x02`/`0x03`, no trailer) or `"vt_fs"`/`"mllp"` (`0x0B`/`0x1C`/`0x0D`). Pass `framing=None` to use explicit bytes instead. |
-| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. |
+| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. `start` and `end` must differ, and neither may be `0x20` (a space); the connection is refused when it is built. A `0x20` `trailer` is allowed. Why: `FrameCodec` in [`messagefoundry/framing.py`](../messagefoundry/framing.py). |
 | `encoding` | both | `utf-8` | charset used to encode/decode the framed payload |
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
@@ -522,8 +530,14 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
   ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
   returning `Send("<outbound>", payload)`; returning the payload bare is an authoring error and
   raises (ERROR / dead-letter, replayable) rather than delivering.
-- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
-  validation, or content sniffing in the connector.
+- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation or
+  validation in the connector. An outbound delivery looks inside in at least two ways: it refuses a
+  payload holding its codec's own frame bytes (ADR 0205), and one that opens with `MSH` and holds a
+  second `MSH` line, as MLLP does, with the permanent code `multiple-messages`
+  ([ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md)). A
+  payload not led by `MSH`, an X12 interchange included, is never read for the second. A TCP
+  outbound has no batch aggregation (that is MLLP only), so a partner that takes several HL7
+  messages per frame cannot be fed them from one `Send`.
 - **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
   retried, so the receiver may see a duplicate — **the receiver must be idempotent.**
 - **Egress allowlist.** A `Tcp(...)` destination is gated by `[egress].allowed_tcp` (host or
@@ -655,7 +669,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606). **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
-| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe waits behind an outstanding debt but **charges nothing**, and neither does a request refused before its body reaches the engine. Only a body the engine reads and records spends budget, including one it then refuses with a `422`, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
@@ -781,11 +795,11 @@ def route(msg):
 | `directory` | both | — (required) | folder to poll / write into |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `1.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once its size and modification time are unchanged since the last poll that saw it (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting, but a very small `poll_seconds` narrows its window to almost nothing. |
-| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. |
+| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. A negative value is refused at build (BACKLOG #3151). |
 | `after_read` | in | `move` | `move` (→ `.processed`), `delete`, or `leave` (process **in place** — never move/delete the source file, for a read-only share / a directory another system owns; a hashed dedup ledger ensures a left file is ingested **once**, #142) |
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
-| `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited. |
+| `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `poll_max_files` | in | `500` | most files one scan will take. The rest stay in the drop directory and the next scan takes them — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for the number and when to raise it. `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
@@ -1057,7 +1071,7 @@ its own policy block below):
   charged on the handle the read opens, not on an earlier `stat()`: an oversize file is rejected by
   its handle's size **before** it is read into memory, and the read itself stops at the cap plus one
   byte, so a file that grows after it was listed is refused too (OOM / DoS guard, BACKLOG #2507).
-  `None`/`0` disables it.
+  `None`/`0` disables it, and the connection then logs a `WARNING` each time it is built (BACKLOG #2749).
 - **Links are refused at listing, read and move time.** The listing looks at each name without
   following a link there. A drop is read only if the opened handle is a regular file at the listed
   name inside the watch directory, reached through no symbolic link or junction: POSIX opens each path
@@ -1314,7 +1328,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `poll_seconds` | in | `5.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once it lists at the same size, and the same modification time where the server lists one, as at the last poll that saw it (BACKLOG #2071, #2758), so every file waits at least one poll. The gate is always on and has no setting. On a server that lists no modification time (at least FTP without `MLSD`, an `MLSD` server without `modify`, and an SFTP server that omits the times) it reads the listed size alone, so there it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size + the listed modification time where the server gives one ensures a left file is ingested once; see *Process-in-place* for what a server that lists no modification time misses) |
-| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges. |
+| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`. Instead every send first **lists** `remote_dir`, so the account needs list permission there even with `overwrite = true`, at one extra round trip per delivery. An upload into a vanished dir then fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir; a credential refusal on that listing stops the lane. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
@@ -2391,6 +2405,13 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
 as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
+On every interaction but `transaction` and `batch`, a body in which a JSON object repeats a key is refused
+before a byte is sent, for the reason rule 2 of
+[the Bundle screen](#a-bundle-connection-screens-every-entry) gives: a permanent refusal, code
+`bad-body` (vault BACKLOG #2812). A Bundle that repeats a key is refused by the screen instead, code
+`bundle-entry-refused`. `FhirPeek.parse` raises `FhirPeekError` on such a body, so a Router that peeks one
+takes the error path, and so does a `fhir_lookup` whose reply repeats a key.
+
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
@@ -2458,6 +2479,15 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
+- A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
+  and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
+  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
+  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
+  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  agreement and its costs, is in
+  [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
+  the 2026-10-17 entry.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
@@ -3583,9 +3613,9 @@ Facts that are easy to get wrong, stated plainly first:
     Noise in the same read as a completed frame starts nothing. A sender that holds
     a quiet socket open with them is closed at `max_frame_seconds`, even where `receive_timeout` is
     longer or off.
-  * On X12 the frame is the interchange, from its `ISA` to its `IEA`. X12 has no line-end allowance
-    yet, so a newline after the `IEA` that arrives in a read of its own starts the clock. That is a
-    known gap, not the intended rule.
+  * On X12 the frame is the interchange, from its `ISA` to the terminator of its `IEA` segment. Up
+    to two bytes directly after that terminator belong to the interchange when each is CR or LF, so
+    a newline after the `IEA` starts nothing, however late it arrives (vault BACKLOG #2938).
   * Time the engine withholds, for pacing or an intake pause, is not counted.
 
   Vault BACKLOG #2847 moved MLLP onto this rule. Its clock used to start only at a start byte.
@@ -3651,20 +3681,40 @@ Facts that are easy to get wrong, stated plainly first:
   `[store].warm_pool_timeout` default 15 s) size the pool; they are not a deadline.
 
   **What it covers, stated as a scope rather than a completeness claim.** On **SQL Server**
-  `_acquire` is the sole borrow site, so it bounds every store call. On **Postgres** it bounds at
+  `_borrow` is the sole borrow site for store calls (the start-up warm-up borrows on its own), and
+  it bounds every store call, the two session writes below by a longer limit. On **Postgres** it bounds at
   least the message-pipeline borrows — the transactional claim/handoff sites and the internal
   `_fetchall` / `_fetchone` / `_execute` helpers, which were routed through the same chokepoint for
   that reason. Take the scope as written; the two backends reach it differently and this setting is
   not a statement about every code path that can touch a pool.
 
-  **Two Postgres session writes wait without the bound, on purpose (BACKLOG #2283).**
-  `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change has
-  committed: a password reset, a disable, a role change, a completed second factor. Nothing retries
-  them, so they wait for a free connection rather than fail after that change. Callers with no
-  earlier write, such as "sign out everywhere else", wait the same way. On SQL Server both stay
-  bounded, because `_acquire` is that backend's sole borrow site. There, at the limit, the request
-  fails after the change has committed. A revoke then leaves the account's other sessions
-  unrevoked. A rotation leaves the session on its old token, now carrying the factor it just proved.
+  **Two session writes wait longer, on purpose (BACKLOG #2283 on Postgres, #3023 on SQL
+  Server).** `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change
+  has committed: a password reset, a disable, a role change, a completed second factor. Nothing
+  retries them, so a pool shortage at the ordinary limit would fail them after that change. Callers
+  with no earlier write, such as "sign out everywhere else", wait the same way.
+
+  - On **SQL Server** they wait up to **2 times `acquire_timeout`**, 60 s at the default, and then
+    raise `StoreAcquireTimeout` like any other borrow. The wait is still bounded. The limit comes
+    from `acquire_timeout` only, so a `[store].command_timeout` of 0, which lifts the statement
+    limit on every store call, does not lift this one. At the defaults the limit is half the API's
+    request deadline (`DEFAULT_REQUEST_TIMEOUT_SECONDS` in `api/request_timeout.py`), so the
+    borrow itself gives up and a rotation enters its fail-closed answer below, rather than being
+    cancelled by the deadline. That margin covers the borrow only: the answer then makes ordinary
+    borrows of its own, two revokes and an audit row, so on a pool that stays wedged they can be
+    refused, or the deadline can still cancel the request first. A larger `acquire_timeout`
+    shrinks the margin. A revoke past the limit fails, as described below.
+  - On **Postgres** they wait without a limit for a free connection.
+
+  On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
+  connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
+  wait writes nothing and records nothing. A revoke that fails leaves the account's other sessions
+  unrevoked, and the change's own audit row and notice are lost with it. A rotation that fails,
+  including one that reached the SQL Server limit, is answered as a lost session: the old session
+  is revoked, best effort, an `auth.session_rotation_failed` row with reason `store_error` records
+  in `revokes_landed` whether every revoke landed, and the caller signs in again. The same callers
+  make other bounded writes after their change commits, such as stamps and audit rows, and those
+  can still fail at the ordinary limit.
 
   **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
   numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it
@@ -3929,7 +3979,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted with a DEBUG line only and no connection event, and gives its slot back; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted; on the standard asyncio loop with a DEBUG line, giving its slot back, and under uvloop before any slot is taken. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop (vault BACKLOG #2613, #3302; PHI.md section 7 row 7 says how). Under uvloop a handshake that only runs past its bound is not counted, and the event names no peer; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

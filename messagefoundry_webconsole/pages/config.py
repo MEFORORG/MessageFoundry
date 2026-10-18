@@ -10,9 +10,10 @@ dry-run diff here; authoring lives in the VS Code extension. Every value is esca
 
 from __future__ import annotations
 
-from messagefoundry.api.models import ConfigProvenance, ReloadResult
+from messagefoundry.api.models import RELOAD_REFUSED_CHANNEL_SCOPED, ConfigProvenance, ReloadResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
+from ._common import _reload_shortfall
 from .approvals import approvals_link
 
 __all__ = ["config_page", "reload_pending", "reload_result"]
@@ -35,23 +36,50 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
         "DRIFTED" if drifted else "clean",
         class_=f"status status-{'error' if drifted else 'running'}",
     )
-    note = (
-        " — the config on disk differs from the running graph; reload to apply"
-        if drifted
-        else " — the running graph matches the config on disk"
-    )
+    if not drifted:
+        note = " — the running graph matches the config on disk"
+    elif prov.reload_refused is None:
+        note = " — the config on disk differs from the running graph; reload to apply"
+    else:
+        # The page says this caller cannot reload, so the badge does not tell them to.
+        note = " — the config on disk differs from the running graph"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
+
+
+def _next_step(refused: str) -> str:
+    """What a refused caller can do about it, for the refusals this page knows."""
+    if refused == RELOAD_REFUSED_CHANNEL_SCOPED:
+        # The default, an account nobody has scoped, is refused too, and its holder may not think of
+        # it as scoped.
+        return (
+            " An account with no channel scope set counts as channel-scoped. A reload needs both"
+            " the all-channels scope and the config:deploy permission."
+        )
+    return ""
 
 
 def config_page(prov: ConfigProvenance | None = None) -> Markup:
     """The config-deploy page: a single 'Reload configuration' action (server's startup dir only), with
-    a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1)."""
-    reload_form = el(
-        "form",
-        el("button", "Reload configuration", type="submit"),
-        method="post",
-        action="/ui/config/reload",
-        class_="ctl",
+    a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1).
+
+    When the engine says it will refuse this caller's reload (``reload_refused``, BACKLOG #3189),
+    the form is replaced by the engine's own reason. Offering it would send the caller through a
+    re-auth and spend the step-up for a 403. The engine computes the rule; this page only reads it."""
+    refused = prov.reload_refused if prov is not None else None
+    reload_form: Markup = (
+        el(
+            "p",
+            text(f"Reload is not available to you: {refused}.{_next_step(refused)}"),
+            class_="banner",
+        )
+        if refused is not None
+        else el(
+            "form",
+            el("button", "Reload configuration", type="submit"),
+            method="post",
+            action="/ui/config/reload",
+            class_="ctl",
+        )
     )
     return page(
         "Configuration",
@@ -71,7 +99,13 @@ def config_page(prov: ConfigProvenance | None = None) -> Markup:
 
 
 def reload_result(result: ReloadResult) -> Markup:
-    """The outcome of a successful config reload — the element counts of the now-live graph."""
+    """The outcome of a successful config reload: the element counts of the now-live graph, and a
+    banner for each thing the reload left undone (:func:`._common._reload_shortfall`)."""
+    shortfall = _reload_shortfall(
+        degraded=result.degraded,
+        failures=result.failures,
+        restart_required=result.restart_required,
+    )
     tbl = rows_table(
         ["Element", "Count"],
         [
@@ -84,6 +118,7 @@ def reload_result(result: ReloadResult) -> Markup:
     body = el(
         "div",
         el("h1", "Configuration reloaded"),
+        *(el("p", sentence, class_="banner") for sentence in shortfall),
         el("p", "The code-first graph is now live.", class_="muted"),
         tbl,
         el("p", el("a", "← Configuration", href="/ui/config")),

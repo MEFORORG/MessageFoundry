@@ -1318,6 +1318,7 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "service_status.py": "`sc query`, list-form argv, 5 s bound",
     "store/store.py": "`icacls` store-file ACL lockdown, one argv token per grant",
     "auth/trust_anchors.py": "`icacls` trust-anchor ACL VERIFY (read-only DACL check, list-form argv)",
+    "security/audit_all_platforms.py": "CI dependency auditor: `pip`, `pip_audit`, list-form argv",
     "tray/actions.py": "tray's VS Code open, list-form argv; os.startfile opens the log",
     "tray/app.py": "tray's os.startfile open of tray.toml in the default editor (BACKLOG #1934)",
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",

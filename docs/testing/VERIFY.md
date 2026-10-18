@@ -51,7 +51,7 @@ the SQLite store through a schema-ensure that creates an absent file. Both now F
 path instead.
 
 So a mistyped `[store].path` is now a FAIL where it used to be a PASS — the check was passing
-because it made whatever it was pointed at. Run `messagefoundry serve` once before
+because it made whatever it was pointed at. Run `python -P -X disable-remote-debug -m messagefoundry serve` once before
 `--section store`. And running `verify` elevated no longer leaves an administrator-owned store and
 directory tree at the configured path, which is the service-identity gap the `store.connect` row's
 own text tells you to go and confirm.

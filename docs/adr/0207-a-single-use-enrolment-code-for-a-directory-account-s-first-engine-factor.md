@@ -84,6 +84,11 @@ federated sign-in on a site that turned the claim gate off.
    the enable, decides which authenticator the account ends up holding. The session that proved the
    first code is stamped all the same. This gap is in the shared step, so it reaches every account
    type. The Lander's review of this record says it goes to the maintainer ledger as its own row.
+
+   *Note (2026-10-16).* The shared-step fix was built under BACKLOG #3025 (first pushed as branch `b259-3025`):
+   `enable_totp` turns TOTP on only while the row still holds the secret cell the confirm
+   verified, and `set_totp_secret` writes only where TOTP is off. This item describes the code as
+   it stood when this record was drafted.
 7. **The passkey finish route draws the console write floor, but not the ceremony budget.** The
    engine API's `POST /me/mfa/confirm` and the web console's TOTP confirm route (`ui_mfa_verify`)
    both draw the per-actor ceremony budget (`allow_reauth_attempt`) before the service runs. The
@@ -435,7 +440,7 @@ The tests named below are written with the build; none exists yet.
   credential row. The test must fail on the code before this build. A test that drives the route
   past the write floor instead passes on today's code, so it does not meet this criterion. The
   discriminating form already exists in `test_l4b_rate_limit_paths`
-  (`packaging/messagefoundry-webconsole/tests/test_webui.py`): it re-proves first, then replaces
+  (`packaging/messagefoundry-webconsole/tests/test_webui_account.py`): it re-proves first, then replaces
   `service.allow_reauth_attempt` with a deny and leaves the write floor alone.
   → a web console test under `packaging/messagefoundry-webconsole/tests/`
 - **AC-15** -- WHEN an account holding an outstanding code is disabled, THE SYSTEM SHALL clear the
