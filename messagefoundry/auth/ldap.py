@@ -115,7 +115,10 @@ class LdapReferralError(LdapError):
 
     A subclass, so every ``except LdapError`` still refuses it as before. The session reconciler
     tells it apart (BACKLOG #2538): a referral is a configuration error that recurs on every pass,
-    not an outage that passes, so it must page rather than read as unavailable forever.
+    not an outage that passes, so it must page rather than read as unavailable forever. The step-up
+    re-bind does not tell it apart (``AuthService._reauth_ad``): it refuses every ``LdapError`` as
+    ``directory_unavailable`` and counts none, which is right for a referral, because the engine
+    never follows one, so no bind judged the password (BACKLOG #3169).
     """
 
 
@@ -123,10 +126,12 @@ class LdapUnansweredError(LdapError):
     """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
 
     A subclass, so every ``except LdapError`` handles it as before; :func:`_refuse_unanswered` says
-    what that means for each caller. ``code`` is the result code, or ``None`` when the result held
-    none that is an integer or a paged search was refused for its paging (:func:`_search_paged`);
-    ``code_name`` is ldap3's name for the code, or the engine's for the case, never text the
-    directory sent.
+    what that means for each of its callers. A user bind raises it too, through
+    :func:`_refuse_unjudged_bind` (BACKLOG #3169), and the step-up re-bind
+    (``AuthService._reauth_ad``) reads it as ``directory_unavailable``, not counted. ``code`` is
+    the result code, or ``None`` when the result held none that is an integer or a paged search was
+    refused for its paging (:func:`_search_paged`); ``code_name`` is ldap3's name for the code, or
+    the engine's for the case, never text the directory sent.
     Both default, so the exception survives a copy or a pickle, which rebuild it from its message
     and then restore both from its ``__dict__``.
     """
@@ -186,8 +191,12 @@ class DirectoryBind:
     :meth:`LdapAuthenticator.authenticate` returns this (BACKLOG #2434), so the step-up re-bind can
     tell a refused password from an absent or disabled account without a second directory read.
     ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
-    no principal means the entry was found enabled and the directory refused the bind, so the
-    password was judged against that account. Any other answer means no bind was judged. None of
+    no principal means the entry was found enabled and the directory refused the bind with a code
+    outside :data:`_UNJUDGED_BIND_CODES` that is not a referral (10), or with a result that holds no
+    integer code at all, which the step-up re-bind counts too. A bind on a found entry that
+    ends with a referral or a code inside that set returns no answer at all: ``authenticate``
+    raises it instead (BACKLOG #2530, #3169). The engine reads every other refusal as the password
+    judged against that account, though a code such as strongerAuthRequired (8) judges none. Any other answer means no bind was judged. None of
     this may reach a client: a sign-in caller must refuse every answer alike.
     """
 
@@ -877,6 +886,36 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
     return LdapUnansweredError(message, code=code, code_name=name)
 
 
+#: The result codes that end a user bind without judging its password (BACKLOG #3169): busy (51),
+#: unavailable (52), unwillingToPerform (53) and adminLimitExceeded (11), the codes #3010 names
+#: for a search the directory did not finish. Literals, because every ldap3 import here is lazy; a
+#: test pins each against ldap3's constant.
+_UNJUDGED_BIND_CODES = frozenset({11, 51, 52, 53})
+
+
+def _refuse_unjudged_bind(conn: Any) -> None:
+    """Raise :class:`LdapUnansweredError` when ``conn``'s bind ended with a code in
+    :data:`_UNJUDGED_BIND_CODES`, and do nothing otherwise.
+
+    BACKLOG #3169. ldap3's ``bind()`` returns ``False`` for each of these, as it does for
+    invalidCredentials (49), so read on, a busy domain controller was a wrong password: the step-up
+    re-bind counted it toward the engine lockout and could lock out a user who typed the right
+    password. Raised, it is an :class:`LdapError`, which the re-bind reads as
+    ``directory_unavailable`` and does not count.
+
+    Not :func:`_refuse_unanswered`, which refuses every code outside a set of answers: every other
+    refused bind, 49 included, still reads as a refused password, so the bind's answers are an open
+    set. The one exception is a referral, which ``authenticate`` refuses first through
+    :func:`_refuse_referral` and which is not counted either. The refusal is :func:`_unanswered`'s,
+    so its text and warning match the searches'.
+    """
+    result = conn.result
+    code = result.get("result") if isinstance(result, dict) else None
+    # type(), not isinstance(): a bool is an int, and is no result code.
+    if type(code) is int and code in _UNJUDGED_BIND_CODES:
+        raise _unanswered("user bind", code)
+
+
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result and any other result but success
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
@@ -1506,6 +1545,14 @@ class LdapAuthenticator:
         and before the bind request is sent, on both branches alike, so such a password reads as a directory error for an absent
         account and a present one. A test pins the healthy-directory path.
 
+        **The decoy reads no result code except a referral; it ignores an outage code (BACKLOG
+        #3169).** The real bind refuses one in :data:`_UNJUDGED_BIND_CODES` as the directory not
+        answering; here the lookup has already answered, and its answer (absent, disabled,
+        undetermined) is what the caller audits. Refusing it would replace that answer with an
+        outage. So a busy directory answers the two branches differently, a case #3017 does not make
+        alike; the caller is a signed-in session re-proving its own account, so the difference
+        names nothing it does not hold.
+
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
         PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
         and a no-such-object in different times, and the group-resolution search on the success path
@@ -1530,7 +1577,8 @@ class LdapAuthenticator:
                 bound = conn.bind()
             if not bound:
                 # As the real bind does, so a referral answers both branches alike (BACKLOG
-                # #3017). Any other refusal is ignored: this branch always fails the sign-in.
+                # #3017). Any other refusal is ignored, an outage code included (BACKLOG #3169):
+                # this branch always fails the re-bind.
                 _refuse_referral(conn, "user bind")
 
     def _search_user(
@@ -1780,7 +1828,8 @@ class LdapAuthenticator:
         self, username: str, password: str, *, object_id: str | None = None
     ) -> DirectoryBind:
         """Verify ``username``/``password`` against AD. Raises :class:`LdapError` on a
-        connectivity/config failure.
+        connectivity/config failure, and on a bind the directory ended without judging the
+        password (:func:`_refuse_unjudged_bind`, BACKLOG #3169).
 
         The answer carries the principal on success, and otherwise says what the lookup found
         (:class:`DirectoryBind`, BACKLOG #2434). Before that it returned ``None`` for a wrong
@@ -1817,7 +1866,9 @@ class LdapAuthenticator:
                     #
                     # Every error in the decoy is mapped HERE, the same way the real bind's is
                     # below, so an absent and a present account fail alike (BACKLOG #2566, #3017).
-                    # Swallowing it inside _equalizing_bind would tell the two apart.
+                    # Swallowing it inside _equalizing_bind would tell the two apart. A bind result
+                    # code is not such an error: a busy one answers the two apart, by design
+                    # (_equalizing_bind, BACKLOG #3169).
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
                     return DirectoryBind(found.answer)
@@ -1844,6 +1895,8 @@ class LdapAuthenticator:
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
+                        # A busy or unavailable directory judged no password (BACKLOG #3169).
+                        _refuse_unjudged_bind(user_conn)
                         # The entry was found enabled, so the refusal judged this account.
                         return DirectoryBind(DirectoryAnswer.FOUND)
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])

@@ -10647,8 +10647,10 @@ class AuthService:
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
         if bind.answer is DirectoryAnswer.FOUND:
             # Found by the row's own id, so the bind that failed was judged against this account:
-            # it counts. That includes a DC too busy to answer the bind, which nothing here can
-            # tell from a wrong password.
+            # it counts. A bind the DC ended busy, unavailable, unwillingToPerform or
+            # adminLimitExceeded never reaches here: authenticate raises it as an LdapError, read
+            # above as directory_unavailable and not counted (BACKLOG #3169). Nor does one answered
+            # with a referral, which authenticate raises as LdapReferralError, an LdapError too.
             return _DirectoryRebind(False)
         # No bind was judged, so nothing is counted.
         return _DirectoryRebind(None, _REBIND_REFUSALS[bind.answer])
