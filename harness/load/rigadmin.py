@@ -11,8 +11,8 @@ reads the API with that session.
 no terminal. So :func:`provision` runs the shipped command in a child process with that read
 replaced by a value the rig holds. The child also wraps the command's
 ``_build_provision_auth_service``, so the service's ``provision_refusal`` and
-``provision_first_administrator`` refuse a store whose enabled Administrators all need an outside
-service (vault BACKLOG #2711, :func:`_keep_the_narrow_rule`). That only narrows the command.
+``provision_first_administrator`` refuse a store that holds an enabled Administrator, though none
+signs in with a local password (vault BACKLOG #2711, :func:`_keep_the_narrow_rule`). That only narrows the command.
 Settings, the at-rest gate, the store open, the password policy and the account write are the
 shipped code path. ``scripts/service/measure-store-access.ps1`` does
 the same on Windows; this is that recipe for every platform.
@@ -394,9 +394,7 @@ def _keep_the_narrow_rule(cli: Any) -> None:
         async def _only_outside_service_admins() -> bool:
             # The case step 1 opened: an enabled Administrator, but none the shipped rule counts.
             # Where a local one counts, the shipped command refuses in its own words.
-            if await service.has_self_sufficient_administrator():
-                return False
-            return bool(await service.has_enabled_administrator())
+            return bool(await service.administrators_needing_an_outside_service())
 
         async def _refusal(*a: Any, **kw: Any) -> Any:
             shipped = await refusal_of(*a, **kw)

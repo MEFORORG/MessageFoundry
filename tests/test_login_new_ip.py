@@ -1216,6 +1216,24 @@ async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -
         await store.close()
 
 
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_a_reset_drops_the_accounts_notice_debounce(reset: str) -> None:
+    """vault BACKLOG #2946: the first NEW sign-in after a reset is mailed, even from an address
+    noticed just before it. Another account's debounce entry stays.
+
+    RED when: the reset leaves the account's ``_login_new_ip_noticed`` entries in place."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        service._login_new_ip_noticed[(uid, "10.1.1.1")] = time.time()
+        service._login_new_ip_noticed[("someone-else", "10.1.1.1")] = time.time()
+        await getattr(service, reset)(uid, actor="boss")
+        assert list(service._login_new_ip_noticed) == [("someone-else", "10.1.1.1")]
+    finally:
+        await store.close()
+
+
 async def test_revoke_all_keeps_the_known_address_record() -> None:
     """Revoking every session is routine, so it clears nothing (owner ruling 2026-10-16)."""
     store = await MessageStore.open(":memory:")

@@ -3153,8 +3153,9 @@ class AuthService:
         """True iff some enabled Administrator is a local account with a usable password, so it can
         sign in with no directory or identity provider up.
 
-        ``provision-admin`` refuses exactly while this holds (vault BACKLOG #2711 step 1, ADR 0183
-        Amendment E). Before that, it refused while any enabled Administrator existed, so a site
+        ``provision-admin`` refuses whenever this holds (vault BACKLOG #2711 step 1, ADR 0183
+        Amendment E), and otherwise only for its own reasons, such as the named row or the password
+        policy. Before that, it refused while any enabled Administrator existed, so a site
         whose every Administrator needed an outside service had no host command to get back in
         while that service was down. :meth:`administrators_needing_an_outside_service` names
         accounts exactly when this is false and an enabled Administrator exists."""
@@ -10517,6 +10518,9 @@ class AuthService:
         failure left it: unchanged, or emptied with no marker. The two calls are separate
         transactions, so any record write still in flight for the account, from a sign-in, a
         step-up, a factor proof or an enrolment, can land after the delete."""
+        # The notice debounce goes too, so the first NEW sign-in after the reset is also mailed.
+        for key in [k for k in self._login_new_ip_noticed if k[0] == user_id]:
+            del self._login_new_ip_noticed[key]
         try:
             await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
             # Stamped at the epoch, so the lookback read never returns it and only the any-age

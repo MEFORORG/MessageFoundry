@@ -309,7 +309,8 @@ changes what the ADR 0167 gate says and adds one WARNING.
 > an Administrator. The rest of the row stands: sign-in is simply always required. The table is kept
 > as written because it records what this amendment measured. The same change added a start WARNING
 > for a store whose every enabled Administrator signs in through an outside identity service (vault
-> BACKLOG #2711, step 2), since `provision-admin` refuses while such an account exists.
+> BACKLOG #2711, step 2), since `provision-admin` refused while such an account existed. Amendment
+E (vault BACKLOG #2711 step 1) since lets the command run on such a store.
 
 **Recommendation: add no new refusal. Confidence: medium.** Four reasons, and the second and fourth
 hold only if Wave 0 comes back green:
@@ -757,8 +758,8 @@ with no address. MessageFoundry has no deployments, so the change costs no migra
 Made by vault BACKLOG #2711 step 1, on owner ruling B258-R4 of 2026-10-16, "Widen provision-admin
 (Recommended)". **It changes Decision item 1.** `provision-admin` now refuses only while an enabled
 **local** Administrator holds a usable password: a hash, and not a must-change credential past its
-deadline. A directory account, a federated-bound one, a disabled one, or a local one with no usable
-password no longer blocks it.
+deadline. A directory account, a federated-bound one, or a local one with no usable password no
+longer blocks it. A disabled Administrator never did.
 
 **Why.** A site whose every Administrator signs in through the directory or an identity provider
 had no host command to get back in while that service was down. `admin-unlock` clears a local
