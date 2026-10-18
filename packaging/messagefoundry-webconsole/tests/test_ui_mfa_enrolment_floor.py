@@ -277,10 +277,18 @@ async def test_the_console_passkey_finish_says_why_an_unchecked_passkey_was_refu
 
 def test_the_passkey_page_says_a_stray_passkey_can_be_deleted() -> None:
     """BACKLOG #3810 finding 4: every refusal at the passkey finish comes after the authenticator
-    made its credential, as it did before #3061, so a failed enrolment can leave one behind that
-    the server never stored. RED when the page stops saying it can be deleted."""
+    made its credential, as it did before #3061, so a failed enrolment can leave one behind. But a
+    failed finish does not prove the passkey was not stored: a session revoked after the store, and
+    "already enrolled", fail with it registered. So the page sends the user to the account's list
+    first, and lets them delete only a passkey that is not in it. RED when the page stops saying
+    so, or says again that a failed passkey "was not added", which on a passkey-only account would
+    lead a user to delete the one factor they hold."""
     from messagefoundry_webconsole import pages
 
-    page = str(pages.webauthn_enroll_page("{}"))
-    assert "was not added to your account and cannot sign you in" in page
-    assert "You can delete it from your browser" in page
+    page = " ".join(str(pages.webauthn_enroll_page("{}")).split())
+    assert "check the Passkeys list on your account page first" in page
+    assert "A passkey listed there is registered: keep it." in page
+    assert "Only a passkey your browser or security key shows that is not in that list" in page
+    assert "is a leftover you may delete" in page
+    assert "was not added" not in page
+    assert "cannot sign you in" not in page

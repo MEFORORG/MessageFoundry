@@ -441,10 +441,14 @@ async def test_a_totp_enabled_by_another_confirm_is_still_a_lost_session_not_a_f
 async def test_a_local_account_is_never_probed_on_totp_enrolment(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A local account's enrolment is unchanged, and costs no directory round trip."""
+    """A local account's enrolment is unchanged, and costs no directory round trip. Under a live
+    second-step lock too: the enrolment legs read the lock only after the directory lookup, so a
+    local account is not lock-checked here and writes no lock row (BACKLOG #3810 finding 4). RED
+    when a local enrolment starts refusing, or auditing, the lock without the docs saying so."""
     directory = _Directory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
+    await _lock_second_step(store, identity.user_id)
     pin_totp_clock(monkeypatch, _T0)
     enroll = await service.begin_mfa_enrollment(identity)
 
@@ -452,8 +456,9 @@ async def test_a_local_account_is_never_probed_on_totp_enrolment(
         identity, totp.totp(enroll.secret, now=_T0), token=token
     )
 
-    assert served.ok is True
+    assert served.ok is True and served.locked is False
     assert directory.probes == []
+    assert {"reason": "locked"} not in await _audited(store, "auth.mfa_failed")
 
 
 # --- the passkey leg: finish_webauthn_registration ---------------------------------------------
@@ -593,13 +598,16 @@ async def test_a_disable_during_the_lookup_is_a_lost_passkey_registration(
 async def test_a_local_account_is_never_probed_on_passkey_registration(
     store: MessageStore,
 ) -> None:
-    """A local account's passkey registration is unchanged, and costs no directory round trip."""
+    """A local account's passkey registration is unchanged, and costs no directory round trip.
+    Under a live second-step lock too, writing no lock row, as on the TOTP leg above."""
     directory = _Directory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
+    await _lock_second_step(store, identity.user_id)
     p = await _passkey_staged(_Signed(service, store, directory, identity, token))
 
     served = await _register(p)
 
-    assert served.ok is True
+    assert served.ok is True and served.locked is False
     assert directory.probes == []
+    assert {"reason": "locked"} not in await _audited(store, "auth.webauthn_failed")

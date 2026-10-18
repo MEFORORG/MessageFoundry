@@ -11315,7 +11315,12 @@ class AuthService:
         """Whether a second-factor leg must refuse ``user`` as locked, auditing the refusal as
         ``event`` if so. :meth:`verify_mfa` calls it with the default event.
         :meth:`finish_webauthn_assertion` calls it directly with ``auth.webauthn_failed``, and
-        :meth:`_factor_holder_current` passes whichever leg's event it was handed.
+        :meth:`_factor_holder_current` passes whichever leg's event it was handed. So at least
+        these legs write the lock row: ``auth.mfa_failed`` from :meth:`verify_mfa` and from
+        :meth:`confirm_mfa_enrollment`, and ``auth.webauthn_failed`` from
+        :meth:`finish_webauthn_assertion` and from :meth:`finish_webauthn_registration`. The two
+        enrolment legs reach it only for a directory account, through
+        :meth:`_directory_vouches_for_factor` (BACKLOG #3061, #3810 finding 4).
 
         Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
         MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
@@ -11924,9 +11929,12 @@ class AuthService:
         ``locked`` (BACKLOG #3810 finding 4); a local account is not lock-checked here.
 
         **Any refusal here comes after the authenticator made its credential** (BACKLOG #3810
-        finding 4), so it leaves a passkey the server never stored. ``docs/SECURITY.md``, *A
-        refused registration can leave a passkey on the authenticator*, says which refusals and
-        what the console tells the user."""
+        finding 4), so it can leave a passkey on the authenticator. Not every failure means the
+        server did not store it: a session revoked after :meth:`add_webauthn_credential` and before
+        :meth:`_elevated` re-keys it, and "already enrolled", fail with the passkey registered.
+        ``docs/SECURITY.md``, *A refused registration can leave a passkey on the authenticator*,
+        says which refusals, and that the console sends the user to the account's passkey list
+        before deleting anything."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:

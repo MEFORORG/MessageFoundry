@@ -465,7 +465,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             enroll = await admin.enroll_mfa(service=service, identity=identity)
         except HTTPException as exc:
-            # AD account / already enrolled — surface on the account page.
+            # Unknown account / already enrolled — surface on the account page. A directory account
+            # is accepted here (BACKLOG #3061), so this is not its refusal.
             return await _account_response(
                 service, identity, request, error=str(exc.detail), status_code=400
             )
@@ -513,7 +514,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 identity, code, token=token, client=client
             )
         except ValueError as exc:
-            # No enrollment staged / not a local account — back to the account page.
+            # Unknown account / no enrollment staged — back to the account page.
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
@@ -526,9 +527,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # second confirm TOTP is already on, so the operator signs in with it, not enrols.
             return login_redirect_response()
         if elevation.token is None:
-            # BACKLOG #3061: the directory could not vouch for a directory account, so the code was
-            # never checked and "Invalid code." would be false. Nor was it under a second-step lock
-            # (BACKLOG #3810 finding 4), which says so in /ui/reauth's words.
+            # Neither of two refusals checked the code, so "Invalid code." would be false for both:
+            # the directory could not vouch for a directory account (BACKLOG #3061), or the account
+            # is under a second-step lock, which is said in /ui/reauth's words (BACKLOG #3810
+            # finding 4).
             error = _refusal_error(elevation, "Invalid code.")
             return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
@@ -687,7 +689,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             options = await service.begin_webauthn_registration(
                 identity, token=token, rp_id=rp[0], rp_name=_RP_NAME
             )
-        except ValueError as exc:  # AD account
+        except ValueError as exc:  # unknown account, or a first factor that must be TOTP
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
