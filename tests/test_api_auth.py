@@ -647,8 +647,10 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     store = engine.store
-    async with _client(engine, service) as c:
+    # Signed in from another address, so the row's client is the sign-out's own (BACKLOG #3339).
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service) as c:
         rotations = rotate_after_first_call(
             monkeypatch, store, service, token, names=("get_session",)
         )
