@@ -621,7 +621,7 @@ async def _frame_error_before_accept(
             writer.write(_UNMASKED_FRAME)
             await writer.drain()
             for _ in range(500):
-                conns = server.server_state.connections
+                conns: list[Any] = list(server.server_state.connections)
                 ended = bool(conns) and all(getattr(p.conn, "eof_sent", False) for p in conns)
                 if ended:
                     break
