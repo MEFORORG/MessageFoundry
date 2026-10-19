@@ -3139,9 +3139,10 @@ class AuthService:
 
         The wait until this actor's next write would be admitted: the rest of the window when the
         count fired, or the rest of the gap when the minimum interval did. Rounded UP and never
-        below 1, so a client that waits this long is admitted by THIS process's limiter, provided
-        the account makes no other write meanwhile. The limiter is in-process, so another engine
-        shard keeps its own count. It reflects this actor's own
+        below 1. This limiter has no all-actors budget, so a client that waits this long is
+        admitted by THIS process's limiter, provided the account makes no other write meanwhile;
+        that holds for no limiter with an all-callers budget. The limiter is in-process, so another
+        engine shard keeps its own count. It reflects this actor's own
         writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
         ``/ui`` console both send this value, so the same refusal reads the same on either."""
         return _retry_after_seconds(self._admin_write_limiter, actor)
@@ -3149,7 +3150,8 @@ class AuthService:
     def phi_read_retry_after(self, actor: str) -> int:
         """The ``Retry-After`` value for a PHI read just refused for ``actor`` (BACKLOG #3293).
 
-        Same rounding and terms as :meth:`admin_write_retry_after`, on the PHI-read limiter. While
+        Same rounding as :meth:`admin_write_retry_after`, on the PHI-read limiter, and a reading,
+        not a reservation (:func:`_retry_after_seconds`). While
         ``phi_read_rate_limit_global`` is on and spent, it is the whole window, because the true wait
         depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
         API and the ``/ui`` console both send it."""
