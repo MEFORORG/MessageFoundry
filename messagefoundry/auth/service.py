@@ -9947,14 +9947,15 @@ class AuthService:
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
         has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
         feed; with nothing ended there is no owner, and the actor stays NULL. That includes a
-        console sign-out that loses a rotation race (BACKLOG #3339, still open for that case). A
+        console sign-out that loses a rotation race (engine PR 2384, open finding 3). A
         read before the revoke would name the owner only through :meth:`_load_session`, the one
         sanctioned session reader, and that read ends and reports a row whose seal fails, so the
         revoke would then record ``nothing_to_revoke`` for a session this call ended.
 
-        ``client`` is the caller's address, from ``client_ip`` on a request; ``None`` means no
-        request was in scope (ADR 0150). It has no default, so a new sign-out caller cannot omit it
-        silently (BACKLOG #3339)."""
+        ``client`` is the caller's address, from ``client_ip`` on a request (ADR 0150). It is
+        ``None`` where ``client_ip`` finds no address, so on this row a NULL client does not by
+        itself mean no request was in scope. It has no default, so a new sign-out caller cannot
+        omit it silently (BACKLOG #3339)."""
         if not token:
             return "nothing_to_revoke"
         ended = await self._store.supersede_session(hash_token(token), now=time.time())

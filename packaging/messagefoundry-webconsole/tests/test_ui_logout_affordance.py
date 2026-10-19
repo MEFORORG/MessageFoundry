@@ -239,7 +239,11 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
 ) -> None:
     """BACKLOG #3339, the control. A cookie that names no session ends nothing, so the row has no
     owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
-    the test above, it shows the actor there comes from the session, not from the request."""
+    the test above, it shows the actor there comes from the session, not from the request.
+
+    It pins the CURRENT behaviour, which is still open: an unauthenticated sign-out can append a
+    row for a cookie naming no session (engine PR 2384, open finding 6, held by vault BACKLOG
+    #3749). A fix that writes no row here, or bounds the rows, is expected to change this test."""
     service = await _service(engine)
     transport = httpx.ASGITransport(
         app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
