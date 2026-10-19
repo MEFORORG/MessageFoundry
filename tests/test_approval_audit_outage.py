@@ -451,6 +451,32 @@ async def test_a_lost_request_row_cannot_forge_a_log_line(
     assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
 
 
+async def test_a_repeat_request_cannot_forge_a_log_line(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The INFO lines a repeat writes, from ``guard`` and from ``rejoin``, name the requester too
+    (vault BACKLOG #3324). caplog's handler has no ControlCharScrubFilter, so this reads the call
+    sites' scrub."""
+    gate = _gate(store, _Sink())
+    first = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=_REQUESTER_ID
+    )
+    forged = "maker\r\nFORGED approval"
+    with caplog.at_level(logging.INFO, logger="messagefoundry.api.approvals"):
+        joined = await gate.guard(
+            "dead_letter_replay", {}, requester=forged, requester_user_id=_REQUESTER_ID
+        )
+        rejoined = await gate.rejoin(
+            "dead_letter_replay", {}, requester=forged, requester_user_id=_REQUESTER_ID
+        )
+    assert first is not None and joined == first and rejoined == first
+    lines = [r.getMessage() for r in caplog.records if "nothing new is held" in r.getMessage()]
+    assert len(lines) == 2, lines
+    for line in lines:
+        assert "\r" not in line and "\n" not in line, line
+        assert "by maker\\r\\nFORGED approval" in line, line
+
+
 # --- vault BACKLOG #3193: a failed request write is read back, and outlives its caller -----------
 
 

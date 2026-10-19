@@ -62,6 +62,32 @@ def failing_append(store: Any, action: str) -> Iterator[None]:
         del store._append_audit_row
 
 
+class CommitFailed(RuntimeError):
+    """The fault :func:`failing_commit` injects into a store's COMMIT."""
+
+
+def commit_seam(store: Any) -> bool:
+    """Whether ``store`` commits through a ``_commit`` method a test can fault (vault BACKLOG
+    #3324). SQLite and SQL Server do. Postgres commits as asyncpg's transaction block exits, which
+    has no such seam, so an arm that needs :func:`failing_commit` does not run on that leg."""
+    return callable(getattr(store, "_commit", None))
+
+
+@contextmanager
+def failing_commit(store: Any) -> Iterator[None]:
+    """Make ``store``'s COMMIT raise, once every statement before it has run. Only where
+    :func:`commit_seam` holds."""
+
+    async def _commit(*_args: Any, **_kwargs: Any) -> None:
+        raise CommitFailed("commit refused")
+
+    store._commit = _commit
+    try:
+        yield
+    finally:
+        del store._commit
+
+
 def _builder(action: str, channel_id: str | None) -> Callable[[Any], AuditAppend | None]:
     """An audit that records every result it is handed, so a zero is visible too."""
 
