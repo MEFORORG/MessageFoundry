@@ -393,6 +393,17 @@ def test_a_current_checkout_installs_without_the_override(tmp_path: Path) -> Non
     assert "WARNING" not in r.stdout, r.stdout
 
 
+def test_an_install_refuses_a_dispatcher_that_is_not_origin_main_s(tmp_path: Path) -> None:
+    """The shell entry trusts the pinned dispatcher's proof, so it is pinned only from the ref."""
+    _need_tools()
+    checkout = _fixture(tmp_path, behind=False)
+    (checkout / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# edited locally\n")
+    r = _run_region(checkout, tmp_path, allow=False)
+    both = r.stdout + r.stderr
+    assert r.returncode != 0 and "which the shell entry pins" in both, both
+    assert "PROCEEDED PAST THE CHECK" not in r.stdout
+
+
 def test_an_install_refuses_when_origin_main_cannot_be_read(tmp_path: Path) -> None:
     _need_tools()
     r = _run_region(_lonely(tmp_path), tmp_path, allow=False)

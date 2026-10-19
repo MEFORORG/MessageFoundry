@@ -4295,12 +4295,17 @@ $gateFiles = @(
     (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "shell-guard-dispatch.ps1"))
 ) | Where-Object { $_ }
 $targetCmp = Get-ComparablePath $target
-if ($targetCmp -in $gateFiles -or $targetCmp -match '/\.claude[^/]*/shell-guard-proof(/|$)') {
+$isProof = $targetCmp -match '/\.claude[^/]*/shell-guard-proof(/|$)'
+if ($targetCmp -in $gateFiles -or $isProof) {
+    $surface = if ($isProof) {
+        "That folder holds per-call proofs that the gate already ran: a file there stands the gate down for a shell`ncall. Only the project's shell-guard dispatcher writes them, so a session may not write here at all."
+    } else {
+        "That directory holds the installed hook, the dispatcher whose proofs it trusts, and its allowlist. The`nallowlist is the gate's kill switch -- a single edit there turns it off for every session on this machine,`nso a session may not write here at all."
+    }
     Write-Deny -Rule "1a" -Detail $target -Reason @"
 BLOCKED: this writes to the worktree gate's own enforcement surface ($(Get-SafeForMessage $target)).
 
-That directory holds the installed hook and its allowlist. The allowlist is the gate's kill switch -- a
-single edit there turns it off for every session on this machine, so a session may not write here at all.
+$surface
 This is not a file to fix in passing.
 
 If the gate is genuinely wrong -- a false positive, a rule that needs changing -- fix it at the SOURCE and

@@ -117,7 +117,18 @@ def _run(home: Path, source_age_days: int = 6) -> dict[str, Any]:
         "dst": dst,
         "bak": Path(f"{dst}.bak"),
         "receipt": Path(f"{dst}.receipt.json"),
+        "dispatch_src": dispatch_src,
+        "dispatch_dst": hooks / "shell-guard-dispatch.ps1",
     }
+
+
+def test_the_install_pins_the_dispatcher_beside_the_gate(tmp_path: Path) -> None:
+    """The shell entry trusts a proof only from a project dispatcher identical to this copy, so an
+    install that skipped it would leave every shell call running the gate in its own pwsh."""
+    r = _run(tmp_path)
+    assert r["dispatch_dst"].read_bytes() == r["dispatch_src"].read_bytes()
+    receipt = json.loads(r["receipt"].read_text(encoding="utf-8-sig"))
+    assert receipt["dispatchSha256"], receipt
 
 
 def test_the_previous_gate_is_backed_up_before_it_is_overwritten(tmp_path: Path) -> None:

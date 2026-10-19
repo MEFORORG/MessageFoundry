@@ -376,9 +376,7 @@ def test_an_unknown_option_is_reported_not_run() -> None:
 
 _SID = "0f1e2d3c-aaaa-bbbb-cccc-123456789abc"
 _CALL = "toolu_01TestCallAbc"
-# A proof exactly as the dispatcher writes it. Bytes, not write_text: on Windows text mode writes
-# CRLF, and a proof holding "<sid>\r" fails the session-id test, so a test planting one would pass
-# without ever reaching the check it names.
+# A proof file's bytes for a prune test, where its content is never read.
 _PROOF = (_SID + "\n").encode("ascii")
 
 
@@ -439,6 +437,12 @@ class _World:
     def hint(self) -> Path:
         return self.proofs / f"{_SID}.session"
 
+    def proof_bytes(self, session: str = _SID) -> bytes:
+        """A proof exactly as the dispatcher writes it: `<session>|<gate path>`. Bytes, not
+        write_text: on Windows text mode writes CRLF, and a proof ending in a CR fails the content
+        test, so a test planting one would pass without ever reaching the check it names."""
+        return f"{session}|{self.gate.as_posix()}\n".encode()
+
 
 def _payload(command: str = "git status", call: str | None = _CALL) -> str:
     body = {**bash(command), "session_id": _SID}
@@ -455,7 +459,7 @@ def test_a_delegated_gate_that_allows_leaves_this_call_its_proof(tmp_path: Path)
     proc = _proc(_dispatch_argv([USER_GATE]), _payload(), env=world.env)
     assert proc.returncode == 0 and proc.stdout == "", (proc.returncode, proc.stderr)
     assert world.runs() == 1
-    assert world.proof("ok").read_text(encoding="utf-8") == _SID + "\n"
+    assert world.proof("ok").read_bytes().lower() == world.proof_bytes().lower()
     assert not world.proof("run").exists()
     assert world.hint().is_file(), "the account's entry waits only for a hinted session"
 
@@ -707,13 +711,31 @@ def test_a_proof_older_than_the_wait_is_not_this_call_s(tmp_path: Path) -> None:
     the transcript -- does not stand the gate down."""
     world = _World(tmp_path, gate=_GATE_DENIES)
     _hinted(world)
-    world.proof("ok").write_bytes(_PROOF)
+    world.proof("ok").write_bytes(world.proof_bytes())
     old = time.time() - 5
     os.utime(world.proof("ok"), (old, old))
     done, took = _Entry(world).run()
     assert assert_denied(_decision(done.stdout)) == "installed gate"
     assert world.runs() == 1
     assert took < 15, took
+
+
+def test_a_proof_naming_another_gate_is_not_this_call_s(tmp_path: Path) -> None:
+    """The dispatcher finds the gate by USERPROFILE. A proof from a run of some other gate file
+    (another profile, a stale copy) does not stand down the entry that would run this one."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    entry = _Entry(world)
+    _hinted(world)
+    other = f"{_SID}|{(tmp_path / 'elsewhere' / 'worktree_gate.ps1').as_posix()}\n".encode()
+    with single_spawn():
+        waiting = entry.start()
+        _await_wait(world, waiting)
+        part = world.proofs / "planted.tmp"
+        part.write_bytes(other)
+        part.replace(world.proof("ok"))
+        out, err = waiting.communicate(timeout=120)
+    assert assert_denied(_decision(out)) == "installed gate", err
+    assert world.runs() == 1
 
 
 def test_a_proof_for_another_session_is_not_this_call_s(tmp_path: Path) -> None:
@@ -727,7 +749,7 @@ def test_a_proof_for_another_session_is_not_this_call_s(tmp_path: Path) -> None:
             assert time.monotonic() < deadline, "the entry never began waiting"
             time.sleep(0.02)
         time.sleep(0.05)
-        world.proof("ok").write_bytes(_PROOF.replace(_SID.encode("ascii"), b"some-other-session"))
+        world.proof("ok").write_bytes(world.proof_bytes("some-other-session"))
         out, err = waiting.communicate(timeout=120)
     assert assert_denied(_decision(out)) == "installed gate", err
     assert world.runs() == 1
@@ -939,7 +961,7 @@ def test_a_proof_dated_in_the_future_is_not_this_call_s(tmp_path: Path) -> None:
         waiting = entry.start()
         _await_wait(world, waiting)
         part = world.proofs / "planted.tmp"
-        part.write_bytes(_PROOF)
+        part.write_bytes(world.proof_bytes())
         future = time.time() + 3600
         os.utime(part, (future, future))
         part.replace(world.proof("ok"))
@@ -958,7 +980,7 @@ def test_a_proof_beside_a_deleted_wait_is_not_this_call_s(tmp_path: Path) -> Non
         _await_wait(world, waiting)
         world.proof("wait").unlink()
         part = world.proofs / "planted.tmp"
-        part.write_bytes(_PROOF)
+        part.write_bytes(world.proof_bytes())
         part.replace(world.proof("ok"))
         out, err = waiting.communicate(timeout=120)
     assert assert_denied(_decision(out)) == "installed gate", err

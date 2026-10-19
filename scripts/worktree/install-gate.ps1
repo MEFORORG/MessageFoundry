@@ -801,6 +801,17 @@ if ($Status) {
         Write-Host "upstream    : $($up.Ref) UNREADABLE -- $($up.Reason)" -ForegroundColor Yellow
     }
 
+    # The pinned dispatcher the shell entry trusts. A pin behind the ref costs no safety, only the
+    # saving: a project dispatcher that differs from it makes the entry run the gate itself, while
+    # the project's dispatcher runs it too.
+    $dUp = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef -RelPath "scripts/hooks/shell-guard-dispatch.ps1"
+    $dSha = Get-GateHash $DispatchDst
+    $dVerdict = if (-not $dSha) { "NOT PINNED -- every shell call runs the gate in its own pwsh" }
+                elseif (-not $dUp.Available) { "UNVERIFIED -- $($dUp.Ref) could not be read" }
+                elseif ($dSha -eq $dUp.Sha) { "CURRENT with $($dUp.Ref)" }
+                else { "NOT CURRENT with $($dUp.Ref) -- a checkout at $($dUp.Ref) runs the gate twice per shell call until re-install" }
+    Write-Host "dispatcher  : $DispatchDst$(& $shortSha $dSha)  $dVerdict"
+
     if ($iSha -and $sSha) {
         if ($iSha -eq $sSha -and $up.Available -and $up.Sha -eq $iSha) {
             Write-Host "parity      : IN SYNC -- identical CONTENT to this checkout AND to $($up.Ref) (line endings are folded out, not compared)." -ForegroundColor Green
@@ -1185,8 +1196,10 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 #     beside the gate, checked against origin/main and protected by gate rule 1a. A working-tree
 #     dispatcher is a file any session can edit, and an edited one could write a proof without running
 #     the gate; a differing one, on any branch, makes this entry run the gate itself.
-# It stands down only when, after the wait began, <tool_use_id>.ok exists, holds this session's id,
-# is NEWER than the <tool_use_id>.wait this entry wrote, which must still exist, and is NOT newer than
+# It stands down only when, after the wait began, <tool_use_id>.ok exists, holds this session's id
+# and the path of the very gate this entry would run (the dispatcher finds the gate by USERPROFILE,
+# so a hook environment that disagrees with this install names another file, and is not trusted), is
+# NEWER than the <tool_use_id>.wait this entry wrote, which must still exist, and is NOT newer than
 # the <tool_use_id>.now this entry writes on seeing it. In every other case it runs the gate itself:
 #   * no dispatcher ran, or a broken one: no proof, so the wait ends and the gate runs;
 #   * the dispatcher's gate denied, decided, exited or threw: it writes <tool_use_id>.run, and the
@@ -1254,7 +1267,7 @@ if [[ $in =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]{1,100})\" ]]
           IFS= read -r p < "$d/$t.ok"
           { : > "$d/$t.now"; } 2>/dev/null
           [[ -e $d/$t.wait && -e $d/$t.now && $d/$t.ok -nt $d/$t.wait &&
-             ! $d/$t.ok -nt $d/$t.now && $p == "$s" ]] && exit 0
+             ! $d/$t.ok -nt $d/$t.now && ${p,,} == "${s,,}|${g,,}" ]] && exit 0
           break
         fi
         [[ -e $d/$t.run ]] && break

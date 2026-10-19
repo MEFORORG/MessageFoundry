@@ -61,13 +61,13 @@
     writes into the account's own Bash|PowerShell entry. That entry still runs for every call, in
     parallel with this file, and stands down only on this file's proof for the same call; the
     conditions it checks are stated once, in install-gate.ps1. This file's half: it writes
-    <account>/shell-guard-proof/<tool_use_id>.ok, holding the session id, only when the gate it ran
-    for this payload read all of it and finished normally with nothing on stdout -- a silent allow.
-    Anything else (a decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which
-    tells the entry to run the gate itself now. It also writes the `<session id>.session` hint the
-    entry waits on. The entry trusts that proof only from a copy of THIS file identical to the one
-    the installer pinned, so an edit here costs the saving until the next install, never the gate.
-    An account that does not delegate runs the gate itself, and this file skips it.
+    <account>/shell-guard-proof/<tool_use_id>.ok, holding `<session id>|<gate path>`, only when the
+    gate it ran for this payload read all of it and finished normally with nothing on stdout -- a
+    silent allow. Anything else (a decision, an exit, a throw, a missing gate) writes
+    `<tool_use_id>.run`, which tells the entry to run the gate itself now. It also writes the
+    `<session id>.session` hint the entry waits on. Which copy of this file the entry trusts, and
+    the rest of what it checks, is stated in install-gate.ps1. An account that does not delegate
+    runs the gate itself, and this file skips it.
 
     ORDER IS THE SETTINGS FILE'S: THE WORKTREE GATE FIRST, THEN THE BOUNDED GUARD. The account's
     entry is waiting on the gate's proof, so the gate must not queue behind guards that could use
@@ -118,7 +118,8 @@ function Write-ShellGuardProof([string]$Kind) {
         $final = [System.IO.Path]::Combine($ShellGuardProofDir, "$ShellGuardCall.$Kind")
         $part = "$final.$PID.tmp"
         # Written whole, then renamed, so the entry never reads a half-written proof.
-        [System.IO.File]::WriteAllText($part, "$ShellGuardSession`n")
+        # The gate's path too, so the entry stands down only for the gate it would have run itself.
+        [System.IO.File]::WriteAllText($part, "$ShellGuardSession|$($ShellGuardGate.Replace('\', '/'))`n")
         [System.IO.File]::Move($part, $final)
     } catch {
         # No proof only costs the entry its own run of the gate.
@@ -155,6 +156,7 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
     $ShellGuardProof = $null
     if ($ShellGuardPath -ceq '--user-hook=worktree_gate') {
         $ShellGuardPath = Join-Path $ShellGuardHome '.claude/hooks/worktree_gate.ps1'
+        $ShellGuardGate = $ShellGuardPath
         $ShellGuardHint = if ($ShellGuardSession) { [System.IO.Path]::Combine($ShellGuardProofDir, "$ShellGuardSession.session") } else { $null }
         $ShellGuardDelegated = $false
         try {
