@@ -180,16 +180,16 @@ and it allows up to 256 characters. The service then applies the whole notificat
 above, rules 1 to 9, and stores the value with the spaces around it stripped. A refusal is a 400 and
 leaves the whole save undone.
 
-Three cases differ from `POST /users`:
+At least these cases differ from `POST /users`:
 
 - Omitting the field keeps the stored value.
 - An explicit `null` clears it.
-- A value equal to the stored address, ignoring the whitespace around either, keeps the stored value
-  without a second check, so an address another writer stored, such as a directory sync, cannot
-  block an unrelated save.
-
-`email` on `POST /users` also seeds the notification address. On `PATCH /users/{user_id}` it does
-not.
+- A value equal to the address stored at the time of the save, ignoring the whitespace around
+  either, keeps the stored value without a second check. So an address another writer stored, such
+  as a directory sync, does not refuse a save that posts it back unchanged. A save that posts a
+  different value, such as one from a page read before that write, is checked.
+- `email` on `POST /users` also seeds the notification address. On `PATCH /users/{user_id}` it does
+  not.
 
 ### Federated subject
 

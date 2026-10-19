@@ -399,6 +399,28 @@ async def test_the_console_refuses_a_profile_email_creation_would_refuse(engine:
         assert user.display_name == "Renamed" and user.email == "new@example.test"
 
 
+async def test_the_console_saves_over_a_stored_profile_email_the_rule_refuses(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3278: the form posts the stored profile email back on every save, so a directory
+    value the rule refuses must not turn a display-name edit or a disable into a 400."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.update_user_profile(uid, display_name=None, email="not-an-address")
+        page = (await c.get(f"/ui/users/{uid}")).text
+        assert 'value="not-an-address"' in page  # what the form will post back
+        r = await _save_profile(
+            c, uid, {"display_name": "Renamed", "email": "not-an-address", "disabled": "on"}
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None
+        assert user.display_name == "Renamed" and user.disabled
+        assert user.email == "not-an-address"
+
+
 async def test_an_unrelated_console_save_leaves_the_notification_address(engine: Engine) -> None:
     """BACKLOG #1139, ADR 0182 Amendment A. The form is pre-filled with the stored profile email and
     posts it back on every save. A display-name edit must not copy it into the notification

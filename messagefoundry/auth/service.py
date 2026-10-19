@@ -13771,7 +13771,8 @@ class AuthService:
         (BACKLOG #3278, :func:`_require_account_email`).** A changed value must be one plain mailbox
         and is stored stripped; a blank one is refused. As above, the stored value posted back, with
         or without the whitespace around it, is kept as stored and not re-checked, so an address a
-        directory sync wrote cannot block an unrelated save, and ``None`` still clears. A refusal is
+        directory sync wrote does not refuse a save that posts it back unchanged, and ``None`` still
+        clears. "Stored" is the row read here, not the one the caller's page showed. A refusal is
         :class:`InvalidNotifyEmail`, raised before anything is written.
 
         **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
