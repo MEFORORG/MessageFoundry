@@ -376,6 +376,16 @@ deferred, truncated, withheld, expired, unreadable, name-rejected and claim-lost
 this channel's three observability rules applied to the caps: what the recipient sees must be a
 function of state, so "the box was truncated" can never render byte-identically to "the box was empty".
 
+**A drain that shows nothing reports only at `SessionStart`; at every other event it writes nothing.**
+Output from a `Stop` hook is not free context: it re-invokes the model. Measured 2026-10-18 in the
+primary checkout, whose box every session there shares: two messages addressed to other sessions made
+each `Stop` emit "Nothing is being shown to you", and an idle session was woken after every reply, at
+least 8 times about 13 seconds apart. The counters behind that line are mostly standing state, so the
+loop never ended on its own. The cost: a one-shot disposition seen at a turn boundary (an expiry, a
+stranding, a sweep) is narrated to nobody, because no later drain counts it again. An expiry still
+leaves the message in `expired/` and an `expired-unshown` receipt for its sender. A stranding leaves
+only `stranded/`, and a strand with no receipt reads as UNPROVEN to `mail.ps1 -Status`.
+
 ---
 
 ## Claiming a message: why the naive primitive was wrong

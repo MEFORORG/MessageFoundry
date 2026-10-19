@@ -3007,8 +3007,10 @@ class AuthService:
         self._reconcile_unkeyed_refused: dict[str, None] = {}
         if self.directory_reconcile_enabled:
             # Built now, at startup, so a reconciler's first refused audit write does not import
-            # the server drivers on the event loop (see `_audit_write_errors`).
+            # the server drivers on the event loop (see `_audit_write_errors`). The same for the
+            # rename refresh's holder re-read, which catches `_session_write_errors` (#3070).
             _audit_write_errors()
+            _session_write_errors()
         # The same for the soft catches that read store_call_errors (a refused enrolment's revoke,
         # the step-up refusal's session read), whichever plane meets a store fault first.
         store_call_errors()
@@ -7630,21 +7632,22 @@ class AuthService:
 
         ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its audit writes go
         through :meth:`_audit_reconciler_row`. The login path leaves it off, so there a refused
-        write still fails the sign-in, as it always has.
+        write still fails the sign-in, as it always has. It also lets a store fault on the ``held``
+        re-read skip the rename rather than raise (BACKLOG #3070; the reason is at that read).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
         both must resolve the collision case the same way. Two copies of this decision would be two
         policies, and the one that ran less often would be the one nobody noticed drifting.
 
-        ``held`` is the row currently holding ``new_username``, read by the caller. Passed rather than
-        re-read for the reason :meth:`_upsert_ad_user` gives about ``by_name``: it puts the dependency
-        in the signature instead of only in prose, and here it also saves a query the login caller
-        **provably** already has the answer to. ``_complete_ad_login`` reads that exact row before it
-        calls down, and refuses outright when it exists with a different id -- so the login path
-        reaches this method only with ``held=None``, and the collision branch below is reachable from
-        the **reconciler alone**, which probes an account it has already identified and has no such
-        guard.
+        ``held`` is the row holding ``new_username`` when the caller read it. One naming another
+        row is re-checked, not trusted: the rule is at the ``held`` pre-check below (BACKLOG
+        #3070). ``held=None`` skips that pre-check, so a holder appearing after the caller's read is
+        caught only by the write's guard. The login caller **provably** already has the answer:
+        ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
+        it exists with a different id -- so the login path reaches this method only with
+        ``held=None``, and the collision branch below is reachable from the **reconciler alone**,
+        which probes an account it has already identified and has no such guard.
 
         **THE CHECK-THEN-ACT RACE IS REAL AND IS ABSORBED BELOW, NOT PREVENTED BY THE STORE.** This
         docstring used to say the store's in-statement guard made "a row claiming the name between
@@ -7842,8 +7845,48 @@ class AuthService:
             )
             return
         if held is not None and held.id != user_id:
-            await _refuse(held.id, "pre_check", before.username)
-            return
+            # BACKLOG #3070. THE ONE STATEMENT OF THIS RULE. The caller read ``held`` before
+            # ``before``, so its holder may have let the name go since, and filing on that read
+            # would audit a conflict and warn of a lockout nobody faces. So the holder of
+            # ``new_username`` is read again here, after ``before``, and only a row that holds the
+            # name now is refused; the audit names that row. If nobody holds it, or this row does
+            # (a sign-in renamed it just now, and the compare-and-set below then writes nothing),
+            # it is no conflict. A verified holder load, not one statement, but only when the
+            # caller's read named another row.
+            #
+            # A holder that fails its seal at this re-read still holds the name, so it is refused
+            # as the caller's read would have been, with the lockout warning, not left to the
+            # write-path refusal's "a later pass retries it", which is false while that holder
+            # stays seal-failed. Its id is not verified, so the audit names ``held``, the last
+            # verified holder. NOT CLOSED HERE: the reconciler's own ``held`` read, and at least
+            # the two write-path holder reads below, still read a seal-failed holder as None; and
+            # ``refused`` also reads true for a holder deleted or re-keyed between the re-read's
+            # own row and role reads, a narrow window that still files this refusal.
+            #
+            # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
+            # one rename for this pass rather than raising: a raise would end the pass before the
+            # renames after this one. Nothing was written; a later pass that probes the account
+            # retries it. The other store reads in the rename loop still raise. A sign-in re-raises,
+            # so it fails loud as it does elsewhere in this method. The error tuple is cached and
+            # built at construction when the reconciler runs, so no driver is imported here.
+            try:
+                current = await self._lookup_by_username(new_username)
+            except _session_write_errors() as exc:
+                if not audit_soft:
+                    raise
+                _log.warning(
+                    "AD account %s: re-reading the holder of its new directory name (account %s "
+                    "held it at the first read) raised %s, so its rename was not applied on this "
+                    "pass; a later pass that probes it retries it (BACKLOG #3070)",
+                    user_id,
+                    held.id,
+                    type(exc).__name__,
+                )
+                return
+            if current.refused or (current.user is not None and current.user.id != user_id):
+                holder_id = held.id if current.user is None else current.user.id
+                await _refuse(holder_id, "pre_check", before.username)
+                return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.

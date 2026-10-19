@@ -865,6 +865,29 @@ def test_a_target_owning_an_unlanded_ledger_number_is_refused_and_force_is_not_t
     assert not wt.exists()
 
 
+def test_the_retired_allocator_tombstone_does_not_refuse_a_path_removal(rig: Rig) -> None:
+    """-Path shares the allocation guard with -Name, so it shares the tombstone skip (BACKLOG #1829).
+    The -Name tests in test_worktree_remove.py cover the near misses that must still refuse."""
+    wt = rig.add(rig.scratch("tomb"))
+    alloc = _common(rig) / "mefor-coord" / "alloc" / "backlog"
+    alloc.mkdir(parents=True)
+    tomb = {"number": "1000000", "kind": "backlog", "title": "t", "branch": "", "worktree": ""}
+    record = alloc / "1000000.json"
+
+    # The control: a string "true" is not the tombstone, so -Path must still refuse over it. Without
+    # this arm a -Path route that never read alloc/ would pass the assertion below.
+    record.write_text(json.dumps({**tomb, "tombstone": "true"}), encoding="utf-8")
+    refused = rig.run("-Path", str(wt), "-Force")
+    assert refused.returncode != 0, "-Path proceeded past a near-tombstone"
+    assert "1000000.json" in _out(refused)
+    assert wt.exists()
+
+    record.write_text(json.dumps({**tomb, "tombstone": True}), encoding="utf-8")
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
 def test_path_runs_no_blanket_prune_so_another_stale_registration_survives(rig: Rig) -> None:
     """`git worktree prune` drops every registration whose directory is missing, with the HEAD reflog
     each one holds. This route removes one worktree and must leave the others exactly as they were."""

@@ -458,10 +458,11 @@ if ($Send) {
     # two items -- stranded for a whole session while the recipient read that lane as silent. The send
     # path printed `Queued 1 message(s)` for every one of them.
     #
-    # THE ASYMMETRY IS THE DEFECT, and it is why this check goes HERE. The drain ALREADY reports its
-    # side ("N message(s) are addressed to a different session id and were left in the inbox"), so the
-    # recipient is told. The SENDER is told nothing, and the sender is the only party who can correct
-    # the id.
+    # THE ASYMMETRY IS THE DEFECT, and it is why this check goes HERE. The drain reports its side
+    # ("N message(s) are addressed to a different session id and were left in the inbox"), but at
+    # SessionStart ONLY: a Stop drain that shows nothing is silent, because output at Stop re-wakes the
+    # model. So a recipient already running when the mail lands is NOT told. The SENDER is told nothing
+    # either, and the sender is the only party who can correct the id.
     #
     # THE SHAPE: a harness session id is a bare UUID (the drain reads `$hook.session_id`). The MCP
     # namespace prefixes its own (`local_<uuid>`), and that is exactly the shape that stranded them --
