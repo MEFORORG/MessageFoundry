@@ -375,28 +375,39 @@ def test_show_names_the_stray_variable_that_made_the_report_partial(
 #: Only ``security show``'s own table is built straight from the file, so only these keys reach the
 #: direct-build refusal from it. Every other removed key reaches it through the loader's refusal.
 _SECURITY_REMOVED_KEYS = sorted(key for section, key in _REMOVED_KEYS if section == "security")
+# An empty list would turn both tests below into a silent skip.
+assert _SECURITY_REMOVED_KEYS, "no removed [security] key left to test"
+
+
+def _show_refusal(path: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    assert main(["security", "show", "--service-config", str(path), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert isinstance(error, str)
+    return error
 
 
 @pytest.mark.parametrize("key", _SECURITY_REMOVED_KEYS)
-def test_show_never_says_no_variable_set_a_removed_key(
+def test_show_makes_no_claim_about_where_a_removed_key_was_not_set(
     key: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The key is in the file AND the environment, as a service environment may still set it.
+    """The key is in the file, and the run is repeated with the environment setting it too.
 
-    The refusal comes from the section built from the file's table, which read no variable. It
-    used to say so as "no environment variable set it", which sent an operator away from the
-    variable the service would still refuse at start."""
+    The refusal comes from the section built from the file's table, so it is the same text in both
+    runs: it cannot know what the environment holds. It used to say "no environment variable set
+    it", which sent an operator away from a variable the service would still refuse at start. The
+    removal step now follows the decision directly, with no claim about where the key came from."""
     toml = tmp_path / "mf.toml"
     toml.write_text(f"[security]\n{key} = false\n", encoding="utf-8")
+    file_only = _show_refusal(toml, capsys)
     monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_{key.upper()}", "false")
-    rc = main(["security", "show", "--service-config", str(toml), "--json"])
-    printed = "".join(capsys.readouterr())
-    # Control: the direct-build refusal, the one that carried the claim, reached the output.
-    assert rc == 1 and "invalid [security]" in printed and f"Remove `{key}`" in printed
-    assert "environment" not in printed
+    file_and_env = _show_refusal(toml, capsys)
+    assert file_and_env == file_only
+    assert file_only.startswith("invalid [security]")
+    assert f"{_REMOVED_KEYS['security', key]}. Remove `{key}` from" in file_only
+    assert "no environment variable" not in file_only
 
 
 @pytest.mark.parametrize("key", _SECURITY_REMOVED_KEYS)
@@ -406,8 +417,8 @@ def test_show_names_the_variable_that_set_a_removed_key(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control: with the key in the environment only, the file builds and the partial reason
-    is the loader's refusal, which names the variable to unset."""
+    """With the key in the environment only, the file builds and the partial reason is the
+    loader's refusal, which names the variable to unset."""
     toml = tmp_path / "mf.toml"
     toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
     variable = f"{_ENV_PREFIX}SECURITY_{key.upper()}"
