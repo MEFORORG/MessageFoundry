@@ -215,8 +215,8 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
             # The one place the baseline is added. The stdlib ends every header block it writes
             # here: this handler's answers, send_error's, and the interim 100 Continue. So an
             # answer written before _serve runs (a malformed request, an unknown method) is
-            # covered without naming it. The interim 100 gets the baseline too, harmlessly: owner
-            # ruling R3 of 2026-09-28 puts an interim 1xx outside the verb, so it is not required
+            # covered without naming it. The interim 100 gets the baseline too, harmlessly: R3 in the
+            # vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts an interim 1xx outside the verb, so it is not required
             # there, and the suite does not pin it.
             for name, value in BASELINE_RESPONSE_HEADERS:
                 self.send_header(name, value)

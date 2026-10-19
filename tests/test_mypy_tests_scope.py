@@ -112,15 +112,17 @@ def test_ci_type_checks_the_harness_sinks_as_a_hard_gate() -> None:
     """BACKLOG #3358 item 11: the harness's HTTP-answering sinks are type-checked, on the engine
     pass's terms, once for each platform the engine is checked for."""
     steps = _mypy_steps()
-    sink_argvs = {
-        tuple(argv[1:]): step for step, argv in steps if argv[-2:] == ["-p", "harness.sinks"]
-    }
-    assert set(sink_argvs) == {
-        ("-p", "harness.sinks"),
-        ("--platform", "win32", "-p", "harness.sinks"),
-    }, f"expected one linux and one win32 ci.yml mypy step over harness.sinks: {steps}"
+    # A list, not a dict keyed on argv, so a duplicated step is seen as two.
+    sink_steps = [(step, argv) for step, argv in steps if "harness.sinks" in argv]
+    platforms = sorted(
+        argv[argv.index("--platform") + 1] if "--platform" in argv else "linux"
+        for _, argv in sink_steps
+    )
+    assert platforms == ["linux", "win32"], (
+        f"expected one linux and one win32 ci.yml mypy step over harness.sinks: {steps}"
+    )
     engine = next(s for s, argv in steps if "messagefoundry_webconsole" in argv)
-    for step in sink_argvs.values():
+    for step, _ in sink_steps:
         assert "continue-on-error" not in step, "a soft-failing type-check gates nothing"
         assert step.get("if") == engine.get("if"), (
             "the harness.sinks passes must run exactly when the linux engine pass does"

@@ -536,8 +536,8 @@ jobs:
       #     branch runs on the Windows pytest legs, where a defect in it fails the run.
       #   * Placed straight after the linux engine pass so it reuses that pass's mypy cache; after
       #     the win32 pass it re-analyses the engine modules the tests import.
-      #   * NOT REPO-WIDE. At least harness/, tee/, scripts/ (all but scripts/asvs/, which has its
-      #     own step below), samples/, docker/, fuzz/, docs/**/*.py and
+      #   * NOT REPO-WIDE. At least harness/ (all but harness/sinks/, which has its own steps
+      #     below), tee/, scripts/ (all but scripts/asvs/, which has its own step below), samples/, docker/, fuzz/, docs/**/*.py and
       #     packaging/messagefoundry-webconsole/tests/ are outside every mypy step. mypy follows a
       #     test's import into harness/ or scripts/, but the editable install reports those modules
       #     as silenced site-packages, so a green step says nothing about them.

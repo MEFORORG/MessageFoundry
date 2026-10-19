@@ -635,9 +635,11 @@ async def _frame_error_before_accept(
     finally:
         if writer is not None:
             writer.close()
-        # A raising stop leaves the connection open, so the app never sees its disconnect.
+        # A raising stop leaves the connection open, so the app never sees its disconnect. Await
+        # the cancel, so what uvicorn's task raises on it is retrieved here and not at a later GC.
         for task in app_tasks:
             task.cancel()
+        await asyncio.gather(*app_tasks, return_exceptions=True)
     return stopped, ended_and_open, raw
 
 

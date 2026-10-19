@@ -91,7 +91,7 @@ def _blocks(raw: bytes) -> list[_Block]:
 
 def _assert_floored(raw: bytes, statuses: list[int]) -> None:
     """The baseline, once each, on every FINAL answer, and no HSTS or Server line on any block.
-    An interim 1xx is not required to carry the baseline: owner ruling R3 of 2026-09-28 puts it
+    An interim 1xx is not required to carry the baseline: R3 in the vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts it
     outside the verb (BACKLOG #1120, #3358 item 9). The sink happens to add it there too."""
     blocks = _blocks(raw)
     assert [status for status, _ in blocks] == statuses, raw[:200]
@@ -295,6 +295,7 @@ def test_the_stdlib_still_answers_http_0_9_requests_bare() -> None:
     bare, the stdlib changed again: re-read it, and if none is bare, the override can go."""
     requests = {case.id: cast(bytes, case.values[0]) for case in _BARE_ON_SOME_PYTHON}
     for case_id in _BARE_ON_EVERY_PYTHON_READ:
+        assert case_id in requests, f"{case_id} is no longer among the bare-on-some cases"
         assert _is_bare(_plain_stdlib_answer(requests[case_id])), (
             f"Python {platform.python_version()} answers {case_id} unbare"
         )

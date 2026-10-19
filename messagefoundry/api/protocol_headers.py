@@ -491,6 +491,8 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
         # library asserts on a second end-of-stream, and uvicorn makes this call at server stop
         # for a connection it answered and has not finished closing. See the module docstring.
         # DEBUG, not WARNING: every server stop with such a connection open takes this path.
+        # So does an app's later answer, the 101 included, on a conn that a pre-accept frame
+        # error ended; nothing can be written there either.
         _log.debug("ws-sansio: dropped a handshake answer on a conn that had ended its stream")
         return
     try:
