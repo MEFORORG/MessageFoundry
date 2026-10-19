@@ -3346,9 +3346,11 @@ class AuthSettings(_Section):
     # seconds — the one deadline all the pages of the nested group search share (auth/ldap.py
     # _search_paged, vault BACKLOG #3696). Each page's reads are still bounded by
     # ad_receive_timeout, so a directory that stops answering fails at that, not at this. Well
-    # above it on purpose: a search past it refuses the account, which the reconciler then cannot
-    # revoke. 120 s is twelve per-read stalls, and still below the 200 s the old 20-page cap
-    # allowed. Validated and named as a loosening with the two timeouts above.
+    # above it on purpose: a search past it refuses the account, whose roles and scope the
+    # reconciler then cannot re-read. 120 s is twelve per-read stalls. NOT a hard wall-clock bound:
+    # it caps each read of a page at what is left, so a page that arrives over several reads can
+    # run past it (docs/CONNECTIONS.md, the Active Directory row). Validated and named as a
+    # loosening with the two timeouts above.
     ad_group_search_deadline: float = 120.0
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) -------------------------------
@@ -8654,9 +8656,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             (
                 "ad_group_search_deadline",
                 "the nested group search's overall deadline",
-                "the paged group search of a sign-in or a session recheck, against a domain "
-                "controller that keeps answering slowly, holds a worker thread longer before it "
-                "is refused",
+                "the paged group search of a directory call (at least a sign-in, a step-up and "
+                "a session recheck), against a domain controller that keeps answering slowly, "
+                "holds a worker thread longer before it is refused",
             ),
         ):
             value, default = getattr(auth, field), _auth_default(field)

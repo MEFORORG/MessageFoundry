@@ -24,6 +24,7 @@ from messagefoundry.auth.ldap import (
     PAGING_TOO_MANY_ENTRIES,
     PAGING_TOO_MANY_PAGES,
     LdapError,
+    LdapReferralError,
     LdapUnansweredError,
 )
 from messagefoundry.auth.service import AuthService
@@ -95,7 +96,8 @@ async def test_a_bounded_group_search_pages_once_per_state_change(
     """The page and its audit row come as the account enters the state, not on the next pass, and
     again after the account reads normally and then enters it once more. Alone, the pass is
     outage-shaped (``directory_unavailable``), which pages nobody for the outage, and still pages
-    for this. The account is never revoked meanwhile: the refusal still reads UNAVAILABLE."""
+    for this. The enabled account's sessions are not revoked meanwhile: it still reads
+    UNAVAILABLE."""
     store = await MessageStore.open(":memory:")
     try:
         names = ("jdoe",) if alone else ("jdoe", "asmith")
@@ -104,7 +106,7 @@ async def test_a_bounded_group_search_pages_once_per_state_change(
 
         plan, pages = await _pages(service)
         assert plan.directory_outage is alone
-        assert plan.paging_refused == (("jdoe", cause),)
+        assert [(name, why) for _uid, name, why in plan.paging_refused] == [("jdoe", cause)]
         assert [(name, fields["reason"]) for name, fields in pages] == [(f"{_SOURCE}jdoe", cause)]
         assert await _rows(store) == [("jdoe", cause)]
 
@@ -124,19 +126,73 @@ async def test_a_bounded_group_search_pages_once_per_state_change(
         await store.close()
 
 
-async def test_a_change_of_bound_pages_again_and_the_text_carries_only_the_account() -> None:
-    """A deadline refusal that becomes a cap refusal is a state change. The detail names the
-    account and the setting, and nothing the directory sent."""
+async def test_a_change_of_bound_is_not_a_new_state_and_the_text_names_no_directory_value() -> None:
+    """An account that alternates between the deadline and the cap stays in one state, so it
+    pages once. The detail names the setting, not the account, which is in the source only, and
+    nothing the directory sent."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap, _tokens = await _service(store, "jdoe", "asmith")
         ldap.broken["jdoe"] = _bounded(PAGING_DEADLINE_SPENT)
-        await _pages(service)
-        ldap.broken["jdoe"] = _bounded(PAGING_TOO_MANY_ENTRIES)
         [(name, fields)] = (await _pages(service))[1]
-        assert (name, fields["reason"]) == (f"{_SOURCE}jdoe", reconcile.PAGING_CAP)
-        assert fields["detail"].startswith("jdoe: the directory group search returned more groups")
-        assert "synthetic" not in fields["detail"]
+        assert (name, fields["reason"]) == (f"{_SOURCE}jdoe", reconcile.PAGING_DEADLINE)
+        assert "ran past [auth].ad_group_search_deadline" in fields["detail"]
+        assert "synthetic" not in fields["detail"] and "jdoe" not in fields["detail"]
+        ldap.broken["jdoe"] = _bounded(PAGING_TOO_MANY_ENTRIES)
+        assert (await _pages(service))[1] == []
+        ldap.broken["jdoe"] = _bounded(PAGING_DEADLINE_SPENT)
+        assert (await _pages(service))[1] == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "unjudged",
+    [LdapReferralError("synthetic: referred"), KeyError("synthetic")],
+    ids=["referral", "probe-fault"],
+)
+async def test_a_referral_or_fault_does_not_re_arm(unjudged: Exception) -> None:
+    """A referral or a probe fault judged nothing about the account, so, like an outage, it says
+    nothing about the bound: the account stays latched and does not page again. Its own detail is
+    not a bound either, so it raises no paging page of its own."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, _tokens = await _service(store, "jdoe", "asmith")
+        ldap.broken["jdoe"] = _bounded(PAGING_TOO_MANY_ENTRIES)
+        assert len((await _pages(service))[1]) == 1
+        ldap.broken["jdoe"] = unjudged
+        assert (await _pages(service))[1] == [], "a referral or fault paged as a paging refusal"
+        ldap.broken["jdoe"] = _bounded(PAGING_TOO_MANY_ENTRIES)
+        assert (await _pages(service))[1] == [], "an unjudged answer re-armed the latch"
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_raises_before_the_row_pages_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The latch is set only once the entry is recorded. A pass that raises before then leaves
+    the account to enter again on the next pass, so its page and row are delayed, never lost."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, _tokens = await _service(store, "jdoe", "asmith")
+        ldap.broken["jdoe"] = _bounded(PAGING_DEADLINE_SPENT)
+        calls = 0
+        real = service._record_reconcile_fault
+
+        async def raise_once(plan: reconcile.ReconcilePlan) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("synthetic: the pass fails part-way")
+            await real(plan)
+
+        monkeypatch.setattr(service, "_record_reconcile_fault", raise_once)
+        with pytest.raises(RuntimeError, match="part-way"):
+            await service.reconcile_directory_sessions()
+        assert await _rows(store) == []
+        assert len((await _pages(service))[1]) == 1, "the entry was lost with the failed pass"
+        assert await _rows(store) == [("jdoe", reconcile.PAGING_DEADLINE)]
     finally:
         await store.close()
 

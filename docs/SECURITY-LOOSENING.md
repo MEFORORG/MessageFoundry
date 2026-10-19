@@ -759,7 +759,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 ### `[auth].ad_connect_timeout`, `ad_receive_timeout` or `ad_group_search_deadline` above its default **with `ad_enabled`** — a stalled directory call holds a thread longer
 > **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
 > BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above its default: `10` s for the two timeouts, `120` s for the deadline (vault BACKLOG #3696). A shorter timeout
-> fails a stalled call sooner, which is stricter, and is not named. Neither has an off value: the
+> fails a stalled call sooner, which is stricter, and is not named. None has an off value: the
 > row in the table above gives what the load refuses.
 - **What you lose:** each directory call runs in a worker thread until the domain controller answers
   or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
@@ -770,12 +770,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `ad_receive_timeout`.
 - **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
   for a healthy round trip, or `120` s too short for a healthy nested group search of the largest
-  account. A search refused at the deadline fails that account's sign-in, and the reconciler pages
-  for it rather than revoking it.
+  account. A search refused at the deadline fails that directory call, a sign-in for example, and
+  the reconciler pages for that account rather than re-reading its roles and scope.
 - **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
   how many start per window, not how many are held, and a session recheck does not pass it. So
   raise the timeout only as far as the measured round trip, or the measured group search, needs.
-- **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
+- **Reversible:** yes, immediately — restore the default, `10` for the two timeouts and `120` for the
+  deadline (or delete the line), and restart.
 
 ### `[auth].require_action_step_up = false` — the action-bound step-up falls back to the session window
 > Reported whenever it is `false` (vault BACKLOG #2600). The default is `true`

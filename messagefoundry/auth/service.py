@@ -1806,6 +1806,15 @@ _PAGING_BOUND_CAUSES: Final[Mapping[str, str]] = MappingProxyType(
         PAGING_TOO_MANY_PAGES: reconcile.PAGING_CAP,
     }
 )
+#: The outcomes that judged nothing about the account, so they neither enter nor re-arm the paging
+#: refusal's latch: the rule `_track_reconcile_episodes` applies to its own conditions.
+_PAGING_UNJUDGED: Final = frozenset(
+    {
+        reconcile.ProbeOutcome.UNAVAILABLE,
+        reconcile.ProbeOutcome.REFERRED,
+        reconcile.ProbeOutcome.FAULT,
+    }
+)
 
 #: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
 #: #2434). None is counted toward the lockout. ``None`` means no lookup ran. ``_reauth_ad`` refuses
@@ -2967,9 +2976,10 @@ class AuthService:
         #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
         #: probe rotation, so two unreadable accounts sampled on different passes are still two.
         self._reconcile_outcomes: dict[str, reconcile.ProbeOutcome] = {}
-        #: user_id -> the bound that refused that account's group search on its latest probe that
-        #: reached the directory (vault BACKLOG #3696). The latch that makes the page fire once
-        #: per account per state change: `_note_paging_refusals` is its only writer.
+        #: user_id -> the bound that first refused that account's group search in its current
+        #: paging-refused state (vault BACKLOG #3696). The latch that makes the page fire once per
+        #: account per state change: `_record_paging_refusals` sets it, `_note_paging_refusals`
+        #: re-arms it, and the prune drops an account that left.
         self._reconcile_paging_refused: dict[str, str] = {}
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
         #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
@@ -7045,43 +7055,50 @@ class AuthService:
 
     def _note_paging_refusals(
         self, probes: Iterable[reconcile.Probe]
-    ) -> tuple[tuple[str, str], ...]:
-        """``(username, cause)`` of each probed account that ENTERED the paging-refused state on
-        this pass, and move the latch (vault BACKLOG #3696).
+    ) -> tuple[tuple[str, str, str], ...]:
+        """``(user_id, username, cause)`` of each probed account that ENTERS the paging-refused
+        state on this pass (vault BACKLOG #3696).
 
         Its group search was refused for the engine's own bound, past
-        ``[auth].ad_group_search_deadline`` or past the entry cap, so it reads UNAVAILABLE and is
-        never revoked while that lasts. Unlike an outage it recurs on every pass, so it pages,
-        once: an account already latched with the same cause is not returned again. Any outcome
-        but UNAVAILABLE re-arms the account. A plain outage (UNAVAILABLE with no cause) leaves the
-        latch alone, since it says nothing about the bound. An account that left the candidate set
-        is pruned from the latch with the other records, and the latch is process-local, so a
-        restart pages a standing one once more. :meth:`_record_paging_refusals` logs and audits
-        each entry; the lifespan task pages it as ``ad_reconcile_aborted``.
+        ``[auth].ad_group_search_deadline`` or past the cap on groups or pages, so it reads
+        UNAVAILABLE. A disable or deletion still strikes, because the user search runs first; what
+        stops is the role and scope re-diff of an enabled account. Unlike an outage it recurs on
+        every pass, so it pages, once per state change: an account already latched is not
+        returned again, whichever bound refused it this time. An outcome that judged the account
+        (any but UNAVAILABLE, REFERRED or FAULT) re-arms it here; one that judged nothing says
+        nothing about the bound and leaves the latch alone. **The latch is set only once the entry
+        is recorded** (:meth:`_record_paging_refusals`), so a pass that raises before that point
+        leaves the account to enter again on the next pass rather than never page. An account that
+        left the candidate set is pruned with the other records, and the latch is process-local, so
+        a restart pages a standing one once more.
         """
         latch = self._reconcile_paging_refused
-        entered: list[tuple[str, str]] = []
+        entered: list[tuple[str, str, str]] = []
         for probe in probes:
-            if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE:
+            if probe.outcome not in _PAGING_UNJUDGED:
                 latch.pop(probe.user_id, None)
-            elif probe.detail is not None and latch.get(probe.user_id) != probe.detail:
-                latch[probe.user_id] = probe.detail
-                entered.append((probe.username, probe.detail))
+            elif (
+                probe.outcome is reconcile.ProbeOutcome.UNAVAILABLE
+                and probe.detail is not None  # REFERRED and FAULT carry a detail of their own
+                and probe.user_id not in latch
+            ):
+                entered.append((probe.user_id, probe.username, probe.detail))
         return tuple(entered)
 
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
-        """Log and audit each account that entered the paging-refused state (vault BACKLOG #3696).
+        """Log, audit and latch each account entering the paging-refused state (vault BACKLOG
+        #3696).
 
         One WARNING and one ``auth.ad_reconcile_paging_refused`` row per entry, naming the account
         as ``actor``, so the page the lifespan task raises for it matches a row, as every
         reconcile alert does (ASVS 8.3.2). Written after the revocations, like the referral's and
         the fault's rows, and through the same soft write, so a refused row costs only its row.
         """
-        for username, cause in plan.paging_refused:
+        for user_id, username, cause in plan.paging_refused:
             _log.warning(
                 "directory reconcile: the group search for %s was refused for its bound (%s), so "
-                "its sessions cannot be revoked while this lasts",
-                username,
+                "its roles and channel scope are not re-read while this lasts",
+                scrub_log_argument(username),
                 cause,
             )
             await self._audit_reconciler_row(
@@ -7089,6 +7106,7 @@ class AuthService:
                 actor=username,
                 detail=_json({"reason": cause, "probed": plan.probed, "aborted": plan.aborted}),
             )
+            self._reconcile_paging_refused[user_id] = cause
 
     async def reconcile_directory_sessions(self) -> reconcile.ReconcilePlan:
         """Run one reconciliation pass and apply it; return what it did (for the loop + tests).

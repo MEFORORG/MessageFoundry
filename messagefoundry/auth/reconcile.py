@@ -186,9 +186,9 @@ PROBE_FAULT_ABORT = ProbeOutcome.FAULT.value
 
 #: The causes of an :attr:`ProbeOutcome.UNAVAILABLE` probe whose group search the engine refused
 #: for its own bounds (vault BACKLOG #3696): past ``[auth].ad_group_search_deadline``, or past the
-#: entry cap or its page backstop. Each pages, once per account as it enters
+#: cap on groups or its page backstop. It pages, once per account as it enters that state
 #: (``AuthService._note_paging_refusals``): unlike an outage it does not pass on its own, and the
-#: account is never revoked while it lasts. Also the alert's ``reason``.
+#: enabled account's roles and scope are not re-read while it lasts. Also the alert's ``reason``.
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
 
@@ -276,11 +276,11 @@ class ReconcilePlan:
     hold_clear: bool = False
     referral_clear: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (vault BACKLOG #3696):
-    #: ``(username, cause)`` of each account that has just ENTERED the state of reading UNAVAILABLE
-    #: because its group search was refused for its bounds, ``cause`` being :data:`PAGING_DEADLINE`
-    #: or :data:`PAGING_CAP`. An account already in that state is not here, so each pages once per
-    #: state change. Set on every pass, an outage-shaped one included.
-    paging_refused: tuple[tuple[str, str], ...] = ()
+    #: ``(user_id, username, cause)`` of each account that has just ENTERED the state of reading
+    #: UNAVAILABLE because its group search was refused for its bounds, ``cause`` being
+    #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
+    #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
+    paging_refused: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def directory_outage(self) -> bool:
