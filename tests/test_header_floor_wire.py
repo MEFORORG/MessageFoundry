@@ -591,74 +591,82 @@ async def _frame_error_before_accept(
     ws_class: type[Any],
 ) -> tuple[AssertionError | None, bool, bytes | None]:
     """Serve ``ws_class`` on a real socket. The client sends a valid upgrade and, while the app has
-    not yet answered it, a frame websockets refuses; the app then refuses the handshake, and the
-    server stops. Returns what the stop raised, whether the frame had ended the conn's stream
-    before the app refused, and, when the stop returned, every byte the client read."""
+    not answered it, a frame websockets refuses, which ends the conn's stream with nothing
+    written. The server then stops with that connection still open, so ``Server.shutdown`` hands
+    it uvicorn's stop-time 500.
+
+    Returns what the stop raised (or the start check, which the caller tells apart by where it was
+    raised), whether the conn had ended its stream and was still in the server's set as the stop
+    began, and, when the stop returned, every byte the client read."""
     connected = asyncio.Event()
-    refuse = asyncio.Event()
-    refused = asyncio.Event()
+    app_tasks: list[asyncio.Task[Any]] = []
 
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
-        await receive()
+        task = asyncio.current_task()
+        if task is not None:
+            app_tasks.append(task)
+        await receive()  # websocket.connect
         connected.set()
-        await refuse.wait()
-        try:
-            await send({"type": "websocket.close", "code": 1000})
-        finally:
-            refused.set()  # the bare class raises out of send; the stop must still follow it
+        await receive()  # websocket.disconnect, once the stop has closed the connection
 
     stopped: AssertionError | None = None
-    ended = False
+    ended_and_open = False
+    raw: bytes | None = None
     writer: asyncio.StreamWriter | None = None
     try:
-        # Nothing in the block asserts, so an AssertionError here is the stop's, raised as the
-        # block exits.
-        async with _serving(app, ws=ws_class) as (port, server):
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            writer.write(_HANDSHAKE.format(path="/ws/stats").encode())
-            await writer.drain()
-            await asyncio.wait_for(connected.wait(), 10.0)
-            writer.write(_UNMASKED_FRAME)
-            await writer.drain()
-            for _ in range(500):
-                conns: list[Any] = list(server.server_state.connections)
-                ended = bool(conns) and all(getattr(p.conn, "eof_sent", False) for p in conns)
-                if ended:
-                    break
-                await asyncio.sleep(0.01)
-            refuse.set()
-            await asyncio.wait_for(refused.wait(), 10.0)
-    except AssertionError as exc:
-        stopped = exc
-    try:
-        # After a raising stop the connection is left open, so there is nothing to read to EOF.
-        raw = None if stopped is not None else await asyncio.wait_for(reader.read(), 10.0)
+        try:
+            async with _serving(app, ws=ws_class) as (port, server):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(_HANDSHAKE.format(path="/ws/stats").encode())
+                await writer.drain()
+                await asyncio.wait_for(connected.wait(), 10.0)
+                writer.write(_UNMASKED_FRAME)
+                await writer.drain()
+                for _ in range(500):
+                    conns: list[Any] = list(server.server_state.connections)
+                    ended_and_open = len(conns) == 1 and conns[0].conn.eof_sent is True
+                    if ended_and_open:
+                        break
+                    await asyncio.sleep(0.01)
+        except AssertionError as exc:
+            stopped = exc
+        if stopped is None:
+            raw = await asyncio.wait_for(reader.read(), 10.0)
     finally:
         if writer is not None:
             writer.close()
-    return stopped, ended, raw
+        # A raising stop leaves the connection open, so the app never sees its disconnect.
+        for task in app_tasks:
+            task.cancel()
+    return stopped, ended_and_open, raw
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the selector loop closes a transport whose data_received raised, and uvicorn 0.54.0's "
+    "data_received raises on this frame, so no ended conn is left open at stop there; the "
+    "Windows proactor loop, the service's, leaves it open",
+)
 async def test_a_frame_error_before_accept_stops_cleanly_with_nothing_written() -> None:
     """``Server.shutdown`` on a real socket, on a floored connection whose conn has ended its
     stream with no answer written and is still open (BACKLOG #3343, and #3358 item 6, which engine
     PR 2210 inferred and did not measure). A client frame websockets refuses before the app answers
-    is one way there. uvicorn then hands the conn the app's refusal and, at stop, a 500.
+    is one way there.
 
-    The control is the bare class: websockets asserts on that refusal and on each 500 after it, and
-    the last of them raises out of ``Server.shutdown``, so the engine's own shutdown would not run.
-    Floored, each answer is dropped on the ended conn, nothing is written, the connection is closed
-    and the stop returns. Remove the floor's ``eof_sent`` check and the floored half fails as the
-    bare one does."""
+    The control is the bare class: at stop, uvicorn sends that connection a 500, websockets
+    asserts on the second end of stream, and the raise comes out of ``Server.shutdown``, so the
+    engine's own shutdown would not run. Floored, the 500 is dropped, nothing is written, the
+    connection is closed and the stop returns. Remove the floor's ``eof_sent`` check and the
+    floored half fails as the bare one does."""
     bare_stop, bare_ended, _ = await _frame_error_before_accept(WebSocketsSansIOProtocol)
-    assert bare_ended, "the frame never ended the bare conn's stream"
+    assert bare_ended, "the bare conn was not ended and still open as the stop began"
     assert bare_stop is not None, "the bare stop returned; uvicorn changed this path"
     _assert_raised_in_websockets(bare_stop)
 
     floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored is not None
     stopped, ended, read = await _frame_error_before_accept(floored)
-    assert ended, "the frame never ended the floored conn's stream"
+    assert ended, "the floored conn was not ended and still open as the stop began"
     assert stopped is None, f"the floored stop raised: {stopped!r}"
     assert read == b"", read
 

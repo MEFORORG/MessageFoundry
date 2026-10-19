@@ -31,9 +31,11 @@ mean a server writer. "Assignment" covers ``x.name = ...``, a class-level ``name
 annotated assignment, and ``setattr(x, "name", ...)`` with a literal name.
 
 ``transport-write`` is for bytes put on an asyncio transport below every ASGI stack, which
-``status-line`` sees only when they are a literal. The protocol floor writes one answer that way,
-bytes the websockets parser built (BACKLOG #3358 item 2). A write through a name other than
-``transport`` evades it.
+``status-line`` sees only when they are a literal. It finds the protocol floor's parser-rejection
+step, which writes bytes the websockets parser built (BACKLOG #3358 item 2). A write through a
+name other than ``transport`` evades it: at least the floor's ``_HeaderInjectingTransport``, which
+forwards the server's own writes through ``self._inner`` and is covered by the
+``protocol-override`` entries for the answers it serves.
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
 only emitters of a shape listed above, in the literal spelling the table gives: an aliased import

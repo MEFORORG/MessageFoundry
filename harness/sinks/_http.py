@@ -222,12 +222,13 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
                 self.send_header(name, value)
             super().end_headers()
 
-        def send_response(self, code: int, message: str | None = None) -> None:
-            # The stdlib's own, less its Server line, which names the Python patch level. The
-            # engine listener's answers carry none. send_error answers through here too.
-            self.log_request(code)
-            self.send_response_only(code, message)
-            self.send_header("Date", self.date_time_string())
+        def send_header(self, keyword: str, value: str) -> None:
+            # Every header line goes through here. The stdlib's send_response adds a Server line
+            # naming the Python patch level, for its own answers and send_error's; the engine
+            # listener's answers carry none, so it is dropped. Filtering here, not copying
+            # send_response, keeps the rest of that method the stdlib's.
+            if keyword.lower() != "server":
+                super().send_header(keyword, value)
 
         # The stdlib writes an answer in HTTP/0.9 form whenever request_version reads "HTTP/0.9":
         # a bare body, with no status line and no header block for end_headers to add to. That is

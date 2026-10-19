@@ -103,7 +103,7 @@ At least these run on every change. A finding they would raise is noise in a rev
 | Check | What it covers |
 |---|---|
 | `ruff check`, `ruff format --check` | Style, imports, a bare `except:`, the bugbear family including B904, RUF006 |
-| `mypy` strict, four legs in `ci.yml` | Types |
+| `mypy` strict, every leg in `ci.yml` | Types |
 | `tests/test_dependency_boundaries.py` | PySide6 or FastAPI in engine packages; clients importing the engine |
 | `tests/test_from_none_is_not_redaction.py` | New `raise ... from None` in engine code |
 | `tests/test_link_resolution.py` | Relative markdown links |

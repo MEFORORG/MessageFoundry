@@ -110,18 +110,21 @@ def test_ci_type_checks_scripts_asvs_as_a_hard_gate() -> None:
 
 def test_ci_type_checks_the_harness_sinks_as_a_hard_gate() -> None:
     """BACKLOG #3358 item 11: the harness's HTTP-answering sinks are type-checked, on the engine
-    pass's terms."""
+    pass's terms, once for each platform the engine is checked for."""
     steps = _mypy_steps()
-    sink_steps = [step for step, argv in steps if argv[1:] == ["-p", "harness.sinks"]]
-    assert len(sink_steps) == 1, (
-        f"expected exactly one ci.yml mypy step over harness.sinks: {steps}"
-    )
-    step = sink_steps[0]
-    assert "continue-on-error" not in step, "a soft-failing type-check gates nothing"
+    sink_argvs = {
+        tuple(argv[1:]): step for step, argv in steps if argv[-2:] == ["-p", "harness.sinks"]
+    }
+    assert set(sink_argvs) == {
+        ("-p", "harness.sinks"),
+        ("--platform", "win32", "-p", "harness.sinks"),
+    }, f"expected one linux and one win32 ci.yml mypy step over harness.sinks: {steps}"
     engine = next(s for s, argv in steps if "messagefoundry_webconsole" in argv)
-    assert step.get("if") == engine.get("if"), (
-        "the harness.sinks pass must run exactly when the linux engine pass does"
-    )
+    for step in sink_argvs.values():
+        assert "continue-on-error" not in step, "a soft-failing type-check gates nothing"
+        assert step.get("if") == engine.get("if"), (
+            "the harness.sinks passes must run exactly when the linux engine pass does"
+        )
 
 
 def test_no_global_exclude_reaches_a_test_file() -> None:

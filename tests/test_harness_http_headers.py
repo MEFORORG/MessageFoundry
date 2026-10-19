@@ -293,13 +293,11 @@ _BARE_ON_EVERY_PYTHON_READ = (
 def test_the_stdlib_still_answers_http_0_9_requests_bare() -> None:
     """So the control above cannot drift to all-status-line unnoticed. If a case here stops being
     bare, the stdlib changed again: re-read it, and if none is bare, the override can go."""
-    bare = [
-        case.id
-        for case in _BARE_ON_SOME_PYTHON
-        if _is_bare(_plain_stdlib_answer(cast(bytes, case.values[0])))
-    ]
+    requests = {case.id: cast(bytes, case.values[0]) for case in _BARE_ON_SOME_PYTHON}
     for case_id in _BARE_ON_EVERY_PYTHON_READ:
-        assert case_id in bare, f"Python {platform.python_version()} answers {case_id} unbare"
+        assert _is_bare(_plain_stdlib_answer(requests[case_id])), (
+            f"Python {platform.python_version()} answers {case_id} unbare"
+        )
 
 
 @pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_ON_SOME_PYTHON)
@@ -386,11 +384,15 @@ def test_the_error_page_cases_cover_every_stdlib_error_class() -> None:
 def test_the_stdlib_names_the_server_software_without_the_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control for the Server line _assert_floored refuses (BACKLOG #3358 item 8): the stdlib's
-    own send_response adds one, naming the Python version."""
-    _without(monkeypatch, "send_response")
-    ((_, headers),) = _blocks(_answer(monkeypatch, _POST))
+    """The control for the Server line _assert_floored refuses (BACKLOG #3358 item 8): without the
+    sink's send_header filter the stdlib adds one, naming the Python version, and the assertion
+    the suite relies on fires."""
+    _without(monkeypatch, "send_header")
+    raw = _answer(monkeypatch, _POST)
+    ((_, headers),) = _blocks(raw)
     assert "Python/" in dict(headers).get("server", ""), headers
+    with pytest.raises(AssertionError, match="names the server software"):
+        _assert_floored(raw, [200])
 
 
 def test_the_sink_baseline_is_the_engine_listeners() -> None:
