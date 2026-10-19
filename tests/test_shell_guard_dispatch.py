@@ -40,7 +40,7 @@ from tests.test_claude_settings_contract import (
     matcher_selects,
 )
 from tests.test_install_gate_upstream_provenance import _psq
-from tests.test_worktree_gate import assert_denied
+from tests.test_worktree_gate import assert_denied, run_gate
 
 DISPATCHER = _ROOT / "scripts" / "hooks" / "shell-guard-dispatch.ps1"
 INSTALLER = _ROOT / "scripts" / "worktree" / "install-gate.ps1"
@@ -376,6 +376,10 @@ def test_an_unknown_option_is_reported_not_run() -> None:
 
 _SID = "0f1e2d3c-aaaa-bbbb-cccc-123456789abc"
 _CALL = "toolu_01TestCallAbc"
+# A proof exactly as the dispatcher writes it. Bytes, not write_text: on Windows text mode writes
+# CRLF, and a proof holding "<sid>\r" fails the session-id test, so a test planting one would pass
+# without ever reaching the check it names.
+_PROOF = (_SID + "\n").encode("ascii")
 
 
 class _World:
@@ -406,6 +410,12 @@ class _World:
         self.project = tmp_path / "project"
         (self.project / ".claude").mkdir(parents=True)
         self.project_settings(USER_GATE)
+        # The entry trusts a proof only from a project dispatcher identical to the pinned copy.
+        self.pinned = hooks / DISPATCHER.name
+        shutil.copyfile(DISPATCHER, self.pinned)
+        self.project_dispatcher = self.project / "scripts" / "hooks" / DISPATCHER.name
+        self.project_dispatcher.parent.mkdir(parents=True)
+        shutil.copyfile(DISPATCHER, self.project_dispatcher)
         self.env = {
             "USERPROFILE": str(home),
             "HOME": str(home),
@@ -414,8 +424,10 @@ class _World:
         }
 
     def project_settings(self, arg: str) -> None:
+        """The wired shape: the project dispatcher, then `arg` as its first argument."""
+        args = ["-File", "${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1", arg]
         (self.project / ".claude" / "settings.json").write_text(
-            json.dumps({"args": [arg]}), encoding="utf-8"
+            json.dumps({"command": "pwsh", "args": args}, indent=2), encoding="utf-8"
         )
 
     def runs(self) -> int:
@@ -509,7 +521,7 @@ def test_old_proofs_are_pruned(tmp_path: Path) -> None:
     world.proofs.mkdir()
     old = time.time() - 3600
     stale = world.proof("ok", "toolu_old")
-    stale.write_text(_SID + "\n", encoding="utf-8")
+    stale.write_bytes(_PROOF)
     os.utime(stale, (old, old))
     other = world.proofs / "another-session.session"
     other.touch()
@@ -523,7 +535,9 @@ def test_old_proofs_are_pruned(tmp_path: Path) -> None:
 # ================================================================== the account's shell entry
 
 
-def _installed_shell_entry(tmp_path: Path, gate_dst: Path) -> dict[str, Any]:
+def _installed_shell_entry(
+    tmp_path: Path, gate_dst: Path, dispatch_dst: Path | None = None
+) -> dict[str, Any]:
     """Build the installer's real Bash|PowerShell entry for a given gate path, without installing:
     the region from the entry text through the entry list, run as the installer runs it."""
     text = INSTALLER.read_text(encoding="utf-8")
@@ -534,6 +548,7 @@ def _installed_shell_entry(tmp_path: Path, gate_dst: Path) -> dict[str, Any]:
         [
             "$ErrorActionPreference = 'Stop'",
             f"$GateDst = {_psq(str(gate_dst))}",
+            f"$DispatchDst = {_psq(str(dispatch_dst or gate_dst.parent / DISPATCHER.name))}",
             region,
             "$entries | Where-Object { $_.matcher -ceq 'Bash|PowerShell' } |"
             " ConvertTo-Json -Depth 6 -Compress",
@@ -555,6 +570,7 @@ def _installed_shell_entry(tmp_path: Path, gate_dst: Path) -> dict[str, Any]:
 # The entry is built once, for a placeholder gate path each test swaps for its own, and bash is
 # resolved once: each costs a pwsh start or several bash probes.
 _GATE_PLACEHOLDER = "C:/mefor-test-gate-placeholder/worktree_gate.ps1"
+_DISPATCH_PLACEHOLDER = "C:/mefor-test-gate-placeholder/shell-guard-dispatch.ps1"
 _WAIT = "+ 20000000 ))"
 
 
@@ -569,6 +585,7 @@ def _scratch() -> Path:
 def _entry_command() -> str:
     command = str(_installed_shell_entry(_scratch(), Path(_GATE_PLACEHOLDER))["command"])
     assert command.count(_GATE_PLACEHOLDER) == 1 and command.count(_WAIT) == 1, command
+    assert command.count(_DISPATCH_PLACEHOLDER) == 1, command
     return command
 
 
@@ -583,29 +600,37 @@ class _Entry:
 
     def __init__(self, world: _World, wait_us: int | None = None) -> None:
         self.world = world
-        self.command = _entry_command().replace(_GATE_PLACEHOLDER, world.gate.as_posix())
+        self.command = (
+            _entry_command()
+            .replace(_GATE_PLACEHOLDER, world.gate.as_posix())
+            .replace(_DISPATCH_PLACEHOLDER, world.pinned.as_posix())
+        )
         if wait_us is not None:
             self.command = self.command.replace(_WAIT, f"+ {wait_us} ))")
         self.shell = _bash()
 
-    def start(self, raw: str | None = None) -> subprocess.Popen[str]:
+    def start(
+        self, raw: str | None = None, env: dict[str, str] | None = None
+    ) -> subprocess.Popen[str]:
         proc = subprocess.Popen(
             [self.shell, "-c", self.command],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env={**os.environ, **self.world.env},
+            env={**os.environ, **self.world.env, **(env or {})},
         )
         assert proc.stdin is not None
         proc.stdin.write(_payload() if raw is None else raw)
         proc.stdin.close()
         return proc
 
-    def run(self) -> tuple[subprocess.CompletedProcess[str], float]:
+    def run(
+        self, raw: str | None = None, env: dict[str, str] | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], float]:
         began = time.monotonic()
         with single_spawn():
-            proc = self.start()
+            proc = self.start(raw, env)
             out, err = proc.communicate(timeout=120)
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), (
             time.monotonic() - began
@@ -682,7 +707,7 @@ def test_a_proof_older_than_the_wait_is_not_this_call_s(tmp_path: Path) -> None:
     the transcript -- does not stand the gate down."""
     world = _World(tmp_path, gate=_GATE_DENIES)
     _hinted(world)
-    world.proof("ok").write_text(_SID + "\n", encoding="utf-8")
+    world.proof("ok").write_bytes(_PROOF)
     old = time.time() - 5
     os.utime(world.proof("ok"), (old, old))
     done, took = _Entry(world).run()
@@ -702,7 +727,7 @@ def test_a_proof_for_another_session_is_not_this_call_s(tmp_path: Path) -> None:
             assert time.monotonic() < deadline, "the entry never began waiting"
             time.sleep(0.02)
         time.sleep(0.05)
-        world.proof("ok").write_text("some-other-session\n", encoding="utf-8")
+        world.proof("ok").write_bytes(_PROOF.replace(_SID.encode("ascii"), b"some-other-session"))
         out, err = waiting.communicate(timeout=120)
     assert assert_denied(_decision(out)) == "installed gate", err
     assert world.runs() == 1
@@ -819,3 +844,158 @@ def test_the_real_gate_decides_in_the_dispatcher_exactly_as_it_does_alone(tmp_pa
         assert world.proof("run", call).exists() != silent, (tool, command)
         denies += _decision(alone.stdout) is not None
     assert denies >= 2, "the control: the corpus must reach the gate's deny in both shells"
+
+
+# ================================================================== the send-back of 2026-10-18 (A1-A7)
+
+
+def _await_wait(world: _World, waiting: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 30
+    while not world.proof("wait").exists():
+        assert waiting.poll() is None, "the entry ended before it began waiting"
+        assert time.monotonic() < deadline, "the entry never began waiting"
+        time.sleep(0.02)
+    time.sleep(0.05)
+
+
+def test_an_edited_project_dispatcher_is_not_trusted(tmp_path: Path) -> None:
+    """A1: the proof comes from a working-tree file any session can edit. A project dispatcher that
+    differs from the pinned copy makes the entry run the gate at once, without waiting."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    _hinted(world)
+    with world.project_dispatcher.open("a", encoding="utf-8") as f:
+        f.write("# an edit in the working tree\n")
+    done, took = _Entry(world).run()
+    assert assert_denied(_decision(done.stdout)) == "installed gate"
+    assert world.runs() == 1
+    assert not world.proof("wait").exists(), "a mismatched dispatcher buys no wait"
+    assert took < 15, took
+
+
+def test_a_missing_pinned_dispatcher_is_not_trusted(tmp_path: Path) -> None:
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    _hinted(world)
+    world.pinned.unlink()
+    done, _ = _Entry(world).run()
+    assert assert_denied(_decision(done.stdout)) == "installed gate"
+    assert not world.proof("wait").exists()
+
+
+def test_the_dispatcher_must_take_the_gate_as_its_first_argument(tmp_path: Path) -> None:
+    """A1: a guard placed before the gate shares its process and could change what the gate sees."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    _hinted(world)
+    settings = world.project / ".claude" / "settings.json"
+    body = json.loads(settings.read_text(encoding="utf-8"))
+    body["args"].insert(2, "${CLAUDE_PROJECT_DIR}/scripts/hooks/some-guard.ps1")
+    settings.write_text(json.dumps(body), encoding="utf-8")
+    done, _ = _Entry(world).run()
+    assert assert_denied(_decision(done.stdout)) == "installed gate"
+    assert not world.proof("wait").exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "{hooks}/shell-guard-dispatch.ps1",
+        "{home}/.claude-account-3/shell-guard-proof/toolu_x.ok",
+        "{home}/.claude/shell-guard-proof/sid.session",
+    ],
+    ids=["pinned-dispatcher", "account-proof", "default-account-hint"],
+)
+def test_rule_1a_refuses_a_write_to_the_pinned_dispatcher_or_a_proof(
+    tmp_path: Path, target: str
+) -> None:
+    """A1: both carry the gate's verdict for shell calls, so they are its enforcement surface."""
+    hooks = tmp_path / "home" / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    repos = hooks / "worktree-gate.repos.txt"
+    repos.write_text("# governed\n" + str(tmp_path / "Repo") + "\n", encoding="utf-8")
+    path = target.format(hooks=hooks.as_posix(), home=(tmp_path / "home").as_posix())
+
+    def edit(file_path: str) -> dict[str, Any]:
+        return {
+            "session_id": _SID,
+            "cwd": str(tmp_path),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": file_path, "content": "x"},
+        }
+
+    assert "1a" in assert_denied(run_gate(edit(path), repos))
+    # Control: a sibling of the proof folder is not the gate's surface.
+    assert (
+        run_gate(edit((tmp_path / "home" / ".claude" / "elsewhere" / "x.ok").as_posix()), repos)
+        is None
+    )
+
+
+def test_a_proof_dated_in_the_future_is_not_this_call_s(tmp_path: Path) -> None:
+    """A2: NEWER than .wait alone passes a planted proof with a future mtime."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    entry = _Entry(world)
+    _hinted(world)
+    with single_spawn():
+        waiting = entry.start()
+        _await_wait(world, waiting)
+        part = world.proofs / "planted.tmp"
+        part.write_bytes(_PROOF)
+        future = time.time() + 3600
+        os.utime(part, (future, future))
+        part.replace(world.proof("ok"))
+        out, err = waiting.communicate(timeout=120)
+    assert assert_denied(_decision(out)) == "installed gate", err
+    assert world.runs() == 1
+
+
+def test_a_proof_beside_a_deleted_wait_is_not_this_call_s(tmp_path: Path) -> None:
+    """A2: with .wait gone, any .ok reads as NEWER than it."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    entry = _Entry(world)
+    _hinted(world)
+    with single_spawn():
+        waiting = entry.start()
+        _await_wait(world, waiting)
+        world.proof("wait").unlink()
+        part = world.proofs / "planted.tmp"
+        part.write_bytes(_PROOF)
+        part.replace(world.proof("ok"))
+        out, err = waiting.communicate(timeout=120)
+    assert assert_denied(_decision(out)) == "installed gate", err
+    assert world.runs() == 1
+
+
+def test_inherited_errexit_and_nounset_do_not_refuse_every_call(tmp_path: Path) -> None:
+    """A6: SHELLOPTS carries shell options into bash; onFailure would turn an early exit into a
+    refusal. The control shows the inherited options do end an entry without the reset."""
+    world = _World(tmp_path, gate=_GATE_DENIES)
+    inherited = {"SHELLOPTS": "errexit:nounset"}
+    entry = _Entry(world)
+    assert "set +eu +o posix\n" in entry.command
+    done, _ = entry.run(env=inherited)
+    assert done.returncode == 0, (done.returncode, done.stderr)
+    assert assert_denied(_decision(done.stdout)) == "installed gate"
+    unreset = _Entry(world)
+    unreset.command = unreset.command.replace("set +eu +o posix\n", "")
+    control, _ = unreset.run(env=inherited)
+    assert control.returncode != 0, "the control: without the reset, errexit ends the entry"
+
+
+def test_the_gate_gets_a_large_payload_whole_and_a_failed_feed_blocks(tmp_path: Path) -> None:
+    """A7: a payload too big for a pipe goes through a here-document file. It must reach the gate
+    whole, and a here-string that cannot be made must exit 1, which onFailure turns into a block."""
+    world = _World(
+        tmp_path,
+        gate=(
+            "[Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+            "permissionDecision='deny';permissionDecisionReason=\"len=$($in.Length)\"}}"
+            " | ConvertTo-Json -Compress))"
+        ),
+    )
+    raw = _payload("echo " + "x" * 200_000)
+    done, _ = _Entry(world).run(raw)
+    assert done.returncode == 0, done.stderr
+    assert assert_denied(_decision(done.stdout)) in (f"len={len(raw)}", f"len={len(raw) + 1}")
+    command = _Entry(world).command
+    feed = command.index('exec {h}<<< "$in" || exit 1')
+    assert feed < command.index('pwsh -NoProfile -File "$g" <&"$h"')

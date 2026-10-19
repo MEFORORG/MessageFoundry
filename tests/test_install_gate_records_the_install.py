@@ -77,6 +77,9 @@ def _run(home: Path, source_age_days: int = 6) -> dict[str, Any]:
     (repo_root / "scripts" / "hooks").mkdir(parents=True)
     src = repo_root / "scripts" / "hooks" / "worktree_gate.ps1"
     src.write_text('$GateVersion = "2026.01.01.1"\n# new gate\n', encoding="utf-8")
+    # The shell entry's pinned dispatcher is copied in the same region.
+    dispatch_src = repo_root / "scripts" / "hooks" / "shell-guard-dispatch.ps1"
+    dispatch_src.write_text("# the dispatcher\n", encoding="utf-8")
 
     hooks = home / ".claude" / "hooks"
     hooks.mkdir(parents=True)
@@ -88,6 +91,8 @@ def _run(home: Path, source_age_days: int = 6) -> dict[str, Any]:
             "$ErrorActionPreference = 'Stop'",
             f"$RepoRoot = '{repo_root.as_posix()}'",
             f"$GateDst  = '{dst.as_posix()}'",
+            f"$sourceDispatch = '{dispatch_src.as_posix()}'",
+            f"$DispatchDst = '{(hooks / 'shell-guard-dispatch.ps1').as_posix()}'",
             "$ConfigDir = @('c:/fixture/.claude')",
             _function("Get-GateVersion"),
             _function("Get-GateHash"),

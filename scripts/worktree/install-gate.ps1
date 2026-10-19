@@ -116,6 +116,9 @@ $HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::Ge
 $HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
+# The shell entry stands down only for a project dispatcher identical to this pinned copy; see the
+# entry's comment below.
+$DispatchDst = Join-Path $HooksDir "shell-guard-dispatch.ps1"
 
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
 $Marker = "worktree_gate.ps1"
@@ -1020,6 +1023,7 @@ if ($Uninstall) {
     if (Test-Path -LiteralPath $ReposFile) { Copy-Item -LiteralPath $ReposFile -Destination "$ReposFile.bak" -Force }
     Remove-Item -LiteralPath $ReposFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $GateDst   -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $DispatchDst -Force -ErrorAction SilentlyContinue
     Write-Host "Worktree gate REMOVED from $($ConfigDir.Count) config dir(s). Sessions are no longer gated (takes effect immediately)." -ForegroundColor Yellow
     return
 }
@@ -1062,6 +1066,20 @@ if ($staleRefusal) {
     Write-Host "NOTE: the source was checked against -UpstreamRef $UpstreamRef, not the default origin/main." -ForegroundColor Yellow
 }
 
+# THE DISPATCHER IS PINNED THE SAME WAY, BECAUSE THE SHELL ENTRY TRUSTS ITS PROOF. A working-tree
+# dispatcher is a file any session can edit; an edited one could write a proof without running the
+# gate. So this run copies the dispatcher, checked against the same ref, beside the gate, where gate
+# rule 1a protects it, and the entry stands down only for a project dispatcher identical to it.
+$sourceDispatch = Join-Path $RepoRoot "scripts\hooks\shell-guard-dispatch.ps1"
+$dispatchSha = Get-GateHash $sourceDispatch
+$dispatchUpstream = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef -RelPath "scripts/hooks/shell-guard-dispatch.ps1"
+$dispatchRefusal = Get-StaleSourceRefusal -SourcePath $sourceDispatch -SourceSha $dispatchSha -Upstream $dispatchUpstream
+if ($dispatchRefusal) {
+    $dispatchRefusal = "shell-guard-dispatch.ps1, which the shell entry pins: " + $dispatchRefusal
+    if (-not $AllowStaleSource -or -not $dispatchSha) { throw $dispatchRefusal }
+    Write-Host "WARNING: pinning a dispatcher that is not the one on $UpstreamRef, because -AllowStaleSource was given." -ForegroundColor Yellow
+}
+
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
 
 # READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES. An allowlist this run cannot read must stop the
@@ -1096,6 +1114,7 @@ if (Test-Path -LiteralPath $GateDst) {
 }
 
 Copy-Item -LiteralPath $GateSrc -Destination $GateDst -Force
+Copy-Item -LiteralPath $sourceDispatch -Destination $DispatchDst -Force
 
 # STAMP THE INSTALLED COPY WITH THE INSTALL TIME, AND THIS IS THE LOAD-BEARING HALF OF #1247.
 #
@@ -1133,6 +1152,7 @@ $receipt = [ordered]@{
     # from a deliberate -AllowStaleSource install.
     upstreamRef        = $UpstreamRef
     upstreamGateSha256 = $upstream.Sha
+    dispatchSha256     = (Get-GateHash $DispatchDst)
     allowStaleSource   = [bool]$AllowStaleSource
     note           ='Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
 } | ConvertTo-Json -Depth 4
@@ -1145,6 +1165,9 @@ if ((Get-GateHash $GateDst) -ne $checkedSha) {
     Write-Host "WARNING: the gate changed on disk between the currency check and the copy, so the installed gate" -ForegroundColor Yellow
     Write-Host "         is NOT the one that was checked against $UpstreamRef. Run -Status, then re-install." -ForegroundColor Yellow
 }
+if ((Get-GateHash $DispatchDst) -ne $dispatchSha) {
+    Write-Host "WARNING: the dispatcher changed on disk between the currency check and the copy. Re-install." -ForegroundColor Yellow
+}
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
 
@@ -1153,43 +1176,46 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 # scripts/hooks/shell-guard-dispatch.ps1 runs this gate inside the one pwsh it starts for its own
 # guards. Hooks run in parallel, so this entry cannot see that run; it waits for its proof instead.
 # The proof is <account>/shell-guard-proof/<tool_use_id>.ok, holding the session id, which the
-# dispatcher writes only after the gate it ran for this very payload allowed it silently. This entry
-# stands down only when that file exists, holds this session's id, and is NEWER than the
-# <tool_use_id>.wait file this entry wrote when it began waiting. In every other case it runs the
-# gate itself, as it did before:
-#   * no dispatcher ran (another project, an old checkout, a missing or broken dispatcher): no
-#     proof, so the wait ends and the gate runs;
+# dispatcher writes only after the gate it ran for this very payload consumed it and allowed it
+# silently. This is the one place the stand-down conditions are stated. This entry waits only when:
+#   * the dispatcher's <session id>.session hint exists (forged or stale, it only buys a wait);
+#   * the project's settings.json passes `"${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1"`
+#     with `"--user-hook=worktree_gate"` as the very next argument, so the gate runs first;
+#   * that project dispatcher is byte-identical (line endings aside) to the copy this installer pinned
+#     beside the gate, checked against origin/main and protected by gate rule 1a. A working-tree
+#     dispatcher is a file any session can edit, and an edited one could write a proof without running
+#     the gate; a differing one, on any branch, makes this entry run the gate itself.
+# It stands down only when, after the wait began, <tool_use_id>.ok exists, holds this session's id,
+# is NEWER than the <tool_use_id>.wait this entry wrote, which must still exist, and is NOT newer than
+# the <tool_use_id>.now this entry writes on seeing it. In every other case it runs the gate itself:
+#   * no dispatcher ran, or a broken one: no proof, so the wait ends and the gate runs;
 #   * the dispatcher's gate denied, decided, exited or threw: it writes <tool_use_id>.run, and the
 #     gate runs here at once;
 #   * the dispatcher is slow: the wait ends after 20 s and the gate runs here;
-#   * a proof written before this call's wait began (a stale file, or one planted for an id read
-#     early from the transcript) fails the NEWER-than test, and the gate runs.
+#   * a proof written before the wait began fails NEWER than .wait; a proof back-dated or dated in
+#     the future fails one of the two tests; a deleted .wait fails the existence test.
 # A tool_use_id is new for every call, so a proof cannot be reused for another. What this does not
 # stop is a process that sits waiting for this call's .wait file and writes the .ok at once; that is
 # a deliberate evasion running under the same user, which can edit this settings file outright.
+# Gate rule 1a refuses a Write or Edit under shell-guard-proof/, which closes the accidental route.
 #
-# <session id>.session is the dispatcher's hint that this session's project runs the gate. Without
-# it the entry does not wait at all, so a project with no dispatcher pays nothing. The hint never
-# stands the gate down: forged or stale, it only buys a wait before the gate runs. The project's own
-# settings.json must also carry `--user-hook=worktree_gate`, for the same reason.
-#
-# TIMEOUTS, AND WHY A FAILURE HERE BLOCKS. The wait is 20 s at most and the hook's timeout is 60 s, so
-# the gate keeps about 40 s after the longest wait (less bash's own start), against the 15 s this
+# TIMEOUTS, AND WHY A FAILURE HERE BLOCKS. The wait is 20 s at most and this hook's timeout is 60 s,
+# so the gate keeps about 40 s after the longest wait (less bash's own start), against the 15 s this
 # entry used to give it. On a box loaded enough that the dispatcher's gate outlasts the wait, this
-# entry's gate runs beside it, and a call whose two runs pass 60 s is blocked.
+# entry runs its own gate as well, and if its wait plus that run passes 60 s the call is blocked.
 # onFailure = block makes this entry's OWN failure a refusal, not a silent allow: if bash cannot
-# start, or the entry and the gate together run past 60 s, the call is blocked rather than left
-# ungated. That is stricter than before, when a gate past 15 s failed open; it now blocks, and only
-# past 40 s. A gate that crashes still fails open, as it always did, because the entry maps the
+# start, if the here-string that feeds the gate cannot be made (`exit 1`), or if the entry runs past
+# 60 s, the call is blocked rather than left ungated. That is stricter than before, when a gate past
+# 15 s failed open. A gate that crashes still fails open, as it always did, because the entry maps the
 # gate's exit other than 0 or 2 to an allow with a systemMessage saying so; a blocking exit 2 is
-# passed on. That mapping cannot tell a gate crash from a gate that never started (pwsh missing, or
-# the here-string's temp file refused), so both fail open with the same message. A missing pwsh failed
-# open before too; a refused here-string is new, since the old entry read Claude Code's stdin itself.
-# `set +o posix` first: in POSIX mode a redirection error on `:` or `exec` would end the shell with
-# status 1, which onFailure turns into a refusal of every call. The gate is not wrapped in `timeout` or captured with $(...): measured, each added
-# about 0.2 s of wall time to every call that runs the gate here. (A bare `timeout` is worse than
-# slow: a bash started without Git's /usr/bin on PATH resolved it to C:\Windows\System32\
-# timeout.exe, which exited 1 without running the gate.)
+# passed on. A missing pwsh fails open the same way, as it did before.
+# `set +eu +o posix` first: an errexit, nounset or POSIX mode inherited through SHELLOPTS would end
+# the shell on a harmless failed test or redirection, which onFailure turns into a refusal of every
+# call. BASH_ENV, SHELLOPTS and BASHOPTS are read before this line can run; the PR records that.
+# The gate is not wrapped in `timeout` or captured with $(...): measured, each added about 0.2 s of
+# wall time to every call that runs the gate here. (A bare `timeout` is worse than slow: a bash
+# started without Git's /usr/bin on PATH resolved it to C:\Windows\System32\timeout.exe, which exited
+# 1 without running the gate.)
 #
 # COST, measured 2026-10-17 on mefordev01; the PR that added this records the instrument and numbers.
 # The wait reads with `read -t` on a pseudo-terminal nobody writes to, which sleeps without starting
@@ -1198,28 +1224,37 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 # LAST occurrence of its key with `##`, because a regex scan to it from the start of the payload cost
 # about 1 ms per KB; the dispatcher reads the same occurrence. JSON escapes the quotes inside a
 # command, so a command cannot spell the key.
-# Single-quoted in bash below, so a quote in the profile path is closed, escaped and reopened.
+# Single-quoted in bash below, so a quote in a profile path is closed, escaped and reopened.
 $gateForBash = $GateDst.Replace('\', '/').Replace("'", "'\''")
+$dispatchForBash = $DispatchDst.Replace('\', '/').Replace("'", "'\''")
 $shellEntry = @'
 # worktree_gate.ps1 for shell tool calls: stands down only on this call's shell-guard-proof.
 # scripts/worktree/install-gate.ps1 says why each check is here.
-set +o posix
+set +eu +o posix
 g='__GATE__'
+k='__DISPATCH__'
 IFS= read -r -N 2147483647 in
-d=${CLAUDE_CONFIG_DIR:-$USERPROFILE/.claude}/shell-guard-proof
+d=${CLAUDE_CONFIG_DIR:-${USERPROFILE:-$HOME}/.claude}/shell-guard-proof
 if [[ $in =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]{1,100})\" ]]; then
   s=${BASH_REMATCH[1]}
   r=${in##*\"tool_use_id\"}
   if [[ -e $d/$s.session && $r != "$in" && $r =~ ^[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]{1,100})\" ]]; then
-    t=${BASH_REMATCH[1]} ps=
-    { IFS= read -r -N 2147483647 ps < "$CLAUDE_PROJECT_DIR/.claude/settings.json"; } 2>/dev/null
-    if [[ $ps == *--user-hook=worktree_gate* ]] && { : > "$d/$t.wait" && exec {w}<>/dev/ptmx; } 2>/dev/null; then
+    t=${BASH_REMATCH[1]} ps= pd= pk=
+    { IFS= read -r -N 2147483647 ps < "$CLAUDE_PROJECT_DIR/.claude/settings.json"
+      IFS= read -r -N 2147483647 pd < "$CLAUDE_PROJECT_DIR/scripts/hooks/shell-guard-dispatch.ps1"
+      IFS= read -r -N 2147483647 pk < "$k"; } 2>/dev/null
+    pd=${pd//$'\r'/} pk=${pk//$'\r'/}
+    if [[ -n $pk && $pd == "$pk" &&
+          $ps =~ \"\$\{CLAUDE_PROJECT_DIR\}/scripts/hooks/shell-guard-dispatch\.ps1\"[[:space:]]*,[[:space:]]*\"--user-hook=worktree_gate\" ]] &&
+       { : > "$d/$t.wait" && exec {w}<>/dev/ptmx; } 2>/dev/null; then
       e=$(( ${EPOCHREALTIME//[!0-9]/} + 20000000 ))
       for (( i = 0; i < 400; i++ )); do
         if [[ -e $d/$t.ok ]]; then
           p=
           IFS= read -r p < "$d/$t.ok"
-          [[ $d/$t.ok -nt $d/$t.wait && $p == "$s" ]] && exit 0
+          { : > "$d/$t.now"; } 2>/dev/null
+          [[ -e $d/$t.wait && -e $d/$t.now && $d/$t.ok -nt $d/$t.wait &&
+             ! $d/$t.ok -nt $d/$t.now && $p == "$s" ]] && exit 0
           break
         fi
         [[ -e $d/$t.run ]] && break
@@ -1230,12 +1265,13 @@ if [[ $in =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]{1,100})\" ]]
     fi
   fi
 fi
-pwsh -NoProfile -File "$g" <<< "$in"
+exec {h}<<< "$in" || exit 1
+pwsh -NoProfile -File "$g" <&"$h"
 r=$?
 (( r == 0 || r == 2 )) && exit "$r"
 printf '{"systemMessage":"worktree_gate.ps1 did not complete (exit %s); this call went ahead ungated"}\n' "$r"
 exit 0
-'@.Replace('__GATE__', $gateForBash).Replace("`r`n", "`n")
+'@.Replace('__GATE__', $gateForBash).Replace('__DISPATCH__', $dispatchForBash).Replace("`r`n", "`n")
 
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
 # matched here NEVER FIRES -- the hook is simply not invoked for that tool, and nothing says so. Rule 3

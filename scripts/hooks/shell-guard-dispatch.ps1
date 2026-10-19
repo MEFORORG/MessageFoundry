@@ -62,10 +62,12 @@
     parallel with this file, and stands down only on this file's proof for the same call; the
     conditions it checks are stated once, in install-gate.ps1. This file's half: it writes
     <account>/shell-guard-proof/<tool_use_id>.ok, holding the session id, only when the gate it ran
-    for this payload finished normally with nothing on stdout -- a silent allow. Anything else (a
-    decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which tells the entry to
-    run the gate itself now. It also writes the `<session id>.session` hint the entry waits on. An
-    account that does not delegate runs the gate itself, and this file skips it.
+    for this payload read all of it and finished normally with nothing on stdout -- a silent allow.
+    Anything else (a decision, an exit, a throw, a missing gate) writes `<tool_use_id>.run`, which
+    tells the entry to run the gate itself now. It also writes the `<session id>.session` hint the
+    entry waits on. The entry trusts that proof only from a copy of THIS file identical to the one
+    the installer pinned, so an edit here costs the saving until the next install, never the gate.
+    An account that does not delegate runs the gate itself, and this file skips it.
 
     ORDER IS THE SETTINGS FILE'S: THE WORKTREE GATE FIRST, THEN THE BOUNDED GUARD. The account's
     entry is waiting on the gate's proof, so the gate must not queue behind guards that could use
@@ -192,7 +194,8 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         $ShellGuardBuffer = [System.IO.StringWriter]::new()
         $global:LASTEXITCODE = 0
         try {
-            [Console]::SetIn([System.IO.StringReader]::new($ShellGuardPayload))
+            $ShellGuardReader = [System.IO.StringReader]::new($ShellGuardPayload)
+            [Console]::SetIn($ShellGuardReader)
             [Console]::SetOut($ShellGuardBuffer)
             $null = & $ShellGuardPath
             $ShellGuardCompleted = $?
@@ -210,8 +213,9 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
             continue
         }
         $ShellGuardOutput = $ShellGuardBuffer.ToString()
-        # A silent allow, and nothing else, is the gate's verdict the account's entry may stand on.
-        if ($ShellGuardProof -and -not $ShellGuardOutput) { $ShellGuardProof = 'ok' }
+        # A silent allow of THIS payload, and nothing else, is the verdict the account's entry may
+        # stand on: a gate that left the payload unread allowed something it never looked at.
+        if ($ShellGuardProof -and -not $ShellGuardOutput -and $ShellGuardReader.Peek() -eq -1) { $ShellGuardProof = 'ok' }
     } finally {
         # Every way out of the gate's run -- continue, exit 2, a throw -- writes its proof first.
         if ($ShellGuardProof) {

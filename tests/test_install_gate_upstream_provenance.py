@@ -102,6 +102,8 @@ def _fixture(tmp_path: Path, *, behind: bool) -> Path:
     up.mkdir()
     _git(up, "init", "-q", "-b", "main")
     _write_gate(up, GATE_V1)
+    # The installer pins the shell entry's dispatcher against the same ref, so upstream carries one.
+    (up / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# the dispatcher\n")
     _git(up, "add", ".")
     _git(up, "commit", "-q", "-m", "gate v1")
 
@@ -252,6 +254,7 @@ def _lonely(tmp_path: Path) -> Path:
     checkout.mkdir()
     _git(checkout, "init", "-q", "-b", "main")
     _write_gate(checkout, GATE_V1)
+    (checkout / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# the dispatcher\n")
     _git(checkout, "add", ".")
     _git(checkout, "commit", "-q", "-m", "no remote at all")
     return checkout
