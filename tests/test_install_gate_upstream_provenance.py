@@ -102,6 +102,8 @@ def _fixture(tmp_path: Path, *, behind: bool) -> Path:
     up.mkdir()
     _git(up, "init", "-q", "-b", "main")
     _write_gate(up, GATE_V1)
+    # The installer pins the shell entry's dispatcher against the same ref, so upstream carries one.
+    (up / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# the dispatcher\n")
     _git(up, "add", ".")
     _git(up, "commit", "-q", "-m", "gate v1")
 
@@ -252,6 +254,7 @@ def _lonely(tmp_path: Path) -> Path:
     checkout.mkdir()
     _git(checkout, "init", "-q", "-b", "main")
     _write_gate(checkout, GATE_V1)
+    (checkout / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# the dispatcher\n")
     _git(checkout, "add", ".")
     _git(checkout, "commit", "-q", "-m", "no remote at all")
     return checkout
@@ -279,6 +282,31 @@ def test_a_current_install_read_from_a_stale_tree_is_current_not_stale(tmp_path:
     verdict = _parity(_status(checkout, home))
     assert "*** STALE ***" not in verdict and "CURRENT" in verdict, verdict
     assert "do NOT install from it" in verdict, verdict
+
+
+@pytest.mark.parametrize(
+    ("pinned", "verdict"),
+    [
+        (None, "NOT PINNED"),
+        (b"# the dispatcher\n", "CURRENT with origin/main"),
+        (b"# an older dispatcher\n", "NOT CURRENT with origin/main"),
+    ],
+    ids=["missing", "current", "stale"],
+)
+def test_status_grades_the_pinned_dispatcher(
+    tmp_path: Path, pinned: bytes | None, verdict: str
+) -> None:
+    """A pin behind the ref costs the saving silently, so -Status must say which it is."""
+    _need_tools()
+    checkout = _fixture(tmp_path, behind=False)
+    home = tmp_path / "home"
+    _plant(home, GATE_V1)
+    if pinned is not None:
+        (home / ".claude" / "hooks" / "shell-guard-dispatch.ps1").write_bytes(pinned)
+    line = next(ln for ln in _status(checkout, home).splitlines() if ln.startswith("dispatcher  :"))
+    assert verdict in line, line
+    if verdict == "CURRENT with origin/main":
+        assert "NOT CURRENT" not in line, line
 
 
 def test_stale_says_which_copy_origin_main_agrees_with(tmp_path: Path) -> None:
@@ -388,6 +416,17 @@ def test_a_current_checkout_installs_without_the_override(tmp_path: Path) -> Non
     r = _run_region(_fixture(tmp_path, behind=False), tmp_path, allow=False)
     assert r.returncode == 0 and "PROCEEDED PAST THE CHECK" in r.stdout, r.stdout + r.stderr
     assert "WARNING" not in r.stdout, r.stdout
+
+
+def test_an_install_refuses_a_dispatcher_that_is_not_origin_main_s(tmp_path: Path) -> None:
+    """The shell entry trusts the pinned dispatcher's proof, so it is pinned only from the ref."""
+    _need_tools()
+    checkout = _fixture(tmp_path, behind=False)
+    (checkout / GATE_REL.parent / "shell-guard-dispatch.ps1").write_bytes(b"# edited locally\n")
+    r = _run_region(checkout, tmp_path, allow=False)
+    both = r.stdout + r.stderr
+    assert r.returncode != 0 and "which the shell entry pins" in both, both
+    assert "PROCEEDED PAST THE CHECK" not in r.stdout
 
 
 def test_an_install_refuses_when_origin_main_cannot_be_read(tmp_path: Path) -> None:

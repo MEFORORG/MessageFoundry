@@ -1583,7 +1583,9 @@ def _wired_command_line() -> list[str]:
 
 
 @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
-def test_the_wired_command_line_denies_a_blanket_stage_and_allows_its_control(tool: str) -> None:
+def test_the_wired_command_line_denies_a_blanket_stage_and_allows_its_control(
+    tool: str, tmp_path: Path
+) -> None:
     """Run the handler's own command line, not `run_guard`'s, so a wrong path or flag shows here."""
     argv = _wired_command_line()
 
@@ -1594,6 +1596,9 @@ def test_the_wired_command_line_denies_a_blanket_stage_and_allows_its_control(to
             capture_output=True,
             text=True,
             timeout=60,
+            # Hermetic: no account delegates the installed worktree gate, so the shared handler runs
+            # this repository's guards only, and writes no proof into the real account.
+            env={**os.environ, "CLAUDE_CONFIG_DIR": str(tmp_path)},
         )
         assert proc.returncode == 0, f"wired hook exited {proc.returncode}: {proc.stderr}"
         return json.loads(proc.stdout) if proc.stdout.strip() else None

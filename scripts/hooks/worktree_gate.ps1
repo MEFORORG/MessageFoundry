@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.04.1"
+$GateVersion = "2026.10.18.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -4284,16 +4284,29 @@ if (-not [System.IO.Path]::IsPathRooted($target)) {
 # wrong twice over: $ReposFile is a parameter that can point anywhere (under test it sits in a temp dir,
 # where it swallowed every unrelated path), and ~/.claude/hooks/ also holds things this rule has no
 # business governing. The surface worth protecting is precisely the kill switch and the script it arms.
+#
+# Two more files carry the gate's verdict for shell calls, so they are its surface too. The pinned
+# shell-guard-dispatch.ps1 is the only dispatcher whose proof the account's shell entry trusts, and
+# <account>/shell-guard-proof/ holds those proofs: a proof written there stands the entry down for that
+# call. install-gate.ps1 states the protocol.
 $gateFiles = @(
     (Get-ComparablePath $ReposFile)
     (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "worktree_gate.ps1"))
+    (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "shell-guard-dispatch.ps1"))
 ) | Where-Object { $_ }
-if ((Get-ComparablePath $target) -in $gateFiles) {
+$targetCmp = Get-ComparablePath $target
+# IsMatch, not -match: -match would leave $Matches set for every rule after this one.
+$isProof = [regex]::IsMatch($targetCmp, '/\.claude[^/]*/shell-guard-proof(/|$)')
+if ($targetCmp -in $gateFiles -or $isProof) {
+    $surface = if ($isProof) {
+        "That folder holds per-call proofs that the gate already ran: a file there stands the gate down for a shell`ncall. Only the project's shell-guard dispatcher writes them, so a session may not write here at all."
+    } else {
+        "That directory holds the installed hook, the dispatcher whose proofs it trusts, and its allowlist. The`nallowlist is the gate's kill switch -- a single edit there turns it off for every session on this machine,`nso a session may not write here at all."
+    }
     Write-Deny -Rule "1a" -Detail $target -Reason @"
 BLOCKED: this writes to the worktree gate's own enforcement surface ($(Get-SafeForMessage $target)).
 
-That directory holds the installed hook and its allowlist. The allowlist is the gate's kill switch -- a
-single edit there turns it off for every session on this machine, so a session may not write here at all.
+$surface
 This is not a file to fix in passing.
 
 If the gate is genuinely wrong -- a false positive, a rule that needs changing -- fix it at the SOURCE and
