@@ -606,6 +606,7 @@ def test_ad_timeout_defaults_are_finite_and_positive() -> None:
     s = AuthSettings()
     assert 0 < s.ad_connect_timeout < float("inf")
     assert 0 < s.ad_receive_timeout < float("inf")
+    assert 0 < s.ad_group_search_deadline < float("inf")
 
 
 def test_ad_timeouts_are_documented_in_the_operator_configuration_reference() -> None:
@@ -614,7 +615,7 @@ def test_ad_timeouts_are_documented_in_the_operator_configuration_reference() ->
     root = Path(__file__).resolve().parent.parent
     config = (root / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
     settings = AuthSettings()
-    for field in ("ad_connect_timeout", "ad_receive_timeout"):
+    for field in ("ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline"):
         row = [line for line in config.splitlines() if line.strip().startswith(f"| `{field}`")]
         assert row, (
             f"[auth].{field} has no row in docs/CONFIGURATION.md's `[auth]` table; it ships as an "
@@ -634,9 +635,13 @@ def test_ad_timeout_rejects_an_unbounded_value(bad: float) -> None:
         _ad_settings(ad_connect_timeout=bad)
     with pytest.raises(ValueError, match="finite number of seconds"):
         _ad_settings(ad_receive_timeout=bad)
+    with pytest.raises(ValueError, match="ad_group_search_deadline must be a finite number"):
+        _ad_settings(ad_group_search_deadline=bad)
 
 
-@pytest.mark.parametrize("field", ["ad_connect_timeout", "ad_receive_timeout"])
+@pytest.mark.parametrize(
+    "field", ["ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline"]
+)
 def test_ad_timeout_rejects_a_value_that_overflows_the_socket(field: str) -> None:
     """A huge finite value raises OverflowError in socket.settimeout. That now maps to LdapError
     (BACKLOG #2566, tests/test_ldap_error_mapping.py), but every sign-in would still fail, so the

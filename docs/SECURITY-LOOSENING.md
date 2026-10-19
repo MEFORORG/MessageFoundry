@@ -136,7 +136,7 @@ leaves the engine.
 | | `[store].secure_delete` | `true` (*conditional* — a loosening only on a file-backed SQLite store; `false` leaves a purged body's bytes in the file) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
-| | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
+| | `[auth].ad_connect_timeout`, `ad_receive_timeout`, `ad_group_search_deadline` | `10` s / `10` s / `120` s (*conditional* — a loosening only once `ad_enabled`; a value above its default is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
 | | `[auth].password_check_breached`, `password_check_context`, `password_check_username` | `true` (each `false` turns off one screen of a local password) |
@@ -174,7 +174,7 @@ leaves the engine.
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[store].secure_delete`, `[auth].ad_session_recheck_seconds`,
 `[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
-`[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
+`[auth].ad_group_search_deadline`, `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
@@ -756,22 +756,27 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   is written, as for the other settings-scoped loosenings.
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
-### `[auth].ad_connect_timeout` or `ad_receive_timeout` above `10` s **with `ad_enabled`** — a stalled directory call holds a thread longer
+### `[auth].ad_connect_timeout`, `ad_receive_timeout` or `ad_group_search_deadline` above its default **with `ad_enabled`** — a stalled directory call holds a thread longer
 > **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
-> BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above `10` s. A shorter timeout
-> fails a stalled call sooner, which is stricter, and is not named. Neither has an off value: the
+> BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above its default: `10` s for the two timeouts, `120` s for the deadline (vault BACKLOG #3696). A shorter timeout
+> fails a stalled call sooner, which is stricter, and is not named. None has an off value: the
 > row in the table above gives what the load refuses.
 - **What you lose:** each directory call runs in a worker thread until the domain controller answers
   or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
   wait on several connects and reads, each bounded on its own. With a longer timeout, a controller
   that has stopped answering holds each thread longer, so stalled calls tie up the thread pool that
-  sign-in shares for longer.
+  sign-in shares for longer. A longer `ad_group_search_deadline` holds the thread while a slow
+  controller keeps sending pages of the nested group search, since each page is still bounded by
+  `ad_receive_timeout`.
 - **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
-  for a healthy round trip.
+  for a healthy round trip, or `120` s too short for a healthy nested group search of the largest
+  account. A search refused at the deadline fails that directory call, a sign-in for example, and
+  the reconciler pages for that account rather than re-reading its roles and scope.
 - **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
   how many start per window, not how many are held, and a session recheck does not pass it. So
-  raise the timeout only as far as the measured round trip needs.
-- **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
+  raise the timeout only as far as the measured round trip, or the measured group search, needs.
+- **Reversible:** yes, immediately — restore the default, `10` for the two timeouts and `120` for the
+  deadline (or delete the line), and restart.
 
 ### `[auth].require_action_step_up = false` — the action-bound step-up falls back to the session window
 > Reported whenever it is `false` (vault BACKLOG #2600). The default is `true`
@@ -2054,7 +2059,7 @@ chapter was not part of the verification above.
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
-| `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
+| `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`, `[auth].ad_group_search_deadline` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |

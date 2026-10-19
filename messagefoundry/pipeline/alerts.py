@@ -594,19 +594,23 @@ class AlertSink(Protocol):
         which leaves the referred accounts unjudged and may sit beside revocations the pass applied;
         or one or more probes raised a fault the engine could not read (``probe_fault``, BACKLOG
         #3100, the ``auth.ad_reconcile_faulted`` row), which leaves those accounts unjudged the same
-        way. The type's name predates the second and third cases. Read ``reason`` before naming the
-        cause.
+        way; or one account's group search was refused for the engine's own bound
+        (``group_search_deadline`` or ``group_search_cap``, vault BACKLOG #3696), raised once as
+        the account enters that state, which leaves it unjudged too. The type's name predates all
+        but the first case. Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
-        ``"directory-reconciler-referral"`` for a referral, and
-        ``"directory-reconciler-probe-fault"`` for a probe fault, so each is its own instance and
-        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is, for the breaker,
-        how many principals the pass judged, its denominator; for a probe fault, the same total of
-        candidates the pass took up, asked or not, which counts the faulted accounts it left
-        unjudged and any id-less row; and for a referral how many probes the pass sent to the
-        directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth service
-        latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``. A
-        whole-directory outage is NOT this event: it is
+        ``"directory-reconciler-referral"`` for a referral,
+        ``"directory-reconciler-probe-fault"`` for a probe fault, and
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal, so each is its own
+        instance and throttle. ``reason`` is one of those five closed-set slugs. ``probed`` is, for
+        the breaker, how many principals the pass judged, its denominator; for a probe fault and a
+        paging refusal, the same total of candidates the pass took up, asked or not, which counts
+        the accounts it left unjudged and any id-less row; and for a referral how many probes the
+        pass sent to the directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is
+        the operator-facing explanation the auth service latches. No PHI. Emitted by the
+        API-lifespan reconciler task, never from ``auth/``. A whole-directory outage is NOT this
+        event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
         ...
 
@@ -1172,8 +1176,9 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            # The count is the candidates the pass took up for the breaker and a probe fault, or a
-            # referral's probes asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            # The count is the candidates the pass took up for the breaker, a probe fault and a
+            # paging refusal, or a referral's probes asked (BACKLOG #3170); see
+            # AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
             "(%s): %s",
             name,
