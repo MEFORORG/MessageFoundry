@@ -84,21 +84,12 @@ def _coord_dir(repo: Path) -> Path:
     return repo / ".git" / "mefor-coord"
 
 
-def _run(
-    repo: Path, script: str, *args: str, cloud: bool, extra_env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
+def _run(repo: Path, script: str, *args: str, cloud: bool) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if cloud:
         env["CLAUDE_CODE_REMOTE"] = "true"
-    env.update(extra_env or {})
-    path = str(repo / "scripts" / script)
-    argv = (
-        [sys.executable, path]
-        if script.endswith(".py")
-        else ["pwsh", "-NoProfile", "-NonInteractive", "-File", path]
-    )
     return subprocess.run(
-        [*argv, *args],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(repo / "scripts" / script), *args],
         cwd=str(repo),
         env=env,
         input="",
@@ -111,39 +102,25 @@ def _run(
 
 @needs_pwsh
 @pytest.mark.parametrize(
-    ("label", "script", "args"),
+    ("script", "args"),
     [
-        pytest.param("seat.ps1", "coord/seat.ps1", SEAT_DECLARE, id="seat-declare"),
-        pytest.param("seat.ps1", "coord/seat.ps1", ("-Close",), id="seat-close"),
-        pytest.param("mail.ps1", "coord/mail.ps1", ("-Status",), id="mail-status"),
-        pytest.param("alloc.ps1", "coord/alloc.ps1", ("-List",), id="alloc-list"),
-        pytest.param("claim.ps1", "coord/claim.ps1", ("-List",), id="claim-list"),
-        pytest.param("handoff.ps1", "coord/handoff.ps1", ("-Where",), id="handoff-where"),
-        pytest.param("handoff.ps1", "coord/handoff.ps1", ("-Report",), id="handoff-report"),
-        pytest.param("lane.ps1", "coord/lane.ps1", ("-Show",), id="lane-show"),
-        pytest.param(
-            "lane.ps1", "coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"
-        ),
-        pytest.param(
-            "tombstone-retired-backlog-allocator.ps1",
-            "coord/tombstone-retired-backlog-allocator.ps1",
-            (),
-            id="tombstone-write",
-        ),
-        pytest.param(
-            "hygiene-report.ps1",
-            "worktree/hygiene-report.ps1",
-            HYGIENE_OFFLINE,
-            id="hygiene-report",
-        ),
+        pytest.param("coord/seat.ps1", SEAT_DECLARE, id="seat-declare"),
+        pytest.param("coord/seat.ps1", ("-Close",), id="seat-close"),
+        pytest.param("coord/mail.ps1", ("-Status",), id="mail-status"),
+        pytest.param("coord/alloc.ps1", ("-List",), id="alloc-list"),
+        pytest.param("coord/claim.ps1", ("-List",), id="claim-list"),
+        pytest.param("coord/handoff.ps1", ("-Where",), id="handoff-where"),
+        pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
+        pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
+        pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
     ],
 )
 def test_each_coordination_script_refuses_in_a_cloud_session(
-    repo: Path, label: str, script: str, args: tuple[str, ...]
+    repo: Path, script: str, args: tuple[str, ...]
 ) -> None:
     proc = _run(repo, script, *args, cloud=True)
     assert proc.returncode == REFUSAL_EXIT, (proc.stdout, proc.stderr)
-    assert proc.stderr.strip() == label + REFUSAL_TAIL, proc.stderr
+    assert proc.stderr.strip() == script.rsplit("/", 1)[-1] + REFUSAL_TAIL, proc.stderr
     assert proc.stdout == "", proc.stdout
     assert not _coord_dir(repo).exists(), "a refused call still created the coordination directory"
 
@@ -188,12 +165,23 @@ OWNER_SENT = ("sent", "--item", "t1", "--actor", "builder", "--summary", "cloud 
 
 
 def _owner_log(
-    repo: Path, ledger: Path, *args: str, cloud: bool, remote: str = "true"
+    tmp_path: Path, ledger: Path, *args: str, remote: str | None
 ) -> subprocess.CompletedProcess[str]:
-    env = {"MEFOR_OWNER_LOG": str(ledger)}
-    if cloud:
+    """MEFOR_OWNER_LOG skips the git lookup, so this runs the real script in place, from a cwd that
+    is no repository at all."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_REMOTE"}
+    env["MEFOR_OWNER_LOG"] = str(ledger)
+    if remote is not None:
         env["CLAUDE_CODE_REMOTE"] = remote
-    return _run(repo, "coord/owner_log.py", *args, cloud=False, extra_env=env)
+    return subprocess.run(
+        [sys.executable, str(COORD / "owner_log.py"), *args],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -206,21 +194,21 @@ def _owner_log(
     ],
 )
 def test_owner_log_refuses_in_a_cloud_session_even_with_its_override(
-    repo: Path, tmp_path: Path, args: tuple[str, ...], remote: str
+    tmp_path: Path, args: tuple[str, ...], remote: str
 ) -> None:
     """MEFOR_OWNER_LOG bypasses the git lookup, so the refusal is proven to come before the write."""
     ledger = tmp_path / "owner-log" / "OWNER-ITEMS.md"
-    proc = _owner_log(repo, ledger, *args, cloud=True, remote=remote)
+    proc = _owner_log(tmp_path, ledger, *args, remote=remote)
     assert proc.returncode == REFUSAL_EXIT, (proc.stdout, proc.stderr)
     assert proc.stderr.strip() == "owner_log.py" + REFUSAL_TAIL, proc.stderr
     assert proc.stdout == "", proc.stdout
     assert not ledger.parent.exists()
 
 
-def test_owner_log_writes_its_row_outside_the_cloud(repo: Path, tmp_path: Path) -> None:
+def test_owner_log_writes_its_row_outside_the_cloud(tmp_path: Path) -> None:
     """The control: the row the refusal withholds is really written here."""
     ledger = tmp_path / "owner-log" / "OWNER-ITEMS.md"
-    proc = _owner_log(repo, ledger, *OWNER_SENT, cloud=False)
+    proc = _owner_log(tmp_path, ledger, *OWNER_SENT, remote=None)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "| t1 | request_sent |" in ledger.read_text(encoding="utf-8")
 
@@ -317,9 +305,11 @@ def test_the_declare_prompt_hook_prints_the_prompt_outside_the_cloud(repo: Path)
     assert "cloud Builder" not in proc.stdout
 
 
-# Every inline copy of the refusal, by the path that carries it. A shared helper would need a new
-# dot-source in scripts that test fixtures copy file by file, an override such as -CoordDir would
-# bypass a check placed in a root resolver, and the Python copy could not share it anyway.
+# Every PowerShell copy of the refusal, inlined rather than shared. No helper is loaded by all of
+# them: alloc.ps1, claim.ps1 and the tombstone script dot-source nothing, and about ten fixtures copy
+# alloc.ps1 or claim.ps1 alone, so a new dot-source would break them. There is no shared coord-root
+# resolver either, and one would be the wrong home: -CoordDir, -MailRoot and MEFOR_OWNER_LOG bypass
+# it. The Python copy is held by the behavioural owner_log tests, which need no pwsh.
 GUARDED = (
     "coord/seat.ps1",
     "coord/mail.ps1",
@@ -342,15 +332,6 @@ def test_each_script_carries_the_one_refusal_line(rel: str) -> None:
     line = f"[Console]::Error.WriteLine('{name}{REFUSAL_TAIL}')".replace("VM's", "VM''s")
     guard = f"    {line}\n    exit {REFUSAL_EXIT}\n"
     assert text.count(guard) == 1, f"{rel} lost or changed its cloud refusal line"
-
-
-def test_the_python_copy_carries_the_one_refusal_line() -> None:
-    text = (ROOT / "scripts" / PY_GUARDED).read_text(encoding="utf-8")
-    call = text.split("sys.stderr.write(\n", 1)[1].split("\n        )\n", 1)[0]
-    joined = "".join(piece.strip()[1:-1] for piece in call.splitlines())
-    assert joined == "owner_log.py" + REFUSAL_TAIL + "\\n", joined
-    assert text.count('if os.environ.get("CLAUDE_CODE_REMOTE", "").lower() == "true":') == 1
-    assert f"        return {REFUSAL_EXIT}\n    result: int = a.func(a)" in text
 
 
 # Every script under scripts/coord, scripts/hooks and scripts/worktree that names mefor-coord, and
