@@ -36,11 +36,12 @@ from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 from starlette.routing import BaseRoute
 
-from messagefoundry.api.auth_models import CredentialReply
+from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     peercert_from_ssl_object,
 )
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import AuthService, LoginOutcome
@@ -54,6 +55,7 @@ from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
+from messagefoundry.store.base import store_call_errors
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -1229,11 +1231,9 @@ _STEP_UP_DETAIL = "step-up re-verification required; POST /me/reauth then retry"
 #: session (BACKLOG #2142, ADR 0142 Amendment F).
 _IDP_STEP_UP_DETAIL = (
     "step-up re-verification required; this session steps up at the identity provider, in a"
-    " browser, through the web console at /ui/reauth, not with a password"
+    " browser, not with a password: repeat the action in the web console, which opens /ui/reauth"
+    " for it"
 )
-#: Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a header
-#: rather than parse the detail. Absent on every other refusal.
-_STEP_UP_VIA_HEADER = "X-Step-Up-Via"
 
 
 async def _step_up_refusal(
@@ -1248,8 +1248,27 @@ async def _step_up_refusal(
     headers = {"X-Step-Up-Required": "1"}
     if action is not None:
         headers["X-Step-Up-Action"] = action
-    if await auth.session_steps_up_at_idp(token):
-        headers[_STEP_UP_VIA_HEADER] = "idp"
+    try:
+        via_idp = await auth.session_steps_up_at_idp(token)
+    except AUDIT_WRITE_DEFECTS:
+        raise
+    except store_call_errors() as exc:
+        # Vault BACKLOG #3145 item 6: the read only picks the wording, and the gate has already
+        # refused, so a store fault keeps the 403 rather than becoming a 500. It answers with the
+        # password wording; an oidc client's POST /me/reauth then asks again and is told the IdP.
+        # With its traceback: ValueError and RuntimeError are also what a bug raises, and the log
+        # line is the only place a fault and a defect can be told apart.
+        log.warning(
+            "a step-up refusal could not read the session's sign-in mechanism (%s); it answers"
+            " with the password wording",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        via_idp = False
+    if via_idp:
+        # Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a
+        # header rather than parse the detail. Absent on every other refusal.
+        headers[STEP_UP_VIA_HEADER] = STEP_UP_VIA_IDP
         return HTTPException(status.HTTP_403_FORBIDDEN, _IDP_STEP_UP_DETAIL, headers=headers)
     return HTTPException(status.HTTP_403_FORBIDDEN, _STEP_UP_DETAIL, headers=headers)
 

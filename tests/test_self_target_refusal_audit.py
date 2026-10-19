@@ -137,3 +137,64 @@ async def test_another_account_writes_no_refusal_row(
         r = await c.request(method, f"/users/{other.id}{suffix}", json=body, headers=_auth(tok))
     assert r.status_code == 200, r.text
     assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
+
+
+# --- vault BACKLOG #3260, limb 2: a self-service revoke that ends nothing --------------------------
+
+#: A well-formed session id that names no session.
+_UNKNOWN_SESSION = "0" * 64
+
+
+async def test_a_missed_session_revoke_writes_one_row_and_the_same_answer(engine: Engine) -> None:
+    """RED when: ``DELETE /me/sessions/{id}`` answers its 404 with no audit row of its own (vault
+    BACKLOG #3260, limb 2; owner ruling 2026-10-16), or the answer or the row tells an unknown id
+    from another account's.
+
+    One row per miss, with the id cut to 12 characters, and nothing else in its detail."""
+    service = await _service(engine)
+    await _add(service, "a", Role.VIEWER)
+    await _add(service, "b", Role.VIEWER)
+    async with _client(engine, service) as c:
+        ta = (await _login(c, "a")).json()["token"]
+        tb = (await _login(c, "b")).json()["token"]
+        foreign = (await c.get("/me/sessions", headers=_auth(tb))).json()["sessions"][0]["id"]
+        answers = []
+        # The grant is single-use, so each attempt takes its own re-proof, as a caller's would.
+        for target in (_UNKNOWN_SESSION, foreign):
+            _r, ta = await _reauth(c, ta, purpose="session_terminate")
+            assert _r.status_code == 200
+            r = await c.delete(f"/me/sessions/{target}", headers=_auth(ta))
+            answers.append((r.status_code, r.json()))
+        still = await c.get("/auth/me", headers=_auth(tb))
+    assert answers == [(404, {"detail": "no such session"})] * 2, answers
+    assert still.status_code == 200, "a missed revoke ended another account's session"
+    rows = await engine.store.list_audit(action="auth.session_revoke_missed", limit=10)
+    assert len(rows) == 2, "one miss, one row"
+    # Newest first: the foreign id's row, then the unknown id's.
+    assert [json.loads(str(r["detail"])) for r in rows] == [
+        {"session": foreign[:12]},
+        {"session": _UNKNOWN_SESSION[:12]},
+    ]
+    for row in rows:
+        assert row["actor"] == "a"
+        assert row["client"] == _DEFAULT_PEER[0], "the miss row dropped the caller's address"
+    assert await engine.store.list_audit(action="auth.session_revoked", limit=10) == []
+
+
+async def test_a_revoke_of_your_own_session_writes_no_miss_row(engine: Engine) -> None:
+    """The control: a revoke that ends a session writes ``auth.session_revoked``, not a miss."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t1 = (await _login(c, "u")).json()["token"]
+        t2 = (await _login(c, "u")).json()["token"]
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        sessions = (await c.get("/me/sessions", headers=_auth(t2))).json()["sessions"]
+        other = next(s for s in sessions if not s["current"])
+        r = await c.delete(f"/me/sessions/{other['id']}", headers=_auth(t2))
+        gone = await c.get("/auth/me", headers=_auth(t1))
+    assert r.status_code == 200, r.text
+    assert gone.status_code == 401
+    assert await engine.store.list_audit(action="auth.session_revoke_missed", limit=10) == []
+    revoked = await engine.store.list_audit(action="auth.session_revoked", limit=10)
+    assert len(revoked) == 1 and revoked[0]["client"] == _DEFAULT_PEER[0]

@@ -33,13 +33,15 @@ Four safety properties are built in, in order of importance:
 A referral is not an outage, and not a reason to stop the pass either (BACKLOG #2538). A
 :attr:`ProbeOutcome.REFERRED` account is left unjudged, like an unreachable one, and every other
 probe in the pass is judged as usual. Unlike an outage, a referral alerts. A pass whose only answers are
-referrals and failures aborts as ``directory_referral``, which judges nothing and alerts.
+referrals and failures aborts as ``directory_referral``, which judges no account it asked about
+and alerts. Such a pass, like an outage, still strikes an UNKEYED row (BACKLOG #3170).
 
 A probe fault is not an outage either (BACKLOG #3100). A :attr:`ProbeOutcome.FAULT` account, whose
 probe raised something that is not an LDAP error, or a response ldap3 could not decode, is left
 unjudged like an unreachable one, and
 unlike one it alerts on every pass that probes it. A pass whose only answers are faults and failures,
-at least one a fault, aborts as ``probe_fault``, which judges nothing and alerts.
+at least one a fault, aborts as ``probe_fault``, which judges no account it asked about and alerts.
+It too still strikes an UNKEYED row (BACKLOG #3170).
 
 The pass also re-diffs channel scope (ADR 0198, BACKLOG #1957). It revokes when the directory would
 withdraw or narrow a principal's scope, and it never writes the scope: the next login does, through
@@ -229,14 +231,19 @@ class ReconcilePlan:
     #: count``. A PRESENT probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7;
     #: ``held`` tells the two apart). An UNAVAILABLE, REFERRED or FAULT probe is absent from this mapping,
     #: leaving whatever strike the user already carried untouched. Populated even on a breaker
-    #: abort — see :func:`plan_pass`.
+    #: abort — see :func:`plan_pass`. On an outage or a pass of referrals or faults only it holds
+    #: the UNKEYED rows' strikes alone (BACKLOG #3170), since those were judged without the
+    #: directory.
     strikes: Mapping[str, int] = field(default_factory=dict)
     #: Candidates this pass judged, asked or not. Excludes the per-pass budget remainder. An UNKEYED
     #: row counts here, because it can revoke. This is the breaker's denominator (``judged``).
     probed: int = 0
     #: Probes this pass actually sent to the directory: ``probed`` less its UNKEYED rows (BACKLOG
-    #: #2434). An outage and a pass of referrals or faults only are judged over these, and the outage's log
-    #: line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count these.
+    #: #2434). An outage and a pass of referrals or faults only are judged over these, and the
+    #: outage's log line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count
+    #: these. So do the referral's latched message, the ``asked`` field of its
+    #: ``auth.ad_reconcile_referred`` row and its alert's count (BACKLOG #3170): a referral can
+    #: only answer a probe that was sent.
     asked: int = 0
     unavailable: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
@@ -311,7 +318,9 @@ class ReconcilePlan:
     def judged_nothing(self) -> bool:
         """True when the pass aborted before judging any account: an outage, a pass of referrals
         and failures only, or one of faults and failures only. Such a pass leaves the hold's state,
-        its message and every clear alone, because it learned nothing about the accounts."""
+        its message and every clear alone, because it learned nothing about the accounts it asked
+        about. It still strikes an UNKEYED row, which was judged without the directory (BACKLOG
+        #3170)."""
         return self.directory_outage or self.directory_referral or self.probe_fault
 
     @property
@@ -399,6 +408,20 @@ def select_candidates(
     return ordered[: max(budget, 0)]
 
 
+def _unkeyed_strikes(probes: list[Probe], prior_strikes: Mapping[str, int]) -> dict[str, int]:
+    """The strikes of a pass that judged nothing (BACKLOG #3170 item 3).
+
+    An UNKEYED row was judged without the directory, so an outage or a pass of referrals or faults
+    only (BACKLOG #3100) still strikes it, as any other pass does. Only the strike: its outcome is
+    not recorded, so the hold's record, and so its carry-over, stays as it was, and an aborted pass
+    revokes nothing."""
+    return {
+        p.user_id: prior_strikes.get(p.user_id, 0) + 1
+        for p in probes
+        if p.outcome is ProbeOutcome.UNKEYED
+    }
+
+
 def plan_pass(
     probes: Iterable[Probe],
     *,
@@ -442,6 +465,7 @@ def plan_pass(
         # user search base in another domain of the forest refers every probe, and an entry or a
         # defect that raises does so on every pass. A referral wins over a fault: it names the fix.
         return ReconcilePlan(
+            strikes=_unkeyed_strikes(probes, prior_strikes),
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
@@ -458,6 +482,7 @@ def plan_pass(
         # zero-revocation pass. The hold is not judged on a pass that learned nothing, so its state
         # carries over.
         return ReconcilePlan(
+            strikes=_unkeyed_strikes(probes, prior_strikes),
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
@@ -562,6 +587,9 @@ def plan_pass(
         readable=readable,
     )
     # Held and referred probes both stay in the breaker's denominator; ReconcilePlan.judged says why.
+    # UNKEYED revocations stay in its numerator, so while such rows hold sessions they push toward
+    # a trip on every pass. Exempting them is declined (BACKLOG #3170 item 2): it would change what
+    # the mass-revoke breaker counts, a security control, and that is not a follow-up's call.
     if breaker_tripped(
         revoke_count=len(revocations),
         probed=plan.judged,

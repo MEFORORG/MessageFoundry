@@ -29,6 +29,8 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_VIA_HEADER,
+    STEP_UP_VIA_IDP,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -795,13 +797,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 # the message names the leg that works. The header is the one the step-up gates
                 # send such a session (BACKLOG #2158), so a client branches on it here too rather
                 # than parsing the detail. No X-Step-Up-Required: this is the step-up itself.
-                # Typed out because api/security.py keeps its constant private; a test pins the
-                # name and the value to what the gates send.
+                # The constants the gates send too (vault BACKLOG #3145); a test pins the two
+                # to each other.
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider; re-authenticate"
-                    " there through the web console at /ui/reauth, not with a password",
-                    headers={"X-Step-Up-Via": "idp"},
+                    " there, not with a password: repeat the action in the web console, which"
+                    " opens /ui/reauth for it",
+                    headers={STEP_UP_VIA_HEADER: STEP_UP_VIA_IDP},
                 )
             if elevation.directory_refusal is not None:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
@@ -852,8 +855,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider and owes no code;"
-                    " step up there through the web console at /ui/reauth",
-                    headers={"X-Step-Up-Via": "idp"},
+                    " step up there by repeating the action in the web console, which opens"
+                    " /ui/reauth for it",
+                    headers={STEP_UP_VIA_HEADER: STEP_UP_VIA_IDP},
                 )
             if elevation.directory_refusal is not None:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
@@ -1028,6 +1032,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
         session_id: DigestId,
+        request: Request,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
@@ -1037,7 +1042,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
-        if not await service.revoke_own_session(identity, session_id, actor=identity.username):
+        # A miss writes one audit row there, the same for an unknown and a foreign id (vault
+        # BACKLOG #3260, limb 2), and the answer here is unchanged.
+        if not await service.revoke_own_session(
+            identity, session_id, actor=identity.username, client=client_ip(request)
+        ):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such session")
         return SimpleMessage(detail="session revoked")
 

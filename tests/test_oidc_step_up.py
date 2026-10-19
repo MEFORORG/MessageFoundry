@@ -413,6 +413,51 @@ async def test_the_step_up_row_records_whether_the_address_moved_mid_ceremony(
         await store.close()
 
 
+async def test_a_refusal_after_the_flow_is_redeemed_records_the_address_fields(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a step-up refused after its flow was redeemed leaves out ``start_client`` and
+    ``client_moved``, which the success row carries (vault BACKLOG #3145 item 4). They come from the
+    flow the start leg staged, never from the token."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token, client="10.0.0.8")
+        stale = _staged(service, flow_id).issued_at - 2 * service._settings.oidc_clock_skew_seconds
+        out = await _return_from_idp(
+            service, monkeypatch, rsa_key, flow_id, client="10.0.0.9", auth_time=stale - 1
+        )
+
+        assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+        detail = json.loads(str((await _audit_rows(store, "auth.reauth"))[-1]["detail"]))
+        assert detail["reason"] == STEP_UP_NOT_FRESH
+        assert (detail["start_client"], detail["client_moved"]) == ("10.0.0.8", True)
+    finally:
+        await store.close()
+
+
+async def test_a_refusal_before_the_state_matches_records_no_address_fields(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for vault BACKLOG #3145 item 4: before ``state`` matches, the callback is not
+    shown to belong to the flow, so its row compares nothing with the flow's start address."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token, client="10.0.0.8")
+        out = await service.complete_oidc_step_up(
+            flow_id=flow_id, state="forged", code=AUTH_CODE, client="10.0.0.9", public_origin=ORIGIN
+        )
+
+        assert not out.ok and out.reason == "state_mismatch"
+        detail = json.loads(str((await _audit_rows(store, "auth.reauth"))[-1]["detail"]))
+        assert "start_client" not in detail and "client_moved" not in detail
+    finally:
+        await store.close()
+
+
 # --- the callback: every refusal elevates nothing -----------------------------------------------------
 
 
@@ -815,6 +860,9 @@ async def test_an_account_demoted_in_the_directory_since_sign_in_is_refused(
                 "provider": "ad",
                 "mech": "oidc",
                 "reason": DIRECTORY_ROLES_DEMOTED,
+                # Both legs at the helpers' default address (vault BACKLOG #3145 item 4).
+                "start_client": "10.0.0.9",
+                "client_moved": False,
             }
             await _assert_untouched(service, token)
         assert set(await store.get_user_role_ids(user_id)) == {"operator"}, "roles were written"
@@ -847,6 +895,20 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
         assert not out.ok and out.reason == DIRECTORY_ROLE_MAP_UNSEALED
         assert out.error and "sign out" not in out.error.lower(), out.error
         assert "administrator" in out.error, out.error
+        # The row comes from the bound refuse partial, so it carries the flow's address fields as
+        # the demotion arm's row does (vault BACKLOG #3145 item 4). Pins the merge of main's #3082
+        # reason with that partial.
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert rows == [
+            {
+                "ok": False,
+                "provider": "ad",
+                "mech": "oidc",
+                "reason": DIRECTORY_ROLE_MAP_UNSEALED,
+                "start_client": "10.0.0.9",
+                "client_moved": False,
+            }
+        ], rows
         await _assert_untouched(service, token)
     finally:
         await store.close()

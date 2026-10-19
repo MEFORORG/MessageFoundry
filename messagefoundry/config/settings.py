@@ -5101,7 +5101,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
         # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
-        # sign-in's role sync (granted_by `<directory>`).
+        # sign-in's role sync, and since vault BACKLOG #3141 by a directory reconcile pass (both
+        # granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
         # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed

@@ -129,16 +129,17 @@ PROVISION_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 _provision_steps = itertools.count(1)
 
 
-def provision_totp() -> dict[str, Any]:
+def provision_totp(secret: str = PROVISION_TOTP_SECRET) -> dict[str, Any]:
     """The TOTP arguments ``provision_first_administrator`` needs under the shipped
     ``require_mfa`` (ADR 0197 Amendment A): the secret, a code for it, and the instant that code was
     "read". Each call lands on its own later 30-second step, so repeated provisions of one row
-    (the repair tests) never replay a step the row already consumed."""
+    (the repair tests) never replay a step the row already consumed. ``secret`` is for a test
+    whose runs must show different entries."""
     from messagefoundry.auth import totp
 
     at = time.time() + totp.DEFAULT_PERIOD * next(_provision_steps)
     return {
-        "totp_secret": PROVISION_TOTP_SECRET,
-        "totp_code": totp.totp(PROVISION_TOTP_SECRET, now=at),
+        "totp_secret": secret,
+        "totp_code": totp.totp(secret, now=at),
         "totp_code_read_at": at,
     }

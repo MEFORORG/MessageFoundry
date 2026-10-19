@@ -828,6 +828,8 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
         assert len(changes) == 2
         assert changes[-1].username == "jdoe" and changes[-1].email == "jdoe@example.org"
         assert changes[-1].detail.get("roles") == ["viewer"]
+        # Worded for the directory, as the reconciler's notice is (vault BACKLOG #3121).
+        assert changes[-1].detail.get("source") == "directory"
     finally:
         await store.close()
 
@@ -945,6 +947,8 @@ async def test_clearing_the_profile_address_leaves_the_account_still_notifiable(
         later = notifier.events[before:]
         assert [e.event_type for e in later] == [ROLES_CHANGED]
         assert later[0].email == "bob@example.org"
+        # An administrator's act keeps the administrator wording (vault BACKLOG #3121).
+        assert "source" not in later[0].detail
     finally:
         await store.close()
 

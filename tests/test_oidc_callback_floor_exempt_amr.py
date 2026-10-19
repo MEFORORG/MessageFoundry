@@ -14,17 +14,24 @@ from __future__ import annotations
 import json
 import time
 import urllib.parse
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.audit_visibility import (
     DIRECTORY_LOCKED_REFUSAL_DETAIL,
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
 )
-from messagefoundry.auth.service import TOO_EARLY, AuthService
+from messagefoundry.auth.service import (
+    DIRECTORY_ROLE_MAP_UNSEALED,
+    DIRECTORY_ROLES_DEMOTED,
+    TOO_EARLY,
+    AuthService,
+)
 from messagefoundry.config.settings import AuthSettings, _auth_limit_loosenings
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import (
@@ -410,7 +417,15 @@ async def test_a_step_up_past_the_floor_records_no_exemption(
         await store.close()
 
 
-@pytest.mark.parametrize("refusal", ["not_in_directory", "step_up_subject_mismatch"])
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "not_in_directory",
+        "step_up_subject_mismatch",
+        DIRECTORY_ROLES_DEMOTED,
+        DIRECTORY_ROLE_MAP_UNSEALED,
+    ],
+)
 @pytest.mark.parametrize(("elapsed", "marked"), [(FLOOR - 0.001, True), (FLOOR + 0.001, False)])
 async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_applied(
     rsa_key: rsa.RSAPrivateKey,
@@ -420,7 +435,8 @@ async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_appl
     marked: bool,
 ) -> None:
     """BACKLOG #3220, the step-up leg: a refusal after the exchange carries the marker when the
-    exemption let the too-early callback past the floor, and only then."""
+    exemption let the too-early callback past the floor, and only then. The two role arms ride the
+    bound refuse partial that carries the marker since main's #3082 reason merged into it."""
     store = await MessageStore.open(":memory:")
     try:
         service, clock, token = await _signed_in(
@@ -429,6 +445,12 @@ async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_appl
         claims: dict[str, Any] = {"amr": ["mfa", EXEMPT, "x-token-only"]}
         if refusal == "not_in_directory":
             service._ldap._principal = None  # type: ignore[union-attr]
+        elif refusal == DIRECTORY_ROLES_DEMOTED:
+            # The account signed in as operator; its groups now map to no role.
+            ldap: Any = service._ldap
+            ldap._principal = replace(ldap._principal, groups=frozenset())
+        elif refusal == DIRECTORY_ROLE_MAP_UNSEALED:
+            monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
         else:
             claims["sub"] = "S-1-5-21-someone-else"
         flow_id, _url = await _begin(service, token)

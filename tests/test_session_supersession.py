@@ -364,13 +364,19 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     caller = await service.identity_for_token(await _token(service), activity=False)
     assert caller is not None
     rotations = rotate_after_first_call(monkeypatch, store, service, target)
-    revoked = await service.revoke_own_session(caller, target_hash, actor="op")
+    revoked = await service.revoke_own_session(caller, target_hash, actor="op", client=None)
 
     assert rotations, "the injection never fired, so this measured nothing"
     rotated = rotations[0]
     assert rotated is not None and await _live(service, rotated), "the race was not driven"
     assert revoked is False, "revoke_own_session reported a revoke that did not happen"
     assert await _superseded(store, "self") == [], "an audit row recorded a revoke that missed"
+    # Vault BACKLOG #3260, limb 2: the miss answers the same 404 as an unknown id, so it writes the
+    # same miss row, naming the id the caller sent.
+    missed = await store.list_audit(action="auth.session_revoke_missed")
+    assert [(row["actor"], json.loads(str(row["detail"]))) for row in missed] == [
+        ("op", {"session": target_hash[:12]})
+    ], "the race's 404 left no miss row"
 
 
 async def test_a_self_revoke_that_lands_returns_true_and_audits_it(store: MessageStore) -> None:
@@ -379,7 +385,10 @@ async def test_a_self_revoke_that_lands_returns_true_and_audits_it(store: Messag
     target = await _token(service)
     caller = await service.identity_for_token(await _token(service), activity=False)
     assert caller is not None
-    assert await service.revoke_own_session(caller, hash_token(target), actor="op") is True
+    assert (
+        await service.revoke_own_session(caller, hash_token(target), actor="op", client=None)
+        is True
+    )
     assert not await _live(service, target)
     assert await _superseded(store, "self") == [
         {"scope": "self", "session": hash_token(target)[:12], "actor": "op"}
