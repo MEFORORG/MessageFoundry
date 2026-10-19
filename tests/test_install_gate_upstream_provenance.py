@@ -284,6 +284,31 @@ def test_a_current_install_read_from_a_stale_tree_is_current_not_stale(tmp_path:
     assert "do NOT install from it" in verdict, verdict
 
 
+@pytest.mark.parametrize(
+    ("pinned", "verdict"),
+    [
+        (None, "NOT PINNED"),
+        (b"# the dispatcher\n", "CURRENT with origin/main"),
+        (b"# an older dispatcher\n", "NOT CURRENT with origin/main"),
+    ],
+    ids=["missing", "current", "stale"],
+)
+def test_status_grades_the_pinned_dispatcher(
+    tmp_path: Path, pinned: bytes | None, verdict: str
+) -> None:
+    """A pin behind the ref costs the saving silently, so -Status must say which it is."""
+    _need_tools()
+    checkout = _fixture(tmp_path, behind=False)
+    home = tmp_path / "home"
+    _plant(home, GATE_V1)
+    if pinned is not None:
+        (home / ".claude" / "hooks" / "shell-guard-dispatch.ps1").write_bytes(pinned)
+    line = next(ln for ln in _status(checkout, home).splitlines() if ln.startswith("dispatcher  :"))
+    assert verdict in line, line
+    if verdict == "CURRENT with origin/main":
+        assert "NOT CURRENT" not in line, line
+
+
 def test_stale_says_which_copy_origin_main_agrees_with(tmp_path: Path) -> None:
     """The STALE warning asks the reader to work out which copy is older. The ref answers it."""
     _need_tools()

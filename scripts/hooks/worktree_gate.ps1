@@ -4295,7 +4295,8 @@ $gateFiles = @(
     (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "shell-guard-dispatch.ps1"))
 ) | Where-Object { $_ }
 $targetCmp = Get-ComparablePath $target
-$isProof = $targetCmp -match '/\.claude[^/]*/shell-guard-proof(/|$)'
+# IsMatch, not -match: -match would leave $Matches set for every rule after this one.
+$isProof = [regex]::IsMatch($targetCmp, '/\.claude[^/]*/shell-guard-proof(/|$)')
 if ($targetCmp -in $gateFiles -or $isProof) {
     $surface = if ($isProof) {
         "That folder holds per-call proofs that the gate already ran: a file there stands the gate down for a shell`ncall. Only the project's shell-guard dispatcher writes them, so a session may not write here at all."

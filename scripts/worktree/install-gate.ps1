@@ -811,6 +811,10 @@ if ($Status) {
                 elseif ($dSha -eq $dUp.Sha) { "CURRENT with $($dUp.Ref)" }
                 else { "NOT CURRENT with $($dUp.Ref) -- a checkout at $($dUp.Ref) runs the gate twice per shell call until re-install" }
     Write-Host "dispatcher  : $DispatchDst$(& $shortSha $dSha)  $dVerdict"
+    $dSrc = Get-GateHash (Join-Path $RepoRoot "scripts\hooks\shell-guard-dispatch.ps1")
+    if ($dSha -and $dSrc -and $dSrc -ne $dSha) {
+        Write-Host "              THIS CHECKOUT's dispatcher differs from the pin, so its sessions run the gate twice." -ForegroundColor Yellow
+    }
 
     if ($iSha -and $sSha) {
         if ($iSha -eq $sSha -and $up.Available -and $up.Sha -eq $iSha) {
