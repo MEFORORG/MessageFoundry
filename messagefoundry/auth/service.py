@@ -9920,7 +9920,9 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def logout(self, token: str | None, *, actor: str | None = None) -> LogoutOutcome:
+    async def logout(
+        self, token: str | None, *, actor: str | None = None, client: str | None = None
+    ) -> LogoutOutcome:
         """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
         return that same outcome.
 
@@ -9944,7 +9946,12 @@ class AuthService:
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
         has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
-        feed; with nothing ended there is no owner, and the actor stays NULL."""
+        feed; with nothing ended there is no owner, and the actor stays NULL. That includes a
+        console sign-out that loses a rotation race: the rotated row no longer answers to the
+        presented hash, so nothing here can name its owner (BACKLOG #3339).
+
+        ``client`` is the caller's address from ``client_ip``, which both sign-out routes pass, so
+        the row records where the sign-out came from (BACKLOG #3339, ADR 0150)."""
         if not token:
             return "nothing_to_revoke"
         ended = await self._store.supersede_session(hash_token(token), now=time.time())
@@ -9954,7 +9961,9 @@ class AuthService:
             actor = owner.username if owner is not None else None
         # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
         # ended, so the trail still records the sign-out request.
-        await self._audit("auth.logout", actor=actor, detail=_json({"outcome": outcome}))
+        await self._audit(
+            "auth.logout", actor=actor, detail=_json({"outcome": outcome}), client=client
+        )
         return outcome
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:

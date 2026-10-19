@@ -171,10 +171,23 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
 # --- end-to-end: the confined must-change session can actually sign out ---------------------------
 
 
+#: A non-loopback peer, pinned so an assertion on the audited ``client`` compares a value this file
+#: chose rather than a transport default.
+PEER_ADDRESS = "198.51.100.23"
+
+
 async def _service(engine: Engine) -> AuthService:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
     return service
+
+
+async def _logout_rows(engine: Engine) -> list[tuple[object, object, object]]:
+    """Each ``auth.logout`` row as its actor, client address and ``outcome``."""
+    return [
+        (r["actor"], r["client"], json.loads(str(r["detail"]))["outcome"])
+        for r in await engine.store.list_audit(action="auth.logout")
+    ]
 
 
 async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> None:
@@ -194,7 +207,9 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
         roles=[Role.OPERATOR.value],
         actor="test",
     )
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
+    )
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         login = await c.post("/ui/login", data={"username": "rotate", "password": PW})
         assert login.status_code == 303
@@ -209,8 +224,23 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
         # the session is really gone: the change-password page now bounces to login
         assert (await c.get("/ui/account/password")).status_code in (302, 303, 401)
     # BACKLOG #3029: the route passes no actor, so the auth.logout row names the owner of the
-    # session it ended rather than carrying a NULL actor.
-    rows = await engine.store.list_audit(action="auth.logout")
-    assert [(r["actor"], json.loads(str(r["detail"]))["outcome"]) for r in rows] == [
-        ("rotate", "revoked")
-    ]
+    # session it ended rather than carrying a NULL actor. BACKLOG #3339: it also records the
+    # address the sign-out came from.
+    assert await _logout_rows(engine) == [("rotate", PEER_ADDRESS, "revoked")]
+
+
+async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_address(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3339, the control. A cookie that names no session ends nothing, so the row has no
+    owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
+    the test above, it shows the actor there comes from the ended session, not from the request."""
+    service = await _service(engine)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        c.cookies.set("mf_session", "a-token-that-names-no-session")
+        out = await c.post("/ui/logout")
+        assert out.status_code == 303
+    assert await _logout_rows(engine) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
