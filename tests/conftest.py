@@ -157,6 +157,13 @@ _publish_slot_var("MEFOR_TEST_SLOT", str(_SLOT))
 _publish_slot_var("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
 _publish_slot_var("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 
+# THE SUITE TESTS THE LOCAL MACHINE, SO IT DOES NOT INHERIT A CLOUD SESSION'S MARKER. A Claude Code
+# cloud VM exports CLAUDE_CODE_REMOTE=true, and the coordination scripts refuse every call under it
+# (tests/test_coord_cloud_refusal.py). Inherited, that refusal would fail every pwsh-driven test of
+# those scripts in a cloud Builder's run for a reason unrelated to the change under test. The tests
+# of the refusal set the variable themselves, per subprocess.
+os.environ.pop("CLAUDE_CODE_REMOTE", None)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _force_aad_bind_when_requested() -> Iterator[None]:
