@@ -490,6 +490,8 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
         # The conn has ended its stream: an answer already went out, or the parser gave up. The
         # library asserts on a second end-of-stream, and uvicorn makes this call at server stop
         # for a connection it answered and has not finished closing. See the module docstring.
+        # DEBUG, not WARNING: every server stop with such a connection open takes this path.
+        _log.debug("ws-sansio: dropped a handshake answer on a conn that had ended its stream")
         return
     try:
         # No named parameters, for the reason write_http_response below gives. At websockets 17.1

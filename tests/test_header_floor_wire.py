@@ -421,10 +421,12 @@ async def test_a_parse_error_with_no_queued_answer_is_closed_with_nothing_writte
     assert raw == b""
 
 
-def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
+def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """What uvicorn does at server stop to a connection it already answered: a second
     send_response. On websockets' own ServerProtocol that asserts, which is the control. With the
-    floor's hook it returns, and queues nothing more."""
+    floor's hook it returns, queues nothing more, and says so at DEBUG, once per drop."""
     from websockets.server import ServerProtocol
 
     def _answered() -> Any:
@@ -442,8 +444,11 @@ def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
     floored.send_response(floored.reject(500, "first"))
     first = floored.data_to_send()
     assert b"nosniff" in first[0] and floored.eof_sent
-    floored.send_response(floored.reject(500, "second"))
+    with caplog.at_level(logging.DEBUG, logger=protocol_headers.__name__):
+        floored.send_response(floored.reject(500, "second"))
     assert floored.data_to_send() == []
+    dropped = [r for r in caplog.records if "dropped a handshake answer" in r.getMessage()]
+    assert [r.levelno for r in dropped] == [logging.DEBUG], caplog.records
 
 
 class _NeverLostTransport(asyncio.Transport):
