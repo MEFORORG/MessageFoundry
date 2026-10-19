@@ -11579,11 +11579,15 @@ class AuthService:
         names = await self.administrators_needing_an_outside_service()
         if not names:
             return names
+        # The names come right after a neutral label and before the word "password". The shipped
+        # CredentialScrubFilter reads "password: <value>" as a credential, so the old wording, with
+        # the list after "no usable password:", masked the first name (BACKLOG #3282).
         _log.warning(
             "no enabled Administrator can sign in without an outside identity service (the "
-            "directory or a federated identity provider); each is a directory account or a local "
-            "one with no usable password: %s. If that service is down, no Administrator can sign "
-            "in to manage this engine. Create a local Administrator now, before an outage, from "
+            "directory or a federated identity provider). Accounts that need one: %s. Each is a "
+            "directory account, or a local account with no usable password. If that service is "
+            "down, no Administrator can sign in to manage this engine. Create a local "
+            "Administrator now, before an outage, from "
             "the web console. During an outage, `messagefoundry provision-admin`, run at the host "
             "with the engine stopped, is not blocked by these accounts "
             "(docs/SECURITY.md, 'Keep a local Administrator').",
