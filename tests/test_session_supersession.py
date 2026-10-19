@@ -302,8 +302,8 @@ async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) 
     # The return value is the same outcome the row records, in both cases.
     service = await _service(store)
     token = await _token(service)
-    first = await service.logout(token, actor="op")
-    replay = await service.logout(token, actor="op")
+    first = await service.logout(token, actor="op", client=None)
+    replay = await service.logout(token, actor="op", client=None)
     assert not await _live(service, token)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
     assert await _logouts(store) == [
@@ -329,21 +329,44 @@ async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
     # matching a default of "op".
     service = await _service(store)
     token = await _token(service, "other")
-    first = await service.logout(token)
-    replay = await service.logout(token)
+    first = await service.logout(token, client="203.0.113.5")
+    replay = await service.logout(token, client="203.0.113.6")
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
     assert await _logouts(store) == [
         {"outcome": "nothing_to_revoke", "actor": None},
         {"outcome": "revoked", "actor": "other"},
     ]
+    # BACKLOG #3339: each row records the address that call passed, on both branches.
+    rows = await store.list_audit(action="auth.logout")
+    assert [row["client"] for row in rows] == ["203.0.113.6", "203.0.113.5"]
+
+
+async def test_a_logout_with_no_actor_that_loses_a_rotation_race_still_names_the_owner(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3339 (engine PR 2384, open finding 3). /ui/logout passes no actor, so the owner used
+    # to come only from the row the revoke ended. A rotation that re-keys the session first leaves
+    # the revoke ending nothing, and the row named nobody. logout now reads the owner before the
+    # revoke, so the rotation is injected right after that read. On the prior code nothing calls
+    # get_session, so the injection never fires and the first assertion goes red.
+    service = await _service(store)
+    token = await _token(service, "other")
+    rotations = rotate_after_first_call(monkeypatch, store, service, token, names=("get_session",))
+    outcome = await service.logout(token, client=None)
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    assert rotated is not None and await _live(service, rotated), "the race was not driven"
+    assert outcome == "nothing_to_revoke"
+    assert await _logouts(store) == [{"outcome": "nothing_to_revoke", "actor": "other"}]
 
 
 async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_row(
     store: MessageStore,
 ) -> None:
     service = await _service(store)
-    assert await service.logout(None) == "nothing_to_revoke"
-    assert await service.logout("") == "nothing_to_revoke"
+    assert await service.logout(None, client=None) == "nothing_to_revoke"
+    assert await service.logout("", client=None) == "nothing_to_revoke"
     assert await _logouts(store) == []
 
 
@@ -410,7 +433,7 @@ async def test_the_no_op_inputs_revoke_nothing_and_write_no_row(
 ) -> None:
     service = await _service(store)
     dead = await _token(service)
-    await service.logout(dead)
+    await service.logout(dead, client=None)
     prior: str | None = {
         "none": None,
         "empty": "",

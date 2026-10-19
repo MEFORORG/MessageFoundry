@@ -675,12 +675,15 @@ async def _logout_rows(store: Any) -> list[tuple[object, object, object]]:
 async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:
     """BACKLOG #3339. ``POST /auth/logout`` passes the signed-in caller and the address from
     ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``
-    assertion compares a value this test named (BACKLOG #1644). The route's control, a token that
-    names no session, is the rotation race test above: its dependency refuses any other dead token."""
+    assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
+    address, so the row cannot pass by recording the address the session was minted from. The
+    route's control, a token that names no session, is the rotation race test above: its dependency
+    refuses any other dead token."""
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
-    async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
     assert await _logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
 

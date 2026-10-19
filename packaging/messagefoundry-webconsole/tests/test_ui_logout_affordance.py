@@ -171,8 +171,10 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
 # --- end-to-end: the confined must-change session can actually sign out ---------------------------
 
 
-#: A non-loopback peer, pinned so an assertion on the audited ``client`` compares a value this file
-#: chose rather than a transport default.
+#: Non-loopback peers, pinned so an assertion on the audited ``client`` compares a value this file
+#: chose rather than a transport default. The sign-in comes from a different address than the
+#: sign-out, so the row cannot pass by recording the address the session was minted from.
+LOGIN_PEER = ("198.51.100.10", 40000)
 PEER_ADDRESS = "198.51.100.23"
 
 
@@ -185,7 +187,7 @@ async def _service(engine: Engine) -> AuthService:
 async def _logout_rows(engine: Engine) -> list[tuple[object, object, object]]:
     """Each ``auth.logout`` row as its actor, client address and ``outcome``."""
     return [
-        (r["actor"], r["client"], json.loads(str(r["detail"]))["outcome"])
+        (r["actor"], r["client"], json.loads(str(r["detail"] or "{}")).get("outcome"))
         for r in await engine.store.list_audit(action="auth.logout")
     ]
 
@@ -207,9 +209,8 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
         roles=[Role.OPERATOR.value],
         actor="test",
     )
-    transport = httpx.ASGITransport(
-        app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
-    )
+    app = create_app(engine, auth=service, serve_ui=True)
+    transport = httpx.ASGITransport(app=app, client=LOGIN_PEER)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         login = await c.post("/ui/login", data={"username": "rotate", "password": PW})
         assert login.status_code == 303
@@ -219,7 +220,11 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
         confined = await c.get("/ui/account/password")
         assert confined.status_code == 200
         assert LOGOUT_FORM in confined.text
-        out = await c.post("/ui/logout")
+        # BACKLOG #3339: the same session signs out from another address.
+        elsewhere = httpx.ASGITransport(app=app, client=(PEER_ADDRESS, 51234))
+        async with httpx.AsyncClient(transport=elsewhere, base_url="http://t") as away:
+            away.cookies.set("mf_session", str(c.cookies.get("mf_session")))
+            out = await away.post("/ui/logout")
         assert out.status_code == 303
         # the session is really gone: the change-password page now bounces to login
         assert (await c.get("/ui/account/password")).status_code in (302, 303, 401)
@@ -234,7 +239,7 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
 ) -> None:
     """BACKLOG #3339, the control. A cookie that names no session ends nothing, so the row has no
     owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
-    the test above, it shows the actor there comes from the ended session, not from the request."""
+    the test above, it shows the actor there comes from the session, not from the request."""
     service = await _service(engine)
     transport = httpx.ASGITransport(
         app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)

@@ -9921,7 +9921,7 @@ class AuthService:
         return await self._build_identity(user)
 
     async def logout(
-        self, token: str | None, *, actor: str | None = None, client: str | None = None
+        self, token: str | None, *, client: str | None, actor: str | None = None
     ) -> LogoutOutcome:
         """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
         return that same outcome.
@@ -9944,20 +9944,27 @@ class AuthService:
         so this returns ``nothing_to_revoke`` and writes no row.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
-        caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
-        has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
-        feed; with nothing ended there is no owner, and the actor stays NULL. That includes a
-        console sign-out that loses a rotation race: the rotated row no longer answers to the
-        presented hash, so nothing here can name its owner (BACKLOG #3339).
+        caller). Otherwise it is the OWNER of the session the token named, so a console sign-out,
+        which has no auth dependency to name a caller, still lands in that user's
+        ``/me/security-events`` feed. The owner is read BEFORE the revoke, through
+        :meth:`_load_session`, for two reasons (BACKLOG #3339). A rotation that re-keys the session
+        between that read and the revoke leaves the revoke ending nothing, and the row still names
+        the owner, as ``POST /auth/logout``'s own dependency read does. And the owner comes from a
+        row whose seal verified, never from the row the revoke returns, whose seal is blank. A
+        token that named no live, sealed session at that read has no owner, and the actor stays
+        NULL. That includes a cookie whose session a rotation re-keyed before the request arrived.
 
-        ``client`` is the caller's address from ``client_ip``, which both sign-out routes pass, so
-        the row records where the sign-out came from (BACKLOG #3339, ADR 0150)."""
+        ``client`` is the caller's address, from ``client_ip`` on a request; ``None`` means no
+        request was in scope (ADR 0150). It has no default, so a new sign-out caller cannot omit it
+        silently (BACKLOG #3339)."""
         if not token:
             return "nothing_to_revoke"
-        ended = await self._store.supersede_session(hash_token(token), now=time.time())
+        token_hash = hash_token(token)
+        held = await self._load_session(token_hash) if actor is None else None
+        ended = await self._store.supersede_session(token_hash, now=time.time())
         outcome: LogoutOutcome = "nothing_to_revoke" if ended is None else "revoked"
-        if actor is None and ended is not None:
-            owner = await self._load_user(ended.user_id)
+        if held is not None:
+            owner = await self._load_user(held.user_id)
             actor = owner.username if owner is not None else None
         # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
         # ended, so the trail still records the sign-out request.
