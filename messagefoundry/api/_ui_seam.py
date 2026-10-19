@@ -594,12 +594,18 @@ from typing import Any
 #: covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
+#: BACKLOG #3339: ``AuthService.logout`` gained a required keyword ``client``, the caller's
+#: address, which ``/ui/logout`` now passes so the ``auth.logout`` row records it. The digest moved
+#: from ``5d9c162790077dfc`` because the discovered signature changed. A console on an engine from
+#: the other side of this change would fail its sign-out with a ``TypeError``; the pinned digest
+#: refuses that pair at mount. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "5d9c162790077dfc"
+ENGINE_UI_SEAM: str = "1f2d208818510f18"
 
 
 @dataclass(frozen=True, slots=True)

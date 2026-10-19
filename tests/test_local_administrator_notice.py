@@ -12,6 +12,8 @@ enabled Administrator, where this notice names nobody, and it can refuse for its
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from messagefoundry.auth.identity import AuthProvider
@@ -20,6 +22,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin
+from tests._phi_log_capture import filtered_sink
 
 _ACTION = "auth.no_local_administrator"
 
@@ -141,3 +144,40 @@ async def test_a_failing_notice_costs_neither_the_census_nor_the_start(
         )
     finally:
         await store.close()
+
+
+#: The wording before BACKLOG #3282, kept only as the control below: the list followed a credential
+#: label, so the shipped credential scrub masked the first name.
+_OLD_WORDING = (
+    "no enabled Administrator can sign in without an outside identity service (the directory or a "
+    "federated identity provider); each is a directory account or a local one with no usable "
+    "password: %s. If that service is down, no Administrator can sign in to manage this engine."
+)
+
+
+_LOGGER = "messagefoundry.auth.service"
+
+
+async def test_every_named_administrator_survives_the_shipped_log_filters() -> None:
+    """BACKLOG #3282. The notice exists to name the accounts, so each name must reach the log
+    through the filter chain the engine installs. The control sends the old wording through the
+    same chain and loses the first name, so this test can tell the two wordings apart."""
+    names = ("dir-a", "dir-b", "ops.lead")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        for name in names:
+            await _directory_admin(service, name)
+        # filtered_sink carries the filters every engine handler carries. caplog sees records
+        # before any handler filter, so it cannot measure this.
+        with filtered_sink(_LOGGER) as written:
+            assert await service.report_administrators_needing_an_outside_service() == names
+    finally:
+        await store.close()
+    assert "outside identity service" in written.text, "the notice did not reach the handler"
+    assert "dir-a, dir-b, ops.lead" in written.text, written.text
+
+    with filtered_sink(_LOGGER) as control:
+        logging.getLogger(_LOGGER).warning(_OLD_WORDING, ", ".join(names))
+    assert "dir-b, ops.lead" in control.text, "the control wording did not reach the handler"
+    assert "dir-a" not in control.text, "the old wording keeps every name: this measures nothing"

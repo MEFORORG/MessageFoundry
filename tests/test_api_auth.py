@@ -647,8 +647,10 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     store = engine.store
-    async with _client(engine, service) as c:
+    # Signed in from another address, so the row's client is the sign-out's own (BACKLOG #3339).
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service) as c:
         rotations = rotate_after_first_call(
             monkeypatch, store, service, token, names=("get_session",)
         )
@@ -658,11 +660,34 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     rotated = rotations[0]
     assert rotated is not None, "the rotation failed closed, so the race was not driven"
     assert await service.identity_for_token(rotated, activity=False) is not None
-    outcomes = [
-        json.loads(str(row["detail"] or "{}")).get("outcome")
+    # BACKLOG #3339: a sign-out that ended nothing still names the caller and the address.
+    assert await _logout_rows(store) == [("u", _DEFAULT_PEER[0], "nothing_to_revoke")], (
+        "the auth.logout row claimed a revoke that missed, or lost its actor or address"
+    )
+
+
+async def _logout_rows(store: Any) -> list[tuple[object, object, object]]:
+    """Each ``auth.logout`` row as its actor, client address and ``detail.outcome``."""
+    return [
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
         for row in await store.list_audit(action="auth.logout")
     ]
-    assert outcomes == ["nothing_to_revoke"], "the auth.logout row claimed a revoke that missed"
+
+
+async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:
+    """BACKLOG #3339. ``POST /auth/logout`` passes the signed-in caller and the address from
+    ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``
+    assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
+    address, so the row cannot pass by recording the address the session was minted from. The
+    route's control, a token that names no session, is the rotation race test above: its dependency
+    refuses any other dead token."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
+        token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+    assert await _logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
