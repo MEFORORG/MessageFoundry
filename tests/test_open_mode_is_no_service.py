@@ -239,7 +239,9 @@ def test_each_refusal_names_only_the_places_the_key_could_be(section: str, key: 
     with pytest.raises(ValueError) as built:
         _section_models()[section].model_validate({key: False})
     assert variable not in str(built.value)
-    assert "no environment variable set it" in str(built.value)
+    # Nor does it say that no variable set the key (vault BACKLOG #3350): the service's
+    # environment may set it beside the file `security show` read.
+    assert "environment" not in str(built.value)
     assert f"Remove `{key}`" in str(built.value)
     # The loader's own refusal, from the environment: it names the variable that set the key.
     with pytest.raises(ValueError, match=variable):

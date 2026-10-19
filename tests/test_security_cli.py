@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import _ENV_PREFIX, _REMOVED_KEYS
 
 
 def _show(path: Path, capsys: pytest.CaptureFixture[str]) -> dict:
@@ -366,6 +367,54 @@ def test_show_names_the_stray_variable_that_made_the_report_partial(
     reason = out_data["loosenings_partial_reason"]
     assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in reason
     assert "SYNTHETIC-VALUE-9f3c" not in json.dumps(out_data)
+
+
+# --- a removed key the environment may still set (vault BACKLOG #3350) ------------------------
+
+
+#: Only ``security show``'s own table is built straight from the file, so only these keys reach the
+#: direct-build refusal from it. Every other removed key reaches it through the loader's refusal.
+_SECURITY_REMOVED_KEYS = sorted(key for section, key in _REMOVED_KEYS if section == "security")
+
+
+@pytest.mark.parametrize("key", _SECURITY_REMOVED_KEYS)
+def test_show_never_says_no_variable_set_a_removed_key(
+    key: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key is in the file AND the environment, as a service environment may still set it.
+
+    The refusal comes from the section built from the file's table, which read no variable. It
+    used to say so as "no environment variable set it", which sent an operator away from the
+    variable the service would still refuse at start."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text(f"[security]\n{key} = false\n", encoding="utf-8")
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_{key.upper()}", "false")
+    rc = main(["security", "show", "--service-config", str(toml), "--json"])
+    printed = "".join(capsys.readouterr())
+    # Control: the direct-build refusal, the one that carried the claim, reached the output.
+    assert rc == 1 and "invalid [security]" in printed and f"Remove `{key}`" in printed
+    assert "environment" not in printed
+
+
+@pytest.mark.parametrize("key", _SECURITY_REMOVED_KEYS)
+def test_show_names_the_variable_that_set_a_removed_key(
+    key: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: with the key in the environment only, the file builds and the partial reason
+    is the loader's refusal, which names the variable to unset."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    variable = f"{_ENV_PREFIX}SECURITY_{key.upper()}"
+    monkeypatch.setenv(variable, "false")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is True
+    assert variable in data["loosenings_partial_reason"]
 
 
 # --- operator JSON that nests past the decoder (BACKLOG #1855) --------------------------------

@@ -7943,13 +7943,11 @@ def _removed_key_message(
     The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
     file and the environment, so it names both. A section built directly reads neither: code
     passed the key (the loader's own ``cli`` overrides count as code), or ``security show``
-    read it from the file's table. Naming an environment
-    variable there would send the reader to a place the key cannot be."""
+    read it from the file's table. That build read no variable, so its refusal names none, and it
+    makes no claim about the environment either (vault BACKLOG #3350): ``security show`` prints it
+    for a key in the file while the service's environment may set the same key too."""
     if built_directly:
-        fix = (
-            f"The key was passed straight to the section, so no environment variable set it. "
-            f"Remove `{key}` from the arguments or the file table the section was built from"
-        )
+        fix = f"Remove `{key}` from the arguments or the file table the section was built from"
         if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
             fix = f"{fix}. {hint}"
     else:
