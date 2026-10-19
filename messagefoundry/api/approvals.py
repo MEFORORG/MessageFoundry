@@ -82,13 +82,14 @@ log = logging.getLogger(__name__)
 #: executor raises only BEFORE its effects happen, and after them it reports trouble in its result
 #: instead. In particular, a domain audit row it writes after acting must be fail-soft (BACKLOG
 #: #1940). A row that commits WITH the effect, as the released replay's does (BACKLOG #2624), may
-#: raise: a failed append rolls the effect back, so the operation did not complete. **Except when
-#: the COMMIT itself is what raised.** A COMMIT the server applied and whose reply was lost raises
-#: after the effect and its row both landed, and the gate still records ``failed`` for an operation
-#: that ran. Nothing here reads the effect back to tell the two apart (vault BACKLOG #3324). The gate
-#: does not write either row for it: the row is the one the operation's inline route writes, built
-#: from detail only the executor holds, and the inline route shares the writer (vault BACKLOG #2255,
-#: finding 1).
+#: raise: a failed append, or a refused COMMIT, rolls the effect back, so the operation did not
+#: complete. **Except for a COMMIT the server applied whose reply was lost.** That raises after the
+#: effect and its row both landed, and the gate still records ``failed`` for an operation that ran.
+#: The store tees only after a commit it saw succeed, so that row is not forwarded off-box either.
+#: Nothing here reads the effect back to tell the two apart; docs/SECURITY.md states the case once
+#: (vault BACKLOG #3324). The gate does not write either row for it: the row is the one the
+#: operation's inline route writes, built from detail only the executor holds, and the inline route
+#: shares the writer (vault BACKLOG #2255, finding 1).
 Executor = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
 
 #: Resolves a ``users.id`` to its CURRENT :class:`Identity` (roles, custom-role overlay, channel scope),
@@ -1110,7 +1111,8 @@ class ApprovalGate:
         **Who writes the post-execution audit row.** The gate writes ``approval.approved``; an
         executor writes the domain row its inline route writes too, because only it holds that
         row's detail and the inline route shares the writer. Some of those rows commit WITH the
-        effect, at least ``dead_letter_replay`` and ``connection_purge`` (BACKLOG #2624), so a
+        effect, at least ``dead_letter_replay`` (BACKLOG #2624) and ``connection_purge`` (vault
+        BACKLOG #3217), so a
         failed append rolls the effect back. Others are written after it, at least
         ``config_reload``, and that executor must not raise once its effects have happened, since a
         raise reads as "did not complete" and is compensated to ``failed``. :data:`Executor` states

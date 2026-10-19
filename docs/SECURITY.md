@@ -2344,6 +2344,10 @@ request moves to `failed`, and `approval.failed` names the error type. A release
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
 attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
 is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
+At least one case does not fail closed: a COMMIT the server applied whose reply was lost. The
+re-queue or the cancel and its row are then committed, and the request still moves to `failed`.
+The store forwards a row off-box only after a commit it saw succeed, so that row is not forwarded,
+and no alert says the operation ran (vault BACKLOG #3324).
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still

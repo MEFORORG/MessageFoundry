@@ -451,6 +451,35 @@ async def test_a_lost_request_row_cannot_forge_a_log_line(
     assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
 
 
+async def test_a_release_whose_effect_commit_lost_its_reply_is_recorded_failed(
+    store: MessageStore,
+) -> None:
+    """The case the ``Executor`` docstring and docs/SECURITY.md state (vault BACKLOG #3324): an
+    executor whose effect COMMITTED and whose commit reply was then lost raises, and the gate
+    records ``failed`` for an operation that ran. Nothing reads the effect back. A change that does
+    is a behaviour change, and this test says so."""
+    effects: list[str] = []
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(
+        _StandingStore(store), settings, resolve_identity=_resolve, alert_sink=_Sink()
+    )
+
+    async def _commit_landed_reply_lost(_p: Mapping[str, Any]) -> dict[str, Any]:
+        effects.append("requeued")
+        raise sqlite3.OperationalError(_FAULT)
+
+    gate.register(
+        "dead_letter_replay", "op", _commit_landed_reply_lost, permission=Permission.MESSAGES_REPLAY
+    )
+    approval_id = await _request(gate)
+    with pytest.raises(sqlite3.OperationalError):
+        await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert effects == ["requeued"]
+    assert await _status(store, approval_id) == "failed"
+
+
 async def test_a_repeat_request_cannot_forge_a_log_line(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -318,18 +318,18 @@ async def _assert_totp_contract(store: Any) -> None:
     from tests._operator_audit_atomic_contract import (
         AppendFailed,
         CommitFailed,
+        TeeTap,
         commit_seam,
         failing_append,
         failing_commit,
     )
-    from tests._pending_approval_store_contract import _TeeTap
 
     faults: list[tuple[AbstractContextManager[None], type[Exception]]] = [
         (failing_append(store, action), AppendFailed)
     ]
     if commit_seam(store):
         faults.append((failing_commit(store), CommitFailed))
-    tap = _TeeTap()
+    tap = TeeTap()
     try:
         for fault, raised in faults:
             with fault, pytest.raises(raised):
@@ -337,6 +337,9 @@ async def _assert_totp_contract(store: Any) -> None:
                     "totp-u1", step=200, expected_enrolled_at=12.0, now=12.75, **replaced
                 )
             assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP", raised
+            assert await store.get_recovery_code_hashes("totp-u1") == ["o1", "o2"], raised
+            user = await store.get_user("totp-u1")
+            assert user is not None and user.totp_enabled is True, raised
             assert len(await store.list_sessions("totp-u1")) == 1, raised
             assert await audit_rows() == 0, raised
         ended = await store.replace_totp_enrolment(
