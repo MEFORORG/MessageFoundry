@@ -19,9 +19,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import platform
 import re
 import socket
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -65,6 +65,11 @@ def _refusal(http: type[Any], ws: type[Any] | None) -> str:
     # Raised outside any handler, so nothing the drive raised rides on the refusal's chain.
     assert refused.value.__context__ is None and refused.value.__cause__ is None
     return message
+
+
+#: How a refusal for a raising drive names the running Python.
+_VERSION = sys.version_info
+_PYTHON = f"{sys.implementation.name} {_VERSION.major}.{_VERSION.minor}.{_VERSION.micro}"
 
 
 def _frames(message: str) -> list[str]:
@@ -279,7 +284,7 @@ def test_a_drive_that_raises_is_refused_by_type_and_places(monkeypatch: pytest.M
 
     monkeypatch.setattr(http, "data_received", _raises)
     message = _refusal(http, ws)
-    assert f"the drive raised ValueError on Python {platform.python_version()} " in message, message
+    assert f"the drive raised ValueError on {_PYTHON} " in message, message
     # The self-test's own frame first, the raising frame in this module last.
     frames = _frames(message)
     assert frames[0].startswith("messagefoundry.api.protocol_floor_selftest:"), message
@@ -287,15 +292,32 @@ def test_a_drive_that_raises_is_refused_by_type_and_places(monkeypatch: pytest.M
     assert "synthetic text" not in message
 
 
+def test_a_recursion_is_listed_once_with_its_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run of one place is collapsed, so a RecursionError's refusal stays one readable line."""
+    http, ws = _floored()
+
+    def _recurses(self: Any, data: bytes) -> None:
+        _recurses(self, data)
+
+    monkeypatch.setattr(http, "data_received", _recurses)
+    message = _refusal(http, ws)
+    assert "the drive raised RecursionError" in message, message
+    assert re.fullmatch(
+        r"(\w+\.)*test_protocol_floor_selftest:\d+ \(\d+ times\)", _frames(message)[-1]
+    ), message
+    assert len(message) < 2000, len(message)
+
+
 def test_a_loop_internal_python_stops_supplying_is_a_clean_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The private loop supplies CPython internals ``asyncio.BaseEventLoop`` calls. One it stops
-    supplying, as a later Python could make it, is a refusal naming the asyncio frame, not a
-    traceback out of ``serve``."""
+    supplying, as a later Python could make it, is a refusal naming the Python and the asyncio
+    frame, not a traceback out of ``serve``."""
     monkeypatch.delattr(protocol_floor_selftest._NoIOLoop, "_process_events")
     message = _refusal(*_floored())
-    assert "the drive raised NotImplementedError on Python " in message, message
+    assert f"the drive raised NotImplementedError on {_PYTHON} " in message, message
+    assert "in the Python under it" in message, message
     assert re.fullmatch(r"asyncio\.base_events:\d+", _frames(message)[-1]), message
 
 
@@ -355,8 +377,10 @@ def test_the_private_loops_error_handler_logs_no_exception_text(
     exception (BACKLOG #1789's exemption, pinned in ``tests/test_last_resort.py``). Read off the
     captured log, so a second log line that printed ``context["exception"]`` fails it."""
     records, text = _logged_loop_error(caplog)
-    assert [r.name for r in records] == [protocol_floor_selftest._log.name], text
-    assert "a discarded task failed" in text, text
+    # Matched by message, not by count: another private loop's pending task, collected while the
+    # log is captured, can add a record of its own.
+    ours = [r for r in records if "a discarded task failed" in r.getMessage()]
+    assert [r.name for r in ours] == [protocol_floor_selftest._log.name], text
     assert _LOOP_ERROR_TEXT not in text and "ValueError" not in text, text
 
     # The controls: the instrument sees exception text when a handler logs it.

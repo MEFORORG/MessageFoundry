@@ -4989,10 +4989,12 @@ def _supervise(args: argparse.Namespace) -> int:
     if floor is None:
         return 2
     # The same again for the client-certificate shim, when the settings ask each shard for one.
-    if _client_cert_shim_wanted(settings):
-        shim = _floor_or_refusal("start the fleet", functools.partial(_client_cert_shim, *floor))
-        if shim is None:
-            return 2
+    if (
+        _client_cert_shim_wanted(settings)
+        and _floor_or_refusal("start the fleet", functools.partial(_client_cert_shim, *floor))
+        is None
+    ):
+        return 2
 
     # BACKLOG #2356: the two checks `serve` makes next, in its order. The SQL Server driver, then
     # the environment gate (ADR 0017): a name, and a production tier for it. Every engine shard
