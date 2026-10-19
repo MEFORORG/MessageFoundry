@@ -394,6 +394,17 @@ def main() -> int:
     st = sub.add_parser("status", help="every item and its legs")
     st.set_defaults(func=cmd_status)
     a = p.parse_args()
+    # A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir
+    # is the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A
+    # cloud session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the
+    # copies equal. Refused even with MEFOR_OWNER_LOG set, as mail.ps1 refuses with -MailRoot.
+    # Case-folded because the PowerShell copies compare with -eq, which ignores case.
+    if os.environ.get("CLAUDE_CODE_REMOTE", "").lower() == "true":
+        sys.stderr.write(
+            "owner_log.py: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This"
+            " VM's .git/mefor-coord reaches no other session, so nothing was read or recorded.\n"
+        )
+        return 3
     result: int = a.func(a)
     return result
 

@@ -84,6 +84,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+# Refused even with -CoordDir, as mail.ps1 refuses with -MailRoot. Exit 3 sits outside the 0/1/2 above.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('handoff.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 # A partial -Retire or -Write call: refuse by name, before anything is read or written. See $Retire.
 $missing = switch ($PSCmdlet.ParameterSetName) {
     'Retire' { if (-not $Retire) { '-Retire <name>' } }

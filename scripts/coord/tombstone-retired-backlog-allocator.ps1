@@ -70,6 +70,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+# Refused even with -GitCommonDir, as mail.ps1 refuses with -MailRoot.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('tombstone-retired-backlog-allocator.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 # Far above any real ledger number, and a round one so it reads as deliberate. The vault ledger was
 # under #1900 when this was written; it would take a thousand years at the current rate to reach this.
 $TombstoneNumber = 1000000
