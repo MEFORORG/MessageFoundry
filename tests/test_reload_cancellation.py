@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -41,16 +41,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import prove, reproving_transport
+from tests._deadline_capture import capture_deadlines, expect_cut_off
 
 PW = "Sup3rSecret!!reload-outlive"
-
-
-async def _wait(predicate: Callable[[], Awaitable[bool]], timeout: float = 10.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not await predicate():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("condition not met within timeout")
-        await asyncio.sleep(0.02)
 
 
 def _registry(tmp_path: Path, *, inbound: str = "file_in", directory: str = "in") -> Registry:
@@ -172,7 +165,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient, Any]:
+async def _deployer(engine: Engine) -> tuple[httpx.AsyncClient, Any]:
     # The shipped default: the action-bound proof is on, and reproving_transport re-proves for it
     # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
     # pins the gate itself.
@@ -206,12 +199,10 @@ async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient,
             "/auth/login", json={"username": "deployer", "password": PW, "provider": "local"}
         )
     assert r.status_code == 200, r.text
-    # The reload takes a proof bound to it (vault BACKLOG #2625). Mint it here, before the
-    # deadline: a re-proof hashes a password, which alone outlasts the deadlines these tests set.
+    # The reload takes a proof bound to it (vault BACKLOG #2625). Mint it here, up front: a
+    # re-proof is a second request, and the test cuts off the reload request alone.
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as proving:
         proved = await prove(proving, r.json()["token"], PW, "config_reload")
-    # After the login: its password hash alone outlasts the deadline these tests set.
-    app.state.request_timeout_seconds = deadline
     client = httpx.AsyncClient(
         transport=transport,
         base_url="http://t",
@@ -228,22 +219,23 @@ async def test_a_reload_cut_off_by_the_deadline_finishes_and_writes_its_row(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry(tmp_path)
+    client, app = await _deployer(engine)
+    # The deadline is the middleware's own, fired from inside the reload rather than set to a
+    # fraction of a second: wall time from the start of the request could run out in the auth
+    # dependencies, before the reload started (vault BACKLOG #3871).
+    capture = capture_deadlines(monkeypatch, app)
 
-    async def slow_reload(*_args: Any, **_kwargs: Any) -> ReloadOutcome:
-        await asyncio.sleep(0.6)  # outlasts the 0.2 s deadline below
+    async def reload_cut_off(*_args: Any, **_kwargs: Any) -> ReloadOutcome:
+        await capture.cut_off()
         return ReloadOutcome(registry=registry, applied=True, directory=tmp_path)
 
-    monkeypatch.setattr(engine, "reload_detail", slow_reload)
-    client, app = await _deployer(engine, deadline=0.2)
-    async with client:
-        r = await client.post("/config/reload", json={})
-    assert r.status_code == 503
-    assert "timed out" in r.json()["detail"]
-
-    async def settled() -> bool:
-        return not app.state.outliving_operations.inflight
-
-    await _wait(settled)
+    monkeypatch.setattr(engine, "reload_detail", reload_cut_off)
+    outliving = app.state.outliving_operations
+    async with client, capture.held(outliving):
+        await expect_cut_off(capture, client.post("/config/reload", json={}))
+        # Cut off while the reload was still running, and not cancelled with the request.
+        assert outliving.inflight == ["config reload"]
+        assert "config_reload" not in await _actions(engine.store)
     actions = await _actions(engine.store)
     assert "config_reload" in actions  # the reload's own row, written after its caller left
     assert "config_reload_interrupted" not in actions

@@ -44,6 +44,7 @@ from messagefoundry.store.store import AuditAppend
 from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests._deadline_capture import DeadlineCapture, capture_deadlines, expect_cut_off
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -1434,28 +1435,26 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
 # --- vault BACKLOG #3178: the upload.create and upload.delete rows outlive the request -------------
 
 
-def _park_audit(engine: Engine, action: str, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
-    """Make ``record_audit`` for ``action`` wait until the returned event is set, so the request
-    deadline fires while that row is being written. Every other row writes through."""
-    release = asyncio.Event()
+def _park_audit(
+    engine: Engine, app: Any, action: str, monkeypatch: pytest.MonkeyPatch
+) -> DeadlineCapture:
+    """Fire the request deadline while ``record_audit`` writes ``action``, and hold that write until
+    the returned capture's ``held`` block ends. Every other row writes through.
+
+    The deadline is the middleware's own, fired from inside the write rather than set to a fraction
+    of a second: wall time from the start of the request could run out in the body read or the file
+    save, before the write started, and the request then stored no file at all (vault BACKLOG
+    #3871)."""
     real = engine.store.record_audit
+    capture = capture_deadlines(monkeypatch, app)
 
     async def _parked(name: str, **kwargs: Any) -> Any:
         if name == action:
-            await release.wait()
+            await capture.cut_off()
         return await real(name, **kwargs)
 
     monkeypatch.setattr(engine.store, "record_audit", _parked)
-    return release
-
-
-async def _settle(app: Any) -> None:
-    """Wait for the app's outliving operations to finish."""
-    for _ in range(200):
-        if not app.state.outliving_operations.inflight:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("an outliving operation never finished")
+    return capture
 
 
 async def test_a_deadline_during_the_create_row_still_writes_it(
@@ -1472,12 +1471,16 @@ async def test_a_deadline_during_the_create_row_still_writes_it(
         transport=reproving_transport(PW, app=app), base_url="http://t"
     ) as c:
         h = await _login(c, "op")
-        release = _park_audit(engine, "upload.create", monkeypatch)
-        app.state.request_timeout_seconds = 0.5
-        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
-        assert r.status_code == 503, r.text
-        release.set()
-        await _settle(app)
+        capture = _park_audit(engine, app, "upload.create", monkeypatch)
+        outliving = app.state.outliving_operations
+        async with capture.held(outliving):
+            await expect_cut_off(
+                capture,
+                c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h),
+            )
+            # Cut off inside the row's write, with the file already stored.
+            assert outliving.inflight == ["upload.create audit"]
+            assert len(await app.state.upload_store.list_files()) == 1
     [stored] = await app.state.upload_store.list_files()
     [row] = await engine.store.list_audit(action="upload.create")
     assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == stored.file_id
@@ -1527,12 +1530,13 @@ async def test_a_deadline_during_the_delete_row_still_writes_it(
         h = await _login(c, "op")
         r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
         fid = r.json()["file_id"]
-        release = _park_audit(engine, "upload.delete", monkeypatch)
-        app.state.request_timeout_seconds = 0.5
-        d = await c.delete(f"/uploads/{fid}", headers=h)
-        assert d.status_code == 503, d.text
-        release.set()
-        await _settle(app)
+        capture = _park_audit(engine, app, "upload.delete", monkeypatch)
+        outliving = app.state.outliving_operations
+        async with capture.held(outliving):
+            await expect_cut_off(capture, c.delete(f"/uploads/{fid}", headers=h))
+            # Cut off inside the row's write, with the file already removed.
+            assert outliving.inflight == ["upload delete"]
+            assert await app.state.upload_store.list_files() == []
     assert await app.state.upload_store.list_files() == []
     [row] = await engine.store.list_audit(action="upload.delete")
     assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == fid

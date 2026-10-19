@@ -11,9 +11,12 @@ the coordinator latched active, and the retry answered success from the idempote
 it (``api/outlive.py``), and the coordinator's own cancellation arms restore state and record an
 interrupted outcome for what can still cancel one, such as a shutdown.
 
-The HTTP tests patch the deadline down to a fraction of a second rather than wait 120 s; the
-mechanism under test is the cancellation, not the number. No test here measures how long a real
-activation takes on a restored store.
+The HTTP tests fire the middleware's own deadline from inside the operation rather than wait 120 s;
+the mechanism under test is the cancellation, not the number. They used to set the deadline to a
+fraction of a second, but it counts from the start of the request, so on a loaded runner the auth
+dependencies alone could outlast it and the 503 came before the operation started (vault BACKLOG
+#3871). ``tests/_deadline_capture.py`` says how the deadline is fired. No test here measures how
+long a real activation takes on a restored store.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.store import MessageStore, Store
 from messagefoundry.store.crypto import generate_key, make_cipher
 from tests._admin_account import create_local_user_chosen
+from tests._deadline_capture import capture_deadlines, expect_cut_off
 
 PW = "Sup3rSecret!!DR-outlive"
 #: Synthetic, never real PHI (CLAUDE.md section 9).
@@ -168,8 +172,8 @@ async def seeded(tmp_path: Path) -> AsyncIterator[tuple[Engine, str]]:
 async def _admin_client(
     engine: Engine, deadline: float, *, provision: bool = True
 ) -> tuple[httpx.AsyncClient, Any]:
-    """A signed-in administrator client. The deadline is set AFTER the login, whose password hash
-    alone takes longer than the fractions of a second these tests use."""
+    """A signed-in administrator client, with ``deadline`` set AFTER the login. A test here that
+    cuts a request off then installs ``tests/_deadline_capture.py``, which replaces it."""
     service = AuthService(
         engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
     )
@@ -255,25 +259,29 @@ async def test_a_release_cut_off_by_the_deadline_still_hands_back_and_records_th
     depth = await _activate_directly(engine)
     rr = engine.registry_runner
     assert rr is not None
+    coord = _coordinator(engine)
 
-    # The drain gives up after 1.0 s; the request deadline fires at 0.3 s, well inside it -- the
-    # shape the 120 s pair had, where any non-draining row meant the deadline fired first.
-    monkeypatch.setattr(engine_module, "DR_RELEASE_DRAIN_TIMEOUT_SECONDS", 1.0)
-    client, app = await _admin_client(engine, deadline=0.3)
-    async with client:
-        r = await client.post("/dr/release")
-        assert r.status_code == 503
-        assert "timed out" in r.json()["detail"]
+    # The request deadline fires inside the drain, before the drain gives up -- the shape the
+    # 120 s pair had, where any non-draining row meant the deadline fired first. The drain is held
+    # until the 503 is in, then runs for real and gives up on the row that cannot drain.
+    monkeypatch.setattr(engine_module, "DR_RELEASE_DRAIN_TIMEOUT_SECONDS", 0.3)
+    real_drain = engine._drain_pipeline
+    client, app = await _admin_client(engine, deadline=30.0)
+    capture = capture_deadlines(monkeypatch, app)
 
-        # The release goes on without its caller and completes the hand-back.
-        coord = _coordinator(engine)
+    async def drain_cut_off(**kwargs: Any) -> tuple[int, int]:
+        await capture.cut_off()
+        return await real_drain(**kwargs)
 
-        async def released() -> bool:
-            return not coord.active and not app.state.outliving_operations.inflight
-
-        await _wait(released)
-
-    assert engine.dr_active is False
+    monkeypatch.setattr(engine, "_drain_pipeline", drain_cut_off)
+    outliving = app.state.outliving_operations
+    async with client, capture.held(outliving):
+        await expect_cut_off(capture, client.post("/dr/release"))
+        # Cut off in its drain: intake is already unbound, and the box is still active.
+        assert outliving.inflight == ["DR release"]
+        assert coord.active and not rr.inbound_running("file_in")
+    # Let go, the release went on without its caller and completed the hand-back.
+    assert not coord.active and engine.dr_active is False
     assert not rr.inbound_running("file_in")
     rows = await _rows(engine.store, "dr.release")
     assert len(rows) == 1
@@ -347,27 +355,25 @@ async def test_a_release_cancelled_in_its_drain_stays_active_and_records_why(
 
 
 async def test_an_activation_cut_off_by_the_deadline_completes_and_a_retry_reads_its_outcome(
-    seeded: tuple[Engine, str],
+    seeded: tuple[Engine, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, _archive = seeded
     coord = _coordinator(engine)
     real_profile = coord._activate_profile
+    client, app = await _admin_client(engine, deadline=30.0)
+    capture = capture_deadlines(monkeypatch, app)
 
-    async def slow_profile() -> None:
-        await asyncio.sleep(0.6)  # outlasts the 0.2 s deadline below
+    async def profile_cut_off() -> None:
+        await capture.cut_off()  # the deadline fires in step 4
         await real_profile()
 
-    coord._activate_profile = slow_profile
-    client, app = await _admin_client(engine, deadline=0.2)
+    coord._activate_profile = profile_cut_off
+    outliving = app.state.outliving_operations
     async with client:
-        r = await client.post("/dr/activate", json={})
-        assert r.status_code == 503
-        assert "timed out" in r.json()["detail"]
-
-        async def settled() -> bool:
-            return not app.state.outliving_operations.inflight
-
-        await _wait(settled)
+        async with capture.held(outliving):
+            await expect_cut_off(capture, client.post("/dr/activate", json={}))
+            assert outliving.inflight == ["DR activation"]
+            assert await _rows(engine.store, "dr.activate") == []
         assert coord.active and engine.dr_active
         rows = await _rows(engine.store, "dr.activate")
         assert len(rows) == 1 and "recorded_late" not in rows[0]
