@@ -140,7 +140,8 @@ class _FakeLdap:
         self.unreachable = unreachable or set()
         #: Usernames whose lookup the directory answers with a referral (BACKLOG #2538).
         self.referring: set[str] = set()
-        #: Usernames whose lookup raises something that is not an LdapError (BACKLOG #2241).
+        #: Usernames whose lookup raises this exception: one that is not an LdapError (BACKLOG
+        #: #2241), or an LdapError the probe reads by its fields (vault BACKLOG #3696).
         self.broken: dict[str, Exception] = {}
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []

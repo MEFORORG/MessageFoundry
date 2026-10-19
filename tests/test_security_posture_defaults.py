@@ -305,6 +305,31 @@ def test_an_ad_timeout_without_ad_is_not_a_loosening(field: str) -> None:
     assert field in _names(auth=_ad(**{field: 3600.0}))
 
 
+# --- [auth].ad_group_search_deadline (vault BACKLOG #3696) -------------------------------------
+
+
+def test_a_group_search_deadline_above_its_default_is_a_named_loosening() -> None:
+    """Named alone, against its own 120 s default rather than the timeouts' 10 s, and only while a
+    paged group search runs: AD on, nested groups on and a group search base set. At or below the
+    default it is stricter and is not named."""
+    field = "ad_group_search_deadline"
+
+    def grouped(**over: object) -> AuthSettings:
+        return _ad(ad_group_search_base="OU=Groups,DC=test,DC=invalid", **over)
+
+    risks = dict(_pairs(auth=grouped(**{field: 3600.0})))
+    assert "3600.0 s, above the default of 120 s" in risks[field]
+    assert "worker thread" in risks[field] and "keeps answering slowly" in risks[field]
+    assert [n for n in risks if n.startswith("ad_")] == [field]
+    assert "is 120.5 s" in dict(_pairs(auth=grouped(**{field: 120.5})))[field]
+    for value in (120.0, 30.0):
+        assert field not in _names(auth=grouped(**{field: value}))
+    assert field not in _names(auth=AuthSettings(**{field: 3600.0}))  # type: ignore[arg-type]
+    # Nor where no paged group search runs: nested groups off, or no group search base.
+    assert field not in _names(auth=grouped(**{field: 3600.0, "ad_use_nested_groups": False}))
+    assert field not in _names(auth=_ad(**{field: 3600.0}))
+
+
 # --- [auth].admin_new_ip_step_up (BACKLOG #288) ----------------------------------------------
 
 
