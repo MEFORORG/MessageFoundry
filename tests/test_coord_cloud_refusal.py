@@ -55,6 +55,11 @@ def _template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@example.invalid")
     _git(r, "config", "user.name", "t")
+    # No background maintenance: the commit below can detach one that holds
+    # .git/objects/maintenance.lock while a test copies the tree, and the copy then fails on a lock
+    # that vanished mid-walk. Measured on the ubuntu tooling leg, PR 2434.
+    _git(r, "config", "maintenance.auto", "false")
+    _git(r, "config", "gc.auto", "0")
     shutil.copytree(COORD, r / "scripts" / "coord")
     shutil.copytree(HOOKS, r / "scripts" / "hooks")
     (r / "f.txt").write_text("x", encoding="utf-8")
@@ -68,7 +73,7 @@ def repo(tmp_path: Path, _template: Path) -> Path:
     """A private copy of the template per test. These scripts anchor on where they live, not on the
     cwd, so the copy is what keeps every write out of the real registry and out of a sibling test."""
     r = tmp_path / "repo"
-    shutil.copytree(_template, r, symlinks=True)
+    shutil.copytree(_template, r, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
     return r
 
 
