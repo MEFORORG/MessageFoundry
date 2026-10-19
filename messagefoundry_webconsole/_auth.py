@@ -581,10 +581,11 @@ def require_ui(
                 next_path=_new_address_continuation(request, landing=reauth_landing(identity)),
             )
         if phi and not auth.allow_phi_read(identity.user_id):
+            # BACKLOG #3293: the actor's own wait, the same value the JSON PHI-read gate sends.
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "too many requests; please slow down",
-                headers={"Retry-After": "10"},
+                headers={"Retry-After": str(auth.phi_read_retry_after(identity.user_id))},
             )
         # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
         # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
@@ -615,7 +616,8 @@ def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | No
 
     Resolved via ``getattr`` because the console ships as a **separately-versioned wheel**: mounted on
     an engine that predates ``allow_reauth_attempt`` it degrades to the previous behaviour rather than
-    failing, so no ENGINE_UI_SEAM bump is required."""
+    failing, so no ENGINE_UI_SEAM bump is required. The 429s it guards call
+    ``AuthService.reauth_retry_after`` directly (BACKLOG #3293), so the seam pins that method."""
     gate = getattr(auth, "allow_reauth_attempt", None)
     if gate is None:  # older engine — previous (shared sign-in budget) behaviour
         return bool(auth.allow_login_attempt(client))

@@ -2108,6 +2108,78 @@ async def test_phi_read_throttle_caps_per_actor_across_endpoints(engine: Engine)
         assert (await c.get("/dead-letters", headers=h)).status_code == 429
 
 
+async def test_phi_read_429_retry_after_is_the_actors_wait(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3293. The PHI-read 429 sent a literal `Retry-After: 10` against a 60 s window, so a
+    # client that honoured it retried inside the window and was refused again. It is now the time
+    # until this actor's next read would be admitted, rounded up. The window is not the default, so
+    # a pass cannot come from a literal that happens to match. The limiter's clock is faked.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            phi_read_rate_limit_per_actor=2,
+            phi_read_rate_limit_window_seconds=37.5,
+        ),
+    )
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "other", Role.VIEWER)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/messages", headers=h)).status_code == 200  # t=1000
+        clock[0] = 1010.0
+        assert (await c.get("/messages", headers=h)).status_code == 200
+        clock[0] = 1020.0
+        full = await c.get("/messages", headers=h)  # the t=1000 read leaves at 1037.5
+        assert (full.status_code, full.headers["Retry-After"]) == (429, "18")
+        # Another account's reads change nothing about this actor's wait (global arm off).
+        other = _auth((await _login(c, "other")).json()["token"])
+        assert (await c.get("/messages", headers=other)).status_code == 200
+        assert (await c.get("/dead-letters", headers=h)).headers["Retry-After"] == "18"
+        clock[0] = 1037.4
+        early = await c.get("/messages", headers=h)
+        assert (early.status_code, early.headers["Retry-After"]) == (429, "1")
+        clock[0] = 1038.0
+        assert (await c.get("/messages", headers=h)).status_code == 200
+
+
+async def test_phi_read_429_retry_after_hides_other_accounts_behind_a_full_global_budget(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3293. With the all-accounts arm on and spent, the true wait is set by when OTHER
+    # accounts read. The refused caller gets the whole window instead, never that timing.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            phi_read_rate_limit_per_actor=5,
+            phi_read_rate_limit_global=2,
+            phi_read_rate_limit_window_seconds=37.5,
+        ),
+    )
+    await _add(service, "a", Role.VIEWER)
+    await _add(service, "b", Role.VIEWER)
+    async with _client(engine, service) as c:
+        ha = _auth((await _login(c, "a")).json()["token"])
+        hb = _auth((await _login(c, "b")).json()["token"])
+        assert (await c.get("/messages", headers=ha)).status_code == 200
+        clock[0] = 1030.0
+        assert (await c.get("/messages", headers=ha)).status_code == 200
+        clock[0] = 1031.0
+        refused = await c.get("/messages", headers=hb)
+        # Not the 7 s until a's first read ages out: the whole 37.5 s window, rounded up.
+        assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38")
+
+
 async def test_phi_read_throttle_is_per_actor(engine: Engine) -> None:
     service = await _service(
         engine, AuthSettings(phi_read_rate_limit_per_actor=2, require_mfa=False)

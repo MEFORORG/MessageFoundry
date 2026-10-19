@@ -3606,9 +3606,11 @@ class AuthSettings(_Section):
     # on local timing will not accept the number. That is why it is labelled provisional and why the
     # window is a setting.
     admin_write_rate_limit_enabled: bool = True
-    admin_write_rate_limit_per_actor: int = (
-        12  # max state-changing admin writes per actor per window
-    )
+    # Max state-changing admin writes per actor per window. 0 turns the count off (a loosening
+    # security_loosenings() names). A negative count is refused at load (BACKLOG #3293): the limiter
+    # read it as a budget of one write per window, a far tighter floor than any value an operator
+    # could have meant, and no loosening check reads a negative count.
+    admin_write_rate_limit_per_actor: int = Field(default=12, ge=0)
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
     admin_write_rate_limit_window_seconds: float = Field(

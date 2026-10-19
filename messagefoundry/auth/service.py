@@ -720,6 +720,16 @@ async def _sleep_until(deadline: float) -> None:
 _ACTION_STEP_UP_GRANT_MAX = 4096
 
 
+def _retry_after_seconds(limiter: SlidingWindowRateLimiter | None, key: str) -> int:
+    """A refusal's ``Retry-After``: ``limiter``'s wait for ``key``, rounded UP to whole seconds and
+    never below 1, so a client that waits this long is admitted by THIS process's limiter, provided
+    the key makes no other attempt meanwhile (BACKLOG #2144, #3293). 1 when the limiter is off,
+    which no refusal reaches."""
+    if limiter is None:
+        return 1
+    return max(1, math.ceil(limiter.retry_after(key)))
+
+
 def _prune_grants(grants: dict[tuple[str, str], float], now: float) -> None:
     """Drop every expired entry from a per-action grant map (monotonic clock)."""
     for key in [k for k, deadline in grants.items() if deadline <= now]:
@@ -3132,9 +3142,31 @@ class AuthService:
         shard keeps its own count. It reflects this actor's own
         writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
         ``/ui`` console both send this value, so the same refusal reads the same on either."""
-        if self._admin_write_limiter is None:
-            return 1
-        return max(1, math.ceil(self._admin_write_limiter.retry_after(actor)))
+        return _retry_after_seconds(self._admin_write_limiter, actor)
+
+    def phi_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a PHI read just refused for ``actor`` (BACKLOG #3293).
+
+        Same rounding and terms as :meth:`admin_write_retry_after`, on the PHI-read limiter. While
+        ``phi_read_rate_limit_global`` is on and spent, it is the whole window, because the true wait
+        depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
+        API and the ``/ui`` console both send it."""
+        return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def login_retry_after(self, client: str | None) -> int:
+        """The ``Retry-After`` value for a sign-in attempt just refused by
+        :meth:`allow_login_attempt` for ``client`` (BACKLOG #3293).
+
+        Keyed as that gate keys, so an attempt with no address reads the ``"unknown"`` bucket. A full
+        all-clients budget answers the whole window, so an unauthenticated caller learns nothing
+        about other addresses' attempts."""
+        return _retry_after_seconds(self._login_limiter, client or "unknown")
+
+    def reauth_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a credential ceremony just refused by
+        :meth:`allow_reauth_attempt` for ``actor`` (BACKLOG #3293). The ceremony limiter has no
+        all-accounts budget, so this is always that account's own wait."""
+        return _retry_after_seconds(self._reauth_limiter, actor)
 
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).

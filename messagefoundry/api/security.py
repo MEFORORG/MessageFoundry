@@ -1606,7 +1606,9 @@ def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
     through export than the per-actor budget allows through ``/messages/{id}``.
 
     Charged at ADMISSION (before selection), so a request that is going to be refused never pays for
-    the store work first."""
+    the store work first. Its Retry-After is the actor's own wait, in whole seconds
+    (:meth:`AuthService.phi_read_retry_after`, BACKLOG #3293); the console's ``require_ui`` sends
+    the same value."""
     auth = get_auth(request)
     if auth is not None and not auth.allow_phi_read(identity.user_id):
         log.warning(
@@ -1617,7 +1619,7 @@ def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "too many requests; please slow down",
-            headers={"Retry-After": "10"},
+            headers={"Retry-After": str(auth.phi_read_retry_after(identity.user_id))},
         )
 
 

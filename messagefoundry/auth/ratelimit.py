@@ -167,7 +167,8 @@ class SlidingWindowRateLimiter:
         wait = self._min_interval - (now - bucket[-1])
         if self._per_key and len(bucket) >= self._per_key:
             # Room opens when the oldest hit ages out. ``allow`` never grows a bucket past a
-            # positive budget, and a negative budget (which loads) admits one hit and then
+            # positive budget, and a negative budget (the sign-in and PHI-read counts still load
+            # one; the admin-write count is refused at load, BACKLOG #3293) admits one hit and then
             # refuses, so the oldest hit is always the one holding the count at the budget.
             wait = max(wait, bucket[0] - (now - self._window))
         return max(wait, 0.0)

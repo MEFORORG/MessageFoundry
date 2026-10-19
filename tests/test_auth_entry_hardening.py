@@ -185,6 +185,15 @@ def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_j
         AuthSettings(admin_write_rate_limit_window_seconds=window)
 
 
+def test_admin_write_count_refuses_a_negative_value_at_load() -> None:
+    # BACKLOG #3293. A negative count loaded, and the limiter then read it as a budget of one write
+    # per window: a floor far tighter than any value an operator meant, and one no loosening check
+    # names. 0 still loads, as the named off value; the control shows the bound is not above 0.
+    with pytest.raises(ValidationError, match="admin_write_rate_limit_per_actor"):
+        AuthSettings(admin_write_rate_limit_per_actor=-1)
+    assert AuthSettings(admin_write_rate_limit_per_actor=0).admin_write_rate_limit_per_actor == 0
+
+
 # --- BACKLOG #2301 (ASVS 2.4.2): the minimum gap between two admin writes ----------------------
 
 
@@ -272,8 +281,8 @@ def test_limiter_retry_after_is_the_wait_of_the_gate_that_fired(
     clock[0] = 2037.5
     assert counted.retry_after("a") == 0.0
     assert counted.allow("a")
-    # A negative budget loads ([auth].admin_write_rate_limit_per_actor has no lower bound) and
-    # refuses every hit after a key's first. The wait must be a number, not an IndexError that
+    # A negative budget still loads for the sign-in and PHI-read counts (only the admin-write count
+    # is refused at load, BACKLOG #3293) and refuses every hit after a key's first. The wait must be a number, not an IndexError that
     # would turn the 429 into a 500: here, until the one hit ages out.
     negative = SlidingWindowRateLimiter(per_key=-1, glob=0, window_seconds=37.5)
     clock[0] = 3000.0

@@ -1747,6 +1747,13 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "the text scan reads CONFIGURATION.md prose; the code half is _ui_refusal's AST read. It also "
         "holds _auth.py source in `src`, which it only passes to _ui_refusal"
     ),
+    (
+        "test_security_doc_rate_limits.py",
+        "test_phi_read_retry_after_is_the_limiters_wait_on_both_surfaces",
+    ): (
+        "the text scan reads SECURITY.md prose; the code half is _ui_refusal's AST read, whose "
+        "result is an unparsed expression, not source text"
+    ),
     ("test_threat_model_doc_drift.py", "test_checks_py_only_names_os_system_as_a_lint_string"): (
         "the claim is about a string literal in checks.py"
     ),

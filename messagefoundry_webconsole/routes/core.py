@@ -661,7 +661,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             raise HTTPException(503, "authentication is not configured")
         client = client_ip(request)
         if not auth.allow_login_attempt(client):
-            raise HTTPException(429, "too many login attempts", headers={"Retry-After": "30"})
+            # BACKLOG #3293: this address's own wait, or the whole window while the all-clients
+            # budget is spent, never a literal shorter than the window.
+            raise HTTPException(
+                429,
+                "too many login attempts",
+                headers={"Retry-After": str(auth.login_retry_after(client))},
+            )
         # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
         # Form()/request.form() would fail; a same-origin login POST is always urlencoded here.
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
@@ -1718,10 +1724,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):
             # Same per-ACTOR ceremony budget the reauth/password flows draw on, so code-guessing
-            # here cannot outrun it either.
-            # Retry-After: 30 matches POST /ui/reauth, the sibling ceremony on the SAME per-actor
-            # budget — a different hint for the same limiter would just misreport when it clears.
-            raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
+            # here cannot outrun it either. Its Retry-After is that budget's own wait for this
+            # account (BACKLOG #3293), the value POST /ui/reauth sends for the same limiter.
+            raise HTTPException(
+                429,
+                "too many attempts",
+                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
+            )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
         if elevation.token is not None:
@@ -1875,7 +1884,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
-            raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
+            raise HTTPException(
+                429,
+                "too many attempts",
+                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
+            )
 
         # Satisfy whichever factor is pending — TOTP first (mirrors require_step_up), then
         # password. The code is only demanded from a user with an ENROLLED authenticator
@@ -2046,7 +2059,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return JSONResponse(
                 {"ok": False, "error": "too many attempts"},
                 status_code=429,
-                headers={"Retry-After": "30"},
+                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
             )
         try:
             body = await request.json()

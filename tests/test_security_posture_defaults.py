@@ -474,7 +474,7 @@ _STRICTER_OR_DEFAULT = [
     ("phi_read_rate_limit_window_seconds", 61.0),
     ("admin_write_rate_limit_per_actor", 12),
     ("admin_write_rate_limit_per_actor", 11),
-    ("admin_write_rate_limit_per_actor", -1),
+    # A negative admin-write count is refused at load (BACKLOG #3293), so it has no row here.
     ("admin_write_rate_limit_window_seconds", 15.0),
     ("admin_write_rate_limit_window_seconds", 16.0),
     ("admin_write_min_interval_seconds", 0.15),

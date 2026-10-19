@@ -1667,6 +1667,28 @@ def test_ui_refusal_is_described_as_the_code_behaves() -> None:
             )
 
 
+def test_phi_read_retry_after_is_the_limiters_wait_on_both_surfaces() -> None:
+    """BACKLOG #3293: the PHI-read 429 sent a literal ``Retry-After: 10`` against a 60 s window.
+
+    The code half pins that ``require_ui``'s ``phi=True`` arm and the JSON ``enforce_phi_read_pacing``
+    send the SAME expression, read from the limiter. The doc half pins that SECURITY.md quotes the
+    retired literal nowhere. The behaviour is pinned in ``tests/test_api_auth.py`` and the console's
+    ``test_ui_retry_after.py``; this keeps the prose from drifting back.
+    """
+    phi = _ui_refusal(_CONSOLE_AUTH.read_text(encoding="utf-8-sig"), "allow_phi_read")
+    assert phi is not None, "require_ui no longer charges the PHI-read budget in an `if` test"
+    assert "phi_read_retry_after" in phi[0], f"require_ui's PHI-read 429 sends {phi[0]}"
+    json_gate = named_func(
+        _parse_src(_API_SECURITY.read_text(encoding="utf-8-sig")), "enforce_phi_read_pacing"
+    )
+    assert _retry_after_values(json_gate) == [phi[0]], (
+        "the JSON PHI-read gate and require_ui must send the same Retry-After for the same refusal"
+    )
+    assert "Retry-After: 10" not in " ".join(_doc_text().split()), (
+        "docs/SECURITY.md quotes the retired PHI-read Retry-After: 10; the 429 sends the actor's wait"
+    )
+
+
 def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
     """Gap wording, enforced both ways.
 
@@ -2191,7 +2213,8 @@ def test_throttle_observability_split_is_documented() -> None:
 def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
     """6.1.1 scores the CONSEQUENCE of a triggered defense, so the doc must not flatten it.
 
-    Only ``POST /ui/login`` raises 429 + ``Retry-After: 30``; the other three console entry routes
+    Only ``POST /ui/login`` raises 429 + ``Retry-After`` (the caller's own wait since BACKLOG #3293,
+    a literal ``30`` before); the other three console entry routes
     return a 303 redirect to ``/ui/login?e=rate_limited``. Derived from the AST of each route's
     rate-limit branch, so the split cannot rot back into one blanket sentence.
 
@@ -2242,8 +2265,8 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
         f"the console routes answering with a 303 redirect changed: {redirecting}"
     )
     text = _doc_text()
-    assert "429 + `Retry-After: 30` on `POST /ui/login`" in text, (
-        "the doc must state the 429 + Retry-After: 30 shape of the POST /ui/login sign-in throttle"
+    assert "429 + a `Retry-After` naming the caller's wait on `POST /ui/login`" in text, (
+        "the doc must state the 429 + Retry-After shape of the POST /ui/login sign-in throttle"
     )
     # Pinned inside the two rows that state the breach shape, not anywhere in the file: a token
     # elsewhere (a route table, a prose aside) would satisfy a file-wide search with the row wrong.
@@ -2264,7 +2287,7 @@ def _retry_after_routes() -> set[str]:
     """Every rate-limit branch that emits ``Retry-After``, across BOTH limiter families.
 
     The narrower walk this replaces looked only at ``allow_login_attempt`` branches, so the two
-    ceremony routes that DO send ``Retry-After: 30`` were structurally invisible to it — and it then
+    ceremony routes that DO send ``Retry-After`` were structurally invisible to it — and it then
     pinned the resulting falsehood ("only POST /ui/login carries it") into the doc. Deriving the set
     means a header added to or removed from any throttle branch reds CI.
     """
@@ -2297,7 +2320,7 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
     """6.1.1 scores the CONSEQUENCE of a triggered defense, so mis-attributing one is the defect.
 
     Derived across both the sign-in window (control 2) and the per-actor ceremony budget (control 3):
-    ``POST /ui/reauth``, ``POST /ui/reauth/webauthn`` and ``POST /ui/mfa`` carry ``Retry-After: 30``
+    ``POST /ui/reauth``, ``POST /ui/reauth/webauthn`` and ``POST /ui/mfa`` carry ``Retry-After``
     too, so scoping it to ``POST /ui/login`` "only" is false.
 
     ``POST /ui/mfa`` (ASVS 6.3.3) joined the set deliberately: it submits a second factor for a
@@ -2318,15 +2341,18 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
     text = _doc_text()
     for route in sorted(emitting):
         assert f"`{route}`" in text, f"{route} sends Retry-After but the doc does not name it"
-    assert "`Retry-After: 30` on `POST /ui/login` only" not in text, (
-        "the retired falsehood is back: two ceremony routes also carry Retry-After: 30."
+    # BACKLOG #3293: these routes send the caller's own wait, so the doc may not quote the literal
+    # anywhere. That also retires the older "`Retry-After: 30` on `POST /ui/login` only" falsehood.
+    assert "Retry-After: 30" not in text, (
+        "docs/SECURITY.md quotes the retired Retry-After: 30; the sign-in and ceremony 429s now "
+        "send the limiter's own wait"
     )
     ceremony = next(
         line
         for line in _section(_H_LIMITS).splitlines()
         if line.strip().startswith("| Credential ceremonies")
     )
-    assert "Retry-After: 30" in ceremony and "/ui/reauth" in ceremony, (
+    assert "`Retry-After` naming the account's wait" in ceremony and "/ui/reauth" in ceremony, (
         "the 2.1.3 'Credential ceremonies' On-breach cell must split the per-route consequence the "
         "same way the sign-in row does — control 3 cannot be documented less completely than 2."
     )

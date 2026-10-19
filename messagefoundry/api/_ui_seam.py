@@ -594,12 +594,19 @@ from typing import Any
 #: covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
+#: Vault BACKLOG #3293: ``AuthService`` gained ``phi_read_retry_after``, ``login_retry_after`` and
+#: ``reauth_retry_after``. ``require_ui``'s PHI-read 429 and the ``POST /ui/login``, ``/ui/mfa``,
+#: ``/ui/reauth`` and ``/ui/reauth/webauthn`` 429s call them for their ``Retry-After``, where they
+#: sent literals. Methods the console calls, so a skew would be an AttributeError where the 429
+#: belongs; they force a bump. ``require_ui``'s body changed too, which moved the route-gate lines.
+#: Re-derived with ``--write`` on main at 45c5ebcfa; re-derive after any merge with another seam move.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "5d9c162790077dfc"
+ENGINE_UI_SEAM: str = "7ac054c8c42245d1"
 
 
 @dataclass(frozen=True, slots=True)
