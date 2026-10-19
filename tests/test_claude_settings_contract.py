@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -86,9 +87,23 @@ def _hook_handlers(settings: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]
 
 
 def _repo_script_refs(handler: dict[str, Any]) -> list[str]:
-    """Every token in a handler that names a file under the repo's script trees."""
-    tokens = [handler.get("command", ""), *handler.get("args", [])]
-    return [t for t in tokens if isinstance(t, str) and (".ps1" in t or ".py" in t)]
+    """Every token in a handler that names a file under the repo's script trees.
+
+    A shell-form handler (no `args`) carries its script inside one command string, so that string
+    is split as the shell would split it. Unsplit, the token starts with whatever precedes the
+    path, and the script would be invisible to the anchoring and existence checks below.
+    """
+    command = handler.get("command", "")
+    if "args" in handler or not isinstance(command, str):
+        tokens = [command, *handler.get("args", [])]
+    else:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            # Unbalanced quoting: keep the whole string, so the anchoring check names this
+            # handler instead of every contract test dying in a traceback.
+            tokens = [command]
+    return [t for t in tokens if isinstance(t, str) and any(x in t for x in (".ps1", ".py", ".sh"))]
 
 
 def _unanchored_refs(settings: dict[str, Any]) -> list[str]:
@@ -239,7 +254,8 @@ _KNOWN_UNWIRED: dict[str, str] = {
 
 
 def _hook_scripts() -> list[str]:
-    return sorted(p.name for p in (_ROOT / "scripts" / "hooks").glob("*.ps1"))
+    hooks = _ROOT / "scripts" / "hooks"
+    return sorted(p.name for pattern in ("*.ps1", "*.sh") for p in hooks.glob(pattern))
 
 
 def _installer_wired(root: Path | None = None) -> set[str]:
@@ -451,6 +467,20 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "bare relative hook path",
         ),
         (
+            # Shell form carries the path inside one command string. Unsplit, the token starts with
+            # `bash`, and before `.sh` was scanned at all this reference was invisible.
+            {
+                "permissions": {"deny": []},
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"shell": "bash", "command": "bash scripts/hooks/x.sh"}]}
+                    ]
+                },
+            },
+            _unanchored_refs,
+            "bare relative path in a shell-form hook",
+        ),
+        (
             {"permissions": {"deny": ["Read(./.env)"]}, "hooks": {}},
             _dot_anchored_denies,
             "dot-anchored deny rule",
@@ -496,7 +526,13 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "matcher that is an exact-name list rather than the regex it resembles",
         ),
     ],
-    ids=["unanchored-hook", "dot-anchored-deny", "unwired-hook-script", "exact-list-matcher"],
+    ids=[
+        "unanchored-hook",
+        "unanchored-shell-form-hook",
+        "dot-anchored-deny",
+        "unwired-hook-script",
+        "exact-list-matcher",
+    ],
 )
 def test_the_checks_can_actually_fail(planted: dict[str, Any], checker: Any, label: str) -> None:
     """A guard that cannot be shown to fail is not a guard.
