@@ -113,6 +113,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+# Every write verb is refused except the two hook paths, -Record and -Prompt, which must exit 0 on
+# every route; the user-scope Stop hook that drives -Record never loads in a cloud session, and the
+# SessionStart hook that drives -Prompt skips it there.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true' -and $PSCmdlet.ParameterSetName -notin 'Record', 'Prompt') {
+    [Console]::Error.WriteLine('seat.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 $SCHEMA = 1
 $WRITER = 'seat.ps1/1.0.0'
 

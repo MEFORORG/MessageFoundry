@@ -82,6 +82,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('claim.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 # Anchored on the SCRIPT, not the current directory -- the reasoning is written out once, at the head of
 # alloc.ps1 (BACKLOG #1060). It applies here identically and was found here by inspection rather than by
 # a second reproduction: this file recorded `worktree = $repo` from the same unanchored call, so an
