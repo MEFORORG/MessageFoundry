@@ -3345,7 +3345,8 @@ class AuthSettings(_Section):
     ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
     # seconds — the one deadline all the pages of the nested group search share (auth/ldap.py
     # _search_paged, vault BACKLOG #3696). Each page's reads are still bounded by
-    # ad_receive_timeout, so a directory that stops answering fails at that, not at this. Well
+    # ad_receive_timeout, so a directory that stops answering fails at that, unless less than
+    # that is left of this, when it is refused as past this. The first page is never capped. Well
     # above it on purpose: a search past it refuses the account, whose roles and scope the
     # reconciler then cannot re-read. 120 s is twelve per-read stalls. NOT a hard wall-clock bound:
     # it caps each read of a page at what is left, so a page that arrives over several reads can
@@ -8661,6 +8662,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "holds a worker thread longer before it is refused",
             ),
         ):
+            if field == "ad_group_search_deadline" and not (
+                auth.ad_use_nested_groups and auth.ad_group_search_base
+            ):
+                continue  # no paged group search runs, so nothing reads it
             value, default = getattr(auth, field), _auth_default(field)
             if value > default:
                 out.append(

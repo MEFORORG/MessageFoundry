@@ -1806,15 +1806,6 @@ _PAGING_BOUND_CAUSES: Final[Mapping[str, str]] = MappingProxyType(
         PAGING_TOO_MANY_PAGES: reconcile.PAGING_CAP,
     }
 )
-#: The outcomes that judged nothing about the account, so they neither enter nor re-arm the paging
-#: refusal's latch: the rule `_track_reconcile_episodes` applies to its own conditions.
-_PAGING_UNJUDGED: Final = frozenset(
-    {
-        reconcile.ProbeOutcome.UNAVAILABLE,
-        reconcile.ProbeOutcome.REFERRED,
-        reconcile.ProbeOutcome.FAULT,
-    }
-)
 
 #: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
 #: #2434). None is counted toward the lockout. ``None`` means no lookup ran. ``_reauth_ad`` refuses
@@ -7054,7 +7045,7 @@ class AuthService:
         )
 
     def _note_paging_refusals(
-        self, probes: Iterable[reconcile.Probe]
+        self, probes: Iterable[reconcile.Probe], judged: Iterable[str]
     ) -> tuple[tuple[str, str, str], ...]:
         """``(user_id, username, cause)`` of each probed account that ENTERS the paging-refused
         state on this pass (vault BACKLOG #3696).
@@ -7064,20 +7055,21 @@ class AuthService:
         UNAVAILABLE. A disable or deletion still strikes, because the user search runs first; what
         stops is the role and scope re-diff of an enabled account. Unlike an outage it recurs on
         every pass, so it pages, once per state change: an account already latched is not
-        returned again, whichever bound refused it this time. An outcome that judged the account
-        (any but UNAVAILABLE, REFERRED or FAULT) re-arms it here; one that judged nothing says
-        nothing about the bound and leaves the latch alone. **The latch is set only once the entry
-        is recorded** (:meth:`_record_paging_refusals`), so a pass that raises before that point
-        leaves the account to enter again on the next pass rather than never page. An account that
+        returned again, whichever bound refused it this time. An account the pass judged
+        (``judged``, the plan's ``outcomes``) re-arms here; an outage, a referral or a fault judged
+        nothing, says nothing about the bound, and leaves the latch alone. **The latch is set only once the entry
+        is recorded** (:meth:`_record_paging_refusals`), so a pass that raises in the service before that
+        point leaves the account to enter again on the next pass. A sink that raises in the
+        lifespan task after it can still cost the page; the row stands. An account that
         left the candidate set is pruned with the other records, and the latch is process-local, so
         a restart pages a standing one once more.
         """
         latch = self._reconcile_paging_refused
+        for user_id in judged:
+            latch.pop(user_id, None)
         entered: list[tuple[str, str, str]] = []
         for probe in probes:
-            if probe.outcome not in _PAGING_UNJUDGED:
-                latch.pop(probe.user_id, None)
-            elif (
+            if (
                 probe.outcome is reconcile.ProbeOutcome.UNAVAILABLE
                 and probe.detail is not None  # REFERRED and FAULT carry a detail of their own
                 and probe.user_id not in latch
@@ -7285,7 +7277,7 @@ class AuthService:
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
-        plan = replace(plan, paging_refused=self._note_paging_refusals(probes))
+        plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted

@@ -629,6 +629,27 @@ def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.Monk
 # --- BACKLOG #3696 items 3 and 4: one deadline across the pages, a cap on entries ----------------
 
 
+def test_a_deadline_below_the_receive_timeout_never_caps_the_first_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2 on PR 2431. A first page slower than the deadline, but inside the socket's
+    own timeout, is read in full: the deadline refuses the search before its second page, as a
+    bound the reconciler pages on, not as a timed-out read it would take for an outage."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+
+    def slow() -> None:
+        clock.now += 0.6
+
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")], on_page=slow)
+    conn.socket = _FakeSocket(10.0)
+    with pytest.raises(LdapUnansweredError) as refused:
+        ldap_module._search_paged(conn, "group search", budget=0.5)
+    assert refused.value.code_name == "deadline spent"
+    assert len(conn.calls) == 1
+    assert conn.socket.set == [10.0], "the first page was capped"
+
+
 def test_the_group_search_deadline_is_its_own_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Lander's send-back on PR 2431. The pages share ``[auth].ad_group_search_deadline``,
     whole and unrounded, not the per-read ``ad_receive_timeout``, which ships at 10 s."""
@@ -675,7 +696,7 @@ def test_pages_each_inside_the_receive_timeout_but_past_the_deadline_together_ar
         ldap_module._search_paged(conn, "group search", budget=10.0, search_base=_GROUPS)
     assert (refused.value.code, refused.value.code_name) == (None, "deadline spent")
     assert len(conn.calls) == 2
-    assert conn.socket.set == [10.0, 4.0, 10.0], "capped to what is left, then restored"
+    assert conn.socket.set == [4.0, 10.0], "capped to what is left, then restored"
     assert conn.abandons == []
     assert [r.levelname for r in caplog.records if "within 10 s" in r.getMessage()] == ["WARNING"]
 
@@ -688,8 +709,9 @@ def test_pages_each_inside_the_receive_timeout_but_past_the_deadline_together_ar
 def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout(
     own: float, bound: float
 ) -> None:
-    """Each page's reads are capped at the shorter of the deadline and the socket's own timeout,
-    and the socket gets its own back when the search ends."""
+    """Each later page's reads are capped at the shorter of the deadline and the socket's own
+    timeout, the first page keeps the socket's own, and the socket gets its own back when the
+    search ends."""
     conn = _PagedConn(
         [
             _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
@@ -699,7 +721,7 @@ def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout(
     conn.socket = _FakeSocket(own)
     assert len(ldap_module._search_paged(conn, "group search", budget=_BUDGET)) == 2
     *capped, restored = conn.socket.set
-    assert len(capped) == 2
+    assert len(capped) == 1
     assert all(value is not None and bound - 1 < value <= bound for value in capped)
     assert restored == own == conn.socket.timeout
 

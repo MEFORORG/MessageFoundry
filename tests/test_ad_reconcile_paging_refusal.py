@@ -136,7 +136,8 @@ async def test_a_change_of_bound_is_not_a_new_state_and_the_text_names_no_direct
         ldap.broken["jdoe"] = _bounded(PAGING_DEADLINE_SPENT)
         [(name, fields)] = (await _pages(service))[1]
         assert (name, fields["reason"]) == (f"{_SOURCE}jdoe", reconcile.PAGING_DEADLINE)
-        assert "ran past [auth].ad_group_search_deadline" in fields["detail"]
+        assert "refused, past [auth].ad_group_search_deadline" in fields["detail"]
+        assert len(fields["detail"]) <= 200, "the store keeps only 200 characters of a reason"
         assert "synthetic" not in fields["detail"] and "jdoe" not in fields["detail"]
         ldap.broken["jdoe"] = _bounded(PAGING_TOO_MANY_ENTRIES)
         assert (await _pages(service))[1] == []

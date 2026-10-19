@@ -1158,10 +1158,13 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
     as the last.
 
     **All the pages share one deadline, ``budget`` seconds** (BACKLOG #3696 item 3). Each socket
-    read of a page waits at most what was left when the page was asked for
+    read of a page after the first waits at most what was left when the page was asked for
     (:class:`_SocketTimeoutCap`), and no page is asked for once it is spent. A deadline spent
     between pages, or a read or send of a later page that waits out what was left, is refused as
-    ``deadline spent``; a first page that times out is one slow read, as any other search's. Without it, every page could take the whole
+    ``deadline spent``. The first page keeps the socket's own timeout, so a first page that times
+    out is one slow read, as any other search's, and a deadline set below
+    ``[auth].ad_receive_timeout`` refuses a search past its first page rather than failing every
+    read as an outage. Without it, every page could take the whole
     ``[auth].ad_receive_timeout``, so the bound was that times the page count. What the bound
     does not cover is in ``docs/CONNECTIONS.md``, the Active Directory row of the timeout table.
 
@@ -1200,7 +1203,8 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
             remaining = deadline - _monotonic()
             if remaining <= 0:
                 raise spent()
-            shortened = timeout.cap(remaining)
+            # The first page is never capped: see the docstring.
+            shortened = bool(page) and timeout.cap(remaining)
             try:
                 _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
             except (
@@ -1209,7 +1213,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
             ) as exc:
                 # ldap3 merges the socket's own exception into its class, so a read or send that
                 # waited out the deadline rather than the socket's timeout is a TimeoutError here.
-                if page and shortened and isinstance(exc, TimeoutError):
+                if shortened and isinstance(exc, TimeoutError):
                     raise spent() from exc
                 raise
             entries.extend(conn.entries)
