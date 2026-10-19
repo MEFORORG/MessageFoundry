@@ -10395,8 +10395,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     point. Their rows stand, except a row that was refused: that account has neither its row nor
     its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
-    Each standing alert but the probe fault's also gets its inverse, which pages nobody and
-    resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
+    Each standing alert but the probe fault's and a paging refusal's also gets its inverse, which
+    pages nobody and resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared``
+    and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so

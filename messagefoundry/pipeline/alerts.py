@@ -606,9 +606,11 @@ class AlertSink(Protocol):
         instance and throttle. ``reason`` is one of those five closed-set slugs. ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator; for a probe fault and a
         paging refusal, the same total of candidates the pass took up, asked or not, which counts
-        the accounts it left unjudged and any id-less row; and for a referral how many probes the
-        pass sent to the directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is
-        the operator-facing explanation the auth service latches. No PHI. Emitted by the
+        any id-less row and, for a probe fault, the faulted accounts it left unjudged; and for a
+        referral how many probes the pass sent to the directory, which leaves out an id-less row
+        (BACKLOG #3170). A paging refusal concerns one account, and its count is still the pass's.
+        ``detail`` is the operator-facing explanation the auth service latches, or for a paging
+        refusal a fixed sentence naming its cause. No PHI. Emitted by the
         API-lifespan reconciler task, never from ``auth/``. A whole-directory outage is NOT this
         event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
@@ -1179,7 +1181,8 @@ class LoggingAlertSink:
             # The count is the candidates the pass took up for the breaker, a probe fault and a
             # paging refusal, or a referral's probes asked (BACKLOG #3170); see
             # AlertSink.ad_reconcile_aborted.
-            "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
+            "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
+            "%d principal(s) "
             "(%s): %s",
             name,
             probed,
