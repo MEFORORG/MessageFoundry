@@ -372,8 +372,9 @@ def test_show_names_the_stray_variable_that_made_the_report_partial(
 # --- a removed key the environment may still set (vault BACKLOG #3350) ------------------------
 
 
-#: Only ``security show``'s own table is built straight from the file, so only these keys reach the
-#: direct-build refusal from it. Every other removed key reaches it through the loader's refusal.
+#: ``security show`` builds only ``[security]`` straight from the file's table, so only these keys
+#: reach the direct-build refusal through it. It reports every other removed key through the
+#: loader's refusal.
 _SECURITY_REMOVED_KEYS = sorted(key for section, key in _REMOVED_KEYS if section == "security")
 # An empty list would turn both tests below into a silent skip.
 assert _SECURITY_REMOVED_KEYS, "no removed [security] key left to test"
@@ -395,10 +396,10 @@ def test_show_makes_no_claim_about_where_a_removed_key_was_not_set(
 ) -> None:
     """The key is in the file, and the run is repeated with the environment setting it too.
 
-    The refusal comes from the section built from the file's table, so it is the same text in both
-    runs: it cannot know what the environment holds. It used to say "no environment variable set
-    it", which sent an operator away from a variable the service would still refuse at start. The
-    removal step now follows the decision directly, with no claim about where the key came from."""
+    The refusal is built from the file's table alone, so it is the same text in both runs. It used
+    to add "no environment variable set it", which would send an operator away from a variable the
+    service would still refuse at start. The removal step is pinned whole, so a provenance claim
+    placed before it, inside it or after it fails."""
     toml = tmp_path / "mf.toml"
     toml.write_text(f"[security]\n{key} = false\n", encoding="utf-8")
     file_only = _show_refusal(toml, capsys)
@@ -406,8 +407,11 @@ def test_show_makes_no_claim_about_where_a_removed_key_was_not_set(
     file_and_env = _show_refusal(toml, capsys)
     assert file_and_env == file_only
     assert file_only.startswith("invalid [security]")
-    assert f"{_REMOVED_KEYS['security', key]}. Remove `{key}` from" in file_only
-    assert "no environment variable" not in file_only
+    assert (
+        f"{_REMOVED_KEYS['security', key]}. Remove `{key}` from the arguments or the file table "
+        "the section was built from (see docs/CONFIGURATION.md)."
+    ) in file_only
+    assert "environment variable" not in file_only.lower()
 
 
 @pytest.mark.parametrize("key", _SECURITY_REMOVED_KEYS)

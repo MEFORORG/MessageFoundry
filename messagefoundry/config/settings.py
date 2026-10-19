@@ -7941,12 +7941,11 @@ def _removed_key_message(
     """The refusal for a removed key: the decision (``reason``), then how to remove the key.
 
     The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
-    file and the environment, so it names both. A section built directly reads neither: code
-    passed the key (the loader's own ``cli`` overrides count as code), or ``security show`` or
-    ``security set`` read it from the file's table, at least. That build read no variable, so its
-    refusal names none, and it makes no claim about the environment either (vault BACKLOG
-    #3350): ``security show`` prints it for a key in the file while the service's environment
-    may set the same key too."""
+    file and the environment, so it names both. A section built directly reads no environment:
+    code passed the key (the loader's own ``cli`` overrides count as code), or at least
+    ``security show`` and ``security set`` passed it from the file's table. Its refusal names no
+    variable, and makes no claim that none set the key (vault BACKLOG #3350): ``security show``
+    prints it for a key in the file while the service's environment may set the same key too."""
     if built_directly:
         fix = f"Remove `{key}` from the arguments or the file table the section was built from"
         if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
