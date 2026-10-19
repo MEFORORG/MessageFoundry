@@ -558,11 +558,14 @@ async def test_a_changed_profile_email_creation_would_refuse_is_refused_whole(ba
         assert user.display_name == "Bob" and user.email == "dir@example.org"
         assert not user.disabled
         assert notifier.events == []
+        audit = await store.list_audit(limit=200)
+        assert not [r for r in audit if r["action"] == "user.updated"]
 
         with pytest.raises(InvalidNotifyEmail):
             await service.create_local_user(
                 username="carol", display_name=None, email=bad, roles=[], actor="admin"
             )
+        assert await store.get_user_by_username("carol") is None
     finally:
         await store.close()
 

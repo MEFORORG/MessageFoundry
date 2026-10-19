@@ -288,8 +288,7 @@ class DirectoryUserCreateRequest(RequestModel):
 class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
-    #: A changed value must pass the mailbox rule ``UserCreateRequest.email`` takes; the service
-    #: checks it, and ``null`` still clears (BACKLOG #3278).
+    #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
     disabled: bool | None = None
     #: The engine-owned address security notices go to. Omitted leaves it as it is. A value moves it

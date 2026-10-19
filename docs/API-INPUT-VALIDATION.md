@@ -184,7 +184,7 @@ Three cases differ from `POST /users`:
 
 - Omitting the field keeps the stored value.
 - An explicit `null` clears it.
-- A value equal to the stored address, ignoring the spaces around either, keeps the stored value
+- A value equal to the stored address, ignoring the whitespace around either, keeps the stored value
   without a second check, so an address another writer stored, such as a directory sync, cannot
   block an unrelated save.
 

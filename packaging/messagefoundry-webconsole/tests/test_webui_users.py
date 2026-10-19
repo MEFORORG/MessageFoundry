@@ -377,6 +377,28 @@ async def _save_profile(c: httpx.AsyncClient, uid: str, form: dict[str, str]) ->
     )
 
 
+async def test_the_console_refuses_a_profile_email_creation_would_refuse(engine: Engine) -> None:
+    """BACKLOG #3278: the console form reaches the PATCH rule. A refused address re-renders with the
+    field named and changes nothing; an accepted one saves."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.update_user_profile(uid, display_name=None, email="dir@example.test")
+        r = await _save_profile(c, uid, {"display_name": "Renamed", "email": "a@b"})
+        assert r.status_code == 400
+        assert "profile email" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None
+        assert user.display_name is None and user.email == "dir@example.test"
+
+        r = await _save_profile(c, uid, {"display_name": "Renamed", "email": "new@example.test"})
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None
+        assert user.display_name == "Renamed" and user.email == "new@example.test"
+
+
 async def test_an_unrelated_console_save_leaves_the_notification_address(engine: Engine) -> None:
     """BACKLOG #1139, ADR 0182 Amendment A. The form is pre-filled with the stored profile email and
     posts it back on every save. A display-name edit must not copy it into the notification

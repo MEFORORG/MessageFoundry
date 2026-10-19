@@ -1381,7 +1381,8 @@ def _adopts_directory_mail(principal: AdPrincipal) -> bool:
 
 
 class InvalidNotifyEmail(ValueError):
-    """A notification address was refused before anything was written (BACKLOG #1139).
+    """A notification address, or an account ``email`` that takes its rule
+    (:func:`_require_account_email`), was refused before anything was written (BACKLOG #1139).
 
     A ``ValueError``, so a caller that catches that still does. Its own type lets a route turn
     exactly this refusal into a ``400``, and not some other ``ValueError`` raised after a write."""
@@ -13769,7 +13770,7 @@ class AuthService:
         **The profile ``email`` takes the rule :meth:`create_local_user` applies to its ``email``
         (BACKLOG #3278, :func:`_require_account_email`).** A changed value must be one plain mailbox
         and is stored stripped; a blank one is refused. As above, the stored value posted back, with
-        or without the spaces around it, is kept as stored and not re-checked, so an address a
+        or without the whitespace around it, is kept as stored and not re-checked, so an address a
         directory sync wrote cannot block an unrelated save, and ``None`` still clears. A refusal is
         :class:`InvalidNotifyEmail`, raised before anything is written.
 
