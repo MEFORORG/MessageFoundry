@@ -642,13 +642,17 @@ a literal `10`, and a client that honoured either could have retried too early.
 
 **The PHI-read, sign-in and ceremony `Retry-After` is the caller's real wait too (BACKLOG
 #3293).** Each is the wait of the limiter that refused, rounded the same way as the write floor's
-above: up to whole seconds, never below 1, in the engine process that refused, and only if the
-caller makes no other attempt meanwhile. The PHI-read `429` sends the account's own wait, the same
+above: up to whole seconds, never below 1, in the engine process that refused. It is a reading,
+not a reservation. A caller that waits it out can still be refused if something else spends the
+room first: another attempt on the same key, or any caller filling an all-callers budget. The
+PHI-read `429` sends the account's own wait, the same
 on the JSON API and under `require_ui(phi=True)`. While `phi_read_rate_limit_global` is on and
 spent, it sends the whole `phi_read_rate_limit_window_seconds`, rounded up, because the true wait
 would be set by other accounts' reads. `POST /ui/login` sends the wait for the client address, or
-the whole `login_rate_limit_window_seconds` while the all-clients budget is spent, so an
-unauthenticated caller learns nothing about other addresses' attempts. `POST /ui/mfa`,
+the whole `login_rate_limit_window_seconds` while the all-clients budget is spent, rather than a
+wait set by other addresses' attempts. Clients that share an address, such as users behind NAT or
+an untrusted proxy, or every client with no address (counted as `"unknown"`), share one bucket, so
+each can read when the oldest attempt in it was made, including another user's. `POST /ui/mfa`,
 `POST /ui/reauth` and `POST /ui/reauth/webauthn` send the account's own wait on the per-actor
 ceremony budget, which has no all-accounts dimension. Before this, the PHI-read `429` sent a
 literal `10` and those four console routes a literal `30`, each against a default 60 s window, so a
@@ -5648,9 +5652,10 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
 | **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate, and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
-The console resolves the ceremony gate through a `getattr` shim because it ships as a separately
-versioned wheel: mounted on an engine that predates the method, it falls back to the **sign-in** budget.
-Any statement about the `/ui` ceremony budget is therefore engine-version-conditional.
+The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
+fell back to the **sign-in** budget on an engine without the method. The console pins one engine
+seam digest, so no such engine mounts it, and the shim went with BACKLOG #3293: its 429s read the
+ceremony limiter's wait, which a fallback charging the sign-in budget would have misreported.
 
 ### Business-logic limits (ASVS 2.1.3)
 
@@ -5695,8 +5700,9 @@ picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 **Almost no limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields carries a
-Pydantic validator except `admin_write_rate_limit_window_seconds`, which must be above `0`, and
-`admin_write_rate_limit_per_actor`, which must be `0` or more (BACKLOG #3293), and
+lower-bound validator except `admin_write_rate_limit_window_seconds`, which must be above `0`, and
+`admin_write_rate_limit_per_actor`, which must be `0` or more (BACKLOG #3293); the windows' other
+validators refuse NaN, infinity and a very long window, not a small one. And
 neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
 dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as

@@ -4,8 +4,8 @@
 
 They sent literals: ``Retry-After: 10`` on a ``require_ui(phi=True)`` view against a 60 s window,
 and ``Retry-After: 30`` on ``POST /ui/login``, ``/ui/mfa``, ``/ui/reauth`` and
-``/ui/reauth/webauthn`` against a 60 s window. A client that honoured either retried inside the
-window and was refused again. BACKLOG #2144 had already done this for the admin-write floor
+``/ui/reauth/webauthn`` against a 60 s window. A client that honoured either would have retried
+inside the window and been refused again. BACKLOG #2144 had already done this for the admin-write floor
 (``test_ui_admin_write_pacing.py``).
 
 Every window here is 37.5 s, not the shipped 60 s, so neither retired literal can pass by matching.

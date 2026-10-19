@@ -599,6 +599,8 @@ from typing import Any
 #: ``/ui/reauth`` and ``/ui/reauth/webauthn`` 429s call them for their ``Retry-After``, where they
 #: sent literals. Methods the console calls, so a skew would be an AttributeError where the 429
 #: belongs; they force a bump. ``require_ui``'s body changed too, which moved the route-gate lines.
+#: The console's ``allow_reauth_attempt`` lost its ``getattr`` fallback and calls
+#: ``AuthService.allow_reauth_attempt`` directly, so that method is on the discovered surface now.
 #: Re-derived with ``--write`` on main at 45c5ebcfa; re-derive after any merge with another seam move.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
@@ -606,7 +608,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7ac054c8c42245d1"
+ENGINE_UI_SEAM: str = "7be4eb854c1c0f25"
 
 
 @dataclass(frozen=True, slots=True)

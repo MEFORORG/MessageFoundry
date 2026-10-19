@@ -722,9 +722,11 @@ _ACTION_STEP_UP_GRANT_MAX = 4096
 
 def _retry_after_seconds(limiter: SlidingWindowRateLimiter | None, key: str) -> int:
     """A refusal's ``Retry-After``: ``limiter``'s wait for ``key``, rounded UP to whole seconds and
-    never below 1, so a client that waits this long is admitted by THIS process's limiter, provided
-    the key makes no other attempt meanwhile (BACKLOG #2144, #3293). 1 when the limiter is off,
-    which no refusal reaches."""
+    never below 1 (BACKLOG #2144, #3293). It is a reading, not a reservation. A client that waits
+    this long is admitted by THIS process's limiter only if nothing else spends the room first:
+    another attempt on the same key (callers can share one, such as an address behind NAT), or,
+    where the limiter has an all-callers budget, any other caller filling it. 1 when the limiter is
+    off, which no refusal reaches."""
     if limiter is None:
         return 1
     return max(1, math.ceil(limiter.retry_after(key)))
@@ -3158,8 +3160,9 @@ class AuthService:
         :meth:`allow_login_attempt` for ``client`` (BACKLOG #3293).
 
         Keyed as that gate keys, so an attempt with no address reads the ``"unknown"`` bucket. A full
-        all-clients budget answers the whole window, so an unauthenticated caller learns nothing
-        about other addresses' attempts."""
+        all-clients budget answers the whole window rather than a wait set by other addresses'
+        attempts. Callers that share an address (NAT, an untrusted proxy, or no address at all)
+        share its bucket, so the wait does reflect each other's attempts."""
         return _retry_after_seconds(self._login_limiter, client or "unknown")
 
     def reauth_retry_after(self, actor: str) -> int:

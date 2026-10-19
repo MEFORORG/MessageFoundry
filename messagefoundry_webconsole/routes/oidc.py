@@ -393,7 +393,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         continues = continues_after_reauth(action, token, next_)
         return_to = next_ if continues else reauth_landing(identity)
         client = client_ip(request)
-        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
+        if not allow_reauth_attempt(auth, identity):  # per-ACTOR, not the sign-in budget
             return reauth_idp_response(
                 deps,
                 auth,

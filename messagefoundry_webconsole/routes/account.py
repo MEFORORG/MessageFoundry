@@ -497,7 +497,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # cookie-vs-header split ui_login/ui_reauth already handle. Semantics match the JSON
         # handler: rate-limited like login; wrong code changes nothing.
         client = client_ip(request)
-        if not allow_reauth_attempt(service, identity, client):  # per-ACTOR, not the sign-in budget
+        if not allow_reauth_attempt(service, identity):  # per-ACTOR, not the sign-in budget
             raise _rate_limited(request, "mfa-confirm")
         token = session_token(request)
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
@@ -730,7 +730,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
         # alone). JSON, so the page's fetch can read `error`.
         client = client_ip(request)
-        if not allow_reauth_attempt(service, identity, client):
+        if not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
             return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
         try:

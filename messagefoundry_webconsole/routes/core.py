@@ -1722,7 +1722,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if await rotation_comes_first(auth, identity.must_change_password, token):
             return RedirectResponse("/ui/account/password", status_code=303)
         client = client_ip(request)
-        if not allow_reauth_attempt(auth, identity, client):
+        if not allow_reauth_attempt(auth, identity):
             # Same per-ACTOR ceremony budget the reauth/password flows draw on, so code-guessing
             # here cannot outrun it either. Its Retry-After is that budget's own wait for this
             # account (BACKLOG #3293), the value POST /ui/reauth sends for the same limiter.
@@ -1883,7 +1883,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=400,
             )
         client = client_ip(request)
-        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
+        if not allow_reauth_attempt(auth, identity):  # per-ACTOR, not the sign-in budget
             raise HTTPException(
                 429,
                 "too many attempts",
@@ -2055,7 +2055,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
         client = client_ip(request)
-        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
+        if not allow_reauth_attempt(auth, identity):  # per-ACTOR, not the sign-in budget
             return JSONResponse(
                 {"ok": False, "error": "too many attempts"},
                 status_code=429,

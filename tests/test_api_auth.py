@@ -2112,7 +2112,7 @@ async def test_phi_read_429_retry_after_is_the_actors_wait(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #3293. The PHI-read 429 sent a literal `Retry-After: 10` against a 60 s window, so a
-    # client that honoured it retried inside the window and was refused again. It is now the time
+    # client that honoured it would have retried inside the window. It is now the time
     # until this actor's next read would be admitted, rounded up. The window is not the default, so
     # a pass cannot come from a literal that happens to match. The limiter's clock is faked.
     clock = [1000.0]

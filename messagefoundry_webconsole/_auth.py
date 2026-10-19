@@ -609,19 +609,16 @@ def require_ui(
     return mark_route_gate(dependency)
 
 
-def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | None) -> bool:
+def allow_reauth_attempt(auth: AuthService, identity: Identity) -> bool:
     """Per-ACTOR budget for the POST-session credential ceremonies (re-auth, password change, MFA
     enrolment confirm), replacing the shared unauthenticated sign-in budget those used to draw on —
     which let anyone able to reach the login page lock every signed-in operator out of step-up.
 
-    Resolved via ``getattr`` because the console ships as a **separately-versioned wheel**: mounted on
-    an engine that predates ``allow_reauth_attempt`` it degrades to the previous behaviour rather than
-    failing, so no ENGINE_UI_SEAM bump is required. The 429s it guards call
-    ``AuthService.reauth_retry_after`` directly (BACKLOG #3293), so the seam pins that method."""
-    gate = getattr(auth, "allow_reauth_attempt", None)
-    if gate is None:  # older engine — previous (shared sign-in budget) behaviour
-        return bool(auth.allow_login_attempt(client))
-    return bool(gate(identity.user_id))
+    It used to fall back to the sign-in budget through ``getattr`` on an engine without this method.
+    The console pins one engine seam digest, so no such engine mounts it, and the 429s this guards
+    read ``AuthService.reauth_retry_after``, the ceremony limiter's wait (BACKLOG #3293). A fallback
+    would have charged one limiter and reported the other's wait, so it is gone."""
+    return auth.allow_reauth_attempt(identity.user_id)
 
 
 def proxied_loopback_host(app_state: object) -> bool:
