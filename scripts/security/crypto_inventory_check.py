@@ -990,8 +990,14 @@ IMPORT_ONLY: dict[str, str] = {
 #: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
 #: import arm never saw carry their own.
 OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # Vault BACKLOG #2796: a rig account with an authenticator key signs in with a TOTP code the
+    # engine's own messagefoundry.auth.totp computes (HMAC-SHA-256), imported where it is used.
     "harness/load/rigadmin.py": frozenset(
-        {"csprng:secrets.token_hex", "tls_context:ssl.create_default_context"}
+        {
+            "csprng:secrets.token_hex",
+            "mac:via messagefoundry.auth.totp",
+            "tls_context:ssl.create_default_context",
+        }
     ),
     "harness/load/tlsmat.py": frozenset(
         {
@@ -1324,7 +1330,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "compare:via messagefoundry.pipeline.secret_rotation",
-            # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
+            # Vault BACKLOG #2597: write_baseline_config compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
             "compare:via messagefoundry.config.fingerprint",
             # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail
@@ -1782,11 +1788,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # enginepoll.py also signs its clients in as the rig Administrator (vault BACKLOG #2719),
-    # which reaches that module's password draw and its verifying TLS context.
+    # which reaches that module's password draw, its verifying TLS context, and the TOTP code a
+    # rig account with an authenticator key signs in with (vault BACKLOG #2796).
     "harness/load/enginepoll.py": frozenset(
         {
             "csprng:via harness.load.rigadmin",
             "key_cert:via harness.load.tlsmat",
+            "mac:via harness.load.rigadmin",
             "sign_verify:via harness.load.tlsmat",
             "tls_context:via harness.load.rigadmin",
         }
@@ -1848,7 +1856,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/verify/runner.py": frozenset(
-        {"hash:via messagefoundry.verify.smoke", "tls_context:via messagefoundry.verify.smoke"}
+        {
+            "hash:via messagefoundry.verify.smoke",
+            "tls_context:via messagefoundry.verify.smoke",
+            # BACKLOG #3277: the host.ciphers hop census loads the config graph (load_config's
+            # digest, vault BACKLOG #2724), as the self smoke does.
+            "hash:via messagefoundry.config.wiring",
+        }
     ),
     # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is

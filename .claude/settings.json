@@ -115,12 +115,13 @@
               "-NonInteractive",
               "-File",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1",
+              "--user-hook=worktree_gate",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-api-burn.ps1",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1"
             ],
-            "timeout": 45,
-            "statusMessage": "Checking for a blanket git stage, GitHub API polling, or an unbounded filesystem scan"
+            "timeout": 60,
+            "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling and filesystem scans"
           }
         ]
       }

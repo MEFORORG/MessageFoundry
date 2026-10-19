@@ -46,6 +46,7 @@ from messagefoundry.uploads import (
     UploadQuotaError,
     UploadQuotaLedger,
     UploadStore,
+    _Observed,
 )
 
 _CAP = 3
@@ -80,7 +81,7 @@ async def _race_stale_scan(
     b_scanned, b_go = threading.Event(), threading.Event()
     real_b_observed = b._observed_sync
 
-    def _b_observed(uploader_id: str) -> tuple[int, int]:
+    def _b_observed(uploader_id: str) -> _Observed:
         out = real_b_observed(uploader_id)
         b_scanned.set()
         b_go.wait(_WAIT)

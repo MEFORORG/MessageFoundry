@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
+from tests._fake_directory import DirectoryOf  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -546,6 +547,8 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
             groups=frozenset(),
             directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
+        # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
+        service._ldap = DirectoryOf(principal)  # type: ignore[assignment]
         # mfa_verified is the per-mechanism grant (ASVS 6.3.4). Passing True here stands in for a
         # federated sign-in that DID carry a verified claim; what is under test is the enrollment
         # ceremony, and a satisfied session keeps the fixture free of the MFA gate.
@@ -1073,6 +1076,8 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
             groups=frozenset(),
             directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
+        # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
+        service._ldap = DirectoryOf(principal)  # type: ignore[assignment]
         out = await service._complete_ad_login(principal, "10.6.6.6", mfa_verified=False)
         assert out.ok and out.mfa_required
         assert out.identity is not None and out.token is not None

@@ -1173,14 +1173,16 @@ def build_source(config: Source, *, egress: EgressSettings) -> SourceConnector:
     return builder(config)
 
 
-def build_destination(config: Destination, *, egress: EgressSettings) -> DestinationConnector:
+def build_destination(
+    config: Destination, *, egress: EgressSettings, warn_query_credentials: bool = True
+) -> DestinationConnector:
     from messagefoundry.transports.egress import check_egress_allowed
 
     try:
         builder = _DESTINATIONS[config.type]
     except KeyError:
         raise ValueError(f"no destination connector registered for {config.type.value!r}") from None
-    check_egress_allowed(config, egress)
+    check_egress_allowed(config, egress, warn_query_credentials=warn_query_credentials)
     if config.settings.get("ech_egress") and config.type not in _ECH_ROUTING_DESTINATIONS:
         raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return builder(config)

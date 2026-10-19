@@ -1048,7 +1048,11 @@ def test_a_filename_this_channel_did_not_mint_is_never_parsed(
 ) -> None:
     info = seed(repo, tmp_path, [{"name": name, "body": "should never be rendered"}])
     key = str(info["key"])
-    text = injection(run_drain(repo))
+    # Stop shows nothing here, and a Stop drain that shows nothing is silent by design (see
+    # test_an_empty_stop_drain_with_only_foreign_mail_emits_nothing). SessionStart is where the box
+    # is narrated, so the render and the count are read there.
+    assert run_drain(repo).stdout == ""
+    text = injection(run_drain(repo, event="SessionStart"))
     assert "should never be rendered" not in text
     assert receipts(repo) == []
     # LEFT WHERE IT IS: the only name available to quarantine it under is the one just refused.
@@ -1059,6 +1063,44 @@ def test_a_filename_this_channel_did_not_mint_is_never_parsed(
         assert "name-rejected" in text
         assert re.search(r"(\d+) name-rejected", text)
         assert int(re.search(r"(\d+) name-rejected", text).group(1)) >= 1  # type: ignore[union-attr]
+
+
+def test_an_empty_stop_drain_with_only_foreign_mail_emits_nothing(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A Stop drain that shows nothing writes NO stdout, because output at Stop re-wakes the model.
+
+    Measured 2026-10-18: the primary checkout's box is shared by every session in it, so it routinely
+    holds mail addressed to another session id. Each Stop emitted "Nothing is being shown to you ...
+    addressed to a different session id", that additionalContext re-invoked the model, and an idle
+    session looped once per reply. The foreign mail is standing state, so every Stop looked the same.
+    """
+    other = "99999999-8888-7777-6666-555555555555"
+    info = seed(
+        repo,
+        tmp_path,
+        [
+            {"stem": "20260101T000000001-aaaaaa", "body": "for someone else", "toSessionId": other},
+            {"stem": "20260101T000000002-aaaaaa", "body": "also not mine", "toSessionId": other},
+        ],
+    )
+    key = str(info["key"])
+
+    # Repeated, because the defect was a loop: every Stop must be silent, not just the first.
+    for _ in range(3):
+        assert run_drain(repo, event="Stop").stdout == ""
+    assert len(box_files(repo, key, "inbox")) == 2, "foreign-addressed mail must stay in the inbox"
+    assert receipts(repo) == []
+
+    # The control that MUST fire: the same box at SessionStart still reports the filtered mail, so
+    # the silence above is the Stop rule and not a drain that failed to see the messages.
+    start = injection(run_drain(repo, event="SessionStart"))
+    assert "2 message(s) are addressed to a different session id" in start
+    assert "for someone else" not in start
+
+    # And mail that IS for this session is still delivered at Stop, as before.
+    seed(repo, tmp_path, [{"stem": "20260101T000000003-aaaaaa", "body": "this one is mine"}])
+    assert "this one is mine" in injection(run_drain(repo, event="Stop"))
 
 
 # --------------------------------------------------------------------------------------------------

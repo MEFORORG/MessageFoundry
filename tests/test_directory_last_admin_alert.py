@@ -29,7 +29,13 @@ import pytest
 from messagefoundry.api.security import DIRECTORY_GRANTED_BY
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import NO_ENABLED_ADMINISTRATOR_ACTION, AuthService
+from messagefoundry.auth.reconcile import SessionRevocation
+from messagefoundry.auth.service import (
+    NO_ENABLED_ADMINISTRATOR_ACTION,
+    AuthService,
+    _AuditWatermark,
+    _RevocationApplied,
+)
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
@@ -393,15 +399,23 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
 ) -> None:
     """A sign-in that lands between the pass's read and its write has already written
     Administrator, and paged for it. The write then adds nothing, so the pass must not page again.
-    RED when the before-set is taken from the plan, which read the roles before that sign-in."""
+    RED when the before-set is taken from the plan, which read the roles before that sign-in.
+
+    The sign-in writes Operator beside Administrator, which the pass's write then removes. Were the
+    stored roles equal to the pass's target, #3085's apply-time check would skip the write and the
+    grant check with it, and this test would pass whatever before-set the service used."""
     rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
     await rig.sign_in("jdoe")
     rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
     real = rig.service._apply_reconcile_revocation
 
-    async def a_sign_in_lands_first(revocation: Any, *, watermark: Any) -> str:
+    async def a_sign_in_lands_first(
+        revocation: SessionRevocation, *, watermark: _AuditWatermark | None
+    ) -> _RevocationApplied:
         await rig.store.set_user_roles(
-            revocation.user_id, [Role.ADMINISTRATOR.value], assigned_by="ad-sync"
+            revocation.user_id,
+            [Role.ADMINISTRATOR.value, Role.OPERATOR.value],
+            assigned_by="ad-sync",
         )
         return await real(revocation, watermark=watermark)
 
@@ -410,6 +424,8 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
     plan = await rig.service.reconcile_directory_sessions()
 
     assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
+    # The control: the pass's own write ran (Operator is gone), so the grant check was reached.
+    assert await rig.roles("jdoe") == [Role.ADMINISTRATOR.value]
     assert rig.grants == []
 
 

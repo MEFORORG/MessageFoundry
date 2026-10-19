@@ -34,6 +34,7 @@ import logging
 import pickle
 import socket
 import threading
+import time
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -66,6 +67,7 @@ from messagefoundry.auth.ldap import (
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import MISCONFIGURED_ABORT, ProbeOutcome
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests.test_ad_user_account_control import _alive, _audited, _pass, _signed_in_estate
 from tests.test_approval_requester_recheck import _Sink
@@ -505,18 +507,43 @@ _ABANDONED = _page(RESULT_SUCCESS, [], b"")
 """What a directory answers the RFC 2696 abandon with: success, no entries, an empty cookie."""
 
 
+#: The overall deadline the bare-double tests give a paged search: far past anything they take.
+_BUDGET = 60.0
+
+
+class _FakeSocket:
+    """The two socket methods :class:`ldap_module._SocketTimeoutCap` calls, recording each timeout
+    set."""
+
+    def __init__(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.set: list[float | None] = []
+
+    def gettimeout(self) -> float | None:
+        return self.timeout
+
+    def settimeout(self, value: float | None) -> None:
+        self.set.append(value)
+        self.timeout = value
+
+
 class _PagedConn:
     """A bare double that answers its n-th search with ``pages[n]``, recording each search. A search
-    with a page size of zero is the abandon: it is recorded in ``abandons`` instead."""
+    with a page size of zero is the abandon: it is recorded in ``abandons`` instead. ``on_page``,
+    when given, runs before each page is answered, so a test can move a clock."""
 
     def __init__(
-        self, pages: list[dict[str, Any]], abandon_raises: Exception | None = None
+        self,
+        pages: list[dict[str, Any]],
+        abandon_raises: Exception | None = None,
+        on_page: Callable[[], None] | None = None,
     ) -> None:
-        self._pages, self._abandon_raises = pages, abandon_raises
+        self._pages, self._abandon_raises, self._on_page = pages, abandon_raises, on_page
         self.calls: list[dict[str, Any]] = []
         self.abandons: list[dict[str, Any]] = []
         self.result: dict[str, Any] | None = None
         self.entries: list[object] = []
+        self.socket: _FakeSocket | None = None
 
     def search(self, **kwargs: Any) -> bool:
         if kwargs.get("paged_size") == 0:
@@ -525,6 +552,8 @@ class _PagedConn:
                 raise self._abandon_raises
             return _replay(self, _ABANDONED)
         self.calls.append(kwargs)
+        if self._on_page is not None:
+            self._on_page()
         return _replay(self, self._pages[min(len(self.calls), len(self._pages)) - 1])
 
 
@@ -537,7 +566,11 @@ def test_a_paged_search_reads_every_page_and_sends_each_cookie_back() -> None:
             _page(RESULT_SUCCESS, [c], b""),  # an empty cookie marks the last page (RFC 2696)
         ]
     )
-    assert ldap_module._search_paged(conn, "group search", search_base=_GROUPS) == [a, b, c]
+    assert ldap_module._search_paged(conn, "group search", budget=_BUDGET, search_base=_GROUPS) == [
+        a,
+        b,
+        c,
+    ]
     assert [call["paged_cookie"] for call in conn.calls] == [
         None,
         b"synthetic-cookie-1",
@@ -553,7 +586,7 @@ def test_a_directory_that_ignores_the_page_request_is_read_once() -> None:
     with success, so it is the whole answer."""
     entry = object()
     conn = _PagedConn([_page(RESULT_SUCCESS, [entry], None)])
-    assert ldap_module._search_paged(conn, "group search") == [entry]
+    assert ldap_module._search_paged(conn, "group search", budget=_BUDGET) == [entry]
     assert len(conn.calls) == 1
     assert conn.abandons == []
 
@@ -591,7 +624,7 @@ def test_a_later_page_that_did_not_end_with_success_refuses_the_whole_search(
         ]
     )
     with pytest.raises(LdapUnansweredError, match="group search") as refused:
-        ldap_module._search_paged(conn, "group search", search_base=_GROUPS)
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET, search_base=_GROUPS)
     assert refused.value.code == code
     assert len(conn.calls) == 2
     assert _abandoned_with(conn) == [abandoned_with]
@@ -601,7 +634,7 @@ def test_a_refused_first_page_is_not_abandoned() -> None:
     """The directory sent no cookie, so it holds no paging state to drop."""
     conn = _PagedConn([_page(RESULT_BUSY, [], None)])
     with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)"):
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
     assert conn.abandons == []
 
 
@@ -609,7 +642,7 @@ def test_a_later_page_answered_with_a_referral_is_refused_and_abandoned() -> Non
     referred = {**_page(10, [], None), "referrals": ["ldaps://dc9.other.invalid/DC=other"]}
     conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"), referred])
     with pytest.raises(LdapReferralError):
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
     assert _abandoned_with(conn) == [b"synthetic-cookie-1"]
 
 
@@ -634,7 +667,7 @@ def test_an_abandon_that_fails_leaves_the_original_refusal(
         abandon_raises=fault,
     )
     with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)") as refused:
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
     assert refused.value is not fault
     assert len(conn.abandons) == 1
     if not isinstance(fault, LdapError):  # a refusal is warned by _search; an ldap3 error is not
@@ -647,10 +680,248 @@ def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.Monk
     monkeypatch.setattr(ldap_module, "_MAX_PAGES", 3)
     conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")])
     with pytest.raises(LdapUnansweredError, match="still paging after 3 pages") as refused:
-        ldap_module._search_paged(conn, "group search", search_base=_GROUPS)
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET, search_base=_GROUPS)
     assert len(conn.calls) == 3
     assert (refused.value.code, refused.value.code_name) == (None, "too many pages")
     assert _abandoned_with(conn) == [b"synthetic-again"]
+
+
+# --- BACKLOG #3696 items 3 and 4: one deadline across the pages, a cap on entries ----------------
+
+
+def test_a_deadline_below_the_receive_timeout_never_caps_the_first_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2 on PR 2431. A first page slower than the deadline, but inside the socket's
+    own timeout, is read in full: the deadline refuses the search before its second page, as a
+    bound the reconciler pages on, not as a timed-out read it would take for an outage."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+
+    def slow() -> None:
+        clock.now += 0.6
+
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")], on_page=slow)
+    conn.socket = _FakeSocket(10.0)
+    with pytest.raises(LdapUnansweredError) as refused:
+        ldap_module._search_paged(conn, "group search", budget=0.5)
+    assert refused.value.code_name == "deadline spent"
+    assert len(conn.calls) == 1
+    assert conn.socket.set == [10.0], "the first page was capped"
+
+
+def test_the_group_search_deadline_is_its_own_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Lander's send-back on PR 2431. The pages share ``[auth].ad_group_search_deadline``,
+    whole and unrounded, not the per-read ``ad_receive_timeout``, which ships at 10 s."""
+    budgets: list[float] = []
+
+    def record(_conn: Any, _operation: str, *, budget: float, **_kwargs: Any) -> list[Any]:
+        budgets.append(budget)
+        return []
+
+    monkeypatch.setattr(ldap_module, "_search_paged", record)
+    settings = _ad_settings(ad_receive_timeout=10.0, ad_group_search_deadline=37.5)
+    LdapAuthenticator(settings)._resolve_groups(object(), _USER_DN, [])
+    assert budgets == [37.5]
+    assert AuthSettings().ad_group_search_deadline > AuthSettings().ad_receive_timeout
+
+
+class _FakeClock:
+    """A monotonic clock that moves only when a test moves it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_pages_each_inside_the_receive_timeout_but_past_the_deadline_together_are_refused(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item 3. Each page takes 6 s, inside a 10 s receive timeout, so no read times out; two pages
+    spend the 10 s deadline, and the third is never asked for. Each page's reads may wait only
+    what is left of the deadline, and the socket gets its own timeout back after. The search is
+    not abandoned: that is one more round trip past the deadline."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+
+    def six_seconds() -> None:
+        clock.now += 6.0
+
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")], on_page=six_seconds)
+    conn.socket = _FakeSocket(10.0)
+    caplog.set_level(logging.WARNING, logger=ldap_module.__name__)
+    with pytest.raises(LdapUnansweredError, match="did not finish paging within 10 s") as refused:
+        ldap_module._search_paged(conn, "group search", budget=10.0, search_base=_GROUPS)
+    assert (refused.value.code, refused.value.code_name) == (None, "deadline spent")
+    assert len(conn.calls) == 2
+    assert conn.socket.set == [4.0, 10.0], "capped to what is left, then restored"
+    assert conn.abandons == []
+    assert [r.levelname for r in caplog.records if "within 10 s" in r.getMessage()] == ["WARNING"]
+
+
+@pytest.mark.parametrize(
+    ("own", "bound"),
+    [(120.0, _BUDGET), (10.0, 10.0)],
+    ids=["deadline-shorter-than-the-socket", "never-lengthened"],
+)
+def test_a_search_that_ends_inside_the_deadline_restores_the_socket_timeout(
+    own: float, bound: float
+) -> None:
+    """Each later page's reads are capped at the shorter of the deadline and the socket's own
+    timeout, the first page keeps the socket's own, and the socket gets its own back when the
+    search ends."""
+    conn = _PagedConn(
+        [
+            _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
+            _page(RESULT_SUCCESS, [object()], b""),
+        ]
+    )
+    conn.socket = _FakeSocket(own)
+    assert len(ldap_module._search_paged(conn, "group search", budget=_BUDGET)) == 2
+    *capped, restored = conn.socket.set
+    assert len(capped) == 1
+    assert all(value is not None and bound - 1 < value <= bound for value in capped)
+    assert restored == own == conn.socket.timeout
+
+
+@pytest.mark.parametrize(
+    ("page_seconds", "abandoned"),
+    [(6.0, [b"synthetic-cookie-1"]), (11.0, [])],
+    ids=["refused-inside-the-deadline-is-abandoned", "refused-past-it-is-not"],
+)
+def test_a_refused_page_is_abandoned_only_inside_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, page_seconds: float, abandoned: list[bytes]
+) -> None:
+    """The abandon is one more round trip, so it gets only what is left of the deadline, and is
+    not sent once the deadline is spent."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+    conn = _PagedConn(
+        [
+            _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
+            _page(RESULT_BUSY, [], None),
+        ],
+        on_page=lambda: setattr(clock, "now", clock.now + page_seconds / 2),
+    )
+    conn.socket = _FakeSocket(20.0)
+    with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)"):
+        ldap_module._search_paged(conn, "group search", budget=10.0)
+    assert _abandoned_with(conn) == abandoned
+    if abandoned:  # the abandon's reads got what was left: 10 - 6
+        assert conn.socket.set[-2] == pytest.approx(4.0)
+    assert conn.socket.timeout == 20.0
+
+
+_RECEIVE_ERROR = ldap3.core.exceptions.LDAPSocketReceiveError
+_SEND_ERROR = ldap3.core.exceptions.LDAPSocketSendError
+
+
+@pytest.mark.parametrize("kind", [_RECEIVE_ERROR, _SEND_ERROR], ids=["read", "send"])
+@pytest.mark.parametrize(
+    ("on_call", "own", "as_deadline"),
+    [
+        pytest.param(1, 60.0, False, id="first-page-is-one-slow-read"),
+        pytest.param(2, 5.0, False, id="later-page-bounded-by-the-socket-timeout"),
+        pytest.param(2, 60.0, True, id="later-page-bounded-by-the-deadline"),
+    ],
+)
+def test_only_a_later_page_timing_out_against_the_deadline_is_refused_as_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: type[Exception],
+    on_call: int,
+    own: float,
+    as_deadline: bool,
+) -> None:
+    """ldap3 merges the socket's TimeoutError into its own class. Only a timeout the deadline set
+    is the deadline: a first page's, or one the socket's own shorter timeout set, passes through
+    as ldap3's error, as any slow read does."""
+    monkeypatch.setattr(ldap_module, "_monotonic", _FakeClock())
+    calls = 0
+
+    def time_out() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == on_call:
+            raise ldap3.core.exceptions.communication_exception_factory(
+                kind, TimeoutError("synthetic")
+            )("synthetic")
+
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")], on_page=time_out)
+    conn.socket = _FakeSocket(own)
+    with pytest.raises(LdapUnansweredError if as_deadline else kind) as raised:
+        ldap_module._search_paged(conn, "group search", budget=10.0)
+    if as_deadline:
+        assert isinstance(raised.value, LdapUnansweredError)
+        assert raised.value.code_name == "deadline spent"
+        assert isinstance(raised.value.__cause__, kind)
+    assert conn.abandons == []
+    assert conn.socket.timeout == own
+
+
+_ENTRY = object()
+"""One entry, repeated: the entry-cap tests count entries and never read one."""
+
+
+def _pages_of(total: int, size: int) -> list[dict[str, Any]]:
+    """``total`` entries in pages of ``size``, as a directory with that MaxPageSize returns them:
+    a cookie on every page but the last, which carries an empty one."""
+    counts = [size] * (total // size) + ([total % size] if total % size else [])
+    return [
+        _page(
+            RESULT_SUCCESS,
+            [_ENTRY] * count,
+            b"" if n == len(counts) - 1 else f"synthetic-cookie-{n}".encode(),
+        )
+        for n, count in enumerate(counts)
+    ]
+
+
+@pytest.mark.parametrize("size", [100, 500])
+@pytest.mark.parametrize("total", [2_500, 10_000])
+def test_an_account_up_to_the_entry_cap_resolves_whatever_the_page_size(
+    size: int, total: int
+) -> None:
+    """Item 4. Counted in pages, a directory capping a page at 100 refused an account in more than
+    2,000 groups, where one returning 500 a page allowed 10,000."""
+    conn = _PagedConn(_pages_of(total, size))
+    assert len(ldap_module._search_paged(conn, "group search", budget=_BUDGET)) == total
+    assert conn.abandons == []
+
+
+@pytest.mark.parametrize(
+    ("size", "total", "abandoned"),
+    [
+        # The page that crosses the cap is the last, so the directory holds no state to drop.
+        pytest.param(100, 10_001, [], id="100-last-page"),
+        pytest.param(500, 10_001, [], id="500-last-page"),
+        # It is not, so its cookie is the live one.
+        pytest.param(100, 10_150, [b"synthetic-cookie-100"], id="100-mid-search"),
+        pytest.param(500, 10_600, [b"synthetic-cookie-20"], id="500-mid-search"),
+    ],
+)
+def test_an_account_past_the_entry_cap_is_refused_with_a_warning_whatever_the_page_size(
+    size: int, total: int, abandoned: list[bytes], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ldap_module.__name__)
+    conn = _PagedConn(_pages_of(total, size))
+    with pytest.raises(LdapUnansweredError, match="returned more than 10,000 entries") as refused:
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
+    assert (refused.value.code, refused.value.code_name) == (None, "too many entries")
+    assert len(conn.calls) == -(-10_001 // size), "refused on the page that crossed the cap"
+    assert _abandoned_with(conn) == abandoned
+    warned = [r for r in caplog.records if "more than 10,000 entries" in r.getMessage()]
+    assert [r.levelname for r in warned] == ["WARNING"]
+
+
+def test_the_page_backstop_cannot_bind_before_the_entry_cap() -> None:
+    """Item 4's loop guard. A directory returning 10 entries a page still reaches the entry cap
+    before the page count refuses it; the deadline bounds the time either way."""
+    conn = _PagedConn(_pages_of(10_001, 10))
+    with pytest.raises(LdapUnansweredError) as refused:
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
+    assert refused.value.code_name == "too many entries"
 
 
 _UNREADABLE_CONTROLS = [
@@ -687,7 +958,7 @@ def test_a_later_page_that_drops_the_paging_control_refuses_the_whole_search(
     later = {**result, "_entries": [object()]}
     conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"), later])
     with pytest.raises(LdapUnansweredError, match="dropped the paging control") as refused:
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", budget=_BUDGET)
     assert (refused.value.code, refused.value.code_name) == (None, "paging control lost")
     assert len(conn.calls) == 2
     assert _abandoned_with(conn) == [b"synthetic-cookie-1"]
@@ -774,6 +1045,9 @@ _EXTENDED_REQUEST, _EXTENDED_RESPONSE = 0x77, 0x78
 #: One message a loopback server sends: its protocolOp, and its controls (empty for none).
 _Reply = tuple[bytes, bytes]
 
+#: A reply that closes the socket where an answer would go, with nothing sent.
+_HANG_UP: _Reply = (b"", b"")
+
 
 def _enumerated(code: int) -> bytes:
     """A non-negative resultCode as BER ENUMERATED content, two's complement, minimal.
@@ -800,8 +1074,18 @@ class _ScriptedDc:
     answered by ``bind_reply(raw request)``, or with success where that is absent or returns
     ``None``; an extended operation such as Who am I is answered with ``extended_reply``, or ends
     with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
-    ``ended`` is set when a client's socket closes. ``opened`` counts the sessions accepted, and
-    ``unbound`` the sessions a client ended with an unbind request."""
+    ``ended`` is set when a client's socket closes. A reply that is already a whole LDAPMessage is
+    sent as written, under its own messageID, and :data:`_HANG_UP` closes the socket instead of
+    answering. ``opened`` counts the sessions accepted, and ``unbound`` the sessions a client
+    ended with an unbind request.
+
+    A client reads any close as the server ending the session, so a test that expects exactly that
+    could pass with nothing it scripted read. Two records stop that. ``closed_by_server`` is set
+    whenever a session closes its socket of its own accord: a hang-up, an operation other than an
+    unbind, or the server's own idle timeout. ``failures`` holds whatever a session raised other
+    than a socket error, recorded before its socket closes; :func:`_scripted_dc` raises the first
+    in the test's own thread, and the session thread re-raises it too, so a fault after the test
+    has left the server is still reported, as an unhandled thread exception."""
 
     def __init__(
         self,
@@ -813,6 +1097,8 @@ class _ScriptedDc:
         self._answer, self._extended_code, self._bind_reply = answer, extended_code, bind_reply
         self._extended_reply = extended_reply
         self.searches: list[bytes] = []
+        self.failures: list[Exception] = []
+        self.closed_by_server = False
         self.ended = threading.Event()
         self.opened = 0
         self.unbound = 0
@@ -833,32 +1119,57 @@ class _ScriptedDc:
         with self._count_lock:
             self.opened += 1
         try:
-            with sock, contextlib.suppress(OSError):
-                sock.settimeout(10)
-                while (message := _read_message(sock)) is not None:
-                    raw, body = message
-                    message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
-                    op = body[2 + body[1]]
-                    if op == _BIND_REQUEST:
-                        scripted = self._bind_reply(raw) if self._bind_reply else None
-                        replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
-                    elif op == _EXTENDED_REQUEST:
-                        replies = [
-                            self._extended_reply
-                            or _done(self._extended_code, tag=_EXTENDED_RESPONSE)
-                        ]
-                    elif op == _SEARCH_REQUEST:
-                        self.searches.append(raw)
-                        replies = self._answer(raw)
-                    else:  # unbind, or anything this server does not speak
-                        if op == _UNBIND_REQUEST:
-                            with self._count_lock:
-                                self.unbound += 1
-                        return
-                    for reply, controls in replies:
-                        sock.sendall(_tlv(0x30, message_id + reply + controls))
+            with sock:
+                try:
+                    self._serve(sock)
+                except TimeoutError:
+                    self.closed_by_server = True  # the client sent nothing for the idle timeout
+                except OSError:
+                    pass  # the client went away mid-read or mid-send
+                except Exception as exc:  # any script fault; see the class docstring
+                    self.failures.append(exc)
+                    raise
         finally:
             self.ended.set()
+
+    def _serve(self, sock: socket.socket) -> None:
+        sock.settimeout(10)
+        while (message := _read_message(sock)) is not None:
+            raw, body = message
+            message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
+            op = body[2 + body[1]]
+            if op == _BIND_REQUEST:
+                scripted = self._bind_reply(raw) if self._bind_reply else None
+                replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
+            elif op == _EXTENDED_REQUEST:
+                replies = [
+                    self._extended_reply or _done(self._extended_code, tag=_EXTENDED_RESPONSE)
+                ]
+            elif op == _SEARCH_REQUEST:
+                self.searches.append(raw)
+                replies = self._answer(raw)
+            else:  # unbind, or anything this server does not speak
+                # Never reset by an unbind: another session's, such as the service account's
+                # (_service_session, BACKLOG #3017), may end after the one that hung up.
+                if op != _UNBIND_REQUEST:
+                    self.closed_by_server = True
+                else:
+                    with self._count_lock:
+                        self.unbound += 1
+                return
+            for reply, controls in replies:
+                if reply == _HANG_UP[0]:
+                    assert not controls, "a hang-up sends nothing"
+                    self.closed_by_server = True
+                    return
+                # A reply that is already a whole LDAPMessage (a SEQUENCE, 0x30) goes out as
+                # written, so a test can send one under another messageID, such as an unsolicited
+                # notification under 0. No protocolOp tag is 0x30.
+                if reply[:1] == b"\x30":
+                    assert not controls, "a whole LDAPMessage carries its own controls"
+                    sock.sendall(reply)
+                else:
+                    sock.sendall(_tlv(0x30, message_id + reply + controls))
 
     def close(self) -> None:
         # shutdown wakes a blocked accept() on Linux, where close() alone does not.
@@ -874,17 +1185,21 @@ def _scripted_dc(
     extended_code: int = RESULT_SUCCESS,
     bind_reply: Callable[[bytes], _Reply | None] | None = None,
     extended_reply: _Reply | None = None,
+    **settings_over: Any,
 ) -> Iterator[tuple[_ScriptedDc, LdapAuthenticator]]:
     """A loopback server, and an authenticator pointed at it over plain ``ldap://``: the property
-    under test is the decode, not the hop's TLS."""
+    under test is the decode, not the hop's TLS. ``settings_over`` overrides further settings."""
     dc = _ScriptedDc(answer, extended_code, bind_reply, extended_reply)
     try:
         settings = _ad_settings(
-            ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
+            ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True, **settings_over
         )
         yield dc, LdapAuthenticator(settings, enforcing=False)
     finally:
         dc.close()
+        # In the finally, so a failure also replaces an exception the test expected to see.
+        if dc.failures:
+            raise AssertionError(f"the scripted DC failed: {dc.failures[0]!r}") from dc.failures[0]
 
 
 @contextlib.contextmanager
@@ -909,7 +1224,9 @@ def _two_pages(raw: bytes) -> list[_Reply]:
 def test_real_ldap3_pages_the_group_search_and_sends_the_cookie_back() -> None:
     """ldap3 encodes the request control and decodes the cookie where ``_paged_cookie`` reads it."""
     with _scripted_dc(_two_pages) as (dc, authenticator), _service_conn(authenticator) as conn:
+        before = conn.socket.gettimeout()
         groups = authenticator._resolve_groups(conn, _USER_DN, [])
+        assert conn.socket.gettimeout() == before, "the receive timeout is restored (#3696)"
     assert groups == {ldap_module.canonical_group_dn(_group_dn(n)) for n in (1, 2, 3)}
     assert len(dc.searches) == 2
     assert all(ldap_module._PAGED_RESULTS_OID.encode() in raw for raw in dc.searches)
@@ -933,6 +1250,38 @@ def test_real_ldap3_refuses_a_group_search_whose_second_page_is_busy() -> None:
     # The third is the abandon, sent through ldap3 with a page size of zero (RFC 2696).
     assert len(dc.searches) == 3
     assert b"synthetic-cookie-1" in dc.searches[2]
+
+
+def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3696 item 3 through a real socket. The second page takes 0.6 s, inside the 2 s
+    receive timeout, so before the deadline it was read. The first page spends all but 0.2 s of
+    the 3 s ``ad_group_search_deadline`` on the engine's clock, so the second page's read may wait
+    only that, and times out. The timeout is refused as the deadline, not passed on as one slow
+    read. The deadline is its own setting: had the receive timeout been the deadline, the first
+    page would have spent it, and the second never been asked."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ldap_module, "_monotonic", clock)
+
+    def answer(raw: bytes) -> list[_Reply]:
+        if b"synthetic-cookie-1" in raw:
+            time.sleep(0.6)
+        else:
+            clock.now += 2.8  # before the reply is sent, so before the engine reads it
+        return _two_pages(raw)
+
+    with (
+        _scripted_dc(answer, ad_receive_timeout=2.0, ad_group_search_deadline=3.0) as (
+            dc,
+            authenticator,
+        ),
+        _service_conn(authenticator) as conn,
+        pytest.raises(LdapUnansweredError, match="did not finish paging within 3 s") as refused,
+    ):
+        authenticator._resolve_groups(conn, _USER_DN, [])
+    assert isinstance(refused.value.__cause__, ldap3.core.exceptions.LDAPSocketReceiveError)
+    assert len(dc.searches) == 2, "no abandon past the deadline"
 
 
 # --- sign-in: a directory error, not an unknown user ---------------------------------------------

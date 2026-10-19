@@ -870,6 +870,50 @@ async def test_an_account_demoted_in_the_directory_since_sign_in_is_refused(
         await store.close()
 
 
+async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3082: a failing role map grants nothing, so every stored role would read as lost.
+    The IdP leg refuses it with its own reason, whose text never says to sign out: a new sign-in
+    reads the same map. RED when it is refused as a demotion."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.auth.service import DIRECTORY_ROLE_MAP_UNSEALED
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _CountingLdap()
+        service = await _service(store, rsa_key, ldap=ldap)
+        await service.set_ad_group_map(
+            [("cn=mf-ops,dc=corp,dc=example", "operator")], actor="admin"
+        )
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token)
+        monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        assert not out.ok and out.reason == DIRECTORY_ROLE_MAP_UNSEALED
+        assert out.error and "sign out" not in out.error.lower(), out.error
+        assert "administrator" in out.error, out.error
+        # The row comes from the bound refuse partial, so it carries the flow's address fields as
+        # the demotion arm's row does (vault BACKLOG #3145 item 4). Pins the merge of main's #3082
+        # reason with that partial.
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert rows == [
+            {
+                "ok": False,
+                "provider": "ad",
+                "mech": "oidc",
+                "reason": DIRECTORY_ROLE_MAP_UNSEALED,
+                "start_client": "10.0.0.9",
+                "client_moved": False,
+            }
+        ], rows
+        await _assert_untouched(service, token)
+    finally:
+        await store.close()
+
+
 async def test_a_different_idp_subject_is_refused(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:

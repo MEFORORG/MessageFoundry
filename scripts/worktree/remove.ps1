@@ -81,7 +81,9 @@
 
     WHAT ONLY -AllowOrphanedAllocations OVERRIDES, on both removal routes: a target that owns a
     ledger number (alloc.ps1) whose item is not on origin/main, or an allocation record that cannot
-    be read. It is the operator's switch too.
+    be read or names no worktree. It is the operator's switch too. The one ownerless record that does
+    not refuse is the retired-allocator tombstone (BACKLOG #1829), matched by its fields; see
+    Read-RecordFile.
 
     WHAT -Path DOES NOT READ. A commit that only a branch's own reflog holds is untouched, because
     the branch stays. Work a session wrote into the target by absolute path from another directory
@@ -607,17 +609,28 @@ function Read-TargetClaims {
 # names, or '' with Problem saying why it cannot be matched. ONE record per file, with a non-blank
 # string worktree, is the only shape claim.ps1 and alloc.ps1 write; any other shape might hide this
 # tree, so it is a cannot-tell (vault BACKLOG #2985, item 16).
+#
+# Tombstone marks, with Problem kept, EXACTLY the ownerless record tombstone-retired-backlog-allocator.ps1
+# writes (BACKLOG #1829): boolean `tombstone` true, `worktree` and `branch` both "". Without it every
+# engine removal needed -AllowOrphanedAllocations, which also hides a REAL at-risk allocation. Only the
+# allocation guard reads it; any near miss stays a cannot-tell (tests/test_worktree_remove.py).
 function Read-RecordFile([System.IO.FileSystemInfo]$File) {
     $c = $null
     $problem = ''
+    $tombstone = $false
     try { $c = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { $problem = 'does not parse' }
     if (-not $problem) {
         if ($c -isnot [System.Management.Automation.PSCustomObject]) { $problem = 'is not one JSON object' }
-        elseif ($c.worktree -isnot [string] -or [string]::IsNullOrWhiteSpace($c.worktree)) { $problem = 'names no worktree' }
+        elseif ($c.worktree -isnot [string] -or [string]::IsNullOrWhiteSpace($c.worktree)) {
+            $problem = 'names no worktree'
+            $tombstone = ($c.tombstone -is [bool]) -and $c.tombstone -and
+                ($c.worktree -is [string]) -and ($c.worktree -eq '') -and
+                ($c.branch -is [string]) -and ($c.branch -eq '')
+        }
     }
-    if ($problem) { return [pscustomobject]@{ Name = $File.Name; Record = $null; Holder = ''; Problem = $problem } }
-    [pscustomobject]@{ Name = $File.Name; Record = $c; Holder = (ConvertTo-Norm $c.worktree); Problem = '' }
+    if ($problem) { return [pscustomobject]@{ Name = $File.Name; Record = $null; Holder = ''; Problem = $problem; Tombstone = $tombstone } }
+    [pscustomobject]@{ Name = $File.Name; Record = $c; Holder = (ConvertTo-Norm $c.worktree); Problem = ''; Tombstone = $tombstone }
 }
 
 function Read-ClaimFiles([string]$Dir) {
@@ -1006,6 +1019,8 @@ if (Test-PresentOrThrow $allocDirRoot 'the allocation directory') {
     $allocUnreadable = @()
     foreach ($f in @(Get-EntriesOrThrow $allocDirRoot 'allocations' '*.json' -Recurse -FilesOnly | Sort-Object FullName)) {
         $r = Read-RecordFile $f
+        # The retired-allocator tombstone names no worktree on purpose, so it can strand nothing.
+        if ($r.Tombstone) { continue }
         if ($r.Problem) { $allocUnreadable += "$($f.Name) ($($r.Problem))"; continue }
         if ($targetNorms -notcontains $r.Holder) { continue }
         $a = $r.Record

@@ -623,14 +623,52 @@ jobs:
       #
       #   leg              max passing step   n     old cap   old margin   new cap   new margin
       #   ubuntu-latest    20:28              35    25:00     1.221x       31:00     1.515x   <- RE-DERIVED 2026-08-12
-      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, and again 2026-10-13: 38:00
-      #                    over a 28:07 row, in the two notes directly below)
+      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, 2026-10-13: 38:00 over a
+      #                    28:07 row, and 2026-10-18: 46:00 over a 33:33 row, in the three notes
+      #                    directly below)
       #
-      # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, AND IT IS NOW 38:00 / JOB 50:00.
+      # THE UBUNTU ROW WAS RE-DERIVED A FOURTH TIME 2026-10-18, AND IT IS NOW 46:00 / JOB 58:00
+      # (BACKLOG #3456). The gate reddened this leg with every test passing on PR 2409's pull-request
+      # run 39110039682 at 29:15 and on merge-group run 39131597083 (PR 2416) at 30:14, which the queue
+      # ejected, both over the 38:00 cap's 29:14 red line. The pool, its n, its uncensored-on-evidence
+      # reading and every execution in it live ONCE, in this leg's row of
+      # scripts/ci/step_margin_baseline.toml and the pool file beside it; this note carries the sizing.
+      #
+      # THE RE-SIZE LINE ON THE EJECTION SAID 41:00. THE POOL SAYS 46:00. Each RE-SIZE line sizes
+      # from its own run: ceil_minute(1.35 x 1813.6s) is 41. The rule sizes from the pool's worst
+      # passing row, and the pool keeps the runs that did not land. Its worst is 33:33, PR 2344's
+      # pull-request run 38992644994 on 2026-10-17, which the gate reddened at 1.133x. That run's own
+      # RE-SIZE line already gave 46:00, and nothing re-measured the row then.
+      # ceil_minute(1.35 x 33:33) = ceil(45.29) = 46:00. At 41:00 that row would still be LOW
+      # (1.222x). That run printed `40388 passed` in 2002.95s, fewer tests than the `42050 passed` in
+      # 1805.15s of the 30:14 ejection, so it is a slow runner rather than a larger suite. The rule
+      # sizes from the worst row whatever its cause, and this change follows it.
+      #
+      # THE JOB CAP keeps the 12 minutes the overhead row below derives, 46 + 12 = 58, as the two
+      # re-derivations before this one did. The 12 was not re-derived here. From the same job reads
+      # (job and step stamps, which the pool file does not carry), this pool's worst same-row overhead
+      # on this leg is 3:13 and its worst pre-pytest setup over every conclusion is 3:03 (both run
+      # 39081455225), under the 5:22 setup the 2026-08 rows below use. The overhead rule applied to
+      # that 3:13 alone would give 5 and a job cap of 51; whether to shrink the 12 is left open, as it
+      # was on 2026-10-13, and 51 would not hold the 5-minute refused-subjects step after a pytest step
+      # that used its whole cap. On the 5:22 the nesting gap is 58:00 - 5:22 - 46:00 = 6:38; on the
+      # 6:18 setup the 2026-10-13 pool measured, it is 58:00 - 6:18 - 46:00 = 5:42.
+      #
+      # At 46:00 the gate reds a run over 2123.1s (35:23.1), 5.5 percent over the worst pooled run.
+      # By the day a run was created, this leg's median rose from 23:45 on 2026-10-13 to 27:20 on
+      # 2026-10-18. The gate's RE-DERIVE annotation is still the trigger to re-measure.
+      #
+      # THE TWO WINDOWS ROWS ARE LEFT TO #3515. From the same job reads, their worst passing steps in
+      # this window are 37:10 (windows-2022) and 45:30 (windows-2025, push run 39099609761); the
+      # second is over the 55:00 caps' 42:19 red line, and that run's gate step failed with the suite
+      # passing (job 117593065787), so that leg already reds passing suites.
+      #
+      # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, TO 38:00 / JOB 50:00 (SUPERSEDED
+      # 2026-10-18, ABOVE).
       # Merge-group run 38372578370 (PR 2301) reddened this leg at 26:13 of 34:00 (1.297x) with
       # `37755 passed, 1197 skipped`, and the queue ejected it. The pool, its n and its
-      # uncensored-on-evidence reading live ONCE, in this leg's row of
-      # scripts/ci/step_margin_baseline.toml; this note carries the sizing.
+      # uncensored-on-evidence reading live ONCE, in the 2026-10-13 row that
+      # scripts/ci/step_margin_baseline.toml keeps whole in a comment; this note carries the sizing.
       #
       # THE EJECTION WAS NOT THE WORST RUN IN ITS POOL, SO THE CAP IS 38 AND NOT 36. The gate's
       # RE-SIZE annotation on that run computed 36:00 from its own 26:13. The pool's worst passing
@@ -806,6 +844,7 @@ jobs:
       #   ubuntu  22:50 x 1.35 = 30:50 -> 31:00   (1.358x over the anchor, 1.515x over max passing)
       #           SUPERSEDED 2026-10-07: 24:36 x 1.35 -> 34:00, under "RE-DERIVED AGAIN 2026-10-07" above
       #           SUPERSEDED 2026-10-13: 28:07 x 1.35 -> 38:00, under "RE-DERIVED A THIRD TIME 2026-10-13" above
+      #           SUPERSEDED 2026-10-18: 33:33 x 1.35 -> 46:00, under "RE-DERIVED A FOURTH TIME 2026-10-18" above
       #   W22     29:23 x 1.35 = 39:40 -> 40:00   (takes the shared Windows value below)
       #   W25     40:07 x 1.35 = 54:09 -> 55:00   (1.371x over the anchor, 1.537x over max passing)
       #
@@ -891,6 +930,7 @@ jobs:
       #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  31+12 = 43
       #            (34+12 = 46 since 2026-10-07; the 12 is unchanged)
       #            (38+12 = 50 since 2026-10-13; the 12 is unchanged)
+      #            (46+12 = 58 since 2026-10-18; the 12 is unchanged)
       #   W22      6:16 (n=413)     4:05 + 2:51 = 6:56   6:56            10:24   11:00  55+11 = 66
       #   W25      6:29 (n=372)     2:32 + 3:59 = 6:31   6:31             9:47   10:00  (takes W22's 66)
       #
@@ -900,6 +940,7 @@ jobs:
       #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
       #           (since 2026-10-07: 5:22 + 33:59 + 2:22 = 41:43 vs 46:00, +4:17)
       #           (since 2026-10-13, same 2026-08 addends: 5:22 + 37:59 + 2:22 = 45:43 vs 50:00, +4:17)
+      #           (since 2026-10-18, same 2026-08 addends: 5:22 + 45:59 + 2:22 = 53:43 vs 58:00, +4:17)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -920,6 +961,7 @@ jobs:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
       #           (since 2026-10-07: 5:22 + 34:00 = 39:22 < 46:00, gap 6:38)
       #           (since 2026-10-13, same 2026-08 setup: 5:22 + 38:00 = 43:22 < 50:00, gap 6:38)
+      #           (since 2026-10-18, same 2026-08 setup: 5:22 + 46:00 = 51:22 < 58:00, gap 6:38)
       #   W22     4:05 + 55:00 = 59:05 < 66:00  (gap 6:55)
       #   W25     2:32 + 55:00 = 57:32 < 66:00  (gap 8:28)
       #
@@ -1148,7 +1190,7 @@ jobs:
       #
       # 5 MINUTES, AND NO MORE. On `!cancelled()` this step also runs after a pytest step that used its
       # whole `step_timeout`, so it must fit in what the ubuntu job cap leaves after setup plus that
-      # step (50 - 38 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
+      # step (58 - 46 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
       # slow fetch fails the script by name first.
       #
       # PULL REQUESTS ONLY. Why `merge_group` is skipped, and what the scan does not cover, is in the
@@ -2524,7 +2566,7 @@ jobs:
           # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":50,"step_timeout":38,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":23,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":58,"step_timeout":46,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":23,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":11,"webconsole_step_timeout":15,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":14,"webconsole_step_timeout":19,"webconsole_job_timeout":27,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
@@ -3596,9 +3638,10 @@ jobs:
     needs: changes
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
-    # A GUESS, stated as one: the ubuntu job has no job cap and no measured duration to size from.
-    # This bounds a hang below GitHub's 6-hour default and should be re-sized from the first runs.
-    timeout-minutes: 90
+    # About 3x the slower of the first measured runs, run 39059057328 (2026-10-17): 7m43s on
+    # windows-2022 and 4m58s on windows-2025. This bounds a hang well below GitHub's 6-hour default;
+    # re-size it from fresh runs if the suite grows.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -3751,11 +3794,13 @@ jobs:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and every API read after that
           # carries that account's session (harness/load/rigadmin.py). Two settings follow:
-          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
-          #     no other way, so the rig account has none. The bind is loopback.
+          #   require_mfa ON, as shipped -- THIS RIG LEG STARTS THE ENGINE WITH MFA REQUIRED (vault
+          #     BACKLOG #2796). The rig account is enrolled with an authenticator key the run block
+          #     draws, and signs in with password and code in one request. The other rig legs keep
+          #     require_mfa off; docs/LOAD-TESTING.md, "Rigs sign in", says why.
           #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
           #     account-security notices. The gate reads configuration only; nothing listens there.
-          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_SECURITY_REQUIRE_MFA: "true"
           MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
           MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
           MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
@@ -3831,7 +3876,13 @@ jobs:
           # that needs it and is never exported, so the engine's own environment never holds it.
           rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
           echo "::add-mask::$rig_pw"
-          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
+          # Its authenticator key, a base32 TOTP secret drawn the same way and handled the same way:
+          # masked, handed only to `provision` and the sign-in, never exported. provision-admin takes
+          # no key as input; rigadmin replaces its terminal enrolment in the provisioning child only.
+          rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+          echo "::add-mask::$rig_totp"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+            python -m harness.load.rigadmin provision --db ./load-ci.db
           # Vault BACKLOG #2700: this leg runs under `enforce`, which refuses a start with the
           # interpreter's remote debugging on. Start the interpreter as the service does.
           python -I -X disable-remote-debug -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
@@ -3846,12 +3897,22 @@ jobs:
           set +e
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
-            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
-            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's. It signs
+            # in ONCE, and first waits for a TOTP step to open, up to about 31 s; _code_in_a_fresh_step
+            # in harness/load/rigadmin.py says why.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+              python -m harness.load.rigadmin run \
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
+            # The engine's start-up census warns about a covered account with no authenticator app
+            # (ADR 0197). With MFA required and the rig account enrolled, it must not. This reads
+            # an absence only: a census that never ran, or logged elsewhere, would pass it too.
+            if grep -q "hold a chosen password and no authenticator app" engine.log; then
+              echo "::error::the engine started with MFA required and named an account with no authenticator app"
+              rc=1
+            fi
           else
             # FAIL ON THE REAL CONDITION RATHER THAN 30s LATER ON A DERIVED ONE. The loop above used to
             # end in `|| sleep 0.5`, which made it incapable of failing the step: a never-ready engine
@@ -3979,9 +4040,9 @@ jobs:
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
-          # that account's session (harness/load/rigadmin.py). require_mfa is off because
-          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
-          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because this leg
+          # supplies no authenticator key, so the rig account has none; docs/LOAD-TESTING.md, "Rigs
+          # sign in", says why. This leg is at `warn` (below), where the notification gate that an
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_FANOUT: "8"
@@ -5247,8 +5308,8 @@ jobs:
           #   * The password is drawn for this run and masked before anything can echo it. Hex cannot
           #     spell a word on the engine's password deny-list. `-e NAME` with no value makes docker
           #     read it from this shell, so it is on no command line.
-          #   * require_mfa is off because provision-admin enrols an authenticator app at a terminal
-          #     and offers no other way, so the rig account has none. The bind is loopback.
+          #   * require_mfa is off because this leg supplies no authenticator key, so the rig account
+          #     has none; docs/LOAD-TESTING.md, "Rigs sign in", says why. The bind is loopback.
           #   * The [alerts] channel is there because, with sign-in on, an enforcing start refuses
           #     without a way to send account-security notices. The gate reads configuration only.
           rig_pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
@@ -5413,6 +5474,15 @@ jobs:
             exit 1
           fi
           echo "the engine's uid cannot create a file in $site"
+          # The config directory too (vault BACKLOG #3106 item 3): the engine executes every *.py
+          # there, and the image keeps /config root-owned so its own uid cannot add one. The same
+          # write control above, in a writable place, is what makes this refusal mean something. The
+          # container runs without --read-only, so the refusal comes from ownership, not the mount.
+          if docker exec mefor touch /config/planted-by-smoke.py; then
+            echo "FAIL: the engine's uid created a file in /config"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in /config"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |

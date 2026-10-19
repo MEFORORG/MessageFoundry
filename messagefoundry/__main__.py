@@ -401,10 +401,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. Under --project-root, a messagefoundry.toml in a working directory "
-        "other than the project root is not read and stops the environment read. When no "
-        "settings load it falls back to the "
-        "setting's own default (ON) — matching the default engine, never a silent OFF (#230).",
+        "names the instance. When no settings load, the preview falls back to the "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
+        "Under --project-root with no --service-config, check reads the project root's "
+        "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
+        "one in its own working directory; when they differ, each settings check's line names "
+        "the file it read. With neither file, a messagefoundry.toml in the working directory is "
+        "not read, and the settings checks skip and name it. An explicit --service-config is "
+        "read wherever it points, the working directory's file included. Without --project-root, "
+        "a directory named messagefoundry.toml in the working directory, when the upward search "
+        "reaches it, fails the settings checks, as it stops serve.",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(check)
@@ -866,8 +872,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="create the first administrator offline (the engine creates no account on its own)",
         description="Create the first Administrator from the host, against the store the service "
         "uses. The engine creates no account on its own, so nobody can manage a new install until "
-        "this runs. It refuses, before asking for a password, when an enabled Administrator already "
-        "exists or an argument is out of range, and it creates the store only once the password "
+        "this runs. It refuses, before asking for a password, when an enabled local Administrator "
+        "with a usable password already exists or an argument is out of range; a directory or "
+        "federated Administrator does not block it, and it creates the store only once the password "
         "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
         "engine stopped.",
     )
@@ -898,8 +905,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
     # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
-    # too, because an enabled Administrator exists. provision-admin can no longer leave one (BACKLOG
-    # #1138), but a directory account granted the role can, and so can a store an earlier build wrote.
+    # too when a local Administrator with a usable password exists. provision-admin can no longer
+    # leave one (BACKLOG #1138), but a directory account granted the role can, and so can a store an
+    # earlier build wrote.
     # This is the offline exit, on admin-unlock's gate.
     admin_set_notify_email = sub.add_parser(
         "admin-set-notify-email",
@@ -1235,7 +1243,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="on-box deployment acceptance: host checks + store connectivity + end-to-end smoke",
     )
     verify.add_argument(
-        "--config", default="samples/config", help="config modules dir (for the self smoke)"
+        "--config",
+        default="samples/config",
+        help="config modules dir (for the self smoke, and the host.ciphers hop census)",
     )
     verify.add_argument(
         "--service-config",
@@ -7667,6 +7677,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
     the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
     non-empty, because a directory sign-in can fill the table without producing an administrator.
+    Since vault BACKLOG #2711 step 1 that Administrator must be a local one with a usable password
+    (``AuthService.has_self_sufficient_administrator``, ADR 0183 Amendment E): a directory or
+    federated Administrator does not block it, so a site can get back in while that service is down.
 
     **It refuses before it prompts wherever it can, and it creates the store last (ADR 0183 AC-15).**
     The length limits, the keyless gate, the store key's resolution, the trust-anchor and directory
@@ -7676,6 +7689,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     that created the store first left a new store behind, and on a Windows service that store is
     secured to whoever opened it. And a scripted install step, like the IDE's Start flow, reads "an
     enabled Administrator exists" as go-ahead, which it can only do if no password is asked for first.
+    Since vault BACKLOG #2711 step 1 that answer means a local Administrator with a usable password,
+    so a store run only by directory Administrators is offered provisioning too.
     Answering that opens an EXISTING store the way ``serve`` does; an absent SQLite store is not
     created by asking. ``provision_first_administrator`` repeats the blank-name, Administrator and
     policy checks itself, so for those this ordering is a courtesy and not the control. The length
@@ -8090,7 +8105,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     enabled Administrator carries ``notify_email``. ``provision-admin`` used to leave exactly that
     state when run without ``--email``; it requires the flag since BACKLOG #1138. A directory account
     granted the role with no address still leaves it, and so does a store an earlier build wrote.
-    ``provision-admin`` then refuses because an enabled Administrator exists, and the web console
+    ``provision-admin`` then refuses when a local Administrator with a usable password exists
+    (vault BACKLOG #2711), and the web console
     cannot be reached while the engine refuses. This is the exit that trades no control.
 
     **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, and it runs
@@ -9900,6 +9916,9 @@ def _check(args: argparse.Namespace) -> int:
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
         allow_empty_config=args.allow_empty_config,
+        # BACKLOG #3063 item 2: _resolve_offline_anchor picked the project root's file, which serve
+        # with the same flags may not read; run_checks names the difference on each settings line.
+        service_config_from_root=args.service_config is None and service_config is not None,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -9922,6 +9941,7 @@ def _connection(args: argparse.Namespace) -> int:
     import os
     from pathlib import Path
 
+    from messagefoundry.checks import INSECURE_BIND_FLAG, insecure_bind_note
     from messagefoundry.config import connections_edit
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.environments import (
@@ -10000,8 +10020,10 @@ def _connection(args: argparse.Namespace) -> int:
             # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
             # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
             trust_anchor_policy=settings.tls.policy(),
-            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
-            # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape,
+            # so pass the settings half serve folds in. This command takes no
+            # --allow-insecure-bind, for the reason `_check_build` in checks.py gives for `check`
+            # (BACKLOG #3063 item 1, a Manager ruling).
             allow_insecure_bind=insecure_bind_escape(settings),
         )
         # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
@@ -10039,6 +10061,11 @@ def _connection(args: argparse.Namespace) -> int:
             advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
         elif BODY_ACKNOWLEDGEMENT_SETTING in message:
             advice = "this edit is then checked against that instance's [security] settings"
+        elif INSECURE_BIND_FLAG in message:
+            # BACKLOG #3063 item 7: the exposure refusal names serve's flag, which this command
+            # does not take (item 1), so say which escape it does read and where it was read from.
+            message = insecure_bind_note(message, "connection")
+            advice = "the cleartext escape is then read from that instance's [security] settings"
         if args.service_config is None and advice is not None:
             # load_settings falls back to ./messagefoundry.toml, so say which case this was.
             local = Path("messagefoundry.toml")

@@ -70,6 +70,24 @@ def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str)
     return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
 
 
+#: The longest node id :func:`config_changed_detail` quotes whole. A node id is ``host:pid:tag``,
+#: and a host name may run to 253 characters (vault BACKLOG #2944).
+_DETAIL_NODE_MAX = 56
+#: How much of a shortened node id's end :func:`_short_node` keeps: room for the ``:pid:tag``.
+_DETAIL_NODE_TAIL = 24
+
+
+def _short_node(node: str) -> str:
+    """``node`` whole when it fits :data:`_DETAIL_NODE_MAX`, else its head and its ``pid:tag`` tail
+    around ``...``, so both the host and the process it names stay readable. Not
+    ``intake_bound.process_alert_subject``'s shortening: that one must give a stable alert key, so
+    it ends in a checksum; this one is prose for a reader."""
+    if len(node) <= _DETAIL_NODE_MAX:
+        return node
+    head = _DETAIL_NODE_MAX - _DETAIL_NODE_TAIL - len("...")
+    return f"{node[:head]}...{node[-_DETAIL_NODE_TAIL:]}"
+
+
 def config_changed_detail(
     *,
     fingerprint: str,
@@ -82,11 +100,18 @@ def config_changed_detail(
 
     It must hold for a config that changed on purpose and for one node that diverged from the rest,
     so it states the two digests and where the older one came from and judges neither. Digests are
-    cut to 12 hex characters here; the event carries them whole. No path and no git commit."""
+    cut to 12 hex characters here; the event carries them whole. No path and no git commit.
+
+    The alert instance's reason column keeps only about the first 200 characters, and its cut drops
+    a token that straddles the limit whole. So the baseline's time and node lead, and a node id
+    longer than :data:`_DETAIL_NODE_MAX` is shortened here, which keeps the whole line inside the
+    cut for a baseline action name of up to 36 characters; the event carries the node whole (vault
+    BACKLOG #2944). The store's redaction replaces the ISO time in that column as date-shaped text,
+    so there it reads ``[redacted]``; the event's ``baseline_at`` carries it whole."""
+    node = _short_node(baseline_node) if baseline_node else "unknown"
     return (
-        f"this process started with config {fingerprint[:12]}; the store's baseline is config "
-        f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
-        f"{baseline_action}, time {baseline_at or 'unknown'})"
+        f"baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): started on "
+        f"config {fingerprint[:12]}, baseline config {previous_fingerprint[:12]}"
     )
 
 
@@ -376,7 +401,8 @@ class AlertSink(Protocol):
         ``remedy_class`` is
         a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
         on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
-        still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed
+        still on the old copy at the last pass that reported the refusal, so a reminder carries
+        the latest count, not the one first raised. ``remedy`` is the engine's own fixed
         sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
         start would refuse the file too, until one of its CRLs takes effect.
 
@@ -384,8 +410,8 @@ class AlertSink(Protocol):
         in the engine log and is never passed here. Not a connection-scoped event: one CRL file
         can serve many hops, and the colon keeps ``name`` outside the connection-name grammar.
 
-        Raised once per file version, as the reload's ERROR line is logged: again only when the
-        file's bytes change or the reason does. Emitted on the event loop by
+        Raised at once for each file version, as the reload's ERROR line is logged, and again
+        as a reminder while that refusal stands (vault BACKLOG #3543). Emitted on the event loop by
         :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`;
         :meth:`crl_reload_applied` is its auto-resolving inverse."""
         ...
@@ -398,9 +424,14 @@ class AlertSink(Protocol):
 
         Emits **no** notification (a recovery needs no page); it exists so durable alert-state
         (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
-        ``name``. Raised only for an alert this runner raised, and only once the refusal is gone
-        from the record: a pass that could not read the file, or that failed, clears nothing. A
-        process that dies without stopping leaves its alert open, for an operator to resolve."""
+        ``name``. Raised for an alert this runner raised once the refusal is gone from the record:
+        a pass that could not read the file, or that failed, clears nothing. Also raised once
+        per held file outside a CA bundle, at the first pass that judges it with no refusal
+        standing, whether or not any alert is open: such a call can resolve nothing, at start or
+        later. It clears an alert an earlier run under the same identity left open, by dying
+        without stopping or because its clear at stop failed (vault BACKLOG #3543). An alert for
+        a file no hop holds now, or one raised under another identity, such as an unpinned
+        cluster node's, stays open for an operator."""
         ...
 
     def secret_rotation_due(
@@ -566,20 +597,26 @@ class AlertSink(Protocol):
         way; or the directory refused one or more probes with a result code that points at the
         configuration, such as a deleted or moved search base (``directory_misconfigured``, BACKLOG
         #3010, the ``auth.ad_reconcile_misconfigured`` row), which leaves those accounts unjudged the
-        same way. The type's name predates every case but the first. Read ``reason`` before naming
-        the cause.
+        same way; or one account's group search was refused for the engine's own bound
+        (``group_search_deadline`` or ``group_search_cap``, vault BACKLOG #3696), raised once as
+        the account enters that state, which leaves it unjudged too. The type's name predates every
+        case but the first. Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
-        for a probe fault, and ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        so each is its own instance and throttle. ``reason`` is one of those four closed-set slugs.
-        ``probed`` is, for the breaker, how many principals the pass judged, its denominator; for
-        each of the other three, how many probes the pass sent to the directory, which leaves out
-        an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth
-        service latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``.
-        A whole-directory outage is NOT this event: it is audited as ``auth.ad_reconcile_skipped``
-        and pages nothing, because the accounts are fine. A pass where every probe fails and none is
-        referred, refused or faults is such an outage."""
+        for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
+        and ``"directory-reconciler-paging:<username>"`` for a paging refusal, so each is its own
+        instance and throttle. ``reason`` is one of those six closed-set slugs. ``probed`` is, for
+        the breaker, how many principals the pass judged, its denominator, and a paging refusal
+        carries that same count of candidates the pass took up, asked or not, which counts any
+        id-less row: a paging refusal concerns one account, and its count is still the pass's. For
+        a referral, a configuration refusal and a probe fault it is how many probes the pass sent to
+        the directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the
+        operator-facing explanation the auth service latches, or for a paging refusal a fixed
+        sentence naming its cause. No PHI. Emitted by the API-lifespan reconciler task, never from
+        ``auth/``. A whole-directory outage is NOT this event: it is audited as
+        ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine. A pass where
+        every probe fails and none is referred, refused or faults is such an outage."""
         ...
 
     def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
@@ -721,6 +758,7 @@ class AlertSink(Protocol):
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         """This process started with a config whose ADR 0041 D1 fingerprint differs from the store's
         baseline (vault BACKLOG #2597). The baseline is the newest usable ``config_loaded``,
@@ -737,7 +775,13 @@ class AlertSink(Protocol):
         ``baseline_node`` describe the row the older digest came from. Never a path, a git commit
         or message content (no PHI). It is not a connection-scoped event, so no rule's
         ``control_action`` fires on it (BACKLOG #1898). Raised once per start at most, never on a
-        fresh store, a baseline without a digest, or one taken under another fingerprint scheme."""
+        fresh store, a baseline without a digest, or one taken under another fingerprint scheme.
+
+        ``comparison`` is the start's outcome: ``compared``, or a marker that the start's digest
+        left out a file it could not read (``partial_start_digest``), the baseline's did
+        (``partial_baseline``), or the directory changed while the start loaded it
+        (``changed_during_load``). A marker adds to the page; it never suppresses one (vault
+        BACKLOG #2944, #3765)."""
         ...
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
@@ -1137,9 +1181,11 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            # The count is the candidates the breaker judged, or for every other source the probes
-            # the pass asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
-            "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
+            # The count is the candidates the pass took up for the breaker and a paging refusal, or
+            # the probes the pass asked for a referral, a configuration refusal and a probe fault
+            # (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
+            "%d principal(s) "
             "(%s): %s",
             name,
             probed,
@@ -1237,10 +1283,11 @@ class LoggingAlertSink:
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         log.warning(
             "ALERT config_changed: %r %s (this node %s, engine shard %s; baseline actor %s; "
-            "fingerprint %s, previous %s)",
+            "fingerprint %s, previous %s; comparison %s)",
             name,
             config_changed_detail(
                 fingerprint=fingerprint,
@@ -1254,6 +1301,7 @@ class LoggingAlertSink:
             baseline_actor,
             fingerprint,
             previous_fingerprint,
+            comparison,
         )
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
@@ -1381,12 +1429,15 @@ def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None
     if table == UPLOADED_FILE_TABLE:
         # The uploaded-file store (BACKLOG #1169, owner ruling 2026-09-23). Unlike a store column, a
         # plaintext file here is usually legitimate: one written before the key was enabled. So the
-        # reason says what fixes it. Still the surface only: never a file id and never a filename.
+        # reason offers the remedies, and promises none, because rotate-key does not seal every one
+        # (BACKLOG #2322, #3183). Still the surface only: never a file id and never a filename.
         subject = UPLOAD_CIPHER_SUBJECT
         reason = (
             f"the keyed store refused a plaintext uploaded file ({table}.{column}): one stored before "
-            "the key was enabled, or a planted one; it stays refused until 'messagefoundry "
-            "rotate-key' seals it"
+            "the key was enabled, or a planted one. An operator may seal it by running 'messagefoundry "
+            "rotate-key' with the engine stopped. If rotate-key leaves it unsealed for good, an "
+            "operator may delete it, or the retention prune may remove it once it expires, where "
+            "either can. docs/PHI.md section 3 names at least some kinds neither can remove"
         )
     else:
         subject = STORE_CIPHER_SUBJECT

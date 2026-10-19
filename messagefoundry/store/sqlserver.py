@@ -194,6 +194,8 @@ from messagefoundry.store.store import (
     AdMap,
     AdMapChange,
     AdMapSql,
+    AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -240,6 +242,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     UserAuthzRecord,
     UserChange,
@@ -271,6 +274,7 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
@@ -318,6 +322,7 @@ from messagefoundry.store.store import (
     totp_disable,
     totp_enable,
     totp_replace,
+    totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
@@ -13292,18 +13297,13 @@ class SqlServerStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted. Does not enable MFA."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """See :meth:`MessageStore.set_totp_secret`: conditional on TOTP being off (#3025)."""
         now = time.time() if now is None else now
-        enc = (
-            self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id))
-            if secret
-            else None
-        )
-        await self._write_user_txn(
-            user_id, lambda r: r.changed(totp_secret=enc, updated_at=float(now))
-        )
+        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
+        written = await self._write_user_txn(user_id, totp_stage(sealed, now))
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=?", (user_id,))
@@ -13314,13 +13314,17 @@ class SqlServerStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # Conditional (see ``totp_enable``, #2224); the write helper's OUTPUT says whether it wrote.
-        return (
-            await self._write_user_txn(user_id, totp_enable(recovery_code_hashes, now)) is not None
-        )
+        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224, #3025).
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def replace_totp_enrolment(
         self,
@@ -13460,12 +13464,12 @@ class SqlServerStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``UPDLOCK`` SELECT + UPDATE run in one transaction so concurrent
-        assertions can't both win."""
+        precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
+        read from the ``UPDLOCK`` SELECT, in the same transaction as the UPDATE, so concurrent
+        assertions can't both win and no delete can land between a miss and the answer (BACKLOG
+        #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -13478,14 +13482,16 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 if not rows or int(rows[0][0]) != expected:
                     await self._commit(conn)
-                    return False  # missing row, or a concurrent assertion moved the counter
+                    # A missing row is a passkey gone. Another count is a concurrent assertion
+                    # that moved the counter, or a cloned key.
+                    return "mismatch" if rows else "gone"
                 await cur.execute(
                     "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
                     " WHERE credential_id_hash=?",
                     (new, used_at, credential_id_hash),
                 )
                 await self._commit(conn)
-                return True
+                return "moved"
             except Exception:
                 await conn.rollback()
                 raise
@@ -13636,6 +13642,56 @@ class SqlServerStore:
                 await self._rollback_or_discard(conn)
                 raise
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. It takes the last-administrator guard's ``_ADMIN_GUARD_LOCK`` before the
+        read, so two grants, or a grant and a removal, never both read before either writes."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    # Opens the transaction the applock attaches to; see remove_unless_last_admin.
+                    await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
+                    await cur.fetchall()
+                    await self._applock(cur, _ADMIN_GUARD_LOCK)
+                    await cur.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                    holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                    _, others = await admin_guard_counts(
+                        holders,
+                        self._row_sealer,
+                        lambda holder: self._read_user_record(cur, holder, lock=False),
+                        counts_as_admin,
+                    )
+                    if others:
+                        await conn.rollback()  # nothing written; releases the applock
+                        return AdminGrant.ADMIN_EXISTS
+                    if await self._write_user(cur, user_id, change) is None:
+                        await conn.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    await self._commit(conn)
+            except Exception:
+                # BACKLOG #1940, as in remove_unless_last_admin.
+                await self._rollback_or_discard(conn)
+                raise
+        return AdminGrant.GRANTED
 
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:

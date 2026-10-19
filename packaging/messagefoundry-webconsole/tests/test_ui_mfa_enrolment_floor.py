@@ -14,6 +14,10 @@ No test sleeps. The wall clock the service and the store read is held, so no tim
 the sign-in and the early attempt however slow the runner is, and the clock then moves only forward.
 A clock that stepped behind a session's own stamps would end the session.
 
+The last three tests pin what the same two routes say when the service refuses a directory account
+the directory did not confirm (BACKLOG #3061) or one under a second-step lock (BACKLOG #3810
+finding 4), neither of which is a floor refusal, and the passkey page's note on a stray passkey.
+
 Each test names the mutation that must turn it RED.
 """
 
@@ -27,6 +31,7 @@ import uuid
 import pytest
 from _ui_clients import (
     SAME_ORIGIN,
+    PresentDirectory,
     cookie_login,
     held_totp_code,
     hold_auth_wall_clock,
@@ -36,7 +41,7 @@ from _ui_clients import (
 )
 
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import TOO_EARLY, AuthService
+from messagefoundry.auth.service import TOO_EARLY, AuthService, DirectoryRefusal, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -46,7 +51,7 @@ assert FLOOR > 0, "the floor ships off, so these tests would test nothing"
 
 
 async def _floored_service(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, *, ldap: object | None = None
 ) -> tuple[AuthService, list[float]]:
     """A service with the floor at its shipped default and require_mfa on, so a fresh sign-in owes
     its factor, and the held clock it reads. The admin-write pacing floor and the sign-in rate
@@ -56,6 +61,7 @@ async def _floored_service(
     service = AuthService(
         engine.store,
         AuthSettings(admin_write_min_interval_seconds=0, login_rate_limit_enabled=False),
+        ldap=ldap,  # type: ignore[arg-type]
     )
     await service.initialize()
     return service, now
@@ -135,7 +141,6 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
     from _soft_webauthn import SoftAuthenticator
     from webauthn.helpers import base64url_to_bytes
 
-    service, now = await _floored_service(engine, monkeypatch)
     principal = AdPrincipal(
         username="adfloor",
         display_name=None,
@@ -144,6 +149,7 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         groups=frozenset(),
         directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adfloor")),
     )
+    service, now = await _floored_service(engine, monkeypatch, ldap=PresentDirectory(principal))
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert out.ok and out.token is not None and out.identity is not None
     assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
@@ -176,3 +182,117 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         served = await c.post("/ui/account/webauthn/verify", json=body, headers=SAME_ORIGIN)
         assert served.status_code == 200 and served.json()["ok"] is True, served.text
     assert len(await service.store.list_webauthn_credentials(out.identity.user_id)) == 1
+
+
+# --- what the two enrolment routes say for a directory refusal (BACKLOG #3061) -----------------
+
+_DIRECTORY_UNCONFIRMED_TEXT = "The directory could not confirm your account."
+
+
+_LOCKED_TEXT = "Account locked. Try again later."
+
+#: The refusal each arm stubs, and the banner it must show. "wrong" is the control: an ordinary
+#: wrong proof keeps the leg's own words.
+_ENROL_REFUSALS = pytest.mark.parametrize(
+    "refusal", ["directory", "locked", "wrong"], ids=["directory-refused", "locked", "wrong-proof"]
+)
+
+
+def _refusal(refusal: str) -> Elevation:
+    return Elevation(
+        directory_refusal=DirectoryRefusal.UNCONFIRMED if refusal == "directory" else None,
+        locked=refusal == "locked",
+    )
+
+
+@_ENROL_REFUSALS
+async def test_the_console_totp_confirm_says_why_an_unchecked_code_was_refused(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """``confirm_mfa_enrollment`` asks the directory before it checks a directory account's code,
+    so a refusal never judged the code. The service answer is stubbed; the refusal itself is pinned
+    in tests/test_enrolment_directory_recheck.py. A second-step lock found by the re-read after the
+    lookup never judged the code either (BACKLOG #3810 finding 4).
+
+    RED when: ``/ui/account/mfa/verify`` drops the directory_refusal or the locked branch (the
+    refused arm then reads "Invalid code."), or applies either to an ordinary wrong code (the
+    control arm)."""
+    service, _now = await _floored_service(engine, monkeypatch)
+    await provision(service, "op", ["operator"])
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return _refusal(refusal)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, "/ui/account/mfa/enroll")
+        assert (await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)).status_code == 200
+        await mint_bound_proof(c, "/ui/account/mfa/confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refused)
+        r = await c.post("/ui/account/mfa/verify", data={"code": "123456"}, headers=SAME_ORIGIN)
+    assert r.status_code == 400
+    banner = _banner(r.text)
+    assert banner is not None
+    assert (_DIRECTORY_UNCONFIRMED_TEXT in banner) is (refusal == "directory")
+    assert (banner == _LOCKED_TEXT) is (refusal == "locked")
+    assert (banner == "Invalid code.") is (refusal == "wrong")
+
+
+@_ENROL_REFUSALS
+async def test_the_console_passkey_finish_says_why_an_unchecked_passkey_was_refused(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """As above, for ``finish_webauthn_registration``. The service answer is stubbed.
+
+    RED when: ``/ui/account/webauthn/verify`` drops the directory_refusal or the locked branch
+    (the refused arm then reads "passkey verification failed"), or applies either to an ordinary
+    failed attestation."""
+    principal = AdPrincipal(
+        username="adwords",
+        display_name=None,
+        email=None,
+        dn="CN=adwords,DC=x",
+        groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adwords")),
+    )
+    service, _now = await _floored_service(engine, monkeypatch, ldap=PresentDirectory(principal))
+    out = await service._complete_ad_login(principal, None, mfa_verified=False)
+    assert out.ok and out.token is not None
+    await service.store.mark_session_reauthed(hash_token(out.token))
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return _refusal(refusal)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", _refused)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", out.token)
+        r = await c.post(
+            "/ui/account/webauthn/verify",
+            json={"label": "key", "response": {}},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 400, r.text
+    error = r.json()["error"]
+    assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is (refusal == "directory")
+    assert (error == _LOCKED_TEXT) is (refusal == "locked")
+    assert (error == "passkey verification failed") is (refusal == "wrong")
+
+
+def test_the_passkey_page_says_a_stray_passkey_can_be_deleted() -> None:
+    """BACKLOG #3810 finding 4: every refusal at the passkey finish comes after the authenticator
+    made its credential, as it did before #3061, so a failed enrolment can leave one behind. But a
+    failed finish does not prove the passkey was not stored (docs/SECURITY.md, "A refused
+    registration can leave a passkey on the authenticator", says how). So the page sends the user
+    to the account's list first, and lets them delete only a passkey that is not in it. RED when
+    the page stops saying so, or says again that a failed passkey "was not added", which on a
+    passkey-only account would lead a user to delete the one factor they hold."""
+    from messagefoundry_webconsole import pages
+
+    page = " ".join(str(pages.webauthn_enroll_page("{}")).split())
+    assert "check the Passkeys list on your account page first" in page
+    assert "A passkey listed there is registered: keep it on your browser or security key." in page
+    assert "If you cannot tell which is which, keep it." in page
+    assert "Only a passkey your browser or security key shows that is not in that list" in page
+    assert "is a leftover you may delete" in page
+    assert "was not added" not in page
+    assert "cannot sign you in" not in page

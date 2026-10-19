@@ -58,7 +58,7 @@ from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
 from messagefoundry.api.models import ReleaseBlocked
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
@@ -134,6 +134,15 @@ DEFAULT_CLAIM_OWNER = "engine"
 #: whose own repeat rule still joins it; only the proof-free path is lost.
 REJOIN_SCAN_LIMIT = 1000
 
+#: Faults :meth:`ApprovalGate._read` raises as they are, because they name a defect in the read
+#: path, not a store that is down: a 503 inviting a retry would never clear (BACKLOG #3157).
+_READ_DEFECTS: tuple[type[Exception], ...] = (
+    *AUDIT_WRITE_DEFECTS,
+    AttributeError,
+    KeyError,
+    TypeError,
+)
+
 #: The refusal for a request whose row fails its integrity seal (BACKLOG #2592). Nothing re-seals
 #: such a row, so it can be neither released, rejected nor resolved; it expires.
 _SEAL_REFUSAL = (
@@ -154,18 +163,25 @@ class RestartReconciliation:
     foreign: tuple[str, ...]
 
 
-def _stored_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
+def _stored_params(
+    approval_id: str, raw: Any, *, throttle: SealFailureThrottle | None = None
+) -> dict[str, Any] | None:
     """A row's captured params, or ``None`` when the stored value is not a JSON object. The one
     decoder for the queue (BACKLOG #2458) and for :meth:`ApprovalGate.approve`, so the two agree on
     what is readable: the queue lists such a row as unreadable, and approve refuses it with a 409.
-    Logged by id and a content-free hint only, because the value may be anything."""
+    Logged by id and a content-free hint only, because the value may be anything.
+
+    ``throttle`` paces the WARNING per approval id. The queue passes one, because every list of
+    the page would otherwise warn again for the same row (BACKLOG #3252). Approve passes none: each
+    refused release is its own event and keeps its line."""
     params, refusal = json_loads_or_refusal(str(raw))
     if refusal is not None or not isinstance(params, dict):
-        log.warning(
-            "approval %s: its stored params are not a JSON object (%s)",
-            approval_id,
-            refusal or "not an object",
-        )
+        if throttle is None or throttle.due(approval_id):
+            log.warning(
+                "approval %s: its stored params are not a JSON object (%s)",
+                approval_id,
+                refusal or "not an object",
+            )
         return None
     return params
 
@@ -221,9 +237,11 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
         log.error("approval %s: a shielded outcome write was cancelled", approval_id)
         return
     error = task.exception()
-    if isinstance(error, ApprovalError) and error.status == 409:
-        # A conflict the gate raises on purpose, such as a resolve that lost the race to another
-        # operator. The row's status already says what won, so it is not an ERROR.
+    if isinstance(error, ApprovalError) and error.status in (409, 503):
+        # A refusal the gate raises on purpose. A 409, such as a resolve that lost the race to
+        # another operator, is no fault: the row's status says what won. The only 503 a
+        # shielded unit raises comes from _store_fault, which logged it at ERROR and paged, so a
+        # second ERROR here would report one fault twice (BACKLOG #3157 item 7).
         log.warning(
             "approval %s: a shielded outcome write was refused after its caller was cancelled "
             "(%d): %s",
@@ -286,7 +304,8 @@ class ApprovalError(Exception):
     """A pending-approval decision could not be made. ``status`` is the HTTP code the API should map
     to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval, and 503
     when the store refuses a write the decision needs before anything runs: the release row, the
-    claim, a rejection or a resolution (vault BACKLOG #2255)."""
+    claim, a rejection or a resolution (vault BACKLOG #2255). A 503 also answers a store read the
+    queue or a decision needs (BACKLOG #3157 item 1)."""
 
     def __init__(self, status: int, detail: str, *, headers: dict[str, str] | None = None) -> None:
         super().__init__(detail)
@@ -308,20 +327,30 @@ class ApprovalGate:
         resolve_identity: IdentityResolver | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
-        claim_owner: str | Callable[[], str] = DEFAULT_CLAIM_OWNER,
+        claim_owner: str | Callable[[], str | None] = DEFAULT_CLAIM_OWNER,
     ) -> None:
         self._store = store
         self._settings = settings
         # Written on every claim, and read back by reconcile_after_restart (BACKLOG #1562). It must
         # be the same across a restart of this engine process and differ between processes that
         # share the store; the API wiring passes Engine.instance_identity. A callable is read on
-        # first use and then fixed, so an app built before its engine has loaded a sharded graph
-        # still claims under the shard's name, and the owner never changes mid-life.
+        # use and fixed once it names an owner, so an app built before its engine has loaded a
+        # graph for an engine shard still claims under that engine shard's name. While it answers
+        # None, the identity is not known yet: the read gives DEFAULT_CLAIM_OWNER and fixes
+        # nothing (BACKLOG #3252), unless a claim is written under it, which fixes it
+        # (_owner_for_claim). Either way the owner never changes once a claim carries it.
         self._claim_owner_source = claim_owner
         self._claim_owner_value = claim_owner if isinstance(claim_owner, str) else None
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
         self._clock = clock
+        # Set when the restart reconcile was put off because the owner was not known yet
+        # (BACKLOG #3252); _catch_up_reconcile runs it once the owner is known, over the rows
+        # claimed before this gate was built, so it never takes this life's claims for leftovers.
+        # The lock keeps two lists from running it at once.
+        self._reconcile_owed = False
+        self._born = clock()
+        self._owner_lock = asyncio.Lock()
         # With no resolver the requester's permissions cannot be re-read, so approve() refuses every
         # release (fail closed) rather than executing on authority it could not check.
         self._resolve_identity = resolve_identity
@@ -334,6 +363,11 @@ class ApprovalGate:
         self._inflight: dict[asyncio.Future[Any], str] = {}
         # When each failing request is reported again (BACKLOG #2592).
         self._seal_failures_reported = SealFailureThrottle()
+        # When the queue warns again about a request whose params are unreadable (BACKLOG #3252).
+        self._unreadable_params_reported = SealFailureThrottle()
+        # When a failed store read of each kind is logged again (BACKLOG #3157): the queue page
+        # reads the store on every load, so an outage would otherwise log a traceback per load.
+        self._read_faults_reported = SealFailureThrottle()
 
     async def _shielded[T](
         self,
@@ -362,11 +396,54 @@ class ApprovalGate:
 
     @property
     def claim_owner(self) -> str:
-        """The claim owner this gate writes and reconciles under (BACKLOG #1562)."""
+        """The claim owner this gate writes and reconciles under (BACKLOG #1562).
+
+        :data:`DEFAULT_CLAIM_OWNER` while the source cannot name one yet, unfixed, so embedded
+        engine shards whose app started before their graph do not all fix that one name and share
+        it (BACKLOG #3252)."""
         if self._claim_owner_value is None:
             source = self._claim_owner_source
-            self._claim_owner_value = source if isinstance(source, str) else source()
+            found = source if isinstance(source, str) else source()
+            if found is None:
+                return DEFAULT_CLAIM_OWNER
+            self._claim_owner_value = found
         return self._claim_owner_value
+
+    def _owner_for_claim(self) -> str:
+        """:attr:`claim_owner`, fixed from now on, for a claim about to be written under it. A
+        claim written under the default must be reconciled under the default too, so the owner
+        cannot move after it, even if the identity becomes known later."""
+        owner = self.claim_owner
+        self._claim_owner_value = owner
+        return owner
+
+    async def _catch_up_reconcile(self) -> None:
+        """Run the restart reconcile that :meth:`reconcile_after_restart` put off, once the
+        owner is known (BACKLOG #3252).
+
+        An embedded app can start before its engine holds its graph, when the owner is not known.
+        This runs on each queue list until it completes, so the engine shard's leftover rows
+        surface as ``interrupted`` once its name is known, or once a claim fixes the default. It
+        moves only rows claimed before this gate was built, so a claim this process made since is
+        never taken for a leftover. A failure or a cancel leaves it owed for the next list; a
+        failure is logged."""
+        if not self._reconcile_owed:
+            return
+        owner = self.claim_owner  # fixed by this read once the source can name it
+        if self._claim_owner_value is None:
+            return  # still not known
+        async with self._owner_lock:
+            if not self._reconcile_owed:
+                return
+            try:
+                await self._reconcile(owner, claimed_before=self._born)
+            except Exception:  # noqa: BLE001 - a failed reconcile fails nothing else
+                log.exception(
+                    "approval gate: the reconcile put off until the claim owner was known "
+                    "failed; the next queue read tries again"
+                )
+                return
+            self._reconcile_owed = False
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> list[str]:
         """Wait up to ``timeout`` seconds for the gate's writes still running (BACKLOG #2087): every
@@ -408,7 +485,10 @@ class ApprovalGate:
         """Move this process's leftover ``executing`` rows to ``interrupted`` (BACKLOG #1562).
 
         Call it once at startup, before the API serves approvals, and once per engine process: a
-        second app over the same engine would take this process's live releases for leftovers. A
+        second app over the same engine would take this process's live releases for leftovers.
+        While the owner is not known yet it moves nothing and puts the work off to
+        :meth:`_catch_up_reconcile`, which runs it once the owner is known and over older claims
+        only (BACKLOG #3252). A
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
@@ -432,6 +512,20 @@ class ApprovalGate:
         tries again; writing the status alone would leave an ``interrupted`` row with no audit row
         saying why. A failed READ raises, for the caller to log."""
         me = self.claim_owner
+        if self._claim_owner_value is None:
+            # Not known yet. Sweeping under the default now would move rows of a sibling that
+            # fixed the default, and miss this engine shard's own (BACKLOG #3252).
+            self._reconcile_owed = True
+            log.info(
+                "approval gate: the claim owner is not known yet, so the restart reconcile waits "
+                "until it is"
+            )
+            return RestartReconciliation((), (), ())
+        return await self._reconcile(me, claimed_before=None)
+
+    async def _reconcile(self, me: str, *, claimed_before: float | None) -> RestartReconciliation:
+        """The body of :meth:`reconcile_after_restart` under owner ``me``. With
+        ``claimed_before``, a row claimed at or after that time is left alone: it is this life's."""
         interrupted: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
@@ -440,6 +534,8 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
+            if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
+                continue  # claimed by this process since it started, so not a leftover
             approval_id = row.id
             approver = row.approver
             detail = json.dumps(
@@ -827,17 +923,49 @@ class ApprovalGate:
         """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks
         the caller's own requests (``caller_is_requester``). A request that fails its integrity
         seal is left out and reported (BACKLOG #2592): it can be neither released nor rejected."""
+        await self._catch_up_reconcile()
         rows = await self._verified_rows(
-            await self._store.list_pending_approvals(now=self._clock())
+            await self._read(
+                self._store.list_pending_approvals(now=self._clock()), what="the approval queue"
+            )
         )
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        # One authority read per requester for the whole listing, however many requests they hold.
+        authority: dict[str, Identity | str | None] = {}
+        return [await self._queue_entry(r, caller_user_id, authority) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
         (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
         :meth:`list_pending`."""
-        rows = await self._verified_rows(await self._store.list_interrupted_approvals())
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        await self._catch_up_reconcile()
+        rows = await self._verified_rows(
+            await self._read(
+                self._store.list_interrupted_approvals(), what="the interrupted releases"
+            )
+        )
+        return [await self._queue_entry(r, caller_user_id, {}) for r in rows]
+
+    async def _read[T](self, read: Awaitable[T], *, what: str) -> T:
+        """A store read an approval route needs, with a fault answered as 503 rather than a raw
+        500 (BACKLOG #3157 item 1). Nothing has been decided or run when it raises.
+
+        Logged at ERROR with the exception, at most once per
+        :data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per ``what``,
+        and not paged: a read writes nothing, so no audit row was lost, and ``audit_write_failed``
+        (:meth:`_store_fault`) would report a loss that did not happen. A defect
+        (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`) is raised as it is, so a bug is
+        not answered as an outage to retry."""
+        try:
+            return await read
+        except _READ_DEFECTS:
+            raise  # a defect in the read path, not an outage
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            if self._read_faults_reported.due(what):
+                log.error("approvals: the store failed to read %s", what, exc_info=exc)
+            raise ApprovalError(
+                503,
+                f"the store could not read {what}, so nothing was done; try again once it answers",
+            ) from exc
 
     def _release_blocked(
         self, r: ApprovalRow, params: dict[str, Any] | None
@@ -845,7 +973,9 @@ class ApprovalGate:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
         BACKLOG #3192). approve() refuses on exactly these, so the queue cannot predict a refusal
         the gate does not make; :class:`~messagefoundry.api.models.PendingApprovalInfo` states
-        what each value means and what ``None`` does not promise."""
+        what each value means and what ``None`` does not promise. The requester's standing is the
+        one reason not tested here: :meth:`_queue_release_blocked` adds it for the queue, and
+        approve() reads it after the dwell floor."""
         if not r.requester_user_id:
             return "no_requester_id"
         op = self._ops.get(r.operation)
@@ -861,9 +991,57 @@ class ApprovalGate:
             return "params_no_requester"
         return None
 
-    def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
+    async def _queue_release_blocked(
+        self,
+        r: ApprovalRow,
+        params: dict[str, Any] | None,
+        authority: dict[str, Identity | str | None],
+    ) -> ReleaseBlocked | None:
+        """:meth:`_release_blocked`, then the requester's standing by the rule approve() refuses on
+        (BACKLOG #3189), so a held reload or purge whose requester has since been channel-scoped is
+        marked ``requester_not_authorized``. ``authority`` caches each requester's read for one
+        listing, a failed read as ``None``. A read that fails predicts nothing for that requester's
+        requests rather than failing the whole queue, so the operator can still reach Reject on
+        every other row; approve() reads it again."""
+        blocked = self._release_blocked(r, params)
+        # The last two tests only narrow the types: _release_blocked returned None, so both hold.
+        if blocked is not None or not r.requester_user_id or params is None:
+            return blocked
+        op = self._ops[r.operation]
+        requester_user_id = r.requester_user_id
+        if requester_user_id not in authority:
+            try:
+                authority[requester_user_id] = await self._requester_authority(
+                    requester_user_id, outage_is_503=False
+                )
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                log.exception("approval %s: the requester's standing could not be read", r.id)
+                authority[requester_user_id] = None
+        read = authority[requester_user_id]
+        if read is None:
+            return None
+        try:
+            standing = self._standing_of(read, op, params)
+        except Exception:  # noqa: BLE001 - an operation's own scope check; approve() reads it again
+            log.exception("approval %s: the requester's standing could not be read", r.id)
+            return None
+        return None if standing is None else "requester_not_authorized"
+
+    async def _queue_entry(
+        self,
+        r: ApprovalRow,
+        caller_user_id: str | None,
+        authority: dict[str, Identity | str | None],
+    ) -> dict[str, Any]:
         operation = r.operation
-        params = _stored_params(r.id, r.params)
+        params = _stored_params(r.id, r.params, throttle=self._unreadable_params_reported)
+        # Only a pending row can be approved; an interrupted one is resolved instead, so its
+        # requester's standing is not read.
+        blocked = (
+            await self._queue_release_blocked(r, params, authority)
+            if r.status == "pending"
+            else None
+        )
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -883,8 +1061,7 @@ class ApprovalGate:
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
             "gated": self.gates(operation),
-            # Only a pending row can be approved; an interrupted one is resolved instead.
-            "release_blocked": self._release_blocked(r, params) if r.status == "pending" else None,
+            "release_blocked": blocked,
         }
 
     async def approve(
@@ -925,8 +1102,9 @@ class ApprovalGate:
         ``audit_write_failed``, but not all of them. docs/SECURITY.md, in its approvals section,
         names at least the ones that do and at least the ones that do not. That list is not closed,
         and the code is the authority. The store READS here (the request row, the
-        requester's account) are not mapped, so a store that refuses reads can still answer a raw
-        500.
+        requester's account) answer 503 too, through :meth:`_read`, which logs and does not page
+        (BACKLOG #3157 item 1). The requester's identity, read through the injected resolver, is
+        not mapped.
 
         **Who writes the post-execution audit row.** The gate writes ``approval.approved``; an
         executor writes the domain row its inline route writes too (``dead_letter_replay``,
@@ -1066,6 +1244,7 @@ class ApprovalGate:
         # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
+        # The queue reads the same rule, as requester_not_authorized (BACKLOG #3189).
         reason = await self._requester_standing(requester_user_id, op, params)
         if reason is not None:
             await self._refuse_stale_requester(
@@ -1112,7 +1291,7 @@ class ApprovalGate:
                 approver=approver,
                 decided_at=self._clock(),
                 audit=attempted,
-                claim_owner=self.claim_owner,
+                claim_owner=self._owner_for_claim(),
             )
         )
         try:
@@ -1349,7 +1528,7 @@ class ApprovalGate:
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
             if moved is False:
                 # Nothing else should move a row out of 'executing' while this process runs (the
-                # restart reconcile runs once, before its first claim), so the likeliest cause:
+                # restart reconcile moves only claims older than this process), so the likeliest cause:
                 # the combined write COMMITTED and only its reply was lost: its row is then already
                 # in the log, and writing another would duplicate the outcome with a false flag.
                 log.error(
@@ -1520,7 +1699,22 @@ class ApprovalGate:
         Existence and the disabled flag come from the store row, not from the resolved identity. The
         resolver deliberately resolves a disabled user too (it also serves the permission inspector),
         so it cannot say "disabled" on its own."""
-        user = await self._store.get_user(requester_user_id)
+        authority = await self._requester_authority(requester_user_id, outage_is_503=True)
+        return self._standing_of(authority, op, params)
+
+    async def _requester_authority(
+        self, requester_user_id: str, *, outage_is_503: bool
+    ) -> Identity | str:
+        """The requester's live identity, or the reason slug that refuses every operation they
+        requested. The half of :meth:`_requester_standing` that reads the store, so the queue can
+        read it once per requester.
+
+        With ``outage_is_503`` a store fault on the account read is :meth:`_read`'s 503, as approve()
+        answers it (BACKLOG #3157 item 1). Without it the fault is raised as it is: the queue
+        degrades it to no prediction for that requester and logs it itself (BACKLOG #3189), so it
+        must not spend :meth:`_read`'s throttle slot, which would silence approve()'s own ERROR."""
+        read = self._store.get_user(requester_user_id)
+        user = await (self._read(read, what="the requester's account") if outage_is_503 else read)
         if user is None:
             return "requester_missing"
         if user.disabled:
@@ -1530,9 +1724,18 @@ class ApprovalGate:
         identity = await self._resolve_identity(requester_user_id)
         if identity is None:  # deleted between the two reads, or no auth service is bound
             return "requester_unverifiable"
-        if not identity.has(op.permission):
+        return identity
+
+    @staticmethod
+    def _standing_of(
+        authority: Identity | str, op: _Operation, params: Mapping[str, Any]
+    ) -> str | None:
+        """:meth:`_requester_standing` from an already-read :meth:`_requester_authority`."""
+        if isinstance(authority, str):
+            return authority
+        if not authority.has(op.permission):
             return "requester_lacks_permission"
-        if op.in_scope is not None and not op.in_scope(identity, params):
+        if op.in_scope is not None and not op.in_scope(authority, params):
             return "requester_out_of_scope"
         return None
 
@@ -2006,7 +2209,8 @@ class ApprovalGate:
         self, approval_id: str, *, status: str, wrong: Callable[[str], str]
     ) -> ApprovalRow:
         """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
-        :meth:`_verified_rows`, the ONLY reader of the store's request readers in this gate;
+        :meth:`_verified_rows` and :meth:`_read_back_request`, which checks what it reads through
+        :meth:`_verified`, the only readers of the store's request readers in this gate;
         ``tests/test_approval_seal.py`` holds that. Raises 404 for no such request, 409 with
         ``wrong(<its status>)`` for one in another status, and 409 for one that fails its seal,
         which is reported.
@@ -2015,7 +2219,9 @@ class ApprovalGate:
         a stale click on one, or on one written before the seal, answers "already decided" rather
         than raising a tamper alarm. A status changed outside the store can only refuse here: a row
         that reads as wanted is still checked whole."""
-        found = await self._store.get_pending_approval(approval_id)
+        found = await self._read(
+            self._store.get_pending_approval(approval_id), what="this approval request"
+        )
         if found is None:
             raise ApprovalError(404, "no such approval request")
         if str(found["status"]) != status:

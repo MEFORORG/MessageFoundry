@@ -1543,24 +1543,38 @@ try {
         # changes nothing. It is here so that the day somebody moves a break, a bounded pass cannot
         # start rendering as silence, which is the failure this whole block exists to prevent.
         $bounded = ($messageSweepTruncated -or $markerSweepTruncated -or $receiptSweepTruncated)
+        # A DRAIN THAT SHOWS NOTHING SPEAKS AT SessionStart ONLY. Any other event is SILENT -- no
+        # stdout at all -- because output there is not free context, it is a wake. Measured 2026-10-18
+        # in the primary checkout: on Stop, additionalContext re-invoked the model, so a box holding
+        # two messages addressed to OTHER sessions (the primary's box is shared by every session in
+        # it) produced "Nothing is being shown to you" after every reply, and an idle Manager looped
+        # at least 8 times about 13 seconds apart, one model turn each. The counters that drive this
+        # block are mostly STANDING state (foreign-addressed mail, held mail, unowned files), so
+        # nothing about the next Stop is different and the loop does not end on its own.
+        #
+        # THE COST, STATED: a ONE-SHOT disposition observed at a turn boundary -- an expiry and its
+        # named ids (BACKLOG #1228), a stranding, a receipt that could not be written, a sweep or a
+        # bounded sweep -- is NOT narrated to anyone, because the file has already moved and no later
+        # drain counts it again. What survives is on disk: expired/ and stranded/ in the box, and the
+        # 'expired-unshown' receipt for an expiry. A strand with no receipt has nothing but stranded/.
+        # Only STANDING state reappears, at the next SessionStart. So the "never renders as silence"
+        # reasoning above holds at SessionStart only.
+        if ($eventName -ne 'SessionStart') { exit 0 }
         if ($anything -gt 0 -or $bounded) {
             $z = @("[mefor-mail] Drain ran at $asOf over $inboxDir. Nothing is being shown to you.")
             $z += $counterLines
             $z += "If that is surprising, run scripts\coord\mail.ps1 -List."
             Write-Injection -Event $eventName -Text ((($z -join "`n") -replace '[^\x20-\x7E\n]', '?'))
         }
-        elseif ($eventName -eq 'SessionStart') {
+        else {
             # AN EMPTY BOX MUST NOT RENDER AS SILENCE, because silence is also what an unwired hook, a
             # crashed hook, and the retention-sweep abort all produce -- and that indistinguishability
             # is the defect this channel's first observability rule exists to prevent. It is on record
             # in announce-session.ps1: a hook wired, firing, resolving nothing and exiting 0 for weeks,
             # byte-identical to a healthy hook with nothing to do.
             #
-            # ON SessionStart ONLY, and that bound is the whole reason this is affordable. Stop fires
-            # once per turn, so an empty-box line there would be a standing per-turn tax on every
-            # session in every worktree for a channel that is idle almost all of the time. Once per
-            # session is enough to answer "is the drain alive", which is the question. The cost of
-            # getting this wrong in the other direction is a hook people mute.
+            # Once per session is enough to answer "is the drain alive", which is the question; the
+            # guard above is why this is SessionStart only.
             Write-Injection -Event $eventName -Text (
                 "[mefor-mail] Drain ran at $asOf over $inboxDir. The box is EMPTY -- no mail is waiting. " +
                 "This line is the drain reporting that it ran; it appears at session start only, so its " +

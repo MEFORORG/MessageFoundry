@@ -113,6 +113,11 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "Its parameters record no requester, so the operation could not name who ran it and it "
         "cannot be approved. {verb} it; if it is still needed, request it again."
     ),
+    "requester_not_authorized": (
+        "The requester no longer holds the authority this operation requires, so it cannot be "
+        "approved while that lasts. If their authority is restored, it can be approved then. "
+        "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
+    ),
 }
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
@@ -149,11 +154,13 @@ _REFUSALS: dict[int, tuple[str, str]] = {
         "The engine ran the release and the operation itself was refused, so it is recorded as "
         "failed. Request the operation again once the cause is fixed.",
     ),
+    # Every action this table serves, the list included, so it names none of them (BACKLOG #3157).
     503: (
-        "Dual control is not available",
-        "The engine could not do this now. Its message below says why: at least no approval "
-        "workflow bound to this engine, or an audit log that could not record a release. In the "
-        "second case nothing ran and the request is still pending.",
+        "Dual control is not available now",
+        "The engine could not do this now, and nothing ran. Its message below says why: at least no "
+        "approval workflow bound to this engine, a store it could not read, or a store that could "
+        "not record this release or rejection. Reload the page to see the request's state, and try "
+        "again once the cause is fixed.",
     ),
 }
 _UNKNOWN_REFUSAL = ("Not done", "The engine refused this action.")
@@ -175,8 +182,8 @@ _RESOLVE_REFUSALS: dict[int, tuple[str, str]] = {
     ),
     503: (
         "Nothing was recorded",
-        "The engine could not record this now, and its message below says why. The release is "
-        "still interrupted; record it again once the cause is fixed.",
+        "The engine could not read or record this now, and its message below says why. Reload "
+        "the page to see the release's state, and record it again once the cause is fixed.",
     ),
 }
 

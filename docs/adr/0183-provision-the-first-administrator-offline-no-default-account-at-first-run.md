@@ -20,6 +20,9 @@
   sole-administrator recovery stay separate (BACKLOG #2304). Seat decision under owner delegation 2026-10-08, not an owner ruling;
   see the note under *To resolve on acceptance* and vault
   `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.
+- **Amended 2026-10-16:** Amendment E below. `provision-admin` runs whenever no enabled **local**
+  Administrator has a usable password, by owner ruling B258-R4 (vault BACKLOG #2711 step 1). A
+  directory or federated Administrator no longer blocks it.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -72,6 +75,8 @@ Four things this decision fixes in place:
    directory sign-in can: `_upsert_ad_user` calls `create_user` and assigns no role, so one completed
    sign-in leaves a roleless row, a non-empty table and no administrator — reached entirely through
    shipped code. An emptiness guard refuses exactly there, which is the state with no way in.
+   *(Amended 2026-10-16 by Amendment E: the Administrator must also be a local account with a
+   usable password. A directory or federated one no longer blocks the command.)*
 2. **The credential is read from a terminal, and unattended provisioning is refused in terms.** There
    is no `--password` and no `--password-file`; either would put a standing Administrator credential
    in argv, readable by every other process on the host, or on disk. An unattended MSI/Ansible/NSSM
@@ -90,6 +95,9 @@ Four things this decision fixes in place:
    conjunction, chosen because it is the only one true at **both** points — and it is also what makes
    the takeover safe, since such an account holds no permission to inherit and this branch is
    reachable only when no enabled administrator exists at all.
+   *(Amended 2026-10-16 by Amendment E: reachable only when no enabled local Administrator has a
+   usable password. A directory Administrator may exist beside the row and still sign in, so this
+   premise is narrower now; see that amendment's *What it opens*.)*
 
    **A draft of this ADR got that wrong and it is recorded rather than quietly corrected.** It also
    refused a stamped `password_claimed_at`, which the credential write sets — so the *second*
@@ -117,6 +125,8 @@ holds. See Amendment A.*
   that became true without running the command, so it now pins what the command itself leaves.)*
 - **AC-2** — IF an enabled Administrator already exists, THEN THE SYSTEM SHALL refuse to provision.
   → `tests/test_provision_first_administrator.py::test_it_refuses_once_an_enabled_administrator_exists`
+  *(Amended 2026-10-16 by Amendment E: an enabled local Administrator with a usable password. See
+  AC-18.)*
 - **AC-3** — WHILE the user table holds only roleless rows a directory sign-in created, THE SYSTEM
   SHALL still provision.
   → `tests/test_provision_first_administrator.py::test_the_guard_asks_for_an_administrator_not_an_empty_table`
@@ -299,7 +309,8 @@ changes what the ADR 0167 gate says and adds one WARNING.
 > an Administrator. The rest of the row stands: sign-in is simply always required. The table is kept
 > as written because it records what this amendment measured. The same change added a start WARNING
 > for a store whose every enabled Administrator signs in through an outside identity service (vault
-> BACKLOG #2711, step 2), since `provision-admin` refuses while such an account exists.
+> BACKLOG #2711, step 2), since `provision-admin` refused while such an account existed. Amendment
+E (vault BACKLOG #2711 step 1) since lets the command run on such a store.
 
 **Recommendation: add no new refusal. Confidence: medium.** Four reasons, and the second and fourth
 hold only if Wave 0 comes back green:
@@ -558,6 +569,7 @@ and AC-16's message half as tests, each red at its base first.*
   → planned, Wave 0: the hosted check above.
 - **AC-15** — IF `provision-admin` refuses a username or password, OR finds an enabled Administrator,
   THEN THE SYSTEM SHALL refuse before prompting where it can, and SHALL leave no new store file.
+  *(Amended 2026-10-16 by Amendment E: an enabled local Administrator with a usable password.)*
   → `tests/test_provision_first_administrator.py::test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open`,
   `::test_a_password_the_policy_refuses_leaves_no_store` and
   `::test_an_existing_administrator_is_refused_before_the_prompt`, with
@@ -740,3 +752,80 @@ with no address. MessageFoundry has no deployments, so the change costs no migra
   `::test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open`,
   with `::test_the_provisioned_administrator_carries_the_address_it_was_given` as the control. The
   service half: `::test_a_blank_or_malformed_address_is_refused_and_writes_nothing`.
+
+## Amendment E (2026-10-16) -- the refusal asks for a local Administrator that can sign in
+
+Made by vault BACKLOG #2711 step 1, on owner ruling B258-R4 of 2026-10-16, "Widen provision-admin
+(Recommended)". **It changes Decision item 1.** `provision-admin` now refuses only while an enabled
+**local** Administrator holds a usable password: a hash, and not a must-change credential past its
+deadline. A directory account, a federated-bound one, or a local one with no usable password no
+longer blocks it. A disabled Administrator never did.
+
+**Why.** A site whose every Administrator signs in through the directory or an identity provider
+had no host command to get back in while that service was down. `admin-unlock` clears a local
+lockout only. Step 2 of the same item, engine PR 1952, made the engine say so at start with the
+`auth.no_local_administrator` notice. This amendment makes the command the recovery that notice
+names.
+
+**One computation.** `AuthService._administrator_standing` is read by both the refusal
+(`has_self_sufficient_administrator`) and the notice (`administrators_needing_an_outside_service`).
+So the command's Administrator check refuses where the notice is silent, on a store with an
+enabled Administrator, under the same settings and at the same moment. Both skip a row that fails
+its integrity seal, so a store whose only Administrator row fails it gets neither the notice nor a
+refusal. The command reads its own
+`--service-config`, and it can still refuse for reasons the notice never checks, such as the
+password policy. A store with no Administrator at all is the first-run case: the command runs and
+this notice stays silent, as before.
+
+**What it keeps.**
+
+- The repair branch is unchanged, with BACKLOG #2915's order: the notice to the earlier holder
+  before the address write, the role write last, and the second session revoke after it. The
+  takeover notice is unchanged. The `auth.first_administrator_provisioned` audit row gains one
+  field, `administrators_at_check`: every enabled Administrator when the run checked. None of them
+  could sign in with a local password.
+- `_existing_row_refusal` still never promotes a directory account. A local Administrator whose
+  password is unusable holds a role, so that row is refused by name; the operator makes a new
+  account under another name.
+- The refusal text keeps the words "already has an enabled Administrator". At least the VS Code
+  extension, the load rig and `scripts/service/measure-store-access.ps1` key on them.
+- The load rig (`harness/load/rigadmin.py`) keeps the rule from before this amendment. It runs the
+  command with `--no-totp` unless a leg supplies an authenticator key (vault BACKLOG #2796), and
+  with or without one it provisions only into a store with no enabled Administrator of
+  any kind, and refuses a store whose Administrators all need an outside service.
+
+**What it opens, and leaves open.**
+
+- The command can now add an Administrator beside directory Administrators that still sign in.
+  No alert or notice goes to them. The audit row's new field is the only trace.
+- The repair branch's safety argument (Decision item 4) was that it runs only when the store has
+  no Administrator at all. It now runs whenever no local one has a usable password. On a
+  directory-run site it can take over a roleless local account while the directory is up. The
+  earlier holder is still told, and the host gate is unchanged.
+- The IDE's Start probe now reads a directory-only store as "needs an Administrator". Its modal
+  still words that as "no enabled administrator".
+
+**The race of vault BACKLOG #3078 is closed by the guarded grant, which counts what this
+amendment counts.** The store's `grant_first_admin_unless_admin_exists` repeats the check in the
+role write's own transaction, under the last-administrator guard's lock, so of two runs with
+different usernames the one whose grant commits second is refused. The service hands that guard
+the same predicate the refusal reads (`_signs_in_without_an_outside_service`), so it counts only
+an enabled local Administrator with a usable password, and a directory or federated one refuses
+the grant no more than it refused the run. The store can still end with two at least these ways,
+each through a write that takes no lock: a directory Administrator who is signed in creates a
+local one from the web console during the run, or resets the password of a local Administrator
+the check passed over (a hashless or lapsed one). Each was made by someone with authority to make
+one.
+
+**New acceptance criterion.**
+
+- **AC-18** — WHILE no enabled local Administrator has a usable password, THE SYSTEM SHALL
+  provision, and IF one has, THEN it SHALL refuse; the refusal SHALL agree with the start notice on
+  every store that holds an enabled Administrator.
+  → `tests/test_provision_admin_without_a_local_administrator.py::test_provision_admin_runs_exactly_when_no_local_administrator_can_sign_in`
+  and `::test_the_refusal_and_the_start_notice_agree`, parametrized over directory-only,
+  federated-only, a hashless, expired or disabled local Administrator beside a directory one, and
+  two controls that refuse: a local Administrator with a usable password, and a locked-out one.
+  The in-transaction guard's half is
+  `tests/_first_admin_grant_store_contract.py::assert_grant_counts_only_a_local_administrator_that_signs_in`,
+  run on SQLite, Postgres and SQL Server.

@@ -695,9 +695,9 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
 
 
 def test_an_unbind_error_never_replaces_the_refusal() -> None:
-    """Round-one review finding. The decoy bind swallows an ``LDAPException`` and the real bind
-    maps it, so an unbind failing after an undecodable bind would tell an absent account from a
-    present one. After a clean block, the unbind's error still propagates."""
+    """Round-one review finding. Both bind branches answer with the block's own exception, so an
+    unbind failing after an undecodable bind must not replace it on one branch only. After a
+    clean block, the unbind's error still propagates."""
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
     conn = SimpleNamespace(unbind=_raise(unbind_fault))
     refusal = LdapUndecodableError("synthetic refusal")
@@ -706,21 +706,6 @@ def test_an_unbind_error_never_replaces_the_refusal() -> None:
     assert raised.value is refusal
     with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
         pass
-
-
-def test_the_service_connection_release_never_fails_an_answered_lookup() -> None:
-    """D3b review round 1. ``authenticate`` and ``probe_principal`` release the service connection
-    with ``quiet``: the lookup was answered, and ldap3's own ``with``, which the release replaced,
-    swallowed an unbind error too. Without it, a reset after the last search would turn a verified
-    sign-in into a login error and a read answer into an outage."""
-    unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
-    conn = SimpleNamespace(unbind=_raise(unbind_fault))
-    with ldap_module._released(conn, quiet=True):
-        pass
-    refusal = LdapUndecodableError("synthetic refusal")
-    with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn, quiet=True):
-        raise refusal
-    assert raised.value is refusal
 
 
 def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:

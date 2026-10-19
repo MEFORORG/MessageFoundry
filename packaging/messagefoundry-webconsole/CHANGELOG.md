@@ -85,6 +85,9 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the posture reports the deny-by-default refusal count.** `SecurityPosture` gains
+  `undeclared_route_refusals` (vault `BACKLOG #2954`). The console does not show it yet, but the
+  field is on the seam it pins, so the supported digest moved.
 - **Seam only: the seam digest covers each console route's gate.** The engine's seam snapshot now
   records what this console installs: each route's top-level dependencies, gates included, with
   their own source and captured settings, and its mounts, middleware and WebSocket authorizer
@@ -99,6 +102,24 @@ this line.**
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
   group, as the engine route does, so a group ending in a no-break space is refused with the
   route's 400 rather than trimmed. (vault `BACKLOG #3222`)
+- **A directory refusal at the second factor, an enrolment or a step-up names the fix for its
+  cause.** When a directory refuses the account, the MFA gate (`/ui/mfa`), the re-auth page
+  (`/ui/reauth`, its passkey leg included) and the account page's TOTP and passkey enrolment
+  finishes now show one text per fix. A role lost in the directory since sign-in is
+  told to sign out, then sign in again. Every other cause, an outage and a role map that fails its
+  seal included, is told to try again later and, if it is still refused, to ask an administrator.
+  Each names the same fix as the engine's 403 for that cause. Seam change: the console imports
+  `DirectoryRefusal` and reads `Elevation.directory_refusal`, so the supported digest moved.
+  (`BACKLOG #3082`)
+- **The "Flag not changed" page has a hint for a cluster node.** A cluster node refuses the
+  connection flag toggle with a 409. The page now carries a second hint, shown beside the
+  code-first one on every 409: each node loads its own config directory, so set `flagged` on the
+  connection's entry in `connections.toml` on every node, then apply it with a coordinated restart.
+  The code-first hint is reworded, with the same meaning. No seam change. (`BACKLOG #2933`)
+- **A flag toggle the audit log did not record gets its own page.** When the engine refuses the
+  toggle with a 503 because its audit row failed or timed out, the console shows a "Flag not
+  changed" page that says the engine undid the change, unless the message on the page says it
+  could not, and to try again. The 409 page's hints are not shown for it. (`BACKLOG #2945`)
 
 ### Fixed
 
@@ -110,6 +131,9 @@ this line.**
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
   administrator to reset it. No seam change. (vault BACKLOG #2298)
+- **The Approvals page's 503 guidance names no single action.** It said an audit log could not
+  record a release, and it also answered a rejection and, now, a queue the store could not read.
+  It now covers all three and says nothing ran. No seam change. (BACKLOG #3157)
 - **The Approvals page no longer offers Approve on a request the engine always refuses.** It reads
   the engine's new `release_blocked` reason, so a request that predates requester-id attribution,
   or whose operation is no longer registered, or a purge or reload whose parameters name no requester, gets
@@ -119,6 +143,34 @@ this line.**
 
 ### Security
 
+- **The users list shows channel scopes only to an administrator.** The engine now sends each
+  account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
+  and Scope source columns for any other reader rather than showing every account as "(none)".
+  The page reads the engine's `channel_scope_withheld` flag rather than deciding the rule itself,
+  so this console needs an engine that sends it, and refuses an older one at startup.
+  (vault BACKLOG #3189)
+- **The configuration page offers no reload the engine will refuse.** For a channel-scoped
+  deployer, whose reload the engine refuses after the step-up is spent, `/ui/config` shows the
+  engine's reason in place of the Reload form. The engine computes the rule. (vault BACKLOG #3189)
+- **The Approvals page stops offering Approve on a request whose requester lost the authority it
+  needs**, such as a held reload or purge whose requester has since been channel-scoped. Every
+  approver was refused such a release. (vault BACKLOG #3189, #3192)
+- **The status page says when its loosenings list is incomplete.** It now shows the engine's
+  `loosenings_scope` note under the security posture, so a list narrowed to a channel-scoped
+  reader's scope, or read with no connection graph loaded, no longer reads as the whole posture.
+  (vault BACKLOG #3189)
+- **The bulk control and bulk purge pages no longer write a malformed name into the audit log.** A
+  channel-scoped operator's selection that is not a valid connection name is still recorded as an
+  `auth.channel_denied` row naming the operator and host, but the row carries no channel. It used to
+  carry the submitted text whole, bounded only by the request size. The page now answers such a
+  selection "not a valid connection name", as it does for any other operator. (vault BACKLOG #3031)
+- **A `/ui` request whose `Sec-Fetch-Site` lines disagree is refused.** It answers `403` on any
+  method. The fetch-metadata middleware used to keep the last such line while the same-origin
+  check read the first, so the two could judge different values of one request. Both now refuse
+  it with the same reason. A browser sends the header once, and repeated lines that carry one
+  value are judged as that value, so no browser request changes. Seam only: the gate helpers it
+  edits are hashed into the seam since BACKLOG #2709, so the supported digest moved.
+  (vault BACKLOG #3316)
 - **A session revoke that ends nothing is audited, with your address.** The revoke button on
   `/ui/account/sessions` now passes the request's address to the engine, which writes one
   `auth.session_revoke_missed` row when the id names no session or another account's. The notice
@@ -153,14 +205,14 @@ this line.**
   standard defines.
   A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
   there. A browser that sends neither header on its own form POST could not sign in with a
-  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
-  not measured about such a browser. A
-  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
-  accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
-  not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET
-  /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped.
-  The complete rule is the table in the `assert_same_origin` docstring
-  (`messagefoundry_webconsole/_auth.py`). No seam change. (BACKLOG #1116, #1124)
+  password or submit any `/ui` form, sign-out included; `docs/BROWSER-SUPPORT.md` says what is
+  and is not measured about such a browser. A script that drives `/ui` must now send `Origin`.
+  The CSP report sink `/ui/csp-report`, which changes nothing, still accepts a report with
+  neither. A GET is not held to this: the sign-in GETs deliberately not blocked for missing fetch
+  metadata, under owner rulings R4 and R4b of 2026-09-28, are listed in the `Origin` row of
+  `docs/BROWSER-SUPPORT.md`. The rule for one line of each header is the table in the
+  `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which also names what
+  the table does not cover. No seam change. (BACKLOG #1116, #1124)
 - **The user page's self-target refusals are audited, with your address.** Reset-password,
   reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
   engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.
@@ -219,6 +271,9 @@ this line.**
   change: the console imports `alert_directory_administrator_granted` from `api.security`. (vault
   BACKLOG #2610)
 
+- **A domain entry with a leading dot matches nothing.** The interstitial check stripped the
+  dot, so `.hospital.example` from a caller other than settings covered the domain. Settings refuse
+  such an entry at load, so the strip only ever widened a match. No seam change. (BACKLOG #3075)
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
   address.** The interstitial check matched every entry on a label boundary. So a host that merely
   ended in a listed address would have counted as covered. The engine still accepts a canonical

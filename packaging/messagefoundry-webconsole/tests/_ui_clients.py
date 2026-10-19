@@ -17,21 +17,25 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from starlette.datastructures import Headers
+from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
 
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
 PW = "a-strong-test-passphrase"
@@ -46,6 +50,57 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 
 #: The same-origin header the console's CSRF guard requires on a /ui POST.
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+
+def origin_check_request(
+    method: str, headers: Mapping[str, str] | Sequence[tuple[str, str]], **state: Any
+) -> Any:
+    """The fewest request attributes ``_auth.assert_same_origin`` reads, for driving it directly.
+
+    ``headers`` is a mapping, or ``(name, value)`` pairs where one name may repeat, as on the wire.
+    ``state`` overrides the app-state posture, which defaults to the ``Host`` fallback: no public
+    origin and no proxy in front of a loopback bind.
+    """
+    pairs = headers.items() if isinstance(headers, Mapping) else headers
+    raw = [(name.lower().encode("latin-1"), value.encode("latin-1")) for name, value in pairs]
+    posture = {"public_origin": None, "loopback": False, "webauthn_rp_from_request": True}
+    return SimpleNamespace(
+        method=method,
+        headers=Headers(raw=raw),
+        app=SimpleNamespace(state=SimpleNamespace(**{**posture, **state})),
+    )
+
+
+async def fetch_metadata_answer(
+    method: str, headers: Sequence[tuple[str, str]], path: str = "/ui/login"
+) -> tuple[int, bytes]:
+    """Put one request through ``UiFetchMetadataMiddleware`` alone, in front of an app that
+    answers 200 with the body ``inner``, and return the status and body that came back.
+
+    ``headers`` are ``(name, value)`` pairs, so one name may repeat, as on the wire."""
+
+    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"inner"})
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers],
+    }
+    await UiFetchMetadataMiddleware(inner)(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return int(status), body
 
 
 async def auth_service(engine: Engine) -> AuthService:
@@ -68,6 +123,18 @@ def ui_client(engine: Engine, service: AuthService, **app_kwargs: Any) -> httpx.
         app=create_app(engine, auth=service, serve_ui=True, **app_kwargs)
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+class PresentDirectory:
+    """A directory that confirms ``principal`` as present and enabled, whatever name is asked.
+    Since BACKLOG #3061 the two enrolment legs ask the directory about a directory account first,
+    and with none wired they refuse, so a test that enrols one wires this. Synthetic data only."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        self.principal = principal
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
 
 
 async def provision(service: AuthService, username: str, roles: list[str]) -> str:

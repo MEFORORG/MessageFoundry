@@ -199,6 +199,8 @@ from messagefoundry.store.store import (
     AdMap,
     AdMapChange,
     AdMapSql,
+    AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -243,6 +245,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     UserAuthzRecord,
     UserChange,
@@ -270,6 +273,7 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
@@ -317,6 +321,7 @@ from messagefoundry.store.store import (
     totp_disable,
     totp_enable,
     totp_replace,
+    totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
@@ -380,6 +385,13 @@ _LOCK_CLASS_ADMIN_GUARD = 5
 _LOCK_CLASS_UPLOAD_QUOTA = 6
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
+#: The ``$n`` twin of the SQLite store's ``_SQL_ADMIN_GUARD_HOLDERS`` (BACKLOG #2592), read by
+#: ``remove_unless_last_admin`` and the first-administrator grant (BACKLOG #3078).
+_PG_SQL_ADMIN_GUARD_HOLDERS: Final = (
+    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = $2 AND NOT u.disabled"
+)
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -8993,14 +9005,13 @@ class PostgresStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted. Does not enable MFA."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """See :meth:`MessageStore.set_totp_secret`: conditional on TOTP being off (#3025)."""
         now = time.time() if now is None else now
         sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
-        await self._write_user_txn(
-            user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
-        )
+        written = await self._write_user_txn(user_id, totp_stage(sealed, now))
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
@@ -9011,13 +9022,17 @@ class PostgresStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224).
-        return (
-            await self._write_user_txn(user_id, totp_enable(recovery_code_hashes, now)) is not None
-        )
+        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224, #3025).
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def replace_totp_enrolment(
         self,
@@ -9194,20 +9209,22 @@ class PostgresStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
-        (no cross-node double-spend)."""
+        precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
+        read from the ``SELECT ... FOR UPDATE`` that locks the row, in the same transaction as the
+        guarded ``UPDATE`` (no cross-node double-spend), so no delete can land between a miss and
+        the answer (BACKLOG #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"
                 " FOR UPDATE",
                 credential_id_hash,
             )
-            if row is None or row["sign_count"] != expected:
-                return False  # consumed by a concurrent assertion — clone signal
+            if row is None:
+                return "gone"
+            if row["sign_count"] != expected:
+                return "mismatch"  # a concurrent assertion moved the counter, or a cloned key
             await conn.execute(
                 "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
                 " WHERE credential_id_hash=$3",
@@ -9215,7 +9232,7 @@ class PostgresStore:
                 used_at,
                 credential_id_hash,
             )
-            return True
+            return "moved"
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
         """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
@@ -9269,11 +9286,8 @@ class PostgresStore:
             if change.takes_role(admin_role_id, role_ids):
                 # Only a change that can empty the set queues on the lock.
                 await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_HOLDERS (BACKLOG #2592).
                 rows = await conn.fetch(
-                    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
-                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
-                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
                     user_id,
                     admin_role_id,
                 )
@@ -9299,6 +9313,47 @@ class PostgresStore:
             else:
                 assert_never(change)
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. It queues on the last-administrator guard's advisory lock, so two grants, or
+        a grant and a removal, never both read before either writes."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+            rows = await conn.fetch(
+                _PG_SQL_ADMIN_GUARD_HOLDERS,
+                user_id,
+                admin_role_id,
+            )
+            _, others = await admin_guard_counts(
+                [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                self._row_sealer,
+                lambda holder: self._read_user_record(conn, holder, lock=False),
+                counts_as_admin,
+            )
+            if others:
+                return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
+            if await self._write_user(conn, user_id, change) is None:
+                return AdminGrant.ACCOUNT_CHANGED
+        return AdminGrant.GRANTED
 
     @staticmethod
     async def _delete_user_rows(conn: Any, user_id: str) -> None:

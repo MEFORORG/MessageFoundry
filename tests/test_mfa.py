@@ -1321,7 +1321,7 @@ async def test_AC2a_a_code_does_not_pass_the_lock_on_an_account_without_active_t
         assert after is not None and _columns(after) == _columns(before)
 
         # --- passkey-only: a factor is enrolled, but it is not TOTP -------------------------------
-        await store.set_totp_secret(identity.user_id, secret=None)
+        await store.disable_totp(identity.user_id)
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="ac2a-passkey-hash",
@@ -2423,10 +2423,19 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
         real_enable = store.enable_totp
 
         async def revoke_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await store.revoke_user_sessions(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", revoke_then_enable)
         enrolled = await service.confirm_mfa_enrollment(
@@ -2463,12 +2472,21 @@ async def test_a_reset_between_rotation_and_enable_leaves_mfa_off_with_no_null_s
         real_enable = store.enable_totp
 
         async def reset_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             # The factor clear of ``admin_reset_mfa``, and none of its session revocation, so the
             # rotated session is still live when the enable runs and only this fix can end it.
             await store.disable_totp(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         refused = await service.confirm_mfa_enrollment(
@@ -2515,10 +2533,19 @@ async def test_the_real_admin_reset_inside_the_window_leaves_mfa_off(
         real_enable = store.enable_totp
 
         async def admin_reset_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await service.admin_reset_mfa(user_id, actor="other-admin")
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", admin_reset_then_enable)
         refused = await service.confirm_mfa_enrollment(
@@ -2552,10 +2579,24 @@ async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
         real_enable = store.enable_totp
 
         async def other_confirm_first(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
-            assert await real_enable(user_id, recovery_code_hashes=["winner-hash"], now=now)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            assert await real_enable(
+                user_id,
+                recovery_code_hashes=["winner-hash"],
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", other_confirm_first)
         refused = await service.confirm_mfa_enrollment(
@@ -2596,10 +2637,19 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         real_enable = store.enable_totp
 
         async def reset_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await store.disable_totp(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
             raise fault
@@ -2641,10 +2691,19 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
         real_enable = store.enable_totp
 
         async def reset_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await store.disable_totp(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
             raise NotImplementedError("a backend without the revoke")
@@ -2661,6 +2720,242 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
             "reason": "secret_cleared",
             "session_ended": False,
         }
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3025: the enable turns on only the secret the confirm verified -----------------------
+
+
+async def test_a_begin_inside_the_confirm_window_cannot_choose_the_enabled_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a begin landing between the confirm's code check and its enable decides which
+    secret is enabled (BACKLOG #3025, ADR 0207 AC-13).
+
+    The confirm checks the code against the staged secret, stamps and rotates the session, then
+    enables. A begin from another session on the same account stages a fresh secret in that window.
+    Before the fix the enable turned on whatever was staged, so the account ended up holding the
+    second begin's factor while the first session was handed recovery codes and a satisfied session.
+    The confirm must now fail closed: TOTP off, no codes, the rotated session ended, and the audit
+    names the reason. The replacing secret is still only staged, and confirms on its own.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
+        identity, token, password = await login_admin(service)
+        first = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+
+        real_elevated = service._elevated
+        second: list[Any] = []
+
+        async def elevated_then_begin(*args: Any, **kwargs: Any) -> Any:
+            out = await real_elevated(*args, **kwargs)
+            # The other session's begin: the service method is keyed on the account, which is all
+            # the two sessions share.
+            second.append(await service.begin_mfa_enrollment(identity))
+            return out
+
+        monkeypatch.setattr(service, "_elevated", elevated_then_begin)
+        refused = await service.confirm_mfa_enrollment(
+            identity, totp.totp(first.secret, now=t0), token=token
+        )
+        assert len(second) == 1 and second[0].secret != first.secret
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.totp_enabled is False, (
+            "the enable turned on a secret the confirm never verified"
+        )
+        assert await store.get_totp_secret(identity.user_id) == second[0].secret
+        assert await store.get_recovery_code_hashes(identity.user_id) == []
+        assert await store.list_sessions(identity.user_id) == []
+        assert not any(e.event_type == MFA_ENABLED for e in notifier.events)
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1 and '"reason": "secret_replaced"' in str(rows[0]["detail"])
+
+        # The replacing secret confirms through its own ceremony, and that is what is enabled. Its
+        # code comes from a later step: the stage keeps the high-water mark, so the step the refused
+        # confirm spent stays spent.
+        monkeypatch.setattr(service, "_elevated", real_elevated)
+        again = await service.login(ADMIN_USERNAME, password)
+        assert again.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(second[0].secret, now=t1), token=again.token
+        )
+        assert confirmed.ok
+        assert (await service.mfa_status(identity)).enabled is True
+        assert await store.get_totp_secret(identity.user_id) == second[0].secret
+    finally:
+        await store.close()
+
+
+async def test_a_lost_enable_write_ends_the_session_and_confirms_after_a_fresh_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a ``write_lost`` refusal hands the session back, records another reason, or leaves
+    no way to confirm afterwards (BACKLOG #3025).
+
+    The enable is made to match no row while the row still holds the verified secret with TOTP
+    off, which is the ``write_lost`` shape. The refused confirm must end the session. The same
+    step's code is spent, so after a fresh sign-in it is refused as a wrong code, and a code from
+    a later step confirms the same staged secret."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, password = await login_admin(service)
+        staged = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+
+        real_enable = store.enable_totp
+
+        async def enable_loses(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(store, "enable_totp", enable_loses)
+        refused = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t0), token=token
+        )
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        assert await store.list_sessions(identity.user_id) == []
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1 and '"reason": "write_lost"' in str(rows[0]["detail"])
+
+        monkeypatch.setattr(store, "enable_totp", real_enable)
+        again = await service.login(ADMIN_USERNAME, password)
+        assert again.token is not None
+        replay = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t0), token=again.token
+        )
+        assert replay.ok is False and replay.session_lost is False, (
+            "the spent step's code was accepted, or answered as a lost session"
+        )
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t1), token=again.token
+        )
+        assert confirmed.ok
+        assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
+async def test_an_unrelated_write_inside_the_confirm_window_still_confirms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the #3025 compare-and-set refuses a confirm that nothing raced.
+
+    Writes to other columns of the user row re-seal the row but carry the stored secret cell over
+    unchanged, so a notify-address change and a sign-in stamp between the begin and the confirm, and
+    between the code check and the enable, must not make the enable refuse."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        await store.set_user_notify_email(identity.user_id, email="admin@example.test")
+        await store.record_login_success(identity.user_id)
+
+        real_elevated = service._elevated
+
+        async def elevated_then_write(*args: Any, **kwargs: Any) -> Any:
+            out = await real_elevated(*args, **kwargs)
+            await store.record_login_success(identity.user_id)
+            return out
+
+        monkeypatch.setattr(service, "_elevated", elevated_then_write)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert confirmed.ok and len(confirmed.recovery_codes) == 10
+        assert (await service.mfa_status(identity)).enabled is True
+        assert await store.get_totp_secret(identity.user_id) == enroll.secret
+    finally:
+        await store.close()
+
+
+async def test_a_begin_whose_stage_lands_after_an_enable_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a begin that read TOTP off, then lost to a confirm that enabled it, overwrites the
+    enabled secret (BACKLOG #3025). The stage is conditional on TOTP being off, so the begin
+    refuses and the enabled secret stands."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        before_enable = await service._load_user(identity.user_id)
+        assert before_enable is not None and not before_enable.totp_enabled
+        enroll = await service.begin_mfa_enrollment(identity)
+        assert (
+            await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        ).ok
+
+        async def stale_read(_user_id: str) -> Any:
+            return before_enable  # the begin's read, taken before the enable landed
+
+        monkeypatch.setattr(service, "_load_user", stale_read)
+        with pytest.raises(ValueError, match="already enabled"):
+            await service.begin_mfa_enrollment(identity)
+        assert await store.get_totp_secret(identity.user_id) == enroll.secret
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("delay", [0.0, 0.01, 0.05, 0.2])
+async def test_a_live_begin_racing_a_confirm_never_enables_an_unverified_secret(
+    monkeypatch: pytest.MonkeyPatch, delay: float
+) -> None:
+    """BACKLOG #3025, closing step 3: two live requests race, with no hook between them.
+
+    The confirm and a second begin run concurrently; the begin starts after ``delay``. Where the
+    begin lands is up to the scheduler, so each run checks the invariant rather than one outcome:
+    whatever happened, an enabled factor is the secret the confirm verified, and a confirm that
+    handed back codes left that factor enabled."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        first = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+
+        async def late_begin() -> Any:
+            await asyncio.sleep(delay)
+            try:
+                return await service.begin_mfa_enrollment(identity)
+            except ValueError:
+                return None  # the confirm enabled first; the begin refused
+
+        outcome, _second = await asyncio.gather(
+            service.confirm_mfa_enrollment(identity, totp.totp(first.secret, now=t0), token=token),
+            late_begin(),
+        )
+        user = await store.get_user(identity.user_id)
+        assert user is not None
+        if user.totp_enabled:
+            assert await store.get_totp_secret(identity.user_id) == first.secret, (
+                "an enabled factor is not the secret the confirm verified"
+            )
+        if outcome.ok:
+            assert user.totp_enabled and outcome.recovery_codes
+        else:
+            assert outcome.recovery_codes == ()
+            assert not user.totp_enabled
     finally:
         await store.close()
 
@@ -2957,8 +3252,10 @@ async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_
         await create_admin(service)
         await _created_holder(service, username="generated")
         enrolled_id, _ = await _created_holder(service, username="enrolled")
-        await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp(enrolled_id, recovery_code_hashes=[])
+        staged_cell = await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            enrolled_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
+        )
         disabled_id, _ = await _created_holder(service, username="disabled")
         await store.set_password(
             disabled_id, password_hash="h", password_generated=False, must_change_password=False
@@ -3139,8 +3436,10 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
         await store.create_user(
             user_id="dir-totp", username="directory", auth_provider="ad", password_generated=False
         )
-        await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp("dir-totp", recovery_code_hashes=[])
+        staged_cell = await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            "dir-totp", expected_secret_cell=staged_cell, recovery_code_hashes=[]
+        )
         await store.create_user(
             user_id="hashless",
             username="half-built",

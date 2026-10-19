@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -35,7 +36,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
-from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
+from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
     _NEW_IP_PER_SESSION_MAX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -44,6 +45,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -132,10 +134,11 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
         # A different address → flagged, audited, and notified.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         assert any(
-            e.event_type == ADMIN_NEW_IP and e.client_ip == "10.2.2.2" for e in notifier.events
+            e.event_type == NEW_ADDRESS_REVERIFY and e.client_ip == "10.2.2.2"
+            for e in notifier.events
         )
         rows = await store.list_audit(limit=20)
-        [flagged] = [r for r in rows if r["action"] == "auth.admin_action_new_ip"]
+        [flagged] = [r for r in rows if r["action"] == "auth.new_address_reverify_required"]
         # Vault BACKLOG #3197: the address is in the client column, not only in the detail, so a
         # search or export by address finds the row.
         assert flagged["client"] == "10.2.2.2"
@@ -211,21 +214,67 @@ async def test_repeat_from_same_new_ip_is_deduped() -> None:
         # Repeat from the SAME address → still forces step-up, but no new audit row / notice.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         actions = [r["action"] for r in await store.list_audit(limit=50)]
-        assert actions.count("auth.admin_action_new_ip") == 1
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 1
+        assert actions.count("auth.new_address_reverify_required") == 1
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 1
         # A DIFFERENT new address is a distinct event → re-emits.
         assert await service.flag_new_client_ip(token, "10.3.3.3", path="/users") is True
         actions = [r["action"] for r in await store.list_audit(limit=50)]
-        assert actions.count("auth.admin_action_new_ip") == 2
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+        assert actions.count("auth.new_address_reverify_required") == 2
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 2
     finally:
         await store.close()
 
 
 async def _new_ip_rows(store: MessageStore) -> list[str]:
-    """The ``seen_ip`` of every ``auth.admin_action_new_ip`` row, oldest first."""
-    rows = await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+    """The ``seen_ip`` of every ``auth.new_address_reverify_required`` row, oldest first."""
+    rows = await store.list_audit(action="auth.new_address_reverify_required", limit=100)
     return [json.loads(str(r["detail"]))["seen_ip"] for r in reversed(rows)]
+
+
+async def test_each_refused_request_writes_its_own_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: a refused request that is not a first sighting writes no WARNING of its own, as
+    under a per-session throttle. Why that throttle was declined is in docs/SECURITY.md,
+    "Administrative-interface defense-in-depth"."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
+        )
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        reported = [f"10.3.3.{i}" for i in range(_NEW_IP_PER_SESSION_MAX + 1)]
+        for seen in reported:
+            assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        repeats = 7
+        forged = "10.8.8.8\nforged line"
+        past_cap = ["10.5.5.5", "10.5.5.5", "10.6.6.6", "10.5.5.5", "10.7.7.7", forged]
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(repeats):
+                assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
+            for seen in past_cap:
+                assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.getMessage().startswith("a request from a new client address must re-verify")
+        ]
+        assert len(warnings) == repeats + len(past_cap)
+        assert sum("already flagged" in line for line in warnings) == repeats
+        over = [line for line in warnings if "past the per-session" in line]
+        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
+            scrub_log_argument(seen) for seen in past_cap
+        ]
+        assert not any("\n" in line for line in over)
+        assert await _new_ip_rows(store) == reported
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
+            reported
+        )
+    finally:
+        await store.close()
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -242,7 +291,7 @@ async def test_alternating_new_addresses_audit_once_each() -> None:
         for seen in ("10.2.2.2", "10.3.3.3", "10.2.2.2", "10.3.3.3", "10.2.2.2"):
             assert await service.flag_new_client_ip(token, seen, path="/users") is True
         assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3"]
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 2
     finally:
         await store.close()
 
@@ -332,16 +381,18 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
                 assert await service.flag_new_client_ip(token, seen, path="/users") is True
         reported = addresses[: _NEW_IP_PER_SESSION_MAX + 1]
         assert await _new_ip_rows(store) == reported
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == len(reported)
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
+            reported
+        )
         details = [
             json.loads(str(r["detail"]))
-            for r in await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+            for r in await store.list_audit(action="auth.new_address_reverify_required", limit=100)
         ]
         capped = [d for d in details if "cap_reached" in d]
         assert [d["seen_ip"] for d in capped] == [addresses[_NEW_IP_PER_SESSION_MAX]]
         assert capped[0]["cap_reached"] == _NEW_IP_PER_SESSION_MAX
         # The holder's notice for that address says so too; the eight before it do not.
-        sent = [e for e in notifier.events if e.event_type == ADMIN_NEW_IP]
+        sent = [e for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY]
         assert [e.client_ip for e in sent if e.detail.get("cap_reached")] == [
             addresses[_NEW_IP_PER_SESSION_MAX]
         ]
@@ -762,6 +813,85 @@ async def test_a_token_replayed_from_a_second_address_is_refused_on_phi_and_pace
         assert (await b.get("/messages", headers=_auth(token))).status_code == 200
         raw = await b.get(f"/messages/{mid}/raw", headers=_auth(token))
         assert raw.status_code == 200 and raw.json()["raw"]
+
+
+async def test_filling_the_notification_address_from_a_second_address_is_refused(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /me/notify-email`` from a host the session has not verified from fills the
+    address with no step-up, while its console twin ``POST /ui/account/notify-address`` is refused
+    (vault BACKLOG #3052 item 6). A replayed token would otherwise choose where the holder's
+    security notices go. The re-verification from the new address is the control: the same body
+    then sets the address, so the refusal is the gate's and not the handler's."""
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    user = await service.store.get_user_by_username("boss")
+    assert user is not None and not user.notify_email
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+        user = await service.store.get_user_by_username("boss")
+        assert user is not None and not user.notify_email
+        ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        assert ok.status_code == 200
+        token = str(ok.json()["token"])
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert r.status_code == 200, r.text
+    user = await service.store.get_user_by_username("boss")
+    assert user is not None and user.notify_email == "boss@example.test"
+
+
+async def test_filling_the_notification_address_is_paced(engine: Engine) -> None:
+    """RED when: ``POST /me/notify-email`` is not paced (vault BACKLOG #3052 review finding 6).
+    Under the base gate a second fill at once answers 409, because the first set the address; under
+    ``require_paced`` it answers 429 with a ``Retry-After`` before the handler runs."""
+    service = _new_ip_service(engine, admin_write_min_interval_seconds=10.0)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+        first = await a.post("/me/notify-email", headers=_auth(token), json=body)
+        assert first.status_code == 200, first.text
+        again = await a.post("/me/notify-email", headers=_auth(token), json=body)
+        assert again.status_code == 429, again.text
+        assert again.headers.get("Retry-After")
+
+
+async def test_a_confined_session_from_a_second_address_still_has_a_way_out(
+    engine: Engine,
+) -> None:
+    """RED when: a session confined to setting its notification address, calling from a host it
+    has not verified from, is left with no way out (vault BACKLOG #3052 item 6, review round 1).
+    With a notice channel wired the account is confined; ``POST /me/notify-email`` is refused with the
+    step-up answer, ``POST /me/reauth`` must stay reachable and re-anchor, and the fill then
+    lands. Any other route stays confined, which is the control that the confinement is live."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, admin_new_ip_step_up=True, require_mfa=False
+        ),
+        security_notifier=_FakeNotifier(),
+    )
+    await service.initialize()
+    await _add_admin(service, "boss")
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        confined = await b.get("/users", headers=_auth(token))
+        assert (confined.status_code, confined.headers.get("X-Notify-Email-Required")) == (403, "1")
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+        ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        assert ok.status_code == 200, ok.text
+        token = str(ok.json()["token"])
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert r.status_code == 200, r.text
 
 
 async def test_a_refusal_for_a_new_address_charges_no_budget(engine: Engine) -> None:

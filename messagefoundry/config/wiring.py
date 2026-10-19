@@ -42,6 +42,8 @@ import os
 import re
 import sys
 import threading
+import tokenize
+import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -6059,7 +6061,8 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused.
 
     It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING in ``pipeline.wiring_runner`` reads the resolved one. Pure."""
+    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
+    Pure."""
     out: list[tuple[str, str]] = []
     for name, settings in (
         *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
@@ -7626,8 +7629,10 @@ def _config_module_name(path: Path) -> str:
     # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
     # __module__, get_type_hints). Helpers are named the same way, so a helper is never registered
     # under the plain name a stdlib or installed module would use (vault BACKLOG #2780).
-    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
-    return f"mefor_config_{path.stem}_{digest}"
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[
+        : _CONFIG_MODULE_SUFFIX_LEN - 1
+    ]
+    return f"{_CONFIG_MODULE_PREFIX}{path.stem}_{digest}"
 
 
 def _is_helper_name(name: str) -> bool:
@@ -7793,8 +7798,10 @@ class _HelperImporter:
         self._pending: list[Path] = []
         # What this load put in sys.modules, with what each name held before, for discard().
         self._registered: list[tuple[str, ModuleType, ModuleType | None]] = []
-        # Optional helpers whose ImportError a guard is left to decide, by name.
-        self._failed: dict[str, ImportError] = {}
+        # Optional helpers whose ImportError a guard is left to decide, by name: a textless stand-in
+        # of the failure (only its type is read) and its withheld diagnostic, taken from its
+        # traceback when it was recorded (vault BACKLOG #3249).
+        self._failed: dict[str, tuple[ImportError, str]] = {}
         # The helper stems present when the load starts: the only names this importer serves, so an
         # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
         self._stems = frozenset(
@@ -7868,9 +7875,10 @@ class _HelperImporter:
             if not self._open:
                 # Never fall through to the normal import: with the config dir on sys.path it would run
                 # the file at run time and register it under its plain name.
-                failed = self._failed.get(name)
-                if failed is None:
+                recorded = self._failed.get(name)
+                if recorded is None:
                     raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                failed, _detail = recorded
                 raise ModuleNotFoundError(
                     f"No module named {name!r} (config helper failed at load: "
                     f"{type(failed).__name__})",
@@ -7924,12 +7932,20 @@ class _HelperImporter:
         for name, caught in _body_helper_imports(source, self._stems):
             if name in self._modules:
                 continue
-            failed = self._failed.get(name)
-            if failed is not None:
+            recorded = self._failed.get(name)
+            if recorded is not None:
+                failed, detail = recorded
                 # Already failed under a guard elsewhere; this import site must be guarded too, or
                 # every message through it would fail.
                 if not _guard_covers(caught, failed):
-                    raise failed
+                    # Engine wording, so it passes _exec_module unchanged: the helper and the
+                    # importer are files the loader chose, and the detail was taken from the
+                    # failure's own traceback when it was recorded, under the same withholding.
+                    raise WiringError(
+                        f"config helper {name}.py failed to load "
+                        f"({detail}; {_WITHHELD}), and "
+                        f"{current.name} imports it outside an ImportError guard"
+                    ) from failed
                 continue
             try:
                 self._load(name)
@@ -7939,9 +7955,12 @@ class _HelperImporter:
                 # An optional helper whose own import failed, under a guard that catches it: left
                 # unloaded, so the run-time import raises ModuleNotFoundError (chained to this) and the
                 # guard decides, as it would have. Any other failure is not optional and fails the
-                # load. Kept without its traceback, whose frames would hold the load alive. Names
-                # only, never the exception text (CLAUDE.md section 9).
-                self._failed[name] = exc.with_traceback(None)
+                # load. Kept as a textless stand-in, so neither its text nor its frames outlive the
+                # load. Names only, never the exception text (CLAUDE.md section 9).
+                self._failed[name] = (
+                    _textless_import_error(exc),
+                    _failure_detail(self._dir.resolve(), f"{name}.py", exc),
+                )
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
                     safe_name(f"{name}.py"),
@@ -7997,7 +8016,11 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
     if not directory.is_dir():
-        raise FileNotFoundError(f"config directory not found: {directory}")
+        # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
+        # moved away after the reload's own check still answers as missing (BACKLOG #3157).
+        from messagefoundry.config.fingerprint import ConfigDirMissing
+
+        raise ConfigDirMissing(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
     # The digest is read just before the modules run (vault BACKLOG #2724).
@@ -8948,6 +8971,163 @@ def untrusted_install_paths() -> list[str]:
     return reasons
 
 
+def _raised_by_the_engine(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback is this package's own code, judged by the
+    frame's module name, as ``__main__._is_engine_refusal`` judges it. A config module and its
+    helpers run as ``mefor_config_*``, never under ``messagefoundry``."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    name = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(name, str) and name.split(".")[0] == "messagefoundry"
+
+
+#: Exceptions whose ``name`` attribute is usually an identifier from the SOURCE -- a module, a
+#: variable, an attribute. It is kept only where it also appears in the source line it was raised
+#: from: ``getattr(obj, value)`` or ``import_module(value)`` put a RUNTIME value in ``name``, which
+#: the line does not spell, so such a name is withheld with the rest.
+_NAMED_EXCEPTIONS: Final = (ImportError, NameError, AttributeError)
+
+#: How the loader names a config file's module (:func:`_config_module_name`): the prefix, then the
+#: stem, then ``_`` and 12 hex digits. An ImportError naming a helper carries this mangled name.
+_CONFIG_MODULE_PREFIX: Final = "mefor_config_"
+_CONFIG_MODULE_SUFFIX_LEN: Final = 13
+
+
+#: Why the loader's diagnostic for author code carries no exception text.
+_WITHHELD: Final = "its message is withheld: it can carry a value the module held"
+
+
+def _module_failure(path: Path, exc: BaseException) -> str:
+    """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
+    file and line it was raised from, and for an import or name error the identifier, but never the
+    exception's text (vault BACKLOG #3249).
+
+    The text is author code's, or a library's quoting author data, and can carry any value the module
+    held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
+    output (so CI logs), the reload WARNING and the ``POST /connections/{name}/flag`` 409, and a
+    credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary."""
+    return (
+        f"error loading config module {path.name}: "
+        f"{_failure_detail(path.parent.resolve(), path.name, exc)} ({_WITHHELD})"
+    )
+
+
+def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
+    """``exc``'s TYPE, the config-directory file and line it was raised from (the file only when it
+    is not ``own_file``), and for an import or name error each identifier the source line spells.
+
+    The file is the deepest frame in the config directory, so a failing helper is named rather than
+    the config module's import of it. A file name and a line number are layout, not data."""
+    located: tuple[str, int] | None = None
+    filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
+    lineno = getattr(exc, "lineno", None)
+    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
+        located = (filename, lineno)
+    else:
+        # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
+        seen: dict[str, bool] = {}
+        for frame, frame_line in traceback.walk_tb(exc.__traceback__):
+            name = frame.f_code.co_filename
+            if name not in seen:
+                seen[name] = _in_dir(name, config_dir)
+            if seen[name]:
+                located = (name, frame_line)
+    detail = type(exc).__name__
+    # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
+    if located is None or not isinstance(located[1], int):
+        return detail
+    source_file, line = located
+    if Path(source_file).name != own_file:
+        detail += f" in {Path(source_file).name}"
+    detail += f" at line {line}"
+    if isinstance(exc, _NAMED_EXCEPTIONS):
+        # `from x import y` puts the module in `name` and the symbol in `name_from`.
+        names_on_line = _dotted_names_on_line(source_file, line)
+        idents = [
+            ident
+            for ident in map(_source_name, (exc.name, getattr(exc, "name_from", None)))
+            if ident is not None and _spelled(ident, names_on_line)
+        ]
+        if idents:
+            detail += " naming " + ", ".join(repr(ident) for ident in idents)
+    return detail
+
+
+def _dotted_names_on_line(source_file: str, line: int) -> list[str]:
+    """Every dotted name (``a``, ``a.b.c``) written in code in the statement that starts on, or spans,
+    ``line`` of ``source_file`` -- a parenthesized import over several lines is one statement --
+    never a string literal's or a comment's content.
+
+    The file is read afresh, never through :mod:`linecache`: that cache holds whatever version of the
+    file was read first, so after an edit and a reload a stale line could vouch for a run-time value.
+    It is tokenized from the top, so a line inside a multi-line string is read as the string it is.
+    ``[]`` -- nothing vouched for -- when the file cannot be read or tokenized."""
+    runs: list[list[str]] = [[]]
+    try:
+        with tokenize.open(source_file) as f:
+            for tok in tokenize.generate_tokens(f.readline):
+                if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                    # A logical line ended: keep it only if it spans `line`, else start afresh.
+                    if tok.start[0] >= line:
+                        break
+                    runs = [[]]
+                elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
+                    runs[-1].append(tok.string)
+                elif runs[-1]:
+                    runs.append([])
+    except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError):
+        return []
+    # "a b" is two runs of names, never one name, so a run is split where two names abut.
+    return [name for run in runs for name in " ".join(run).replace(" . ", ".").split()]
+
+
+def _spelled(ident: str, names: list[str]) -> bool:
+    """Whether dotted ``ident`` is a whole run of parts in one of ``names``: ``b`` and ``a.b`` are
+    spelled by ``a.b.c``, but ``ab`` is not spelled by ``abc`` nor by ``"ab"``."""
+    return any(f".{ident}." in f".{name}." for name in names)
+
+
+def _source_name(name: object) -> str | None:
+    """``name`` as an author would have written it, or ``None`` when it is not a dotted identifier:
+    a helper's mangled module name is given back as its stem."""
+    if not isinstance(name, str) or not all(part.isidentifier() for part in name.split(".")):
+        return None
+    if name.startswith(_CONFIG_MODULE_PREFIX) and len(name) > (
+        len(_CONFIG_MODULE_PREFIX) + _CONFIG_MODULE_SUFFIX_LEN
+    ):
+        return name[len(_CONFIG_MODULE_PREFIX) : -_CONFIG_MODULE_SUFFIX_LEN]
+    return name
+
+
+def _in_dir(filename: str, directory: Path) -> bool:
+    """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
+    siblings -- compared resolved.
+
+    Only an absolute filename counts. The loader's modules record one (the import machinery makes the
+    spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
+    ``<frozen ...>`` and any other relative name would resolve against the working directory, and so
+    match whenever the engine runs from the config directory."""
+    candidate = Path(filename)
+    if not candidate.is_absolute():
+        return False
+    try:
+        # The folder, not the file, is resolved: a config file may be a symlink into another folder
+        # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
+        return candidate.parent.resolve() == directory
+    except (OSError, ValueError):
+        return False
+
+
+def _textless_import_error(exc: ImportError) -> ImportError:
+    """A stand-in for ``exc`` that keeps only its type: no text, and no ``name``, which can hold a
+    run-time value (``import_module(value)``) the diagnostic withholds. The engine-shard preflight
+    (:mod:`messagefoundry.pipeline._config_preflight`) reads only the cause's type."""
+    return ModuleNotFoundError() if isinstance(exc, ModuleNotFoundError) else ImportError()
+
+
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     # Register the module in sys.modules under its path-derived name so intra-config imports and
     # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
@@ -8957,20 +9137,44 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         raise WiringError(f"cannot load config module: {path}")
     module = helpers.new_module(spec)
     helpers.register(mod_name, module)
+    withheld: WiringError | None = None
+    cause: ImportError | None = None
     try:
         spec.loader.exec_module(module)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
         helpers.preload(path)
-    except WiringError:
-        helpers.unregister(mod_name, module)
-        raise
     except Exception as exc:
         helpers.unregister(mod_name, module)
-        raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+        # An import or name error is judged by its identifier, not its frame: a failed import ends
+        # in this package's own helper finder whoever wrote the import.
+        if _raised_by_the_engine(exc) and not isinstance(exc, _NAMED_EXCEPTIONS):
+            # The engine's own wording -- a factory or registry refusal naming a connection or a
+            # setting -- which is the diagnostic an author needs, so it keeps its text, as before.
+            # That relies on engine raise sites not quoting a value. At least a few wrap another
+            # exception's text (`f"{where}: {exc}"`), and an engine call such as int() on an
+            # author value can quote it; nothing scrubs those here.
+            if isinstance(exc, WiringError):
+                raise
+            raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+        try:
+            withheld = WiringError(_module_failure(path, exc))
+        except Exception:  # noqa: BLE001 - a fault building the detail must not escape with `exc`
+            # chained as its context; the type alone is still a withheld diagnostic.
+            withheld = WiringError(
+                f"error loading config module {path.name}: {type(exc).__name__} ({_WITHHELD})"
+            )
+        # An import failure keeps a textless stand-in of its type as the cause, because the
+        # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
+        if isinstance(exc, ImportError):
+            cause = _textless_import_error(exc)
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.
         helpers.drop_pending()
+    if withheld is not None:
+        # Raised AFTER the handler, so the original is neither __cause__ nor __context__: a rendered
+        # traceback, a structured log or a crash reporter would print it again from either.
+        raise withheld from cause
 
 
 def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
@@ -9012,6 +9216,11 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
             try:
                 _exec_module(path, helpers)
             except WiringError as exc:
+                # Not scrubbed, because the scrub would mangle the engine's own fix advice, which
+                # spells `credential_password=env(...)`. `_module_failure` withholds a module's own
+                # text (vault BACKLOG #3249), but an engine-raised WiringError passes through as
+                # worded, and at least a few engine raise sites wrap another exception's text, so
+                # this arm can still print an author value (vault BACKLOG #3765 item 1).
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the

@@ -145,7 +145,7 @@ looked at.
 | `tomlkit` | parses operator-authored TOML from the config directory, which is inside the trust boundary |
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
-| `opentelemetry-api` | the OpenTelemetry API that `fastapi` requires. With no SDK provider configured, every call into it is a no-op. It also holds the propagators that parse trace headers from a request. `fastapi` 0.142 calls them from its built-in request telemetry, which is on by default and can configure its own provider from an `OTEL_EXPORTER_OTLP_*` endpoint in the environment. The engine turns that telemetry off: `create_app` passes a config with every switch off, and `tests/test_api_fastapi_telemetry_off.py` pins it. So no install or environment variable reaches the propagators. The engine's own OTLP metrics export, in the `otel` extra, builds a private meter provider and parses no headers. A change that turns `fastapi` telemetry back on, or that calls the propagators itself, needs this row read again |
+| `opentelemetry-api` | the OpenTelemetry API that `fastapi` requires. With no SDK provider configured, every call into it is a no-op. It also holds the propagators that parse trace headers from a request. `fastapi` 0.142 and later call them from its built-in request telemetry, which is on by default. It can also configure its own provider from an `OTEL_EXPORTER_OTLP_*` endpoint in the environment: by default on 0.142, and on 0.143 when `FASTAPI_OTEL_AUTO_CONFIGURE=true` is set. The engine turns that telemetry off: `create_app` passes a config with every switch off, and `tests/test_api_fastapi_telemetry_off.py` pins it. So no install or environment variable reaches the propagators. The engine's own OTLP metrics export, in the `otel` extra, builds a private meter provider and parses no headers. A change that turns `fastapi` telemetry back on, or that calls the propagators itself, needs this row read again |
 
 That is 12, and 23 plus 12 is 35. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
@@ -495,7 +495,8 @@ project in them, in any form.
 The word search ran over the 39 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
 a single module adapted from another project, 24 hold lines copied into a wheel's own module, and 59
 hold prose that marks no copy, such as a project's own licence header. The record lists each hit
-under its wheel.
+under its wheel. Each hit was sorted into its kind by hand. No test runs the search again: the
+wheels are not kept in this repository, so the counts of files hit are not checked against them.
 
 **Single modules adapted from another project, as found:**
 

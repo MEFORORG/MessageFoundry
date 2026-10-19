@@ -605,7 +605,7 @@ def _publishing_jobs() -> dict[str, JobDict]:
 
     A PUBLISH-ONLY job (vault BACKLOG #2631, limb 1) builds nothing and so gates nothing itself: it
     publishes files another job gated, after checking them against that job's digests. Such a job
-    is replaced here by the job that gated its files, which `_gating_job` finds and checks, so every
+    is replaced here by the jobs that gated its files, which `_gating_jobs` finds and checks, so every
     test below grades the job where the gate has to be.
     """
     jobs = _jobs()
@@ -619,8 +619,8 @@ def _publishing_jobs() -> dict[str, JobDict]:
                 or "gh release upload" in run
                 or "gh release create" in run
             ):
-                gid = _gating_job(jid, job)
-                out[gid] = jobs[gid]
+                for gid in _gating_jobs(jid, job):
+                    out[gid] = jobs[gid]
                 break
     return out
 
@@ -629,29 +629,32 @@ def _publishing_jobs() -> dict[str, JobDict]:
 _DIGEST_SOURCE = re.compile(r"needs\.([\w-]+)\.outputs\.pypi-digests")
 
 
-def _gating_job(jid: str, job: JobDict) -> str:
-    """``jid`` when the job runs the gate itself; else the job whose gated files it publishes.
+def _gating_jobs(jid: str, job: JobDict) -> list[str]:
+    """``[jid]`` when the job runs the gate itself; else every job whose gated files it publishes.
 
-    For a publish-only job this ASSERTS the chain that makes the substitution honest: a step
-    checks the download against `needs.<producer>.outputs.pypi-digests` before any publish step,
-    and `<producer>` is in the job's `needs:`.
+    For a publish-only job this ASSERTS the chain that makes the substitution honest: one step
+    checks the download against each `needs.<producer>.outputs.pypi-digests` before any publish
+    step, and each `<producer>` is in the job's `needs:`. Every producer is returned, not the
+    first: `publish-pypi` publishes files from `release` and `release-harness` (vault BACKLOG
+    #2975), and keeping only one would drop the other from every test below.
     """
     steps = _steps(job)
     if any(_GATE_INVOCATION in str(s.get("run") or "") for s in steps):
-        return jid
+        return [jid]
     checks = [
-        (i, m.group(1))
+        (i, producers)
         for i, s in enumerate(steps)
-        if (m := _DIGEST_SOURCE.search(str((s.get("env") or {}).get("EXPECTED") or "")))
+        if (producers := _DIGEST_SOURCE.findall(str((s.get("env") or {}).get("EXPECTED") or "")))
     ]
     assert len(checks) == 1, f"{jid} publishes with no gate and no single digest check: {checks}"
-    at, producer = checks[0]
+    at, producers = checks[0]
     publish_at = [i for i, s in enumerate(steps) if "gh-action-pypi-publish" in str(s.get("uses"))]
     assert publish_at and at < min(publish_at), f"{jid} checks digests after it publishes"
-    assert producer in needs_of(job), (
-        f"{jid} checks {producer}'s digests without needing {producer}"
-    )
-    return producer
+    for producer in producers:
+        assert producer in needs_of(job), (
+            f"{jid} checks {producer}'s digests without needing {producer}"
+        )
+    return producers
 
 
 def test_the_publishing_job_set_is_the_one_we_think_it_is() -> None:

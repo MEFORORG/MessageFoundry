@@ -101,7 +101,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
-from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
+from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
@@ -443,7 +443,8 @@ class _Section(_InputHidingModel):
         return data
 
 
-#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind.
+#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
+#: honoured only on an instance at ``[security].enforcement = warn``.
 INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
@@ -485,7 +486,8 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
 
 def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
-    CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
+    CLAMPED so an enforcing hop is NEVER relaxed (#200, ADR 0092 decision 2): only when ``posture``
+    is known and the instance is at ``[security].enforcement = warn``.
 
     The **weakened-TLS / cleartext-escape** cells route their global-escape check through
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
@@ -499,7 +501,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
-    be set, AND a posture must be known, AND it must not be enforcing.
+    be set, AND a posture must be known, AND it must not be enforcing. For a known posture this is
+    :func:`hop_insecure_escape_downgrades`, which it calls rather than repeats (vault BACKLOG #3753).
 
     **``None`` FAILS CLOSED (vault BACKLOG #2354).** No posture means the escape is NOT permitted.
     CORRECTED: this read *"``None`` (a backup utility / embedding / test outside the construction gate)
@@ -512,7 +515,7 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    return insecure_tls_allowed() and posture is not None and not posture.enforcing
+    return posture is not None and hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -563,11 +566,12 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     so it never does under ``[security].enforcement = enforce`` (vault BACKLOG #2599).
 
     The escape is honoured only when the SAME environment also carries
-    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert, as ``MEFOR_ALLOW_INSECURE_TLS``
-    is (:func:`weakened_tls_escape_permitted`): a safe source loads, an unsafe one is refused, and the
-    refusal names the variable. It used to be honoured at any dial, so one variable in the service
-    environment would have turned off the check that keeps writable Python from running as the service
-    account, and nothing would have reported it.
+    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert: a safe source loads, an unsafe
+    one is refused, and the refusal names the variable. It used to be honoured at any dial, so one
+    variable in the service environment would have turned off the check that keeps writable Python
+    from running as the service account, and nothing would have reported it. The insecure-TLS escape
+    ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
+    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
     ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
@@ -3079,7 +3083,8 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
 #: and ``tests/test_site_context_words.py`` holds the two equal.
 EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 
-#: Upper bound for ``[auth].ad_connect_timeout`` and ``ad_receive_timeout``. An hour is far past any
+#: Upper bound for ``[auth].ad_connect_timeout``, ``ad_receive_timeout`` and
+#: ``ad_group_search_deadline``. An hour is far past any
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
@@ -3338,6 +3343,16 @@ class AuthSettings(_Section):
     # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
     ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
+    # seconds — the one deadline all the pages of the nested group search share (auth/ldap.py
+    # _search_paged, vault BACKLOG #3696). Each page's reads are still bounded by
+    # ad_receive_timeout, so a directory that stops answering fails at that, unless less than
+    # that is left of this, when it is refused as past this. The first page is never capped. Well
+    # above it on purpose: a search past it refuses the account, whose roles and scope the
+    # reconciler then cannot re-read. 120 s is twelve per-read stalls. NOT a hard wall-clock bound:
+    # it caps each read of a page at what is left, so a page that arrives over several reads can
+    # run past it (docs/CONNECTIONS.md, the Active Directory row). Validated and named as a
+    # loosening with the two timeouts above.
+    ad_group_search_deadline: float = 120.0
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) -------------------------------
     # Disabling an account in AD does NOT terminate its live engine session: once an opaque token is
@@ -3850,16 +3865,16 @@ class AuthSettings(_Section):
             )
         return value
 
-    @field_validator("ad_connect_timeout", "ad_receive_timeout")
+    @field_validator("ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline")
     @classmethod
-    def _check_ad_timeout(cls, value: float) -> float:
+    def _check_ad_timeout(cls, value: float, info: ValidationInfo) -> float:
         # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats a None, or a 0 connect_timeout, as
         # "wait forever", which is exactly the unbounded wait these settings exist to remove, and
         # inf/NaN are the same hole by another spelling. (A 0 receive_timeout instead makes the socket
         # non-blocking, so every read fails at once.) Rejected at config load, not at bind time.
         if not value > 0 or value == float("inf"):
             raise ValueError(
-                "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "
+                f"{info.field_name} must be a finite number of seconds > 0 "
                 "(inf, NaN or a None connect timeout would mean an unbounded LDAP wait; 0 or a "
                 "negative value would fail every LDAP read or connect)"
             )
@@ -3869,7 +3884,7 @@ class AuthSettings(_Section):
         # every time. The cap refuses the value at load instead, far below that point.
         if value > _AD_TIMEOUT_MAX_SECONDS:
             raise ValueError(
-                f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
+                f"{info.field_name} must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
                 f"seconds (got {value:g}); the cap keeps the value far below where a socket "
                 "timeout overflows"
             )
@@ -4316,6 +4331,10 @@ class AuthSettings(_Section):
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
         suffix source is configured at all, which the validator above refuses when stripping is on.
         """
+        # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
+        # compared with the raw suffix an identity provider writes into a claim, not with a DNS
+        # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
+        # both of which the shared rule refuses.
         if self.oidc_allowed_username_domains:
             return tuple(d.strip().lower() for d in self.oidc_allowed_username_domains if d.strip())
         return (self.ad_domain.strip().lower(),) if self.ad_domain else ()
@@ -4801,23 +4820,51 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
-def _bare_domain_entries(value: list[str], *, allow_ipv4: bool, refusal: str) -> list[str]:
+def _not_a_host_address(text: str) -> bool:
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the unspecified
+    ``0.0.0.0``, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075). No identity provider or link is served from one,
+    and some browsers route ``0.0.0.0`` to the local machine. This does not refuse loopback: a
+    ``127.0.0.1`` entry still loads, as ``localhost`` does."""
+    address = ipaddress.IPv4Address(text)
+    return address.is_unspecified or address.is_multicast or address.is_reserved
+
+
+def _bare_domain_entries(
+    value: list[str], *, allow_ipv4: bool, refusal: str, max_length: int | None = None
+) -> list[str]:
     """One domain list's entries, normalised, or a ``ValueError`` for the first that can never match.
 
     Shared by ``[egress].allowed_recipient_domains`` and the two ``[security]`` navigation lists
     (vault BACKLOG #2843). Surrounding whitespace is stripped and a blank entry is skipped. Each
     entry must pass :func:`~messagefoundry.domainshape.domain_shape_problem`, or with
-    ``allow_ipv4`` be a canonical IPv4 address. No dot is stripped, so a leading or trailing dot is
-    refused rather than silently dropped. An entry is lowercased only after the check, because
-    ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones, which
-    would accept a value that differs from the one written. ``refusal`` ends the error message."""
+    ``allow_ipv4`` be a canonical IPv4 address :func:`_not_a_host_address` does not refuse
+    (BACKLOG #3075). ``max_length``, when set, is a
+    tighter cap than the shape rule's 253 characters. No dot is stripped, so a leading or trailing
+    dot is refused rather than silently dropped. An entry is lowercased only after the check,
+    because ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones,
+    which would accept a value that differs from the one written. ``refusal`` ends the error
+    message.
+
+    A single label is accepted, a bare public suffix such as ``com`` included (BACKLOG #3075 item
+    4, declined): an intranet name is often one label, and telling a public suffix from a private
+    name needs the Public Suffix List, which this stdlib-only rule does not carry."""
     cleaned: list[str] = []
     for raw in value:
         item = raw.strip()
         if not item:
             continue
-        problem = domain_shape_problem(item)
-        if problem is not None and not (allow_ipv4 and is_canonical_ipv4(item)):
+        if allow_ipv4 and is_canonical_ipv4(item):
+            problem = (
+                "an IPv4 address that is not one host's; list a single host's address"
+                if _not_a_host_address(item)
+                else None
+            )
+        elif max_length is not None and len(item) > max_length:
+            problem = f"a domain longer than {max_length} characters"
+        else:
+            problem = domain_shape_problem(item)
+        if problem is not None:
             raise ValueError(f"{item!r} is {problem}. {refusal}")
         cleaned.append(item.lower())
     return cleaned
@@ -4882,7 +4929,11 @@ class EgressSettings(_Section):
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
-    # MEFOR_EGRESS_PROXY_NO_PROXY.
+    # MEFOR_EGRESS_PROXY_NO_PROXY. It keeps its own rule, transports/rest.py `_proxy_bypasses`, which
+    # config/static_credentials.py reads rather than restates (BACKLOG #3075 item 2, declined). It
+    # takes an IP literal, a port and an underscore host the shared domain rule refuses. An entry
+    # that matches nothing sends that host through the proxy; that rule ignores a port and reads
+    # '*:443' as '*', so a malformed entry can also bypass the proxy for every host.
     proxy_no_proxy: list[str] = []
     # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
     # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
@@ -4957,14 +5008,15 @@ class EgressSettings(_Section):
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
 
         Each entry must pass the shape rule the send path applies to a recipient's domain, so an
-        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
-        domain of exactly 253 characters passes here, but the send path's 254-character address cap
-        refuses every address in it. Normalisation, in
+        entry shaped like no sendable domain is refused here, not at the gate. The domain is also
+        capped at 252 characters, the most the send path's 254-character address cap leaves, so a
+        253-character domain no address can carry is refused too (BACKLOG #3075). Normalisation, in
         :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
         lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
         return _bare_domain_entries(
             value,
             allow_ipv4=False,
+            max_length=MAX_MAIL_DOMAIN,
             refusal="[egress].allowed_recipient_domains needs a bare domain such as "
             "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
             "subdomain as its own entry",
@@ -7110,7 +7162,8 @@ class ServiceSettings(_InputHidingModel):
         """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
         plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
 
-        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way (ADR 0092 decision 2, and
+        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way, honoured only at
+        ``[security].enforcement = warn`` (ADR 0092 decision 2, and
         ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
         at the shipped ``enforce`` it would have sent the service-account and user passwords over a
         cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
@@ -7595,8 +7648,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
-      variable, another tool's). So a typo in the SECTION part of a name is not refused.
+    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
+      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
     * one with no key part, which gets the same note when it is a section's name;
@@ -8224,7 +8278,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     * ``ad_connect_timeout`` and ``ad_receive_timeout`` (vault BACKLOG #2567) bound how long one
       directory call may hold a worker thread, so a value above its default is looser, named while
       AD is on. They are timeouts and not rate limits; they sit here because they are read the same
-      way, against the shipped default.
+      way, against the shipped default. So is ``ad_group_search_deadline`` (vault BACKLOG #3696),
+      the deadline the pages of the nested group search share.
     * ``step_up_max_age_seconds``, ``totp_skew_steps`` and ``initial_password_expiry_hours`` (vault
       BACKLOG #2600 step 4) are read the same way too. A step-up window or a temporary-password
       life above its default is looser, and so is any TOTP skew above the strict 0. A
@@ -8594,25 +8649,40 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # default is looser. The load refuses 0, a negative, inf and NaN, so there is no off value.
     # Named only with AD on, as ad_session_recheck_seconds is: with no directory nothing reads them.
     if auth.ad_enabled:
-        for field, what in (
-            ("ad_connect_timeout", "the LDAP connect timeout"),
+        stalled = (
+            "a directory call (at least a sign-in, a step-up and a session recheck) to a domain "
+            "controller that has stopped answering holds a worker thread longer before it fails"
+        )
+        for field, what, so in (
+            ("ad_connect_timeout", "the LDAP connect timeout", stalled),
             # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
             (
                 "ad_receive_timeout",
                 "the LDAP response-read timeout (applied rounded up to a whole second)",
+                stalled,
+            ),
+            # Vault BACKLOG #3696. Each page is still bounded by ad_receive_timeout, so this one
+            # holds the thread only while a slow directory keeps answering.
+            (
+                "ad_group_search_deadline",
+                "the nested group search's overall deadline",
+                "the paged group search of a directory call (at least a sign-in, a step-up and "
+                "a session recheck), against a domain controller that keeps answering slowly, "
+                "holds a worker thread longer before it is refused",
             ),
         ):
+            if field == "ad_group_search_deadline" and not (
+                auth.ad_use_nested_groups and auth.ad_group_search_base
+            ):
+                continue  # no paged group search runs, so nothing reads it
             value, default = getattr(auth, field), _auth_default(field)
             if value > default:
                 out.append(
                     (
                         field,
                         # repr round-trips, so a value one step past the default never prints as it.
-                        f"{what} is {value!r} s, above the default of {default:g} s, so a "
-                        "directory call (at least a sign-in, a step-up and a session recheck) to "
-                        "a domain controller that has stopped answering holds a worker thread "
-                        "longer before it fails -- stalled calls then tie up the thread pool that "
-                        "sign-in shares for longer",
+                        f"{what} is {value!r} s, above the default of {default:g} s, so {so} -- "
+                        "stalled calls then tie up the thread pool that sign-in shares for longer",
                     )
                 )
 

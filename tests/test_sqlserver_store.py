@@ -824,6 +824,32 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_first_admin_grant_contract(store) -> None:
+    """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
+    administrator exists, and over credentials the caller did not write."""
+    from tests._first_admin_grant_store_contract import assert_first_admin_grant_contract
+
+    await assert_first_admin_grant_contract(store)
+
+
+async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in(store) -> None:
+    """Vault BACKLOG #2711 step 1 on SQL Server: a directory Administrator does not refuse the
+    first-administrator grant, and a local one with a usable password does."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_counts_only_a_local_administrator_that_signs_in,
+    )
+
+    await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_concurrent_first_admin_grants_leave_one(store) -> None:
+    """BACKLOG #3078 on SQL Server: two grants to two accounts on two pooled connections, at once.
+    The last-administrator guard's applock serializes them; one is refused."""
+    from tests._first_admin_grant_store_contract import assert_concurrent_grants_leave_one
+
+    await assert_concurrent_grants_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real SQL Server backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
@@ -6234,6 +6260,16 @@ async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
     from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
 
     await attestation_roundtrip(store)
+
+
+async def test_the_config_changed_reason_survives_a_long_node_ss(store) -> None:
+    """vault BACKLOG #2944, item 6: the start-time config_changed detail at the longest node id
+    is stored uncut by this backend's reason column."""
+    from tests.test_start_config_change_alert import (
+        check_config_changed_reason_survives_a_long_node,
+    )
+
+    await check_config_changed_reason_survives_a_long_node(store)
 
 
 # --- vault BACKLOG #2223: the ServerCertificate pin is enforced under Encrypt=strict (gated) -------

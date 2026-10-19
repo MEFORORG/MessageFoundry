@@ -25,6 +25,7 @@ from messagefoundry.api import approvals as approvals_module
 from messagefoundry.api import tls as tls_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+from messagefoundry.config.fingerprint import ConfigDirMissing
 from tests._ast_sites import call_sites, parse_source
 
 _LOG = logging.getLogger("tests.audit_write")
@@ -173,7 +174,7 @@ def test_a_reload_row_defect_after_the_swap_reports_the_audit_step(
                 engine,
                 actor="alice",
                 failed_steps=["references"],
-                loaded=app_module._UNKNOWN_LOADED,
+                loaded=None,
             )
         )
     assert failures == ["references", app_module._RELOAD_AUDIT_STEP]
@@ -185,7 +186,7 @@ def test_a_refused_reload_row_defect_still_answers_the_refusal() -> None:
     engine = _engine_whose_audit_raises(sqlite3.ProgrammingError())
     status, _answer = asyncio.run(
         app_module._audit_refused_reload(
-            engine, FileNotFoundError("gone"), actor="alice", requested="/x", dry_run=False
+            engine, ConfigDirMissing("gone"), actor="alice", requested="/x", dry_run=False
         )
     )
     assert status == 404

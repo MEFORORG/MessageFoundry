@@ -108,7 +108,9 @@ class ProbeOutcome(Enum):
     #: no revocation, no strike reset, no recorded outcome. Unlike it, a referral alerts, because it
     #: is a configuration error that recurs on every pass: read as unavailable, it would stop
     #: revocation for the referred accounts without a sound. It never stops the other accounts
-    #: being judged.
+    #: being judged. It is not counted as a readable answer for the hold's ``r``, although a
+    #: referral on the group search came after the user search read ``userAccountControl``
+    #: (BACKLOG #3100 item 9, left open).
     REFERRED = "referred"
     #: The probe raised something that is neither an ``LdapError`` nor a network-class ``OSError``
     #: (:attr:`UNAVAILABLE` takes both), or ``LdapUndecodableError``, which is an ``LdapError``
@@ -158,8 +160,10 @@ class Probe:
     #: the referred hosts and nothing else (BACKLOG #2530). The pass logs the first one. For
     #: :attr:`ProbeOutcome.FAULT`: the exception's type name, never its message (BACKLOG #3100).
     #: For :attr:`ProbeOutcome.MISCONFIGURED`: the refusal's text, which names the operation and the
-    #: result code and never the directory's diagnostic message (BACKLOG #3010). None for every
-    #: other outcome.
+    #: result code and never the directory's diagnostic message (BACKLOG #3010). For
+    #: :attr:`ProbeOutcome.UNAVAILABLE`: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP` when the
+    #: group search was refused for its bounds rather than unanswered (vault BACKLOG #3696), else
+    #: None. None for every other outcome.
     detail: str | None = None
 
 
@@ -213,6 +217,14 @@ PROBE_FAULT_ABORT = ProbeOutcome.FAULT.value
 #: failures, at least one a configuration refusal and none a referral (BACKLOG #3010). Also the
 #: reason slug of that refusal's own audit row and alert, on any pass with one.
 MISCONFIGURED_ABORT = "directory_misconfigured"
+
+#: The causes of an :attr:`ProbeOutcome.UNAVAILABLE` probe whose group search the engine refused
+#: for its own bounds (vault BACKLOG #3696): past ``[auth].ad_group_search_deadline``, or past the
+#: cap on groups or its page backstop. It pages, once per account as it enters that state
+#: (``AuthService._note_paging_refusals``): unlike an outage it does not pass on its own, and the
+#: enabled account's roles and scope are not re-read while it lasts. Also the alert's ``reason``.
+PAGING_DEADLINE = "group_search_deadline"
+PAGING_CAP = "group_search_cap"
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
@@ -270,7 +282,8 @@ class ReconcilePlan:
     #: configuration refusal and the probe fault each count these in their log line or latched
     #: message and in the ``asked`` field of their audit row, and the last three in their alert's
     #: count (BACKLOG #3170, #3010): only a probe that was sent can be referred, refused or raise a fault.
-    #: The breaker's alert alone counts ``probed``, its judged denominator.
+    #: The breaker's alert counts ``probed``, its judged denominator, and so does each paging
+    #: refusal's (vault BACKLOG #3696), which concerns one account and reports the pass's count.
     asked: int = 0
     unavailable: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
@@ -313,6 +326,12 @@ class ReconcilePlan:
     breaker_clear: bool = False
     hold_clear: bool = False
     referral_clear: bool = False
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (vault BACKLOG #3696):
+    #: ``(user_id, username, cause)`` of each account that has just ENTERED the state of reading
+    #: UNAVAILABLE because its group search was refused for its bounds, ``cause`` being
+    #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
+    #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
+    paging_refused: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def directory_outage(self) -> bool:
