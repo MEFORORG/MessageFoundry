@@ -63,7 +63,7 @@ def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
 def _answer(monkeypatch: pytest.MonkeyPatch, request: bytes, status: int = 200) -> bytes:
     """What a fresh sink writes back for ``request``. Only the stalled-body case shortens the read
     timeout and keeps its side open: every other case leaves the sink its normal five seconds."""
-    stalled = request is _STALLED_BODY
+    stalled = request == _STALLED_BODY
     if stalled:
         monkeypatch.setattr(http_sink, "READ_TIMEOUT_SECONDS", 0.3)
     with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
@@ -90,14 +90,26 @@ def _blocks(raw: bytes) -> list[_Block]:
 
 
 def _assert_floored(raw: bytes, statuses: list[int]) -> None:
+    """The baseline, once each, on every FINAL answer, and no HSTS or Server line on any block.
+    An interim 1xx is not required to carry the baseline: owner ruling R3 of 2026-09-28 puts it
+    outside the verb (BACKLOG #1120, #3358 item 9). The sink happens to add it there too."""
     blocks = _blocks(raw)
     assert [status for status, _ in blocks] == statuses, raw[:200]
     for status, headers in blocks:
         names = [name for name, _ in headers]
-        for name, value in _EXPECTED:
-            assert (name, value) in headers, f"the {status} lacks {name}: {headers}"
-            assert names.count(name) == 1, f"the {status} carries {name} more than once"
+        if status >= 200:
+            for name, value in _EXPECTED:
+                assert (name, value) in headers, f"the {status} lacks {name}: {headers}"
+                assert names.count(name) == 1, f"the {status} carries {name} more than once"
         assert HSTS_HEADER.lower() not in names, "HSTS on a cleartext loopback answer"
+        assert "server" not in names, f"the {status} names the server software: {headers}"
+
+
+def _is_bare(raw: bytes) -> bool:
+    """Whether ``raw`` is an HTTP/0.9-form answer: something, with no header block. An empty read
+    is no answer at all, so it is refused rather than counted as bare."""
+    assert raw, "nothing was read, so this says nothing about the answer's form"
+    return not _blocks(raw)
 
 
 _POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
@@ -105,13 +117,15 @@ _POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
 #: Declares a hundred bytes and sends ten, then waits: the sink's 408.
 _STALLED_BODY = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly ten b"
 
-#: The longest line the stdlib reads. http.client holds it as the private _MAXLINE for a header
-#: line, and http/server.py spells the same 65536 as a literal for the request line. A release
-#: that raises either leaves the 414 or 431 case waiting for bytes that never come.
-_STDLIB_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
+#: The longest request line the stdlib reads: a literal in http/server.py's handle_one_request,
+#: with no name to read it from. A release that raises it reads the case below, a two-word line
+#: ended by the half-close, as an HTTP/0.9 GET instead of answering the 414, and the case turns red.
+_REQUEST_LINE_LIMIT = 65536
+#: The longest header line: http.client's private _MAXLINE, which parse_headers reads.
+_HEADER_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
 _GET_LINE = b"GET /x HTTP/1.1\r\n"
-_LONG_REQUEST_LINE = b"GET /".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
-_LONG_HEADER_LINE = b"X-Long: ".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
+_LONG_REQUEST_LINE = b"GET /".ljust(_REQUEST_LINE_LIMIT + 1, b"a")
+_LONG_HEADER_LINE = b"X-Long: ".ljust(_HEADER_LINE_LIMIT + 1, b"a")
 #: One header past http.client's limit, with no blank line: the stdlib refuses as it reads the last.
 _MANY_HEADERS = b"X-H: v\r\n" * (getattr(http.client, "_MAXHEADERS", 100) + 1)
 
@@ -158,8 +172,8 @@ _CASES: list[Any] = [
     ),
     # An HTTP/0.9 answer has no status line and no header block, so there would be nowhere to
     # put the headers. Which of these the stdlib answers that way depends on the Python patch
-    # level; _BARE_UNDER_THE_STDLIB below says how. The sink answers each with a status line and
-    # a header block.
+    # level; _BARE_ON_SOME_PYTHON below is how the suite finds out. The sink answers each with a
+    # status line and a header block.
     pytest.param(200, b"GET /x\r\n", [200], id="http-0.9-two-word-request"),
     pytest.param(200, b"GET /x HTTP/0.9\r\n\r\n", [200], id="http-0.9-named-version"),
     pytest.param(200, b"BREW /x HTTP/0.9\r\n\r\n", [501], id="http-0.9-stdlib-501"),
@@ -169,11 +183,9 @@ _CASES: list[Any] = [
 
 #: The cases above that SOME stdlib answers with no header block at all, by id, each with the
 #: statuses the sink must answer it with. Which of them a given Python answers bare is observed by
-#: the control below, never assumed: CPython 3.14.6 answers all seven bare. 3.14.8 no longer
-#: leaves request_version at "HTTP/0.9" on four of those paths (the bad version, the 505, the
-#: one-word line and the two-word line that is not a GET), so it answers them with a status line
-#: of its own.
-_BARE_UNDER_THE_STDLIB = [
+#: the control below, never assumed. The sink's request_version comment says which patch levels
+#: were read.
+_BARE_ON_SOME_PYTHON = [
     pytest.param(case.values[1], case.values[2], id=case.id)
     for case in _CASES
     if case.id in ("stdlib-400-malformed", "stdlib-505-version") or case.id.startswith("http-0.9-")
@@ -240,7 +252,7 @@ def test_the_probe_sees_absence_when_the_choke_point_is_removed(
         _assert_floored(raw, statuses)
 
 
-@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_UNDER_THE_STDLIB)
+@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_ON_SOME_PYTHON)
 def test_the_request_version_override_is_what_gives_a_bare_answer_its_headers(
     request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -254,20 +266,19 @@ def test_the_request_version_override_is_what_gives_a_bare_answer_its_headers(
     writes the header block itself, and end_headers must then floor it once, with nothing doubled.
     Either way the test passes or fails; it never skips, and a broken removal fails on a Python
     whose stdlib is bare."""
-    bare_on_this_python = not _blocks(_plain_stdlib_answer(request_bytes))
+    bare_on_this_python = _is_bare(_plain_stdlib_answer(request_bytes))
     _assert_floored(_answer(monkeypatch, request_bytes), statuses)
 
     _without(monkeypatch, "request_version")
     raw = _answer(monkeypatch, request_bytes)
-    assert raw, "the sink wrote nothing, so this says nothing about its form"
     if bare_on_this_python:
-        assert _blocks(raw) == [], raw[:80]
+        assert _is_bare(raw), raw[:80]
     else:
         _assert_floored(raw, statuses)
 
 
 def test_the_bare_control_covers_seven_cases() -> None:
-    assert len(_BARE_UNDER_THE_STDLIB) == 7, [case.id for case in _BARE_UNDER_THE_STDLIB]
+    assert len(_BARE_ON_SOME_PYTHON) == 7, [case.id for case in _BARE_ON_SOME_PYTHON]
 
 
 #: The cases a plain stdlib handler answers bare on every CPython read so far: 3.14.6 by running
@@ -284,15 +295,15 @@ def test_the_stdlib_still_answers_http_0_9_requests_bare() -> None:
     bare, the stdlib changed again: re-read it, and if none is bare, the override can go."""
     bare = [
         case.id
-        for case in _BARE_UNDER_THE_STDLIB
-        if not _blocks(_plain_stdlib_answer(cast(bytes, case.values[0])))
+        for case in _BARE_ON_SOME_PYTHON
+        if _is_bare(_plain_stdlib_answer(cast(bytes, case.values[0])))
     ]
     for case_id in _BARE_ON_EVERY_PYTHON_READ:
         assert case_id in bare, f"Python {platform.python_version()} answers {case_id} unbare"
 
 
-@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_UNDER_THE_STDLIB)
-def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(
+@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_ON_SOME_PYTHON)
+def test_an_answer_some_stdlib_writes_bare_has_a_status_line(
     request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The status line names the handler's protocol_version, HTTP/1.1, whatever the request said,
@@ -370,6 +381,16 @@ def test_the_error_page_cases_cover_every_stdlib_error_class() -> None:
     assert len(ids) == 9, ids
     finals = {cast(list[int], case.values[1])[-1] for case in _STDLIB_ERROR_PAGES}
     assert {400, 414, 431, 501, 505} <= finals
+
+
+def test_the_stdlib_names_the_server_software_without_the_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the Server line _assert_floored refuses (BACKLOG #3358 item 8): the stdlib's
+    own send_response adds one, naming the Python version."""
+    _without(monkeypatch, "send_response")
+    ((_, headers),) = _blocks(_answer(monkeypatch, _POST))
+    assert "Python/" in dict(headers).get("server", ""), headers
 
 
 def test_the_sink_baseline_is_the_engine_listeners() -> None:

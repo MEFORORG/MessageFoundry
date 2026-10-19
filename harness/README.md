@@ -280,7 +280,8 @@ headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-Frame-Options`
 `Content-Security-Policy` of `frame-ancestors 'none'; base-uri 'none'`. That includes the answers
 Python's own HTTP server writes for a request the sink never sees, such as a malformed request
 line. Those error answers are `text/plain`, not Python's default HTML page. No answer carries
-`Strict-Transport-Security`, because the sinks speak cleartext on loopback.
+`Strict-Transport-Security`, because the sinks speak cleartext on loopback, and none carries a
+`Server` line naming the Python version.
 
 These outbounds sit behind `[egress].allowed_http`. `serve` turns
 `[security].block_unlisted_outbound` on unless you set it, and then an empty list refuses all four,

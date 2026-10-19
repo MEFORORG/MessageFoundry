@@ -563,6 +563,15 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy scripts/asvs
 
+      # BACKLOG #3358 item 11: the harness's loopback sinks, harness.sinks, under the same strict
+      # profile. They answer HTTP with the browser baseline (BACKLOG #1120), and nothing hosted
+      # type-checked them. NARROW ON PURPOSE: this one package, not harness/, whose other trees
+      # do not pass strict today. By package (-p), because harness/ has no top-level layout mypy
+      # can map from a path. A step in this job, so it adds no context.
+      - name: Type-check (mypy, strict — harness.sinks)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: mypy -p harness.sinks
+
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
