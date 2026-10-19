@@ -844,9 +844,10 @@ three on its own, until it restarts again.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
-  referral. A pass with any referral or probe fault resolves none of these alerts. Neither is
+  referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
+  resolves none of these alerts. None is
   carried to later passes for the breaker's and the hold's alerts: a later pass whose probe sample
-  leaves out the referred or faulting account reads its older answer, and can resolve one of
+  leaves out the referred, faulting or refused account reads its older answer, and can resolve one of
   those two (BACKLOG #3100, left open).
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.

@@ -7680,7 +7680,7 @@ class AuthService:
           counts, a held one too, so an account that never reads PRESENT does not keep a trip or a
           referral open for good. For a hold the answer must not be undetermined: a lone account
           that is held, then strikes, then is held again is one hold, not one per flap. A probe
-          that reached no answer (unavailable, referred, faulted), a probe sample that misses the
+          that reached no answer (unavailable, referred, faulted, misconfigured), a probe sample that misses the
           accounts, and a pass that judged nothing end nothing, so one condition seen across a
           rotation or an outage stays one episode.
 
@@ -8538,8 +8538,11 @@ class AuthService:
         if refusals and plan.misconfigured:
             others = f"{len(plan.misconfigured)} were refused for the configuration. {others}"
         if plan.unavailable:
+            # UNAVAILABLE also carries an account whose group search the engine refused for its own
+            # paging bound (vault BACKLOG #3696), which pages on its own, so this names both.
             others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
+                f"{plan.unavailable} could not be read (the directory was unreachable, or the "
+                f"engine refused a group search for its own bound). {others}"
             )
         return others
 

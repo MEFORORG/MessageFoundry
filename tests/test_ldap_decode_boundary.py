@@ -709,7 +709,9 @@ def test_an_unbind_error_never_replaces_the_refusal() -> None:
 
 
 def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
-    """The same, end to end: the unbind's send fails, and the probe still answers."""
+    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): unlike
+    ``_released`` above after a clean block, an unbind whose send fails is suppressed, and the probe
+    still answers."""
     with _scripted_dc(_groups_answered) as (_dc, authenticator):
         real = ldap3.Connection.unbind
 

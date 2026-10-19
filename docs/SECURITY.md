@@ -4708,7 +4708,9 @@ revocation. A pass with any such refusal logs one ERROR naming the code and no a
 `directory_misconfigured`, under its own source `directory-reconciler-misconfigured`. If every
 probe is refused, faulted or fails, at least one refused and none referred, the pass aborts as
 `directory_misconfigured`: it judges no account it asked about and revokes nothing, but it pages.
-Like the fault's, that alert has no inverse; an operator resolves it. **The cost:** while the
+Like the fault's, that alert has no inverse; an operator resolves it, and a pass with such a
+refusal marks no alert clear. A service-account bind the directory refuses with one of those codes
+takes the same path, as a malformed `ad_bind_dn` does. **The cost:** while the
 refusal lasts, the refused accounts' sessions are never revoked by the reconciler, so they run to
 the absolute cap. Other result codes that are not an answer, such as busy or unavailable, are an
 outage. A second-factor step-up and a passkey assertion, which probe the directory before they
