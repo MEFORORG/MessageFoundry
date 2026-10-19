@@ -56,7 +56,8 @@ def _git(repo: Path, *args: str) -> None:
 
 @pytest.fixture(scope="module")
 def _template(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """One clone carrying its OWN copy of scripts/coord and scripts/hooks, built once per module."""
+    """One clone carrying its OWN copy of scripts/coord, scripts/hooks and scripts/worktree, built
+    once per module."""
     r = tmp_path_factory.mktemp("template") / "repo"
     r.mkdir()
     _git(r, "init", "-q", "-b", "main")
@@ -376,7 +377,7 @@ def test_every_script_naming_the_coordination_directory_is_classified() -> None:
         p.relative_to(ROOT / "scripts").as_posix()
         for d in (COORD, HOOKS, WORKTREE)
         for p in d.rglob("*")
-        if p.suffix in {".ps1", ".py", ".sh"} and "mefor-coord" in p.read_text(encoding="utf-8")
+        if p.suffix in {".ps1", ".py", ".sh"} and b"mefor-coord" in p.read_bytes()
     }
     # A positive control: a census that found nothing would pass the subset check below.
     assert PY_GUARDED in named

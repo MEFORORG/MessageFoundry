@@ -480,10 +480,11 @@ gates a merge**, and no seat has to clear one.
 A Claude Code cloud session (`CLAUDE_CODE_REMOTE=true`) holds one seat only: a **Builder in its own
 session, on `MEFORORG/MessageFoundry` alone**. **Never attach a second repository**: a session with
 several repositories loads hooks from none of them. Its `.git/mefor-coord` belongs to its own clone
-and reaches no other session, so the scripts that write into it refuse there, at least `seat.ps1
--Declare`, `mail.ps1`, `alloc.ps1`, `claim.ps1`, `handoff.ps1`, `lane.ps1` and `owner_log.py`
-(`tests/test_coord_cloud_refusal.py` holds the census), and the declare rule above does not apply. A brief that needs an ADR number is not a
-cloud brief. Cite the brief's item in the commit body, not the subject: the commit-msg claim gate
+and reaches no other session. So the scripts that write state for other sessions to read refuse
+there, at least `seat.ps1 -Declare`, `mail.ps1`, `alloc.ps1`, `claim.ps1`, `handoff.ps1`,
+`lane.ps1` and `owner_log.py`, and the declare rule above does not apply. A clone-local lock or
+cache is still written. `tests/test_coord_cloud_refusal.py` holds the census of which is which. A
+brief that needs an ADR number is not a cloud brief. Cite the brief's item in the commit body, not the subject: the commit-msg claim gate
 refuses a code commit whose subject cites a ledger number nobody claimed, and no claim can be taken
 there. Commit under the allowlisted git identity the cloud environment sets, or `cla` blocks the PR.
 

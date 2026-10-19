@@ -43,7 +43,8 @@
     nobody looks. The app's suggested remedy, `<worktree>\.git\mefor-coord\...`, cannot work: a
     worktree's `.git` is a file. So a session drafts the document inside its own worktree, where the
     edit tools work, and this script copies it into the shared directory. Exit 0 is written, 1 is a
-    refusal that names its reason, and 2 is a failure while writing.
+    refusal that names its reason, 2 is a failure while writing, and 3 is the refusal in a Claude
+    Code cloud session.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\handoff.ps1 -Report
@@ -65,7 +66,8 @@ param(
     # Move ONE entry to _retired-<date>/. Refuses on any hold unless -Force.
     # -Retire, -Write and -From are NOT Mandatory, ON PURPOSE: a partial call binds the Retire or
     # Write set without them (-Force alone, for one), and a Mandatory prompt there hangs a caller with
-    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
+    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The partial-call refusal follows this
+    # param block, after the cloud refusal.
     [Parameter(ParameterSetName = 'Retire')][string]$Retire,
     [Parameter(ParameterSetName = 'Retire')][switch]$Force,
 
