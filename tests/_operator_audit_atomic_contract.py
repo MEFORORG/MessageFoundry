@@ -17,6 +17,9 @@ that never called the audit at all, so the clean leg is the control that makes i
 The fault is injected at ``_append_audit_row``, the one append every backend's audited writes go
 through. Its action argument is matched by value, so the same wrapper fits all three signatures.
 
+The fault helpers and :class:`TeeTap` are shared: the dual-control and TOTP-replace contracts use
+them too, and :func:`failing_commit` refuses a COMMIT for them (vault BACKLOG #3324).
+
 Deliberately **extra-free**, like ``_pending_approval_store_contract``: the live server legs import it
 inside a test function. Every name it writes is unique per run, so a shared server database is safe.
 """
@@ -47,7 +50,7 @@ class AppendFailed(RuntimeError):
 
 
 @contextmanager
-def failing_append(store: Any, action: str | None = None) -> Iterator[None]:
+def failing_append(store: Any, action: str | None) -> Iterator[None]:
     """Make ``store``'s audit append raise for ``action``, and only for it, or for every action
     when it is ``None``."""
     real = store._append_audit_row
@@ -74,7 +77,7 @@ def commit_seam(store: Any) -> bool:
     every write does: a SQLite grouped commit and a SQL Server fused-hop handoff do not. Postgres
     commits as asyncpg's transaction block exits, which has no such seam, so an arm that needs
     :func:`failing_commit` does not run on that leg."""
-    return callable(getattr(store, "_commit", None))
+    return callable(getattr(type(store), "_commit", None))
 
 
 @contextmanager

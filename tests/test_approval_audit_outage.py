@@ -8,8 +8,9 @@ refuses, answer a mapped status rather than a raw 500 (finding 3), and a lost au
 ``audit_write_failed`` on at least the paths these tests name (finding 4). Not every lost row
 pages; docs/SECURITY.md lists at least the exceptions.
 
-The gate runs over a real SQLite store. Only the faults are injected, by a wrapper that fails the
-named audit actions or status writes with the error a full disk gives.
+The gate runs over a real SQLite store. Most faults are injected by a wrapper that fails the
+named audit actions or status writes with the error a full disk gives; a few tests raise from the
+executor or read the log lines instead.
 """
 
 from __future__ import annotations
@@ -454,29 +455,23 @@ async def test_a_lost_request_row_cannot_forge_a_log_line(
 async def test_a_release_whose_effect_commit_lost_its_reply_is_recorded_failed(
     store: MessageStore,
 ) -> None:
-    """The case the ``Executor`` docstring and docs/SECURITY.md state (vault BACKLOG #3324): an
-    executor whose effect COMMITTED and whose commit reply was then lost raises, and the gate
-    records ``failed`` for an operation that ran. Nothing reads the effect back. A change that does
-    is a behaviour change, and this test says so."""
-    effects: list[str] = []
-    settings = ApprovalsSettings(
-        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
-    )
-    gate = ApprovalGate(
-        _StandingStore(store), settings, resolve_identity=_resolve, alert_sink=_Sink()
-    )
+    """The case the ``Executor`` docstring and docs/SECURITY.md state (vault BACKLOG #3324). The
+    executor's effect row COMMITS, then the executor raises the error a lost COMMIT reply gives, and
+    the gate records ``failed`` for an operation whose row the store holds. Nothing reads the row
+    back. A gate that did would record something else here, which is a behaviour change."""
+    from tests._pending_approval_store_contract import _gate as _contract_gate
 
     async def _commit_landed_reply_lost(_p: Mapping[str, Any]) -> dict[str, Any]:
-        effects.append("requeued")
+        await store.record_audit(
+            "dead_letter_replay", actor="maker", detail=json.dumps({"requeued": 1})
+        )
         raise sqlite3.OperationalError(_FAULT)
 
-    gate.register(
-        "dead_letter_replay", "op", _commit_landed_reply_lost, permission=Permission.MESSAGES_REPLAY
-    )
+    gate = _contract_gate(store, _commit_landed_reply_lost)
     approval_id = await _request(gate)
     with pytest.raises(sqlite3.OperationalError):
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
-    assert effects == ["requeued"]
+    assert len(await store.list_audit(action="dead_letter_replay")) == 1
     assert await _status(store, approval_id) == "failed"
 
 

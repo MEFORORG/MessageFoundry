@@ -13,8 +13,8 @@ from the ``SELECT`` projection reads back as absent, which is indistinguishable 
 never having run. This body round-trips the value through the real store object instead, so the
 PostgreSQL and SQL Server legs execute their own SQL rather than having it read.
 
-Deliberately **extra-free**: it imports nothing outside the core package and the store object it is
-handed, so the live server legs can import it inside a test function.
+Deliberately **extra-free**: it imports nothing outside the core package, its sibling test helpers
+and the store object it is handed, so the live server legs can import it inside a test function.
 
 The second half is the **release outcome** contract (BACKLOG #1562). ``ApprovalGate.approve`` claims
 a row as ``executing`` and settles it to ``approved``, ``failed`` or ``interrupted``, each through a
@@ -139,8 +139,10 @@ async def _assert_transition_audit_contract(store: Any) -> None:
 
     async def refused_writes_leave_nothing(
         fault: AbstractContextManager[None], raised: type[Exception]
-    ) -> str:
-        """Under ``fault`` a new request and a transition both raise, and neither leaves a row."""
+    ) -> None:
+        """Under ``fault`` a new request and a transition both raise, and neither leaves a row
+        or tees one. Under the commit fault each append really took a row id, so a backend that
+        teed before its commit would tee a row that rolled back."""
         lost_id = uuid4().hex
         with fault:
             # A failed write rolls the INSERT back: no request is held without its row.
@@ -159,21 +161,18 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         assert await _audit_rows_for(store, "approval.requested", lost_id) == []
         assert await _status(store, approval_id) == "pending"
         assert await _audit_rows_for(store, "approval.release_attempted", approval_id) == []
-        return lost_id
+        assert tap.ids("approval.requested", lost_id) == []
+        assert tap.ids("approval.release_attempted", approval_id) == []
 
     tap = _TeeTap()
     try:
         assert await request(approval_id) == approval_id
         assert len(await _audit_rows_for(store, "approval.requested", approval_id)) == 1
 
-        await refused_writes_leave_nothing(failing_append(store), AppendFailed)
+        await refused_writes_leave_nothing(failing_append(store, None), AppendFailed)
         # vault BACKLOG #3324: the COMMIT itself refused, after the write and its append both ran.
-        # Each append really took a row id here, so a backend that teed before its commit would tee
-        # a row that rolled back, and the tap would see it.
         if commit_seam(store):
-            uncommitted = await refused_writes_leave_nothing(failing_commit(store), CommitFailed)
-            assert tap.ids("approval.requested", uncommitted) == []
-            assert tap.ids("approval.release_attempted", approval_id) == []
+            await refused_writes_leave_nothing(failing_commit(store), CommitFailed)
 
         # A transition that matches no row writes no row.
         assert not await store.decide_pending_approval(
@@ -185,6 +184,7 @@ async def _assert_transition_audit_contract(store: Any) -> None:
             audit=row("approval.approved"),
         )
         assert await _audit_rows_for(store, "approval.approved", approval_id) == []
+        assert tap.ids("approval.approved", approval_id) == []
 
         # The control: one that matches moves the row and writes exactly one.
         assert await store.decide_pending_approval(
