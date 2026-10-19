@@ -565,6 +565,102 @@ async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() 
     assert library in raised_in.parents, f"the stop raised outside websockets: {raised_in}"
 
 
+#: A text frame with no mask. A server must refuse one from a client, so websockets ends the
+#: conn's stream with no answer written.
+_UNMASKED_FRAME = b"\x81\x05hello"
+
+
+async def _frame_error_before_accept(ws_class: type[Any]) -> tuple[AssertionError | None, bytes]:
+    """Serve ``ws_class`` on a real socket. The client sends a valid upgrade and, while the app has
+    not yet answered it, a frame websockets refuses; the app then refuses the handshake, and the
+    server stops. Returns what the stop raised and every byte the client read."""
+    connected = asyncio.Event()
+    refuse = asyncio.Event()
+    refused = asyncio.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await receive()
+        connected.set()
+        await refuse.wait()
+        try:
+            await send({"type": "websocket.close", "code": 1000})
+        finally:
+            refused.set()  # the bare class raises out of send; the stop must still follow it
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(
+        uvicorn.Config(app, lifespan="off", log_config=None, server_header=False, ws=ws_class)
+    )
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    writer: asyncio.StreamWriter | None = None
+    try:
+        for _ in range(500):
+            if server.started or task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert server.started, "uvicorn did not start"
+        reader, writer = await asyncio.open_connection("127.0.0.1", sock.getsockname()[1])
+        writer.write(_HANDSHAKE.format(path="/ws/stats").encode())
+        await writer.drain()
+        await asyncio.wait_for(connected.wait(), 10.0)
+        writer.write(_UNMASKED_FRAME)
+        await writer.drain()
+        # Wait for the frame to reach the conn: its stream is ended once it has.
+        for _ in range(500):
+            conns = server.server_state.connections
+            if conns and all(getattr(p.conn, "eof_sent", False) for p in conns):
+                break
+            await asyncio.sleep(0.01)
+        refuse.set()
+        await asyncio.wait_for(refused.wait(), 10.0)
+        server.should_exit = True
+        stopped: AssertionError | None = None
+        try:
+            await asyncio.wait_for(task, 10.0)
+        except AssertionError as exc:
+            stopped = exc
+        try:
+            raw = await asyncio.wait_for(reader.read(), 1.0)
+        except TimeoutError:
+            raw = b"<still open>"
+    finally:
+        if writer is not None:
+            writer.close()
+        if not task.done():
+            task.cancel()
+        sock.close()
+    return stopped, raw
+
+
+async def test_a_frame_error_before_accept_stops_cleanly_with_nothing_written() -> None:
+    """``Server.shutdown`` on a real socket, on a floored connection whose conn has ended its
+    stream with no answer written and is still open (BACKLOG #3343, and #3358 item 6, which engine
+    PR 2210 inferred and did not measure). A client frame websockets refuses before the app answers
+    is one way there. uvicorn then hands the conn the app's refusal and, at stop, a 500.
+
+    The control is the bare class: websockets asserts on that refusal and on each 500 after it, and
+    the last of them raises out of ``Server.shutdown``, so the engine's own shutdown would not run.
+    Floored, each answer is dropped on the ended conn, nothing is written, the connection is closed
+    and the stop returns. Remove the floor's ``eof_sent`` check and the floored half fails as the
+    bare one does."""
+    bare_stop, bare_read = await _frame_error_before_accept(WebSocketsSansIOProtocol)
+    assert bare_stop is not None, "the bare stop returned; uvicorn changed this path"
+    tb = bare_stop.__traceback__
+    assert tb is not None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    raised_in = Path(tb.tb_frame.f_code.co_filename).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"the stop raised outside websockets: {raised_in}"
+    assert not bare_read.startswith(b"HTTP/"), bare_read[:40]
+
+    floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    stopped, read = await _frame_error_before_accept(floored)
+    assert stopped is None, f"the floored stop raised: {stopped!r}"
+    assert read == b"", read[:40]
+
+
 def test_the_sans_io_websocket_protocol_is_floored() -> None:
     """It was refused until BACKLOG #1120 floored it: uvicorn 0.50 and later resolve
     ``ws="auto"`` to it, so on the measured uvicorn every start goes through this class."""
