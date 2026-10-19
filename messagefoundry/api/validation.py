@@ -2,12 +2,18 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Input-validation rules for the operator API's control-plane data items (BACKLOG #1108).
 
-**This module is the single authority for the rules; the prose lives in
+**This module is the authority for the rules it defines; the prose lives in
 [`docs/API-INPUT-VALIDATION.md`](../../docs/API-INPUT-VALIDATION.md).** The document explains each
-rule and why it is drawn where it is; every pattern and ceiling it quotes is defined here and
-pinned by ``tests/test_api_input_validation.py``, so the two cannot drift. The one exception is the
-connection-name pattern: it is defined in :mod:`messagefoundry.connection_names`, because the config
-loader enforces it too and may not import this package (BACKLOG #1107), and it is re-exported here.
+rule and why it is drawn where it is. Not every rule the page states is defined here: at least the
+account address rules live in :mod:`messagefoundry.auth.service` and
+:mod:`messagefoundry.transports.email`, and the connection-name pattern is defined in
+:mod:`messagefoundry.connection_names`, because the config loader enforces it too and may not
+import this package (BACKLOG #1107); it is re-exported here.
+
+``tests/test_api_input_validation.py`` tests the rules defined here, and its drift check reads
+some of the page's bounds back against this module: only the claims its ``_doc_claims`` builds. A
+bound the page quotes outside that set is not compared, so the page can drift from it unnoticed
+(BACKLOG #3278).
 
 Scope is the **control plane** -- the ids, connection names, time bounds and search terms an
 operator sends to the engine's own API. The **data plane** (the HL7, X12, DICOM and other payloads
