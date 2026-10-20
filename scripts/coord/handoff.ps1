@@ -43,7 +43,8 @@
     nobody looks. The app's suggested remedy, `<worktree>\.git\mefor-coord\...`, cannot work: a
     worktree's `.git` is a file. So a session drafts the document inside its own worktree, where the
     edit tools work, and this script copies it into the shared directory. Exit 0 is written, 1 is a
-    refusal that names its reason, and 2 is a failure while writing.
+    refusal that names its reason, 2 is a failure while writing, and 3 is the refusal in a Claude
+    Code cloud session.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\handoff.ps1 -Report
@@ -65,7 +66,8 @@ param(
     # Move ONE entry to _retired-<date>/. Refuses on any hold unless -Force.
     # -Retire, -Write and -From are NOT Mandatory, ON PURPOSE: a partial call binds the Retire or
     # Write set without them (-Force alone, for one), and a Mandatory prompt there hangs a caller with
-    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
+    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The partial-call refusal follows this
+    # param block, after the cloud refusal.
     [Parameter(ParameterSetName = 'Retire')][string]$Retire,
     [Parameter(ParameterSetName = 'Retire')][switch]$Force,
 
@@ -83,6 +85,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+# Refused even with -CoordDir, as mail.ps1 refuses with -MailRoot. Exit 3 sits outside the 0/1/2 above.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('handoff.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
 
 # A partial -Retire or -Write call: refuse by name, before anything is read or written. See $Retire.
 $missing = switch ($PSCmdlet.ParameterSetName) {
