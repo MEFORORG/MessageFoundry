@@ -195,6 +195,15 @@ _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
 
+#: Vault BACKLOG #3028: what :attr:`AuthService.supersession_lineage_seconds` adds to the flow TTL
+#: for the sign-in's own work after its last wait. At the federated callback that is the code
+#: exchange and a JWKS refresh, each under a 10-second socket timeout, then the directory resolve,
+#: whose LDAP calls each sit under ``ad_connect_timeout`` and ``ad_receive_timeout`` (10 seconds
+#: by default), then the store writes before the mint. The password and directory legs are one
+#: request of the same parts. A socket timeout bounds each blocking call, not the whole, so a
+#: sign-in that runs past the window is possible, and docs/SECURITY.md states it as a limit.
+_LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
+
 #: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
 
@@ -360,6 +369,7 @@ _CERT_DIRECTORY_OUTAGES = frozenset(
     {
         reconcile.ProbeOutcome.UNAVAILABLE.value,
         reconcile.ProbeOutcome.REFERRED.value,
+        reconcile.ProbeOutcome.MISCONFIGURED.value,
         CERT_PROBE_SATURATED,
     }
 )
@@ -2079,7 +2089,8 @@ HOLDER_NOTICE_DISPATCHED = "dispatched"
 #: The account had no notification address before the repair, so there was nobody to tell.
 HOLDER_NOTICE_NO_PRIOR_ADDRESS = "no_prior_address"
 #: The account had an address, but nothing was handed off: no channel was wired, notices are turned
-#: off, or the notifier raised (each logged where it applies).
+#: off, the notifier raised, or it dropped the notice on a full queue (each logged where it applies;
+#: vault BACKLOG #3120 for the last).
 HOLDER_NOTICE_NO_CHANNEL = "no_channel"
 
 
@@ -2345,12 +2356,21 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
 _LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
-#: BACKLOG #2216: how long the API lifespan's :meth:`AuthService.drain_background` lets the
+#: BACKLOG #2216: how long :meth:`AuthService.close_background` lets the
 #: service's background tasks finish at shutdown before it cancels the rest, and how long it then
-#: waits for the cancelled ones to unwind. Both are shares of the service's graceful-stop window,
-#: whose budget is stated at ``DRAIN_TIMEOUT_SECONDS`` in ``api/approvals.py``; keep the sum inside
-#: it. A task still running at the first bound is queued behind other throttle reads, or stuck on
-#: the store. A task still unwinding at the second is left to finish or fail on its own.
+#: waits for the cancelled ones to unwind. A task still running at the first bound is queued behind
+#: other throttle reads, or stuck on the store. A task still unwinding at the second is left to
+#: finish or fail on its own.
+#:
+#: The budget is NSSM's 15 s graceful-stop window (``AppStopMethodConsole`` in
+#: ``scripts/service/install-service.ps1``), not any one drain's constant (vault BACKLOG #3120). The
+#: API lifespans spend it through one shutdown budget. ``_SHUTDOWN_BUDGET_SECONDS`` in
+#: ``api/app.py`` states the budget and the window arithmetic (BACKLOG #3191); ``_app_drain_steps``
+#: and the managed lifespan's teardown hold the steps, their order and each step's floor, from which
+#: ``_run_teardown`` computes the step's bound. Where the lock-notice step's bound is below
+#: :data:`_BACKGROUND_DRAIN_SECONDS`, the teardown cuts this drain before it cancels anything;
+#: ``docs/SECURITY.md``, *Residual: the background task adds one way to lose a notice*, says what
+#: that costs. A change to either constant is read against that budget.
 _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
@@ -2921,15 +2941,19 @@ class AuthService:
         # one kind landing together read the throttle one after the other and mail once. Its own table:
         # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
         # API process, like that queue: engine shards serving their own API ports each keep one, so
-        # two locks landing on two of them at once can still mail twice.
+        # two locks landing on two of them at once can still mail twice. Declined in vault BACKLOG
+        # #3120, with the residual in docs/SECURITY.md.
         self._lock_notice_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #2216: strong references to the service's background tasks, so a running one is not
-        # garbage-collected. Each removes itself when done; drain_background() awaits the rest.
+        # garbage-collected. Each removes itself when done; drain_background() awaits the rest. No
+        # cap on how many wait, declined in vault BACKLOG #3120: a cap would have to drop a lock
+        # notice or run it on the request path. docs/SECURITY.md states the residual.
         self._background_tasks: set[asyncio.Task[None]] = set()
         # Set by drain_background(close=True) at shutdown. After it, a lock notice runs inline,
         # since a task started then would outlive the drain and meet a closed store.
         self._background_closed = False
-        # One throttle read at a time (BACKLOG #2216); see _lock_notice_held_back.
+        # One throttle read at a time in this process, across every account (BACKLOG #2216); see
+        # _lock_notice_held_back.
         self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
@@ -2977,6 +3001,10 @@ class AuthService:
         #: Latched probe fault (BACKLOG #3100): set on a pass in which a probe faulted, and released
         #: by the next pass that judged something with no fault (`_record_reconcile_fault`).
         self._reconcile_fault_alert: str | None = None
+        #: Latched configuration refusal (BACKLOG #3010), on the probe fault's rule: set on a pass in
+        #: which the directory refused a probe for its configuration, and released by the next pass
+        #: that judged something with no such refusal (`_record_reconcile_misconfigured`).
+        self._reconcile_misconfigured_alert: str | None = None
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -4845,6 +4873,21 @@ class AuthService:
     def oidc_flow_ttl_seconds(self) -> int:
         """The staged-flow lifetime, so the browser cookie's max-age matches the server-side TTL."""
         return self._settings.oidc_flow_ttl_seconds
+
+    @property
+    def supersession_lineage_seconds(self) -> float:
+        """How long a retired session hash still leads a sign-in's supersession to the session it
+        became (vault BACKLOG #3028, ADR 0210), in seconds. The session reaper purges links older
+        than this.
+
+        It must outlast the longest sign-in a rotation can race, because the presented hash is read
+        at the START of the sign-in and the supersession runs at its end. The longest is the
+        federated leg: its start leg stages the hash, and the callback can come back as late as
+        ``oidc_flow_ttl_seconds`` after. :data:`_LINEAGE_SIGN_IN_SLACK_SECONDS` covers the
+        callback's own work after that, and every other leg is one request inside it. A longer
+        window only lengthens the time a stale copy of a token can END its successor; it never
+        lets one authenticate."""
+        return float(self._settings.oidc_flow_ttl_seconds) + _LINEAGE_SIGN_IN_SLACK_SECONDS
 
     def _oidc_redirect_uri(self, public_origin: str) -> str:
         return public_origin.rstrip("/") + self._settings.oidc_redirect_path
@@ -6852,6 +6895,13 @@ class AuthService:
         return self._reconcile_fault_alert
 
     @property
+    def directory_reconcile_misconfigured(self) -> str | None:
+        """The standing configuration refusal's operator message, or ``None`` (BACKLOG #3010).
+        Latches until a pass judges something with no such refusal
+        (:meth:`_record_reconcile_misconfigured`)."""
+        return self._reconcile_misconfigured_alert
+
+    @property
     def directory_reconcile_hold(self) -> str | None:
         """The engaged undetermined-wave hold's operator message, or ``None`` (ADR 0195). Latches
         while the hold is engaged, so an operator who missed the log line still sees it."""
@@ -6922,13 +6972,27 @@ class AuthService:
             # the arm above reads as REFERRED (vault BACKLOG #3697 step 2).
             return _fault_probe(user, exc)
         except LdapError as exc:
+            if isinstance(exc, LdapUnansweredError) and exc.configuration:
+                # BACKLOG #3010. A deleted or moved search base, or one the service account may not
+                # read, refuses every probe on every pass. Read as UNAVAILABLE it would stop
+                # revocation without a page; MISCONFIGURED alerts instead, and never strikes or
+                # revokes this account. DEBUG here, as for a referral: the reconciler logs one
+                # ERROR per pass carrying the first refusal's text. That text is the engine's own,
+                # naming the operation and the code, never the directory's diagnostic message.
+                _log.debug("directory probe of %s was refused: %s", user.username, exc)
+                return reconcile.Probe(
+                    user.id, user.username, reconcile.ProbeOutcome.MISCONFIGURED, detail=str(exc)
+                )
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
             # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
             # row per refusal, so it adds no log line here either.
             # An unreachable DC must never revoke: a fail-closed re-check would turn a
             # directory blip into a total console outage during exactly the incident when operators
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
-            # user per pass; the pass-level summary below reports the count at WARNING.
+            # user per pass; the pass-level summary below reports the count at WARNING. A result
+            # code that is not an answer is also reported at WARNING by ldap.py itself, once per
+            # operation and code (BACKLOG #3010), in engine text that never quotes the directory's
+            # diagnostic message. An undecodable response does not reach here (the arm above).
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             # Vault BACKLOG #3696. A group search past its deadline or its entry cap is still
             # unjudged, so still UNAVAILABLE, but it says which bound refused it, so it pages.
@@ -7018,8 +7082,9 @@ class AuthService:
         stops is the role and scope re-diff of an enabled account. Unlike an outage it recurs on
         every pass, so it pages, once per state change: an account already latched is not
         returned again, whichever bound refused it this time. An account the pass judged
-        (``judged``, the plan's ``outcomes``) re-arms here; an outage, a referral or a fault judged
-        nothing, says nothing about the bound, and leaves the latch alone. **The latch is set only once the entry
+        (``judged``, the plan's ``outcomes``) re-arms here; an outage, a referral, a configuration
+        refusal (BACKLOG #3010) or a fault judged nothing, says nothing about the bound, and leaves
+        the latch alone. **The latch is set only once the entry
         is recorded** (:meth:`_record_paging_refusals`), so a pass that raises in the service before that
         point leaves the account to enter again on the next pass. A sink that raises in the
         lifespan task after it can still cost the page; the row stands. An account that
@@ -7033,7 +7098,7 @@ class AuthService:
         for probe in probes:
             if (
                 probe.outcome is reconcile.ProbeOutcome.UNAVAILABLE
-                and probe.detail is not None  # REFERRED and FAULT carry a detail of their own
+                and probe.detail is not None  # REFERRED, FAULT, MISCONFIGURED carry their own
                 and probe.user_id not in latch
             ):
                 entered.append((probe.user_id, probe.username, probe.detail))
@@ -7071,7 +7136,8 @@ class AuthService:
 
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a probe the directory referred contributes nothing either, and the pass alerts, while
-          every other account is still judged (BACKLOG #2538);
+          every other account is still judged (BACKLOG #2538). So does a probe the directory
+          refused for its configuration, such as a deleted search base (BACKLOG #3010);
         * a principal must come back absent, disabled, undetermined or unkeyed
           ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
@@ -7276,20 +7342,25 @@ class AuthService:
         # anything below can raise or return, so every pass that judged or saw a condition counts.
         self._track_reconcile_episodes(plan, users, announced=announced)
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
+        refusal = next(
+            (p for p in probes if p.outcome is reconcile.ProbeOutcome.MISCONFIGURED), None
+        )
         if plan.aborted is not None:
-            if not plan.directory_referral and not plan.probe_fault:
+            if plan.directory_outage or not plan.judged_nothing:
+                # The outage's skipped row, or the breaker's trip. A pass that judged nothing for
+                # any other reason is recorded only by the recorders below, as a referral (#2538),
+                # a configuration refusal (#3010) or a fault (#3100), and never as a trip.
                 await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
-                # A pass of referrals only is recorded as a referral and nothing else (#2538), and
-                # a pass of faults only as a fault and nothing else (#3100).
                 await self._record_reconcile_referral(plan, first=referral)
+                await self._record_reconcile_misconfigured(plan, first=refusal)
                 await self._record_reconcile_fault(plan)
             # Vault BACKLOG #3696. On every abort, an outage-shaped one included, as its page is.
             await self._record_paging_refusals(plan)
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
-                # item 9). An outage or a pass of referrals only judged nothing, so it leaves the
-                # hold's message alone and marks no clear (BACKLOG #2538).
+                # item 9). A pass that judged nothing (an outage, or one whose every answer went
+                # unjudged) leaves the hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -7350,7 +7421,8 @@ class AuthService:
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
-        # BACKLOG #3100. After the revocations too, for the same reason as the referral's.
+        # BACKLOG #3010 and #3100. After the revocations too, for the same reason as the referral's.
+        await self._record_reconcile_misconfigured(plan, first=refusal)
         await self._record_reconcile_fault(plan)
         # Vault BACKLOG #3696. After the revocations too, for the same reason.
         await self._record_paging_refusals(plan)
@@ -7409,11 +7481,12 @@ class AuthService:
           referred account has no answer from this pass, and an older one on record may predate
           the referral. So while a referred account is probed, a standing referral keeps the
           breaker's and the hold's instances open after their own causes are gone: a missed
-          clear, never a false one (BACKLOG #3100 item 7). A pass with a probe fault marks none
-          either, for the same reason. For these two clears neither is carried to later passes:
-          a later pass whose sample misses the referred or faulting account reads its older
-          answer on record and can still mark one (left open under BACKLOG #3100). Only the
-          referral's own clear below carries its accounts across passes.
+          clear, never a false one (BACKLOG #3100 item 7). A pass with a probe fault, or with a
+          probe refused for its configuration (BACKLOG #3010), marks none either, for the same
+          reason. For these two clears none is carried to later passes: a later pass whose
+          sample misses the referred, faulting or refused account reads its older answer on
+          record and can still mark one (left open under BACKLOG #3100). Only the referral's own
+          clear below carries its accounts across passes.
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -7474,11 +7547,18 @@ class AuthService:
         revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        # A faulted account, like a referred one, keeps an older answer that may predate the fault
-        # (BACKLOG #3100), so a pass with either marks no clear.
-        covered = bool(ids) and None not in outcomes and not plan.referred and not plan.faulted
+        # A faulted or refused account, like a referred one, keeps an older answer that may predate
+        # the fault or the refusal (BACKLOG #3100, #3010), so a pass with any of them marks no clear.
+        covered = (
+            bool(ids)
+            and None not in outcomes
+            and not plan.referred
+            and not plan.faulted
+            and not plan.misconfigured
+        )
         settled = covered and undetermined not in outcomes
-        # Called only on a pass that judged something, so a pass of referrals only never gets here.
+        # Called only on a pass that judged something, so a pass that judged nothing never gets
+        # here.
         referral_clear = (
             covered
             and self._reconcile_referral_standing == "referred"
@@ -7600,7 +7680,7 @@ class AuthService:
           counts, a held one too, so an account that never reads PRESENT does not keep a trip or a
           referral open for good. For a hold the answer must not be undetermined: a lone account
           that is held, then strikes, then is held again is one hold, not one per flap. A probe
-          that reached no answer (unavailable, referred, faulted), a probe sample that misses the
+          that reached no answer (unavailable, referred, faulted, misconfigured), a probe sample that misses the
           accounts, and a pass that judged nothing end nothing, so one condition seen across a
           rotation or an outage stays one episode.
 
@@ -8232,8 +8312,8 @@ class AuthService:
             )
             return
         # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
-        # 0195 amendment 2026-10-11, BACKLOG #2138). A pass of referrals only never reaches here: it
-        # is not a trip (BACKLOG #2538).
+        # 0195 amendment 2026-10-11, BACKLOG #2138). No other pass that judged nothing reaches
+        # here: none of them is a trip (BACKLOG #2538, #3010, #3100).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
@@ -8266,8 +8346,9 @@ class AuthService:
     ) -> None:
         """Latch, log and audit a pass in which the directory referred probes.
 
-        BACKLOG #2538. Called on every pass that judged something, and on a pass of referrals
-        only; an outage pass does not call it. On one with a referral,
+        BACKLOG #2538. Called on every pass but an outage, the same as
+        :meth:`_record_reconcile_misconfigured` and :meth:`_record_reconcile_fault`. On one with a
+        referral,
         whatever else the pass did, it latches the message, logs it at ERROR with the first
         referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
         action, because a pass with a referral beside other answers is not an aborted one, and an
@@ -8291,18 +8372,10 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered without a referral were judged as usual."
         )
-        if plan.faulted:
-            # BACKLOG #3100. Counted here too, and recorded as a fault of their own.
-            others = f"{len(plan.faulted)} raised a probe fault. {others}"
-        if plan.unavailable:
-            # A pass of referrals and failures is recorded here and not as an outage, so the
-            # failures are counted here, or a near-total outage would read as a search-base fault.
-            others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
-            )
+        others = self._unjudged_others(plan, others, faults=True, refusals=True)
         self._reconcile_referral_alert = (
-            "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
-            "[auth].ad_group_search_base; one names a base in another domain of the forest. "
+            "LDAP referral: check [auth].ad_user_search_base, [auth].ad_group_search_base for "
+            "nested groups, and [auth].ad_bind_dn; one names another domain of the forest. "
             f"{len(plan.referred)} of {plan.asked} signed-in directory account(s) probed were "
             f"referred and left unjudged. {others} A referred account is never revoked while it "
             "is referred, because the engine does not follow referrals. Use a base in the bound "
@@ -8347,10 +8420,12 @@ class AuthService:
         source for the reason ``api/app.py::_alert_reconcile_plan`` states. **Nothing resolves
         that instance automatically**: an operator resolves it once the fault is gone.
 
-        Called on every pass that judged something, and on a pass of referrals or faults only; an
-        outage pass does not call it. A pass with no fault that judged something releases the
-        latched message. The message and the row carry counts and no username; the per-probe
-        WARNING in :meth:`_probe_principal` names each account and the exception type.
+        Called on every pass but an outage. Whatever else a pass did, one with no fault that judged
+        something releases the latched message, and one that judged nothing leaves it as it was.
+        The message, the row and the alert count the faults over the probes ASKED, as the
+        referral's do (BACKLOG #3170): an UNKEYED row was never sent, so it cannot fault. The
+        message and the row carry counts and no username; the per-probe WARNING in
+        :meth:`_probe_principal` names each account and the exception type.
         """
         if not plan.faulted:
             if not plan.judged_nothing:
@@ -8361,12 +8436,7 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered were judged as usual."
         )
-        if plan.unavailable:
-            # Counted here, as the referral's message does: a pass of faults and failures is
-            # recorded as a fault and not as an outage, so the outage would otherwise go unsaid.
-            others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
-            )
+        others = self._unjudged_others(plan, others, refusals=True)
         # The pointer to the account comes first: the store keeps only the first 200 characters
         # of an alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_fault_alert = (
@@ -8384,11 +8454,97 @@ class AuthService:
                     "reason": reconcile.PROBE_FAULT_ABORT,
                     "faulted": len(plan.faulted),
                     "unavailable": plan.unavailable,
-                    "probed": plan.probed,
+                    "asked": plan.asked,
                     "aborted": plan.aborted,
                 }
             ),
         )
+
+    async def _record_reconcile_misconfigured(
+        self, plan: reconcile.ReconcilePlan, *, first: reconcile.Probe | None
+    ) -> None:
+        """Latch, log and audit a pass in which the directory refused a probe for its configuration.
+
+        BACKLOG #3010. A search that ends with noSuchObject, invalidDNSyntax or
+        insufficientAccessRights says the configured base, or the service account's right to read
+        it, is wrong, not that the account is gone (:attr:`~reconcile.ProbeOutcome.MISCONFIGURED`).
+        It leaves that account unjudged: no strike and no revocation. A deleted or moved search base
+        refuses every account on every pass, so while it lasts nothing is revoked and the sessions
+        run to the absolute cap. Before #3010 such a search read as "not found", which tripped the
+        mass-revoke breaker on a large enough estate, and a plain outage would page nobody. So
+        every pass with such a refusal latches the message, logs it at ERROR with the first
+        refusal's text, and writes an ``auth.ad_reconcile_misconfigured`` row, and the lifespan
+        task raises it as ``ad_reconcile_aborted`` with reason ``directory_misconfigured`` under its
+        own source label, for the reasons :meth:`_record_reconcile_fault` gives. Like the fault's,
+        **nothing resolves that instance automatically**, and the latched message follows the
+        fault's rule.
+
+        Called on every pass but an outage. The message, the row and the alert count over the
+        probes ASKED (BACKLOG #3170). They carry counts and no username; the refusal's text names
+        the operation and the code, never the directory's diagnostic message, and
+        :meth:`_probe_principal` names each refused account at DEBUG.
+        """
+        if not plan.misconfigured:
+            if not plan.judged_nothing:
+                self._reconcile_misconfigured_alert = None
+            return
+        others = (
+            "The pass revoked nothing."
+            if plan.aborted is not None
+            else "Accounts that answered were judged as usual."
+        )
+        others = self._unjudged_others(plan, others, faults=True)
+        # The settings to change come first: the store keeps only the first 200 characters of an
+        # alert instance's reason, as `_record_reconcile_referral` says.
+        self._reconcile_misconfigured_alert = (
+            "LDAP configuration refused: check [auth].ad_user_search_base, "
+            "[auth].ad_group_search_base and the read rights of [auth].ad_bind_dn. "
+            f"{len(plan.misconfigured)} of {plan.asked} signed-in directory account(s) asked were "
+            f"refused for the configuration and left unjudged. {others} A refused account is "
+            "never revoked while the refusal lasts, so its sessions run to "
+            "[auth].session_absolute_hours. The ERROR log line for each such pass names the code."
+        )
+        _log.error(
+            "directory reconcile: %s First refusal: %s",
+            self._reconcile_misconfigured_alert,
+            first.detail if first is not None else "?",
+        )
+        await self._audit_reconciler_row(
+            "auth.ad_reconcile_misconfigured",
+            detail=_json(
+                {
+                    "reason": reconcile.MISCONFIGURED_ABORT,
+                    "misconfigured": len(plan.misconfigured),
+                    "unavailable": plan.unavailable,
+                    "asked": plan.asked,
+                    "aborted": plan.aborted,
+                }
+            ),
+        )
+
+    @staticmethod
+    def _unjudged_others(
+        plan: reconcile.ReconcilePlan, others: str, *, faults: bool = False, refusals: bool = False
+    ) -> str:
+        """``others`` led by the counts of the pass's other unjudged probes, for a latched message.
+
+        A pass whose every answer went unjudged is recorded by its referral, refusal or fault and
+        not as an outage, so its failures are counted here, or a near-total outage would read as a
+        configuration fault. ``faults`` and ``refusals`` add those counts too, each passed by every
+        recorder but its own kind's, so each message names the other unjudged kinds, which are
+        recorded under their own alerts as well."""
+        if faults and plan.faulted:
+            others = f"{len(plan.faulted)} raised a probe fault. {others}"
+        if refusals and plan.misconfigured:
+            others = f"{len(plan.misconfigured)} were refused for the configuration. {others}"
+        if plan.unavailable:
+            # UNAVAILABLE also carries an account whose group search the engine refused for its own
+            # paging bound (vault BACKLOG #3696), which pages on its own, so this names both.
+            others = (
+                f"{plan.unavailable} could not be read (the directory was unreachable, or the "
+                f"engine refused a group search for its own bound). {others}"
+            )
+        return others
 
     async def _audit_reconciler_row(
         self,
@@ -8401,19 +8557,19 @@ class AuthService:
         """Write one of the reconcile pass's rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row, the referral's row (BACKLOG #2538), the probe fault's row (BACKLOG #3100) and the
-        unkeyed-binding report. They include each paging refusal's
-        ``auth.ad_reconcile_paging_refused`` row (vault BACKLOG #3696), which names the account as
-        ``actor``. Since BACKLOG #3018 they also include each account's
+        row, the referral's row (BACKLOG #2538), the probe fault's row (BACKLOG #3100), the
+        configuration refusal's row (BACKLOG #3010) and the unkeyed-binding report. They include
+        each paging refusal's ``auth.ad_reconcile_paging_refused`` row (vault BACKLOG #3696), which
+        names the account as ``actor``. Since BACKLOG #3018 they also include each account's
         ``auth.ad_session_revoked`` row and, on the reconciler's call only, a rename's
         ``auth.ad_username_refreshed`` and ``auth.ad_username_refresh_conflict`` rows; those name
         the account as ``actor``. **A failed write here does not end the pass.** If it raised, the
         pass would return no plan, and the lifespan task would raise no alert for the revocations
-        already applied, nor for the hold, the breaker, the referral or the probe fault. It would
-        also skip every account after this one. So a store refusal of a type
-        :func:`_audit_write_errors` names is logged at ERROR, naming the action and the actor, and
-        the pass goes on. Any other error still raises and ends the pass. The log line is the only
-        record of a refused row: nothing retries it.
+        already applied, nor for the hold, the breaker, the referral, the probe fault, the
+        configuration refusal or a paging refusal. It would also skip every account after this
+        one. So a store refusal of a type :func:`_audit_write_errors` names is logged at ERROR,
+        naming the action and the actor, and the pass goes on. Any other error still raises and
+        ends the pass. The log line is the only record of a refused row: nothing retries it.
 
         A revocation or rename these rows record has already committed; the conflict row records a
         rename that was refused. A revocation's notice is sent inline, so it still goes. **A
@@ -9834,7 +9990,8 @@ class AuthService:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        or the probe cap full. It logs one WARNING per outage and, if that
+        refusing the search for its configuration (``misconfigured``, BACKLOG #3010), or the probe
+        cap full. It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
         said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
         apart, so an outage that flaps (a full cap turning over, or one referring account beside a
@@ -9983,8 +10140,12 @@ class AuthService:
         turn every sign-in into a forced sign-out of every other device.
 
         The prior session may belong to a different user, for example on a shared workstation. It is
-        still ended. Anyone holding that token could already end it with ``POST /auth/logout``, so
-        this grants no new power. The audit row's actor is the session's OWNER, not whoever signed
+        still ended. Anyone holding that LIVE token could already end it with ``POST
+        /auth/logout``, so ending the presented session grants no new power. Following the lineage
+        does grant one, and it is bounded: for :attr:`supersession_lineage_seconds` after an
+        elevation, a holder of the RETIRED token can end the session it became through a sign-in
+        that succeeds, which ``logout`` cannot do. docs/SECURITY.md states it. The audit row's
+        actor is the session's OWNER, not whoever signed
         in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
         user whose session ended, and must not put that user's ids in anyone else's.
 
@@ -9994,18 +10155,27 @@ class AuthService:
         session that was still LIVE gets an audit row, so the trail does
         not record the ending of something that had already ended.
 
-        **The read and the revoke are one atomic store operation (BACKLOG #2146).** Why that closes
-        the race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
+        **The read and the revoke are one store transaction (BACKLOG #2146).** Why that closes the
+        race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
         across engine processes too, because engine shards serve the API from one shared store.
 
-        **A rotation that committed BEFORE that operation is a stated limit, not a race this
-        closes.** The presented hash then names no session, so this ends nothing, and the session
-        lives on under its new token. docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs)
-        states how wide that window is.
+        **A rotation that committed BEFORE that transaction is followed (vault BACKLOG #3028, ADR
+        0210).** An elevation in another tab can finish while this sign-in is in flight, and on the
+        federated leg the presented hash was read at the start leg, before the identity provider's
+        round trip. The presented hash then names no session. The store follows the lineage links
+        each rotation wrote to the session's live end and revokes that, in the same transaction.
+        Only links retired within :attr:`supersession_lineage_seconds` of now are followed, so this
+        is the one place a retired hash leads anywhere, and it leads only to an end. An elevation
+        that finished longer ago than that, such as one a second holder of the token completed
+        earlier, is not followed; docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs) states
+        that bound. The audit row names the session that ended and, when a link was followed, the
+        hash that was presented.
         Returns True when it audited.
         """
         before = time.time()
-        prior = await self._store.supersede_session(prior_hash, now=before)
+        prior = await self._store.supersede_session(
+            prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
+        )
         if prior is None:
             return False
         after = time.time()
@@ -10019,10 +10189,13 @@ class AuthService:
         if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
             return False
         owner = await self._load_user(prior.user_id)
+        detail = {"scope": "superseded", "session": prior.token_hash[:12]}
+        if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
+            detail["presented"] = prior_hash[:12]
         await self._audit(
             "auth.session_revoked",
             actor=owner.username if owner is not None else None,
-            detail=_json({"scope": "superseded", "session": prior_hash[:12]}),
+            detail=_json(detail),
             client=client,
         )
         return True
@@ -11101,9 +11274,9 @@ class AuthService:
 
         **THE BASELINE IS THE ACCOUNT'S KNOWN-ADDRESS RECORD** (vault BACKLOG #2145): the host keys
         that :meth:`_mark_login_address_known` writes, which says when, read through the record's
-        primary key on the account id. It replaced a baseline read from ``audit_log``, which has no
-        actor index and could not tell a finished sign-in from one that stopped at the password on
-        the directory leg. Keyed on the
+        primary key on the account id. It replaced a baseline read from ``audit_log``, which then had
+        no actor index and could not tell a finished sign-in from one that stopped at the password
+        on the directory leg. Keyed on the
         account id, so a re-created namesake inherits nothing, and the account's deletion removes it.
 
         Only rows seen within ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` count. Addresses compare by
@@ -15199,10 +15372,12 @@ class AuthService:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
         Kept apart from the row write, so the background task can send the mail between this read
-        and :meth:`_record_lock_notice` (BACKLOG #2216). One such read runs at a time per
-        service (``_lock_notice_read_slots``). It walks every recent ``auth.lock_notice`` row of
-        every account, since the audit log has no actor index. Many locks at once would otherwise
-        fill the store's read pool, which sign-ins wait on too.
+        and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves it (vault BACKLOG
+        #3120); ``docs/SECURITY.md`` names it and says on which backends its use is measured. One
+        such read still runs at a time per service (``_lock_notice_read_slots``), so locks on many
+        accounts at once cannot fill the store's read pool, which sign-ins wait on too. The cost is
+        that each notice waits behind the reads queued before it, across every account in this
+        process; ``docs/SECURITY.md`` states it.
 
         A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
         neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,
@@ -15217,7 +15392,8 @@ class AuthService:
                 )
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(
-                "a security-notice throttle read failed (%s); the notice was sent unthrottled",
+                "a security-notice throttle read failed (%s); the throttle did not hold the notice "
+                "back, and whether it is mailed is up to the notifier",
                 type(exc).__name__,
             )
             return False
@@ -15236,9 +15412,16 @@ class AuthService:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
 
         ``mailed`` is true only when the account had an address AND the notifier took the event
-        (``handed``, BACKLOG #2019). A refused hand-off then writes ``mailed: false``, which holds
-        back no later mailable notice, so the next lock mails again rather than staying quiet for
-        a day."""
+        (``handed``, BACKLOG #2019). A refused hand-off, or one the notifier dropped on a full
+        queue or refused once it had begun to close at shutdown (vault BACKLOG #3120), then writes
+        ``mailed: false``, which holds back no later
+        mailable notice, so the next lock mails again rather than staying quiet for a day.
+
+        **A send that fails after the hand-off still leaves ``mailed: true``.** It fails on the
+        notifier's own task, after this row is written, and is recorded only on the notifier's
+        ``auth.lock_notice_undelivered`` row (BACKLOG #2383), which the throttle does not read. So
+        the next lock of the kind is held back for the rest of the window. A residual
+        ``docs/SECURITY.md`` states."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
@@ -15259,9 +15442,11 @@ class AuthService:
         or an admin action. The caller writes the audit row, not this method: see
         :meth:`_record_suspicious_login` for the two 6.3.5 events.
 
-        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019), so a
-        caller that audits the outcome can record what happened. That is a hand-off, not a delivery.
-        Most callers ignore it.
+        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019) and
+        said it took it: the shipped notifier answers ``False`` for an event it dropped, for the
+        reasons the ``SecurityNotifier`` contract lists (vault BACKLOG #3120). So a caller that audits the outcome
+        can record what happened. That is a hand-off, not a delivery: a send that fails later, on
+        the notifier's own task, is not reported back. Most callers ignore it.
 
         The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
         #1139), so read the branches rather than this paragraph if they ever diverge again."""
@@ -15308,7 +15493,7 @@ class AuthService:
             )
             return False
         try:
-            await self._security_notifier.notify(
+            taken = await self._security_notifier.notify(
                 SecurityEvent(
                     event_type=event_type,
                     username=username,
@@ -15332,4 +15517,6 @@ class AuthService:
                     type(exc).__name__,
                 )
             return False
-        return True
+        # bool(): a notifier outside the contract that returns nothing reads as not taken, so the
+        # cheap failure follows (a duplicate lock notice), never a day held back.
+        return bool(taken)

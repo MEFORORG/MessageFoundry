@@ -51,14 +51,15 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 class _RaisingNotifier:
     """A notifier that always fails, to prove a broken channel cannot refuse a login."""
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         raise OSError("synthetic relay failure")
 
 
@@ -799,8 +800,8 @@ async def test_the_record_is_keyed_on_the_account_not_the_username() -> None:
 
 
 async def test_the_signal_never_reads_the_audit_log(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Gap 5. The baseline read is one primary-key lookup on the record; ``audit_log``, which has
-    no actor index, is not read at all. A ``list_audit`` that raises cannot change the verdict."""
+    """Gap 5. The baseline read is one primary-key lookup on the record; ``audit_log`` is not read
+    at all. A ``list_audit`` that raises cannot change the verdict."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()

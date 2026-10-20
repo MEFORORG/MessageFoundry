@@ -39,6 +39,7 @@ from pydantic import ValidationError
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import (
+    _MISCONFIGURED_ALERT_SOURCE,
     _PROBE_FAULT_ALERT_SOURCE,
     _RECONCILE_CLEAR_RESOLVES,
     _REFERRAL_ALERT_SOURCE,
@@ -52,6 +53,7 @@ from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _accoun
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    MISCONFIGURED_ABORT,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ProbeOutcome,
@@ -959,6 +961,7 @@ _AUTH = SimpleNamespace(
     directory_reconcile_hold=None,
     directory_reconcile_referral=None,
     directory_reconcile_fault=None,
+    directory_reconcile_misconfigured=None,
 )
 
 #: The referral's own source label (BACKLOG #2538), apart from the breaker's.
@@ -1095,6 +1098,74 @@ def test_a_probe_fault_pages_under_its_own_source(
     assert [(e[0], e[1]) for e in sink.events] == expected
     faulted = [e for e in sink.events if (e[0], e[1]) == _FAULT_PAGE]
     assert faulted and all(e[2]["reason"] == PROBE_FAULT_ABORT for e in faulted)
+
+
+_REFUSAL_PAGE = ("ad_reconcile_aborted", _MISCONFIGURED_ALERT_SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (
+            ReconcilePlan(
+                probed=3,
+                asked=3,
+                misconfigured=("a",),
+                revocations=(SessionRevocation("b", "bwong", reason="directory_absent"),),
+            ),
+            [("ad_session_revoked", "bwong"), _REFUSAL_PAGE],
+        ),
+        (
+            # A pass of refusals only: the refusal's page alone, never the breaker's instance.
+            ReconcilePlan(probed=2, asked=2, misconfigured=("a", "b"), aborted=MISCONFIGURED_ABORT),
+            [_REFUSAL_PAGE],
+        ),
+        (
+            # A pass of referrals and refusals only: one page on each of their instances.
+            ReconcilePlan(
+                probed=2, asked=2, referred=("a",), misconfigured=("b",), aborted=REFERRAL_ABORT
+            ),
+            [("ad_reconcile_aborted", _REFERRAL_SOURCE), _REFUSAL_PAGE],
+        ),
+        (
+            ReconcilePlan(
+                probed=2, asked=2, misconfigured=("a",), faulted=("b",), aborted=MISCONFIGURED_ABORT
+            ),
+            [_REFUSAL_PAGE, _FAULT_PAGE],
+        ),
+        (
+            ReconcilePlan(probed=12, asked=12, misconfigured=("a",), aborted="mass_revoke_breaker"),
+            [("ad_reconcile_aborted", "directory-reconciler"), _REFUSAL_PAGE],
+        ),
+        (
+            # THE CONTROL: a plain outage pages nothing.
+            ReconcilePlan(probed=2, asked=2, unavailable=2, aborted="directory_unavailable"),
+            [],
+        ),
+    ],
+    ids=[
+        "beside-a-revocation",
+        "refusals-only",
+        "beside-a-referral",
+        "beside-a-fault",
+        "beside-a-trip",
+        "outage",
+    ],
+)
+def test_a_configuration_refusal_pages_under_its_own_source(
+    plan: ReconcilePlan, expected: list[tuple[str, str]]
+) -> None:
+    """BACKLOG #3010 limb 5. A deleted or moved search base read as an outage with #3010, which
+    pages nobody. Every pass with a configuration refusal pages under its own source, counted
+    over the probes asked, so an acknowledged refusal never silences a breaker trip or a referral.
+
+    RED before D3b: a pass of refusals only pages nothing."""
+    sink = _InverseSink()
+    _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
+    assert [(e[0], e[1]) for e in sink.events] == expected
+    for event in sink.events:
+        if (event[0], event[1]) == _REFUSAL_PAGE:
+            assert event[2]["reason"] == MISCONFIGURED_ABORT and event[2]["probed"] == plan.asked
 
 
 def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None:

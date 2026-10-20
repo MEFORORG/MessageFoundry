@@ -1418,8 +1418,9 @@ class _Recorder:
         # How many notices were queued when the drain ran: a drain before the notice loses it.
         self.queued_at_close: int | None = None
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
     def start(self) -> None:
         self.started = True
@@ -1804,7 +1805,7 @@ async def test_a_notifier_that_raises_is_recorded_as_no_hand_off() -> None:
     """The row is written after the notice, so a notifier failure cannot be recorded as dispatched."""
 
     class _Raising(_Recorder):
-        async def notify(self, event: SecurityEvent) -> None:
+        async def notify(self, event: SecurityEvent) -> bool:
             raise RuntimeError("synthetic notifier failure")
 
     store = await MessageStore.open(":memory:")

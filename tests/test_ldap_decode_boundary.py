@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import inspect
+import time
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
@@ -241,12 +242,9 @@ def _assert_referred_bind(exc: BaseException, operation: str) -> None:
 
 
 def test_a_service_bind_answered_with_a_referral_is_a_referral() -> None:
-    """Before D3b it read as an undecodable response, an outage the reconciler pages nobody for.
-    THE PREMISE first: the bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
-    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
-        dc,
-        authenticator,
-    ):
+    """Before D3b it read as an undecodable response, not as a referral. THE PREMISE first: the
+    bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
+    with _bad_bind_dc(_REFERRAL_BIND) as (dc, authenticator):
         with pytest.raises(KeyError) as bare:
             _bare_bind(dc.port)
         assert bare.value.args == (3,)
@@ -278,21 +276,10 @@ def test_a_user_bind_answered_with_a_referral_fails_a_present_and_an_absent_acco
 
 
 async def test_the_reconciler_reads_a_referred_service_bind_as_referred() -> None:
-    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's."""
-    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
-        dc,
-        authenticator,
-    ):
-        store = await MessageStore.open(":memory:")
-        try:
-            settings = _ad_settings(
-                ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
-            )
-            service = AuthService(store, settings, ldap=authenticator)
-            user = SimpleNamespace(id="u-1", username="alice", directory_object_id=None)
-            probe = await service._probe_principal(user)  # type: ignore[arg-type]
-        finally:
-            await store.close()
+    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's or the
+    probe fault's, and its detail names no referred host."""
+    with _bad_bind_dc(_REFERRAL_BIND) as (dc, authenticator):
+        probe = await _probe_through_the_reconciler(authenticator, dc.port)
     assert probe.outcome is ProbeOutcome.REFERRED
     assert probe.detail is not None and _REFERRED not in probe.detail
 
@@ -315,6 +302,60 @@ def test_a_referral_in_a_who_am_i_response_is_still_undecodable() -> None:
         reading = authenticator.read_bind_account()
     assert reading.whoami_error is not None
     assert "Who am I with a response ldap3 could not decode (KeyError)" in reading.whoami_error
+
+
+# --- the service connection is released by every lookup (D3b) ------------------------------------
+
+
+def _groups_answered(raw: bytes) -> list[_Reply]:
+    """The user search finds alice; the nested group search ends with success and no group."""
+    return [_done(RESULT_SUCCESS)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _group_search_busy(raw: bytes) -> list[_Reply]:
+    return [_done(51)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _group_page_undecodable(raw: bytes) -> list[_Reply]:
+    no_value = _tlv(0x30, _tlv(0x04, _OID))  # ldap3 raises TypeError on it
+    return [_bad_page(no_value)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _probe(name: str) -> Callable[[Any], object]:
+    return lambda authenticator: authenticator.probe_principal(name)
+
+
+def _sign_in(name: str) -> Callable[[Any], object]:
+    return lambda authenticator: authenticator.authenticate(name, "synthetic-user-pw")
+
+
+@pytest.mark.parametrize(
+    ("answer", "call", "sessions"),
+    [
+        pytest.param(_groups_answered, _probe("alice"), 1, id="probe-present"),
+        pytest.param(_groups_answered, _probe("nobody"), 1, id="probe-absent"),
+        pytest.param(_group_search_busy, _probe("alice"), 1, id="probe-group-search-busy"),
+        pytest.param(_group_page_undecodable, _probe("alice"), 1, id="probe-undecodable-page"),
+        pytest.param(_groups_answered, _sign_in("alice"), 2, id="sign-in-present"),
+        pytest.param(_groups_answered, _sign_in("nobody"), 2, id="sign-in-absent-decoy"),
+        pytest.param(_group_search_busy, _sign_in("alice"), 2, id="sign-in-group-search-busy"),
+    ],
+)
+def test_every_directory_session_a_lookup_opens_is_ended(
+    answer: Callable[[bytes], list[_Reply]], call: Callable[[Any], object], sessions: int
+) -> None:
+    """D3b, a finding of BACKLOG #3010's review. ``authenticate`` and ``probe_principal`` held the
+    service connection in ldap3's own ``with``, which never unbinds a connection bound on entry,
+    so every lookup left one directory session open until the connection was collected. Counted
+    at the loopback server, by the unbind requests it receives, whatever the lookup answered."""
+    with _scripted_dc(answer) as (dc, authenticator):
+        with contextlib.suppress(LdapError):
+            call(authenticator)
+        assert dc.opened == sessions, "the lookup did not open the sessions this case names"
+        deadline = time.monotonic() + _CLOSE_WAIT
+        while dc.unbound < dc.opened and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert dc.unbound == dc.opened, f"{dc.opened} session(s) opened, {dc.unbound} ended"
 
 
 # --- the nested group search: a malformed paged results control ---------------------------------
@@ -665,6 +706,22 @@ def test_an_unbind_error_never_replaces_the_refusal() -> None:
     assert raised.value is refusal
     with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
         pass
+
+
+def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
+    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): unlike
+    ``_released`` above after a clean block, an unbind whose send fails is suppressed, and the probe
+    still answers."""
+    with _scripted_dc(_groups_answered) as (_dc, authenticator):
+        real = ldap3.Connection.unbind
+
+        def failing_unbind(self: Any) -> Any:
+            real(self)
+            raise ldap3.core.exceptions.LDAPSocketSendError("synthetic")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ldap3.Connection, "unbind", failing_unbind)
+            assert authenticator.probe_principal("alice").principal is not None
 
 
 def test_the_refusal_warns_once_per_operation_and_fault(caplog: pytest.LogCaptureFixture) -> None:
