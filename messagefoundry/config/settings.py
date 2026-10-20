@@ -8174,8 +8174,9 @@ LOCKOUT_THRESHOLD_CEILING = 100
 
 def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str]]:
     """The ``[api].trusted_proxies`` entries that cover more than one address, as
-    ``(whole_family, ranges)``, in order and as written; a repeated spelling is named once
-    (BACKLOG #1131).
+    ``(whole_family, ranges)``. Each list keeps the input order across both families, and names each
+    network once, under the first spelling given for it: ``10.0.0.0/08`` and ``::ffff:10.0.0.0/104``
+    both name the network ``10.0.0.0/8`` does, so beside it they add nothing (BACKLOG #1131, #3393).
 
     ``whole_family`` holds EVERY multi-address entry of a family whose entries, together, cover
     every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
@@ -8189,9 +8190,12 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     Each entry is read by :func:`_parse_trusted_proxy`, the load's own reader, and one it refuses is
     skipped. The load refuses such an entry (BACKLOG #2488, #3042), so on a loaded config nothing is
     skipped."""
-    v4: list[tuple[str, ipaddress.IPv4Network]] = []
-    v6: list[tuple[str, ipaddress.IPv6Network]] = []
-    for entry in dict.fromkeys(entries):  # a repeated entry is named once, in order
+    v4: list[ipaddress.IPv4Network] = []
+    v6: list[ipaddress.IPv6Network] = []
+    # Keyed by the network an entry names, so a respelling is not named twice. The value is the
+    # first spelling and every family the network counts toward.
+    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[str, set[int]]] = {}
+    for entry in entries:
         try:
             parsed = _parse_trusted_proxy(entry)
         except ValueError:
@@ -8201,30 +8205,38 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
         # A mapped entry also stays in IPv6's collapse, since uvicorn holds it as an IPv6 network.
         net = ipaddress.ip_network(parsed)
         meaning = _ipv4_meaning(net)
-        if isinstance(net, ipaddress.IPv4Network):
-            v4.append((entry, net))
+        as_v4: ipaddress.IPv4Network | None
+        if isinstance(meaning, ipaddress.IPv4Network):
+            as_v4 = meaning  # an IPv4 entry is its own meaning
+        elif _trusts_every_ipv4_host(net):
+            # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
+            # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
+            as_v4 = ipaddress.IPv4Network("0.0.0.0/0")
         else:
-            v6.append((entry, net))
-            if isinstance(meaning, ipaddress.IPv4Network):
-                v4.append((entry, meaning))
-            elif _trusts_every_ipv4_host(net):
-                # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
-                # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
-                v4.append((entry, ipaddress.IPv4Network("0.0.0.0/0")))
+            as_v4 = None
+        if isinstance(net, ipaddress.IPv6Network):
+            v6.append(net)
+        families = {net.version}
+        if as_v4 is not None:
+            v4.append(as_v4)
+            families.add(4)
+        if net.num_addresses > 1:
+            named.setdefault(meaning, (entry, set()))[1].update(families)
+    # collapse_addresses takes one family at a time, so each is collapsed on its own.
+    covered = {
+        version
+        for version, collapsed in (
+            (4, ipaddress.collapse_addresses(v4)),
+            (6, ipaddress.collapse_addresses(v6)),
+        )
+        if any(n.prefixlen == 0 for n in collapsed)
+    }
     whole_family: list[str] = []
     ranges: list[str] = []
-    # collapse_addresses takes one family at a time, so each is collapsed on its own.
-    families: list[tuple[Sequence[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]], bool]]
-    families = [
-        (v4, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4))),
-        (v6, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6))),
-    ]
-    for family, covers_all in families:
-        multi = [entry for entry, net in family if net.num_addresses > 1]
-        (whole_family if covers_all else ranges).extend(multi)
-    # An entry counted in both families is named once, under the wider wording it earns.
-    whole_family = list(dict.fromkeys(whole_family))
-    return whole_family, [entry for entry in dict.fromkeys(ranges) if entry not in whole_family]
+    # An entry counted in both families earns the wider wording if either is covered whole.
+    for entry, counted_in in named.values():
+        (whole_family if counted_in & covered else ranges).append(entry)
+    return whole_family, ranges
 
 
 def _auth_default(field: str) -> Any:

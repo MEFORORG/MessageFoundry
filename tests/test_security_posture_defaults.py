@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import re
 from collections.abc import Collection
 from pathlib import Path
 from types import SimpleNamespace
@@ -1516,12 +1517,24 @@ def _proxy_risk(*entries: str) -> str:
     return dict(_pairs(api=_proxied(*entries)))["trusted_proxies"]
 
 
+def _named(risk: str) -> list[str]:
+    """The entries a proxy risk names, in order: each clause's comma-separated list after
+    "includes". Read whole, never by substring, since ``10.0.0.1`` is a substring of
+    ``10.0.0.16/28`` (BACKLOG #3393). A risk with no clause it can read fails here, so a reworded
+    clause cannot make every "not named" check pass on an empty list."""
+    clause = rf"includes (.+?), (?:{re.escape(_WHOLE_FAMILY)}|{re.escape(_RANGE)})"
+    listed = re.findall(clause, risk)
+    assert listed, risk
+    return [entry for entries in listed for entry in entries.split(", ")]
+
+
 @pytest.mark.parametrize(
     "entry",
     [
         "10.0.0.0/31",  # two addresses: the smallest IPv4 range
         "fd00::/127",  # two addresses: the smallest IPv6 range
         "10.0.0.0/30",  # a small pool
+        "10.0.0.16/28",  # spelled with the single-host entry as a prefix of its text
         "10.0.0.0/8",
         "fd00::/8",
     ],
@@ -1534,13 +1547,58 @@ def test_a_multi_address_proxy_entry_is_a_named_loosening(entry: str) -> None:
     risk = dict(pairs)["trusted_proxies"]
     assert _RANGE in risk and _WHOLE_FAMILY not in risk
     # The range is named; the single-host proxy entry beside it is not blamed.
-    assert entry in risk and "10.0.0.1" not in risk
+    assert _named(risk) == [entry]
+
+
+def test_a_substring_check_cannot_tell_a_named_host_from_a_range_spelled_after_it() -> None:
+    """BACKLOG #3393: the check above once read ``"10.0.0.1" not in risk``. Beside ``10.0.0.16/28``
+    that substring is present though the host is not named, so the old check could not tell the
+    two apart; it went red on a correct risk, and would stay red on a wrong one."""
+    risk = _proxy_risk("10.0.0.1", "10.0.0.16/28")
+    assert "10.0.0.1" in risk
+    assert "10.0.0.1" not in _named(risk)
 
 
 def test_multi_address_entries_are_read_strictly_and_named_once() -> None:
     assert _classify_proxy_entries(
         ["10.1.2.3/0", "10.0.0.1", "fd00::/127", "10.0.0.0/31", "fd00::/127"]
-    ) == ([], ["10.0.0.0/31", "fd00::/127"])
+    ) == ([], ["fd00::/127", "10.0.0.0/31"])
+
+
+def test_proxy_entries_keep_input_order_across_both_families() -> None:
+    """BACKLOG #3393: the docstring said "in order", and IPv4 entries came first whatever the input.
+    Red under the per-family order: ``["10.0.0.0/8", "fd00::/8"]``."""
+    assert _classify_proxy_entries(["fd00::/8", "10.0.0.0/8"]) == ([], ["fd00::/8", "10.0.0.0/8"])
+    risk = _proxy_risk("fd00::/8", "10.0.0.1", "10.0.0.0/8")
+    assert _named(risk) == ["fd00::/8", "10.0.0.0/8"]
+    # The whole-family list keeps input order too.
+    halves = _split("0.0.0.0/0", 1)[::-1]
+    assert _classify_proxy_entries(halves) == (halves, [])
+
+
+@pytest.mark.parametrize(
+    ("entries", "named"),
+    [
+        (["10.0.0.0/08", "10.0.0.0/8"], "10.0.0.0/08"),
+        (["10.0.0.0/8", "10.0.0.0/08"], "10.0.0.0/8"),
+        (["10.0.0.0/8", "::ffff:10.0.0.0/104"], "10.0.0.0/8"),
+        (["::ffff:10.0.0.0/104", "10.0.0.0/8"], "::ffff:10.0.0.0/104"),
+        (["::ffff:a00:0/104", "::ffff:10.0.0.0/104"], "::ffff:a00:0/104"),
+    ],
+)
+def test_one_network_spelled_twice_is_named_once_under_its_first_spelling(
+    entries: list[str], named: str
+) -> None:
+    """BACKLOG #3393: duplicates were removed by spelling, so one network written two ways was
+    named twice. A mapped entry names the IPv4 range it maps, since uvicorn is handed both
+    spellings of either (BACKLOG #3042)."""
+    assert _classify_proxy_entries(entries) == ([], [named])
+
+
+def test_a_respelled_whole_family_entry_is_named_once() -> None:
+    """The mapped block and ``0.0.0.0/0`` both trust every IPv4 peer, so the second adds nothing."""
+    assert _classify_proxy_entries(["::ffff:0:0/96", "0.0.0.0/0"]) == (["::ffff:0:0/96"], [])
+    assert _classify_proxy_entries(["0.0.0.0/0", "::ffff:0:0/96"]) == (["0.0.0.0/0"], [])
 
 
 def test_a_whole_family_and_a_range_in_another_family_each_get_their_wording() -> None:
@@ -1624,13 +1682,10 @@ def _split(network: str, bits: int) -> list[str]:
 def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[str]) -> None:
     """Review round 1: two halves trust every peer as surely as one /0 does."""
     risk = _proxy_risk(*entries)
-    assert risk is not None
-    # Every range in the union is named, so a regression naming only one half reds here.
-    for entry in entries:
-        if ipaddress.ip_network(entry).num_addresses > 1:
-            assert entry in risk
-    # The single-host proxy entry adds nothing to the union, so it is not blamed.
-    assert "10.0.0.1" not in risk
+    assert _WHOLE_FAMILY in risk
+    # Every range in the union is named, in input order, so a regression naming only one half reds
+    # here. The single-host proxy entry adds nothing to the union, so it is not blamed.
+    assert _named(risk) == [e for e in entries if ipaddress.ip_network(e).num_addresses > 1]
 
 
 def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
