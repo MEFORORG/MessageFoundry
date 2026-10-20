@@ -44,11 +44,6 @@ CREDENTIAL_ID_HASH_SCHEME = "wc1"
 #: Every tag this release can read. The rehash pass refuses a stored value with any other tag.
 CREDENTIAL_ID_HASH_SCHEMES = frozenset({CREDENTIAL_ID_HASH_SCHEME})
 
-#: What :func:`credential_id_hash_scheme` returns for a value with no tag: the bare
-#: :func:`hash_bytes` digest every release before BACKLOG #3423 wrote. It is today's hash, so the
-#: rehash pass moves such a row by adding the tag.
-UNTAGGED_CREDENTIAL_ID_HASH = ""
-
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -64,13 +59,14 @@ def credential_id_hash(raw_id: bytes) -> str:
 
 def credential_id_hash_scheme(stored: str) -> str:
     """The scheme a stored ``credential_id_hash`` names: a tag in :data:`CREDENTIAL_ID_HASH_SCHEMES`,
-    or :data:`UNTAGGED_CREDENTIAL_ID_HASH` for a bare pre-#3423 digest. Anything else raises
+    or ``""`` for a bare pre-#3423 :func:`hash_bytes` digest, which is today's hash with no tag, so
+    the rehash pass moves it by adding the tag. Anything else raises
     :class:`CredentialHashSchemeError`, so a stored marker only ever chooses among the schemes
     compiled into the release."""
     scheme, sep, digest = stored.partition(":")
     if not sep:
         if _HEX64.fullmatch(stored):
-            return UNTAGGED_CREDENTIAL_ID_HASH
+            return ""
         raise CredentialHashSchemeError("a credential-id hash carries no scheme tag")
     if scheme not in CREDENTIAL_ID_HASH_SCHEMES:
         raise CredentialHashSchemeError(

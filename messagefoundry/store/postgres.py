@@ -976,8 +976,13 @@ _SCHEMA: list[str] = [
         last_used_at       DOUBLE PRECISION
     )""",
     # BACKLOG #3423: the hash now carries a scheme tag ("wc1:" + 64 hex), wider than VARCHAR(64).
-    # Widening a varchar is metadata-only here, and the primary key comes along unchanged.
-    "ALTER TABLE webauthn_credentials ALTER COLUMN credential_id_hash TYPE VARCHAR(128)",
+    # Widening a varchar is metadata-only here, and the primary key comes along unchanged. Guarded,
+    # so a column already at 128 takes no ACCESS EXCLUSIVE lock when the batch runs again.
+    "DO $$ BEGIN IF (SELECT character_maximum_length FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'webauthn_credentials'"
+    " AND column_name = 'credential_id_hash') < 128 THEN"
+    " ALTER TABLE webauthn_credentials ALTER COLUMN credential_id_hash TYPE VARCHAR(128);"
+    " END IF; END $$",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite

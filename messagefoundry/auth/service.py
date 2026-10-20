@@ -128,7 +128,9 @@ from messagefoundry.auth.tokens import (
     hash_token,
     mint_token,
 )
-from messagefoundry.auth.tokens import credential_id_hash as _credential_id_hash
+from messagefoundry.auth.tokens import (
+    credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
+)
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
