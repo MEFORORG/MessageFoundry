@@ -99,7 +99,10 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
   });
 
   test("the secret key carries its scheme version (BACKLOG #3426)", () => {
-    assert.strictEqual(collectionsSecretKey("file:///ws/a"), `${LEGACY_COLLECTIONS_KEY}.v1.${DIGEST_A}`);
+    const v1 = `${LEGACY_COLLECTIONS_KEY}.v1.${DIGEST_A}`;
+    assert.strictEqual(collectionsSecretKey("file:///ws/a"), v1);
+    // Pinned by name too, so a later bump of the default cannot hide an edit to the v1 entry.
+    assert.strictEqual(collectionsSecretKey("file:///ws/a", "v1"), v1);
   });
 
   test("an unknown key scheme marker is refused, not resolved (BACKLOG #3426)", () => {
@@ -167,7 +170,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     assert.strictEqual(secrets.data.size, 0);
   });
 
-  test("reset after a failed migration also clears the workspaceState copy (BACKLOG #3426)", async () => {
+  test("reset after a failed migration keeps the unseen workspaceState copy, merged next (BACKLOG #3426)", async () => {
     const secrets = new FakeSecrets();
     const memento = new FakeMemento();
     await secrets.store(UNVERSIONED_A, "{not json");
@@ -176,8 +179,20 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     // The legacy merge reads the moved, unreadable secret and fails.
     await assert.rejects(store.load(), CollectionStoreError);
     await store.reset();
-    assert.deepStrictEqual(await store.load(), {}, "what the user deleted does not come back");
+    assert.deepStrictEqual(await store.load(), { old: coll("old") }, "readable collections survive");
     assert.strictEqual(memento.data.size, 0);
+  });
+
+  test("a load in the same tick as a reset waits behind it, and nothing comes back (BACKLOG #3426)", async () => {
+    const secrets = new FakeSecrets();
+    await secrets.store(UNVERSIONED_A, JSON.stringify({ a: coll("a") }));
+    const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
+    const resetting = store.reset(); // no migration has run, so the unversioned value is still there
+    const loading = store.load();
+    await resetting;
+    assert.deepStrictEqual(await loading, {});
+    assert.deepStrictEqual(await store.load(), {});
+    assert.strictEqual(secrets.data.size, 0);
   });
 
   test("reset waits for a running migration, so the move cannot write back what it deletes (BACKLOG #3426)", async () => {

@@ -39,8 +39,9 @@ function sha256Scope(workspaceScope: string): string {
  * How a workspace scope becomes a key, by scheme version (BACKLOG #3426). The release picks the
  * scheme, through CURRENT_KEY_SCHEME; no stored value names one. Only schemes in this table resolve,
  * and an unknown marker is refused rather than guessed at. A new digest is a new entry here, a bump of
- * CURRENT_KEY_SCHEME, and pointing the store's move at the previous scheme's key. Never edit an
- * existing entry: that would leave every saved collection under a key nothing reads.
+ * CURRENT_KEY_SCHEME, and a store move from every earlier key, the unversioned one included, since a
+ * workspace not opened under v1 still holds only that. Never edit an existing entry: that would leave
+ * every saved collection under a key nothing reads.
  */
 const KEY_SCHEMES: ReadonlyMap<string, (workspaceScope: string) => string> = new Map([
   ["v1", sha256Scope],
@@ -167,31 +168,45 @@ export class CollectionStore {
    * promise, a save racing a first load could land and then be overwritten by the load's merge.
    */
   private migrate(): Promise<void> {
-    this.migration ??= this.movePreviousKey()
-      .then(() => this.moveLegacy())
-      .catch((e: unknown) => {
-        this.migration = undefined; // let the next call retry
-        throw e;
-      });
+    if (this.migration === undefined) {
+      const run: Promise<void> = this.movePreviousKey()
+        .then(() => this.moveLegacy())
+        .catch((e: unknown) => {
+          // Let the next call retry, unless a reset has already chained itself on in its place.
+          if (this.migration === run) {
+            this.migration = undefined;
+          }
+          throw e;
+        });
+      this.migration = run;
+    }
     return this.migration;
   }
 
   /**
-   * Delete this workspace's saved collections: the way out of a stored value that cannot be read.
-   * Every copy goes, the unversioned key and workspaceState included, or a later migration would bring
-   * back what the user chose to delete. A migration already running settles first, so it cannot write
-   * back a value it read before the deletes; afterwards nothing is left to move.
+   * Delete this workspace's saved collections: the way out of a stored value that cannot be read. It
+   * deletes at least the versioned key and the unversioned one, or the next move would bring the old
+   * value back. It leaves a workspaceState map a failed migration kept, whose collections were never
+   * shown and may be readable, and the next load merges it as usual.
+   *
+   * The deletes join the migration chain: they wait for a migration already running, so it cannot write
+   * back a value it read first, and a load or save arriving meanwhile waits behind them.
    */
   async reset(): Promise<void> {
-    await this.migration?.catch(() => undefined);
-    this.migration = Promise.resolve();
+    const run = (this.migration ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        // Sources first: if the second delete fails, no older copy is left to move over the original.
+        await this.secrets.delete(this.previousKey);
+        await this.secrets.delete(this.key);
+      });
+    this.migration = run;
     try {
-      await this.secrets.delete(this.key);
-      await this.secrets.delete(this.previousKey);
-      await this.legacy.update(LEGACY_COLLECTIONS_KEY, undefined);
-    } catch (e) {
-      this.migration = undefined; // a copy may survive, so the next call migrates again
-      throw e;
+      await run;
+    } finally {
+      if (this.migration === run) {
+        this.migration = undefined; // the next call migrates again, merging any kept legacy map
+      }
     }
   }
 
