@@ -651,13 +651,14 @@ whole `phi_read_rate_limit_window_seconds`, rounded up, because the true wait wo
 accounts' reads. **`POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` keep the
 constant `Retry-After: 30` (a Lander decision under the owner's Driver delegation, 2026-10-20).** A
 caller that holds only the password can reach `POST /ui/mfa`, and the exact per-account wait would
-give it exact pacing for second-factor guesses. The constant discloses none.
+give it exact pacing for second-factor guesses. The constant discloses none. It is not the
+budget's clear-time: against the default 60 s window a client that honours it can be refused again.
 **`POST /ui/login` sends the whole `login_rate_limit_window_seconds`, rounded up, never the
 bucket's own wait (owner ruling 2026-10-20).** It is unauthenticated, and clients that share an
 address (users behind NAT or an untrusted proxy, or every client with no address, counted as
 `"unknown"`) share one bucket, so an exact wait would tell one of them when another's oldest
-attempt was made. The window discloses no per-bucket timing, and it is never too early: the
-bucket's oldest attempt leaves within it. Before this, the PHI-read `429` sent a literal `10` and
+attempt was made. The window discloses no per-bucket timing, though it does tell any caller the
+configured window, and it is never too early: the bucket's oldest attempt leaves within it. Before this, the PHI-read `429` sent a literal `10` and
 `POST /ui/login` a literal `30`, each against a default 60 s window, so a client that honoured
 either could have retried too early. The routes that send no `Retry-After`
 are unchanged; the [Route → limiter map](#route--limiter-map) names them.

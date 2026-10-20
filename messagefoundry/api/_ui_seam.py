@@ -601,9 +601,9 @@ from typing import Any
 #: refuses that pair at mount. Re-derived with ``--write``.
 #:
 #: Vault BACKLOG #3293: ``AuthService`` gained ``phi_read_retry_after``, ``login_retry_after`` and
-#: ``reauth_retry_after``. ``require_ui``'s PHI-read 429 and the ``POST /ui/login``, ``/ui/mfa``,
-#: ``/ui/reauth`` and ``/ui/reauth/webauthn`` 429s call them for their ``Retry-After``, where they
-#: sent literals. Methods the console calls, so a skew would be an AttributeError where the 429
+#: ``reauth_retry_after`` (the last SUPERSEDED: removed again below). ``require_ui``'s PHI-read 429
+#: and the ``POST /ui/login`` 429 call them for their ``Retry-After``, where they sent literals; the
+#: ceremony 429s did too until the later paragraph below. Methods the console calls, so a skew would be an AttributeError where the 429
 #: belongs; they force a bump. ``require_ui``'s body changed too, which moved the route-gate lines.
 #: The console's ``allow_reauth_attempt`` lost its ``getattr`` fallback and calls
 #: ``AuthService.allow_reauth_attempt`` directly, so that method is on the discovered surface now.

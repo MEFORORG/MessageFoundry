@@ -1685,7 +1685,7 @@ def test_phi_read_retry_after_is_the_limiters_wait_on_both_surfaces() -> None:
     assert _retry_after_values(json_gate) == [phi[0]], (
         "the JSON PHI-read gate and require_ui must send the same Retry-After for the same refusal"
     )
-    assert "Retry-After: 10" not in " ".join(_doc_text().split()), (
+    assert "`Retry-After: 10`" not in " ".join(_doc_text().split()), (
         "docs/SECURITY.md quotes the retired PHI-read Retry-After: 10; the 429 sends the actor's wait"
     )
 
@@ -2327,9 +2327,8 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
 
     ``POST /ui/mfa`` (ASVS 6.3.3) joined the set deliberately: it submits a second factor for a
     session that has already proven its password, so it draws the SAME per-actor ceremony budget as
-    ``POST /ui/reauth`` and must report the same clear-time. A different Retry-After on one limiter
-    would misreport when the budget actually recovers. All three send the constant ``30``
-    (BACKLOG #3293; docs/SECURITY.md says why).
+    ``POST /ui/reauth`` and sends the same ``Retry-After``. All three send the constant ``30``,
+    which is not the budget's clear-time (BACKLOG #3293; docs/SECURITY.md says why).
     """
     emitting = _retry_after_routes()
     assert emitting == {

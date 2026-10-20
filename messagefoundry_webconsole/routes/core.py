@@ -110,9 +110,8 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 _CSP_REPORT_SUMMARY_MAX = 5
 
 #: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
-#: ``/ui/reauth/webauthn``. A constant, not the bucket's exact wait (BACKLOG #3293; docs/SECURITY.md
-#: says why, once): a caller holding only the password can reach ``/ui/mfa``, and an exact wait
-#: would pace its second-factor guesses.
+#: ``/ui/reauth/webauthn``: a constant, not the bucket's exact wait (BACKLOG #3293). The reason is
+#: stated once, in docs/SECURITY.md, under the PHI-read ``Retry-After`` paragraph.
 _CEREMONY_RETRY_AFTER = "30"
 
 #: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
