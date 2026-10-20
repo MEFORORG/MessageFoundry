@@ -1695,10 +1695,14 @@ def test_an_ipv4_entry_s_mapped_twin_completes_the_ipv6_family() -> None:
     The rest was named as narrow ranges, because the twin never counted toward IPv6's collapse.
 
     Mutation: drop the twin from IPv6's collapse. Red: the rest is classed as ranges."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
     entries = [*_MAPPED_REST, "0.0.0.0/0"]
-    # What uvicorn is handed covers every IPv6 address: the premise this test rests on.
-    handed = [ipaddress.ip_network(h) for h in uvicorn_trusted_hosts(entries) if ":" in h]
-    assert list(ipaddress.collapse_addresses(handed)) == [ipaddress.ip_network("::/0")]
+    # The premise, asked of uvicorn itself: what it is handed trusts a mapped and a plain IPv6 peer.
+    # Control: without the IPv4 entry the mapped peer is not trusted.
+    assert "::ffff:203.0.113.9" in _TrustedHosts(uvicorn_trusted_hosts(entries))
+    assert "2001:db8::9" in _TrustedHosts(uvicorn_trusted_hosts(entries))
+    assert "::ffff:203.0.113.9" not in _TrustedHosts(uvicorn_trusted_hosts(_MAPPED_REST))
     assert _classify_proxy_entries(entries) == (entries, [])
     risk = _proxy_risk(*entries)
     assert _WHOLE_FAMILY in risk and _RANGE not in risk

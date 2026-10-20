@@ -1120,14 +1120,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > `0.0.0.0/0` or `::/0` loads and does the same thing for its address family. So do ranges whose union
 > covers a whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The entry names
 > every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
-> wording too. A range in the other family gets the range wording.
+> wording too. A range in the other family gets the range wording, unless that family is whole
+> too, counting each entry in both of its spellings (below).
 >
 > The check reads each entry with the same parser as the load, and skips an entry the load
 > refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
 > `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
-> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording. An IPv4 entry also
-> counts toward IPv6 as its mapped twin, which uvicorn is handed too, so `0.0.0.0/0` beside
-> ranges covering the rest of `::/0` gets the whole-family wording for those ranges.
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording. An IPv4 entry counts
+> toward IPv6 as its mapped twin (the same row says why), so `0.0.0.0/0` beside ranges covering
+> the rest of `::/0` gets the whole-family wording for those ranges.
 >
 > **Each network is named once, under the first spelling the list gives it.** Within each wording
 > the networks keep list order; the whole-family wording comes first. A later spelling of the same
