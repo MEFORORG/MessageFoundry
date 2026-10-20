@@ -13,8 +13,8 @@ from the ``SELECT`` projection reads back as absent, which is indistinguishable 
 never having run. This body round-trips the value through the real store object instead, so the
 PostgreSQL and SQL Server legs execute their own SQL rather than having it read.
 
-Deliberately **extra-free**: it imports nothing outside the core package and the store object it is
-handed, so the live server legs can import it inside a test function.
+Deliberately **extra-free**: it imports nothing outside the core package, its sibling test helpers
+and the store object it is handed, so the live server legs can import it inside a test function.
 
 The second half is the **release outcome** contract (BACKLOG #1562). ``ApprovalGate.approve`` claims
 a row as ``executing`` and settles it to ``approved``, ``failed`` or ``interrupted``, each through a
@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from tests._operator_audit_atomic_contract import TeeTap as _TeeTap
 
 #: Distinct from the username on purpose. A backend that returned the name where the id belongs --
 #: the exact confusion #1540 exists to remove -- would pass a check that let the two be equal.
@@ -92,10 +94,6 @@ async def _assert_pending_approval_contract(store: Any) -> None:
 # --- vault BACKLOG #2255: a transition and its audit row are one write -----------------------------
 
 
-class _AppendFails(Exception):
-    pass
-
-
 async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any]:
     return [
         r
@@ -104,61 +102,28 @@ async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any
     ]
 
 
-class _TeeTap(logging.Handler):
-    """Read each row a store tees off-box, from the real tee's own log record.
-
-    A handler on the ``messagefoundry.audit`` logger, so the real ``tee_audits`` path runs and
-    nothing is patched. Only teed rows land here, so a row that rolled back must not appear, and a
-    committed one must appear exactly once."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.teed: list[dict[str, Any]] = []
-        logging.getLogger("messagefoundry.audit").addHandler(self)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            event = json.loads(record.getMessage())
-        except ValueError:
-            return
-        if isinstance(event, dict):
-            self.teed.append(event)
-
-    def stop(self) -> None:
-        logging.getLogger("messagefoundry.audit").removeHandler(self)
-
-    def ids(self, action: str, approval_id: str) -> list[int]:
-        found = []
-        for event in self.teed:
-            if event.get("action") != action:
-                continue
-            try:
-                detail = json.loads(str(event.get("detail")))
-            except ValueError:
-                continue
-            if isinstance(detail, dict) and detail.get("approval_id") == approval_id:
-                found.append(int(event["row_id"]))
-        return found
-
-
 async def _assert_transition_audit_contract(store: Any) -> None:
     """``create_pending_approval`` and ``decide_pending_approval`` append their ``audit`` row in the
     SAME transaction, on this backend's own SQL.
 
-    The fault is injected at the append every audit write on every backend goes through, so the
-    rollback asserted here is the backend's own, not a wrapper declining to call it. Each backend's
-    ``_append_audit_row`` takes a different first argument, hence the catch-all signature."""
+    The faults are injected at the append, and at the COMMIT where :func:`commit_seam` says the
+    store has a seam for one, which Postgres does not. So the rollback asserted here is the
+    backend's own, not a wrapper declining to call it."""
     from uuid import uuid4
 
     from messagefoundry.store.store import AuditAppend
+    from tests._operator_audit_atomic_contract import (
+        AppendFailed,
+        CommitFailed,
+        commit_seam,
+        failing_append,
+        failing_commit,
+    )
 
-    approval_id, lost_id = uuid4().hex, uuid4().hex
+    approval_id = uuid4().hex
 
     def row(action: str, for_id: str = approval_id) -> Any:
         return AuditAppend(action, actor=_APPROVER, detail=json.dumps({"approval_id": for_id}))
-
-    async def _raises(*_args: Any, **_kwargs: Any) -> Any:
-        raise _AppendFails("audit append refused")
 
     def request(for_id: str) -> Any:
         return store.create_pending_approval(
@@ -172,29 +137,42 @@ async def _assert_transition_audit_contract(store: Any) -> None:
             audit=row("approval.requested", for_id),
         )
 
-    real_append = store._append_audit_row
+    async def refused_writes_leave_nothing(
+        fault: AbstractContextManager[None], raised: type[Exception]
+    ) -> None:
+        """Under ``fault`` a new request and a transition both raise, and neither leaves a row
+        or tees one. Under the commit fault each append really took a row id, so a backend that
+        teed before its commit would tee a row that rolled back."""
+        lost_id = uuid4().hex
+        with fault:
+            # A failed write rolls the INSERT back: no request is held without its row.
+            with pytest.raises(raised):
+                await request(lost_id)
+            # ...and it rolls a transition back: the row is still pending.
+            with pytest.raises(raised):
+                await store.decide_pending_approval(
+                    approval_id,
+                    status="executing",
+                    approver=_APPROVER,
+                    decided_at=1_001.0,
+                    audit=row("approval.release_attempted"),
+                )
+        assert await store.get_pending_approval(lost_id) is None
+        assert await _audit_rows_for(store, "approval.requested", lost_id) == []
+        assert await _status(store, approval_id) == "pending"
+        assert await _audit_rows_for(store, "approval.release_attempted", approval_id) == []
+        assert tap.ids("approval.requested", lost_id) == []
+        assert tap.ids("approval.release_attempted", approval_id) == []
+
     tap = _TeeTap()
     try:
         assert await request(approval_id) == approval_id
         assert len(await _audit_rows_for(store, "approval.requested", approval_id)) == 1
 
-        # A failed append rolls the INSERT back: no request is held without its row.
-        store._append_audit_row = _raises
-        with pytest.raises(_AppendFails):
-            await request(lost_id)
-        # ...and a failed append rolls a transition back: the row is still pending.
-        with pytest.raises(_AppendFails):
-            await store.decide_pending_approval(
-                approval_id,
-                status="executing",
-                approver=_APPROVER,
-                decided_at=1_001.0,
-                audit=row("approval.release_attempted"),
-            )
-        store._append_audit_row = real_append
-        assert await store.get_pending_approval(lost_id) is None
-        assert await _status(store, approval_id) == "pending"
-        assert await _audit_rows_for(store, "approval.release_attempted", approval_id) == []
+        await refused_writes_leave_nothing(failing_append(store, None), AppendFailed)
+        # vault BACKLOG #3324: the COMMIT itself refused, after the write and its append both ran.
+        if commit_seam(store):
+            await refused_writes_leave_nothing(failing_commit(store), CommitFailed)
 
         # A transition that matches no row writes no row.
         assert not await store.decide_pending_approval(
@@ -206,6 +184,7 @@ async def _assert_transition_audit_contract(store: Any) -> None:
             audit=row("approval.approved"),
         )
         assert await _audit_rows_for(store, "approval.approved", approval_id) == []
+        assert tap.ids("approval.approved", approval_id) == []
 
         # The control: one that matches moves the row and writes exactly one.
         assert await store.decide_pending_approval(
@@ -219,18 +198,12 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         rejected = await _audit_rows_for(store, "approval.rejected", approval_id)
         assert len(rejected) == 1 and str(rejected[0]["actor"]) == _APPROVER
 
-        # Each committed row is teed off-box once, as the row the chain holds. A refused append and
-        # a transition that matched nothing tee nothing. No arm here faults the COMMIT itself, so
-        # this does not show the tee waits for the commit; the backends' code order carries that.
+        # Each committed row is teed off-box once, as the row the chain holds.
         requested = await _audit_rows_for(store, "approval.requested", approval_id)
         assert tap.ids("approval.requested", approval_id) == [int(requested[0]["id"])]
-        assert tap.ids("approval.requested", lost_id) == []
-        assert tap.ids("approval.release_attempted", approval_id) == []
-        assert tap.ids("approval.approved", approval_id) == []
         assert tap.ids("approval.rejected", approval_id) == [int(rejected[0]["id"])]
     finally:
         tap.stop()
-        store._append_audit_row = real_append
         # Leave the table as it was found; the server legs share one database across tests.
         await store.decide_pending_approval(
             approval_id, status="rejected", approver="contract-cleanup", decided_at=1_004.0

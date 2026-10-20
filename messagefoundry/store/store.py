@@ -5899,9 +5899,11 @@ class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
 
     For a record that must not outlive, or be outlived by, the row it describes. Written as a
-    second call, a crash between the two kept the change and lost its record. ``create_user`` and
-    ``update_user_profile`` take them (BACKLOG #2221), and so do the operator mutations through an
-    :data:`OperatorAudit` (BACKLOG #2624). Each joins the hash chain
+    second call, a crash between the two kept the change and lost its record. At least these take
+    them: ``create_user`` and ``update_user_profile`` (BACKLOG #2221), the operator mutations
+    through an :data:`OperatorAudit` (BACKLOG #2624), the four operator alert mutations (vault
+    BACKLOG #3217), a dual-control request and its transitions (vault BACKLOG #2255), and
+    ``replace_totp_enrolment`` (ADR 0171 Amendment B). Each joins the hash chain
     :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
