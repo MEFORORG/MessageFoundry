@@ -1168,6 +1168,16 @@ def test_listener_sha224_signature_follows_the_runtime(
 # trust branches, that a refusal is not read as bad TLS material, and that no second copy of the
 # setter call exists to drift. The floor probe is left stock on purpose; the last arms pin that.
 
+#: The first-party Python roots the setter scan reads.
+_FIRST_PARTY_ROOTS = (
+    "messagefoundry",
+    "messagefoundry_toolkit",
+    "messagefoundry_webconsole",
+    "harness",
+    "tee",
+    "scripts",
+)
+
 _CLIENT_CONTEXT_SITES = ("apiclient pinned", "apiclient os store", "tray pinned", "tray os store")
 
 #: What the ``client_contexts`` fixture hands a test: install a stand-in class, get the ones made.
@@ -1231,18 +1241,21 @@ def test_the_client_contexts_reach_the_pin(site: str, client_contexts: _Install)
 def test_a_client_sigalg_refusal_is_not_read_as_bad_tls_material(
     site: str, client_contexts: _Install
 ) -> None:
-    """A build that refuses every list fails closed with the shared module's ``RuntimeError``. It
-    is not an ``OSError``, so neither the apiclient's "cannot load TLS material" handlers nor the
-    tray's fall-back-to-the-OS-store handler can swallow it as a bad file."""
+    """A build that refuses every list fails closed, and never as an ``OSError``, so neither the
+    apiclient's "cannot load TLS material" handlers nor the tray's fall-back-to-the-OS-store handler
+    can read it as a bad file. The apiclient raises the ``ApiError`` its callers handle; the tray
+    keeps the shared module's ``RuntimeError``, as it does for a refused suite list."""
 
     class _Refusing(_SigalgCapableContext):
         def refuse(self, sigalgs: str) -> bool:
             return True
 
     client_contexts(_Refusing)
-    with pytest.raises(tls_sigalgs.NarrowerRefused, match="without SHA-224") as caught:
+    expected = apiclient.ApiError if site.startswith("apiclient") else tls_sigalgs.NarrowerRefused
+    with pytest.raises(expected, match="without SHA-224") as caught:
         _build_client_context(site, "unused-ca.pem")
     assert not isinstance(caught.value, OSError)
+    assert "TLS material" not in str(caught.value)
 
 
 @pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)
@@ -1259,10 +1272,14 @@ def test_client_context_sha224_offer_follows_the_runtime(
 
 def test_one_module_sets_the_signature_schemes() -> None:
     """``tls_policy``, the apiclient and the tray share one implementation, so a second module that
-    calls the setter is a second copy that can drift. The expected set doubles as the control: the
-    scan must find the one module, or it found nothing."""
+    calls the setter is a second copy that can drift. Every first-party Python root is read, not
+    only the engine package. The expected set doubles as the control: the scan must find the one
+    module, or it found nothing."""
+    repo = _PKG.parent
+    roots = [repo / name for name in _FIRST_PARTY_ROOTS]
+    assert all(root.is_dir() for root in roots), [str(r) for r in roots if not r.is_dir()]
     found = set()
-    for path in sorted(_PKG.rglob("*.py")):
+    for path in sorted(p for root in roots for p in root.rglob("*.py")):
         text = path.read_text(encoding="utf-8-sig")
         if (
             "_sigalgs" not in text
@@ -1270,7 +1287,7 @@ def test_one_module_sets_the_signature_schemes() -> None:
             continue
         tree = ast.parse(text)
         if any(call_sites(tree, name) for name in ("set_server_sigalgs", "set_client_sigalgs")):
-            found.add(path.relative_to(_PKG.parent).as_posix())
+            found.add(path.relative_to(repo).as_posix())
     assert found == {"messagefoundry/tls_sigalgs.py"}, sorted(found)
 
 

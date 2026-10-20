@@ -71,6 +71,9 @@ _CLI_ENGINE = frozenset(
         # the guard before its other imports. Stdlib and `controlchars` only.
         "messagefoundry.remotedebug",
         "messagefoundry.secretscrub",
+        # Eager on purpose (BACKLOG #3414): `config.tls_policy` re-exports the stdlib-only
+        # signature-scheme narrower from it, so loading tls_policy loads it.
+        "messagefoundry.tls_sigalgs",
     }
 )
 

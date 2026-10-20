@@ -58,8 +58,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from messagefoundry import tls_sigalgs
-from messagefoundry.tls_sigalgs import narrow_signature_algorithms
+from messagefoundry.tls_sigalgs import NarrowerRefused, narrow_signature_algorithms
 
 logger = logging.getLogger(__name__)
 
@@ -1524,10 +1523,11 @@ class EngineTlsListRefused(ValueError):
 
 #: What :func:`narrow_tls13_suites` and :func:`narrow_signature_algorithms` raise when there is no
 #: engine list the build will take. The signature-scheme narrowing lives in the stdlib-only
-#: :mod:`messagefoundry.tls_sigalgs` (BACKLOG #3414), so the class does too, and both narrowers share
-#: it. A subclass of :class:`RuntimeError`, so the wrappers convert only that and not any other
-#: :class:`RuntimeError`, such as a ``NotImplementedError``.
-_NarrowerRefused = tls_sigalgs.NarrowerRefused
+#: :mod:`messagefoundry.tls_sigalgs` (BACKLOG #3414), so the class does too, and both narrowers
+#: share it. Its own :class:`RuntimeError` subclass, so the wrappers convert only that and not any
+#: other :class:`RuntimeError`, such as a ``NotImplementedError``. Bound here under the private name
+#: the wrappers and the tests use.
+_NarrowerRefused = NarrowerRefused
 
 
 def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:

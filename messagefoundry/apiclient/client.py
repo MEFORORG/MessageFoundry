@@ -82,7 +82,7 @@ from messagefoundry.api.models import (
 )
 from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.tls_sigalgs import narrow_signature_algorithms
+from messagefoundry.tls_sigalgs import NarrowerRefused, narrow_signature_algorithms
 
 __all__ = ["EngineClient", "ApiError", "IdpStepUpRequired"]
 
@@ -482,7 +482,14 @@ def _build_verify_context(
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
     _narrow_tls13(ctx)
-    narrow_signature_algorithms(ctx)
+    try:
+        narrow_signature_algorithms(ctx)
+    except NarrowerRefused as exc:
+        # The ApiError every caller handles, and not an OSError: the handlers around this call
+        # would report one as bad TLS material, and the fault is the interpreter's OpenSSL build.
+        raise ApiError(
+            f"this Python/OpenSSL build refused the client's TLS signature scheme list: {exc}"
+        ) from exc
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM. This client
         # takes no key passphrase, so an encrypted key is refused before OpenSSL could prompt at a

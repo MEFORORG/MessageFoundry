@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The SHA-224 signature-scheme narrowing, in ONE copy every TLS client and server shares.
+"""The SHA-224 signature-scheme narrowing: one copy for the engine, the apiclient and the tray.
 
 :func:`narrow_signature_algorithms`'s docstring is the one statement of what it does, of the owner
 ruling of 2026-09-29 on ASVS 11.4.1 behind it, and of what it reaches. ``tls_policy`` re-exports
@@ -46,8 +46,9 @@ class NarrowerRefused(RuntimeError):
 
     A :class:`RuntimeError` and never an :class:`ssl.SSLError`, so a caller that reads an
     ``SSLError`` as "cannot load the certificate", as the tray's ``load_pin`` does, cannot report a
-    build fault as a bad file. ``tls_policy`` turns it into a configuration refusal (BACKLOG #2484);
-    the apiclient and the tray let it propagate, as they do for a refused suite list."""
+    build fault as a bad file. ``tls_policy`` turns it into a configuration refusal (BACKLOG #2484),
+    the apiclient into the ``ApiError`` its callers handle, and the tray lets it propagate, as it
+    does for a refused suite list."""
 
 
 @functools.cache
@@ -118,8 +119,11 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     ``rsa_pss_pss_*``. The two apply to different key types, so no certificate can use both.
 
     SHA-1 schemes stay in the list, as they are in the default one. The OpenSSL security level
-    filters them out of what is sent, and ``tls_policy.refuse_lowered_security_level`` holds that
-    level.
+    filters them out of what is sent. On the engine's gated contexts
+    ``tls_policy.refuse_lowered_security_level`` holds that level. The apiclient and the tray probe
+    carry the level their context starts with and refuse none, so on a box whose OpenSSL
+    configuration lowers the default level, those two would offer SHA-1 schemes as the stock
+    context there would.
 
     **``False`` means SHA-224 is still offered.** That is CPython 3.14, which has no setter, and a
     3.15 linked to an OpenSSL older than 3.4, whose catalogue cannot be read. The second case logs a
