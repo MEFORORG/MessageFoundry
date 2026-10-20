@@ -8562,9 +8562,6 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
         before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
         return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
-    # The stored form, with the parameters the prompt enrolled under (BACKLOG #3422). The prompt
-    # already returns it; marking here keeps a bare secret from reaching the store all the same.
-    secret = totp.new_enrolment(secret)
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)

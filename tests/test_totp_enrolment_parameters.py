@@ -15,13 +15,14 @@ real release would widen beside it), because that is the edit a future release w
 from __future__ import annotations
 
 import hmac
+import logging
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from _totp_clock import pin_totp_clock
+from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.auth import totp
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, lockable_account_census
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
@@ -45,10 +46,6 @@ def _reference_code(secret: str, moment: float, digest: str = "sha256") -> str:
     mac = hmac.new(key, int(moment // 30).to_bytes(8, "big"), digest).digest()
     offset = mac[-1] & 0x0F
     return str((int.from_bytes(mac[offset : offset + 4], "big") & 0x7FFFFFFF) % 10**6).zfill(6)
-
-
-def _sha256_six_digit(secret: str, moment: float) -> str:
-    return _reference_code(secret, moment)
 
 
 def _move_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -82,7 +79,7 @@ def test_new_enrolment_records_the_default_and_round_trips() -> None:
     assert totp.new_enrolment(stored) == stored  # already stored: unchanged
     assert totp.needs_reenrolment(stored) is False
     code = totp.totp(stored, now=_T0)
-    assert code == totp.totp(_SECRET, now=_T0) == _sha256_six_digit(_SECRET, _T0)
+    assert code == totp.totp(_SECRET, now=_T0) == _reference_code(_SECRET, _T0)
     assert totp.verify_totp_step(stored, code, now=_T0, window=0) == int(_T0 // 30)
 
 
@@ -90,7 +87,7 @@ def test_an_unmarked_enrolment_still_verifies_after_the_default_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _move_default(monkeypatch)
-    code = _sha256_six_digit(_SECRET, _T0)
+    code = _reference_code(_SECRET, _T0)
     assert totp.verify_totp_step(_SECRET, code, now=_T0, window=0) == int(_T0 // 30)
     assert totp.totp(_SECRET, now=_T0) == code
     assert totp.needs_reenrolment(_SECRET) is True  # offered a fresh one, still working meanwhile
@@ -103,7 +100,7 @@ def test_a_marked_enrolment_computes_with_what_it_records(
     _move_default(monkeypatch)
     after = totp.new_enrolment(_SECRET)
     assert after == f"totp1:SHA256:8:30:{_SECRET}"
-    old_code = _sha256_six_digit(_SECRET, _T0)
+    old_code = _reference_code(_SECRET, _T0)
     assert totp.verify_totp_step(before, old_code, now=_T0, window=0) == int(_T0 // 30)
     assert totp.needs_reenrolment(before) is True
     assert totp.needs_reenrolment(after) is False
@@ -125,6 +122,9 @@ def test_a_marked_enrolment_computes_with_what_it_records(
         f"totp1:SHA256:6:1:{_SECRET}",
         f"totp2:SHA256:6:30:{_SECRET}",
         f"totp1:SHA256:6:{_SECRET}",
+        f"totp1:SHA256:06:30:{_SECRET}",  # a compiled-in set, but not its canonical spelling
+        f"totp1:SHA256:{'9' * 5000}:30:{_SECRET}",  # past int()'s digit limit: still refused
+        f"totp1:SHA256:6:30:extra:{_SECRET}",
         "totp1:SHA256:6:30:",
         f"totp1:SHA256:\uff16:30:{_SECRET}",  # a fullwidth digit is not a digit here
         f"mfenc:v1:{_SECRET}",  # ciphertext a keyless open hands through
@@ -141,7 +141,7 @@ def test_an_unknown_marker_is_refused(stored: str) -> None:
         totp.new_enrolment(stored)
     assert totp.needs_reenrolment(stored) is True
     # Refused rather than computed with: not even the code the named digest would give matches.
-    for code in (_reference_code(_SECRET, _T0, "sha1"), _sha256_six_digit(_SECRET, _T0)):
+    for code in (_reference_code(_SECRET, _T0, "sha1"), _reference_code(_SECRET, _T0)):
         assert totp.verify_totp_step(stored, code, now=_T0, window=1) is None
 
 
@@ -166,7 +166,7 @@ async def test_service_enrolment_stores_its_parameters_and_reports_none_to_redo(
         assert stored == totp.new_enrolment(enroll.secret)
         assert "digits=6" in enroll.otpauth_uri and enroll.secret in enroll.otpauth_uri
         confirmed = await service.confirm_mfa_enrollment(
-            identity, totp.totp(enroll.secret), token=token
+            identity, fresh_totp(enroll.secret), token=token
         )
         assert confirmed.ok
         assert (await service.mfa_status(identity)).totp_reenrolment_recommended is False
@@ -187,7 +187,7 @@ async def test_an_enrolment_written_before_the_change_signs_in_after_a_default_m
         assert staged is not None
         pin_totp_clock(monkeypatch, _T0)
         confirmed = await service.confirm_mfa_enrollment(
-            identity, _sha256_six_digit(_SECRET, _T0), token=token
+            identity, _reference_code(_SECRET, _T0), token=token
         )
         assert confirmed.ok
         assert (await service.mfa_status(identity)).totp_reenrolment_recommended is False
@@ -200,7 +200,27 @@ async def test_an_enrolment_written_before_the_change_signs_in_after_a_default_m
         assert out.ok and out.mfa_required and out.token is not None
         t1 = _T0 + 30
         pin_totp_clock(monkeypatch, t1)
-        verified = await service.verify_mfa(out.token, _sha256_six_digit(_SECRET, t1))
+        verified = await service.verify_mfa(out.token, _reference_code(_SECRET, t1))
         assert verified.ok is True
+    finally:
+        await store.close()
+
+
+async def test_a_refused_enrolment_is_named_by_the_census_with_its_own_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, _, _ = await login_admin(service)
+        cell = await store.set_totp_secret(identity.user_id, secret=f"totp1:SHA1:6:30:{_SECRET}")
+        assert await store.enable_totp(
+            identity.user_id, recovery_code_hashes=[], expected_secret_cell=cell
+        )
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            census = await lockable_account_census(store, AuthSettings())
+        assert census.undecryptable_totp == (ADMIN_USERNAME,)
+        assert any("does not compute with" in r.getMessage() for r in caplog.records)
+        assert not any("does not decrypt" in r.getMessage() for r in caplog.records)
     finally:
         await store.close()

@@ -22,7 +22,7 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
-from messagefoundry.auth.totp import DEFAULT_DIGITS as TOTP_DIGITS
+from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
@@ -64,7 +64,7 @@ class LoginRequest(RequestModel):
     supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
     # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
     # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
-    # TOTP digit count; the engine treats a blank one as absent. No response gains a field.
+    # longest code any compiled-in enrolment gives (#3422); the engine treats a blank one as absent.
     totp_code: str | None = Field(default=None, max_length=TOTP_DIGITS, pattern=r"^[0-9]*$")
 
 

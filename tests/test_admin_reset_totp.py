@@ -149,7 +149,8 @@ def console(monkeypatch: pytest.MonkeyPatch) -> _Console:
 
     def enrol(*, username: str, skew_steps: int, **_wording: str) -> tuple[str, str, float]:
         at = time.time()
-        return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
+        # What the real prompt returns: the enrolment in its stored form (BACKLOG #3422).
+        return totp.new_enrolment(_NEW_SECRET), totp.totp(_NEW_SECRET, now=at), at
 
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     monkeypatch.setattr(cli, "_show_on_terminal", recorded.show)

@@ -33,6 +33,7 @@ from urllib.parse import quote, urlencode
 
 __all__ = [
     "DEFAULT_DIGITS",
+    "MAX_DIGITS",
     "DEFAULT_PARAMETERS",
     "DEFAULT_PERIOD",
     "DEFAULT_WINDOW",
@@ -43,6 +44,7 @@ __all__ = [
     "needs_reenrolment",
     "new_enrolment",
     "parse_enrolment",
+    "reenrolment_possible",
     "totp",
     "verify_totp",
     "verify_totp_step",
@@ -103,11 +105,11 @@ def _decode_secret(secret: str) -> bytes:
 #: ruling. An existing enrolment computes with the digest it records (:func:`parse_enrolment`), so a
 #: change here moves only enrolments made after it (BACKLOG #3422).
 #:
-#: THIS CONSTANT AND THE ADVERTISED ALGORITHM MUST NEVER DIVERGE. The authenticator computes with
-#: whatever ``otpauth_uri`` told it and the engine computes with this — so a change to one alone does
-#: not fail loudly, it silently produces codes that never match, for every user, with no diagnostic.
-#: That is why :data:`_TOTP_ALGORITHM` is DERIVED from this rather than written beside it: the two
-#: cannot be edited apart. ``hashlib.sha256().name.upper()`` is exactly the otpauth spelling, and the
+#: WHAT IS ADVERTISED AND WHAT IS COMPUTED WITH MUST NEVER DIVERGE. The authenticator computes with
+#: whatever ``otpauth_uri`` told it, and the engine with the parameters the enrolment records; a
+#: mismatch does not fail loudly, it silently produces codes that never match, with no diagnostic.
+#: So both read one :class:`TotpParameters`, and :data:`_TOTP_ALGORITHM` is DERIVED from this
+#: rather than written beside it: the two cannot be edited apart. ``hashlib.sha256().name.upper()`` is exactly the otpauth spelling, and the
 #: same derivation is correct for all three permitted digests.
 _TOTP_DIGEST = hashlib.sha256
 _TOTP_ALGORITHM = _TOTP_DIGEST().name.upper()
@@ -129,7 +131,9 @@ DEFAULT_PARAMETERS = TotpParameters(_TOTP_ALGORITHM, DEFAULT_DIGITS, DEFAULT_PER
 
 #: What an enrolment that records no parameters was made with (BACKLOG #3422). Before that change
 #: the stored cell held the bare base32 secret and the parameters were the module constants above,
-#: which were SHA-256, 6 digits and 30 seconds from 2026-08-11. THESE ARE LITERALS AND MUST NEVER
+#: which were SHA-256, 6 digits and 30 seconds from 2026-08-11. (A cell written before then was
+#: SHA-1; those stopped matching at the G18 move, accepted while nothing was deployed, and this does
+#: not restore them.) THESE ARE LITERALS AND MUST NEVER
 #: CHANGE, and above all they must never be derived from the defaults: they describe enrolments
 #: already written, so a release that moves a default must leave them where they are, or every
 #: unmarked authenticator stops matching, which is exactly the failure this item closed.
@@ -149,6 +153,10 @@ _DIGESTS = {"SHA256": "sha256", _TOTP_ALGORITHM: _TOTP_DIGEST().name}
 #: engine cannot use is named by the startup census and by ``messagefoundry verify``.
 _COMPILED_PARAMETERS = frozenset({DEFAULT_PARAMETERS, UNMARKED_PARAMETERS})
 
+#: The longest code any compiled-in enrolment produces: the bound for a code field read before the
+#: account is known, which cannot assume the default's length (BACKLOG #3422).
+MAX_DIGITS = max(params.digits for params in _COMPILED_PARAMETERS)
+
 #: Opens a stored enrolment that records its parameters: ``totp1:<algorithm>:<digits>:<period>:``
 #: then the base32 secret. A colon is outside the base32 alphabet, so no bare secret carries one,
 #: and an unmarked cell is told apart from a marked one by its content alone.
@@ -160,6 +168,11 @@ class RefusedEnrolment(ValueError):
     :data:`_COMPILED_PARAMETERS`. Refused, never computed with. The message names no value."""
 
 
+def _marker(params: TotpParameters) -> str:
+    """The canonical marker text for ``params``, the only spelling :func:`parse_enrolment` reads."""
+    return f"{_ENROLMENT_MARKER}:{params.algorithm}:{params.digits}:{params.period}"
+
+
 def new_enrolment(secret: str) -> str:
     """The stored form of a new enrolment of ``secret``: the bare base32 secret marked with
     :data:`DEFAULT_PARAMETERS`, which :func:`otpauth_uri` then advertises and every code check
@@ -167,26 +180,30 @@ def new_enrolment(secret: str) -> str:
     if ":" in secret:
         parse_enrolment(secret)
         return secret
-    p = DEFAULT_PARAMETERS
-    return f"{_ENROLMENT_MARKER}:{p.algorithm}:{p.digits}:{p.period}:{secret}"
+    return f"{_marker(DEFAULT_PARAMETERS)}:{secret}"
 
 
 def parse_enrolment(stored: str) -> tuple[str, TotpParameters]:
     """Split a stored enrolment into its bare base32 secret and the parameters it was made with.
 
     A cell with no marker is an enrolment written before BACKLOG #3422 and gets
-    :data:`UNMARKED_PARAMETERS`. Any other marker that does not name a set in
-    :data:`_COMPILED_PARAMETERS` raises :class:`RefusedEnrolment`."""
+    :data:`UNMARKED_PARAMETERS`. A marker is matched against the canonical spelling of each set in
+    :data:`_COMPILED_PARAMETERS`, never parsed into numbers, so a set outside them, a non-canonical
+    spelling of one inside them, or a malformed marker raises :class:`RefusedEnrolment`."""
     if ":" not in stored:
         return stored, UNMARKED_PARAMETERS
-    fields = stored.split(":")
-    if len(fields) == 5 and fields[0] == _ENROLMENT_MARKER and fields[4]:
-        _, algorithm, digits, period, secret = fields
-        if all(f.isascii() and f.isdigit() for f in (digits, period)):
-            params = TotpParameters(algorithm, int(digits), int(period))
-            if params in _COMPILED_PARAMETERS:
+    marker, _, secret = stored.rpartition(":")
+    if secret:
+        for params in _COMPILED_PARAMETERS:
+            if _marker(params) == marker:
                 return secret, params
     raise RefusedEnrolment("the stored TOTP enrolment names parameters this release cannot use")
+
+
+def reenrolment_possible() -> bool:
+    """Whether any enrolment this release accepts can differ from its default, so a caller can skip
+    opening a cell only to learn that :func:`needs_reenrolment` is false."""
+    return any(params != DEFAULT_PARAMETERS for params in _COMPILED_PARAMETERS)
 
 
 def needs_reenrolment(stored: str) -> bool:
@@ -348,7 +365,8 @@ def otpauth_uri(
     parameters it records, so the app and every later code check compute alike (BACKLOG #3422). A
     bare secret advertises :data:`UNMARKED_PARAMETERS`.
 
-    **Advertises SHA-256, and enrolling apps must honour it.** Most modern authenticators do (1Password,
+    **Advertises the enrolment's digest, SHA-256 for every set this release compiles in, and
+    enrolling apps must honour it.** Most modern authenticators do (1Password,
     Bitwarden, Aegis, FreeOTP, Authy). **Google Authenticator historically IGNORES the ``algorithm``
     parameter and computes SHA-1 regardless** — against which this engine's codes will simply never
     match, with no error to explain why. That is the known cost of the 2026-08-11 SHA-1 retirement

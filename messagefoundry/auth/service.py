@@ -2237,6 +2237,16 @@ def _log_totp_undecryptable(username: str) -> None:
     _log.warning("the TOTP secret of account %r does not decrypt under this store key", username)
 
 
+def _log_totp_refused(username: str) -> None:
+    """Log an account whose TOTP cell opens but names parameters this release does not compile in
+    (BACKLOG #3422). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    _log.warning(
+        "the TOTP enrolment of account %r names parameters this release does not compute with; no "
+        "code matches it until the account enrols again",
+        username,
+    )
+
+
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
     """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
     compared in constant time (ASVS 11.2.4); the stamps are not secret."""
@@ -2256,9 +2266,11 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
     """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with.
 
-    Two ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
-    the account and never the value. Or a keyless open hands the stored ciphertext through unchanged,
-    which is not base32, so computing a code from it fails. Any other store error propagates: it
+    Three ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
+    the account and never the value. A keyless open hands the stored ciphertext through unchanged,
+    which is not base32, so computing a code from it fails. Or the cell opens but its enrolment
+    marker is refused (:class:`totp.RefusedEnrolment`, BACKLOG #3422), logged with its own cause
+    since the store key is healthy and the cure is a re-enrolment. Any other store error propagates: it
     says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
     a healthy account."""
     try:
@@ -2275,7 +2287,10 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
         )
     try:
         totp.totp(secret)
-    except ValueError:  # not base32 (binascii.Error), or a refused enrolment marker (#3422)
+    except totp.RefusedEnrolment:
+        _log_totp_refused(user.username)
+        return False
+    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
         return False
     return True
 
@@ -3601,7 +3616,12 @@ class AuthService:
         else:
             # Checked and stored as the enrolment, so the code is proved with the parameters the
             # store will record for it (BACKLOG #3422).
-            totp_secret = totp.new_enrolment(totp_secret)
+            try:
+                totp_secret = totp.new_enrolment(totp_secret)
+            except totp.RefusedEnrolment as exc:
+                raise FirstAdministratorRefused(
+                    "the authenticator secret is not one this release can enrol; nothing was written"
+                ) from exc
             matched_step = totp.verify_totp_step(
                 totp_secret,
                 (totp_code or "").strip(),
@@ -9635,8 +9655,16 @@ class AuthService:
     def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
-        be checked against no seal, and its codes would sign in."""
-        return self._store.open_totp_secret(user.id, user.totp_secret_cell)
+        be checked against no seal, and its codes would sign in. A secret whose enrolment marker
+        is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
+        so this line is what names the cause."""
+        secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
+        if secret is not None:
+            try:
+                totp.parse_enrolment(secret)
+            except totp.RefusedEnrolment:
+                _log_totp_refused(user.username)
+        return secret
 
     def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
@@ -13164,11 +13192,14 @@ class AuthService:
             identity.user_id
         )
         reenrol = False
-        if user.totp_enabled:
+        # The cell is opened only when this release compiles in a set other than its default, the
+        # only way an enabled enrolment can differ from it, so a status read costs no decrypt
+        # otherwise. A refused marker is the census's to name, and the code check logs it.
+        if user.totp_enabled and totp.reenrolment_possible():
             try:
                 secret = self._totp_secret(user)
             except CipherError:
-                # Not this field's to report: the startup census names a cell that does not open.
+                _log_totp_undecryptable(user.username)
                 secret = None
             reenrol = secret is not None and totp.needs_reenrolment(secret)
         return MfaStatus(
