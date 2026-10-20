@@ -93,6 +93,7 @@ _TABLES = (
     "session_lineage",  # vault BACKLOG #3028 (no FK): a link left behind would lead a later test's
     #                     supersession into a session it never retired
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+    "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",
@@ -5819,3 +5820,17 @@ async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
     )
 
     await check_config_changed_reason_survives_a_long_node(store)
+
+
+async def test_processed_files_key_forms(store) -> None:
+    # BACKLOG #3424: the scheme-tagged dedup key and the bare pre-tag one, at SQLite parity.
+    from tests.test_processed_files_ledger import check_processed_files_key_forms
+
+    await check_processed_files_key_forms(store)
+
+
+async def test_webauthn_rehash_contract(store) -> None:
+    # BACKLOG #3423: the tagged credential-id hash fits VARCHAR(128) and a passkey moves to it.
+    from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
+
+    await _assert_webauthn_rehash_contract(store)

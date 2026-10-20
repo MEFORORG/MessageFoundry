@@ -878,6 +878,10 @@ _MSSQL_WEBAUTHN_DELETE_ONE: Final = (
 _MSSQL_WEBAUTHN_DELETE_ALL: Final = (
     "DELETE FROM webauthn_credentials OUTPUT deleted.credential_id_hash WHERE user_id=?"
 )
+_MSSQL_WEBAUTHN_REHASH: Final = (
+    "UPDATE webauthn_credentials SET credential_id_hash=? OUTPUT inserted.credential_id_hash"
+    " WHERE user_id=? AND credential_id_hash=?"
+)
 
 
 # --- ADR 0071 B5 PR1: hoisted handoff SQL + pure param-builders (async/sync shared) --------------
@@ -2482,12 +2486,29 @@ _SCHEMA: list[str] = [
     # sign_count is BIGINT (WebAuthn uint32 overflows signed INT). label is capped at 100 so the
     # UNIQUE (user_id, label) index key stays bounded (64+100 chars).
     """IF OBJECT_ID('webauthn_credentials','U') IS NULL CREATE TABLE webauthn_credentials (
-        credential_id_hash NVARCHAR(64) NOT NULL PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
+        credential_id_hash NVARCHAR(128) NOT NULL
+            CONSTRAINT pk_webauthn_credentials PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
         user_id NVARCHAR(64) NOT NULL, rp_id NVARCHAR(256) NOT NULL,
         public_key NVARCHAR(MAX) NOT NULL, sign_count BIGINT NOT NULL,
         transports NVARCHAR(MAX) NULL, device_type NVARCHAR(32) NOT NULL,
         backed_up BIT NOT NULL DEFAULT 0, label NVARCHAR(100) NOT NULL,
         aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL)""",
+    # BACKLOG #3423: widen a hash column created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128)
+    # to hold the "wc1:" scheme tag. A table created before this change carries a SYSTEM-NAMED
+    # primary key, which SQL Server will not let a column under it be altered, so the key is looked
+    # up, dropped and rebuilt under a fixed name. EXEC defers each parse, as for processed_files.
+    """IF COL_LENGTH('webauthn_credentials','credential_id_hash') = 128
+    BEGIN
+        DECLARE @pk sysname = (SELECT name FROM sys.key_constraints
+            WHERE parent_object_id = OBJECT_ID('webauthn_credentials') AND type = 'PK');
+        DECLARE @drop nvarchar(400) =
+            N'ALTER TABLE webauthn_credentials DROP CONSTRAINT ' + QUOTENAME(@pk);
+        EXEC(@drop);
+        EXEC(N'ALTER TABLE webauthn_credentials
+               ALTER COLUMN credential_id_hash NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE webauthn_credentials ADD CONSTRAINT pk_webauthn_credentials
+               PRIMARY KEY (credential_id_hash)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ix_webauthn_credentials_user','IndexID') IS NULL
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
@@ -2571,12 +2592,24 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (NOT ciphered). file_key = sha256 of the file identity — a DERIVED id, NEVER a cleartext
+    # body/PHI (NOT ciphered). file_key = a scheme tag + ":" + sha256 of the file identity (BACKLOG
+    # #3424: NVARCHAR(128) holds the tag; a bare pre-tag digest still reads) — a DERIVED id, NEVER a cleartext
     # filename (which can embed an MRN) and never logged at INFO+; channel_id (the inbound connection
     # name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit success (file = unit).
     """IF OBJECT_ID('processed_files','U') IS NULL CREATE TABLE processed_files (
-        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(64) NOT NULL, processed_at FLOAT NOT NULL,
+        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(128) NOT NULL, processed_at FLOAT NOT NULL,
         CONSTRAINT pk_processed_files PRIMARY KEY (channel_id, file_key))""",
+    # BACKLOG #3424: widen a table created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128) to hold
+    # the "fk1:" tag. The guarded CREATE above never reaches an existing table, and SQL Server will
+    # not ALTER a primary-key column in place, so the key is dropped and rebuilt around it. EXEC
+    # defers each parse, the same way as the users backfills, so the batch compiles on any shape.
+    """IF COL_LENGTH('processed_files','file_key') = 128
+    BEGIN
+        EXEC(N'ALTER TABLE processed_files DROP CONSTRAINT pk_processed_files');
+        EXEC(N'ALTER TABLE processed_files ALTER COLUMN file_key NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE processed_files ADD CONSTRAINT pk_processed_files
+               PRIMARY KEY (channel_id, file_key)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('processed_files'),'ix_processed_files_channel','IndexID') IS NULL
         CREATE INDEX ix_processed_files_channel ON processed_files(channel_id, processed_at)""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
@@ -7157,6 +7190,14 @@ class SqlServerStore:
         row = await self._fetchone(
             "SELECT 1 AS present FROM processed_files WHERE channel_id=? AND file_key=?",
             (channel_id, file_key),
+        )
+        return row is not None
+
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._fetchone(
+            "SELECT TOP 1 1 AS present FROM processed_files"
+            " WHERE channel_id=? AND file_key NOT LIKE '%:%'",
+            (channel_id,),
         )
         return row is not None
 
@@ -13452,6 +13493,14 @@ class SqlServerStore:
         count is read from ``OUTPUT`` (BACKLOG #2283)."""
         count = await self._write_passkeys_txn(
             user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+        )
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423); store.py's
+        ``MessageStore.rehash_webauthn_credential`` states the contract. Counted from ``OUTPUT``."""
+        count = await self._write_passkeys_txn(
+            user_id, _MSSQL_WEBAUTHN_REHASH, (new_hash, user_id, old_hash), counted=True
         )
         return count > 0
 

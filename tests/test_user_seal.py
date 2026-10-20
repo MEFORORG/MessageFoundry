@@ -427,18 +427,22 @@ _SEALING: dict[str, dict[str, frozenset[str]]] = {
         "_USER_RESEAL": frozenset({"_write_user"}),
         "_USER_ROLE_INSERT": frozenset({"_write_user"}),
         "_WEBAUTHN_INSERT": frozenset({"add_webauthn_credential"}),
+        # BACKLOG #3423: moves one passkey's hash through _write_passkeys, which re-seals.
+        "_WEBAUTHN_REHASH": frozenset({"rehash_webauthn_credential"}),
     },
     "postgres.py": {
         "_PG_USER_INSERT": frozenset({"create_user"}),
         "_PG_USER_RESEAL": frozenset({"_write_user"}),
         "_PG_USER_ROLE_INSERT": frozenset({"_write_user"}),
         "_PG_WEBAUTHN_INSERT": frozenset({"add_webauthn_credential"}),
+        "_PG_WEBAUTHN_REHASH": frozenset({"rehash_webauthn_credential"}),
     },
     "sqlserver.py": {
         "_MSSQL_USER_INSERT": frozenset({"create_user"}),
         "_MSSQL_USER_RESEAL": frozenset({"_write_user"}),
         "_USER_ROLE_INSERT": frozenset({"_write_user"}),
         "_WEBAUTHN_INSERT": frozenset({"add_webauthn_credential"}),
+        "_MSSQL_WEBAUTHN_REHASH": frozenset({"rehash_webauthn_credential"}),
     },
 }
 _TABLES = ("USERS", "USER_ROLES", "WEBAUTHN_CREDENTIALS")

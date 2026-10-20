@@ -25,6 +25,16 @@ async def test_webauthn_store_contract_sqlite(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_webauthn_rehash_contract_sqlite(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "rehash.db")
+    try:
+        from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
+
+        await _assert_webauthn_rehash_contract(store)
+    finally:
+        await store.close()
+
+
 async def test_totp_store_contract_sqlite(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "totp.db")
     try:

@@ -665,7 +665,8 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (not part of the cipher seam). file_key = sha256 of the file identity — a DERIVED id,
+    # body/PHI (not part of the cipher seam). file_key = a scheme tag + ":" + sha256 of the file
+    # identity (BACKLOG #3424; a bare pre-tag digest still reads) — a DERIVED id,
     # NEVER a cleartext filename (which can embed an MRN) and never logged at INFO+; channel_id (the
     # inbound connection name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit.
     """CREATE TABLE IF NOT EXISTS processed_files (
@@ -960,7 +961,7 @@ _SCHEMA: list[str] = [
     # BIGINT (a WebAuthn uint32 overflows signed INT); label is column-capped so ux_webauthn_label
     # stays bounded; public_key is COSE verification material, plaintext by design (not a secret).
     """CREATE TABLE IF NOT EXISTS webauthn_credentials (
-        credential_id_hash VARCHAR(64) PRIMARY KEY,
+        credential_id_hash VARCHAR(128) PRIMARY KEY,
         credential_id      TEXT NOT NULL,
         user_id            TEXT NOT NULL REFERENCES users(id),
         rp_id              VARCHAR(256) NOT NULL,
@@ -974,6 +975,14 @@ _SCHEMA: list[str] = [
         created_at         DOUBLE PRECISION NOT NULL,
         last_used_at       DOUBLE PRECISION
     )""",
+    # BACKLOG #3423: the hash now carries a scheme tag ("wc1:" + 64 hex), wider than VARCHAR(64).
+    # Widening a varchar is metadata-only here, and the primary key comes along unchanged. Guarded,
+    # so a column already at 128 takes no ACCESS EXCLUSIVE lock when the batch runs again.
+    "DO $$ BEGIN IF (SELECT character_maximum_length FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'webauthn_credentials'"
+    " AND column_name = 'credential_id_hash') < 128 THEN"
+    " ALTER TABLE webauthn_credentials ALTER COLUMN credential_id_hash TYPE VARCHAR(128);"
+    " END IF; END $$",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
@@ -1259,6 +1268,7 @@ _PG_USER_RESEAL: Final = (
 _PG_USER_ROLE_INSERT: Final = (
     "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES ($1,$2,$3,$4)"
 )
+_PG_WEBAUTHN_REHASH: Final = "UPDATE webauthn_credentials SET credential_id_hash=$1 WHERE user_id=$2 AND credential_id_hash=$3"
 _PG_WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
@@ -5664,6 +5674,13 @@ class PostgresStore:
         )
         return row is not None
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._fetchval(
+            "SELECT 1 FROM processed_files WHERE channel_id=$1 AND file_key NOT LIKE '%:%' LIMIT 1",
+            channel_id,
+        )
+        return row is not None
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:
@@ -9192,6 +9209,15 @@ class PostgresStore:
                 "DELETE FROM webauthn_credentials WHERE user_id=$1 AND credential_id_hash=$2",
                 user_id,
                 credential_id_hash,
+            )
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423); store.py's
+        ``MessageStore.rehash_webauthn_credential`` states the contract."""
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            count = await self._write_passkeys(
+                conn, user_id, _PG_WEBAUTHN_REHASH, new_hash, user_id, old_hash
             )
         return count > 0
 

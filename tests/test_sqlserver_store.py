@@ -117,6 +117,7 @@ async def store() -> AsyncIterator[object]:
                 "session_lineage",  # vault BACKLOG #3028 (no FK): a stale link would lead a later
                 #                     test's supersession into a session it never retired
                 "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+                "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "user_roles",
                 "ad_group_role_map",
@@ -863,7 +864,7 @@ async def test_roles_permissions_contract(store) -> None:
 
 async def test_webauthn_store_contract(store) -> None:
     """ADR 0068 §4 webauthn_credentials contract on the real SQL Server backend: multi-row CRUD,
-    the 1023-byte credential-id round-trip (NVARCHAR(MAX) body vs the NVARCHAR(64) digest PK),
+    the 1023-byte credential-id round-trip (NVARCHAR(MAX) body vs the NVARCHAR(128) digest PK),
     duplicate-label integrity violation, and the strict sign-count compare-and-set under the
     UPDLOCK/ROWLOCK idiom. Extra-free import (the shared module never touches the [webauthn]
     extra, so this leg — which installs .[dev,sqlserver] — actually runs it)."""
@@ -6371,3 +6372,18 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     )
     assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
     assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"
+
+
+async def test_processed_files_key_forms(store) -> None:
+    # BACKLOG #3424: the 68-character tagged key must fit file_key (NVARCHAR(128)), and the bare
+    # pre-tag one still reads, at SQLite parity.
+    from tests.test_processed_files_ledger import check_processed_files_key_forms
+
+    await check_processed_files_key_forms(store)
+
+
+async def test_webauthn_rehash_contract(store) -> None:
+    # BACKLOG #3423: the tagged credential-id hash fits NVARCHAR(128) and a passkey moves to it.
+    from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
+
+    await _assert_webauthn_rehash_contract(store)

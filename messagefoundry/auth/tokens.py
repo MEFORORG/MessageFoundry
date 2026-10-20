@@ -10,6 +10,7 @@ persisted, so reading the store never exposes a usable token.
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 
 #: Bytes of entropy per token (urlsafe-base64 encoded to ~43 chars).
@@ -31,3 +32,46 @@ def hash_bytes(data: bytes) -> str:
     to 1023 raw bytes, unboundable as an index key, so the store keys on this fixed-width digest —
     the same shape as :func:`hash_token` for session tokens)."""
     return hashlib.sha256(data).hexdigest()
+
+
+#: The scheme tag every ``webauthn_credentials.credential_id_hash`` this release WRITES carries
+#: (BACKLOG #3423, ASVS 11.2.2): SHA-256 hex of the raw credential id, as :func:`hash_bytes` gives.
+#: Sign-in finds a passkey only by this value, so a release that changes the hash adds a new tag
+#: and :meth:`~messagefoundry.auth.service.AuthService.rehash_webauthn_credentials` moves every
+#: row to it from the raw id stored beside it. Compiled in, never a setting.
+CREDENTIAL_ID_HASH_SCHEME = "wc1"
+
+#: Every tag this release can read. The rehash pass refuses a stored value with any other tag.
+CREDENTIAL_ID_HASH_SCHEMES = frozenset({CREDENTIAL_ID_HASH_SCHEME})
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+class CredentialHashSchemeError(ValueError):
+    """A stored credential-id hash whose scheme this release does not know, or whose shape is
+    wrong. The message never echoes the value."""
+
+
+def credential_id_hash(raw_id: bytes) -> str:
+    """The key a passkey with this raw credential id is stored and found under, in today's scheme."""
+    return f"{CREDENTIAL_ID_HASH_SCHEME}:{hash_bytes(raw_id)}"
+
+
+def credential_id_hash_scheme(stored: str) -> str:
+    """The scheme a stored ``credential_id_hash`` names: a tag in :data:`CREDENTIAL_ID_HASH_SCHEMES`,
+    or ``""`` for a bare pre-#3423 :func:`hash_bytes` digest, which is today's hash with no tag, so
+    the rehash pass moves it by adding the tag. Anything else raises
+    :class:`CredentialHashSchemeError`, so a stored marker only ever chooses among the schemes
+    compiled into the release."""
+    scheme, sep, digest = stored.partition(":")
+    if not sep:
+        if _HEX64.fullmatch(stored):
+            return ""
+        raise CredentialHashSchemeError("a credential-id hash carries no scheme tag")
+    if scheme not in CREDENTIAL_ID_HASH_SCHEMES:
+        raise CredentialHashSchemeError(
+            "a credential-id hash carries a scheme tag this release does not know"
+        )
+    if not _HEX64.fullmatch(digest):
+        raise CredentialHashSchemeError("a credential-id hash's digest is not 64 lowercase hex")
+    return scheme

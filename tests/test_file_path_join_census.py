@@ -783,7 +783,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key": Site(
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
     "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(

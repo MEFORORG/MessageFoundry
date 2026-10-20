@@ -122,7 +122,15 @@ from messagefoundry.auth.policy import (
     _operator_corpus,
 )
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
-from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
+from messagefoundry.auth.tokens import (
+    CREDENTIAL_ID_HASH_SCHEME,
+    credential_id_hash_scheme,
+    hash_token,
+    mint_token,
+)
+from messagefoundry.auth.tokens import (
+    credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
+)
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -3395,8 +3403,75 @@ class AuthService:
         :meth:`create_local_user` behind ``USERS_MANAGE``, and a directory sign-in, which assigns no
         role. The first-run account this used to mint went in Wave 2, and the WP-3 lifecycle that
         retired it went with it.
+
+        It then runs :meth:`rehash_webauthn_credentials`, so a passkey stored under an older
+        credential-id hash scheme can sign in before the first request arrives (BACKLOG #3423).
         """
         await self._seed_roles()
+        await self.rehash_webauthn_credentials()
+
+    async def rehash_webauthn_credentials(self) -> tuple[int, int]:
+        """Move every passkey whose ``credential_id_hash`` names another scheme to today's
+        (:data:`~messagefoundry.auth.tokens.CREDENTIAL_ID_HASH_SCHEME`, BACKLOG #3423), recomputing
+        it from the raw ``credential_id`` stored beside it, so a hash change does not lose a
+        registered passkey. No secret is needed: the raw id is not one.
+
+        Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
+        in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
+        value whose tag this release does not compile in is REFUSED: left as it is, never matched,
+        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
+        id does not give, and a move the store refuses: the account's seal failed between the read
+        and the write, or the new hash is already held. An account or passkey set already failing
+        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
+        a refusal never stops start-up."""
+        rehashed = refused = 0
+        if not await self._store.any_webauthn_credentials():
+            return 0, 0
+        # The checked loaders: an account or passkey set that fails its seal is reported there and
+        # skipped here, since it signs in with no passkey whatever its hash says.
+        for user in await self._load_users():
+            for cred in await self._verified_passkeys(user) or ():
+                try:
+                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
+                    # binascii.Error, a ValueError, for a credential_id that is not base64url.
+                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
+                except ValueError:  # CredentialHashSchemeError is one too
+                    refused += 1
+                    continue
+                if cred.credential_id_hash == new_hash:
+                    continue
+                if scheme == CREDENTIAL_ID_HASH_SCHEME:
+                    # Today's tag over a digest its own raw id does not give: not a row this
+                    # release wrote, so it is not rewritten into one that signs in.
+                    refused += 1
+                    continue
+                try:
+                    moved = await self._store.rehash_webauthn_credential(
+                        user.id, cred.credential_id_hash, new_hash
+                    )
+                except Exception as exc:
+                    # The seal failed between the read and the write, or the new hash is already
+                    # held (the same credential id enrolled again under today's scheme). Either
+                    # way the row stays as it is, and start-up goes on.
+                    if not isinstance(exc, RowSealError) and not _is_integrity_refusal(exc):
+                        raise
+                    refused += 1
+                    continue
+                rehashed += int(moved)
+        if rehashed:
+            _log.info(
+                "moved %d passkey(s) to credential-id hash scheme %s",
+                rehashed,
+                CREDENTIAL_ID_HASH_SCHEME,
+            )
+        if refused:
+            _log.warning(
+                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
+                " scheme, a hash its own credential id does not give, or a move the store refused);"
+                " they cannot sign in",
+                refused,
+            )
+        return rehashed, refused
 
     async def _seed_roles(self) -> None:
         for role in Role:
@@ -13362,7 +13437,7 @@ class AuthService:
                 client=client,
             )
             return Elevation()
-        credential_id_hash = hash_bytes(result.credential_id)
+        credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
         now = time.time()
@@ -13534,7 +13609,7 @@ class AuthService:
         # The account's passkeys, checked against the digest its seal covers (BACKLOG #2592): a
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
-        wanted = hash_bytes(raw_id)
+        wanted = _credential_id_hash(raw_id)
         cred = next((c for c in held or () if c.credential_id_hash == wanted), None)
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
