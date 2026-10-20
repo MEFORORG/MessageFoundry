@@ -866,10 +866,8 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
         # The pin is compared in the digest it names (BACKLOG #3425), so a release that changes
         # ANCHOR_DIGEST still matches a pin written for the old one.
         pin = parse_anchor_pin(spec.pin)
-        if pin.algorithm == ANCHOR_DIGEST:
-            seen = fingerprint
-        else:
-            seen = anchor_digest_hex(pin.algorithm, data)
+        same = pin.algorithm == ANCHOR_DIGEST
+        seen = fingerprint if same else anchor_digest_hex(pin.algorithm, data)
         # Constant-time (ASVS 11.2.4, BACKLOG #1167). A CA's fingerprint is public, so this hides no
         # secret; it keeps a short-circuit `==` off the pin check. Both sides are lowercase hex of
         # one digest: `hexdigest` emits that form, and `parse_anchor_pin` produces it or raises.
@@ -1598,20 +1596,18 @@ def _observed_fingerprint(label: str, detail: Mapping[str, Any]) -> str | None:
     """The fingerprint of ``detail``, a row for ``label``, when it is in :data:`ANCHOR_DIGEST`.
 
     Observations are compared only within one digest (BACKLOG #3425), so a row in another digest
-    is no baseline, and the next check records ``observed`` rather than a false ``changed``. A row
-    with no ``algorithm`` was written before the field existed, and is :data:`ANCHOR_DIGEST`. A
-    marker this release does not compile in is refused the same way, with a WARNING: it never
-    selects a digest to compute."""
+    is no baseline, and the next check records ``observed`` rather than a false ``changed``, with a
+    WARNING. A row with no ``algorithm`` was written before the field existed, and is
+    :data:`ANCHOR_DIGEST`. The stored marker never selects a digest to compute."""
     algorithm = detail.get("algorithm", ANCHOR_DIGEST)
     if algorithm != ANCHOR_DIGEST:
-        if not isinstance(algorithm, str) or algorithm not in ANCHOR_DIGESTS:
-            log.warning(
-                "trust anchor %r: the last audited observation names the digest %s, which this "
-                "release does not support; it is not compared, and this check records a new "
-                "baseline",
-                label,
-                ascii(algorithm)[:64],  # a stored value: kept short and printable
-            )
+        log.warning(
+            "trust anchor %r: the last audited observation names the digest %s, not this "
+            "release's %s; it is not compared, and this check records a new baseline",
+            label,
+            ascii(algorithm)[:64],  # a stored value: kept short and printable
+            ANCHOR_DIGEST,
+        )
         return None
     fp = detail.get("fingerprint")
     return fp if isinstance(fp, str) else None
@@ -1651,12 +1647,9 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
 
 
 async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -> None:
-    fields: dict[str, object] = {"label": spec.label, "setting": spec.setting, "event": event}
-    fields.update(extra)
-    if "fingerprint" in extra:
-        # Every fingerprint this module writes is ANCHOR_DIGEST's; the row names it (BACKLOG #3425).
-        fields["algorithm"] = ANCHOR_DIGEST
-    detail = json.dumps(fields)
+    # Every digest a row carries is ANCHOR_DIGEST's, and the row names it (BACKLOG #3425).
+    fields = {"label": spec.label, "setting": spec.setting, "event": event, **extra}
+    detail = json.dumps(fields | {"algorithm": ANCHOR_DIGEST})
     try:
         await store.record_audit(AUDIT_ACTION, actor=None, detail=detail)
     except _STORE_CALL_DEFECTS:

@@ -28,7 +28,7 @@ from messagefoundry.auth.trust_anchors import (
 )
 from messagefoundry.config.wiring import _check_tls_ca_pin
 from messagefoundry.store import MessageStore
-from tests.test_trust_anchors import _block, _path_ok
+from tests.test_trust_anchors import _block, _path_ok, _rows
 
 
 @pytest.fixture
@@ -46,10 +46,8 @@ def _judged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
 
 
-async def _rows(store: MessageStore, label: str) -> list[dict[str, object]]:
-    rows = await store.list_audit(action=AUDIT_ACTION, limit=200)
-    out = [json.loads(r["detail"]) for r in rows]
-    return [d for d in out if d.get("label") == label]
+def _colons(fp: str) -> str:
+    return ":".join(fp[i : i + 2] for i in range(0, len(fp), 2))
 
 
 def _anchor(tmp_path: Path, body: bytes = b"marker") -> tuple[Path, str]:
@@ -75,8 +73,7 @@ def test_every_compiled_in_digest_has_an_arm_of_its_length() -> None:
 def test_a_bare_pin_written_today_still_reads_as_sha256(tmp_path: Path) -> None:
     p, fp = _anchor(tmp_path)
     assert parse_anchor_pin(fp) == ("sha256", fp)
-    colons = ":".join(fp[i : i + 2] for i in range(0, len(fp), 2)).upper()
-    assert parse_anchor_pin(colons) == ("sha256", fp)
+    assert parse_anchor_pin(_colons(fp).upper()) == ("sha256", fp)
     assert enforce_anchor(AnchorSpec("t", "[x]", str(p), fp), enforcing=True) == fp
 
 
@@ -86,8 +83,7 @@ def test_a_pin_that_names_sha256_matches(tmp_path: Path, prefix: str) -> None:
     p, fp = _anchor(tmp_path)
     assert parse_anchor_pin(prefix + fp) == ("sha256", fp)
     assert enforce_anchor(AnchorSpec("t", "[x]", str(p), prefix + fp), enforcing=True) == fp
-    colons = ":".join(fp[i : i + 2] for i in range(0, len(fp), 2))
-    assert ta.evaluate_anchor(AnchorSpec("t", "[x]", str(p), prefix + colons)).pin_ok is True
+    assert ta.evaluate_anchor(AnchorSpec("t", "[x]", str(p), prefix + _colons(fp))).pin_ok is True
 
 
 def test_a_prefixed_pin_that_does_not_match_still_refuses(tmp_path: Path) -> None:
@@ -176,4 +172,4 @@ async def test_an_observation_in_another_digest_is_no_baseline(
     latest = (await _rows(store, "api_client"))[0]
     assert latest["event"] == "observed"
     assert (latest["algorithm"], latest["fingerprint"]) == ("sha256", fp)
-    assert "does not support" in caplog.text
+    assert "it is not compared" in caplog.text
