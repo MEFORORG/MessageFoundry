@@ -2571,11 +2571,12 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (NOT ciphered). file_key = sha256 of the file identity — a DERIVED id, NEVER a cleartext
+    # body/PHI (NOT ciphered). file_key = a scheme tag + ":" + sha256 of the file identity (BACKLOG
+    # #3424: NVARCHAR(128) holds the tag; a bare pre-tag digest still reads) — a DERIVED id, NEVER a cleartext
     # filename (which can embed an MRN) and never logged at INFO+; channel_id (the inbound connection
     # name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit success (file = unit).
     """IF OBJECT_ID('processed_files','U') IS NULL CREATE TABLE processed_files (
-        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(64) NOT NULL, processed_at FLOAT NOT NULL,
+        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(128) NOT NULL, processed_at FLOAT NOT NULL,
         CONSTRAINT pk_processed_files PRIMARY KEY (channel_id, file_key))""",
     """IF INDEXPROPERTY(OBJECT_ID('processed_files'),'ix_processed_files_channel','IndexID') IS NULL
         CREATE INDEX ix_processed_files_channel ON processed_files(channel_id, processed_at)""",

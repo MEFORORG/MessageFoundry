@@ -6906,7 +6906,8 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- (after_read='leave') File/RemoteFile poll source has ALREADY ingested, so a read-only share whose
 -- files another system owns can be polled without moving/deleting them and a left file is ingested
 -- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
--- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
+-- the clear (NOT part of the `_cipher` seam). `file_key` is a scheme tag, ":", and a SHA-256 of the
+-- file's identity (BACKLOG #3424: the tag names the derivation; a bare pre-tag digest still reads)
 -- (relative-path+mtime+size local / full-remote-path+size+the listed mtime remote, the mtime only where
 -- the server lists one, BACKLOG #2758 — the PATH is folded in, not just the basename, so two
 -- same-named files under different subdirs stay distinct and are BOTH ingested) — a
@@ -6916,7 +6917,7 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- FILE, not each split message, is the dedup unit). Additive: CREATE TABLE IF NOT EXISTS on every open.
 CREATE TABLE IF NOT EXISTS processed_files (
     channel_id   TEXT NOT NULL,   -- inbound connection name (config metadata, non-PHI)
-    file_key     TEXT NOT NULL,   -- sha256(rel-path || mtime || size) — a HASHED derived id, never a path
+    file_key     TEXT NOT NULL,   -- "fk1:" + sha256(identity) — a HASHED derived id, never a path
     processed_at REAL NOT NULL,   -- epoch ts recorded AFTER emit success; drives the age/count prune
     PRIMARY KEY (channel_id, file_key)
 );

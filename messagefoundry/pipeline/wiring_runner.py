@@ -224,6 +224,7 @@ from messagefoundry.transports.base import (
     IntakeRateLimiter,
     ReplyBodyDropped,
     SyncReplyResolver,
+    check_file_key,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
@@ -329,16 +330,23 @@ class _StoreProcessedLedger:
     dedup ledger with the store's ``processed_files`` table, closing over the inbound's channel id.
     Injected via the source's :attr:`~messagefoundry.transports.base.SourceConnector.processed_ledger`
     seam so ``transports/`` never imports ``store/``; the source passes only a **HASHED** ``file_key``
-    (never a cleartext filename). :meth:`prune` bounds growth by age + count."""
+    (never a cleartext filename). :meth:`prune` bounds growth by age + count.
+
+    Every key is checked against the schemes this release compiles in before the store sees it
+    (BACKLOG #3424): a write must carry today's tag, a read may also be the bare pre-tag digest, and
+    any other tag raises :class:`~messagefoundry.transports.base.FileKeyError` rather than being
+    looked up or recorded."""
 
     def __init__(self, store: QueueStore, channel_id: str) -> None:
         self._store = store
         self._channel_id = channel_id
 
     async def is_processed(self, file_key: str) -> bool:
+        check_file_key(file_key, write=False)
         return await self._store.is_file_processed(channel_id=self._channel_id, file_key=file_key)
 
     async def mark_processed(self, file_key: str) -> None:
+        check_file_key(file_key, write=True)
         await self._store.record_processed_file(channel_id=self._channel_id, file_key=file_key)
 
     async def prune(self) -> None:

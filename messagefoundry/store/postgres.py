@@ -665,7 +665,8 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (not part of the cipher seam). file_key = sha256 of the file identity — a DERIVED id,
+    # body/PHI (not part of the cipher seam). file_key = a scheme tag + ":" + sha256 of the file
+    # identity (BACKLOG #3424; a bare pre-tag digest still reads) — a DERIVED id,
     # NEVER a cleartext filename (which can embed an MRN) and never logged at INFO+; channel_id (the
     # inbound connection name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit.
     """CREATE TABLE IF NOT EXISTS processed_files (

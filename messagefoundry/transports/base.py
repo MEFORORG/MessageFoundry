@@ -57,6 +57,11 @@ __all__ = [
     "ReplyOutcome",
     "SyncReplyResolver",
     "ProcessedFileLedger",
+    "FILE_KEY_SCHEME",
+    "FileKeyError",
+    "check_file_key",
+    "file_key_forms",
+    "ledger_holds",
     "DeliveryError",
     "NegativeAckError",
     "SourceStartupError",
@@ -642,6 +647,65 @@ class ProcessedFileLedger(Protocol):
         """Bound the ledger's growth (age + count). Called at most once per poll tick, only when a new
         file was recorded, so a stable read-only share never churns the store."""
         ...
+
+
+#: The scheme tag every ``processed_files.file_key`` this release WRITES carries (BACKLOG #3424, ASVS
+#: 11.2.2 census row 15). It names how the key was derived: SHA-256, hex, over the source's identity
+#: string, which each source computes itself (``_file_key_forms`` in ``file.py`` and
+#: ``remotefile.py``). A release that changes the derivation adds a new tag, writes it, and keeps
+#: computing the old forms for lookup only, so a file left in place is not read again just because
+#: its key changed. Compiled in, never a setting: no operator selects a scheme.
+FILE_KEY_SCHEME = "fk1"
+
+#: Every tag this release can read. A stored or presented key with any other tag is refused.
+FILE_KEY_SCHEMES = frozenset({FILE_KEY_SCHEME})
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+class FileKeyError(ValueError):
+    """A dedup-ledger key whose scheme this release does not know, or whose shape is wrong."""
+
+
+def file_key_forms(digest: str) -> tuple[str, ...]:
+    """Every form under which a file whose identity hashes to ``digest`` (SHA-256 hex) may sit in the
+    dedup ledger, the one written today first.
+
+    The second form is the bare digest, the key every release before BACKLOG #3424 wrote. It is
+    the same hash with no tag, so a ledger row written before the tag existed still marks its file
+    read. It needs looking up only while such a row can survive: the ledger's age prune
+    (``PROCESSED_FILE_LEDGER_TTL_SECONDS``) removes it once its window has passed, but only on a
+    tick that records a new file, so a stable share can keep one longer. A release may drop the bare
+    form only once that window is known to have passed everywhere; today nothing proves it, so the
+    lookup stays.
+    """
+    return (f"{FILE_KEY_SCHEME}:{digest}", digest)
+
+
+async def ledger_holds(ledger: ProcessedFileLedger | None, forms: tuple[str, ...]) -> bool:
+    """True if ``ledger`` holds the file under any of ``forms`` (from :func:`file_key_forms`), asked
+    in order, so a file recorded today costs one lookup and only a miss asks for an older form."""
+    if ledger is None:
+        return False
+    for form in forms:
+        if await ledger.is_processed(form):
+            return True
+    return False
+
+
+def check_file_key(file_key: str, *, write: bool) -> None:
+    """Refuse a key this release did not derive. A write must carry :data:`FILE_KEY_SCHEME`; a read
+    may also be the bare pre-#3424 digest. Any other tag is unknown here, and is refused rather than
+    looked up, so a marker can only ever choose among the schemes compiled into the release."""
+    scheme, sep, digest = file_key.partition(":")
+    if not sep:
+        if not write and _HEX64.fullmatch(file_key):
+            return
+        raise FileKeyError("a dedup-ledger key carries no scheme tag")
+    if scheme not in FILE_KEY_SCHEMES:
+        raise FileKeyError(f"unknown dedup-ledger key scheme {scheme[:16]!r}")
+    if not _HEX64.fullmatch(digest):
+        raise FileKeyError("a dedup-ledger key's digest is not 64 lowercase hex")
 
 
 class DeliveryError(Exception):
