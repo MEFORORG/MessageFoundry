@@ -28,7 +28,8 @@ Modes:
     open the owner's blobs when the scope allows it), and a user-scope round trip of its own (a
     control: DPAPI works for this account at all). It writes ``other.json``.
 
-``judge --owner-dir D --other-dir D --owner-sid S --other-sid S --privilege P --image I``
+``judge --owner-dir D --other-dir D --owner-sid S --other-sid S --owner-account A``
+``--other-account B --privilege P --image I [--summary F]``
     Run by the rig, elevated, once both services have reported. It reads the reports and prints
     the three answers with their controls, and appends them to ``--summary`` when given.
 
@@ -74,7 +75,7 @@ def owner_report(start: int | str) -> str:
     return f"owner-start-{start}.json"
 
 
-YES, NO, INCONCLUSIVE = "YES", "NO", "INCONCLUSIVE"
+YES, NO, NOT_RUN, INCONCLUSIVE = "YES", "NO", "NOT RUN", "INCONCLUSIVE"
 
 # secrets_dpapi.DpapiError carries the code only in its message, and this spike changes no product
 # code. If that wording changes, the code reads as None and the detail line still has the message.
@@ -237,6 +238,16 @@ def _why(record: dict[str, Any] | None) -> str:
     return str(record.get("error") or "ok")
 
 
+def _dpapi_refused(record: dict[str, Any] | None) -> bool:
+    """The bytes were read and DPAPI itself refused them: secrets_dpapi raises DpapiError then."""
+    return (
+        isinstance(record, dict)
+        and record.get("read", True) is True
+        and record.get("ok") is False
+        and str(record.get("error") or "").startswith("DpapiError:")
+    )
+
+
 def _held(controls: list[Control]) -> bool:
     return all(held for _, held, _ in controls)
 
@@ -269,7 +280,9 @@ def judge_reports(
     """The three answers. A control that does not hold makes its answer INCONCLUSIVE, never NO.
 
     ``owner_sid`` is the owner service's own SID, ``other_sid`` the second account's, and
-    ``privileges`` the list install-service.ps1 gives every service.
+    ``privileges`` the list install-service.ps1 gives every service. NO is said only of a refusal
+    DPAPI itself gave (:func:`_dpapi_refused`); a file that could not be read, or any other
+    failure, is INCONCLUSIVE. When Q1 is NO there is no valid blob, so Q2 and Q3 are NOT RUN.
     """
     s1 = start1 or {}
     s2 = start2 or {}
@@ -279,18 +292,26 @@ def judge_reports(
         _service_token(s1, "start 1", owner_sid, privileges),
         ("start 1 was not elevated", s1.get("elevated") is False, f"elevated={s1.get('elevated')}"),
     ]
+    protect, unprotect1 = s1.get("user_protect"), s1.get("user_unprotect")
     if not start1:
         q1, q1_detail = INCONCLUSIVE, "the owner service wrote no report at its first start"
     elif not _held(q1_controls):
         q1, q1_detail = INCONCLUSIVE, "the service did not run with the token the question names"
-    elif not _ok(s1.get("user_protect")):
-        q1, q1_detail = NO, f"protect failed: {_why(s1.get('user_protect'))}"
-    elif not _opened(s1.get("user_unprotect")):
-        q1 = NO
-        q1_detail = f"protect worked, unprotect failed: {_why(s1.get('user_unprotect'))}"
-    else:
+    elif protect is None:
+        q1 = INCONCLUSIVE
+        q1_detail = (
+            "the report numbered 1 did not protect: an earlier start left the blob unreported"
+        )
+    elif not _ok(protect):
+        q1 = NO if _dpapi_refused(protect) else INCONCLUSIVE
+        q1_detail = f"protect failed: {_why(protect)}"
+    elif _opened(unprotect1):
         q1 = YES
         q1_detail = "user-scope protect, then unprotect of the written file, gave PAYLOAD back"
+    else:
+        q1 = NO if _dpapi_refused(unprotect1) or _ok(unprotect1) else INCONCLUSIVE
+        q1_detail = f"protect worked, unprotect did not give PAYLOAD back: {_why(unprotect1)}"
+    no_blob = "Q1 is NO, so there is no valid blob to test"
 
     q2_controls = [
         (
@@ -316,21 +337,23 @@ def judge_reports(
         ),
     ]
     foreign = o.get("foreign_user_blob")
-    if not other:
+    if q1 == NO:
+        q2, q2_detail = NOT_RUN, no_blob
+    elif not other:
         q2, q2_detail = INCONCLUSIVE, "the other account wrote no report"
     elif not _held(q2_controls):
-        q2, q2_detail = (
-            INCONCLUSIVE,
-            "a control did not hold, so a refusal here would not be the scope's",
-        )
-    elif not foreign or foreign.get("read") is not True:
-        q2, q2_detail = INCONCLUSIVE, f"the other account could not read its copy: {_why(foreign)}"
+        q2 = INCONCLUSIVE
+        q2_detail = "a control did not hold, so a refusal here would not be the scope's"
     elif _ok(foreign):
         q2 = NO
-        q2_detail = f"the other account OPENED the owner's user-scope blob (matches={foreign.get('matches')})"
+        q2_detail = "the other account OPENED the owner's user-scope blob"
+    elif _dpapi_refused(foreign):
+        q2 = YES
+        q2_detail = f"DPAPI refused it: {_why(foreign)}"
     else:
-        q2, q2_detail = YES, f"refused: {_why(foreign)} (Win32 {foreign.get('win32')})"
+        q2, q2_detail = INCONCLUSIVE, f"the attempt failed outside DPAPI: {_why(foreign)}"
 
+    unprotect2 = s2.get("user_unprotect") or {}
     q3_controls = [
         ("the blob was valid at start 1 (Q1 is YES)", q1 == YES, f"Q1={q1}"),
         ("start 2 is the second start", s2.get("start") == 2, f"start={s2.get('start')}"),
@@ -339,21 +362,33 @@ def judge_reports(
             s1.get("pid") != s2.get("pid"),
             f"pid {s1.get('pid')} then {s2.get('pid')}",
         ),
+        (
+            "start 2 read the blob start 1 wrote, and protected nothing new",
+            "user_protect" not in s2
+            and unprotect2.get("blob_len") is not None
+            and unprotect2.get("blob_len") == (unprotect1 or {}).get("blob_len"),
+            f"length {(unprotect1 or {}).get('blob_len')} then {unprotect2.get('blob_len')}, "
+            f"protected again={'user_protect' in s2}",
+        ),
         _service_token(s2, "start 2", owner_sid, privileges),
     ]
-    if not start2:
+    if q1 == NO:
+        q3, q3_detail = NOT_RUN, no_blob
+    elif not start2:
         q3, q3_detail = INCONCLUSIVE, "the owner service wrote no report after its restart"
     elif not _held(q3_controls):
         q3, q3_detail = INCONCLUSIVE, "a control did not hold"
-    elif _opened(s2.get("user_unprotect")):
+    elif _opened(unprotect2):
         q3 = YES
         q3_detail = (
             "the restarted service opened the blob; logon SID "
             f"{s1.get('logon_sid')} then {s2.get('logon_sid')}"
         )
-    else:
+    elif _dpapi_refused(unprotect2) or _ok(unprotect2):
         q3 = NO
-        q3_detail = f"the restarted service could not open it: {_why(s2.get('user_unprotect'))}"
+        q3_detail = f"the restarted service did not get PAYLOAD back: {_why(unprotect2)}"
+    else:
+        q3, q3_detail = INCONCLUSIVE, f"the attempt failed outside DPAPI: {_why(unprotect2)}"
 
     return [
         Answer(

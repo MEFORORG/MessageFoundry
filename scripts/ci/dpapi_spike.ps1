@@ -10,16 +10,9 @@
   grants that user "Log on as a service" and writes under C:\. .github/workflows/dpapi-spike.yml is
   the only caller. Never run it on a machine you keep.
 
-  The key-custody draft makes user-scope DPAPI, done by the service account itself, the Windows
-  default wrap for the master key, and asks three questions before anything is built on it:
-
-    1. Does CryptProtectData in user scope succeed under NT SERVICE\<name>?
-    2. Does a different, non-elevated account fail to unprotect that blob?
-    3. Does the blob still open after a service restart, and after a host reboot?
-
-  This rig answers 1, 2 and the restart half of 3. THE REBOOT HALF IS NOT RUN: a hosted runner cannot
-  reboot inside a job. scripts/ci/dpapi_spike_worker.py does the DPAPI calls, as each service, with
-  the engine's own messagefoundry.secrets_dpapi, and holds the rule for what each answer is.
+  The questions it answers, and what it leaves out, are in that workflow's header.
+  scripts/ci/dpapi_spike_worker.py does the DPAPI calls, as each service, and judge_reports() there
+  holds the rule for each answer. This script is the rig around them.
 
   THE OWNER SERVICE IS REGISTERED THE WAY install-service.ps1 REGISTERS THE ENGINE, because a DPAPI
   answer under some other token would not answer the question. Its definitions are lifted out of
@@ -49,7 +42,7 @@
 param(
     # An administrator-only folder for the checked nssm.exe. Resolve-Nssm creates and checks it.
     [Parameter(Mandatory)][string]$NssmDir,
-    # The interpreter both services run. Its path goes into the service parameters unquoted.
+    # The interpreter both services run: each registration's nssm Application.
     [Parameter(Mandatory)][string]$PythonExe,
     # The runner image, for the summary.
     [Parameter(Mandatory)][string]$Image,
@@ -88,7 +81,7 @@ $lifted = @(
     "Set-ServiceAccount", "Disable-RefusedService", "Set-ServiceLogonRight",
     "Get-ServiceSidTypeChoice", "Get-ServiceTokenProblem", "Set-ServiceTokenHardening",
     "Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument", "Invoke-Nssm",
-    "Assert-NoNssmExpansion"
+    "Assert-NoNssmExpansion", "Stop-ServiceAndConfirm"
 )
 $liftedValues = @("NssmUrl", "NssmMirrorUrls", "NssmSha256", "NssmExeSha256", "ServicePrivileges")
 $parseErrors = $null
@@ -137,9 +130,10 @@ function Start-SpikeService([string]$Name) {
     try { Start-Service -Name $Name } catch { Write-Warning "Start-Service $Name : $($_.Exception.Message)" }
 }
 
-function Stop-SpikeService([string[]]$Name) {
-    try { Stop-Service -Name $Name -Force } catch { Write-Warning "Stop-Service $Name : $($_.Exception.Message)" }
-    foreach ($one in $Name) { (Get-Service -Name $one).WaitForStatus("Stopped", "00:00:30") }
+function Stop-SpikeService([string]$Name) {
+    # Through the SCM (no -NssmPath), and a stop that is slow only warns: the reports already on
+    # disk still reach the judge, which decides what they show.
+    if (-not (Stop-ServiceAndConfirm -ServiceName $Name)) { Write-Warning "$Name did not stop within 30 seconds" }
 }
 
 function Register-SpikeService {
@@ -237,7 +231,7 @@ try {
     Start-SpikeService $OwnerService
     Wait-ForReport (Join-Path $OwnerDir "owner-start-2.json") $OwnerService
 
-    Stop-SpikeService @($OwnerService, $OtherService)
+    foreach ($name in $OwnerService, $OtherService) { Stop-SpikeService $name }
     Show-Folder $OwnerDir
     Show-Folder $OtherDir
 

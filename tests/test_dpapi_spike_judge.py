@@ -67,6 +67,14 @@ def _refused() -> dict[str, Any]:
     }
 
 
+def _dpapi_failed() -> dict[str, Any]:
+    return {"ok": False, "error": "DpapiError: CryptProtectData failed (Win32 error 5)", "win32": 5}
+
+
+def _unread() -> dict[str, Any]:
+    return {"ok": False, "read": False, "error": "could not read user.blob: [Errno 13]"}
+
+
 def _token(user: str, *, restricted: bool) -> dict[str, Any]:
     """The shape service_token_probe.read_token returns."""
     return {
@@ -163,15 +171,30 @@ def _mutate(path: str, value: Any) -> dict[str, Any]:
         ("start1.token", None, {"Q1": "INCONCLUSIVE"}),
         ("start1.elevated", True, {"Q1": "INCONCLUSIVE"}),
         ("start1", None, {"Q1": "INCONCLUSIVE", "Q2": "INCONCLUSIVE", "Q3": "INCONCLUSIVE"}),
-        # Q1 measured NO: then the blob is not known good, so neither later answer stands.
-        ("start1.user_protect", {"ok": False, "error": "x", "win32": 5}, {"Q1": "NO"}),
+        # Q1 measured NO: then there is no valid blob, so Q2 and Q3 are NOT RUN.
+        ("start1.user_protect", _dpapi_failed(), {"Q1": "NO"}),
         ("start1.user_unprotect", _refused(), {"Q1": "NO"}),
+        ("start1.user_unprotect", {**_opened(), "matches": False}, {"Q1": "NO"}),
+        # A failure that is not DPAPI's is not a NO.
+        (
+            "start1.user_protect",
+            {"ok": False, "error": "MemoryError: ", "win32": None},
+            {"Q1": "INCONCLUSIVE"},
+        ),
+        ("start1.user_unprotect", _unread(), {"Q1": "INCONCLUSIVE"}),
+        # A report numbered 1 that did not protect: an earlier start wrote the blob unreported.
+        ("start1.user_protect", None, {"Q1": "INCONCLUSIVE"}),
         # Q2: a refusal counts only beside every control.
         ("user_copy_identical", False, {"Q2": "INCONCLUSIVE"}),
         ("machine_copy_identical", False, {"Q2": "INCONCLUSIVE"}),
         ("other.token.user", OWNER_SID, {"Q2": "INCONCLUSIVE"}),
         ("other.token.user", "S-1-5-21-9-9-9-1002", {"Q2": "INCONCLUSIVE"}),
         ("other_sid", OWNER_SID, {"Q2": "INCONCLUSIVE"}),
+        (
+            "other.foreign_user_blob",
+            {**_refused(), "error": "MemoryError: "},
+            {"Q2": "INCONCLUSIVE"},
+        ),
         ("other.token", None, {"Q2": "INCONCLUSIVE"}),
         ("other.elevated", True, {"Q2": "INCONCLUSIVE"}),
         ("other.elevated", None, {"Q2": "INCONCLUSIVE"}),
@@ -190,6 +213,9 @@ def _mutate(path: str, value: Any) -> dict[str, Any]:
         ("start2.start", 3, {"Q3": "INCONCLUSIVE"}),
         ("start2.token.user", SYSTEM_SID, {"Q3": "INCONCLUSIVE"}),
         ("start2.token.write_restricted", False, {"Q3": "INCONCLUSIVE"}),
+        ("start2.user_protect", _ok(blob_len=294), {"Q3": "INCONCLUSIVE"}),
+        ("start2.user_unprotect", {**_opened(), "blob_len": 300}, {"Q3": "INCONCLUSIVE"}),
+        ("start2.user_unprotect", _unread(), {"Q3": "INCONCLUSIVE"}),
         ("start2.user_unprotect", _refused(), {"Q3": "NO"}),
     ],
 )
@@ -197,11 +223,18 @@ def test_one_broken_input_moves_only_the_answers_it_should(
     path: str, value: Any, expected: dict[str, str]
 ) -> None:
     answers = _answers(_mutate(path, value))
-    # An answer the case does not name stays YES, except where Q1 fell: Q2 and Q3 rest on it.
+    # An answer the case does not name stays YES, except where Q1 is not YES: Q2 and Q3 rest on it.
     q1 = expected.get("Q1", "YES")
-    rest = "YES" if q1 == "YES" else "INCONCLUSIVE"
+    rest = {"YES": "YES", "NO": "NOT RUN"}.get(q1, "INCONCLUSIVE")
     want = {"Q1": q1, "Q2": rest, "Q3": rest, **expected}
     assert answers == want, path
+
+
+def test_an_other_report_that_is_the_owner_itself_is_not_a_second_account() -> None:
+    # The rig handed the owner's SID as --other-sid, and the other report did run as the owner.
+    case = _mutate("other_sid", OWNER_SID)
+    case["other"]["token"]["user"] = OWNER_SID
+    assert _answers(case)["Q2"] == "INCONCLUSIVE"
 
 
 def test_the_render_prints_every_answer_control_and_the_reboot_arm() -> None:
@@ -214,7 +247,7 @@ def test_the_render_prints_every_answer_control_and_the_reboot_arm() -> None:
             line.startswith(f"DPAPI-SPIKE windows-2022 {key} ") and line.endswith(": YES")
             for line in lines
         ), key
-    assert sum(" control HELD: " in line for line in lines) == 11
+    assert sum(" control HELD: " in line for line in lines) == 12
     assert not any(" control FAILED: " in line for line in lines)
     assert any("REBOOT arm: NOT RUN" in line and "hosted runners" in line for line in lines)
     # cp1252-safe: the summary is read on Windows consoles too.
@@ -257,6 +290,17 @@ def test_the_judge_reads_the_files_and_a_no_is_still_a_green_run(tmp_path: Path)
     assert "DPAPI-SPIKE windows-2025 Q2 " in text and "blob: NO" in text
 
 
+def test_a_q1_no_is_a_finding_and_leaves_the_run_green(tmp_path: Path) -> None:
+    case = _good()
+    case["start1"]["user_protect"] = _dpapi_failed()
+    owner, other = _write_tree(tmp_path, case)
+    summary = tmp_path / "summary.md"
+    assert _judge(owner, other, summary) == 0
+    text = summary.read_text(encoding="utf-8")
+    assert "Q1 " in text and "as the service" in text
+    assert sum(line.endswith(": NOT RUN") for line in text.splitlines()) == 2, text
+
+
 def test_a_copy_that_differs_on_disk_makes_the_run_red(tmp_path: Path) -> None:
     owner, other = _write_tree(tmp_path, _good())
     (other / W.FOREIGN_USER_BLOB).write_bytes(b"not the owner's bytes")
@@ -280,7 +324,7 @@ $assign = [System.Management.Automation.Language.AssignmentStatementAst]
 $fnType = [System.Management.Automation.Language.FunctionDefinitionAst]
 $named = { param($name) @(& $at $rig $assign | Where-Object { $_.Left.Extent.Text -eq $name }) }
 $lifted = @((& $named '$lifted')[0].Right.Expression.SafeGetValue() | Where-Object { $_ -ne $Drop })
-$values = @((& $named '$liftedValues')[0].Right.Expression.SafeGetValue())
+$values = @((& $named '$liftedValues')[0].Right.Expression.SafeGetValue() | Where-Object { $_ -ne $Drop })
 $rigDefs = @(& $at $rig $fnType | ForEach-Object { $_.Name })
 $tree = $L::ParseFile($InstallerPath, [ref]$null, [ref]$null)
 $top = @($tree.EndBlock.Statements)
@@ -338,6 +382,12 @@ def test_every_installer_helper_the_rig_lifts_is_lifted_with_it(tmp_path: Path) 
     result = _lift_gaps(tmp_path)
     assert result["lifted"] >= 18, "CONTROL FAILED: the rig's $lifted list was not read"
     assert result["gaps"] == []
+
+
+def test_the_lift_check_reports_a_value_left_out(tmp_path: Path) -> None:
+    # The control arm for the variable branch: Resolve-Nssm reads $NssmExeSha256.
+    gaps = _lift_gaps(tmp_path, drop="NssmExeSha256")["gaps"]
+    assert any("reads top-level $NssmExeSha256" in gap for gap in gaps), gaps
 
 
 def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:

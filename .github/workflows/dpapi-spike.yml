@@ -10,17 +10,15 @@
 #   Q1  user-scope CryptProtectData, then CryptUnprotectData, as the same service. The round trip is
 #       also what proves the blob valid for the next two.
 #   Q2  a second, non-elevated local account, under a service of its own, is refused that blob.
-#       Controls: Q1 on the same bytes, the same account opening the owner's MACHINE-scope blob, and
-#       its own user-scope round trip. A garbage blob or a broken account cannot pass as a refusal.
 #   Q3  the blob opens after a service restart, in a new process.
 #
 # THE REBOOT ARM OF Q3 IS NOT RUN. A hosted runner cannot reboot inside a job. The summary says so.
 #
 # HOW TO READ IT. Each leg's job summary holds lines starting `DPAPI-SPIKE <image> Q1|Q2|Q3`, an
-# answer of YES, NO or INCONCLUSIVE, and one line per control. The rule for each answer is
-# judge_reports() in scripts/ci/dpapi_spike_worker.py; scripts/ci/dpapi_spike.ps1 is the rig. A NO
-# is a finding and leaves the job green. Only INCONCLUSIVE, an answer the instrument could not
-# give, or a rig failure turns it red.
+# answer, and one line per control. The answers and their controls are defined once, in
+# judge_reports() in scripts/ci/dpapi_spike_worker.py; scripts/ci/dpapi_spike.ps1 is the rig. YES,
+# NO and NOT RUN (Q2 and Q3 when Q1 is NO) are findings and leave the job green. Only
+# INCONCLUSIVE, an answer the instrument could not give, or a rig failure turns it red.
 #
 # IT CAN NEVER BLOCK A MERGE, by structure:
 #   * a separate workflow, not in ci.yml, so not in the `CI gate` roll-up's `needs`;
@@ -30,9 +28,10 @@
 #     this. A separate job keeps a spike red off them.
 #
 # TRIGGERS. Manual dispatch, and pull requests that touch this job's own three files, so the pull
-# request that changes the spike carries its result. No schedule: a spike answers once. A change to
-# install-service.ps1 or messagefoundry/secrets_dpapi.py, which this job also exercises, does NOT
-# re-run it; dispatch it by hand when one of those changes the answer could depend on.
+# request that changes the spike carries its result. No schedule: a spike answers once. The job
+# also depends on at least scripts/service/install-service.ps1, scripts/ci/service_token_probe.py
+# and messagefoundry/secrets_dpapi.py, and a change to any of them does NOT re-run it. Dispatch it
+# by hand when the answers could depend on such a change.
 #
 # COST AND FORKS. Two 2x-billed Windows legs, free on this public repository and billed to a fork's
 # owner, so the job runs only here, as windows-service-smoke does.
@@ -63,8 +62,10 @@ jobs:
     name: dpapi spike (${{ matrix.os }})
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
-    # The rig's waits are bounded at about five minutes in all, plus setup and the NSSM download.
-    timeout-minutes: 12
+    # The rig's own waits come to about five minutes. The NSSM download is uncached here, unlike
+    # windows-service-smoke's, and Save-PinnedNssm bounds a stalled source only by a read timeout of
+    # about five minutes on Windows PowerShell 5.1, so two stalled sources need room too.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
