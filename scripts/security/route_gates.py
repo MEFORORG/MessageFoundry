@@ -111,7 +111,8 @@ def fastapi_symbol(owner: object, name: str) -> Any:
     fails with the name in the message rather than reading less and passing. At least these do:
     ``iter_route_contexts``, the rebuilt route FastAPI serves for a non-API route reached through an
     include, the ``RouteContext._route_context`` record that route is read from, the low-priority
-    route list, and the two callable classifiers the thread-pool guard reads. Names FastAPI documents, such as ``RouteContext.original_route``, are read directly."""
+    route list, and the two callable classifiers the thread-pool guard reads. Names FastAPI
+    documents, such as ``RouteContext.original_route``, are read directly."""
     try:
         return getattr(owner, name)
     except AttributeError:
@@ -546,14 +547,13 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
         # The copy is read from the context's effective-route record, never through
         # ``RouteContext``'s attribute fallback; ``_holder_of`` in messagefoundry/api/security.py
         # says why.
+        # Only an included route has a record, so a direct one skips the read and is served as is.
         record = fastapi_symbol(context, "_route_context")
-        served = getattr(record, "starlette_route", None)
+        served = fastapi_symbol(record, "starlette_route") if record is not None else None
         if not isinstance(served, BaseRoute):
             if original is not entry:
                 # Reached through an include, so the copy must exist. FastAPI does not promise the
                 # field, and the unprefixed original is the wrong path to report.
-                if record is not None:
-                    served = fastapi_symbol(record, "starlette_route")
                 raise ValueError(
                     f"FastAPI {fastapi.__version__} serves an included {type(original).__name__} "
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"

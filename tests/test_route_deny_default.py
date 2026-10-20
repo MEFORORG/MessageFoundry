@@ -581,10 +581,8 @@ def test_the_count_reads_an_included_websocket_and_a_route_served_under_two_temp
     them. A router included twice serves one route object under two templates, and that object
     holds one count, so the key names both templates rather than crediting the first.
 
-    From FastAPI 0.143.1, ``RouteContext``'s attribute fallback answers ``starlette_route`` from the
-    rebuilt copy, which has none, and a walk that read the copy through it dropped the WebSocket's
-    count. The second case makes the fallback answer that way on whichever release is installed.
-    It covers that one read, not every property 0.143.1 moved."""
+    The second case makes the fallback refuse ``starlette_route`` as FastAPI 0.143.1 and later do
+    (``tests/_route_context_shapes.py`` says what that simulates), and the count must not change."""
     monkeypatch.setattr(security_module, "_UNKNOWN_ROUTE_REFUSALS", security_module._RefusalTally())
     monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
     app = create_app(allow_no_auth=True)

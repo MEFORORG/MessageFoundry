@@ -820,11 +820,11 @@ def _holder_of(context: RouteContext) -> tuple[BaseRoute, str | None]:
     The rebuilt copy is read from the context's effective-route record, never through
     ``RouteContext``'s attribute fallback. From FastAPI 0.143.1, a context whose record holds a
     rebuilt copy answers its properties and its fallback from that copy, which has no
-    ``starlette_route``, so a read through the fallback found none and an included WebSocket's
-    count went unreported. The record is a private, typed field, read directly so that strict mypy
-    against the locked FastAPI catches a rename."""
-    record = context._route_context
-    rebuilt = record.starlette_route if record is not None else None
+    ``starlette_route``, so a read through the fallback finds none and would drop an included
+    WebSocket's count. Both names are private to FastAPI and read with a ``None`` default, so a
+    release that renamed one would under-report rather than fail ``GET /security/posture``;
+    ``tests/test_route_deny_default.py`` reds on such a release."""
+    rebuilt = getattr(getattr(context, "_route_context", None), "starlette_route", None)
     if isinstance(rebuilt, BaseRoute):
         return rebuilt, getattr(rebuilt, "path", None)
     return context.original_route, context.path

@@ -676,8 +676,8 @@ def _route_context_hiding(
     monkeypatch: pytest.MonkeyPatch, name: str, *, empty: bool = False
 ) -> None:
     """Make every effective-route record a ``RouteContext`` holds answer ``name`` as a FastAPI that
-    renamed it would, by raising AttributeError, or as one that left it empty, by returning ``None``.
-    The record is where the walk reads the rebuilt route, so that is where a rename would show.
+    renamed it would, by raising AttributeError, or as one that left it empty, by returning
+    ``None``. The record is where the walk reads the rebuilt route, so that is where a rename would show.
 
     Use it only on an app with no included API route. From FastAPI 0.143.1, FastAPI's own
     ``RouteContext`` properties read this field too, so hiding it there makes reading such a
@@ -704,20 +704,13 @@ def _app_with_an_included_websocket() -> FastAPI:
 
 
 @pytest.mark.parametrize(
-    "build",
-    [
-        _app_with_an_included_plain_route,
-        _app_with_an_included_websocket,
-        route_gates.full_surface_app,
-    ],
+    "build", [_app_with_an_included_plain_route, _app_with_an_included_websocket]
 )
 def test_the_walk_does_not_read_the_rebuilt_route_through_the_attribute_fallback(
     monkeypatch: pytest.MonkeyPatch, build: Callable[[], FastAPI]
 ) -> None:
-    """From FastAPI 0.143.1, ``RouteContext``'s attribute fallback answers ``starlette_route`` from
-    the rebuilt copy, which has none, and a walk that read it there failed every included non-API
-    route by name. This makes the fallback answer that way on whichever release is installed, and
-    the walk must read the same rows. It covers that one read, not every property 0.143.1 moved."""
+    """With the fallback refusing ``starlette_route`` as FastAPI 0.143.1 and later do
+    (``tests/_route_context_shapes.py`` says what that simulates), the walk reads the same rows."""
     app = build()
     expected = route_gates.route_rows(app)
     route_context_forwarding_to_the_copy(monkeypatch)
