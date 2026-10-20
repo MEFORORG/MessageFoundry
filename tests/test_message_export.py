@@ -479,7 +479,7 @@ async def test_a_session_revoked_mid_export_stops_the_stream(
         token = await _login(c, "op")
         _after_first_read(monkeypatch, engine, revoke)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
-    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert r.status_code == 200  # the response had started before the stop
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [
         {"selected": 2, "streamed": 1, "reason": "standing_changed"}
@@ -557,7 +557,7 @@ async def test_a_scope_changed_mid_export_stops_the_stream_once(
         token = await _login(c, "op")
         _after_first_read(monkeypatch, engine, rescope)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
-    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert r.status_code == 200  # the response had started before the stop
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": "scope_changed"}]
     actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
@@ -600,11 +600,13 @@ async def test_a_grant_then_a_withdrawal_mid_export_stops_at_the_grant(
 async def test_a_row_checked_inside_the_write_to_revoke_window_stops_on_the_scope(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3381 item 4. Every engine path that changes a live account's scope or roles revokes
-    its sessions after the write, so a row checked between the two sees the new scope on a live
-    session. ``set_channel_scope``'s revoke is held here until the export has finished, which puts
-    row two inside that window. The widened scope stops the export with ``scope_changed``; it used
-    to stream row two, from the channel just granted, before the revoke landed."""
+    """BACKLOG #3381 item 4. ``set_channel_scope`` revokes the account's sessions after it writes
+    the scope, as at least the other engine paths that change a live account's scope or roles do,
+    so a row checked between the two sees the new scope on a live session. The revoke is held here
+    until the export has finished, which puts row two inside that window. The widened scope stops
+    the export with ``scope_changed``; it used to stream row two, from the channel just granted,
+    before the revoke landed. The token is proved up front, because a re-proof re-keys the session
+    and would end the token this test reads on its own."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
     mid_a, mid_b = await _seed(engine)
@@ -624,17 +626,27 @@ async def test_a_row_checked_inside_the_write_to_revoke_window_stops_on_the_scop
         pending.append(
             asyncio.create_task(service.set_channel_scope(uid, ["IB_A", "IB_B"], actor="admin"))
         )
-        await written.wait()
+        # Bounded, so a set_channel_scope that fails before its revoke fails here, not at the
+        # suite's timeout.
+        await asyncio.wait_for(written.wait(), timeout=10)
 
-    async with _client(engine, service, raise_app_exceptions=False) as c:
-        token = await _login(c, "op")
-        _after_first_read(monkeypatch, engine, administer)
-        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
-    release.set()
-    await pending[0]
+    try:
+        async with _client(engine, service, raise_app_exceptions=False) as c:
+            token = await prove(c, await _login(c, "op"), PW, "message_export")
+            _after_first_read(monkeypatch, engine, administer)
+            r = await c.get(
+                "/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]}
+            )
+        # The control: the window was still open when the export ended, so the scope check, not
+        # the revoke, stopped it.
+        assert await service.identity_for_token(token, activity=False) is not None
+    finally:
+        release.set()
+        if pending:
+            await pending[0]
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": "scope_changed"}]
-    assert await service.identity_for_token(token) is None  # control: the revoke did land after
+    assert await service.identity_for_token(token) is None  # and the revoke landed after it
 
 
 @pytest.mark.parametrize(
@@ -660,10 +672,12 @@ async def test_an_administrator_scope_change_mid_export_stops_it_as_a_revoke(
         await service.set_channel_scope(uid, change, actor="admin")
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
-        token = await _login(c, "op")
+        # Proved up front: a re-proof re-keys the session, which would end this token whatever
+        # the administrator did, and the last assertion reads it.
+        token = await prove(c, await _login(c, "op"), PW, "message_export")
         _after_first_read(monkeypatch, engine, administer)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
-    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert r.status_code == 200  # the response had started before the stop
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [
         {"selected": 2, "streamed": 1, "reason": "standing_changed"}
@@ -779,22 +793,23 @@ async def test_a_stall_shorter_than_the_idle_window_can_end_the_export(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3381 item 5: SECURITY.md says one stall of about three quarters of the idle window
-    can end an export. The touch runs only at a row's top, at most every quarter window, so a stall
-    after a row that did not touch adds to the time since the last touch. Here the window is 2.0 s:
-    row one touches, row two comes 0.25 s later and does not, and a 1.85 s stall after it, under
-    the whole window, idles the session before row three's re-check. Accepted, not fixed: a touch
-    during a stall would need a timer beside the stream, and a client that stops reading for that
-    long signs in again."""
-    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
+    can end an export. That figure is arithmetic: the touch runs only at a row's top, at most every
+    quarter window, so after a row that did not touch, a stall needs only the rest of the window.
+    This test pins the part that can be measured with margin: a stall SHORTER than the window ends
+    the export. The window is 3.0 s; row one touches, row two comes 0.4 s later and does not, and a
+    2.75 s stall after it idles the session before row three's re-check. Accepted, not fixed: a
+    touch during a stall would need a timer beside the stream, and a client that stops reading for
+    that long signs in again."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 3.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     ids = await _seed_many(engine, 3)
 
     async def short_gap() -> None:
-        await asyncio.sleep(0.25)  # under the 0.5 s quarter window, so row two does not touch
+        await asyncio.sleep(0.4)  # under the 0.75 s quarter window, so row two does not touch
 
     async def stall() -> None:
-        await asyncio.sleep(1.85)
+        await asyncio.sleep(2.75)
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
@@ -813,9 +828,12 @@ def test_uvicorn_drops_the_traceback_of_a_deliberate_stop_and_keeps_a_crash(
     ``Exception in ASGI application`` with a traceback on ``uvicorn.error``. The app installs a
     filter there that drops that record for :class:`ExportStopped` only, so another exception keeps
     its traceback. Installed once however many times it is asked."""
-    create_app(engine)
-    quiet_deliberate_export_stops()  # a second install, as a second app would make
     log = logging.getLogger("uvicorn.error")
+    for installed in [f for f in log.filters if isinstance(f, ExportStopLogFilter)]:
+        log.removeFilter(installed)  # an earlier test's app installed it; this one must
+    create_app(engine)
+    assert sum(isinstance(f, ExportStopLogFilter) for f in log.filters) == 1, log.filters
+    quiet_deliberate_export_stops()  # a second install, as a second app would make
 
     def record(exc: BaseException) -> logging.LogRecord:
         return log.makeRecord(

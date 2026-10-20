@@ -2004,15 +2004,19 @@ class ExportStopped(RuntimeError):
     """A running export lost its caller's standing, so the stream aborts (BACKLOG #1154). The
     bulk message export and the audit export raise it.
 
-    The response has already started, so no status code can say so. Raising aborts the transfer,
-    and the client sees an incomplete download rather than a short file that looks complete.
-    Returning without the final body message would not: the ``@app.middleware("http")`` layers
-    would then finish the response cleanly, which is the short file this exists to prevent.
+    The response has already started, so no status code can say so. The raise was meant to abort
+    the transfer, so the client would see an incomplete download rather than a short file that
+    looks complete. **It does not, on the engine as shipped (found under BACKLOG #3381, unfixed).**
+    Starlette's ``BaseHTTPMiddleware``, which each ``@app.middleware("http")`` layer is, ends the
+    response with its final body message when the inner app raises, and re-raises only after
+    that. So the client receives a cleanly ended 200 holding the rows streamed before the stop.
+    Raising still records the stop as the app's failure, and returning without the final body
+    message would fare no better behind those layers.
 
-    A stop is a decision, not a crash, so the server log records it once, as the WARNING with
-    counts that the raising stream writes before it raises (BACKLOG #3381). ``_unhandled_exception``
-    writes no ERROR line for this type, and :class:`ExportStopLogFilter` drops the traceback
-    uvicorn would log for it."""
+    A stop is a decision, not a crash. The raising stream writes a WARNING with the counts and the
+    stop's audit row before it raises (BACKLOG #3381), so ``_unhandled_exception`` writes no ERROR
+    line for this type, and :class:`ExportStopLogFilter` drops the traceback uvicorn would log for
+    it."""
 
 
 class ExportStopLogFilter(logging.Filter):
@@ -2021,7 +2025,8 @@ class ExportStopLogFilter(logging.Filter):
     traceback."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return not (record.exc_info is not None and isinstance(record.exc_info[1], ExportStopped))
+        # Truthiness, not ``is not None``: a call with ``exc_info=False`` leaves False there.
+        return not (record.exc_info and isinstance(record.exc_info[1], ExportStopped))
 
 
 _EXPORT_STOP_FILTER = ExportStopLogFilter()

@@ -4495,17 +4495,23 @@ on that session, for example) ends it as a revocation would.
 
   A second check catches a scope change that reaches a live session without a revoke. At least
   two cases do. One is a direct store write. The other is a row checked after an engine path
-  writes a scope or a role set but before its revoke lands. Every engine path that changes a live
-  account's scope or roles revokes after its write, so each has that window: at least
-  `set_channel_scope`, a role change, and the directory's sign-in and reconcile writes. The AD map
-  edit writes no user's scope, so it has no such window. In both cases the export stops, with the
-  reason `scope_changed`, when the caller's channel scope differs from the one it started with,
-  wider or narrower (BACKLOG #3381). So no row streams on a scope the export's step-up and its
-  `messages_export` row did not cover, and a grant then a withdrawal stops at the grant rather
-  than skipping later rows one by one. A stop records `messages_export.stopped` with the selected
-  and streamed counts and the reason. Then it aborts the transfer, so the client sees a failed
-  download rather than a short file. The server logs the stop once, as a WARNING with the counts,
-  and not as an error with a traceback.
+  writes a scope or a role set but before its revoke lands. At least these paths revoke after
+  their write, so each has that window: `set_channel_scope`, a role change, and the directory's
+  sign-in and reconcile writes. The AD map edit writes no user's scope, so it has no such window.
+  In both cases the export stops, with the reason `scope_changed`, when the caller's channel
+  scope differs from the one it started with, wider or narrower (BACKLOG #3381). So no row
+  streams on a scope the export's step-up and its `messages_export` row did not cover, and a
+  grant then a withdrawal stops at the grant rather than skipping later rows one by one. A stop
+  records `messages_export.stopped` with the selected and streamed counts and the reason. The
+  server log carries a WARNING with the counts beside that audit row, not an error with a
+  traceback.
+
+  **The stop does not reach the client as a failed download, in the shipped code.** The export
+  raises to abort the transfer, but the engine's `@app.middleware("http")` layers end the
+  response cleanly before that raise leaves them. So a client receives a 200 that ends normally
+  and holds only the rows streamed before the stop, and it cannot tell that file from a complete
+  export. The `messages_export.stopped` row is the only record that the file is short. This was
+  found under BACKLOG #3381 and is not fixed there. The same holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
@@ -4520,7 +4526,8 @@ on that session, for example) ends it as a revocation would.
   identity the export started with. A caller that may now read fewer rows, as after losing
   `users:manage`, would still receive the lock rows. So that stops it too, with the reason
   `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
-  the reason, then aborts the transfer. The idle clock moves as the bulk export's does, at most
+  the reason, then raises to abort the transfer, which reaches the client as a cleanly ended short
+  file, as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
   every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.

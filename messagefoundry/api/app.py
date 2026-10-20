@@ -6712,7 +6712,8 @@ def create_app(
         it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
         caller is re-resolved before each row. Once its standing fails, or its channel scope differs
         from the one it started with, wider or narrower, the stream records
-        ``messages_export.stopped`` and aborts (BACKLOG #1154, #3381). Each streamed body is re-checked
+        ``messages_export.stopped`` and raises :class:`ExportStopped` (BACKLOG #1154, #3381), which
+        does not reach the client as a failed download; see that class. Each streamed body is re-checked
         against that row's per-channel scope, which is therefore the starting one (load-bearing for the
         attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
         (``auth.channel_denied``).
@@ -6811,7 +6812,7 @@ def create_app(
                 # A changed channel scope stops the export too, in either direction (BACKLOG
                 # #3381). This catches a change that reached the session without a revoke: a direct
                 # store write, or a row checked after an engine path wrote a scope or a role set but
-                # before its revoke landed, which every such path has. A narrowing stops rather than
+                # before its revoke landed (docs/SECURITY.md names the paths). A narrowing stops rather than
                 # skipping and auditing every later out-of-scope row, which would trip the
                 # access-denied burst signal against an operator who did nothing. A widening stops
                 # rather than streaming rows the step-up never covered, which nothing would record.
