@@ -181,12 +181,15 @@ replacement for it, and hooks get added.
 | push guard (`pre-push`) | You tried to push a protected branch directly. Branch and open a PR. |
 
 **mypy does not run at commit.** No pre-commit hook invokes it. mypy strict runs in CI and reports
-after your process is gone, so run the four legs `ci.yml` runs by hand before you commit:
+after your process is gone, so run the legs `ci.yml` runs by hand before you commit, at least
+these:
 
     mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
     mypy --platform win32 messagefoundry messagefoundry_toolkit
     mypy --explicit-package-bases tests
     mypy --platform linux scripts/asvs
+    mypy --platform linux -p harness.sinks
+    mypy --platform win32 -p harness.sinks
 
 Never use `--no-verify`, and never rename a file to slip past a gate. A gate you bypassed is a gate
 nobody will re-run.
