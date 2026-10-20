@@ -1534,7 +1534,10 @@ def _named(risk: str) -> list[str]:
         "10.0.0.0/31",  # two addresses: the smallest IPv4 range
         "fd00::/127",  # two addresses: the smallest IPv6 range
         "10.0.0.0/30",  # a small pool
-        "10.0.0.16/28",  # spelled with the single-host entry as a prefix of its text
+        # "10.0.0.1" is a prefix of this entry's text, so the substring check this test once made,
+        # "10.0.0.1" not in risk, goes red here on a correct risk. It cannot tell the host from
+        # this range (#3393).
+        "10.0.0.16/28",
         "10.0.0.0/8",
         "fd00::/8",
     ],
@@ -1550,15 +1553,6 @@ def test_a_multi_address_proxy_entry_is_a_named_loosening(entry: str) -> None:
     assert _named(risk) == [entry]
 
 
-def test_a_substring_check_cannot_tell_a_named_host_from_a_range_spelled_after_it() -> None:
-    """BACKLOG #3393: the check above once read ``"10.0.0.1" not in risk``. Beside ``10.0.0.16/28``
-    that substring is present though the host is not named, so the old check could not tell the
-    two apart; it went red on a correct risk, and would stay red on a wrong one."""
-    risk = _proxy_risk("10.0.0.1", "10.0.0.16/28")
-    assert "10.0.0.1" in risk
-    assert "10.0.0.1" not in _named(risk)
-
-
 def test_multi_address_entries_are_read_strictly_and_named_once() -> None:
     assert _classify_proxy_entries(
         ["10.1.2.3/0", "10.0.0.1", "fd00::/127", "10.0.0.0/31", "fd00::/127"]
@@ -1571,9 +1565,11 @@ def test_proxy_entries_keep_input_order_across_both_families() -> None:
     assert _classify_proxy_entries(["fd00::/8", "10.0.0.0/8"]) == ([], ["fd00::/8", "10.0.0.0/8"])
     risk = _proxy_risk("fd00::/8", "10.0.0.1", "10.0.0.0/8")
     assert _named(risk) == ["fd00::/8", "10.0.0.0/8"]
-    # The whole-family list keeps input order too.
-    halves = _split("0.0.0.0/0", 1)[::-1]
-    assert _classify_proxy_entries(halves) == (halves, [])
+    # The whole-family list keeps input order too. Red under the per-family order, which put
+    # ``0.0.0.0/0`` first.
+    low, high = _split("::/0", 1)
+    whole = [high, "0.0.0.0/0", low]
+    assert _classify_proxy_entries(whole) == (whole, [])
 
 
 @pytest.mark.parametrize(

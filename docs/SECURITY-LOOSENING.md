@@ -153,7 +153,7 @@ leaves the engine.
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
-| | `[api].trusted_proxies` | `[]` (any entry covering more than one address is named, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
+| | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
@@ -1111,7 +1111,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### `[api].trusted_proxies` covering more than one address, up to every address — a host that is not the proxy may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
-> trail either way. **Any entry covering more than one address is named**, IPv4 or IPv6, however small:
+> trail either way. **Any network covering more than one address is named**, IPv4 or IPv6, however small:
 > a `/31` or `/127` holds two hosts, and a range of any size trusts every host inside it. A cutoff above
 > one address would leave some range silent. A bare address, `/32` or `/128` is the proxy itself and is
 > not named. The check is advisory: it refuses nothing.
@@ -1126,6 +1126,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
 > `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
 > the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
+>
+> **Each network is named once, in list order, under the first spelling the list gives it.** So
+> `10.0.0.0/08` or `::ffff:10.0.0.0/104` beside `10.0.0.0/8` is not named again (BACKLOG #3393).
+> To clear a named range, remove every spelling of it from the list.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With

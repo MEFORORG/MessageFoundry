@@ -8178,10 +8178,10 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     network once, under the first spelling given for it: ``10.0.0.0/08`` and ``::ffff:10.0.0.0/104``
     both name the network ``10.0.0.0/8`` does, so beside it they add nothing (BACKLOG #1131, #3393).
 
-    ``whole_family`` holds EVERY multi-address entry of a family whose entries, together, cover
+    ``whole_family`` holds EVERY multi-address network of a family whose entries, together, cover
     every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
     family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. ``ranges`` holds the
-    multi-address entries of every other family. A single-host entry is in neither.
+    multi-address networks of every other family. A single-host entry is in neither.
 
     The cutoff is one address, not a size. Every host inside a trusted range may set its own
     ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
@@ -8193,8 +8193,8 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     v4: list[ipaddress.IPv4Network] = []
     v6: list[ipaddress.IPv6Network] = []
     # Keyed by the network an entry names, so a respelling is not named twice. The value is the
-    # first spelling and every family the network counts toward.
-    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[str, set[int]]] = {}
+    # first spelling and the family whose collapse decides its wording.
+    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[str, int]] = {}
     for entry in entries:
         try:
             parsed = _parse_trusted_proxy(entry)
@@ -8216,12 +8216,13 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
             as_v4 = None
         if isinstance(net, ipaddress.IPv6Network):
             v6.append(net)
-        families = {net.version}
         if as_v4 is not None:
             v4.append(as_v4)
-            families.add(4)
         if net.num_addresses > 1:
-            named.setdefault(meaning, (entry, set()))[1].update(families)
+            # An entry that counts toward IPv4 is judged by IPv4's collapse alone. That loses
+            # nothing: an IPv6 collapse covering every address covers the mapped block, and each
+            # entry inside or around that block added its IPv4 view above, so IPv4 is whole too.
+            named.setdefault(meaning, (entry, 6 if as_v4 is None else 4))
     # collapse_addresses takes one family at a time, so each is collapsed on its own.
     covered = {
         version
@@ -8233,9 +8234,8 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     }
     whole_family: list[str] = []
     ranges: list[str] = []
-    # An entry counted in both families earns the wider wording if either is covered whole.
-    for entry, counted_in in named.values():
-        (whole_family if counted_in & covered else ranges).append(entry)
+    for entry, family in named.values():
+        (whole_family if family in covered else ranges).append(entry)
     return whole_family, ranges
 
 
