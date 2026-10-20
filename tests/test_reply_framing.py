@@ -21,15 +21,18 @@ import contextlib
 import copy
 import email.message
 import http.client
+import importlib
 import io
 import logging
 import pickle
 import socket
 import sys
 import threading
+import unicodedata
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -1383,33 +1386,242 @@ def test_a_proxy_handler_may_sit_on_a_strict_opener() -> None:
     )
 
 
-#: Calls that make an opener or a connection with the stock response class.
+#: Names of the calls that make an opener or a connection with the stock response class.
 _STOCK_OPENER_CALLS = frozenset(
     {"build_opener", "urlopen", "OpenerDirector", "HTTPConnection", "HTTPSConnection"}
 )
+
+#: Import origins that share a name above but build no urllib opener or ``http.client``
+#: connection. Each must be an absolute, importable origin. starlette's ``HTTPConnection`` wraps an
+#: ASGI scope and dials nothing.
+_NOT_STOCK_OPENERS = frozenset({"starlette.requests.HTTPConnection"})
+
+
+class _Bindings(NamedTuple):
+    #: ``bound name -> dotted origins``, from every ``import`` in the file at any depth. A name
+    #: bound by two imports keeps both. A relative import keeps its leading dots rather than
+    #: resolving the package, so it never equals an absolute origin on the allow-list.
+    imports: dict[str, set[str]]
+    #: Names some other statement also binds: an assignment, a ``def`` or ``class``, a parameter.
+    shadowed: set[str]
+    #: A star import can rebind any name, so no import origin is trusted alone.
+    star: bool
+
+
+def _bindings(tree: ast.AST) -> _Bindings:
+    imports: dict[str, set[str]] = {}
+    shadowed: set[str] = set()
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # ``import http.client as h`` binds ``h``; ``import http.client`` binds ``http``.
+                if alias.asname:
+                    imports.setdefault(alias.asname, set()).add(alias.name)
+                else:
+                    top = alias.name.partition(".")[0]
+                    imports.setdefault(top, set()).add(top)
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            for alias in node.names:
+                if alias.name == "*":
+                    star = True
+                else:
+                    origin = f"{module}.{alias.name}" if node.module else module + alias.name
+                    imports.setdefault(alias.asname or alias.name, set()).add(origin)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            shadowed.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            shadowed.add(node.name)
+        elif isinstance(node, ast.arg):
+            shadowed.add(node.arg)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            shadowed.add(node.name)
+    return _Bindings(imports, shadowed, star)
+
+
+def _getattr_target(node: ast.expr) -> tuple[ast.expr, str] | None:
+    """``getattr(obj, "name")`` as ``(obj, "name")``, which reads the same as ``obj.name``."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    ):
+        return node.args[0], node.args[1].value
+    return None
+
+
+def _call_origins(func: ast.expr, bindings: _Bindings) -> set[tuple[str, bool]]:
+    """Each ``(dotted origin, came from an import)`` a call's target can be.
+
+    The root name goes through the file's imports. A root no import binds (a local name, ``self``,
+    a call result) keeps its spelling, and so does a root the file also binds another way or that
+    a star import could rebind. The last part of a spelling still names the call, so the scan fails
+    closed on it."""
+    attrs: list[str] = []
+    while True:
+        if isinstance(func, ast.Attribute):
+            attrs.append(func.attr)
+            func = func.value
+        elif target := _getattr_target(func):
+            func, attr = target
+            attrs.append(attr)
+        else:
+            break
+    tail = ".".join(reversed(attrs))
+    if not isinstance(func, ast.Name):
+        return {(tail, False)} if tail else set()
+    roots = {(root, True) for root in bindings.imports.get(func.id, ())}
+    if not roots or bindings.star or func.id in bindings.shadowed:
+        roots.add((func.id, False))
+    return {(f"{root}.{tail}" if tail else root, imported) for root, imported in roots}
+
+
+def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
+    """``(line, origin)`` for each call whose origin ends in a stock name.
+
+    The import decides, not the spelling: ``from http.client import HTTPConnection as C`` then
+    ``C(host)`` is a stock call, and starlette's ``HTTPConnection`` under its own name is not. An
+    origin outside urllib and ``http.client`` that ends in a stock name is still an offence unless
+    ``_NOT_STOCK_OPENERS`` names it, because urllib3's connections, for one, read a reply head with
+    ``http.client``'s class too. The allow-list clears only an origin an import gave, never a
+    spelling.
+
+    At least these pass unseen: a stock class held in a variable first, as in
+    ``C = http.client.HTTPConnection`` then ``C(host)``, which a planted control pins; and a stock
+    name re-exported under another name by a second module and imported from there, which a scan
+    of one file at a time cannot see and no planted control pins."""
+    bindings = _bindings(tree)
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            # sorted only so a failure lists a call's origins in a stable order.
+            for origin, imported in sorted(_call_origins(node.func, bindings)):
+                if origin.rpartition(".")[2] in _STOCK_OPENER_CALLS and not (
+                    imported and origin in _NOT_STOCK_OPENERS
+                ):
+                    found.append((node.lineno, origin))
+    return found
 
 
 def test_no_engine_module_builds_a_stock_opener() -> None:
     """A source scan, because some openers (the SOAP mutual-TLS one, at least) need key material to
     build. Every urllib opener in the engine must come from build_strict_opener. Calls are found in
-    the syntax tree, so a docstring that names one is not a call."""
+    the syntax tree, so a docstring that names one is not a call, and each call is judged by where
+    its import says it came from (``_stock_calls``)."""
+    for entry in _NOT_STOCK_OPENERS:
+        module, _, name = entry.rpartition(".")
+        assert hasattr(importlib.import_module(module), name), f"{entry} is not an import origin"
     root = Path(__file__).resolve().parents[1] / "messagefoundry"
     stock: list[str] = []
     control = 0
     for path in root.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if not any(name in text for name in _STOCK_OPENER_CALLS):
-            continue  # most files name none of them; skipping the parse keeps the scan cheap
-        for node in ast.walk(ast.parse(text)):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name not in _STOCK_OPENER_CALLS:
-                continue
-            if path.name == "bounded_read.py" and name == "build_opener":
+        # utf-8-sig: a byte-order mark would otherwise fail the parse for a reason unrelated to
+        # openers.
+        text = path.read_text(encoding="utf-8-sig")
+        # Most files name none of them, and skipping the parse keeps the scan cheap. An aliased
+        # import still spells the stock name in the import itself. NFKC is how the parser reads
+        # an identifier, so a look-alike spelling is not skipped either.
+        normalized = unicodedata.normalize("NFKC", text)
+        if not any(name in normalized for name in _STOCK_OPENER_CALLS):
+            continue
+        rel = path.relative_to(root).as_posix()
+        for lineno, origin in _stock_calls(ast.parse(text)):
+            if rel == "transports/bounded_read.py" and origin == "urllib.request.build_opener":
                 control += 1  # the one sanctioned call, inside build_strict_opener
             else:
-                stock.append(f"{path.relative_to(root)}:{node.lineno}")
+                stock.append(f"{rel}:{lineno} {origin}")
     assert control == 1, "the scan did not find build_strict_opener's own call"
-    assert stock == []
+    assert stock == [], (
+        "build the opener with build_strict_opener; if an import gave the origin and it is another "
+        "library's class that builds no urllib opener or http.client connection, add that absolute "
+        f"origin to _NOT_STOCK_OPENERS: {stock}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "offending"),
+    [
+        pytest.param(
+            "from http.client import HTTPConnection as C\nC('h')", True, id="aliased-http-client"
+        ),
+        pytest.param(
+            "from urllib.request import urlopen as fetch\nfetch('u')", True, id="aliased-urllib"
+        ),
+        pytest.param("import http.client as h\nh.HTTPConnection('h')", True, id="module-alias"),
+        pytest.param(
+            "from urllib import request as r\nr.build_opener()", True, id="submodule-alias"
+        ),
+        pytest.param("import urllib.request\nurllib.request.OpenerDirector()", True, id="dotted"),
+        pytest.param(
+            "from http.client import HTTPSConnection\nHTTPSConnection('h')", True, id="direct"
+        ),
+        pytest.param(
+            "import urllib.request as ur\ngetattr(ur, 'urlopen')('u')", True, id="getattr"
+        ),
+        pytest.param("HTTPConnection('h')", True, id="unimported-name"),
+        pytest.param("self.urlopen('u')", True, id="unresolved-receiver"),
+        pytest.param(
+            "import urllib3\nurllib3.connection.HTTPConnection('h')", True, id="other-library"
+        ),
+        pytest.param(
+            "from starlette.requests import HTTPConnection\n"
+            "def f():\n    from http.client import HTTPConnection\n    HTTPConnection('h')",
+            True,
+            id="rebound-by-import",
+        ),
+        pytest.param(
+            "import http.client\nfrom starlette.requests import HTTPConnection\n"
+            "def f(HTTPConnection=http.client.HTTPConnection):\n    HTTPConnection('h')",
+            True,
+            id="rebound-by-parameter",
+        ),
+        pytest.param(
+            "from starlette.requests import HTTPConnection\nfrom http.client import *\n"
+            "HTTPConnection('h')",
+            True,
+            id="star-import",
+        ),
+        pytest.param(
+            "starlette.requests.HTTPConnection(scope)", True, id="allow-listed-spelling-unimported"
+        ),
+        pytest.param(
+            "from starlette.requests import HTTPConnection\nHTTPConnection(scope)",
+            False,
+            id="starlette-own-name",
+        ),
+        pytest.param(
+            "import starlette.requests\nstarlette.requests.HTTPConnection(scope)",
+            False,
+            id="starlette-dotted",
+        ),
+        pytest.param(
+            "from messagefoundry.transports.bounded_read import build_strict_opener\n"
+            "build_strict_opener()",
+            False,
+            id="strict-opener",
+        ),
+        pytest.param(
+            "import urllib.request\ndef f(o: urllib.request.OpenerDirector): return o.open('u')",
+            False,
+            id="annotation-not-a-call",
+        ),
+        # A gap _stock_calls names. If it starts to read as an offence, the guard got wider: move
+        # it up and correct that docstring.
+        pytest.param(
+            "import http.client\nC = http.client.HTTPConnection\nC('h')",
+            False,
+            id="gap-class-held-in-a-variable",
+        ),
+    ],
+)
+def test_the_stock_opener_guard_judges_the_import_not_the_spelling(
+    source: str, offending: bool
+) -> None:
+    """The guard's own control: each planted shape it exists to catch reads as an offence, and the
+    neighbouring shapes that build no stock opener do not (BACKLOG #3360)."""
+    found = _stock_calls(ast.parse(source))
+    assert bool(found) is offending, found

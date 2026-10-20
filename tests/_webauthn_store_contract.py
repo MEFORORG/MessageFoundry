@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Awaitable
+from contextlib import AbstractContextManager
 from typing import Any
+
+import pytest
 
 from messagefoundry.auth.service import _is_integrity_refusal
 from messagefoundry.store.store import WebAuthnCredential
@@ -308,16 +311,50 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP"
     assert len(await store.list_sessions("totp-u1")) == 1
     assert await audit_rows() == 0
-    ended = await store.replace_totp_enrolment(
-        "totp-u1", step=200, expected_enrolled_at=12.0, now=13.0, **replaced
+    # A refused audit append, or a refused COMMIT where the store has a seam for one, leaves the
+    # seed, the sessions and the audit log as they were and tees nothing, and the swap that commits
+    # tees its row once (vault BACKLOG #3324). Under the commit fault the append has run for real,
+    # so a tee before the commit would show.
+    from tests._operator_audit_atomic_contract import (
+        AppendFailed,
+        CommitFailed,
+        TeeTap,
+        commit_seam,
+        failing_append,
+        failing_commit,
     )
+
+    faults: list[tuple[AbstractContextManager[None], type[Exception]]] = [
+        (failing_append(store, action), AppendFailed)
+    ]
+    if commit_seam(store):
+        faults.append((failing_commit(store), CommitFailed))
+    tap = TeeTap()
+    try:
+        for fault, raised in faults:
+            with fault, pytest.raises(raised):
+                await store.replace_totp_enrolment(
+                    "totp-u1", step=200, expected_enrolled_at=12.0, now=12.75, **replaced
+                )
+            assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP", raised
+            assert await store.get_recovery_code_hashes("totp-u1") == ["o1", "o2"], raised
+            user = await store.get_user("totp-u1")
+            assert user is not None and user.totp_enabled is True, raised
+            assert len(await store.list_sessions("totp-u1")) == 1, raised
+            assert await audit_rows() == 0, raised
+        ended = await store.replace_totp_enrolment(
+            "totp-u1", step=200, expected_enrolled_at=12.0, now=13.0, **replaced
+        )
+    finally:
+        tap.stop()
     assert ended == 1
+    [written] = await store.list_audit(limit=10, action=action)
+    assert tap.ids(action) == [int(written["id"])]
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is True
     assert await store.get_totp_secret("totp-u1") == new_seed
     assert await store.get_recovery_code_hashes("totp-u1") == ["n1"]
     assert await store.list_sessions("totp-u1") == []
-    assert await audit_rows() == 1
     # The high-water mark is the proving code's step, not the old seed's: 200 is spent, 201 is not.
     assert await store.consume_totp_step("totp-u1", 200) is False
     assert await store.consume_totp_step("totp-u1", 201) is True

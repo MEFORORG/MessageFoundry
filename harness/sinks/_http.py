@@ -30,11 +30,10 @@ part of 3.4.3; BACKLOG #1120).
 That includes the answers the stdlib handler writes before the sink's own code runs, such as its
 ``400`` for a malformed request line and its ``501`` for a method the sink does not serve. The
 handler's ``end_headers`` adds them, and the stdlib closes every header block through that one
-method. Nothing is answered in HTTP/0.9 form, which has no status line and no header block. The
-stdlib uses that form for an HTTP/0.9 request on every CPython read so far. Up to at least
-3.14.6 it also used it for its own ``400`` for a request line it cannot parse and its ``505`` for
-a version it refuses; 3.14.8 writes those with a status line itself. The sink answers all of them
-with a status line and a header block, like any other; the handler's ``request_version`` says how.
+method. Nothing is answered in HTTP/0.9 form, which has no status line and no header block; the
+comment on the handler's ``request_version`` says which answers the stdlib writes that way and
+how the sink avoids it. No answer carries a ``Server`` line: the stdlib's names the Python patch
+level, and the engine listener sends none.
 
 The stdlib's own error answers are ``text/plain``, not its default HTML page. The comment on the
 handler's ``error_content_type`` names the paths that were read.
@@ -216,10 +215,20 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
             # The one place the baseline is added. The stdlib ends every header block it writes
             # here: this handler's answers, send_error's, and the interim 100 Continue. So an
             # answer written before _serve runs (a malformed request, an unknown method) is
-            # covered without naming it.
+            # covered without naming it. The interim 100 gets the baseline too, harmlessly: R3 in the
+            # vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts an interim 1xx outside the verb, so it is not required
+            # there, and the suite does not pin it.
             for name, value in BASELINE_RESPONSE_HEADERS:
                 self.send_header(name, value)
             super().end_headers()
+
+        def send_header(self, keyword: str, value: str) -> None:
+            # Every header line goes through here. The stdlib's send_response adds a Server line
+            # naming the Python patch level, for its own answers and send_error's; the engine
+            # listener's answers carry none, so it is dropped. Filtering here, not copying
+            # send_response, keeps the rest of that method the stdlib's.
+            if keyword.lower() != "server":
+                super().send_header(keyword, value)
 
         # The stdlib writes an answer in HTTP/0.9 form whenever request_version reads "HTTP/0.9":
         # a bare body, with no status line and no header block for end_headers to add to. That is

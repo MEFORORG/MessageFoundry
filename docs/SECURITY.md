@@ -2344,13 +2344,18 @@ request moves to `failed`, and `approval.failed` names the error type. A release
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
 attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
 is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
+At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
+exception the claim has. The re-queue or the cancel and its row are then committed, and the gate
+still tries to move the request to `failed`. That row is not forwarded off-box, and no alert says
+the operation ran (vault BACKLOG #3324). Before you request a `failed` replay or purge again, look
+in the local audit log for a `dead_letter_replay` or `connection_purge` row written when it ran.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
 `approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
-error, as stated above.
+error, as stated for the claim above.
 
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name.

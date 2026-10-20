@@ -536,8 +536,8 @@ jobs:
       #     branch runs on the Windows pytest legs, where a defect in it fails the run.
       #   * Placed straight after the linux engine pass so it reuses that pass's mypy cache; after
       #     the win32 pass it re-analyses the engine modules the tests import.
-      #   * NOT REPO-WIDE. At least harness/, tee/, scripts/ (all but scripts/asvs/, which has its
-      #     own step below), samples/, docker/, fuzz/, docs/**/*.py and
+      #   * NOT REPO-WIDE. At least harness/ (all but harness/sinks/, which has its own steps
+      #     below), tee/, scripts/ (all but scripts/asvs/, which has its own step below), samples/, docker/, fuzz/, docs/**/*.py and
       #     packaging/messagefoundry-webconsole/tests/ are outside every mypy step. mypy follows a
       #     test's import into harness/ or scripts/, but the editable install reports those modules
       #     as silenced site-packages, so a green step says nothing about them.
@@ -562,6 +562,19 @@ jobs:
       - name: Type-check (mypy, strict — scripts/asvs)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy scripts/asvs
+
+      # BACKLOG #3358 item 11: the harness's loopback sinks, harness.sinks, under the same strict
+      # profile. They answer HTTP with the browser baseline (BACKLOG #1120), and nothing hosted
+      # type-checked them. NARROW ON PURPOSE: this one package, not harness/, whose other trees
+      # do not pass strict today. By package (-p), because harness/ has no top-level layout mypy
+      # can map from a path. Steps in this job, so they add no context. Two platforms, as for the
+      # engine: the sinks' sys.platform == 'win32' branches are unreachable to the linux pass.
+      - name: Type-check (mypy, strict — harness.sinks, linux platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: mypy -p harness.sinks
+      - name: Type-check (mypy, strict — harness.sinks, win32 platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: mypy --platform win32 -p harness.sinks
 
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.

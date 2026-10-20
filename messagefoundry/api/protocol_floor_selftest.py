@@ -38,7 +38,9 @@ is a backstop for a later edit to this module, and no drive reaches it today.
 exception from the drive itself all raise
 :class:`~messagefoundry.api.protocol_headers.ProtocolFloorUnavailable`, which ``serve`` and
 ``supervise`` already refuse to start on. The message names each response and each header it lacked.
-It never quotes the bytes written, and it names an exception by type only.
+It never quotes the bytes written or an exception's message. An exception is named by its type, the
+Python version, and the module and line of each frame it passed through, so a fault in the server,
+in asyncio and in this module read apart.
 
 **What it does not prove.** At least these are outside it:
 
@@ -55,17 +57,25 @@ The header set comes from
 :data:`~messagefoundry.api.protocol_headers.PROTOCOL_SECURITY_HEADERS`, the floor's one definition.
 
 **It leans on CPython internals.** The private loop subclasses ``asyncio.BaseEventLoop`` and supplies
-the ``_selector`` and ``_process_events`` that class expects. A Python release that moves either
-makes every drive raise, and the engine then refuses to start, naming this module as a possible
-cause. The test suite drives the real self-test, so such a release turns CI red first.
+the ``_selector`` and ``_process_events`` that class expects, which every drive reaches. It also
+supplies ``_write_to_self``, which only a callback scheduled from another thread would reach, and no
+drive does that today. A Python release that moves either of the first two makes every drive raise.
+The engine then refuses to start with exit code 2 and no traceback, and the refusal names the
+Python and the ``asyncio`` frame that raised. A release that moved only ``_write_to_self`` would
+not show here until a drive came to need it. It fails
+closed on purpose: falling back to a stock loop would open the socket pair this module exists not to
+open. The test suite drives the real self-test, so such a release turns CI red first.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+import traceback
 from collections.abc import Container, Iterator
 from contextlib import contextmanager
+from itertools import groupby
 from pathlib import PurePath
 from typing import Any, NamedTuple
 
@@ -331,15 +341,22 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
     return problems
 
 
-def _raised_at(exc: BaseException) -> str:
-    """Where ``exc`` was raised, as ``file.py:line``. A place and no text, so the refusal can tell
-    a server fault from one in this module without carrying the exception's message."""
-    frame = exc.__traceback__
-    if frame is None:
-        return "an unknown place"
-    while frame.tb_next is not None:
-        frame = frame.tb_next
-    return f"{PurePath(frame.tb_frame.f_code.co_filename).name}:{frame.tb_lineno}"
+def _traceback_places(exc: BaseException) -> str:
+    """Each frame ``exc`` passed through, outermost first, as ``module:line``. The traceback's
+    places and none of its text, so the refusal can tell a server fault from one in asyncio or in
+    this module without carrying the exception's message. A frame with no module name gives its
+    file's name instead. A run of one place, as a recursion leaves, is listed once with its count,
+    so the refusal stays one readable line."""
+    places = []
+    for frame, lineno in traceback.walk_tb(exc.__traceback__):
+        module = frame.f_globals.get("__name__")
+        where = module if isinstance(module, str) else PurePath(frame.f_code.co_filename).name
+        places.append(f"{where}:{lineno}")
+    listed = []
+    for place, run in groupby(places):
+        times = len(list(run))
+        listed.append(place if times == 1 else f"{place} ({times} times)")
+    return " > ".join(listed) or "no frame recorded"
 
 
 def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -> None:
@@ -362,12 +379,19 @@ def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -
             drives.close()  # a no-op once it ran; it never starts when a loop is already running
             loop.close()
     except Exception as exc:
-        # Only the type is kept, and the refusal is raised after this handler ends, so the caught
-        # exception is not on its chain. The cause may be this harness and not the server, so the
-        # message points here as well.
+        # The type and the places are kept and the message is not, and the refusal is raised after
+        # this handler ends, so the caught exception is not on its chain. ``serve`` runs this before
+        # it installs a log handler, so the places ride in the refusal and are not logged. The cause
+        # may be this harness or the Python under it and not the server, so the message names all
+        # three. The version is read from fields that cannot fail to parse, unlike
+        # platform.python_version(), so building the refusal cannot itself raise.
+        version = sys.version_info
+        python = f"{sys.implementation.name} {version.major}.{version.minor}.{version.micro}"
         problems = [
-            f"the drive raised {type(exc).__name__} at {_raised_at(exc)} before a response could be "
-            "read, in the server or in messagefoundry/api/protocol_floor_selftest.py itself"
+            f"the drive raised {type(exc).__name__} on {python} before a response could be read, "
+            "in the server, in the Python under it (this module's private event loop leans on "
+            "asyncio internals), or in messagefoundry/api/protocol_floor_selftest.py itself; its "
+            f"frames, outermost first: {_traceback_places(exc)}"
         ]
     if problems:
         found = "; ".join(problems)

@@ -17,6 +17,9 @@ that never called the audit at all, so the clean leg is the control that makes i
 The fault is injected at ``_append_audit_row``, the one append every backend's audited writes go
 through. Its action argument is matched by value, so the same wrapper fits all three signatures.
 
+The fault helpers and :class:`TeeTap` are shared: the dual-control and TOTP-replace contracts use
+them too, and :func:`failing_commit` refuses a COMMIT for them (vault BACKLOG #3324).
+
 Deliberately **extra-free**, like ``_pending_approval_store_contract``: the live server legs import it
 inside a test function. Every name it writes is unique per run, so a shared server database is safe.
 """
@@ -24,6 +27,7 @@ inside a test function. Every name it writes is unique per run, so a shared serv
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -46,12 +50,13 @@ class AppendFailed(RuntimeError):
 
 
 @contextmanager
-def failing_append(store: Any, action: str) -> Iterator[None]:
-    """Make ``store``'s audit append raise for ``action``, and only for it."""
+def failing_append(store: Any, action: str | None) -> Iterator[None]:
+    """Make ``store``'s audit append raise for ``action``, and only for it, or for every action
+    when it is ``None``."""
     real = store._append_audit_row
 
     async def _append(*args: Any, **kwargs: Any) -> Any:
-        if action in args:
+        if action is None or action in args:
             raise AppendFailed(action)
         return await real(*args, **kwargs)
 
@@ -60,6 +65,75 @@ def failing_append(store: Any, action: str) -> Iterator[None]:
         yield
     finally:
         del store._append_audit_row
+
+
+class CommitFailed(RuntimeError):
+    """The fault :func:`failing_commit` injects into a store's COMMIT."""
+
+
+def commit_seam(store: Any) -> bool:
+    """Whether ``store`` has a ``_commit`` method a test can fault (vault BACKLOG #3324). On SQLite
+    and SQL Server the single-transaction writes these contracts fault commit through it, but not
+    every write does: a SQLite grouped commit and a SQL Server fused-hop handoff do not. Postgres
+    commits as asyncpg's transaction block exits, which has no such seam, so an arm that needs
+    :func:`failing_commit` does not run on that leg."""
+    return callable(getattr(type(store), "_commit", None))
+
+
+@contextmanager
+def failing_commit(store: Any) -> Iterator[None]:
+    """Make ``store``'s COMMIT raise, once every statement before it has run. Only where
+    :func:`commit_seam` holds."""
+
+    async def _commit(*_args: Any, **_kwargs: Any) -> None:
+        raise CommitFailed("commit refused")
+
+    store._commit = _commit
+    try:
+        yield
+    finally:
+        del store._commit
+
+
+class TeeTap(logging.Handler):
+    """Read each row a store tees off-box, from the real tee's own log record.
+
+    A handler on the ``messagefoundry.audit`` logger, so the real ``tee_audits`` path runs and
+    nothing is patched. Only teed rows land here, so a row that rolled back must not appear, and a
+    committed one must appear exactly once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.teed: list[dict[str, Any]] = []
+        logging.getLogger("messagefoundry.audit").addHandler(self)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            event = json.loads(record.getMessage())
+        except ValueError:
+            return
+        if isinstance(event, dict):
+            self.teed.append(event)
+
+    def stop(self) -> None:
+        logging.getLogger("messagefoundry.audit").removeHandler(self)
+
+    def ids(self, action: str, approval_id: str | None = None) -> list[int]:
+        """The row ids teed for ``action``; with ``approval_id``, only that request's."""
+        found = []
+        for event in self.teed:
+            if event.get("action") != action:
+                continue
+            if approval_id is None:
+                found.append(int(event["row_id"]))
+                continue
+            try:
+                detail = json.loads(str(event.get("detail")))
+            except ValueError:
+                continue
+            if isinstance(detail, dict) and detail.get("approval_id") == approval_id:
+                found.append(int(event["row_id"]))
+        return found
 
 
 def _builder(action: str, channel_id: str | None) -> Callable[[Any], AuditAppend | None]:
