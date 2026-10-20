@@ -52,9 +52,13 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
 **Out of scope, stated so the silence is not read as coverage.**
 
 * LISTENERS (inbound MLLP, TCP, X12, DICOM, HTTP). There the partner presents a credential to the
-  engine, not the other way round. Whether a trading partner is a backend component is a question the
-  record declines to settle, and the HTTP listener has its own intake-authentication gate
-  (``check_http_intake_auth``).
+  engine, not the other way round, and this inventory lists only credentials the engine presents. A
+  trading partner's system is a backend component, inbound and outbound (owner ruling 2026-10-09), so
+  that is a limit of this inventory, not a finding that listeners are compliant: a listener that
+  accepts a static shared secret, such as an HTTP ``intake_api_key``, or no credential at all is not
+  reported here. The HTTP listener's intake-authentication gate (``check_http_intake_auth``) asks
+  only whether an off-loopback listener has an effective peer control, which a narrow
+  ``source_ip_allowlist`` with no credential satisfies, and never whether a credential is static.
 * Plugin connector types this module does not know. They are not guessed at.
 * A generic-ODBC database hop that sets no top-level ``username``/``password``: the credential, if
   any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
