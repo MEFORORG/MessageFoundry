@@ -82,6 +82,13 @@
             ],
             "timeout": 20,
             "statusMessage": "Injecting this worktree's role card"
+          },
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; bash \"${CLAUDE_PROJECT_DIR}/scripts/hooks/cloud-setup.sh\"",
+            "timeout": 300,
+            "statusMessage": "Cloud session only: installing pwsh and Python 3.14, setting the git identity"
           }
         ]
       }
