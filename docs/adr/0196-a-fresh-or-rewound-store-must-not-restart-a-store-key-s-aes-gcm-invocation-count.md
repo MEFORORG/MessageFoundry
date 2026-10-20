@@ -538,10 +538,22 @@ enforced ceiling would cover that key's archive use.
 
 Context item 4 still holds for `key_id` in memory. What `cipher_meta` stores is that id behind a
 scheme tag, `sha256-16:<key_id>` (`cipher_meta_key` and `KEY_ID_SCHEME` in `store/crypto.py`). The
-tag names the function, not the key, so a release that changed `_fingerprint` could find the row an
-unchanged key already has. Without it, that key's count would restart at zero, the reset this ADR
-exists to prevent. A row keyed on the bare id, written before the tag, is read as today's scheme:
-`cipher_invocations` sums both forms, and `add_cipher_invocations` folds the bare row into the
-tagged one in the same transaction on all three backends. The DEK row of `secret_rotation_meta`
-carries the same tag, so a changed `_fingerprint` would not reset the key-age clock either. The
-`mfenc:` markers and DR archives are unchanged: their format version can name a new function.
+tag names the function, not the key.
+
+The tag does not by itself keep a count across a change to `_fingerprint`. A row is found by an id
+computed from the key, so a release that changes the function must keep the old one compiled in,
+compute the old id, and read the row under it. What the tag adds is that each stored row says which
+function made it, so that release can tell an old-scheme row from a new key's. A release that does
+not know a tag finds no row for it, so it never reads one under the wrong function. A release that
+adds a scheme should therefore keep the old-scheme row rather than fold it away, or a rollback
+counts the key from zero.
+
+A row keyed on the bare id, written before the tag, is read as today's scheme. `cipher_invocations`
+sums both forms, and `add_cipher_invocations` folds the bare row into the tagged one within one
+write transaction on all three backends. That fold does not keep the bare row, so a store moved back
+to a release from before the tag would count that key from zero.
+
+The DEK row of `secret_rotation_meta` carries the same tag, and its non-DEK rows carry
+`hmac-sha256-32`. There the stored value is parsed, so an unknown tag is refused: the row is left as
+stored and its dates kept. The `mfenc:` markers and DR archives are unchanged, because their format
+version can name a new function.

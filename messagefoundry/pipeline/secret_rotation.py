@@ -171,7 +171,7 @@ def _fingerprint_bytes(value: str) -> bytes:
 
     ``compare_digest`` is applied to **bytes**, not ``str``, deliberately — the same reasoning as
     :func:`messagefoundry.store.store.audit_mac_bytes`, restated here rather than imported because this
-    module is engine-side and stdlib-only at runtime and must not pull a store backend in. Its ``str``
+    module is engine-side and must not pull a store backend in. Its ``str``
     overload raises ``TypeError`` on any non-ASCII input, and ``secret_rotation_meta.fingerprint`` is
     out-of-band writable. A raise would not surface: :meth:`~messagefoundry.pipeline.engine.Engine`'s
     reconcile call site wraps :func:`reconcile_rotation_meta` in a blanket ``except Exception`` that logs
@@ -193,8 +193,12 @@ def fingerprints_equal(stored: str, current: str) -> bool:
     ``current`` carries its scheme tag, and ``stored`` is read under that scheme alone
     (:func:`~messagefoundry.store.crypto.read_scheme_tag`, BACKLOG #3421). An untagged ``stored``
     value was written before tags and reads as today's scheme, so an unchanged secret still compares
-    equal. Any other tag raises :class:`~messagefoundry.store.crypto.UnknownSchemeError`."""
+    equal. Any other tag raises :class:`~messagefoundry.store.crypto.UnknownSchemeError`. A
+    ``current`` with no compiled tag is a caller's error and raises ``ValueError``: compared as an
+    untagged value it would read every unchanged key as rotated."""
     scheme, _, value = current.partition(":")
+    if scheme not in (KEY_ID_SCHEME, _FP_SCHEME):
+        raise ValueError("fingerprints_equal: current must carry a scheme tag this release makes")
     return hmac.compare_digest(
         _fingerprint_bytes(read_scheme_tag(stored, scheme)), _fingerprint_bytes(value)
     )
@@ -515,7 +519,10 @@ async def reconcile_rotation_meta(
     if refused:
         log.warning(
             "secret rotation: %d stored fingerprint(s) name a scheme this release does not know, "
-            "so they were not compared. Their dates are kept and the rows left as stored.",
+            "so they were not compared. Their dates are kept and the rows left as stored, so a "
+            "rotation cannot be detected for them. To restart tracking, delete those "
+            "secret_rotation_meta rows; for the store key, [secret_rotation].store_key_last_rotated "
+            "records its real rotation date.",
             refused,
         )
     if undecided:

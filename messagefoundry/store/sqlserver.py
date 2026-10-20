@@ -2806,9 +2806,10 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
 
     WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
-    ``add_cipher_invocations`` needs FOUR sequential executor dispatches -- ``cursor()``, ``execute()``,
-    ``fetchone()``, ``commit()`` -- and the pool is opened ``autocommit=False``, so the row locks taken by
-    the MERGE in dispatch 2 are released only by the commit in dispatch 4. Once as many tasks as there
+    ``add_cipher_invocations`` needs SIX sequential executor dispatches -- ``cursor()``, then
+    ``execute()`` and ``fetchone()`` for the pre-tag fold's DELETE and again for the MERGE (BACKLOG
+    #3421), then ``commit()`` -- and the pool is opened ``autocommit=False``, so the row locks taken
+    from dispatch 2 on are released only by the commit in dispatch 6. Once as many tasks as there
     are threads are parked inside a blocked ``execute``, the lock holder's own ``commit`` sits behind
     them in the executor's FIFO queue with no worker left to run it. Nothing progresses until an ODBC
     query timeout or the pool acquire bound breaks the tie, which surfaces as HYT00 or StoreAcquireTimeout

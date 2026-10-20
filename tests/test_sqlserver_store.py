@@ -5566,6 +5566,22 @@ async def test_cipher_invocations_are_keyed_per_key_id(store) -> None:
     assert await store.cipher_invocations(b) == 3
 
 
+async def test_a_pre_tag_cipher_meta_row_is_folded_once(store) -> None:
+    # BACKLOG #3421: a row keyed on the bare id, as a release before scheme tags wrote it, keeps its
+    # count. The DELETE's row lock, held to the commit, makes concurrent adds fold it exactly once.
+    key_id = uuid4().hex[:16]
+    await store._execute(
+        "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?, 100, 0)", (key_id,)
+    )
+    assert await store.cipher_invocations(key_id) == 100
+    await asyncio.gather(*(store.add_cipher_invocations(key_id, 1) for _ in range(10)))
+    assert await store.cipher_invocations(key_id) == 110
+    rows = await store._fetchall(
+        "SELECT key_id FROM cipher_meta WHERE key_id IN (?, ?)", (key_id, cipher_meta_key(key_id))
+    )
+    assert [r["key_id"] for r in rows] == [cipher_meta_key(key_id)]
+
+
 async def test_checkpoint_is_a_noop_without_a_bounded_cipher(store) -> None:
     # The gated fixtures open with the default (identity) cipher, so there is no birthday budget to
     # bound and the checkpoint must return None rather than writing a row.

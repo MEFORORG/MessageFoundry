@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Stored key fingerprints carry a scheme tag (BACKLOG #3421; ASVS 11.2.2 census rows 6, 7 and 8).
+"""Stored key fingerprints carry a scheme tag (BACKLOG #3421).
 
 ``cipher_meta.key_id``, the DEK row of ``secret_rotation_meta`` and its non-DEK rows used to store a
 fingerprint with no marker naming the function that made it. A release that changed that function
@@ -13,6 +13,7 @@ Synthetic values only: every "secret" here is a test string.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import sqlite3
@@ -128,6 +129,32 @@ async def test_a_pre_tag_cipher_meta_row_keeps_its_count(tmp_path: Path) -> None
     assert rows[cipher_meta_key("feedfacefeedface")] == 10
 
 
+async def test_two_writers_fold_a_pre_tag_row_once(tmp_path: Path) -> None:
+    # Two handles on one file, as `serve` and a CLI command that checkpoints at open would be. A fold
+    # that read the bare row outside the write transaction added its count twice.
+    db = tmp_path / "s.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    await store.close()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?, ?, 0)",
+            ("feedfacefeedface", 100),
+        )
+    a = await MessageStore.open(db)
+    b = await MessageStore.open(db)
+    try:
+        totals = await asyncio.gather(
+            a.add_cipher_invocations("feedfacefeedface", 1),
+            b.add_cipher_invocations("feedfacefeedface", 1),
+        )
+    finally:
+        await a.close()
+        await b.close()
+    assert sorted(totals) == [101, 102]
+    assert dict(_rows(db))[cipher_meta_key("feedfacefeedface")] == 102
+    assert "feedfacefeedface" not in dict(_rows(db))
+
+
 # --- secret_rotation_meta: the age clocks carry over ------------------------------------------
 
 
@@ -203,3 +230,7 @@ def test_fingerprints_equal_refuses_an_unknown_stored_scheme() -> None:
     assert not sr.fingerprints_equal("0000000000000000", current)
     with pytest.raises(UnknownSchemeError):
         sr.fingerprints_equal("sha3-16:3fa1b2c3d4e5f607", current)
+    # The pre-tag calling convention, an untagged `current`, is a caller's error, never a silent
+    # "changed": rotate-key once passed the bare key id, and every same-key run would read as rotated.
+    with pytest.raises(ValueError, match="scheme tag"):
+        sr.fingerprints_equal("3fa1b2c3d4e5f607", "3fa1b2c3d4e5f607")

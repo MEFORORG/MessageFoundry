@@ -9410,7 +9410,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         # BACKLOG #3421: refused and left as stored, as the watcher leaves it.
                         print(
                             "warning: the stored store-key fingerprint names a scheme this release"
-                            " does not know, so its rotation stamp was left as stored",
+                            " does not know, so its rotation stamp was left as stored and this"
+                            " rotation is not recorded. Set [secret_rotation].store_key_last_rotated"
+                            " to today, or delete the MEFOR_STORE_ENCRYPTION_KEY row of"
+                            " secret_rotation_meta and start the engine to restart its clock.",
                             file=sys.stderr,
                         )
                     if changed:

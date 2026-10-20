@@ -14455,21 +14455,19 @@ class MessageStore:
         bare ``key_id``, is folded into it here, so its count carries over (BACKLOG #3421)."""
         now = time.time()
         row_id = cipher_meta_key(key_id)
-        cur = await self._db.execute(
-            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
-        )
-        legacy = await cur.fetchone()
-        folded = 0
-        if legacy is not None:
-            folded = int(legacy["invocations"])
-            await self._db.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
+        # The pre-tag row is read inside the upsert, its first write, so the write lock is held from
+        # the read through the commit and no second writer can fold the same count. The DELETE
+        # follows it: if it fails after the upsert, the next add folds the row again, an over-count,
+        # the direction this bound may drift in.
         await self._db.execute(
-            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?,?,?)"
-            " ON CONFLICT(key_id) DO UPDATE SET"
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at)"
+            " SELECT ?, ? + COALESCE((SELECT invocations FROM cipher_meta WHERE key_id = ?), 0), ?"
+            " WHERE true ON CONFLICT(key_id) DO UPDATE SET"
             " invocations = cipher_meta.invocations + excluded.invocations,"
             " updated_at = excluded.updated_at",
-            (row_id, int(count) + folded, now),
+            (row_id, int(count), key_id, now),
         )
+        await self._db.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
         cur = await self._db.execute(
             "SELECT invocations FROM cipher_meta WHERE key_id = ?", (row_id,)
         )
