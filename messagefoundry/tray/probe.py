@@ -34,7 +34,8 @@ man-in-the-middle and the tray's whole job is to report which one answered.
 
 Both contexts offer only the approved AEAD TLS 1.2 suites (BACKLOG #300, owner ruling R3 of
 2026-09-27), from a pinned copy of the engine's list: see :data:`_APPROVED_TLS12_SUITES`. The TLS
-1.3 list is narrowed only where the interpreter allows it, which CPython 3.14 does not.
+1.3 list is narrowed only where the interpreter allows it, which CPython 3.14 does not, and so are
+the SHA-224 signature schemes (BACKLOG #3414).
 
 **Why ``truststore`` is safe here but not in** :mod:`messagefoundry.auth.oidc_http`. That module
 rejects ``truststore`` for a real reason: its ``SSLContext`` flips a *shared inner* context to
@@ -59,6 +60,7 @@ from pathlib import Path
 
 import httpx
 
+from messagefoundry.tls_sigalgs import narrow_signature_algorithms
 from messagefoundry.tray.config import is_tls_url
 from messagefoundry.tray.state import HealthProbe, UiProbe
 
@@ -261,7 +263,11 @@ def _narrow_to_approved_suites(ctx: ssl.SSLContext) -> ssl.SSLContext:
     narrowers do. The engine's wrappers turn theirs into a config refusal (BACKLOG #2484); the tray
     is not a config seam, so it keeps ``RuntimeError``. An ``ssl.SSLError`` here would read as
     "cannot load the engine certificate" to :func:`build_verify` and :func:`load_pin`, which is not
-    what failed."""
+    what failed.
+
+    The SHA-224 signature schemes are narrowed too, through the engine's one copy of that
+    narrowing (:func:`messagefoundry.tls_sigalgs.narrow_signature_algorithms`, BACKLOG #3414; ADR
+    0113, amendment of 2026-10-20)."""
     try:
         ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
         target = getattr(ctx, "_ctx", ctx)
@@ -271,6 +277,7 @@ def _narrow_to_approved_suites(ctx: ssl.SSLContext) -> ssl.SSLContext:
         raise RuntimeError(
             f"this Python/OpenSSL build refuses the tray's approved TLS suites: {exc}"
         ) from exc
+    narrow_signature_algorithms(ctx)
     return ctx
 
 

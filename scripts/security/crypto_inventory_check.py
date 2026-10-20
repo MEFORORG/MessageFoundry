@@ -298,6 +298,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # loop ran, and installs it as a server context's sslobject_class. It re-raises unchanged, and
     # builds no context, loads no key and chooses no algorithm, so section 4 gains no row.
     "messagefoundry/tls_handshake_failures.py": frozenset({"ssl"}),
+    # BACKLOG #3414: the SHA-224 signature-scheme narrowing (BACKLOG #1171) moved out of
+    # config/tls_policy.py into this stdlib-only leaf, so the apiclient and the tray, which may not
+    # import config/, call the same copy. It narrows a context it is handed with set_server_sigalgs
+    # (Python 3.15 only) and builds none. Section 4 rows that already name each context say so.
+    "messagefoundry/tls_sigalgs.py": frozenset({"ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
@@ -1082,6 +1087,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
             "tls_context:via messagefoundry.keywrap",
+            "tls_context:via messagefoundry.tls_sigalgs",  # BACKLOG #3414
         }
     ),
     # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
@@ -1217,13 +1223,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
-            "tls_context:.set_server_sigalgs()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",
             "tls_context:ssl.create_default_context",
+            # BACKLOG #3414: narrow_signature_algorithms calls the shared leaf.
+            "tls_context:via messagefoundry.tls_sigalgs",
         }
     ),
     "messagefoundry/config/tls_probe.py": frozenset(
@@ -1715,6 +1722,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"tls_context:.load_verify_locations()"}
     ),
+    # BACKLOG #3414: the SHA-224 narrowing, moved here from config/tls_policy.py (BACKLOG #1171).
+    "messagefoundry/tls_sigalgs.py": frozenset({"tls_context:.set_server_sigalgs()"}),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
     "messagefoundry/tray/probe.py": frozenset(
@@ -1723,6 +1732,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.set_ciphersuites()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
+            "tls_context:via messagefoundry.tls_sigalgs",  # BACKLOG #3414
         }
     ),
     "messagefoundry/uploads.py": frozenset(

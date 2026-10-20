@@ -44,8 +44,9 @@ gate" the critic's client passed. Each call site is keyed by file, enclosing fun
 ``connector=`` expression it passes, and :data:`_SITES` must name exactly that set. A new call site
 fails :func:`test_the_measured_population_is_the_derived_population` until someone says how to
 build it here. That covers at least the gated contexts, over one predicate: contexts built without
-that gate (at least the tray and ``apiclient`` copies and the deliberately unhardened ``tls_probe``
-offer) are outside it and are not measured here.
+that gate (at least the tray and ``apiclient`` contexts and the deliberately unhardened ``tls_probe``
+offer) are outside it. The SHA-224 section measures those three separately (BACKLOG #3414); the
+rsa_pkcs1 tripwires do not reach them.
 
 THE SERVER READINGS DEPEND ON THE CERTIFICATE'S KEY TYPE. The listener arms load an RSA-2048
 identity, because a TLS 1.2 handshake signature can only be PKCS#1 v1.5 or PSS under an RSA key.
@@ -83,17 +84,19 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import messagefoundry
-from messagefoundry import logging_setup
+from messagefoundry import logging_setup, tls_sigalgs
 from messagefoundry.api import tls as api_tls
+from messagefoundry.apiclient import client as apiclient
 from messagefoundry.auth import oidc_http
 from messagefoundry.auth.ldap import LdapAuthenticator
 from messagefoundry.config import settings as settings_module
-from messagefoundry.config import tls_policy
+from messagefoundry.config import tls_policy, tls_probe
 from messagefoundry.config.settings import ApiSettings, AuthSettings, StoreSettings
 from messagefoundry.store import postgres
 from messagefoundry.transports import dicom, mllp, remotefile, rest, soap
+from messagefoundry.tray import probe as tray_probe
 from messagefoundry.verify import smoke
-from tests._ast_sites import callee_name
+from tests._ast_sites import call_sites, callee_name
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
@@ -295,20 +298,26 @@ class ClientReading:
     versions: list[int]
 
 
-def client_offer(ctx: ssl.SSLContext) -> ClientReading:
-    """Start a handshake on ``ctx`` and parse the ClientHello it emits. Nothing is sent anywhere."""
+def _emitted_hello(ctx: ssl.SSLContext) -> bytes:
+    """Start a handshake on ``ctx`` and return the ClientHello body it emits. Nothing is sent."""
     incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
     tls = ctx.wrap_bio(incoming, outgoing, server_hostname="localhost")
     with pytest.raises(ssl.SSLWantReadError):
         tls.do_handshake()
     hellos = [body for kind, body in _handshake_messages(outgoing.read()) if kind == _CLIENT_HELLO]
     assert len(hellos) == 1, f"expected one ClientHello, parsed {len(hellos)}"
-    extensions = _client_hello_extensions(hellos[0])
+    return hellos[0]
+
+
+def client_offer(ctx: ssl.SSLContext) -> ClientReading:
+    """Start a handshake on ``ctx`` and parse the ClientHello it emits. Nothing is sent anywhere."""
+    hello = _emitted_hello(ctx)
+    extensions = _client_hello_extensions(hello)
     versions_ext = extensions.get(_EXT_SUPPORTED_VERSIONS)
     versions = (
         [_u16(versions_ext, 1 + k) for k in range(0, versions_ext[0], 2)]
         if versions_ext is not None
-        else [_u16(hellos[0], 0)]
+        else [_u16(hello, 0)]
     )
     return ClientReading(
         sigalgs=_u16_list(extensions[_EXT_SIGNATURE_ALGORITHMS]), versions=versions
@@ -903,9 +912,9 @@ def catalogue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """``ssl.get_sigalgs`` returning :data:`_CATALOGUE`, with the per-process cache emptied on both
     sides so no reading leaks into another test."""
     monkeypatch.setattr(ssl, "get_sigalgs", lambda: list(_CATALOGUE), raising=False)
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
     yield
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
 
 
 def _pin_acts_here() -> bool:
@@ -935,9 +944,9 @@ def test_a_build_refusing_ml_dsa_still_drops_sha224_and_warns_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """ML-DSA alone never fails closed: the list without it is applied, with one warning."""
-    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    monkeypatch.setattr(tls_sigalgs, "_SIGALGS_MLDSA_WARNED", False)
     first, second = _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT), _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT)
-    with caplog.at_level("WARNING", logger=tls_policy.logger.name):
+    with caplog.at_level("WARNING", logger=tls_sigalgs.logger.name):
         assert tls_policy.narrow_signature_algorithms(first) is True
         assert tls_policy.narrow_signature_algorithms(second) is True
     assert first.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
@@ -952,12 +961,12 @@ def test_ml_dsa_already_in_the_catalogue_is_not_added_twice(
     are passed as they are, once, and nothing is put in front."""
     listed = ["mldsa65", "rsa_pkcs1_sha256", "rsa_pkcs1_sha224", "mldsa87", "mldsa44"]
     monkeypatch.setattr(ssl, "get_sigalgs", lambda: list(listed), raising=False)
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
     ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
         assert tls_policy.narrow_signature_algorithms(ctx) is True
     finally:
-        tls_policy._sigalgs_without_sha224.cache_clear()
+        tls_sigalgs._sigalgs_without_sha224.cache_clear()
     assert ctx.sigalg_calls == ["mldsa65:rsa_pkcs1_sha256:mldsa87:mldsa44"]
 
 
@@ -997,16 +1006,16 @@ def test_a_build_refusing_every_list_raises_runtime_error(
         def refuse(self, sigalgs: str) -> bool:
             return True
 
-    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    monkeypatch.setattr(tls_sigalgs, "_SIGALGS_MLDSA_WARNED", False)
     ctx = _Refusing(ssl.PROTOCOL_TLS_CLIENT)
     with (
-        caplog.at_level("WARNING", logger=tls_policy.logger.name),
+        caplog.at_level("WARNING", logger=tls_sigalgs.logger.name),
         pytest.raises(RuntimeError, match="without SHA-224"),
     ):
         tls_policy.narrow_signature_algorithms(ctx)
     assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
     assert not [r for r in caplog.records if "ML-DSA" in r.getMessage()]
-    assert tls_policy._SIGALGS_MLDSA_WARNED is False
+    assert tls_sigalgs._SIGALGS_MLDSA_WARNED is False
 
 
 @pytest.mark.usefixtures("catalogue")
@@ -1035,13 +1044,13 @@ def test_a_refused_sigalg_list_is_a_config_refusal_naming_openssl(wrapper: str) 
 def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing left once SHA-224 is gone is a refusal, not the "cannot list" no-op."""
     monkeypatch.setattr(ssl, "get_sigalgs", lambda: ["rsa_pkcs1_sha224"], raising=False)
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
     ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
         with pytest.raises(RuntimeError, match="no scheme left once SHA-224 is removed"):
             tls_policy.narrow_signature_algorithms(ctx)
     finally:
-        tls_policy._sigalgs_without_sha224.cache_clear()
+        tls_sigalgs._sigalgs_without_sha224.cache_clear()
     assert getattr(ctx, "sigalg_calls", []) == []
 
 
@@ -1054,15 +1063,15 @@ def test_an_unreadable_catalogue_pins_nothing_and_warns_once(
         raise NotImplementedError("Getting signature algorithms requires OpenSSL 3.4 or later.")
 
     monkeypatch.setattr(ssl, "get_sigalgs", unreadable, raising=False)
-    monkeypatch.setattr(tls_policy, "_SIGALGS_PIN_WARNED", False)
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    monkeypatch.setattr(tls_sigalgs, "_SIGALGS_PIN_WARNED", False)
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
     try:
         ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
-        with caplog.at_level("WARNING", logger=tls_policy.logger.name):
+        with caplog.at_level("WARNING", logger=tls_sigalgs.logger.name):
             assert tls_policy.narrow_signature_algorithms(ctx) is False
             assert tls_policy.narrow_signature_algorithms(ctx) is False
     finally:
-        tls_policy._sigalgs_without_sha224.cache_clear()
+        tls_sigalgs._sigalgs_without_sha224.cache_clear()
     assert getattr(ctx, "sigalg_calls", []) == [], "a list was applied from no catalogue"
     warned = [r for r in caplog.records if "SHA-224" in r.getMessage()]
     assert len(warned) == 1, [r.getMessage() for r in warned]
@@ -1080,7 +1089,7 @@ def test_without_the_setter_nothing_is_called(monkeypatch: pytest.MonkeyPatch) -
         return list(_CATALOGUE)
 
     monkeypatch.setattr(ssl, "get_sigalgs", spy, raising=False)
-    tls_policy._sigalgs_without_sha224.cache_clear()
+    tls_sigalgs._sigalgs_without_sha224.cache_clear()
 
     class _NoSetter:
         pass
@@ -1092,7 +1101,7 @@ def test_without_the_setter_nothing_is_called(monkeypatch: pytest.MonkeyPatch) -
             assert tls_policy.narrow_signature_algorithms(real) is False
             tls_policy.narrow_to_approved_suites(real)
     finally:
-        tls_policy._sigalgs_without_sha224.cache_clear()
+        tls_sigalgs._sigalgs_without_sha224.cache_clear()
     assert reads == [], "the catalogue was read on a runtime that cannot apply it"
 
 
@@ -1112,6 +1121,11 @@ def test_destination_sha224_offer_follows_the_runtime(
     the ML-DSA schemes the catalogue omits are put back. Where it cannot act, which is 3.14, the
     offer equals a stock context's with the same protocol bounds, whole and in order."""
     ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    _assert_offer_follows_the_runtime(site, ctx)
+
+
+def _assert_offer_follows_the_runtime(site: str, ctx: ssl.SSLContext) -> None:
+    """The reading both client-side SHA-224 tests make; the first one's docstring says what."""
     offered = client_offer(ctx).sigalgs
     stock = client_offer(_version_matched_stock(ctx)).sigalgs
     if _pin_acts_here():
@@ -1145,3 +1159,134 @@ def test_listener_sha224_signature_follows_the_runtime(
         assert reading.chosen is None and reading.refusal is not None, f"{site}: {reading}"
     else:
         assert reading.chosen == RSA_PKCS1_SHA224, f"{site}: {reading}"
+
+
+# --- the client contexts outside tls_policy, and the floor probe (BACKLOG #3414) ------------------------
+#
+# The apiclient and the tray probe may not import ``config/``, so they call the shared stdlib-only
+# ``messagefoundry.tls_sigalgs`` that ``tls_policy`` calls too. These arms show they reach it on both
+# trust branches, that a refusal is not read as bad TLS material, and that no second copy of the
+# setter call exists to drift. The floor probe is left stock on purpose; the last arms pin that.
+
+_CLIENT_CONTEXT_SITES = ("apiclient pinned", "apiclient os store", "tray pinned", "tray os store")
+
+#: What the ``client_contexts`` fixture hands a test: install a stand-in class, get the ones made.
+_Install = Callable[[type[_SigalgCapableContext]], list[_SigalgCapableContext]]
+
+
+def _build_client_context(site: str, cacert: str) -> ssl.SSLContext:
+    """The context each client builds, through its real seam."""
+    pin = cacert if site.endswith("pinned") else None
+    if site.startswith("apiclient"):
+        return apiclient._build_verify_context(pin, None, None)
+    verify = tray_probe.build_verify("https://localhost:8765", pin)
+    assert isinstance(verify, ssl.SSLContext), verify
+    return verify
+
+
+@pytest.fixture
+def client_contexts(monkeypatch: pytest.MonkeyPatch) -> _Install:
+    """Make every context the two clients build a stand-in, and return the ones made.
+
+    The pinned branch's ``ssl.create_default_context`` returns one, and the OS-store branch's
+    ``truststore.SSLContext`` holds one as its inner context, which is where the narrowing has to
+    land."""
+    truststore = pytest.importorskip("truststore")
+    real_truststore = truststore.SSLContext
+
+    def install(cls: type[_SigalgCapableContext]) -> list[_SigalgCapableContext]:
+        made: list[_SigalgCapableContext] = []
+
+        def pinned(*, cafile: str | None = None, **_: object) -> ssl.SSLContext:
+            ctx = cls(ssl.PROTOCOL_TLS_CLIENT)
+            made.append(ctx)
+            return ctx
+
+        def os_store(protocol: int) -> ssl.SSLContext:
+            wrapper = real_truststore(protocol)
+            inner = cls(protocol)
+            wrapper._ctx = inner
+            made.append(inner)
+            return wrapper
+
+        monkeypatch.setattr(ssl, "create_default_context", pinned)
+        monkeypatch.setattr(truststore, "SSLContext", os_store)
+        return made
+
+    return install
+
+
+@pytest.mark.usefixtures("catalogue")
+@pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)
+def test_the_client_contexts_reach_the_pin(site: str, client_contexts: _Install) -> None:
+    """Each client context gets the engine's first list, once. Deleting the narrowing call from
+    either client's builder leaves ``sigalg_calls`` unset, and this reds."""
+    made = client_contexts(_SigalgCapableContext)
+    _build_client_context(site, "unused-ca.pem")
+    assert [getattr(c, "sigalg_calls", []) for c in made] == [[_PINNED_MARKED]], site
+
+
+@pytest.mark.usefixtures("catalogue")
+@pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)
+def test_a_client_sigalg_refusal_is_not_read_as_bad_tls_material(
+    site: str, client_contexts: _Install
+) -> None:
+    """A build that refuses every list fails closed with the shared module's ``RuntimeError``. It
+    is not an ``OSError``, so neither the apiclient's "cannot load TLS material" handlers nor the
+    tray's fall-back-to-the-OS-store handler can swallow it as a bad file."""
+
+    class _Refusing(_SigalgCapableContext):
+        def refuse(self, sigalgs: str) -> bool:
+            return True
+
+    client_contexts(_Refusing)
+    with pytest.raises(tls_sigalgs.NarrowerRefused, match="without SHA-224") as caught:
+        _build_client_context(site, "unused-ca.pem")
+    assert not isinstance(caught.value, OSError)
+
+
+@pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)
+def test_client_context_sha224_offer_follows_the_runtime(
+    site: str, rsa_identity: tuple[str, str]
+) -> None:
+    """The real contexts, read on the wire as the gated client sites are: on 3.15 no SHA-224 is
+    offered and only SHA-224 is dropped; on 3.14 the offer equals a stock context's."""
+    if site.endswith("os store"):
+        pytest.importorskip("truststore")
+    ctx = _build_client_context(site, rsa_identity[0])
+    _assert_offer_follows_the_runtime(site, ctx)
+
+
+def test_one_module_sets_the_signature_schemes() -> None:
+    """``tls_policy``, the apiclient and the tray share one implementation, so a second module that
+    calls the setter is a second copy that can drift. The expected set doubles as the control: the
+    scan must find the one module, or it found nothing."""
+    found = set()
+    for path in sorted(_PKG.rglob("*.py")):
+        text = path.read_text(encoding="utf-8-sig")
+        if (
+            "_sigalgs" not in text
+        ):  # both setter names hold it; skip the parse, as derived_sites does
+            continue
+        tree = ast.parse(text)
+        if any(call_sites(tree, name) for name in ("set_server_sigalgs", "set_client_sigalgs")):
+            found.add(path.relative_to(_PKG.parent).as_posix())
+    assert found == {"messagefoundry/tls_sigalgs.py"}, sorted(found)
+
+
+@pytest.mark.filterwarnings("ignore:ssl.TLSVersion.TLSv1:DeprecationWarning")
+@pytest.mark.parametrize("version", tls_probe.LEGACY_TLS_VERSIONS)
+def test_the_floor_probes_legacy_offers_carry_no_signature_scheme_list(version: str) -> None:
+    """One of the reasons ``tls_probe._offer_context`` is not narrowed: a TLS 1.0 or 1.1 offer has no
+    ``signature_algorithms`` extension to narrow. The default offer is the control, and has one."""
+    legacy = tls_probe._offer_context(tls_probe._legacy_version(version))
+    assert _EXT_SIGNATURE_ALGORITHMS not in _client_hello_extensions(_emitted_hello(legacy))
+    default = tls_probe._offer_context(None)
+    assert _EXT_SIGNATURE_ALGORITHMS in _client_hello_extensions(_emitted_hello(default))
+
+
+def test_the_floor_probes_default_offer_is_left_stock() -> None:
+    """The exclusion recorded beside ``tls_probe._offer_context``: its default-capability offer stays
+    the interpreter's own on every runtime. On 3.15 this reds if someone narrows it."""
+    ctx = tls_probe._offer_context(None)
+    assert client_offer(ctx).sigalgs == client_offer(_version_matched_stock(ctx)).sigalgs

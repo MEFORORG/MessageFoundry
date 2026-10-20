@@ -82,6 +82,7 @@ from messagefoundry.api.models import (
 )
 from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.tls_sigalgs import narrow_signature_algorithms
 
 __all__ = ["EngineClient", "ApiError", "IdpStepUpRequired"]
 
@@ -460,6 +461,8 @@ def _build_verify_context(
     **The TLS 1.2 suites are pinned** to :data:`_APPROVED_TLS12_SUITES` on either branch (BACKLOG
     #300), so this client offers the AEAD suites the engine listener defaults to and nothing wider.
     The TLS 1.3 suites are pinned too, where the interpreter allows it (:func:`_narrow_tls13`).
+    So are the SHA-224 signature schemes, through the engine's one copy of that narrowing
+    (:func:`messagefoundry.tls_sigalgs.narrow_signature_algorithms`, BACKLOG #3414).
 
     An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
     is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
@@ -479,6 +482,7 @@ def _build_verify_context(
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
     _narrow_tls13(ctx)
+    narrow_signature_algorithms(ctx)
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM. This client
         # takes no key passphrase, so an encrypted key is refused before OpenSSL could prompt at a

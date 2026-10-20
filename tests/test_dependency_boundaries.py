@@ -809,6 +809,16 @@ def test_the_mllp_leaves_import_only_stdlib_and_their_named_siblings(leaf: str) 
     assert _leaf_violations(_ENGINE_ROOT / leaf) == []
 
 
+def test_the_tls_sigalgs_leaf_imports_only_the_standard_library() -> None:
+    # ADR 0113's 2026-10-20 amendment lets the tray import `messagefoundry.tls_sigalgs` because it is
+    # stdlib-only (BACKLOG #3414). The tray probe below sees only what `tray.app` loads at import;
+    # this walk reads every import statement, deferred ones included, and admits no engine sibling.
+    path = _ENGINE_ROOT / "tls_sigalgs.py"
+    modules = _imported_modules(path, path.parent)
+    assert "ssl" in modules, "control: the walk did not read the module's imports"
+    assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
+
+
 def test_the_leaf_check_fires_on_a_root_import_and_a_third_party_one(tmp_path: Path) -> None:
     planted = tmp_path / "messagefoundry" / "leaf.py"
     planted.parent.mkdir()
