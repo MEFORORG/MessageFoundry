@@ -16,8 +16,8 @@ imports it.
 
 from __future__ import annotations
 
-import inspect
 import json
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -32,16 +32,22 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._deadline_capture import capture_deadlines, expect_cut_off
 
-# ``tests`` and ``messagefoundry`` resolve through the import path, where an editable install from
-# another worktree can come first: the test would then run one checkout's helper or engine against
-# another's with no error. The engine conftest refuses the same case for its tooling manifest.
-_ROOTS = {
-    "this test": Path(__file__).resolve().parents[3],
-    "the helper": Path(inspect.getfile(capture_deadlines)).resolve().parents[1],
-    "the engine": Path(inspect.getfile(messagefoundry)).resolve().parents[1],
-}
-if len(set(_ROOTS.values())) != 1:
-    raise RuntimeError(f"imported from more than one checkout: {_ROOTS}")
+
+@pytest.fixture(autouse=True)
+def _helper_and_engine_from_this_checkout() -> None:
+    """``tests`` and ``messagefoundry`` resolve through the import path, where an editable install
+    from another worktree can come first: the test would then run one checkout's helper or engine
+    against another's with no error. The engine conftest refuses the same case for its tooling
+    manifest. ``messagefoundry_webconsole`` is not compared: its editable install is a copy in
+    site-packages, by design, wherever it came from."""
+    roots = {
+        "this test": Path(__file__).resolve().parents[3],
+        "the helper": Path(str(sys.modules[capture_deadlines.__module__].__file__))
+        .resolve()
+        .parents[1],
+        "the engine": Path(str(messagefoundry.__file__)).resolve().parents[1],
+    }
+    assert len(set(roots.values())) == 1, f"imported from more than one checkout: {roots}"
 
 
 @pytest.fixture

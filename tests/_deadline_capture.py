@@ -39,8 +39,13 @@ __all__ = ["GENEROUS_DEADLINE_SECONDS", "DeadlineCapture", "capture_deadlines", 
 
 #: Long enough that a deadline never fires on its own during a test: :meth:`DeadlineCapture.fire`
 #: fires it. Short enough that a test whose operation never fires it still fails on its own
-#: assertion inside the per-test timeout, after this, the drain below and its cancel grace.
+#: assertion inside the per-test timeout, after this, the answer grace, the drain and its cancel
+#: grace.
 GENEROUS_DEADLINE_SECONDS = 15.0
+
+#: How long past the generous deadline :func:`expect_cut_off` waits for an answer. A request still
+#: unanswered then has outlived its own deadline, as a route that absorbs the cancellation would.
+_ANSWER_GRACE_SECONDS = 5.0
 
 #: How long a test waits for the held operation to finish once it is let go.
 _DRAIN_SECONDS = 10.0
@@ -52,9 +57,9 @@ class DeadlineCapture:
 
     def __init__(self, outliving: OutlivingOperations) -> None:
         self.deadlines: list[asyncio.Timeout] = []
-        self.fired = False
-        #: The loop time the deadline was brought forward to, so :func:`expect_cut_off` can tell a
-        #: deadline the fire expired from one that ran out at its own, generous time.
+        #: The loop time :meth:`fire` brought the deadline forward to. :func:`expect_cut_off` checks
+        #: the deadline expired at it, not merely that the fire ran: a fire that did not take, as
+        #: with its ``reschedule`` line changed, would otherwise pass on the generous deadline's 503.
         self.fired_at: float | None = None
         #: Why a fire went wrong. Recorded rather than raised: :meth:`fire` runs on the operation's
         #: task, where the code under test may catch an error and turn it into its own outcome.
@@ -62,6 +67,10 @@ class DeadlineCapture:
         self.problem: str | None = None
         self._outliving = outliving
         self._released = asyncio.Event()
+
+    @property
+    def fired(self) -> bool:
+        return self.fired_at is not None
 
     def timeout(self, delay: float | None) -> asyncio.Timeout:
         deadline = asyncio.timeout(delay)
@@ -89,11 +98,14 @@ class DeadlineCapture:
         except RuntimeError as exc:  # it had already expired, or its request had ended
             self._refuse(f"the deadline could not be fired: {exc}")
             return
-        self.fired = True
         self.fired_at = now
 
     def _refuse(self, problem: str) -> None:
         self.problem = problem
+        self.release()
+
+    def release(self) -> None:
+        """Let the held operation go."""
         self._released.set()
 
     async def cut_off(self) -> None:
@@ -107,15 +119,25 @@ class DeadlineCapture:
         """While the block runs, the operation stays held in :meth:`cut_off`. On the way out it is
         let go and waited for, so it never runs on into the fixture's engine stop, and on a clean
         exit it must have finished by itself rather than been cancelled by the drain. Whether it
-        succeeded is for the test's own assertions on its outcome rows."""
+        succeeded is for the test's own assertions on its outcome rows.
+
+        A fire refused after :func:`expect_cut_off` returned, such as a second ``cut_off``, is
+        reported here, ahead of the block's own failure when the refusal caused it: a refusal lets
+        the operation go, so the block's held-state assertions fail with a symptom."""
         try:
             yield
-        finally:
-            self._released.set()
-            cancelled = await self._outliving.drain(timeout=_DRAIN_SECONDS)
-        assert cancelled == [], f"never finished once let go: {cancelled}"
-        # A fire refused after expect_cut_off returned, such as a second cut_off, is reported here.
+        except BaseException as exc:
+            await self._let_go()
+            if self.problem is not None:
+                raise AssertionError(self.problem) from exc
+            raise
+        cancelled = await self._let_go()
         assert self.problem is None, self.problem
+        assert cancelled == [], f"never finished once let go: {cancelled}"
+
+    async def _let_go(self) -> list[str]:
+        self.release()
+        return await self._outliving.drain(timeout=_DRAIN_SECONDS)
 
 
 def capture_deadlines(monkeypatch: pytest.MonkeyPatch, app: Any) -> DeadlineCapture:
@@ -138,15 +160,34 @@ async def expect_cut_off(capture: DeadlineCapture, request: Awaitable[httpx.Resp
 
     The generous deadline bounds the wait: a deadline the operation never fires answers 503 there,
     and the ``fired`` check fails. ``fired`` says the fire ran, not that it took effect, so the
-    deadline must also have expired at the fire's time rather than its own. A fire that went wrong
-    is reported first, even when the request raised because of it."""
+    deadline must also have expired at the fire's time rather than its own.
+
+    A request still unanswered after the generous deadline and a grace has outlived its own
+    deadline, as a route that absorbs the cancellation would. The operation is then let go, so a
+    route waiting it out can answer, and the test fails on that, instead of every await waiting on
+    a hold only :meth:`DeadlineCapture.held` would end. Cancelling the request instead would not
+    end it: the route that absorbs one cancellation absorbs that one too. A fire that went wrong is
+    reported first, even when the request raised because of it."""
+    late = False
+
+    def let_go_late() -> None:
+        nonlocal late
+        late = True
+        capture.release()
+
+    timer = asyncio.get_running_loop().call_later(
+        GENEROUS_DEADLINE_SECONDS + _ANSWER_GRACE_SECONDS, let_go_late
+    )
     try:
         r = await request
     except Exception as exc:
         if capture.problem is not None:
             raise AssertionError(capture.problem) from exc
         raise
+    finally:
+        timer.cancel()
     assert capture.problem is None, capture.problem
+    assert not late, "no answer until the operation was let go: the request outlived its deadline"
     assert r.status_code == 503, r.text
     assert r.json() == {"detail": "the server timed out building a response"}
     assert capture.fired, "the deadline was not fired from inside the operation"
