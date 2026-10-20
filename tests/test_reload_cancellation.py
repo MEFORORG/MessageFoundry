@@ -220,9 +220,7 @@ async def test_a_reload_cut_off_by_the_deadline_finishes_and_writes_its_row(
 ) -> None:
     registry = _registry(tmp_path)
     client, app = await _deployer(engine)
-    # The deadline is the middleware's own, fired from inside the reload rather than set to a
-    # fraction of a second: wall time from the start of the request could run out in the auth
-    # dependencies, before the reload started (vault BACKLOG #3871).
+    # The middleware's own deadline, fired from inside the reload (tests/_deadline_capture.py).
     capture = capture_deadlines(monkeypatch, app)
 
     async def reload_cut_off(*_args: Any, **_kwargs: Any) -> ReloadOutcome:
@@ -231,7 +229,7 @@ async def test_a_reload_cut_off_by_the_deadline_finishes_and_writes_its_row(
 
     monkeypatch.setattr(engine, "reload_detail", reload_cut_off)
     outliving = app.state.outliving_operations
-    async with client, capture.held(outliving):
+    async with client, capture.held():
         await expect_cut_off(capture, client.post("/config/reload", json={}))
         # Cut off while the reload was still running, and not cancelled with the request.
         assert outliving.inflight == ["config reload"]

@@ -993,7 +993,7 @@ async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
 
 
 async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
-    engine: Engine, tmp_path: Path
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #2261, end to end. The request deadline cancels POST /uploads while its save-time
     sweep is parked mid-pass. The response is the deadline's 503, and every file the sweep removed
@@ -1032,6 +1032,7 @@ async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
             )
 
         # Park the sweep's thread before its second aged pair until the pass is told to stop.
+        loop = asyncio.get_running_loop()
         aborts: list[threading.Event] = []
         parked = threading.Event()
         real_prune, real_paths = us.prune_expired, us._paths
@@ -1047,15 +1048,19 @@ async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
                 seen += 1
                 if seen == 2:
                     parked.set()
+                    loop.call_soon_threadsafe(capture.fire)
                     aborts[-1].wait(timeout=5)
             return real_paths(file_id)
 
         us.prune_expired = _prune
         us._paths = _paths
-        app.state.request_timeout_seconds = 2.0
-        r = await c.post("/uploads", files={"file": ("new.hl7", BATCH, "text/plain")}, headers=h)
+        # The middleware's own deadline, fired by the parked sweep (tests/_deadline_capture.py).
+        capture = capture_deadlines(monkeypatch, app)
+        await expect_cut_off(
+            capture,
+            c.post("/uploads", files={"file": ("new.hl7", BATCH, "text/plain")}, headers=h),
+        )
         assert parked.is_set(), "the sweep never reached its second aged pair"
-        assert r.status_code == 503, r.text
 
     deleted = aged - {m.file_id for m in await us.list_files()}
     rows = await engine.store.list_audit(action="upload.prune")
@@ -1439,12 +1444,8 @@ def _park_audit(
     engine: Engine, app: Any, action: str, monkeypatch: pytest.MonkeyPatch
 ) -> DeadlineCapture:
     """Fire the request deadline while ``record_audit`` writes ``action``, and hold that write until
-    the returned capture's ``held`` block ends. Every other row writes through.
-
-    The deadline is the middleware's own, fired from inside the write rather than set to a fraction
-    of a second: wall time from the start of the request could run out in the body read or the file
-    save, before the write started, and the request then stored no file at all (vault BACKLOG
-    #3871)."""
+    the returned capture's ``held`` block ends (``tests/_deadline_capture.py``). Every other row
+    writes through."""
     real = engine.store.record_audit
     capture = capture_deadlines(monkeypatch, app)
 
@@ -1473,7 +1474,7 @@ async def test_a_deadline_during_the_create_row_still_writes_it(
         h = await _login(c, "op")
         capture = _park_audit(engine, app, "upload.create", monkeypatch)
         outliving = app.state.outliving_operations
-        async with capture.held(outliving):
+        async with capture.held():
             await expect_cut_off(
                 capture,
                 c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h),
@@ -1532,7 +1533,7 @@ async def test_a_deadline_during_the_delete_row_still_writes_it(
         fid = r.json()["file_id"]
         capture = _park_audit(engine, app, "upload.delete", monkeypatch)
         outliving = app.state.outliving_operations
-        async with capture.held(outliving):
+        async with capture.held():
             await expect_cut_off(capture, c.delete(f"/uploads/{fid}", headers=h))
             # Cut off inside the row's write, with the file already removed.
             assert outliving.inflight == ["upload delete"]

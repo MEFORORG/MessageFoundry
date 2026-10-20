@@ -11,12 +11,9 @@ the coordinator latched active, and the retry answered success from the idempote
 it (``api/outlive.py``), and the coordinator's own cancellation arms restore state and record an
 interrupted outcome for what can still cancel one, such as a shutdown.
 
-The HTTP tests fire the middleware's own deadline from inside the operation rather than wait 120 s;
-the mechanism under test is the cancellation, not the number. They used to set the deadline to a
-fraction of a second, but it counts from the start of the request, so on a loaded runner the auth
-dependencies alone could outlast it and the 503 came before the operation started (vault BACKLOG
-#3871). ``tests/_deadline_capture.py`` says how the deadline is fired. No test here measures how
-long a real activation takes on a restored store.
+The HTTP tests fire the middleware's own deadline from inside the operation rather than wait 120 s
+(``tests/_deadline_capture.py``, vault BACKLOG #3871); the mechanism under test is the cancellation,
+not the number. No test here measures how long a real activation takes on a restored store.
 """
 
 from __future__ import annotations
@@ -275,7 +272,7 @@ async def test_a_release_cut_off_by_the_deadline_still_hands_back_and_records_th
 
     monkeypatch.setattr(engine, "_drain_pipeline", drain_cut_off)
     outliving = app.state.outliving_operations
-    async with client, capture.held(outliving):
+    async with client, capture.held():
         await expect_cut_off(capture, client.post("/dr/release"))
         # Cut off in its drain: intake is already unbound, and the box is still active.
         assert outliving.inflight == ["DR release"]
@@ -370,7 +367,7 @@ async def test_an_activation_cut_off_by_the_deadline_completes_and_a_retry_reads
     coord._activate_profile = profile_cut_off
     outliving = app.state.outliving_operations
     async with client:
-        async with capture.held(outliving):
+        async with capture.held():
             await expect_cut_off(capture, client.post("/dr/activate", json={}))
             assert outliving.inflight == ["DR activation"]
             assert await _rows(engine.store, "dr.activate") == []

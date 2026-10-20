@@ -8,21 +8,22 @@ dependencies, the body read or the file save alone could outlast it. The 503 the
 route had started the operation, nothing was left running to outlive the request, and the test
 failed on a state the code under test never reached.
 
-:class:`DeadlineCapture` stands in for ``asyncio`` inside the deadline middleware's module only and
-keeps each deadline the middleware opens. A test installs it with :func:`capture_deadlines`, which
-also sets a deadline long enough never to fire on its own, and the operation it holds awaits
+:func:`capture_deadlines` replaces ``asyncio`` inside the deadline middleware's module only, so the
+:class:`DeadlineCapture` it returns keeps each deadline the middleware opens, and gives the app a
+deadline long enough never to fire on its own. The operation the test holds awaits
 :meth:`DeadlineCapture.cut_off`. That expires the middleware's own ``asyncio.Timeout`` on the loop's
-next pass, wherever the request is, so the 503 lands mid-operation and nowhere else, and then holds
-the operation until :meth:`DeadlineCapture.held` lets it go.
+next pass, wherever the request is, so the 503 lands mid-operation and nowhere else, then holds the
+operation until :meth:`DeadlineCapture.held` lets it go.
 
-The web console's ``test_ui_dr_outlive.py`` gets the same stand-in, as its own copy, in its own
-change (engine PR 2438).
+Engine PR 2438 carries a simpler copy of the stand-in in the web console's ``test_ui_dr_outlive.py``:
+it fires the latest deadline, with none of the checks below.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import types
 from collections.abc import AsyncIterator, Awaitable
 from typing import Any
 
@@ -35,20 +36,26 @@ from messagefoundry.api.outlive import OutlivingOperations
 __all__ = ["GENEROUS_DEADLINE_SECONDS", "DeadlineCapture", "capture_deadlines", "expect_cut_off"]
 
 #: Long enough that a deadline never fires on its own during a test: :meth:`DeadlineCapture.fire`
-#: fires it.
-GENEROUS_DEADLINE_SECONDS = 30.0
+#: fires it. Short enough that a test whose operation never fires it still fails on its own
+#: assertion inside the per-test timeout, after this, the drain below and its cancel grace.
+GENEROUS_DEADLINE_SECONDS = 15.0
 
 #: How long a test waits for the held operation to finish once it is let go.
 _DRAIN_SECONDS = 10.0
 
 
 class DeadlineCapture:
-    """Stands in for ``asyncio`` inside :mod:`messagefoundry.api.request_timeout`, and keeps each
-    deadline the middleware opens so a test can make the real one fire when it chooses."""
+    """Keeps each deadline the middleware opens, so a test can make the real one fire when it
+    chooses. :func:`capture_deadlines` builds and installs it."""
 
-    def __init__(self) -> None:
+    def __init__(self, outliving: OutlivingOperations) -> None:
         self.deadlines: list[asyncio.Timeout] = []
         self.fired = False
+        #: Why a fire went wrong. Recorded rather than raised: :meth:`fire` runs on the operation's
+        #: task, where the code under test may catch an error and turn it into its own outcome.
+        #: :func:`expect_cut_off` reports it on the test's task.
+        self.problem: str | None = None
+        self._outliving = outliving
         self._released = asyncio.Event()
 
     def timeout(self, delay: float | None) -> asyncio.Timeout:
@@ -59,11 +66,16 @@ class DeadlineCapture:
     def fire(self) -> None:
         """Expire the one request deadline opened since this capture was installed, now.
 
-        Exactly one: a test installs the capture just before the request it cuts off, so a second
-        deadline means a request the test did not expect, and firing the wrong one would prove
-        nothing. ``reschedule`` refuses a deadline whose request has already ended."""
-        assert len(self.deadlines) == 1, f"expected one request deadline, saw {len(self.deadlines)}"
-        self.deadlines[0].reschedule(asyncio.get_running_loop().time())
+        Exactly one, still armed: a test installs the capture just before the request it cuts off,
+        so a second deadline means a request the test did not expect, and a disarmed one means the
+        response has already started, where firing would cut the body rather than the operation.
+        The latest deadline is still fired then, so the test fails at once rather than waiting."""
+        if len(self.deadlines) != 1:
+            self.problem = f"expected one request deadline, saw {len(self.deadlines)}"
+        elif self.deadlines[0].when() is None:
+            self.problem = "the request had already started its response"
+        if self.deadlines:
+            self.deadlines[-1].reschedule(asyncio.get_running_loop().time())
         self.fired = True
 
     async def cut_off(self) -> None:
@@ -73,28 +85,30 @@ class DeadlineCapture:
         await self._released.wait()
 
     @contextlib.asynccontextmanager
-    async def held(self, outliving: OutlivingOperations) -> AsyncIterator[None]:
+    async def held(self) -> AsyncIterator[None]:
         """While the block runs, the operation stays held in :meth:`cut_off`. On the way out it is
         let go and waited for, so it never runs on into the fixture's engine stop, and on a clean
-        exit the operation must have finished by itself rather than been cancelled by the drain."""
+        exit it must have finished by itself rather than been cancelled by the drain. Whether it
+        succeeded is for the test's own assertions on its outcome rows."""
         try:
             yield
         finally:
             self._released.set()
-            cancelled = await outliving.drain(timeout=_DRAIN_SECONDS)
+            cancelled = await self._outliving.drain(timeout=_DRAIN_SECONDS)
         assert cancelled == [], f"never finished once let go: {cancelled}"
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(asyncio, name)
 
 
 def capture_deadlines(monkeypatch: pytest.MonkeyPatch, app: Any) -> DeadlineCapture:
-    """Install a :class:`DeadlineCapture` and give ``app`` a deadline that never fires on its own.
+    """Install a :class:`DeadlineCapture` for ``app`` and give it a deadline that never fires on
+    its own; both are undone with ``monkeypatch``.
 
-    Call it after the sign-in and any proof, just before the request the test cuts off."""
-    capture = DeadlineCapture()
-    monkeypatch.setattr(request_timeout, "asyncio", capture)
-    setattr(app.state, request_timeout.TIMEOUT_STATE_ATTR, GENEROUS_DEADLINE_SECONDS)
+    Call it after the sign-in and any proof, just before the request the test cuts off. The
+    middleware's module sees only ``timeout``, which is all it uses, so a new use fails loudly."""
+    capture = DeadlineCapture(app.state.outliving_operations)
+    monkeypatch.setattr(request_timeout, "asyncio", types.SimpleNamespace(timeout=capture.timeout))
+    monkeypatch.setattr(
+        app.state, request_timeout.TIMEOUT_STATE_ATTR, GENEROUS_DEADLINE_SECONDS, raising=False
+    )
     return capture
 
 
@@ -102,8 +116,10 @@ async def expect_cut_off(capture: DeadlineCapture, request: Awaitable[httpx.Resp
     """Await ``request`` and check the answer is the deadline middleware's own 503, fired by
     ``capture`` from inside the operation: not a route's 503, and not the deadline running out.
 
-    Bounded, so a deadline that never fires fails here rather than hanging the run."""
-    r = await asyncio.wait_for(request, timeout=GENEROUS_DEADLINE_SECONDS + 10)
+    The generous deadline bounds the wait: a deadline the operation never fires answers 503 there,
+    and the ``fired`` check fails."""
+    r = await request
+    assert capture.problem is None, capture.problem
     assert r.status_code == 503, r.text
     assert r.json() == {"detail": "the server timed out building a response"}
     assert capture.fired, "the deadline was not fired from inside the operation"
