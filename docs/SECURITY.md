@@ -4494,20 +4494,25 @@ on that session, for example) ends it as a revocation would.
   export it ends still records `standing_changed`.
 
   A second check catches a scope change that reaches a live session without a revoke. At least
-  two cases do. One is a direct store write. The other is a row checked after `set_channel_scope`
-  writes the scope but before its revoke lands. The AD map edit writes no user's scope, so it has
-  no such window. In both cases the export stops, with the reason `scope_changed`, when the
-  caller's channel scope no longer covers the scope it started with. A widened scope still covers
-  it. After a direct store write the export goes on. In the write-to-revoke window it goes on only
-  until the revoke lands, and the next row's check stops it with `standing_changed`. A stop
-  records `messages_export.stopped` with the selected and streamed counts and the reason. Then it
-  aborts the transfer, so the client sees a failed download rather than a short file.
+  two cases do. One is a direct store write. The other is a row checked after an engine path
+  writes a scope or a role set but before its revoke lands. Every engine path that changes a live
+  account's scope or roles revokes after its write, so each has that window: at least
+  `set_channel_scope`, a role change, and the directory's sign-in and reconcile writes. The AD map
+  edit writes no user's scope, so it has no such window. In both cases the export stops, with the
+  reason `scope_changed`, when the caller's channel scope differs from the one it started with,
+  wider or narrower (BACKLOG #3381). So no row streams on a scope the export's step-up and its
+  `messages_export` row did not cover, and a grant then a withdrawal stops at the grant rather
+  than skipping later rows one by one. A stop records `messages_export.stopped` with the selected
+  and streamed counts and the reason. Then it aborts the transfer, so the client sees a failed
+  download rather than a short file. The server logs the stop once, as a WARNING with the counts,
+  and not as an error with a traceback.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the
-  export.
+  export. A search selection that runs longer than the whole idle window does the same before the
+  first row streams, and the caller signs in again.
 - The audit export (`GET /audit/export`, and the console's `/ui/audit/export`, which passes its
   cookie session) asks before every page of up to 1,000 rows, not every row. A page is one store
   read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
