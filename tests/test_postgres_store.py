@@ -38,7 +38,13 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.content_search import make_spec
-from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
+    cell_aad,
+    cipher_meta_key,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
@@ -5251,7 +5257,9 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
             async with cleanup._pool.acquire() as conn:
                 for table in ("message_events", "queue", "response", "messages"):
                     await conn.execute(f"DELETE FROM {table}")  # FK order: children first
-                await conn.execute("DELETE FROM cipher_meta WHERE key_id = $1", key_id)
+                await conn.execute(
+                    "DELETE FROM cipher_meta WHERE key_id = $1", cipher_meta_key(key_id)
+                )
         finally:
             await cleanup.close()
 
@@ -5747,7 +5755,8 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
             for c in ciphers:
                 if isinstance(c, AesGcmCipher):
                     await conn.execute(
-                        "DELETE FROM cipher_meta WHERE key_id = $1", c.invocation_key_id
+                        "DELETE FROM cipher_meta WHERE key_id = $1",
+                        cipher_meta_key(c.invocation_key_id),
                     )
 
 

@@ -682,8 +682,53 @@ def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
     (preimage-resistant), so embedding it in the stored prefix reveals nothing about the key. Accepts a
     ``bytearray`` so it can fingerprint an owned DEK buffer *before* it is zeroized, without forcing an
-    immutable copy."""
+    immutable copy.
+
+    Where its output is STORED -- a ``cipher_meta`` row and the DEK row of ``secret_rotation_meta``
+    -- it carries :data:`KEY_ID_SCHEME` (BACKLOG #3421). Changing this function means a new scheme
+    tag, read beside this one, or every stored count and age clock would restart at zero."""
     return hashlib.sha256(key).hexdigest()[:_KEY_ID_LEN]
+
+
+#: The scheme tag a STORED :func:`_fingerprint` output carries (BACKLOG #3421): SHA-256, the first 16
+#: hex. It names the function, not the key, so a release that changes the function can tell a value
+#: the old one wrote. The ``mfenc:`` markers and DR archives do not carry it: their format version
+#: can name a new function.
+KEY_ID_SCHEME = "sha256-16"
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+class UnknownSchemeError(ValueError):
+    """A stored value names a scheme this release does not compile in (BACKLOG #3421). A stored tag
+    may only choose among the release's own schemes, so it is refused, never resolved at run time."""
+
+
+def scheme_tagged(scheme: str, value: str) -> str:
+    """``value`` as it is stored, prefixed ``<scheme>:`` (BACKLOG #3421)."""
+    return f"{scheme}:{value}"
+
+
+def read_scheme_tag(stored: str, scheme: str) -> str:
+    """The value ``stored`` holds under ``scheme``, the one scheme its caller compiles in.
+
+    A tag is the text before the first ``:`` when it is not lowercase hex. Every value written
+    before tags existed starts with a hex key id or MAC, so an untagged value reads as written under
+    ``scheme`` and is returned as it is. A tag other than ``scheme`` raises
+    :class:`UnknownSchemeError`. Every tag therefore holds a character that is not lowercase hex."""
+    head, sep, rest = stored.partition(":")
+    if not sep or (head and _HEX_DIGITS.issuperset(head)):
+        return stored
+    if head != scheme:
+        raise UnknownSchemeError(f"stored value names an unknown scheme {head[:32]!r}")
+    return rest
+
+
+def cipher_meta_key(key_id: str) -> str:
+    """The ``cipher_meta`` row id for the key whose :func:`_fingerprint` is ``key_id``: the id
+    tagged :data:`KEY_ID_SCHEME` (BACKLOG #3421). A row written before tags existed is keyed on the
+    bare id; each backend reads it as this row and folds it in on its next add."""
+    return scheme_tagged(KEY_ID_SCHEME, key_id)
 
 
 def _derive_audit_mac_key(dek: bytes | bytearray) -> bytes:

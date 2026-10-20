@@ -129,6 +129,7 @@ from messagefoundry.store.crypto import (
     audit_key_id,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
@@ -14448,17 +14449,29 @@ class MessageStore:
         The rotation / at-rest-migration bursts hold the write lock across their whole batch loop and
         must still charge the bound per batch (otherwise a kill mid-burst permanently under-counts every
         value already re-encrypted). ``self._lock`` is a plain non-reentrant ``asyncio.Lock``, so they
-        charge through this variant; every other caller goes through the public method."""
+        charge through this variant; every other caller goes through the public method.
+
+        The row is keyed on :func:`cipher_meta_key`. A row written before scheme tags, keyed on the
+        bare ``key_id``, is folded into it here, so its count carries over (BACKLOG #3421)."""
         now = time.time()
+        row_id = cipher_meta_key(key_id)
+        cur = await self._db.execute(
+            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+        )
+        legacy = await cur.fetchone()
+        folded = 0
+        if legacy is not None:
+            folded = int(legacy["invocations"])
+            await self._db.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
         await self._db.execute(
             "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?,?,?)"
             " ON CONFLICT(key_id) DO UPDATE SET"
             " invocations = cipher_meta.invocations + excluded.invocations,"
             " updated_at = excluded.updated_at",
-            (key_id, int(count), now),
+            (row_id, int(count) + folded, now),
         )
         cur = await self._db.execute(
-            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (row_id,)
         )
         row = await cur.fetchone()
         await self._commit()
@@ -14591,13 +14604,15 @@ class MessageStore:
         return withdrawn
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+                "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN (?, ?)",
+                (cipher_meta_key(key_id), key_id),
             )
             row = await cur.fetchone()
-        return int(row["invocations"]) if row is not None else 0
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""

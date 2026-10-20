@@ -133,6 +133,7 @@ from messagefoundry.store.crypto import (
     allows_unmarked,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
@@ -8559,16 +8560,23 @@ class PostgresStore:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
         NEGATIVE ``count`` refunds an unspent reserve at settlement). See the SQLite twin — one row per
         key_id, reserve-then-spend, aggregating every process on this one unified store (engine shards
-        and `[cluster]` HA nodes alike)."""
+        and `[cluster]` HA nodes alike).
+
+        The CTE folds a pre-tag row, keyed on the bare ``key_id``, into the :func:`cipher_meta_key`
+        row in the same statement (BACKLOG #3421). A concurrent fold waits on the DELETE's row lock
+        and then finds no row, so the old count is added once."""
         row = await self._fetchone(
-            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES ($1,$2,$3)"
+            "WITH legacy AS (DELETE FROM cipher_meta WHERE key_id = $4 RETURNING invocations)"
+            " INSERT INTO cipher_meta (key_id, invocations, updated_at)"
+            " VALUES ($1, $2::bigint + COALESCE((SELECT invocations FROM legacy), 0), $3)"
             " ON CONFLICT (key_id) DO UPDATE SET"
             " invocations = cipher_meta.invocations + EXCLUDED.invocations,"
             " updated_at = EXCLUDED.updated_at"
             " RETURNING invocations",
-            key_id,
+            cipher_meta_key(key_id),
             int(count),
             time.time(),
+            key_id,
         )
         return int(row["invocations"]) if row is not None else int(count)
 
@@ -8650,9 +8658,14 @@ class PostgresStore:
         return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
-        row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
-        return int(row["invocations"]) if row is not None else 0
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
+        row = await self._fetchone(
+            "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN ($1, $2)",
+            cipher_meta_key(key_id),
+            key_id,
+        )
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""

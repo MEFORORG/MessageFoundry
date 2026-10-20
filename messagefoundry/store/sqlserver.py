@@ -116,6 +116,7 @@ from messagefoundry.store.crypto import (
     allows_unmarked,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
@@ -12281,13 +12282,25 @@ class SqlServerStore:
         contended server; both roll the statement back with NO committed effect, so we retry (bounded,
         with backoff). ``merged`` is the no-double-count guard: it is set the instant the MERGE returns
         its OUTPUT — after that a failure could be a completed-but-unacknowledged COMMIT, so we NEVER
-        retry then (a re-issue would double-count the security-critical GCM invocation bound)."""
+        retry then (a re-issue would double-count the security-critical GCM invocation bound).
+
+        The row is keyed on :func:`cipher_meta_key`. A pre-tag row, keyed on the bare ``key_id``, is
+        deleted in the same transaction and its count added to the MERGE (BACKLOG #3421). A
+        concurrent fold waits on the DELETE's row lock and then finds no row, so it is added once; a
+        rolled-back attempt restores the row for the retry."""
         now = time.time()
+        row_id = cipher_meta_key(key_id)
         for attempt in range(_CIPHER_MERGE_ATTEMPTS):
             merged = False
             retry = False
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
+                    await cur.execute(
+                        "DELETE FROM cipher_meta OUTPUT DELETED.invocations WHERE key_id = ?",
+                        (key_id,),
+                    )
+                    legacy = await cur.fetchone()
+                    folded = int(legacy[0]) if legacy is not None else 0
                     await cur.execute(
                         "MERGE cipher_meta WITH (HOLDLOCK) AS t"
                         " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
@@ -12298,11 +12311,11 @@ class SqlServerStore:
                         " INSERT (key_id, invocations, updated_at)"
                         " VALUES (s.key_id, s.invocations, s.updated_at)"
                         " OUTPUT INSERTED.invocations;",
-                        (key_id, int(count), now),
+                        (row_id, int(count) + folded, now),
                     )
                     row = await cur.fetchone()
                     merged = True  # MERGE ran + OUTPUT the total; past here a failure is a COMMIT
-                    total = int(row[0]) if row is not None else int(count)
+                    total = int(row[0]) if row is not None else int(count) + folded
                     await self._commit(conn)
                     return total
                 except Exception as exc:
@@ -12455,11 +12468,13 @@ class SqlServerStore:
         return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
         row = await self._fetchone(
-            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+            "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN (?, ?)",
+            (cipher_meta_key(key_id), key_id),
         )
-        return int(row["invocations"]) if row is not None else 0
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
