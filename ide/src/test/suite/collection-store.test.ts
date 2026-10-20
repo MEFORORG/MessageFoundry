@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
-import { createHash } from "node:crypto";
 
 import {
   CollectionStore,
@@ -48,13 +47,19 @@ class FakeMemento implements LegacyStore {
 
 const BODY = "MSH|^~\\&|APP|FAC|RCV|RFAC|20260101||ADT^A01|C1|P|2.5\rPID|1||MRN-123||DOE^JANE";
 
-/**
- * The key exactly as builds before BACKLOG #3426 wrote it, derived here rather than from the module so
- * a change to the module's digest cannot also move what these tests read.
- */
-function unversionedKey(scope: string): string {
-  const digest = createHash("sha256").update(scope, "utf8").digest("hex").slice(0, 32);
-  return `${LEGACY_COLLECTIONS_KEY}.${digest}`;
+/** The first 32 hex digits of SHA-256("file:///ws/a"), written out so no change to the module moves it. */
+const DIGEST_A = "7c4d332c95c64d7fea948cb20336b35b";
+
+/** The key for "file:///ws/a" exactly as builds before BACKLOG #3426 wrote it. */
+const UNVERSIONED_A = `${LEGACY_COLLECTIONS_KEY}.${DIGEST_A}`;
+
+/** A promise the test resolves by hand, to hold a store call open while another call runs. */
+function gate(): { wait: Promise<void>; open: () => void } {
+  let open = (): void => undefined;
+  const wait = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { wait, open };
 }
 
 function coll(name: string, input = BODY): TestCollection {
@@ -94,43 +99,110 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
   });
 
   test("the secret key carries its scheme version (BACKLOG #3426)", () => {
-    assert.ok(collectionsSecretKey("file:///ws/a").startsWith(`${LEGACY_COLLECTIONS_KEY}.v1.`));
+    assert.strictEqual(collectionsSecretKey("file:///ws/a"), `${LEGACY_COLLECTIONS_KEY}.v1.${DIGEST_A}`);
   });
 
   test("an unknown key scheme marker is refused, not resolved (BACKLOG #3426)", () => {
     for (const marker of ["v0", "v2", "", "__proto__", "toString", "constructor"]) {
-      assert.throws(() => collectionsSecretKey("file:///ws/a", marker), CollectionStoreError, marker);
+      assert.throws(
+        () => collectionsSecretKey("file:///ws/a", marker),
+        // Not CollectionStoreError, which the Test Bench answers by offering to delete collections.
+        (e: unknown) => e instanceof Error && !(e instanceof CollectionStoreError) && /scheme/.test(e.message),
+        marker,
+      );
     }
   });
 
   test("a value saved under the unversioned key still reads and is moved across (BACKLOG #3426)", async () => {
     const secrets = new FakeSecrets();
-    const unversioned = unversionedKey("file:///ws/a");
-    await secrets.store(unversioned, JSON.stringify({ kept: coll("kept") }));
+    await secrets.store(UNVERSIONED_A, JSON.stringify({ kept: coll("kept") }));
     secrets.calls.length = 0;
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
     assert.deepStrictEqual(await store.load(), { kept: coll("kept") });
-    assert.ok(!secrets.data.has(unversioned), "the unversioned copy is removed");
-    assert.ok(secrets.data.get(collectionsSecretKey("file:///ws/a"))?.includes("MRN-123"));
+    assert.ok(!secrets.data.has(UNVERSIONED_A), "the unversioned copy is removed");
+    const key = collectionsSecretKey("file:///ws/a");
+    assert.ok(secrets.data.get(key)?.includes("MRN-123"));
     const writes = secrets.calls.filter((c) => !c.startsWith("get "));
-    assert.deepStrictEqual(writes, [`store ${collectionsSecretKey("file:///ws/a")}`, `delete ${unversioned}`]);
+    assert.deepStrictEqual(writes, [`store ${key}`, `delete ${UNVERSIONED_A}`], "write before delete");
   });
 
   test("a crash between the key move's two steps leaves the versioned copy winning (BACKLOG #3426)", async () => {
     const secrets = new FakeSecrets();
-    const unversioned = unversionedKey("file:///ws/a");
-    await secrets.store(unversioned, JSON.stringify({ stale: coll("stale") }));
+    await secrets.store(UNVERSIONED_A, JSON.stringify({ stale: coll("stale") }));
     await secrets.store(collectionsSecretKey("file:///ws/a"), JSON.stringify({ current: coll("current") }));
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
     assert.deepStrictEqual(await store.load(), { current: coll("current") });
-    assert.ok(!secrets.data.has(unversioned));
+    assert.ok(!secrets.data.has(UNVERSIONED_A));
   });
 
-  test("reset also deletes an unversioned copy not yet moved (BACKLOG #3426)", async () => {
+  test("a failed key move keeps the unversioned copy and is retried (BACKLOG #3426)", async () => {
     const secrets = new FakeSecrets();
-    await secrets.store(unversionedKey("file:///ws/a"), "{not json");
+    await secrets.store(UNVERSIONED_A, JSON.stringify({ kept: coll("kept") }));
+    let fail = true;
+    const flaky: SecretStore = {
+      get: (key) => secrets.get(key),
+      store: async (key, value) => {
+        if (fail) {
+          throw new Error("keychain unavailable");
+        }
+        await secrets.store(key, value);
+      },
+      delete: (key) => secrets.delete(key),
+    };
+    const store = new CollectionStore(flaky, new FakeMemento(), "file:///ws/a");
+    await assert.rejects(store.load());
+    assert.ok(secrets.data.has(UNVERSIONED_A), "unversioned copy kept when the write failed");
+    fail = false;
+    assert.deepStrictEqual(await store.load(), { kept: coll("kept") });
+    assert.ok(!secrets.data.has(UNVERSIONED_A));
+  });
+
+  test("an unreadable unversioned value is moved, refused, and reset (BACKLOG #3426)", async () => {
+    const secrets = new FakeSecrets();
+    await secrets.store(UNVERSIONED_A, "{not json");
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
+    await assert.rejects(store.load(), CollectionStoreError);
     await store.reset();
+    assert.deepStrictEqual(await store.load(), {});
+    assert.strictEqual(secrets.data.size, 0);
+  });
+
+  test("reset after a failed migration also clears the workspaceState copy (BACKLOG #3426)", async () => {
+    const secrets = new FakeSecrets();
+    const memento = new FakeMemento();
+    await secrets.store(UNVERSIONED_A, "{not json");
+    memento.data.set(LEGACY_COLLECTIONS_KEY, { old: coll("old") });
+    const store = new CollectionStore(secrets, memento, "file:///ws/a");
+    // The legacy merge reads the moved, unreadable secret and fails.
+    await assert.rejects(store.load(), CollectionStoreError);
+    await store.reset();
+    assert.deepStrictEqual(await store.load(), {}, "what the user deleted does not come back");
+    assert.strictEqual(memento.data.size, 0);
+  });
+
+  test("reset waits for a running migration, so the move cannot write back what it deletes (BACKLOG #3426)", async () => {
+    const secrets = new FakeSecrets();
+    await secrets.store(UNVERSIONED_A, JSON.stringify({ a: coll("a") }));
+    const held = gate();
+    let holdNextGet = false;
+    const slow: SecretStore = {
+      get: async (key) => {
+        const value = await secrets.get(key);
+        if (holdNextGet) {
+          holdNextGet = false;
+          await held.wait;
+        }
+        return value;
+      },
+      store: (key, value) => secrets.store(key, value),
+      delete: (key) => secrets.delete(key),
+    };
+    const store = new CollectionStore(slow, new FakeMemento(), "file:///ws/a");
+    holdNextGet = true; // the move's read of the unversioned value stays open
+    const loading = store.load();
+    const resetting = store.reset();
+    held.open();
+    await Promise.all([loading, resetting]);
     assert.deepStrictEqual(await store.load(), {});
     assert.strictEqual(secrets.data.size, 0);
   });

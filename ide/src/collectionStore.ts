@@ -36,10 +36,11 @@ function sha256Scope(workspaceScope: string): string {
 }
 
 /**
- * How a workspace scope becomes a key, by scheme version (BACKLOG #3426). Only schemes compiled into
- * this release resolve; an unknown marker is refused rather than guessed at. A new digest is a new
- * entry here plus a move from the old key, never an edit to an existing entry, which would leave every
- * saved collection under a key nothing reads.
+ * How a workspace scope becomes a key, by scheme version (BACKLOG #3426). The release picks the
+ * scheme, through CURRENT_KEY_SCHEME; no stored value names one. Only schemes in this table resolve,
+ * and an unknown marker is refused rather than guessed at. A new digest is a new entry here, a bump of
+ * CURRENT_KEY_SCHEME, and pointing the store's move at the previous scheme's key. Never edit an
+ * existing entry: that would leave every saved collection under a key nothing reads.
  */
 const KEY_SCHEMES: ReadonlyMap<string, (workspaceScope: string) => string> = new Map([
   ["v1", sha256Scope],
@@ -55,7 +56,9 @@ const CURRENT_KEY_SCHEME = "v1";
 export function collectionsSecretKey(workspaceScope: string, scheme = CURRENT_KEY_SCHEME): string {
   const digest = KEY_SCHEMES.get(scheme);
   if (digest === undefined) {
-    throw new CollectionStoreError("unknown Test Bench collection key scheme");
+    // A plain Error, not CollectionStoreError: this is a build defect, not an unreadable stored value,
+    // and the Test Bench answers CollectionStoreError by offering to delete the saved collections.
+    throw new Error("unknown Test Bench collection key scheme");
   }
   return `${LEGACY_COLLECTIONS_KEY}.${scheme}.${digest(workspaceScope)}`;
 }
@@ -125,8 +128,10 @@ function validCollections(v: unknown): Record<string, TestCollection> {
  *
  * Before that, the same first load moves a value from the unversioned SecretStorage key to the
  * versioned one, in the same write-then-delete order. A value already under the versioned key wins
- * whole, without a merge: only a crash after the move's write leaves both, and a merge could bring back
- * a collection deleted since.
+ * whole, without a merge, because a merge could bring back a collection deleted since. Both keys hold
+ * a value after a crash between the move's write and delete, and also after a build from before
+ * BACKLOG #3426 runs again on the same machine and saves: that build writes the unversioned key, and
+ * this one then deletes that write unread.
  */
 export class CollectionStore {
   private readonly key: string;
@@ -171,11 +176,23 @@ export class CollectionStore {
     return this.migration;
   }
 
-  /** Delete this workspace's saved collections: the way out of a stored value that cannot be read. */
+  /**
+   * Delete this workspace's saved collections: the way out of a stored value that cannot be read.
+   * Every copy goes, the unversioned key and workspaceState included, or a later migration would bring
+   * back what the user chose to delete. A migration already running settles first, so it cannot write
+   * back a value it read before the deletes; afterwards nothing is left to move.
+   */
   async reset(): Promise<void> {
-    // The unversioned copy too, or a reset before the first load would be undone by its move.
-    await this.secrets.delete(this.key);
-    await this.secrets.delete(this.previousKey);
+    await this.migration?.catch(() => undefined);
+    this.migration = Promise.resolve();
+    try {
+      await this.secrets.delete(this.key);
+      await this.secrets.delete(this.previousKey);
+      await this.legacy.update(LEGACY_COLLECTIONS_KEY, undefined);
+    } catch (e) {
+      this.migration = undefined; // a copy may survive, so the next call migrates again
+      throw e;
+    }
   }
 
   private async movePreviousKey(): Promise<void> {
