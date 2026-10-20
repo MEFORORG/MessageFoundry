@@ -2139,6 +2139,13 @@ class WebAuthnCredential:
     deliberately excluded from the store cipher and the id-keyed rekey loops). ``sign_count`` is a
     WebAuthn uint32 (0 is legitimate and permanent for synced passkeys); ``rp_id`` is pinned at
     mint time so an origin migration renders the row visibly unusable, never silently failing.
+
+    ``discoverable`` (ADR 0197 Amendment A, wave 2) records that the passkey was registered as a
+    discoverable credential: the ``credProps.rk`` the client reported, or the ``residentKey``
+    requirement the registration sent when it reported none. Only such a passkey can answer the
+    usernameless sign-in, so only it is a way past the sign-in lock. False on a row written before
+    the column existed, the closed direction. The account's seal covers it through the passkey
+    digest, so a row flipped outside the store fails the set.
     """
 
     credential_id_hash: str
@@ -2154,6 +2161,7 @@ class WebAuthnCredential:
     aaguid: str | None
     created_at: float
     last_used_at: float | None = None
+    discoverable: bool = False
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
@@ -2172,6 +2180,7 @@ class WebAuthnCredential:
             aaguid=d.get("aaguid"),
             created_at=float(d["created_at"]),
             last_used_at=_opt_float(d.get("last_used_at")),
+            discoverable=bool(d.get("discoverable", False)),
         )
 
 
@@ -2476,8 +2485,8 @@ _USER_ROLE_INSERT: Final = (
 _WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-    " aaguid, created_at, last_used_at)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " aaguid, created_at, last_used_at, discoverable)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
@@ -2524,6 +2533,7 @@ def webauthn_insert_params(cred: WebAuthnCredential) -> tuple[object, ...]:
         cred.aaguid,
         cred.created_at,
         cred.last_used_at,
+        bool(cred.discoverable),
     )
 
 
@@ -2619,13 +2629,32 @@ def lockout_clear(r: UserAuthzRecord, *, reset_cycles: bool, now: float) -> User
     return out.changed(lock_cycles=0, second_step_lock_cycles=0) if reset_cycles else out
 
 
+def holds_way_past(
+    record: UserAuthzRecord, passkeys: Sequence[WebAuthnCredential], *, sealed: bool
+) -> bool:
+    """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
+    TOTP on with a secret, or a passkey recorded as discoverable (wave 2). ``passkeys`` is the
+    account's set, read in the same transaction as the write that asks. On a ``sealed`` store a set
+    that does not match the digest the record's seal covers counts for nothing: a passkey row
+    written or flipped outside the store must not open the gate. TOTP with no secret is no way past,
+    hence its second test."""
+    row = record.row
+    if row.totp_enabled and row.totp_secret is not None:
+        return True
+    if sealed and passkey_digest(passkeys) != row.cred_digest:
+        return False
+    return any(c.discoverable for c in passkeys)
+
+
 def password_change(
     *,
     password_hash: str,
     password_generated: bool,
     must_change_password: bool,
-    require_totp: bool,
+    require_way_past: bool,
     now: float,
+    passkeys: Sequence[WebAuthnCredential] = (),
+    sealed: bool = False,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2642,13 +2671,14 @@ def password_change(
     caller passing False has just authenticated the holder. Do not add a second writer of the
     column, and never set it back to NULL after creation.
 
-    With ``require_totp`` (ADR 0197 Amendment A) the write happens only while TOTP is on with a
-    secret, so an ``admin_reset_mfa`` landing first makes it write nothing. TOTP with no secret is
-    no way past the lock, hence the second test."""
+    With ``require_way_past`` (ADR 0197 Amendment A) the write happens only while the account
+    holds a way past the sign-in lock (:func:`holds_way_past`, over ``passkeys`` read in the same
+    transaction), so an ``admin_reset_mfa`` or a passkey removal landing first makes it write
+    nothing."""
     when = float(now)
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if require_totp and not (r.row.totp_enabled and r.row.totp_secret is not None):
+        if require_way_past and not holds_way_past(r, passkeys, sealed=sealed):
             return None
         claimed = r.row.password_claimed_at
         if not must_change_password and claimed is None:
@@ -7242,7 +7272,8 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
                                                -- backends (NVARCHAR/VARCHAR(100)) AND at the service
     aaguid             TEXT,
     created_at         REAL NOT NULL,
-    last_used_at       REAL
+    last_used_at       REAL,
+    discoverable       INTEGER NOT NULL DEFAULT 0  -- ADR 0197 Amendment A wave 2: registered as a discoverable credential
 );
 CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label);
@@ -9163,6 +9194,16 @@ class MessageStore:
         if "seal" not in approval_cols:
             await db.execute(
                 "ALTER TABLE pending_approvals ADD COLUMN seal TEXT NOT NULL DEFAULT ''"
+            )
+        # ADR 0197 Amendment A, wave 2: whether a passkey was registered as a discoverable
+        # credential. 0 on an existing row reads "not discoverable", so a passkey registered before
+        # the column is no way past the sign-in lock -- the closed direction. No backfill: nothing
+        # recorded it until now.
+        cur = await db.execute("PRAGMA table_info(webauthn_credentials)")
+        passkey_cols = {row["name"] for row in await cur.fetchall()}
+        if passkey_cols and "discoverable" not in passkey_cols:
+            await db.execute(
+                "ALTER TABLE webauthn_credentials ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 0"
             )
         await MessageStore._migrate_outbox_to_queue(db)
 
@@ -15054,18 +15095,21 @@ class MessageStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
-        )
         async with _writer_guard(self._db, self._lock):
+            # The passkeys the condition reads are read under the same writer lock as the write.
+            change = password_change(
+                password_hash=password_hash,
+                password_generated=password_generated,
+                must_change_password=must_change_password,
+                require_way_past=require_way_past,
+                now=now,
+                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                sealed=self._row_sealer is not None,
+            )
             written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None

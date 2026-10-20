@@ -106,6 +106,7 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_counters_stay_apart_and_clear(store)
     await _assert_generated_credential(store)
     await _assert_conditional_rotation(store)
+    await _assert_conditional_rotation_on_a_passkey(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -397,6 +398,55 @@ async def _assert_generated_credential(store: Any) -> None:
         await store.delete_user(user_id)
 
 
+async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
+    """ADR 0197 Amendment A, wave 2: a passkey recorded as discoverable is a way past, so the
+    conditional rotation lands on an account holding one and no TOTP; a passkey that is not
+    discoverable is not, so the write matches no row. And removing the discoverable passkey between
+    the caller's check and the write refuses it, because the passkeys are read in the write's own
+    transaction."""
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="rot-pk1",
+        username="rot-pk-alice",
+        auth_provider="local",
+        password_hash="h-issued",
+        must_change_password=True,
+        password_generated=True,
+        now=1.0,
+    )
+
+    async def rotate() -> bool:
+        return bool(
+            await store.set_password(
+                "rot-pk1",
+                password_hash="h-chosen",
+                password_generated=False,
+                must_change_password=False,
+                require_way_past=True,
+            )
+        )
+
+    await store.add_webauthn_credential(_cred("rot-pk1", "plain", id_hash="rot-pk-plain"))
+    assert not await rotate(), "a passkey that is not discoverable opened the rotation"
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.password_hash == "h-issued" and user.password_generated
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "resident", id_hash="rot-pk-resident", created_at=2.0, discoverable=True)
+    )
+    # The caller "checks" here and sees it ... then the holder removes it before the write.
+    assert await store.delete_webauthn_credential("rot-pk1", "rot-pk-resident")
+    assert not await rotate(), "the rotation landed after the discoverable passkey was removed"
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "resident", id_hash="rot-pk-resident", created_at=3.0, discoverable=True)
+    )
+    assert await rotate(), "a discoverable passkey did not open the rotation"
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.password_hash == "h-chosen" and not user.password_generated
+    await store.delete_all_webauthn_credentials("rot-pk1")
+    await store.delete_user("rot-pk1")
+
+
 async def _assert_conditional_rotation(store: Any) -> None:
     """ADR 0197 Amendment A, N-B2 part 4: a rotation that requires TOTP carries the condition in its
     own UPDATE, so TOTP cleared between the caller's check and the write makes the write match no
@@ -416,7 +466,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
     )
     user = await store.get_user("rot-u1")
     assert user is not None
@@ -440,7 +490,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
     )
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
@@ -454,7 +504,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
     )
     user = await store.get_user("rot-u1")
     assert user is not None

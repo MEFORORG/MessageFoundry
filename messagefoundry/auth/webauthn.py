@@ -390,6 +390,66 @@ class ChallengeCache:
         return len(moved)
 
 
+class PreAuthChallengePool:
+    """Bounded, TTL'd, process-local staging for the usernameless sign-in's challenges (ADR 0197
+    Amendment A, wave 2).
+
+    Apart from :class:`ChallengeCache` on purpose. That cache is fed only by authenticated traffic
+    and bounds each principal; these entries are staged BEFORE anyone is authenticated, so there is
+    no principal to bound. The key is the hash of an opaque random handle the begin leg mints and
+    sets as an HttpOnly cookie, never a client address: behind an undeclared proxy every caller
+    shares one address, so an address key would let one caller replace or crowd out the owner's
+    challenge. **A full pool evicts its OLDEST entry rather than refusing**, so a flood can delay
+    the owner by evicting a challenge, which the owner answers by starting again, but can never
+    refuse the ceremony outright. The begin leg charges the sign-in limiter first, which keeps the
+    fill rate far below what it takes to evict a challenge inside its TTL; with that limiter off, a
+    fast enough flood can, which ADR 0197 names as a residual.
+
+    Every entry has the same TTL, so insertion order is deadline order: the first entry is the
+    oldest, and expiry and eviction both work from the front.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = CHALLENGE_TTL_SECONDS,
+        cap: int = GLOBAL_PENDING_CAP,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._cap = cap
+        self._clock = clock
+        self._entries: dict[str, tuple[bytes, float]] = {}
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _prune(self, now: float) -> None:
+        while self._entries:
+            key = next(iter(self._entries))
+            if self._entries[key][1] > now:
+                return
+            del self._entries[key]
+
+    def put(self, key: str, challenge: bytes) -> None:
+        """Stage ``challenge`` under ``key`` (a handle hash), evicting the oldest entry when full."""
+        now = self._clock()
+        self._prune(now)
+        self._entries.pop(key, None)
+        while len(self._entries) >= self._cap:
+            del self._entries[next(iter(self._entries))]
+        self._entries[key] = (challenge, now + self._ttl)
+
+    def pop(self, key: str) -> bytes | None:
+        """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired."""
+        # A dict lookup, discharged for ASVS 11.2.4 for the reason ChallengeCache.put gives: the
+        # key is the SHA-256 of the caller's own handle.
+        entry = self._entries.pop(key, None)
+        if entry is None or entry[1] <= self._clock():
+            return None
+        return entry[0]
+
+
 @dataclass(frozen=True, slots=True)
 class RegistrationResult:
     """The verified outcome of a registration ceremony, decoupled from library types."""
@@ -401,6 +461,9 @@ class RegistrationResult:
     device_type: str
     backed_up: bool
     aaguid: str
+    #: ``credProps.rk`` as the client reported it, or ``None`` when it reported none (ADR 0197
+    #: Amendment A, wave 2). The service records the ``residentKey`` requirement in that case.
+    resident_key: bool | None = None
 
 
 def registration_options(
@@ -417,6 +480,15 @@ def registration_options(
     ``attestation=NONE``, ``user_verification=PREFERRED`` and :data:`SUPPORTED_COSE_ALGS` are
     pinned here (module docstring); ``exclude_credential_ids`` carries the user's existing
     credentials so re-registering the same authenticator is refused client-side.
+
+    **A discoverable credential is REQUIRED** (ADR 0197 Amendment A, wave 2): ``residentKey``
+    ``required``, with the legacy ``requireResidentKey`` beside it. Under ``required`` a conforming
+    browser creates a discoverable credential or fails the ceremony, and only a discoverable
+    credential can answer the usernameless sign-in that passes the sign-in lock. The ``credProps``
+    extension is asked for too, so the client can report what it actually made
+    (:func:`resident_key_from_response`). py_webauthn builds no extensions, so it is added to the
+    JSON here. Stated rather than hidden: an authenticator that cannot store a discoverable
+    credential, such as an older U2F key, can no longer register; its holder keeps TOTP.
     """
     _require_webauthn()
     from webauthn import generate_registration_options
@@ -425,6 +497,7 @@ def registration_options(
         AttestationConveyancePreference,
         AuthenticatorSelectionCriteria,
         PublicKeyCredentialDescriptor,
+        ResidentKeyRequirement,
         UserVerificationRequirement,
     )
 
@@ -436,14 +509,18 @@ def registration_options(
         challenge=challenge,
         attestation=AttestationConveyancePreference.NONE,
         authenticator_selection=AuthenticatorSelectionCriteria(
-            user_verification=UserVerificationRequirement.PREFERRED
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            require_resident_key=True,
+            user_verification=UserVerificationRequirement.PREFERRED,
         ),
         exclude_credentials=[
             PublicKeyCredentialDescriptor(id=cid) for cid in exclude_credential_ids
         ],
         supported_pub_key_algs=_supported_pub_key_algs(),
     )
-    return options_to_json(options)
+    built = json.loads(options_to_json(options))
+    built["extensions"] = {"credProps": True}
+    return json.dumps(built)
 
 
 def verify_registration(
@@ -487,13 +564,16 @@ def verify_registration(
         device_type=verified.credential_device_type.value,
         backed_up=verified.credential_backed_up,
         aaguid=verified.aaguid,
+        resident_key=resident_key_from_response(response_json),
     )
 
 
 def assertion_options(
     *, rp_id: str, challenge: bytes, allow_credential_ids: Sequence[bytes]
 ) -> str:
-    """Build the browser ``navigator.credentials.get`` options as a JSON string."""
+    """Build the browser ``navigator.credentials.get`` options as a JSON string. An empty
+    ``allow_credential_ids`` is the usernameless form (ADR 0197 Amendment A, wave 2): the browser
+    offers the discoverable credentials it holds for ``rp_id``, and the options name no account."""
     _require_webauthn()
     from webauthn import generate_authentication_options
     from webauthn.helpers import options_to_json
@@ -583,6 +663,43 @@ def credential_id_from_response(response_json: str) -> bytes:
     with contextlib.suppress(ValueError, TypeError):
         return base64url_to_bytes(raw_id)
     raise WebAuthnVerificationError("malformed ceremony response")
+
+
+def user_handle_from_response(response_json: str) -> bytes | None:
+    """The ``response.userHandle`` of an assertion, decoded, or ``None`` when it carries none or
+    it is malformed (ADR 0197 Amendment A, wave 2).
+
+    The usernameless sign-in names the account in the form and the credential in the assertion, so
+    the service compares this to the named account's id: a discoverable credential always returns
+    the handle it was registered with, which is the account id (:func:`registration_options`). A
+    missing or unreadable handle is no match, so the assertion counts as invalid.
+    """
+    _require_webauthn()
+    from webauthn.helpers import base64url_to_bytes
+
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
+        return None
+    response = parsed.get("response")
+    handle = response.get("userHandle") if isinstance(response, dict) else None
+    if not isinstance(handle, str) or not handle:
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        return base64url_to_bytes(handle)
+    return None
+
+
+def resident_key_from_response(response_json: str) -> bool | None:
+    """``clientExtensionResults.credProps.rk`` of a registration response, or ``None`` when the
+    client reported none (ADR 0197 Amendment A, wave 2). Only a JSON boolean counts: any other
+    shape is read as not reported, and the caller then records the requirement it sent."""
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
+        return None
+    results = parsed.get("clientExtensionResults")
+    props = results.get("credProps") if isinstance(results, dict) else None
+    rk = props.get("rk") if isinstance(props, dict) else None
+    return rk if isinstance(rk, bool) else None
 
 
 def _transports_from_response(response_json: str) -> list[str] | None:

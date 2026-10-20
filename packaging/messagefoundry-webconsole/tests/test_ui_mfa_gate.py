@@ -725,9 +725,10 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
 
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
-    # The passkey is registered with the requirement OFF: under it, a passkey cannot be a covered
-    # account's first factor in wave 1 (ADR 0197 Amendment A). This builds the passkey-only state
-    # an account can still reach from before the requirement covered it.
+    # The passkey is registered with the requirement OFF, and its client reports it is NOT
+    # discoverable: under the requirement such a passkey cannot be a covered account's first factor
+    # (ADR 0197 Amendment A, wave 2). This builds the passkey-only state with no way past that an
+    # account can still reach from before the requirement covered it.
     setup_service = await _service(engine, require_mfa=False)
     identity = await setup_service.identity_for_user_id(user_id)
     assert identity is not None
@@ -741,7 +742,7 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
     key = SoftAuthenticator(rp_id="t", origin="http://t")
     registered = await setup_service.finish_webauthn_registration(
         identity,
-        key.create_response(base64url_to_bytes(options["challenge"])),
+        key.create_response(base64url_to_bytes(options["challenge"]), resident_key=False),
         label="key",
         token=setup.token,
         rp_id="t",
@@ -764,9 +765,9 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
         # Proven, so the route confines it again: the other half of the old blanket refusal.
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
         assert r.status_code == 403 and r.json()["error"] == "password change required"
-        # A passkey is not a way past the sign-in lock in wave 1 (ADR 0197 Amendment A), so the
-        # rotation still waits for TOTP: the password page sends it to enrol, and a POST changes
-        # nothing. The account is not stranded; the enrolment is open to it.
+        # A passkey that is not discoverable is no way past the sign-in lock (ADR 0197 Amendment
+        # A), so the rotation still waits for a factor that is: the password page sends it to
+        # enrol, and a POST changes nothing. The account is not stranded; the enrolment is open.
         r = await c.get(_PASSWORD)
         assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
         r = await _change_password(c, current=temp)

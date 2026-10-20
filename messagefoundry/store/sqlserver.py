@@ -2487,7 +2487,13 @@ _SCHEMA: list[str] = [
         public_key NVARCHAR(MAX) NOT NULL, sign_count BIGINT NOT NULL,
         transports NVARCHAR(MAX) NULL, device_type NVARCHAR(32) NOT NULL,
         backed_up BIT NOT NULL DEFAULT 0, label NVARCHAR(100) NOT NULL,
-        aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL)""",
+        aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL,
+        discoverable BIT NOT NULL DEFAULT 0)""",
+    # ADR 0197 Amendment A, wave 2: COL_LENGTH-gated ADD for a table created before the column. 0 on
+    # an existing row reads "not discoverable", so such a passkey is no way past the sign-in lock --
+    # the closed direction.
+    """IF COL_LENGTH('webauthn_credentials','discoverable') IS NULL
+        ALTER TABLE webauthn_credentials ADD discoverable BIT NOT NULL DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ix_webauthn_credentials_user','IndexID') IS NULL
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
@@ -13271,20 +13277,31 @@ class SqlServerStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
-        )
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
-        # and a conditional rotation must know whether it matched.
-        return await self._write_user_txn(user_id, change) is not None
+        # and a conditional rotation must know whether it matched. The passkeys the condition reads
+        # are read in the write's own transaction; a removal that commits before the write moves
+        # the record's seal, so the write's compare loses.
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                change = password_change(
+                    password_hash=password_hash,
+                    password_generated=password_generated,
+                    must_change_password=must_change_password,
+                    require_way_past=require_way_past,
+                    now=now,
+                    passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
+                    sealed=self._row_sealer is not None,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None

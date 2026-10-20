@@ -2204,9 +2204,11 @@ class AuthStore(Protocol):
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
-    # ``require_totp`` makes the write CONDITIONAL on ``totp_enabled`` in the same UPDATE, so an
-    # ``admin_reset_mfa`` that clears TOTP between the caller's check and this write makes it match
-    # no row. Returns whether a row was written; a conditional caller refuses on False.
+    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock, in the same
+    # transaction as the write: TOTP on with a secret, or (wave 2) a passkey recorded as
+    # discoverable, read from the set the account's seal covers. So an ``admin_reset_mfa`` or a
+    # passkey removal that lands between the caller's check and this write makes it match no row.
+    # Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
         user_id: str,
@@ -2214,7 +2216,7 @@ class AuthStore(Protocol):
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2314,7 +2316,7 @@ class AuthStore(Protocol):
     # the secret, a second confirm that enables first, or a second begin that stages another
     # secret, between the caller's read and this write, makes it match no row. ``None`` matches
     # nothing. A caller must refuse on False and never treat MFA as on, the way
-    # ``set_password(require_totp=...)`` callers do.
+    # ``set_password(require_way_past=...)`` callers do.
     async def enable_totp(
         self,
         user_id: str,

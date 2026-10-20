@@ -1592,19 +1592,40 @@ def _effective_scope_source(user: UserRecord) -> ChannelScopeSource | None:
 ENROL_AUTHENTICATOR_FIRST = "enrol an authenticator app first"
 
 
-#: The detail ``disable_mfa`` refuses with while ``[security].require_mfa`` covers the account (ADR
-#: 0197 Amendment A, AC-A3a). In wave 1 TOTP is the only way past the sign-in lock, so a covered
-#: account keeps it; an administrator's factor reset remains the recovery.
+#: The detail ``disable_mfa`` refuses with while ``[security].require_mfa`` covers the account and
+#: no passkey recorded as discoverable remains (ADR 0197 Amendment A, AC-A3a): TOTP is then its only
+#: way past the sign-in lock, so a covered account keeps it; an administrator's factor reset remains
+#: the recovery.
 TOTP_REMOVAL_REFUSED = (
     "your authenticator app is the last second factor that gets you past a sign-in lock, and MFA "
     "is required for your account, so it cannot be removed -- an administrator can reset it"
 )
 
 
+#: The detail ``delete_webauthn_credential`` refuses with while ``[security].require_mfa`` covers
+#: the account and the passkey is its last way past the sign-in lock (ADR 0197 Amendment A, AC-A3a,
+#: wave 2). An administrator's factor reset remains the recovery.
+PASSKEY_REMOVAL_REFUSED = (
+    "this passkey is the last second factor that gets you past a sign-in lock, and MFA is required "
+    "for your account, so it cannot be removed -- enrol an authenticator app or another passkey "
+    "first, or an administrator can reset it"
+)
+
+#: The detail ``finish_webauthn_registration`` refuses with when a covered account with no way past
+#: the sign-in lock registers a passkey its client reports is not discoverable (ADR 0197 Amendment
+#: A, wave 2): such a passkey cannot answer the usernameless sign-in, so it cannot be a first factor.
+PASSKEY_NOT_DISCOVERABLE = (
+    "this authenticator did not store a passkey it can find without your username, so it cannot "
+    "get you past a sign-in lock -- use an authenticator that stores passkeys, or enrol an "
+    "authenticator app first"
+)
+
+
 class FactorEnrolmentRequired(ValueError):
     """The account ``[security].require_mfa`` covers holds no factor with a way past the sign-in lock,
-    so this step must wait until it enrols one (ADR 0197 Amendment A, N-B2 part 4). In wave 1 only
-    TOTP is such a factor. A ``ValueError`` so every route that already renders a flow refusal renders
+    so this step must wait until it enrols one (ADR 0197 Amendment A, N-B2 part 4). Such a factor is
+    TOTP or, from wave 2, a passkey recorded as discoverable. A ``ValueError`` so every route that
+    already renders a flow refusal renders
     this one too; the password routes map it to 403 with :data:`ENROL_AUTHENTICATOR_FIRST`."""
 
     def __init__(self) -> None:
@@ -2154,13 +2175,19 @@ class LockableAccountCensus:
     """What :meth:`AuthService.lockable_account_census` found (ADR 0197 Amendment A, N-B2 part 6).
 
     ``no_way_past`` names every local account ``[security].require_mfa`` covers that holds a chosen
-    credential (``password_generated`` unset) and no factor with a way past the sign-in lock -- TOTP,
-    in wave 1. ``undecryptable_totp`` names every account whose ENABLED TOTP secret the engine cannot
-    decrypt, which turns the owner's combined sign-in into "right password, wrong code". Both are
-    usernames only, sorted; neither carries a secret."""
+    credential (``password_generated`` unset) and no factor with a way past the sign-in lock: no TOTP,
+    and no passkey recorded as discoverable (wave 2). ``undecryptable_totp`` names every account
+    whose ENABLED TOTP secret the engine cannot decrypt, which turns the owner's combined sign-in into
+    "right password, wrong code". All are usernames only, sorted; none carries a secret.
+
+    ``passkey_only`` is informational and not a finding: the covered accounts whose only way past is
+    a passkey recorded as discoverable. The record is what the client reported, or the requirement
+    the registration sent when it reported nothing, so on a client that does not conform it can
+    overstate, and ADR 0197 Amendment A (N-G) has the census name these accounts for that reason."""
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
+    passkey_only: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
@@ -2300,6 +2327,8 @@ async def lockable_account_census(
     site-wide veto."""
     no_way_past: list[str] = []
     undecryptable: list[str] = []
+    passkey_only: list[str] = []
+    sealed = store.row_sealer() is not None
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
@@ -2321,10 +2350,21 @@ async def lockable_account_census(
             if settings.require_mfa_scope == "every_local_account"
             else _roles_from_ids(await store.get_user_role_ids(user.id))
         )
-        if _requirement_covers(settings, user, roles):
+        if not _requirement_covers(settings, user, roles):
+            continue
+        # Wave 2: a passkey recorded as discoverable is a way past, read from the set the account's
+        # seal covers. A set that fails its digest counts for nothing, so the account is named.
+        creds = await store.list_webauthn_credentials(user.id)
+        digest = user.row.cred_digest if user.row is not None else ""
+        trusted = not sealed or passkey_digest(creds) == digest
+        if trusted and any(c.discoverable for c in creds):
+            passkey_only.append(user.username)
+        else:
             no_way_past.append(user.username)
     return LockableAccountCensus(
-        no_way_past=tuple(sorted(no_way_past)), undecryptable_totp=tuple(sorted(undecryptable))
+        no_way_past=tuple(sorted(no_way_past)),
+        undecryptable_totp=tuple(sorted(undecryptable)),
+        passkey_only=tuple(sorted(passkey_only)),
     )
 
 
@@ -11693,23 +11733,24 @@ class AuthService:
         everything right passes through "a password they chose, no factor, no session", and anyone
         who knows the username can lock them out at that moment. The refusal is HERE and not only in
         the route gate, because the web console's password form calls the JSON handler in-process,
-        past its ``Depends`` gate. And the write carries the condition itself (``require_totp``), so
-        an ``admin_reset_mfa`` that clears TOTP between this read and the write makes the write match
-        no row, and the change is refused rather than landing on an account with no way past.
+        past its ``Depends`` gate. And the write carries the condition itself (``require_way_past``),
+        so an ``admin_reset_mfa`` that clears TOTP, or a removal of the last discoverable passkey,
+        between this read and the write makes the write match no row, and the change is refused
+        rather than landing on an account with no way past.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if covered and user is not None and not self._has_way_past(user):
+        if covered and user is not None and not await self._has_way_past(user):
             raise FactorEnrolmentRequired()
         written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
-            require_totp=covered,
+            require_way_past=covered,
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
@@ -11735,15 +11776,22 @@ class AuthService:
         must reach those too."""
         return _requirement_covers(self._settings, user, roles)
 
-    @staticmethod
-    def _has_way_past(user: UserRecord) -> bool:
-        """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A).
+    async def _has_way_past(self, user: VerifiedUser) -> bool:
+        """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A):
+        TOTP, which has option E's combined sign-in, or (wave 2) a passkey recorded as
+        discoverable, which has the usernameless passkey sign-in (option N-G).
 
-        WAVE 1: TOTP ONLY, because only TOTP has a combined sign-in (option E). A passkey counts as a
-        second factor everywhere else, but the engine cannot use it to get past the lock, and a
-        passkey registered without a discoverable-credential request may never get a way past at all
-        (the amendment's fact 11). Wave 2 adds a passkey recorded as discoverable."""
-        return user.totp_enabled
+        A passkey registered before wave 2, or one whose client reported it was not made
+        discoverable, cannot be found by the usernameless ceremony, so it is a second factor
+        everywhere else but no way past the lock (the amendment's fact 11)."""
+        return user.totp_enabled or await self._holds_discoverable_passkey(user)
+
+    async def _holds_discoverable_passkey(self, user: VerifiedUser) -> bool:
+        """Whether ``user`` holds a passkey recorded as discoverable, asked of the set its seal
+        covers (BACKLOG #2592): a set that fails its digest counts for nothing, so a passkey row
+        written or flipped outside the store cannot open a gate (ADR 0197 Amendment A, wave 2)."""
+        held = await self._verified_passkeys(user)
+        return any(c.discoverable for c in held or ())
 
     async def must_enrol_before_rotating(self, identity: Identity) -> bool:
         """Whether a password change by ``identity`` would be refused with
@@ -11754,7 +11802,7 @@ class AuthService:
         return (
             user is not None
             and self._covered_by_requirement(user, identity.roles)
-            and not self._has_way_past(user)
+            and not await self._has_way_past(user)
         )
 
     async def lockable_account_census(self) -> LockableAccountCensus:
@@ -11831,14 +11879,25 @@ class AuthService:
         except Exception:  # noqa: BLE001 -- a start notice must never cost the census or the start
             _log.exception("the local-Administrator notice could not run; startup continues")
         census = await self.lockable_account_census()
+        if census.passkey_only:
+            # Informational, not a finding (ADR 0197 Amendment A, N-G): the record of a discoverable
+            # passkey is what the client reported, so a client that does not conform can overstate.
+            _log.info(
+                "ADR 0197: %d local account(s) rely on a passkey recorded as discoverable as their "
+                "only way past a sign-in lock: %s. If a holder's passkey cannot sign in without the "
+                "username, ask them to enrol an authenticator app.",
+                len(census.passkey_only),
+                ", ".join(census.passkey_only),
+            )
         if census.clean:
             return census
         if census.no_way_past:
             _log.warning(
                 "ADR 0197: %d local account(s) the MFA requirement covers hold a chosen password and "
-                "no authenticator app, so anyone who knows the username can lock them out with no "
-                "way past: %s. Ask each holder to enrol an authenticator app, or reset the account's "
-                "factors (POST /users/{id}/reset-mfa) to issue a generated credential.",
+                "no authenticator app or discoverable passkey, so anyone who knows the username can "
+                "lock them out with no way past: %s. Ask each holder to enrol an authenticator app "
+                "or a passkey, or reset the account's factors (POST /users/{id}/reset-mfa) to issue "
+                "a generated credential.",
                 len(census.no_way_past),
                 ", ".join(census.no_way_past),
             )
@@ -12998,23 +13057,26 @@ class AuthService:
         the user is notified out-of-band (ASVS 6.3.7).
 
         Raises :class:`ValueError` (:data:`TOTP_REMOVAL_REFUSED`) whenever ``[security].require_mfa``
-        covers the caller as a local account and TOTP is on, passkeys or not: in wave 1 TOTP is the
-        only way past the sign-in lock (ADR 0197 Amendment A, AC-A3a). Otherwise it raises when TOTP
-        is the caller's LAST second factor and MFA is still required, the refusal
+        covers the caller as a local account, TOTP is on, and no passkey recorded as discoverable
+        remains: TOTP is then the account's only way past the sign-in lock (ADR 0197 Amendment A,
+        AC-A3a; from wave 2 a discoverable passkey is one too). Otherwise it raises when TOTP is the
+        caller's LAST second factor and MFA is still required, the refusal
         :meth:`delete_webauthn_credential` also makes (ADR 0068 decision 5). BACKLOG #1022: these
         were two self-service routes to zero factors behind one step-up gate, and only one of them
-        asked. The two no longer refuse on the same condition: passkey removal adds no wave-1 rule.
+        asked. Passkey removal asks the twin of the way-past question (:data:`PASSKEY_REMOVAL_REFUSED`).
 
         This is NOT the admin escape hatch — that is :meth:`admin_reset_mfa`, which clears TOTP and
         every passkey and is deliberately unguarded. Nothing here narrows it.
         """
         user = await self._load_user(identity.user_id)
-        # ADR 0197 Amendment A, AC-A3a: removing TOTP removes the account's way past the sign-in lock
-        # (wave 1: nothing else is one), so a covered account may not remove it, passkeys or not.
+        # ADR 0197 Amendment A, AC-A3a: removing TOTP removes a way past the sign-in lock, so a
+        # covered account may remove it only while a passkey recorded as discoverable remains
+        # (wave 2). A passkey that is not discoverable is no way past, so it does not count.
         if (
             user is not None
             and user.totp_enabled
             and self._covered_by_requirement(user, identity.roles)
+            and not await self._holds_discoverable_passkey(user)
         ):
             raise ValueError(TOTP_REMOVAL_REFUSED)
         # Dropping to zero factors while MFA is required is not a lockout — it lands the user in the
@@ -13211,9 +13273,9 @@ class AuthService:
         if user is None:
             raise ValueError("no such user")
         # ADR 0197 Amendment A, AC-A3: a covered account's FIRST factor must be one with a way past
-        # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
-        if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
-            raise FactorEnrolmentRequired()
+        # the sign-in lock. From wave 2 a passkey registered here is one, because these options
+        # REQUIRE a discoverable credential, so a registration is not refused here. The finish leg
+        # refuses the one case left: a client that reports it made no discoverable credential.
         existing = await self._verified_passkeys(user)
         if existing is None:
             raise ValueError("no such user")
@@ -13362,6 +13424,19 @@ class AuthService:
                 client=client,
             )
             return Elevation()
+        # ADR 0197 Amendment A, wave 2: what the client reported it made, or the requirement the
+        # options sent (``residentKey`` required) when it reported nothing. Under that requirement a
+        # conforming browser makes a discoverable credential or fails the ceremony.
+        discoverable = True if result.resident_key is None else result.resident_key
+        # AC-A3: a covered account with no way past may take only a factor that is one as its first.
+        # A passkey the client says is not discoverable is not, so it is refused before it is
+        # stored. Asked after the verify, since only the response says what was made.
+        if (
+            not discoverable
+            and self._covered_by_requirement(user, identity.roles)
+            and not await self._has_way_past(user)
+        ):
+            raise ValueError(PASSKEY_NOT_DISCOVERABLE)
         credential_id_hash = hash_bytes(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
@@ -13379,6 +13454,7 @@ class AuthService:
             label=label,
             aaguid=result.aaguid,
             created_at=now,
+            discoverable=discoverable,
         )
         try:
             await self._store.add_webauthn_credential(cred)
@@ -13732,11 +13808,19 @@ class AuthService:
                 target = cred  # recorded, NOT returned -- the walk runs to the end
         if target is None:
             return False
-        # ADR 0197 Amendment A, AC-A3a asks whether a removal would take the account's last way
-        # past the sign-in lock. In wave 1 a passkey is never one (``_has_way_past``), so removing
-        # one cannot, and this path adds no refusal: a holder must stay able to revoke a lost or
-        # stolen passkey. From wave 2 a discoverable passkey is a way past, and the check belongs
-        # here.
+        # ADR 0197 Amendment A, AC-A3a: refuse a removal that would take the account's last way past
+        # the sign-in lock while the requirement covers it. From wave 2 a discoverable passkey is
+        # one, so removing it is refused unless TOTP or another discoverable passkey remains. A
+        # passkey that is not discoverable is no way past, so its removal is never refused on this
+        # ground. ``admin_reset_mfa`` stays the recovery for a lost or stolen one, as ADR 0068 says.
+        others_discoverable = [c for c in creds if c is not target and c.discoverable]
+        if (
+            target.discoverable
+            and not user.totp_enabled
+            and not others_discoverable
+            and self._covered_by_requirement(user, identity.roles)
+        ):
+            raise ValueError(PASSKEY_REMOVAL_REFUSED)
         last_second_factor = len(creds) == 1 and not user.totp_enabled
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False

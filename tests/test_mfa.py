@@ -3017,7 +3017,8 @@ async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_hold
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC-A3, the whole first sign-in. At every step the account holds a way past, and each step
-    that would break that is refused: the rotation before TOTP, and a passkey as the first factor."""
+    that would break that is refused: the rotation before a factor with a way past. From wave 2 a
+    passkey registration may start, because it requires a discoverable credential."""
     from messagefoundry.auth.service import FactorEnrolmentRequired
 
     store = await _store()
@@ -3039,11 +3040,14 @@ async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_hold
         assert row is not None and row.password_generated and _way_past(row)
         assert await service.must_enrol_before_rotating(identity)
 
-        # A passkey cannot be the first factor: it has no way past the lock in wave 1.
-        with pytest.raises(FactorEnrolmentRequired):
+        # Wave 2: a passkey may be the first factor, because the registration REQUIRES a
+        # discoverable credential, which the usernameless sign-in can find.
+        options = json.loads(
             await service.begin_webauthn_registration(
                 identity, token=token, rp_id="localhost", rp_name="MessageFoundry"
             )
+        )
+        assert options["authenticatorSelection"]["residentKey"] == "required"
 
         # Enrolment is allowed, and it is TOTP.
         enroll = await service.begin_mfa_enrollment(identity)
@@ -3406,7 +3410,7 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
                 password_hash=await asyncio.to_thread(hash_password_for_test, "a-chosen-one-99x"),
                 password_generated=False,
                 must_change_password=False,
-                require_totp=True,
+                require_way_past=True,
             ), "the holder's conditional write must match here, TOTP is still on"
             await real_disable(user_id, **k)
 

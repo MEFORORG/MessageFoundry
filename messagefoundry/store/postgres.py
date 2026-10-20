@@ -972,7 +972,8 @@ _SCHEMA: list[str] = [
         label              VARCHAR(100) NOT NULL,
         aaguid             VARCHAR(64),
         created_at         DOUBLE PRECISION NOT NULL,
-        last_used_at       DOUBLE PRECISION
+        last_used_at       DOUBLE PRECISION,
+        discoverable       BOOLEAN NOT NULL DEFAULT FALSE
     )""",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
@@ -1145,6 +1146,12 @@ _SCHEMA.append(_gated_add_column("pending_approvals", "seal", "TEXT NOT NULL DEF
 # NULL on an existing row means the origin was not recorded.
 _SCHEMA.append(_gated_add_column("messages", "origin", "TEXT"))
 _SCHEMA.append(_gated_add_column("messages", "origin_actor", "TEXT"))
+# ADR 0197 Amendment A, wave 2: whether a passkey was registered as a discoverable credential, for a
+# webauthn_credentials table created before the column. FALSE on an existing row is the closed
+# direction: such a passkey is no way past the sign-in lock. In _SCHEMA, so no _MIGRATION_REV bump.
+_SCHEMA.append(
+    _gated_add_column("webauthn_credentials", "discoverable", "BOOLEAN NOT NULL DEFAULT FALSE")
+)
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -1262,8 +1269,8 @@ _PG_USER_ROLE_INSERT: Final = (
 _PG_WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-    " aaguid, created_at, last_used_at)"
-    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+    " aaguid, created_at, last_used_at, discoverable)"
+    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
 )
 # The `$n` twins of store.py's approval statements (BACKLOG #2592); store.py states the contract.
 # The writes are used only by `_write_approval`.
@@ -8981,18 +8988,23 @@ class PostgresStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
-        )
-        return await self._write_user_txn(user_id, change) is not None
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The passkeys the condition reads are read in the write's own transaction; a removal
+            # that commits before the write moves the record's seal, so the write's compare loses.
+            change = password_change(
+                password_hash=password_hash,
+                password_generated=password_generated,
+                must_change_password=must_change_password,
+                require_way_past=require_way_past,
+                now=now,
+                passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
+                sealed=self._row_sealer is not None,
+            )
+            return await self._write_user(conn, user_id, change) is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None

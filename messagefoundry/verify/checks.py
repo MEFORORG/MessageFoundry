@@ -447,19 +447,28 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         return CheckResult(rid, title, Status.ERROR, str(exc))
     except Exception as exc:  # any driver or decode failure: the check broke, not a finding
         return CheckResult(rid, title, Status.ERROR, f"could not read the accounts: {exc}")
+    # Wave 2 (ADR 0197 Amendment A, N-G): named, not failed. The discoverable record is what the
+    # client reported, so on a client that does not conform it can overstate.
+    passkey_note = (
+        ". Relying on a passkey recorded as discoverable as their only way past: "
+        + ", ".join(census.passkey_only)
+        if census.passkey_only
+        else ""
+    )
     if census.clean:
         return CheckResult(
             rid,
             title,
             Status.PASS,
-            "every local account the MFA requirement covers holds a generated credential or an "
-            "authenticator app, and every enabled TOTP secret decrypts",
+            "every local account the MFA requirement covers holds a generated credential, an "
+            "authenticator app or a discoverable passkey, and every enabled TOTP secret decrypts"
+            + passkey_note,
         )
     parts: list[str] = []
     if census.no_way_past:
         parts.append(
-            "chosen password and no authenticator app (anyone who knows the username can lock them "
-            "out): " + ", ".join(census.no_way_past)
+            "chosen password and no authenticator app or discoverable passkey (anyone who knows "
+            "the username can lock them out): " + ", ".join(census.no_way_past)
         )
     if census.undecryptable_totp:
         parts.append(
@@ -470,8 +479,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         title,
         Status.FAIL,
         "; ".join(parts)
-        + ". Ask each holder to enrol an authenticator app, or reset the account's factors "
-        "(POST /users/{id}/reset-mfa), which issues a generated credential.",
+        + ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
+        "factors (POST /users/{id}/reset-mfa), which issues a generated credential" + passkey_note,
     )
 
 

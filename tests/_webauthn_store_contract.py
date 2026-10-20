@@ -44,6 +44,7 @@ def _cred(
     rp_id: str = "t",
     transports: list[str] | None = None,
     created_at: float = 1000.0,
+    discoverable: bool = False,
 ) -> WebAuthnCredential:
     return WebAuthnCredential(
         credential_id_hash=id_hash,
@@ -59,6 +60,7 @@ def _cred(
         aaguid="aaguid-0000",
         created_at=created_at,
         last_used_at=None,
+        discoverable=discoverable,
     )
 
 
@@ -100,7 +102,15 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     c1 = _cred(
         "wa-u1", "yubikey", id_hash="h1", transports=["usb", "nfc"], sign_count=5, created_at=10.0
     )
-    c2 = _cred("wa-u1", "phone", id_hash="h2", transports=None, sign_count=0, created_at=20.0)
+    c2 = _cred(
+        "wa-u1",
+        "phone",
+        id_hash="h2",
+        transports=None,
+        sign_count=0,
+        created_at=20.0,
+        discoverable=True,
+    )
     await store.add_webauthn_credential(c1)
     await store.add_webauthn_credential(c2)
     assert await store.has_webauthn_credentials("wa-u1") is True
@@ -113,6 +123,9 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert got.transports == ["usb", "nfc"] and got.backed_up is True
     assert got.sign_count == 5 and got.aaguid == "aaguid-0000" and got.last_used_at is None
     assert (await store.get_webauthn_credential("h2")).transports is None
+    # ADR 0197 Amendment A, wave 2: the discoverable flag round-trips as a bool both ways.
+    assert got.discoverable is False
+    assert (await store.get_webauthn_credential("h2")).discoverable is True
     assert await store.get_webauthn_credential("missing") is None
 
     # Max-length credential id (1023 raw bytes as base64url) rides the unbounded body column.
