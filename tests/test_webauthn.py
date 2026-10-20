@@ -189,6 +189,21 @@ async def test_a_passkey_stored_under_the_untagged_hash_still_signs_in() -> None
         assert await store.get_webauthn_credential(unknown) is not None  # left as it is
         ok, token = await _assert_once(service, token, auth, sign_count=3)
         assert ok is False
+
+        # Today's tag over a digest the raw id does not give is refused, not rewritten.
+        wrong = "wc1:" + "0" * 64
+        assert await store.rehash_webauthn_credential(identity.user_id, unknown, wrong)
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+        assert await store.get_webauthn_credential(wrong) is not None
+
+        # A move whose new hash is already held is refused, and start-up goes on.
+        assert await store.rehash_webauthn_credential(identity.user_id, wrong, bare)
+        (held,) = await store.list_webauthn_credentials(identity.user_id)
+        await store.add_webauthn_credential(
+            dataclasses.replace(held, credential_id_hash=tagged, label="again")
+        )
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+        assert await store.get_webauthn_credential(bare) is not None
     finally:
         await store.close()
 

@@ -368,7 +368,10 @@ class _StoreProcessedLedger:
             older_than=time.time() - PROCESSED_FILE_LEDGER_TTL_SECONDS,
             keep_last=PROCESSED_FILE_LEDGER_KEEP_MAX,
         )
-        if self._untagged:  # False stays False: nothing writes an untagged row
+        # False stays False: this adapter refuses an untagged write (check_file_key), and it is
+        # the ledger's only writer. The store itself accepts any key, so a writer that bypassed
+        # this seam would make the cached answer wrong.
+        if self._untagged:
             self._untagged = None
 
 

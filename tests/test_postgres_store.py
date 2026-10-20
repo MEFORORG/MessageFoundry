@@ -93,6 +93,7 @@ _TABLES = (
     "session_lineage",  # vault BACKLOG #3028 (no FK): a link left behind would lead a later test's
     #                     supersession into a session it never retired
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+    "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",

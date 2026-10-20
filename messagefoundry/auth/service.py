@@ -3419,10 +3419,11 @@ class AuthService:
         Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
         in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
         value whose tag this release does not compile in is REFUSED: left as it is, never matched,
-        and counted, as is a ``credential_id`` that is not base64url, or a move the store refuses
-        because the account's seal failed between the read and the write. An account or passkey set
-        already failing its seal is left to the checked loaders, which report it. Returns
-        ``(rehashed, refused)``; neither ever stops start-up."""
+        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
+        id does not give, and a move the store refuses: the account's seal failed between the read
+        and the write, or the new hash is already held. An account or passkey set already failing
+        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
+        a refusal never stops start-up."""
         rehashed = refused = 0
         if not await self._store.any_webauthn_credentials():
             return 0, 0
@@ -3431,21 +3432,29 @@ class AuthService:
         for user in await self._load_users():
             for cred in await self._verified_passkeys(user) or ():
                 try:
-                    if (
-                        credential_id_hash_scheme(cred.credential_id_hash)
-                        == CREDENTIAL_ID_HASH_SCHEME
-                    ):
-                        continue
+                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
                     # binascii.Error, a ValueError, for a credential_id that is not base64url.
                     new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
                 except ValueError:  # CredentialHashSchemeError is one too
+                    refused += 1
+                    continue
+                if cred.credential_id_hash == new_hash:
+                    continue
+                if scheme == CREDENTIAL_ID_HASH_SCHEME:
+                    # Today's tag over a digest its own raw id does not give: not a row this
+                    # release wrote, so it is not rewritten into one that signs in.
                     refused += 1
                     continue
                 try:
                     moved = await self._store.rehash_webauthn_credential(
                         user.id, cred.credential_id_hash, new_hash
                     )
-                except RowSealError:
+                except Exception as exc:
+                    # The seal failed between the read and the write, or the new hash is already
+                    # held (the same credential id enrolled again under today's scheme). Either
+                    # way the row stays as it is, and start-up goes on.
+                    if not isinstance(exc, RowSealError) and not _is_integrity_refusal(exc):
+                        raise
                     refused += 1
                     continue
                 rehashed += int(moved)
@@ -3457,8 +3466,9 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were not moved to the current credential-id hash scheme: an unknown"
-                " scheme, or an account that failed its integrity seal; they cannot sign in",
+                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
+                " scheme, a hash its own credential id does not give, or a move the store refused);"
+                " they cannot sign in",
                 refused,
             )
         return rehashed, refused
