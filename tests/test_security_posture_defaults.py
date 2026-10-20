@@ -1700,8 +1700,10 @@ def test_an_ipv4_entry_s_mapped_twin_completes_the_ipv6_family() -> None:
     entries = [*_MAPPED_REST, "0.0.0.0/0"]
     # The premise, asked of uvicorn itself: what it is handed trusts a mapped and a plain IPv6 peer.
     # Control: without the IPv4 entry the mapped peer is not trusted.
-    assert "::ffff:203.0.113.9" in _TrustedHosts(uvicorn_trusted_hosts(entries))
-    assert "2001:db8::9" in _TrustedHosts(uvicorn_trusted_hosts(entries))
+    trusted = _TrustedHosts(uvicorn_trusted_hosts(entries))
+    # One mapped peer in each half of the mapped block, so a twin covering only half is caught.
+    assert "::ffff:10.0.0.1" in trusted and "::ffff:203.0.113.9" in trusted
+    assert "2001:db8::9" in trusted  # the rest's own peers, for "every IPv6 peer"
     assert "::ffff:203.0.113.9" not in _TrustedHosts(uvicorn_trusted_hosts(_MAPPED_REST))
     assert _classify_proxy_entries(entries) == (entries, [])
     risk = _proxy_risk(*entries)
@@ -1744,7 +1746,8 @@ def test_ranges_that_leave_a_gap_get_the_range_wording_not_the_whole_family_one(
     risk = _proxy_risk(*quarters)
     assert _RANGE in risk and _WHOLE_FAMILY not in risk
     assert all(q in risk for q in quarters)
-    # Two families never union into one.
+    # Half of each family is neither family whole. An IPv4 entry does count toward IPv6 as its
+    # mapped twin (#3393), but this one's twin covers only half the mapped block.
     halves = (_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])
     risk = _proxy_risk(*halves)
     assert _RANGE in risk and _WHOLE_FAMILY not in risk

@@ -1121,7 +1121,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > covers a whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The entry names
 > every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
 > wording too. A range in the other family gets the range wording, unless that family is whole
-> too, counting each entry in both of its spellings (below).
+> too, counting the IPv4 and IPv4-mapped entries described below.
 >
 > The check reads each entry with the same parser as the load, and skips an entry the load
 > refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the

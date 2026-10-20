@@ -1,5 +1,5 @@
-- **The `trusted_proxies` loosening names each range once, in list order, with its other spellings,
-  and an IPv4 entry's mapped twin can now make IPv6 ranges read as trusting every peer.**
+- **The `trusted_proxies` loosening names each range once, in list order within each wording, with
+  its other spellings, and an IPv4 entry's mapped twin can now make IPv6 ranges read as trusting every peer.**
   The warning listed every IPv4 range before every IPv6 one, whatever the input order, and removed a
   repeat only when it was spelled the same way. So `10.0.0.0/08` beside `10.0.0.0/8`, or
   `::ffff:10.0.0.0/104` beside it, was named twice. Each network is now named once, under the first

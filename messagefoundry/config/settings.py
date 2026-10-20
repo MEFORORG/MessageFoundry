@@ -8221,7 +8221,9 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
                 v6.append(spelling)
         every_ipv4 = _trusts_every_ipv4_host(net)
         if every_ipv4:
-            v4.append(ipaddress.IPv4Network("0.0.0.0/0"))  # ``::/80`` and the like; see above
+            # The ``::/80`` rule the docstring names. For ``0.0.0.0/0`` and ``::ffff:0:0/96`` the
+            # spellings above already added this, and a repeat changes no collapse.
+            v4.append(ipaddress.IPv4Network("0.0.0.0/0"))
         meaning = _ipv4_meaning(net)
         if net.num_addresses > 1:
             # An entry that counts toward IPv4 is judged by IPv4's collapse alone. That loses
@@ -9515,7 +9517,8 @@ def security_loosenings(
     # own parser, _parse_trusted_proxy, which parses as uvicorn's _TrustedHosts does (__main__ hands
     # it the list plus each IPv4 entry's other spelling, uvicorn_trusted_hosts) and refuses at least
     # a host-bits entry such as "10.1.2.3/0" (BACKLOG #2488) and a zoned one (#3042), so none
-    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042). Not gated on
+    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042), and an IPv4 entry
+    # toward IPv6 as its mapped twin, since uvicorn is handed that twin too (#3393). Not gated on
     # sign-in: a forged source address poisons the audit trail either way.
     # A range short of a whole family is named too, with its own wording: any host inside it may
     # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
