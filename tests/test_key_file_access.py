@@ -135,7 +135,7 @@ def test_a_certificate_holding_its_key_is_judged_and_pem_text_is_never_a_path() 
     assert found == [("inbound connection 'IB_COMBINED' setting 'tls_cert_file'", "combined.pem")]
 
 
-def test_a_path_typed_key_is_judged_and_a_certificate_without_tls_is_not() -> None:
+def test_a_path_typed_key_is_judged_and_files_without_a_tls_identity_are_not() -> None:
     registry = _registry(
         inbound={
             "IB_PATH": ConnectionSpec(
@@ -143,16 +143,27 @@ def test_a_path_typed_key_is_judged_and_a_certificate_without_tls_is_not() -> No
                 {"tls": True, "tls_cert_file": "p.crt", "tls_key_file": Path("p.key")},
             ),
             "IB_PLAIN": ConnectionSpec(
-                ConnectorType.MLLP, {"tls": False, "tls_cert_file": "x.crt"}
+                ConnectorType.MLLP,
+                {"tls": False, "tls_cert_file": "x.crt", "tls_key_file": "x.key"},
+            ),
+            "IB_BLANK": ConnectionSpec(
+                ConnectorType.MLLP,
+                {"tls": True, "tls_cert_file": "b.pem", "tls_key_file": env("blank_key")},
             ),
         },
         outbound={
             "OB_FTPS": ConnectionSpec(
-                ConnectorType.REMOTEFILE, {"protocol": "ftps", "tls_cert_file": "f.pem"}
+                ConnectorType.REMOTEFILE, {"protocol": "FTPS", "tls_cert_file": "f.pem"}
+            ),
+            "OB_SFTP": ConnectionSpec(
+                ConnectorType.REMOTEFILE, {"protocol": "sftp", "tls_key_file": "s.key"}
             ),
         },
     )
-    assert connection_key_files(registry, {}) == [
+    # A blank key is read from the certificate, so the certificate is judged. Without a TLS
+    # identity the loader opens neither file. The protocol is read case-blind, as the transport does.
+    assert connection_key_files(registry, {"blank_key": ""}) == [
+        ("inbound connection 'IB_BLANK' setting 'tls_cert_file'", "b.pem"),
         ("inbound connection 'IB_PATH' setting 'tls_key_file'", "p.key"),
         ("outbound connection 'OB_FTPS' setting 'tls_cert_file'", "f.pem"),
     ]

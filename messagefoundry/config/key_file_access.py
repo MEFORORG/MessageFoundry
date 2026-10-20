@@ -49,9 +49,10 @@ __all__ = [
     "make_connection_key_file_guard",
 ]
 
-#: Each (certificate setting, key setting, key may be in the certificate) a connector loads as its own
-#: TLS identity. Where the third is true and the key setting is unset, the loader reads the key from
-#: the certificate. A SOAP client certificate needs its key setting, so it never holds the key.
+#: Each (certificate setting, key setting, TLS-gated) a connector loads as its own TLS identity. A
+#: TLS-gated pair is read only where the connection loads a TLS identity, and there an unset key is
+#: read from the certificate. A SOAP client certificate needs its key setting, so it never holds the
+#: key, and SOAP loads the pair whenever both are set.
 _IDENTITY_SETTINGS: Final[tuple[tuple[str, str, bool], ...]] = (
     ("tls_cert_file", "tls_key_file", True),
     ("client_cert_file", "client_key_file", False),
@@ -68,7 +69,9 @@ def _absent(path: str) -> bool:
     """Whether nothing is at ``path``. Only a missing name counts: a file whose status cannot be
     read is not absent, and :func:`broad_access_problem` reports it as a problem."""
     try:
-        os.lstat(path)
+        # The same call broad_access_problem makes: lstat on Windows, stat on POSIX, so a dangling
+        # link is missing on POSIX, as the loader that follows it finds it.
+        os.lstat(path) if sys.platform == "win32" else os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
         return True
     except OSError:
@@ -104,18 +107,24 @@ def connection_key_files(
     """``(label, path)`` for each private-key file a connection in ``registry`` names.
 
     ``env()`` references are resolved against ``env_values``. Every inbound and outbound connection
-    is read, deployed or not, so a key is judged before a deploy can load it. A key setting that
-    does not resolve is skipped, and so is its certificate: the connection's own build refuses it
-    and names the missing value. So is a value that is not a path, or that holds PEM text. The
-    certificate stands in for an unset key only where the connection loads a TLS identity. The
+    is read, deployed or not, so a key is judged before a deploy can load it. A setting that does
+    not resolve is skipped with its pair: the connection's own build refuses it and names the
+    missing value. So is a value that is not a path, or that holds PEM text. A ``tls_key_file`` or
+    ``tls_cert_file`` is judged only where the connection loads a TLS identity, and the certificate
+    stands in for a key that resolves unset or blank, as the loader then reads the key from it. The
     label names the connection and the setting, never the path."""
+    from messagefoundry.config.models import remote_file_protocol
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
+    unresolved = object()
+
     def resolved(settings: Mapping[str, Any], name: str) -> object:
+        if name not in settings:
+            return None
         try:
             return resolve_env_settings({name: settings[name]}, env_values)[name]
         except WiringError:
-            return None
+            return unresolved
 
     def as_path(value: object) -> str | None:
         # Every loader str()s the value, so a pathlib.Path names a file as text does.
@@ -125,12 +134,14 @@ def connection_key_files(
             return None
         return value
 
-    def uses_tls(settings: Mapping[str, Any]) -> bool:
-        # The certificate holds the key only where a TLS identity is loaded: ``tls`` on MLLP, the
-        # HTTP listener and DICOM, and the ``ftps`` protocol of a remote-file connection.
-        return bool(settings.get("tls") and resolved(settings, "tls")) or (
-            bool(settings.get("protocol")) and resolved(settings, "protocol") == "ftps"
-        )
+    def loads_tls_identity(settings: Mapping[str, Any]) -> bool:
+        # ``tls`` on MLLP, the HTTP listener and DICOM; the ``ftps`` protocol of a remote-file
+        # connection, read through the transport's own normalisation.
+        tls = resolved(settings, "tls")
+        if tls is not unresolved and tls:
+            return True
+        protocol = resolved(settings, "protocol")
+        return isinstance(protocol, str) and remote_file_protocol({"protocol": protocol}) == "ftps"
 
     found: list[tuple[str, str]] = []
     groups: tuple[tuple[str, Iterable[InboundConnection | OutboundConnection]], ...] = (
@@ -140,15 +151,17 @@ def connection_key_files(
     for direction, connections in groups:
         for conn in sorted(connections, key=lambda c: c.name):
             settings = conn.spec.settings
-            for cert_setting, key_setting, key_may_be_in_cert in _IDENTITY_SETTINGS:
-                if settings.get(key_setting):
-                    # Set: judge it, or nothing when it does not resolve or holds PEM text. The
-                    # build names an unresolved value, and inline PEM is not a file.
-                    setting, value = key_setting, as_path(resolved(settings, key_setting))
-                elif key_may_be_in_cert and settings.get(cert_setting) and uses_tls(settings):
-                    setting, value = cert_setting, as_path(resolved(settings, cert_setting))
-                else:
+            for cert_setting, key_setting, tls_identity in _IDENTITY_SETTINGS:
+                if tls_identity and not loads_tls_identity(settings):
+                    continue  # the loader opens neither file
+                key = resolved(settings, key_setting)
+                if key is unresolved:
                     continue
+                setting, value = key_setting, as_path(key)
+                if value is None and not key and tls_identity:
+                    # The key resolves unset or blank, so the loader reads it from the certificate.
+                    cert = resolved(settings, cert_setting)
+                    setting, value = cert_setting, None if cert is unresolved else as_path(cert)
                 if value is not None:
                     found.append(
                         (f"{direction} connection {conn.name!r} setting {setting!r}", value)

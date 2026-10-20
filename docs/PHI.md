@@ -356,7 +356,8 @@ warning and goes on.
 A connection's key file is checked each time the engine loads the graph, at the start and on every
 reload, with `env()` values resolved. That is at least `tls_key_file` on MLLP, the HTTP listener,
 DICOM and FTPS, and `Soap(client_key_file=...)`. Where a TLS connection leaves `tls_key_file`
-unset, the key is in its certificate PEM, so `tls_cert_file` is checked instead.
+unset, or its `env()` value blank, the key is in its certificate PEM, so `tls_cert_file` is
+checked instead. A connection that loads no TLS identity has neither file checked.
 Under `"enforce"` a file a broad group can read would refuse the start, or the reload, which keeps
 the running graph. Under `"warn"` it is logged. `supervise` refuses such a graph before it starts
 an engine shard. A value that holds PEM text rather than a path is not checked
