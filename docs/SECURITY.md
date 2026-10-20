@@ -6663,6 +6663,15 @@ these limits hold, and a reader should assume there are others:
   a branch pushed with no pull request is scanned by none of them. On a public repository the
   content is public the instant the push completes, so this layer reports a leak and cannot prevent
   one.
+- **A pull request's description is scanned for record content, after it is public.**
+  `.github/workflows/pr-body-leak-scan.yml` runs `scan_forbidden.py --pr-body-event` when a pull
+  request is opened, edited, reopened or pushed (BACKLOG #3364). It flags a requirement identifier
+  beside its verdict, its gap, or a code path, in the phrasings it was measured against; a green run
+  means none of those was found, not that the body states no record content. It reads nothing else:
+  not titles, comments or commit messages, and not the bodies of pull requests left unedited since
+  it landed. That workflow's header names at least two limits: a run it never starts, and a run that
+  uses the pull request's own copy of the detector. It is not a
+  required context. Like the branch scan, it tells an author to edit; it cannot unpublish.
 
 **What to do with this.** If you keep the private corpus beside this checkout, run
 `scripts/coord/install-git-hooks.ps1` in every clone and worktree, and never reach for `--no-verify`
