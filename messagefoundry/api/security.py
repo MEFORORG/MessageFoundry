@@ -2001,8 +2001,8 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
 
 
 class ExportStopped(RuntimeError):
-    """A running export lost its caller's standing, so the stream aborts (BACKLOG #1154). The
-    bulk message export and the audit export raise it.
+    """A running export stopped: its caller lost standing, or its scope changed (BACKLOG #1154,
+    #3381). The bulk message export and the audit export raise it.
 
     The response has already started, so no status code can say so. The raise was meant to abort
     the transfer, so the client would see an incomplete download rather than a short file that
@@ -2010,8 +2010,7 @@ class ExportStopped(RuntimeError):
     Starlette's ``BaseHTTPMiddleware``, which each ``@app.middleware("http")`` layer is, ends the
     response with its final body message when the inner app raises, and re-raises only after
     that. So the client receives a cleanly ended 200 holding the rows streamed before the stop.
-    Raising still records the stop as the app's failure, and returning without the final body
-    message would fare no better behind those layers.
+    Returning without the final body message would fare no better behind those layers.
 
     A stop is a decision, not a crash. The raising stream writes a WARNING with the counts and the
     stop's audit row before it raises (BACKLOG #3381), so ``_unhandled_exception`` writes no ERROR

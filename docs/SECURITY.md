@@ -4488,7 +4488,8 @@ on that session, for example) ends it as a revocation would.
   narrower, revokes the session. At least two such changes do. One is a user's channel scope set,
   from the list above. The other is an edit to the AD group-to-scope map, which revokes the
   sessions of every enabled directory account. So the next row's check refuses it, and the export
-  stops with the reason `standing_changed`. The reconcile pass also revokes when the directory
+  stops with the reason `standing_changed`. A row checked before that revoke lands stops it with
+  `scope_changed` instead, as the next paragraph says. The reconcile pass also revokes when the directory
   narrows or withdraws a scope. Its audit row, `auth.ad_session_revoked`, carries the reason
   `scope_changed`, or `roles_changed` with a `scope_changed` key when the roles changed too. The
   export it ends still records `standing_changed`.
@@ -4500,8 +4501,8 @@ on that session, for example) ends it as a revocation would.
   sign-in and reconcile writes. The AD map edit writes no user's scope, so it has no such window.
   In both cases the export stops, with the reason `scope_changed`, when the caller's channel
   scope differs from the one it started with, wider or narrower (BACKLOG #3381). So no row
-  streams on a scope the export's step-up and its `messages_export` row did not cover, and a
-  grant then a withdrawal stops at the grant rather than skipping later rows one by one. A stop
+  streams from a channel the caller did not hold when it proved the export, and a grant then a
+  withdrawal stops at the grant rather than skipping later rows one by one. A stop
   records `messages_export.stopped` with the selected and streamed counts and the reason. The
   server log carries a WARNING with the counts beside that audit row, not an error with a
   traceback.
@@ -4510,15 +4511,15 @@ on that session, for example) ends it as a revocation would.
   raises to abort the transfer, but the engine's `@app.middleware("http")` layers end the
   response cleanly before that raise leaves them. So a client receives a 200 that ends normally
   and holds only the rows streamed before the stop, and it cannot tell that file from a complete
-  export. The `messages_export.stopped` row is the only record that the file is short. This was
+  export. The `messages_export.stopped` row and the server's WARNING record that it is short;
+  the file itself does not. This was
   found under BACKLOG #3381 and is not fixed there. The same holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the
-  export. A search selection that runs longer than the whole idle window does the same before the
-  first row streams, and the caller signs in again.
+  export.
 - The audit export (`GET /audit/export`, and the console's `/ui/audit/export`, which passes its
   cookie session) asks before every page of up to 1,000 rows, not every row. A page is one store
   read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the

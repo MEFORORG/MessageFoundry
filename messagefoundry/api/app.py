@@ -6815,7 +6815,8 @@ def create_app(
                 # before its revoke landed (docs/SECURITY.md names the paths). A narrowing stops rather than
                 # skipping and auditing every later out-of-scope row, which would trip the
                 # access-denied burst signal against an operator who did nothing. A widening stops
-                # rather than streaming rows the step-up never covered, which nothing would record.
+                # rather than streaming rows from a scope the caller did not hold when it proved
+                # the export, which no audit row would name.
                 if current is None or current.allowed_channels != identity.allowed_channels:
                     reason = "standing_changed" if current is None else "scope_changed"
                     # Counts only, never an id or a body.

@@ -492,8 +492,10 @@ async def test_a_session_revoked_mid_export_stops_the_stream(
 async def test_the_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The stop must leave the whole app as a raise. If a middleware swallowed it, the server would
-    finish the response cleanly and the client would get a short file that looks complete."""
+    """The stop must leave the whole app as a raise. This pins the raise, NOT what the client
+    receives: the engine's ``@app.middleware("http")`` layers end the response cleanly before the
+    raise leaves them, so the client still gets a short file that looks complete (found under
+    BACKLOG #3381, unfixed; see ``ExportStopped``)."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value])
     mid_a, mid_b = await _seed(engine)
