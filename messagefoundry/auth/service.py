@@ -2266,7 +2266,7 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
     """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with.
 
-    Three ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
+    At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
     the account and never the value. A keyless open hands the stored ciphertext through unchanged,
     which is not base32, so computing a code from it fails. Or the cell opens but its enrolment
     marker is refused (:class:`totp.RefusedEnrolment`, BACKLOG #3422), logged with its own cause
@@ -9659,7 +9659,8 @@ class AuthService:
         is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
         so this line is what names the cause."""
         secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
-        if secret is not None:
+        # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
+        if secret is not None and not secret.startswith(MARKER_PREFIX):
             try:
                 totp.parse_enrolment(secret)
             except totp.RefusedEnrolment:
@@ -11879,9 +11880,10 @@ class AuthService:
             )
         if census.undecryptable_totp:
             _log.warning(
-                "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt, so "
-                "their combined sign-in cannot pass a lock: %s. Check the store key, or reset the "
-                "account's factors (POST /users/{id}/reset-mfa).",
+                "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt or "
+                "compute with, so their combined sign-in cannot pass a lock: %s. Each is logged above "
+                "with its cause: check the store key for a cell that does not open, or reset the "
+                "account's factors (POST /users/{id}/reset-mfa) for an enrolment this release refuses.",
                 len(census.undecryptable_totp),
                 ", ".join(census.undecryptable_totp),
             )
@@ -13193,8 +13195,9 @@ class AuthService:
         )
         reenrol = False
         # The cell is opened only when this release compiles in a set other than its default, the
-        # only way an enabled enrolment can differ from it, so a status read costs no decrypt
-        # otherwise. A refused marker is the census's to name, and the code check logs it.
+        # only way an ACCEPTED enrolment can differ from it, so a status read costs no decrypt
+        # otherwise. A refused marker is not reported here: the census names it at startup and in
+        # verify, and _totp_secret logs it at every code check.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
                 secret = self._totp_secret(user)

@@ -176,7 +176,10 @@ def _marker(params: TotpParameters) -> str:
 def new_enrolment(secret: str) -> str:
     """The stored form of a new enrolment of ``secret``: the bare base32 secret marked with
     :data:`DEFAULT_PARAMETERS`, which :func:`otpauth_uri` then advertises and every code check
-    computes with. A ``secret`` already in the stored form is returned unchanged once it parses."""
+    computes with. A ``secret`` already in the stored form is returned unchanged once it parses,
+    whichever compiled-in set it names. An empty ``secret`` raises :class:`ValueError`."""
+    if not secret:
+        raise ValueError("an empty TOTP secret cannot be enrolled")
     if ":" in secret:
         parse_enrolment(secret)
         return secret
@@ -281,7 +284,8 @@ def verify_totp_step(
 
     ``secret`` is a bare base32 secret or a stored enrolment, checked with the parameters it records
     (BACKLOG #3422). A refused marker (:class:`RefusedEnrolment`) returns ``None``: no code matches
-    an enrolment this release cannot compute, so a recovery code stays the way past it.
+    an enrolment this release cannot compute. On the two-step sign-in a recovery code stays the way
+    past it; the combined sign-in takes a TOTP code only, so there it reads as a wrong code.
 
     The forward half of the skew window is *accepted* (so a near-boundary fast-clock authenticator can
     still log in) but the returned step is **clamped to the current step** (SEC-014, CWE-287): a
