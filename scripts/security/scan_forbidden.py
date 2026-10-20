@@ -3,9 +3,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Forbidden-content scanner: keep customer/PHI-adjacent strings out of the public repo.
 
-Two callers share this one module so their detection can never drift:
+At least these callers share this one module so their detection can never drift:
   * ``.pre-commit-config.yaml`` runs it over staged files before every commit.
   * ``.github/workflows/security.yml`` runs it over the whole tracked tree in CI.
+  * ``.github/workflows/pr-body-leak-scan.yml`` runs its ``--pr-body`` mode over a pull request's
+    description, the one public surface the tree scans cannot read.
 
 Why a custom scanner in addition to gitleaks: gitleaks finds *secrets* (keys/tokens). This finds
 *customer-identifying* strings -- a partner/vendor name, a real site-estate's site-code prefix, a
@@ -56,6 +58,10 @@ Usage:
                                     #   it would copy the leak into public CI logs; default is
                                     #   reasons-only: location + category, never the matched text)
   scan_forbidden.py                 # scan all git-tracked files in the current repo
+  scan_forbidden.py --pr-body FILE  # scan one pull request body (``-`` for stdin) for security-record
+                                    #   content: a requirement id beside its verdict, its gap, or a
+                                    #   code path. Reasons-only; needs no token source. Run by
+                                    #   .github/workflows/pr-body-leak-scan.yml (BACKLOG #3364).
   scan_forbidden.py --self-test     # probe each LOADED class with a string derived from itself, so a
                                     #   table that parsed but cannot match is caught. Counts and class
                                     #   names only -- never a token, so it is safe in public CI. Each
@@ -379,6 +385,232 @@ _RECORD_PAIR: tuple[re.Pattern[str], ...] = (
     re.compile(rf"(?i){_RECORD_ID}\s*[:=|\-—>\]]+\s*{_RECORD_VERDICT}\b"),
     re.compile(rf"(?i)\b{_RECORD_VERDICT}\s*[:=|\-—<\[]+\s*{_RECORD_ID}"),
 )
+
+# --------------------------------------------------------------------------------------------------
+# PULL-REQUEST BODY RECORD CONTENT (BACKLOG #3364). The same vaulted assessment as the pair above, in
+# the one public surface this scanner did not read: an engine pull request's description. Owner ruling
+# 2026-10-09 scoped it to three kinds, each a requirement identifier BOUND to something that rebuilds
+# the private grid -- a VERDICT, a GAP, or the CODE that implements it. A bare identifier with none of
+# the three beside it is NOT flagged; whether it should be is an open owner decision, not this
+# detector's call.
+#
+# WHY NOT REUSE _RECORD_PAIR ALONE. It binds only by punctuation, which is right for tracked files and
+# wrong for prose: a description says the identifier "stays" or "is held at" its verdict, with no colon
+# or pipe anywhere. Measured over the 2438 public engine PR bodies that existed on 2026-10-20, the
+# punctuation-only pair caught a small minority of the verdict sentences the rule below catches.
+#
+# WHAT KEEPS PROSE MATCHING FROM STORMING, measured over the same corpus. Three narrowings, each of
+# which removed a named class of false positive and none of which removed a true one:
+#   * the identifier shape is the requirement range, not any dotted triple: chapter 1-17, a
+#     single-digit section, and no zero component, which drops most semantic versions outright;
+#   * an identifier that directly follows a runtime, tool or package name ("Python", "OpenSSL", a word
+#     carrying a digit, "from"/"to" in a version bump) is a VERSION and is skipped -- versions next to
+#     code paths and pass/fail counts were the dominant false positive before this rule;
+#   * a verdict must sit next to the identifier (directly, after a state verb such as "stays" or "held
+#     at", or across a table cell), while a gap word or a code path need only share the sentence
+#     within _PR_WINDOW characters. Past tense ("passed", "failed") is a test count, not a verdict.
+# The measured residue is stated in the pull request that added this, not here: it is a number about a
+# corpus that keeps growing, and a copy of it in this file would go stale silently.
+#
+# REASON-ONLY, like every record detector here: the identifier beside its verdict IS the disclosure, so
+# a hit names a line and a kind and never echoes the text into a public CI log.
+_PR_REQ_ID = re.compile(
+    r"(?<![\w.])(?:V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![\w.]|\.\d)"
+)
+#: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
+#: rephrase around; it never hides a hit that carries its own requirement context.
+_PR_VERSION_LEAD = re.compile(
+    r"(?i)(?:\b(?:c?python|pypy|openssl|libressl|versions?|releases?|v|from|to|pwsh|powershell"
+    r"|node(?:js)?|npm|pip(?:-audit)?|pytest|mypy|ruff|uv|uvicorn|uvloop|fastapi|starlette|pydantic"
+    r"|httpx|anyio|lxml|cryptography|signxml|paramiko|zizmor|gh|git|sqlite|postgres(?:ql)?|ubuntu"
+    r"|windows|macos|requests|hl7apy|semgrep|bandit|gitleaks|trivy|actionlint|go|rust|bumps?)"
+    # A word carrying a digit (`ldap3`), a word cut at a hyphen (`openssl-bin-`), or a hyphenated
+    # package name (`js-yaml`). Each starts at a word boundary, and `re-` is excluded so the record's
+    # own verbs ("re-scores", "re-read") are not mistaken for a package.
+    r"|\b[A-Za-z][\w-]*\d[\w-]*|\b[A-Za-z]\w*-|\b(?!re-)[a-z]+(?:-[a-z]+)+)[\s*`_]*$"
+    # A pin operator (`==`, `~=`, `@`) or a field separator with no space before it (an HL7 version
+    # field, `VER=`): neither is how prose or a markdown table cell introduces a requirement.
+    r"|(?:[=@~<>^]|\S\|)[\s*`_]*$"
+)
+#: "<version> to <version>" is a dependency bump, whichever side the requirement shape lands on.
+_PR_VERSION_TAIL = re.compile(r"^[*`_]*\s+(?:to|->|\u2192)\s+[*`_]*v?\d+\.\d+")
+_PR_FMT = r"[*`_\"']*"
+_PR_SEP = r"[\s*`_\"']+"
+_PR_VERDICT = (
+    r"(?:pass|fail|partial|n/?a|not[- ]applicable|needs[- ]review|not met|unmet|met)(?![\w/-])"
+)
+_PR_STATE_VERB = (
+    r"(?:stays?|remains?|held at|holds? at|holding at|is(?: now| still)?|was|are|went to|goes to"
+    r"|moves? to|moved to|back to|re-?scored(?: as)?|scored(?: as)?|scores|reads|now|at)"
+)
+_PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+#: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
+_PR_VERDICT_AFTER = re.compile(
+    rf"(?i)^{_PR_FMT}(?:\s+cell)?"
+    rf"(?:\s*[:=|\-\u2014>\]]+\s*|{_PR_SEP})"
+    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|to){_PR_SEP})?{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+)
+#: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
+#: binds only when the text before the identifier says the identifier is what moves.
+_PR_MOVE_LEAD = re.compile(
+    r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of)"
+    rf"{_PR_SEP}(?:(?:the|vault|cells?){_PR_SEP})*$"
+)
+#: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
+_PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*[:=|\-\u2014<\[(]+\s*{_PR_FMT}$")
+#: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
+#: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
+#: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
+_PR_PROSE_VERDICT = re.compile(
+    rf"(?i)\b(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
+    rf"(?:{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"|\bheld{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
+    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:to|(?:can{_PR_SEP})?reach(?:es|ed)?){_PR_SEP}"
+    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+)
+_PR_GAP = re.compile(
+    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|uncovered|unmet"
+    r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
+)
+#: A source path, a path under one of this repository's code roots, or a dotted engine module. Docs are
+#: deliberately not code here: the ruled kind is a map to the code that implements a requirement.
+_PR_CODE = re.compile(
+    r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)\b"
+    r"|(?<![\w/.-])(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
+    r"|\bmessagefoundry\w*(?:\.\w+)+"
+)
+#: How far a gap word or a code path may sit from the identifier, inside one sentence.
+_PR_WINDOW = 80
+_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])")
+_PR_BLOCK_START = re.compile(r"(?:[-*+]|\d+[.)])\s|#|>")
+PR_BODY_REASONS = {
+    "verdict": "requirement verdict (a requirement id beside its verdict)",
+    "gap": "requirement gap (a requirement id beside a gap or residual)",
+    "map": "requirement-to-code map (a requirement id beside a code path)",
+}
+
+
+def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+    """Split a PR body into the units a sentence can live in.
+
+    A blank line, a list item, a heading, a quote or a table row starts a new unit; any other line
+    continues the paragraph above it, so a hard-wrapped sentence is read whole. Each unit carries
+    (offset, line) marks so a hit can be reported at the line its identifier sits on.
+    """
+    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    marks: list[tuple[int, int]] = []
+    parts: list[str] = []
+
+    def flush() -> None:
+        if parts:
+            units.append((list(marks), " ".join(parts), False))
+            marks.clear()
+            parts.clear()
+
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            flush()
+            continue
+        if line.startswith("|"):
+            flush()
+            units.append(([(0, lineno)], line, True))
+            continue
+        if _PR_BLOCK_START.match(line):
+            flush()
+        offset = sum(len(p) + 1 for p in parts)
+        marks.append((offset, lineno))
+        parts.append(line)
+    flush()
+    return units
+
+
+def _pr_line_at(marks: list[tuple[int, int]], offset: int) -> int:
+    line = marks[0][1]
+    for start, lineno in marks:
+        if start > offset:
+            break
+        line = lineno
+    return line
+
+
+def _pr_requirement_ids(text: str) -> list[re.Match[str]]:
+    return [
+        m
+        for m in _PR_REQ_ID.finditer(text)
+        if m.group(0)[0] in "VA"
+        or not (
+            _PR_VERSION_LEAD.search(text[max(0, m.start() - 40) : m.start()])
+            or _PR_VERSION_TAIL.match(text[m.end() : m.end() + 40])
+        )
+    ]
+
+
+def _pr_verdict_bound(text: str, m: re.Match[str]) -> bool:
+    before = text[max(0, m.start() - 60) : m.start()]
+    after = text[m.end() : m.end() + 80]
+    if _PR_VERDICT_BEFORE.search(before):
+        return True
+    hit = _PR_VERDICT_AFTER.match(after)
+    if hit is None:
+        return False
+    # A bare "to" is only a verdict binding after a move verb; every other state verb stands alone.
+    bound_by_to = re.match(rf"(?i){_PR_FMT}(?:\s+cell)?{_PR_SEP}{_PR_FMT}to{_PR_SEP}", after)
+    return bound_by_to is None or _PR_MOVE_LEAD.search(before) is not None
+
+
+def _pr_table_verdict(row: str) -> bool:
+    """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits."""
+    cells = [c.strip(" *`_\"'") for c in row.strip().strip("|").split("|")]
+    if not any(_PR_REQ_ID.fullmatch(c) for c in cells):
+        return False
+    whole = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
+    return any(whole.fullmatch(c) for c in cells)
+
+
+def scan_pr_body(body: str) -> list[str]:
+    """Record-content hits in a pull request body, as ``pr-body:<line>: <reason>`` strings.
+
+    Reasons only, never the matched text. One hit per kind per unit (a sentence or table row), so a
+    paragraph restating one verdict three ways reports once per kind rather than storming.
+    """
+    hits: list[str] = []
+    for marks, unit, is_row in _pr_units(body):
+        sentences = [(0, unit)] if is_row else []
+        if not is_row:
+            pos = 0
+            for piece in _PR_SENTENCE_SPLIT.split(unit):
+                start = unit.index(piece, pos)
+                sentences.append((start, piece))
+                pos = start + len(piece)
+        for start, sentence in sentences:
+            ids = _pr_requirement_ids(sentence)
+            if not ids:
+                continue
+            found: dict[str, int] = {}
+            for m in ids:
+                if "verdict" not in found and _pr_verdict_bound(sentence, m):
+                    found["verdict"] = m.start()
+                lo, hi = (
+                    (0, len(sentence))
+                    if is_row
+                    else (max(0, m.start() - _PR_WINDOW), m.end() + _PR_WINDOW)
+                )
+                window = sentence[lo:hi]
+                if "verdict" not in found and not is_row and _PR_PROSE_VERDICT.search(window):
+                    found["verdict"] = m.start()
+                if "gap" not in found and _PR_GAP.search(window):
+                    found["gap"] = m.start()
+                if "map" not in found and _PR_CODE.search(window):
+                    found["map"] = m.start()
+            if is_row and "verdict" not in found and _pr_table_verdict(sentence):
+                found["verdict"] = ids[0].start()
+            for kind in PR_BODY_REASONS:
+                if kind in found:
+                    line = _pr_line_at(marks, start + found[kind])
+                    hits.append(f"pr-body:{line}: {PR_BODY_REASONS[kind]}")
+    return hits
+
 
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
 _IP_SKIP_SUFFIXES = {".lock"}
@@ -1522,7 +1754,50 @@ def _detector_count_report(counts: dict[str, int]) -> list[str]:
     return [f"mode={mode}"] + [f"{k}={v}" for k, v in sorted(counts.items())]
 
 
+def _pr_body_mode(argv: list[str]) -> int:
+    """``--pr-body PATH``: scan one pull request body for record content and exit.
+
+    ``-`` reads stdin, which is how CI feeds it: the body arrives as an environment variable piped in,
+    never as an Actions expression inside a ``run:`` script, so a crafted body cannot become shell.
+    Needs no token source -- the three record kinds are structural -- so it runs the same on a fork.
+    """
+    i = argv.index("--pr-body")
+    if i + 1 >= len(argv):
+        print("scan_forbidden: --pr-body needs a file path, or - for stdin.", file=sys.stderr)
+        return 2
+    source = argv[i + 1]
+    try:
+        body = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"scan_forbidden: --pr-body: cannot read {source}: {exc}", file=sys.stderr)
+        return 2
+    # Say what was read, as the tree scan does: a body that silently arrived empty would otherwise pass
+    # exactly as a clean one does.
+    print(
+        f"scan_forbidden: examined a pull request body of {len(body.splitlines())} line(s).",
+        file=sys.stderr,
+    )
+    hits = scan_pr_body(body)
+    if hits:
+        print("FORBIDDEN CONTENT in the pull request body (fail closed):", file=sys.stderr)
+        for h in hits:
+            print(f"  {h}", file=sys.stderr)
+        print(
+            f"\n{len(hits)} hit(s). A public pull request body must not state a requirement's verdict, "
+            "its gap, or the code that implements it; the per-requirement grid is private. Edit the "
+            "body to describe the change without them. A bare requirement number with none of the "
+            "three beside it is not flagged.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    # BACKLOG #3364. A terminal mode read before the token load: it scans text that is not a file in the
+    # tree, and none of its detectors come from the token source.
+    if "--pr-body" in argv:
+        return _pr_body_mode(argv)
     reload_tokens()
     # SEC-04 / BACKLOG #1368. Both are read BEFORE the require/floor parsing below, because each is a
     # terminal mode that reports and exits rather than scanning.

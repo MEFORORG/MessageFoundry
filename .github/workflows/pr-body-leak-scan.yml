@@ -1,0 +1,61 @@
+name: PR body leak scan
+
+# The publish leak gate, extended to the one public surface the tree scans cannot read: a pull
+# request's DESCRIPTION (BACKLOG #3364, owner ruling 2026-10-09, "Guard forward only").
+#
+# WHAT IT FLAGS. A requirement identifier bound to one of three things that rebuild the private
+# per-requirement grid: its VERDICT, its GAP, or the CODE that implements it. The detector is
+# `scan_forbidden.py --pr-body`; its comment block says how each kind is matched and why prose matching
+# is narrowed the way it is. A bare requirement number with none of the three beside it passes, and
+# whether it should is an open owner decision, not this job's.
+#
+# WHAT IT DOES NOT READ, deliberately, because the owner ruling covers bodies only: titles, comments,
+# review text, and commit or squash messages. Each was proposed and none is ruled. Old pull requests and
+# commits are left as they are, so nothing here scans history.
+#
+# NOT A REQUIRED CONTEXT. Do not add this job's name to `.github/required-contexts.txt` or to branch
+# protection on the strength of this file: making it required is a separate branch-protection decision.
+# It does go red on a hit, so it is a signal on the pull request, but GitHub publishes a description
+# the instant it is saved -- this job can tell an author to edit, it cannot unpublish.
+#
+# WHY ITS OWN WORKFLOW AND NOT A JOB IN security.yml. The body changes without a push, so the scan has
+# to run on `edited`. security.yml's `pull_request` arm takes the default activity types, and adding
+# `edited` there would re-run every scanner in that file on each description edit.
+#
+# INJECTION. The body is attacker-controlled text. It reaches the scanner as a step-level environment
+# variable fed on stdin, never as an Actions expression inside the `run:` script, so no body can become
+# shell. The job needs no secret and writes nothing, so it runs the same on a fork pull request.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  # Per pull request: an edit or a push supersedes the in-flight scan of the same pull request, and
+  # the newer run reads the current body. Nothing gates on this job, so cancelling is safe.
+  group: pr-body-leak-scan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-body-leak-scan:
+    name: pr-body leak scan (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Only the scanner is read, so only its directory is fetched.
+          sparse-checkout: scripts/security
+          # zizmor artipacked: nothing here pushes or calls the API, so no credential is persisted.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Scan the pull request body for requirement verdicts, gaps and code maps
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python scripts/security/scan_forbidden.py --pr-body - <<< "$PR_BODY"

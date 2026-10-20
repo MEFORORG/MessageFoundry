@@ -625,3 +625,177 @@ def test_no_token_source_reports_mode_none_rather_than_a_clean_zero(sf, monkeypa
     """ "loaded nothing" and "loaded a real list that happens to be small" must not render alike."""
     monkeypatch.setattr(sf, "TOKENS_PRESENT", False)
     assert "mode=none" in sf._detector_count_report({"names": 0})
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #3364 -- the same record content in a PULL REQUEST BODY, where it is written as prose.
+#
+# THE SAME TWO CONTROLS AS #1337 ABOVE, AND THE SAME RULE THAT NEITHER GOES WITHOUT THE OTHER: each
+# owner-ruled kind (verdict, gap, code map) has fixtures that must fire, and ordinary PR text must pass.
+#
+# THE IDENTIFIERS ARE DELIBERATELY ONES NO REQUIREMENT CARRIES. A fixture reading "<id> stays <verdict>"
+# with a real identifier would itself publish a verdict-shaped sentence, so these use a real chapter and
+# the section number nine with a requirement number in the nineties: the detector's shape, and nobody's
+# assessment. The paths are invented for the same reason. The identifier and the verdict also stay
+# separate literals joined at runtime, as above, so this source carries no pair for the tree scan.
+# --------------------------------------------------------------------------------------------------
+
+_REQ = "16.9.97"
+_REQ_B = "9.9.98"
+_PARTIAL, _PASS, _FAIL, _NA = "partial", "pass", "fail", "na"
+
+_PR_VERDICT_MUST_FIRE = [
+    f"After this merges, {_REQ} stays {_PARTIAL} until the follow-up lands.",
+    f"ASVS {_REQ} stays **`{_FAIL}`** -- none of this changes the ceiling.",
+    f"The vault re-score held {_REQ} at {_PARTIAL} on one ground.",
+    f"The re-read of {_REQ} held the cell at {_PARTIAL} on four sentences.",
+    f"It does not move the ASVS {_REQ} cell to {_PASS}, and nothing here claims it does.",
+    f"A single-limb requirement gets `{_NA}` ({_REQ}), while a multi-limb one cannot.",
+    f"| #1 | {_REQ} | Stay **{_PARTIAL}**. The row's basis is replaced. |",
+    f"| {_REQ} | the outbound limb | {_PASS} |",
+    f"{_REQ}{': '}{_FAIL}",
+]
+_PR_GAP_MUST_FIRE = [
+    f"BACKLOG #1, one limb: the unvalidated input residual (ASVS {_REQ}).",
+    f"It is the gap that keeps ASVS {_REQ} open on the record.",
+    f"## #1 (ASVS {_REQ}) -- verified, and deliberately not built",
+]
+_PR_MAP_MUST_FIRE = [
+    f"`pkg/example_module.py` states the ASVS {_REQ} guarantee for every caller.",
+    f"| `tests/test_example_widget.py` | {_REQ} | extracts one shared helper |",
+    f"Vault cell {_REQ} anchors on the `pkg/example.py:12` citation.",
+]
+
+#: Ordinary pull request text with NO requirement number at all -- the Lander's negative control. It
+#: carries every word the detector keys on (verdict words, gap words, code paths, versions) so a pass
+#: here means the binding held, not that the words were absent.
+_PR_CLEAN_BODY = "\n".join(
+    [
+        "## What this changes",
+        "",
+        "Adds a bounded retry to the outbound sender in `pkg/example_sender.py`, so a refused",
+        "connection is retried before the row dead-letters. The gap between attempts doubles.",
+        "",
+        "- Tests: 412 passed, 3 skipped; the new case would fail without the fix.",
+        "- Python 3.14.6, OpenSSL 3.5.7; bumps lxml from 6.1.1 to 6.1.2 in passing.",
+        "- `ruff==0.15.22`, js-yaml 4.3.1 in `ide/package-lock.json`, ldap3 2.9.1 in core/connection.py.",
+        "- It requires 3.14.6 to pass the collection step; no residual risk is introduced.",
+        "",
+        "| check | result |",
+        "| --- | --- |",
+        "| pytest | pass |",
+        "| mypy | fail before, pass after |",
+    ]
+)
+#: Text where a dotted triple is a version or an HL7 field, beside the words a record line would use.
+_PR_VERSION_MUST_STAY_QUIET = [
+    "Bumps lxml from 6.1.1 to 6.1.2 in `requirements.lock`.",
+    "Local CPython 3.14.6, OpenSSL 3.5.7: `tests/test_example_tls.py` gave 8 passed and 1 skipped.",
+    # A bump whose OLD side follows punctuation, so only the "<version> to <version>" tail marks it.
+    "One lockfile entry, 1.2.1 to 1.2.2, read by `pkg/example_client.py`.",
+    "| `gitleaks` | `v8.1.4` | `security.yml` `VER=8.1.4` | same |",
+    "E    MSH|^~\\&|SAPP|FAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1  at pkg/example_parser.py:40",
+    "the suite will pass; see 1.2.2 later for the rationale",
+    "requires 3.14.6 to pass the collection step",
+]
+
+
+def _pr_kinds(sf, body: str) -> set[str]:
+    hits = sf.scan_pr_body(body)
+    return {kind for kind, reason in sf.PR_BODY_REASONS.items() if any(reason in h for h in hits)}
+
+
+@pytest.mark.parametrize("line", _PR_VERDICT_MUST_FIRE)
+def test_a_pr_body_stating_a_requirement_verdict_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, verdicts: prose binding ("stays", "held at", "cell to") as well as punctuation."""
+    assert "verdict" in _pr_kinds(sf, f"Context above.\n\n{line}\n\nContext below."), line
+
+
+@pytest.mark.parametrize("line", _PR_GAP_MUST_FIRE)
+def test_a_pr_body_stating_a_requirement_gap_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, gaps: a requirement beside a gap, residual or not-built claim."""
+    assert "gap" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize("line", _PR_MAP_MUST_FIRE)
+def test_a_pr_body_mapping_a_requirement_to_code_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, code maps: a requirement beside the source path that implements it."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+def test_a_clean_pr_body_with_no_requirement_number_passes(sf) -> None:
+    """CONTROL 2. Without it, a detector that flags every body looks identical to a correct one."""
+    assert sf.scan_pr_body(_PR_CLEAN_BODY) == []
+
+
+@pytest.mark.parametrize("line", _PR_VERSION_MUST_STAY_QUIET)
+def test_a_version_beside_verdict_or_path_words_is_not_record_content(sf, line: str) -> None:
+    """Versions next to test counts and code paths were the dominant false positive when measured."""
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_bare_requirement_number_is_not_flagged_while_that_is_unruled(sf) -> None:
+    """Whether a bare number with no verdict, gap or code path beside it should pass is an OPEN owner
+    decision. Until it is ruled the detector must not decide it, so this pins the pass. If the owner
+    rules the other way, this test is the one to change, deliberately."""
+    body = (
+        f"BACKLOG #1 (ASVS {_REQ}). Adds an input bound to the intake path.\n\nSee also {_REQ_B}."
+    )
+    assert sf.scan_pr_body(body) == []
+
+
+def test_a_hard_wrapped_sentence_is_read_whole_and_reported_at_the_identifier_line(sf) -> None:
+    body = f"Intro line.\n\nThe control for ASVS {_REQ} is the one\nthat `pkg/example_module.py` enforces."
+    hits = sf.scan_pr_body(body)
+    assert hits == [f"pr-body:3: {sf.PR_BODY_REASONS['map']}"], hits
+
+
+def test_the_pr_body_detector_reports_no_value(sf) -> None:
+    """The identifier beside its verdict IS the disclosure; a public CI log must not repeat it."""
+    body = "\n".join(_PR_VERDICT_MUST_FIRE + _PR_GAP_MUST_FIRE + _PR_MAP_MUST_FIRE)
+    hits = sf.scan_pr_body(body)
+    assert hits, "the fixtures must fire, or this asserts nothing"
+    for h in hits:
+        for leaked in (_REQ, "example_module", "example.py", f" {_PARTIAL} "):
+            assert leaked not in h, f"the reason echoed {leaked!r}: {h!r}"
+
+
+def test_the_pr_body_mode_exit_codes(sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 on a hit, 0 on a clean body, 2 when the instrument cannot read -- never 0 for "could not look"."""
+    import io
+
+    dirty = tmp_path / "dirty.md"
+    dirty.write_text(_PR_VERDICT_MUST_FIRE[0], encoding="utf-8")
+    clean = tmp_path / "clean.md"
+    clean.write_text(_PR_CLEAN_BODY, encoding="utf-8")
+    assert sf.main(["--pr-body", str(dirty)]) == 1
+    assert sf.main(["--pr-body", str(clean)]) == 0
+    assert sf.main(["--pr-body"]) == 2
+    assert sf.main(["--pr-body", str(tmp_path / "absent.md")]) == 2
+    monkeypatch.setattr("sys.stdin", io.StringIO(_PR_GAP_MUST_FIRE[0]))
+    assert sf.main(["--pr-body", "-"]) == 1
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert sf.main(["--pr-body", "-"]) == 0
+
+
+def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> None:
+    """The body is attacker-controlled. It must reach the scanner through ``env:``, never as an Actions
+    expression in a ``run:`` script, and the job must run on an edit as well as a push. The job is not a
+    required context: making it one is a separate branch-protection decision."""
+    yaml = pytest.importorskip("yaml")
+    path = _REPO_ROOT / ".github" / "workflows" / "pr-body-leak-scan.yml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    on = doc[True]  # PyYAML reads the bare `on:` key as the boolean True
+    assert set(on["pull_request"]["types"]) == {"opened", "edited", "reopened", "synchronize"}
+    (job,) = doc["jobs"].values()
+    fed = False
+    for step in job["steps"]:
+        assert "${{" not in step.get("run", ""), (
+            "no Actions expression may sit inside a run: script"
+        )
+        if "--pr-body" in step.get("run", ""):
+            assert step["env"]["PR_BODY"] == "${{ github.event.pull_request.body }}"
+            fed = True
+    assert fed, "no step runs the scanner's --pr-body mode"
+    required = (_REPO_ROOT / ".github" / "required-contexts.txt").read_text(encoding="utf-8")
+    assert job["name"] not in required
