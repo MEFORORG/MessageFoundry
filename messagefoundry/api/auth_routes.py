@@ -320,16 +320,12 @@ async def _refuse_if_self(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
-#: The gate of the four group-wide saves: both AD group maps, custom-role edit and delete
-#: (BACKLOG #3401). Everything but the step-up runs here: the permission, pacing, the MFA gate, the
-#: new-address check and the factor-binding refusal. :func:`_prove_group_save` takes the step-up.
-_GROUP_SAVE_GATE = require_step_up_action(
-    STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
-)
-
-
 async def _prove_group_save(request: Request, identity: Identity, ended: frozenset[str]) -> None:
     """The step-up of a group-wide save whose revoke would end the sessions of ``ended``.
+
+    The route's gate is ``require_step_up_action(save_ends_own_sessions, USERS_MANAGE,
+    proof_in_route=True)``: the permission, pacing, the MFA gate, the new-address check and the
+    factor-binding refusal run there, and this takes the step-up.
 
     BACKLOG #3401 (ASVS 7.5.2, a #1149 follow-up). Each of these saves ends the sessions of every
     account it reaches, and that can be the caller's own. On the login window alone that was a mass
@@ -1172,7 +1168,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: CustomRoleRequest,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(_GROUP_SAVE_GATE),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> CustomRoleInfo:
         """Edit a custom role. Ends the sessions of every holder, so a caller who holds it takes
         the bound proof (BACKLOG #3401, :func:`_prove_group_save`)."""
@@ -1211,7 +1211,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         role_id: CustomRoleId,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(_GROUP_SAVE_GATE),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
         """Delete a custom role. Ends the sessions of every holder, so a caller who holds it takes
         the bound proof (BACKLOG #3401, :func:`_prove_group_save`)."""
@@ -1877,7 +1881,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: AdGroupMap,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(_GROUP_SAVE_GATE),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
         """Replace the AD-group to role map. Ends every directory account's sessions, so a caller
         signed in through the directory takes the bound proof (BACKLOG #3401,
@@ -1928,7 +1936,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: AdGroupScopeMap,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(_GROUP_SAVE_GATE),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
         """Replace the AD-group to channel-scope map. Ends every directory account's sessions, as
         the role map does, and takes the same step-up (BACKLOG #3401)."""

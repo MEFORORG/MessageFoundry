@@ -1488,8 +1488,8 @@ def require_ui_step_up_when_own_sessions_end(
 ) -> Callable[[Request], Awaitable[Identity]]:
     """:func:`require_ui_step_up`, but the step-up is the single-use proof bound to ``action``
     when the request would end the caller's own sessions. The cookie twin of the JSON plane's
-    ``_GROUP_SAVE_GATE`` and ``_prove_group_save`` in ``api.auth_routes`` (BACKLOG #3401, ASVS
-    7.5.2).
+    ``proof_in_route`` gate plus ``_prove_group_save`` in ``api.auth_routes`` (BACKLOG #3401,
+    ASVS 7.5.2).
 
     ``ended`` names the accounts whose sessions the request ends. It is read from the engine's
     stored accounts, by the same enumeration the revoke runs, never from the caller's identity. A
