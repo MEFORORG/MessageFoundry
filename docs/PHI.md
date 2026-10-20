@@ -355,7 +355,8 @@ warning and goes on.
 
 A connection's key file is checked each time the engine loads the graph, at the start and on every
 reload, with `env()` values resolved. That is at least `tls_key_file` on MLLP, the HTTP listener,
-DICOM and FTPS, and `Soap(client_key_file=...)`, or the certificate when the key setting is unset.
+DICOM and FTPS, and `Soap(client_key_file=...)`. Where a TLS connection leaves `tls_key_file`
+unset, the key is in its certificate PEM, so `tls_cert_file` is checked instead.
 Under `"enforce"` a file a broad group can read would refuse the start, or the reload, which keeps
 the running graph. Under `"warn"` it is logged. `supervise` refuses such a graph before it starts
 an engine shard. A value that holds PEM text rather than a path is not checked
@@ -377,9 +378,14 @@ an engine shard. A value that holds PEM text rather than a path is not checked
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds
   permissions, or supply your own certificate.
-- It does not look at the syslog forwarder's client key, a `Database` connection's `odbc_params`
-  `sslkey`, or a path in `[auth].oidc_client_private_key`. Restrict those yourself. `Sftp(private_key=...)` holds key
+- It does not look at, at least: the syslog forwarder's client key, a `Database` connection's
+  `odbc_params` `sslkey`, a `smart_private_key` on a connection or a `FhirLookup`, a signing key
+  such as `sign_private_key` or `Direct(signing_key=...)`, and a path in
+  `[auth].oidc_client_private_key`. Restrict those yourself. `Sftp(private_key=...)` holds key
   text, not a path, so it has no file to check.
+- A connection's key file is checked when the graph loads, not each time a connection starts. A DR
+  activation re-applies the running graph without checking it again, and so does an operator start
+  of a connection whose key file was missing when the graph loaded.
 - A key file is created for the account that creates it. `cert import` and `cert self-signed` have
   no grant option, so run them as the account that will read the key, or grant that account
   yourself. If an administrator runs `serve` by hand before the service first starts, the minted

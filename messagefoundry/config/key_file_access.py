@@ -19,9 +19,12 @@ reload. A refused reload leaves the running graph in place.
 HTTP listener, DICOM, and the FTPS key :mod:`messagefoundry.transports.remotefile` reads) and
 ``Soap(client_key_file=...)``. Where the key setting is unset, the private key is in the certificate
 PEM, so the certificate file is judged instead, as the loaders read it. A value holding PEM text is
-key material, not a path, and is never judged as one. Out of scope: ``Sftp(private_key=...)``, which
-is key text, a ``Database`` connection's ``odbc_params`` ``sslkey``, the syslog client PEM, and
-``[auth].oidc_client_private_key``.
+key material, not a path, and is never judged as one. Not judged, at least: a ``Database``
+connection's ``odbc_params`` ``sslkey``, ``smart_private_key`` (on a connection or a ``FhirLookup``),
+a signing key such as ``sign_private_key`` or ``Direct(signing_key=...)``, the syslog client PEM, and
+``[auth].oidc_client_private_key``. ``Sftp(private_key=...)`` is key text, not a file. A DR
+activation re-applies the running graph without the registry guard, so it does not judge these
+files again.
 """
 
 from __future__ import annotations
@@ -46,11 +49,12 @@ __all__ = [
     "make_connection_key_file_guard",
 ]
 
-#: Each (certificate setting, key setting) pair a connector loads as its own TLS identity. The key
-#: setting names the private key; where it is unset the loader reads the key from the certificate.
-_IDENTITY_SETTINGS: Final[tuple[tuple[str, str], ...]] = (
-    ("tls_cert_file", "tls_key_file"),
-    ("client_cert_file", "client_key_file"),
+#: Each (certificate setting, key setting, key may be in the certificate) a connector loads as its own
+#: TLS identity. Where the third is true and the key setting is unset, the loader reads the key from
+#: the certificate. A SOAP client certificate needs its key setting, so it never holds the key.
+_IDENTITY_SETTINGS: Final[tuple[tuple[str, str, bool], ...]] = (
+    ("tls_cert_file", "tls_key_file", True),
+    ("client_cert_file", "client_key_file", False),
 )
 
 #: What marks a setting's value as PEM text rather than a path, as ``transports/signing.py`` reads it.
@@ -67,8 +71,8 @@ def _absent(path: str) -> bool:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return True
-    except (OSError, ValueError):
-        pass
+    except OSError:
+        return False  # not a missing name: the access check that follows reports it
     return False
 
 
@@ -82,6 +86,10 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
     each caller refuses under ``enforce`` and warns under ``warn``."""
     from messagefoundry.restricted_file import broad_access_problem
 
+    if "\x00" in path:
+        # No file can carry this name, and the stat calls below raise ValueError on it rather than
+        # the OSError the access check reports. Refused as unexaminable, never passed as absent.
+        return f"{what} is not restricted: its path could not be examined (a NUL in it). {remedy}"
     if absent_ok and _absent(path):
         return None
     problem = broad_access_problem(Path(path))
@@ -96,20 +104,33 @@ def connection_key_files(
     """``(label, path)`` for each private-key file a connection in ``registry`` names.
 
     ``env()`` references are resolved against ``env_values``. Every inbound and outbound connection
-    is read, deployed or not, so a key is judged before a deploy can load it. A setting that does
-    not resolve is skipped: the connection's own build refuses it and names the missing value. So
-    is a value that is not text, or that holds PEM text rather than a path. The label names the
-    connection and the setting, never the path."""
+    is read, deployed or not, so a key is judged before a deploy can load it. A key setting that
+    does not resolve is skipped, and so is its certificate: the connection's own build refuses it
+    and names the missing value. So is a value that is not a path, or that holds PEM text. The
+    certificate stands in for an unset key only where the connection loads a TLS identity. The
+    label names the connection and the setting, never the path."""
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
-    def resolved(settings: Mapping[str, Any], name: str) -> str | None:
-        if not settings.get(name):
-            return None
+    def resolved(settings: Mapping[str, Any], name: str) -> object:
         try:
-            value = resolve_env_settings({name: settings[name]}, env_values)[name]
+            return resolve_env_settings({name: settings[name]}, env_values)[name]
         except WiringError:
             return None
-        return value if isinstance(value, str) and value else None
+
+    def as_path(value: object) -> str | None:
+        # Every loader str()s the value, so a pathlib.Path names a file as text does.
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if not isinstance(value, str) or not value or _PEM_MARKER in value:
+            return None
+        return value
+
+    def uses_tls(settings: Mapping[str, Any]) -> bool:
+        # The certificate holds the key only where a TLS identity is loaded: ``tls`` on MLLP, the
+        # HTTP listener and DICOM, and the ``ftps`` protocol of a remote-file connection.
+        return bool(settings.get("tls") and resolved(settings, "tls")) or (
+            bool(settings.get("protocol")) and resolved(settings, "protocol") == "ftps"
+        )
 
     found: list[tuple[str, str]] = []
     groups: tuple[tuple[str, Iterable[InboundConnection | OutboundConnection]], ...] = (
@@ -119,13 +140,19 @@ def connection_key_files(
     for direction, connections in groups:
         for conn in sorted(connections, key=lambda c: c.name):
             settings = conn.spec.settings
-            for cert_setting, key_setting in _IDENTITY_SETTINGS:
-                setting, value = key_setting, resolved(settings, key_setting)
-                if value is None:
-                    setting, value = cert_setting, resolved(settings, cert_setting)
-                if value is None or _PEM_MARKER in value:
+            for cert_setting, key_setting, key_may_be_in_cert in _IDENTITY_SETTINGS:
+                if settings.get(key_setting):
+                    # Set: judge it, or nothing when it does not resolve or holds PEM text. The
+                    # build names an unresolved value, and inline PEM is not a file.
+                    setting, value = key_setting, as_path(resolved(settings, key_setting))
+                elif key_may_be_in_cert and settings.get(cert_setting) and uses_tls(settings):
+                    setting, value = cert_setting, as_path(resolved(settings, cert_setting))
+                else:
                     continue
-                found.append((f"{direction} connection {conn.name!r} setting {setting!r}", value))
+                if value is not None:
+                    found.append(
+                        (f"{direction} connection {conn.name!r} setting {setting!r}", value)
+                    )
     return found
 
 

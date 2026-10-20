@@ -131,11 +131,43 @@ def test_a_certificate_holding_its_key_is_judged_and_pem_text_is_never_a_path() 
     found = connection_key_files(registry, values)
     # The unset key falls back to the certificate the loader reads it from. The inline PEM is key
     # text, not a path. An env() that does not resolve is left to the connection's own build, which
-    # names it; its certificate is judged meanwhile, as the loader would read the key from it.
-    assert found == [
-        ("inbound connection 'IB_COMBINED' setting 'tls_cert_file'", "combined.pem"),
-        ("outbound connection 'OB_UNRESOLVED' setting 'client_cert_file'", "u.crt"),
+    # names it, and its public certificate is not judged in its place.
+    assert found == [("inbound connection 'IB_COMBINED' setting 'tls_cert_file'", "combined.pem")]
+
+
+def test_a_path_typed_key_is_judged_and_a_certificate_without_tls_is_not() -> None:
+    registry = _registry(
+        inbound={
+            "IB_PATH": ConnectionSpec(
+                ConnectorType.MLLP,
+                {"tls": True, "tls_cert_file": "p.crt", "tls_key_file": Path("p.key")},
+            ),
+            "IB_PLAIN": ConnectionSpec(
+                ConnectorType.MLLP, {"tls": False, "tls_cert_file": "x.crt"}
+            ),
+        },
+        outbound={
+            "OB_FTPS": ConnectionSpec(
+                ConnectorType.REMOTEFILE, {"protocol": "ftps", "tls_cert_file": "f.pem"}
+            ),
+        },
+    )
+    assert connection_key_files(registry, {}) == [
+        ("inbound connection 'IB_PATH' setting 'tls_key_file'", "p.key"),
+        ("outbound connection 'OB_FTPS' setting 'tls_cert_file'", "f.pem"),
     ]
+
+
+def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
+    graph = _registry(
+        outbound={
+            "OB_SOAP": Soap(
+                url="https://x.invalid/s", client_cert_file="s.crt", client_key_file=env("k")
+            )
+        }
+    )
+    problem = connection_key_file_problem(graph, {"k": "a\x00b.key"})
+    assert problem is not None and "could not be examined" in problem
 
 
 # --- the registry guard ---------------------------------------------------------------------------
@@ -197,6 +229,42 @@ def test_the_guard_reads_the_values_again_for_each_graph(tmp_path: Path) -> None
     values["soap_key"] = str(broad)
     with pytest.raises(WiringError, match="OB_SOAP"):
         guard(graph)
+
+
+async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
+    """The engine's own reload path raises the guard's refusal, before any connector is built. A
+    dry run, so this does not show that a running graph is kept; the engine's reload tests own
+    that ordering, as tests/test_retention_override_gate.py says of its guard."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    key = _key(tmp_path / "broad.key", broad=True)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+        "inbound('IB_FEED', MLLP(port=2611, tls=True, tls_cert_file='c.crt',\n"
+        f"        tls_key_file={key.as_posix()!r}), router='r')\n"
+        "outbound('OB_FEED', MLLP(host='127.0.0.1', port=2612))\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_FEED', msg)\n",
+        encoding="utf-8",
+    )
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=make_connection_key_file_guard(dict, enforcing=True, log=_LOG),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with pytest.raises(WiringError, match="'IB_FEED' setting 'tls_key_file' is not restricted"):
+            await eng.reload_detail(cfg, dry_run=True)
+    finally:
+        await eng.stop()
 
 
 def test_every_broad_file_is_named_in_one_refusal(tmp_path: Path) -> None:
