@@ -150,6 +150,13 @@ class PendingFlow:
     #: same clock (BACKLOG #2301). ``0.0`` on a flow never staged, which reads as staged long ago.
     started: float = 0.0
 
+    def __post_init__(self) -> None:
+        # A step-up flow names both its session and its user, or neither, so every reader may ask
+        # either field "is this a step-up?" and get one answer (BACKLOG #3374). Checked on the type,
+        # so ``dataclasses.replace`` and a direct construction are held to it too.
+        if (self.step_up_session_hash is None) != (self.step_up_user_id is None):
+            raise ValueError("a step-up flow stages both its session hash and its user id")
+
 
 class FlowCache:
     """Bounded, TTL'd, process-local staging for in-flight OIDC flows (ADR 0142).
@@ -265,11 +272,7 @@ def start_flow(
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
     ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks.
-    A step-up flow names both its session and its user, or neither: a step-up flow with no user
-    would draw the sign-in window at the callback (BACKLOG #3374).
     """
-    if (step_up_session_hash is None) != (step_up_user_id is None):
-        raise ValueError("a step-up flow stages both its session hash and its user id")
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
     flow = PendingFlow(

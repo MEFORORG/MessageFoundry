@@ -3163,9 +3163,9 @@ class AuthService:
         password and re-bind step-up legs (``POST /me/reauth``, ``POST /ui/reauth``) and the passkey
         leg (``POST /ui/reauth/webauthn``) draw this budget instead, so such a flood cannot deny them.
 
-        An ``oidc`` session's step-up draws it at both legs: ``POST /ui/reauth/oidc`` and the IdP's
-        return to ``GET /ui/oidc/callback``, under the user :meth:`oidc_step_up_flow` reads from
-        the staged flow (BACKLOG #3374). True = proceed; always True when the limiter is
+        An ``oidc`` session's step-up draws it at both legs: ``POST /ui/reauth/oidc`` under the
+        user, and the IdP's return to ``GET /ui/oidc/callback`` under a key of its own for the user
+        :meth:`oidc_step_up_flow` reads from the staged flow (BACKLOG #3374). True = proceed; always True when the limiter is
         disabled."""
         if self._reauth_limiter is None:
             return True
@@ -5581,8 +5581,8 @@ class AuthService:
         or an unknown or expired one.
 
         The callback route uses it twice: to pick the completion, and to charge the step-up return
-        to the staged user's ceremony budget (:meth:`allow_reauth_attempt`) rather than the sign-in
-        window (BACKLOG #3374). The callback cannot read the SameSite=Strict session cookie, so the
+        to a per-user key of the ceremony limiter (:meth:`allow_reauth_attempt`) rather than the
+        sign-in window (BACKLOG #3374). The callback cannot read the SameSite=Strict session cookie, so the
         user comes from the session the start leg verified and staged, never from the request.
         Each completion pops the flow and re-checks its kind, so a wrong answer here refuses. It
         never elevates or mints on the wrong leg. A None sends the callback to the sign-in
@@ -5591,7 +5591,9 @@ class AuthService:
         if self._oidc_flows is None:
             return None
         flow = self._oidc_flows.peek(flow_id)
-        if flow is None or flow.step_up_user_id is None:
+        # PendingFlow sets the two step-up fields together; the hash is the discriminator every
+        # other reader uses, and the user id is read for the type checker.
+        if flow is None or flow.step_up_session_hash is None or flow.step_up_user_id is None:
             return None
         return OidcStepUpFlow(user_id=flow.step_up_user_id, return_to=flow.return_to)
 

@@ -131,6 +131,42 @@ def _step_up_target(return_to: str) -> str:
     return return_to if lookup_ui_action(return_to) is not None else "/ui"
 
 
+#: The refusal text of a spent ceremony budget, on the step-up start and on its return.
+_TOO_MANY_ATTEMPTS = "Too many attempts. Wait a moment."
+
+
+def _step_up_return_key(user_id: str) -> str:
+    """The ceremony-limiter key an IdP step-up's RETURN is charged under (BACKLOG #3374).
+
+    Its own key per user, apart from the one ``POST /ui/reauth/oidc`` and the other ceremonies
+    charge, for two reasons. One step-up then spends one attempt of the user's ceremony budget,
+    not two. And the flow cookie is SameSite=Lax, so a foreign page can send a browser holding a
+    live step-up flow to the callback: on this key those navigations can refuse that user's IdP
+    returns, never their other ceremonies. The limiter is ``glob=0``, so no other key shares it.
+    """
+    return f"oidc-step-up-return:{user_id}"
+
+
+def _step_up_refusal(
+    deps: UiDeps, auth: AuthService, return_to: str, *, error: str | None, status_code: int
+) -> HTMLResponse:
+    """The step-up page a refused IdP return renders. It offers the IdP leg again and never a
+    password field.
+
+    An auto-retry target was staged only because it was issued, and the start leg spent that issue
+    (#2764), so a fresh flow started from this page continues only to an unlock target; the page
+    says so. (After a state mismatch the original flow is still staged and its real return would
+    still continue -- the conservative wording errs toward "nothing will run".) An action-bound
+    unlock page arrives here as return_to only when the start leg found it issued, and that leg
+    leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the retry this page offers
+    still continues to it.
+    """
+    next_ = _step_up_target(return_to)
+    return reauth_idp_response(
+        deps, auth, next_, continues=is_unlock_action(next_), error=error, status_code=status_code
+    )
+
+
 def _step_up_landing(
     request: Request, deps: UiDeps, auth: AuthService, outcome: OidcStepUp
 ) -> Response:
@@ -144,31 +180,16 @@ def _step_up_landing(
         resp: Response = login_redirect_response()
         clear_oidc_flow_cookie(resp, request)
         return resp
-    next_ = _step_up_target(outcome.return_to)
     token = outcome.elevation.token
     if token is None:
-        # A refusal. The page it renders offers the IdP leg again and never a password field. An
-        # auto-retry target was staged only because it was issued, and the start leg spent that
-        # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
-        # the page says so. (After a state mismatch the original flow is still staged and its real
-        # return would still continue -- the conservative wording errs toward "nothing will run".)
-        # An action-bound unlock page arrives here as return_to only when the start leg found it
-        # issued, and that leg leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the
-        # retry this page offers still continues to it.
-        resp = reauth_idp_response(
-            deps,
-            auth,
-            next_,
-            continues=is_unlock_action(next_),
-            error=outcome.error,
-            status_code=403,
-        )
+        resp = _step_up_refusal(deps, auth, outcome.return_to, error=outcome.error, status_code=403)
         if outcome.flow_consumed:
             # The refusal ended the flow, so its cookie goes too. One that consumed nothing (a
             # state mismatch) skips this: the flow waits for the real IdP return, which needs the
             # cookie (BACKLOG #3198).
             clear_oidc_flow_cookie(resp, request)
         return resp
+    next_ = _step_up_target(outcome.return_to)
     if next_ == "/ui" or is_unlock_action(next_):
         # A GET admin form (or nothing to continue to): open it in the fresh step-up window.
         resp = HTMLResponse(pages.oidc_landing(next_), status_code=200)
@@ -406,7 +427,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 auth,
                 next_,
                 continues=continues,
-                error="Too many attempts. Wait a moment.",
+                error=_TOO_MANY_ATTEMPTS,
                 status_code=429,
             )
         public_origin = getattr(request.app.state, "public_origin", None)
@@ -468,27 +489,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         client = client_ip(request)
         flow_id = request.cookies.get(oidc_flow_cookie_name(request))
-        # BACKLOG #3374: a STEP-UP return draws the per-ACTOR ceremony budget its start leg drew,
-        # under the user the flow names (see oidc_step_up_flow), so a flood on the sign-in surface
-        # cannot refuse it. Every other caller, a forged or expired cookie included, still draws
-        # the sign-in window.
+        # BACKLOG #3374: a STEP-UP return draws the per-ACTOR ceremony limiter, under the key
+        # _step_up_return_key gives the user the flow names (see oidc_step_up_flow), so a flood on
+        # the sign-in surface cannot refuse it. Every other caller, a forged or expired cookie
+        # included, still draws the sign-in window.
         staged: OidcStepUpFlow | None = auth.oidc_step_up_flow(flow_id) if flow_id else None
         if staged is not None:
-            if not auth.allow_reauth_attempt(staged.user_id):
+            if not auth.allow_reauth_attempt(_step_up_return_key(staged.user_id)):
                 # A _log.warning, never an audit, as on the sign-in branch below. The flow consumed
-                # nothing, so its cookie stays and the real return can be retried once the budget
-                # refills. The page is the refusal page _step_up_landing renders.
+                # nothing: a reload of this return retries it once the budget refills, and the
+                # page's own button starts a fresh flow, leaving this one to lapse at its TTL.
                 _log.warning(
                     "federated step-up return rate limit exceeded for %s", client or "<unknown>"
                 )
-                next_ = _step_up_target(staged.return_to)
-                return reauth_idp_response(
-                    deps,
-                    auth,
-                    next_,
-                    continues=is_unlock_action(next_),
-                    error="Too many attempts. Wait a moment.",
-                    status_code=429,
+                return _step_up_refusal(
+                    deps, auth, staged.return_to, error=_TOO_MANY_ATTEMPTS, status_code=429
                 )
         elif not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.

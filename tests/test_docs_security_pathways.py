@@ -1603,11 +1603,15 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         for t in (s.targets if isinstance(s, ast.Assign) else [s.target])
         if isinstance(t, ast.Name)
     }
-    charged_with = {
-        ast.unparse(n.args[0]) for n in call_sites(splits[0], "allow_reauth_attempt") if n.args
-    }
-    assert flow_names and charged_with == {f"{name}.user_id" for name in flow_names}, (
-        f"the callback charges the ceremony budget under {sorted(charged_with)}, not the user "
+    charges = call_sites(splits[0], "allow_reauth_attempt")
+    staged_user = {f"{name}.user_id" for name in flow_names}
+    keyed_on_staged_user = [
+        bool(c.args) and any(ast.unparse(sub) in staged_user for sub in ast.walk(c.args[0]))
+        for c in charges
+    ]
+    assert flow_names and charges and all(keyed_on_staged_user), (
+        f"the callback charges the ceremony budget under "
+        f"{[ast.unparse(c.args[0]) for c in charges if c.args]}, not a key built from the user "
         f"oidc_step_up_flow read from the staged flow ({sorted(flow_names)})."
     )
     reauth_oidc = routes["POST /ui/reauth/oidc"]
