@@ -3287,7 +3287,8 @@ replace it chooses which CA the hop trusts.
 ### The engine checks the file at every start and reload (`tls_ca_pin`)
 
 The engine checks the `tls_ca_file` of each connection that dials out (vault BACKLOG #2371).
-`tls_ca_pin` is optional. It is the file's SHA-256 in hex, with `:` separators allowed. Every
+`tls_ca_pin` is optional. It is the file's SHA-256 in hex, with `:` separators allowed, and may
+carry a `sha256:` prefix ([CONFIGURATION.md](CONFIGURATION.md#api), *Trust-anchor pin syntax*). Every
 factory that takes `tls_ca_file` for an outbound hop takes it: `Rest()`, `FHIR()`, `Soap()`,
 `DICOMweb()`, `FhirLookup()`, `Ftp()`, `Email()`, `Direct()`, and an outbound `MLLP()` or
 `DICOM()` with `tls = true`. An inbound `Ftp()` poller dials out too, so its CA takes the same
