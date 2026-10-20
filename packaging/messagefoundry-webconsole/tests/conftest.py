@@ -18,6 +18,10 @@ does NOT inherit the engine's ``tests/conftest.py``. The two pieces of that conf
 The shared ``engine`` fixture (moved out of ``test_webui.py`` so the golden-surface tests can build
 an app too) lives here as well. The mid-test asyncio<->aiosqlite cross-loop concern is handled by the
 session loop scopes in ``pyproject.toml`` — not here.
+
+One module imports from the engine suite rather than copying: ``test_ui_dr_outlive.py`` uses
+``tests/_deadline_capture.py``, so it needs the engine checkout's ``tests/`` importable. That
+helper's docstring says how it is reached.
 """
 
 from __future__ import annotations
@@ -36,6 +40,11 @@ from _ui_clients import HEADERLESS_UI_REQUEST
 
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
+
+# The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
+# asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.
+# An unrewritten assert vanishes under `python -O`.
+pytest.register_assert_rewrite("tests._deadline_capture")
 
 
 @pytest.fixture
