@@ -582,7 +582,7 @@ budget charged is
 `/messages`. Over the write floor the request is refused with `429 Too Many Requests` + a
 `Retry-After` naming the actor's own wait (see *The write floor's `Retry-After` is the actor's real
 wait* below); over the PHI-read budget with `429` + a `Retry-After` naming the actor's own wait
-(see *The PHI-read and ceremony `Retry-After` is the caller's real wait* below). On
+(see *The PHI-read `Retry-After` is the caller's real wait* below). On
 the JSON API both are
 logged at WARNING with the actor and path; the console's refusals are not, as the next paragraph
 says. The floor (`[auth].admin_write_rate_limit_per_actor` over
@@ -640,27 +640,26 @@ That includes a password-only session on a route that charges the floor before i
 the paragraph above names at least one. Before this, the JSON API sent a literal `1` and `/ui`
 a literal `10`, and a client that honoured either could have retried too early.
 
-**The PHI-read and ceremony `Retry-After` is the caller's real wait; the sign-in one is the whole
-window (BACKLOG #3293).** The authenticated `429`s send the wait of the limiter that refused,
-rounded the same way as the write floor's above: up to whole seconds, never below 1, in the engine
-process that refused. It is a reading, not a reservation. A caller that waits it out can still be
-refused if something else spends the room first: another attempt on the same key, or any caller
-filling an all-callers budget. The PHI-read `429` sends the account's own wait, the same on the
-JSON API and under `require_ui(phi=True)`. While `phi_read_rate_limit_global` is on and spent, it
-sends the whole `phi_read_rate_limit_window_seconds`, rounded up, because the true wait would be
-set by other accounts' reads. `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` send
-the account's own wait on the per-actor ceremony budget, which has no all-accounts dimension.
-Every session on the account shares that budget, so a session that has proven only the password
-can reach `POST /ui/mfa` or `POST /ui/reauth/webauthn` and read when the account's oldest ceremony
-in the window ran, including the real user's from another session.
+**The PHI-read `Retry-After` is the caller's real wait; the sign-in one is the whole window, and
+the ceremony one stays `30` (BACKLOG #3293).** The PHI-read `429` sends the wait of the limiter
+that refused, rounded the same way as the write floor's above: up to whole seconds, never below 1,
+in the engine process that refused. It is a reading, not a reservation. A caller that waits it out
+can still be refused if something else spends the room first: another read on the same account, or
+any account filling an all-accounts budget. It is the account's own wait, the same on the JSON API
+and under `require_ui(phi=True)`. While `phi_read_rate_limit_global` is on and spent, it sends the
+whole `phi_read_rate_limit_window_seconds`, rounded up, because the true wait would be set by other
+accounts' reads. **`POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` keep the
+constant `Retry-After: 30` (a Lander decision under the owner's Driver delegation, 2026-10-20).** A
+caller that holds only the password can reach `POST /ui/mfa`, and the exact per-account wait would
+give it exact pacing for second-factor guesses. The constant discloses none.
 **`POST /ui/login` sends the whole `login_rate_limit_window_seconds`, rounded up, never the
 bucket's own wait (owner ruling 2026-10-20).** It is unauthenticated, and clients that share an
 address (users behind NAT or an untrusted proxy, or every client with no address, counted as
 `"unknown"`) share one bucket, so an exact wait would tell one of them when another's oldest
 attempt was made. The window discloses no per-bucket timing, and it is never too early: the
-bucket's oldest attempt leaves within it. Before this, the PHI-read `429` sent a
-literal `10` and those four console routes a literal `30`, each against a default 60 s window, so a
-client that honoured either could have retried too early. The routes that send no `Retry-After`
+bucket's oldest attempt leaves within it. Before this, the PHI-read `429` sent a literal `10` and
+`POST /ui/login` a literal `30`, each against a default 60 s window, so a client that honoured
+either could have retried too early. The routes that send no `Retry-After`
 are unchanged; the [Route → limiter map](#route--limiter-map) names them.
 
 **The console's refusal differs from the JSON floor's.** `require_ui` writes no WARNING line naming
@@ -5648,7 +5647,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |
 | `POST /me/reauth` | per-actor ceremony budget | |
 | `POST /me/mfa/confirm` | per-actor ceremony budget | |
-| `POST /ui/reauth`, `POST /ui/reauth/webauthn` | per-actor ceremony budget | the only route that finishes a WebAuthn assertion is the second one; **both carry a `Retry-After` naming the account's wait** on the 429 (the first as an `HTTPException` header, the second on a `JSONResponse`) |
+| `POST /ui/reauth`, `POST /ui/reauth/webauthn` | per-actor ceremony budget | the only route that finishes a WebAuthn assertion is the second one; **both carry `Retry-After: 30`** on the 429 (the first as an `HTTPException` header, the second on a `JSONResponse`) |
 | `POST /ui/reauth/oidc` | per-actor ceremony budget | registered only with federation on; the federated step-up's start leg (BACKLOG #296). Its 429 re-renders the step-up page and carries **no** `Retry-After`. The IdP's return lands on `GET /ui/oidc/callback`, which charges the sign-in window as above |
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
@@ -5658,8 +5657,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
-seam digest, so no such engine mounts it, and the shim went with BACKLOG #3293: its 429s read the
-ceremony limiter's wait, which a fallback charging the sign-in budget would have misreported.
+seam digest, so no such engine mounts it; the shim was unreachable, and BACKLOG #3293 removed it.
 
 ### Business-logic limits (ASVS 2.1.3)
 
@@ -5683,7 +5681,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Limit | Setting(s) | Default | Window | Per-user | Global | Per-IP | Scope | On breach |
 |---|---|---|---|---|---|---|---|---|
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + a `Retry-After` of the whole sign-in window on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
-| Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 6 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`, `POST /ui/account/webauthn/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; a `Retry-After` naming the account's wait on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify`, `POST /ui/account/webauthn/verify` or `POST /ui/account/password`; logged |
+| Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 6 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`, `POST /ui/account/webauthn/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify`, `POST /ui/account/webauthn/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). While the credential in force is engine-generated (an administrator's account creation and both resets set it), a sign-in failure is still counted and audited but arms no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); the second-step lock arms as usual. The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — on the password leg the uniform `auth.login_failed` (`bad_credentials`) row and then `auth.login_locked`, which only `users:manage` reads (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, 1 further `/ui` GET that inherits the charge by delegating into the handler body, and the `reveal` act on the monitoring JSON routes that carry one (at least `GET /events`, `GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and `GET /connections/{name}/metadata`), charged at admission (BACKLOG #2443) | 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent); logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + a `Retry-After` naming the actor's wait, logged. `/ui`: the same 429 + `Retry-After`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |

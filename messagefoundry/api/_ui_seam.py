@@ -615,12 +615,17 @@ from typing import Any
 #: 1f2d208818510f18. Neither parent's value covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers both entries above.
 #:
+#: Vault BACKLOG #3293, later: a Lander decision under the owner's Driver delegation (2026-10-20)
+#: kept the constant ``Retry-After: 30`` on ``/ui/mfa``, ``/ui/reauth`` and
+#: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
+#: removed. The digest moved again; re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "59f365a69d997684"
+ENGINE_UI_SEAM: str = "7f01058f7699dfe8"
 
 
 @dataclass(frozen=True, slots=True)

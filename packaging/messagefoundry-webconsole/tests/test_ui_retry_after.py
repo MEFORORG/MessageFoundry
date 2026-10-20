@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #3293 -- the console's PHI-read, sign-in and ceremony 429s stop sending literals.
+"""BACKLOG #3293 -- what the console's PHI-read, sign-in and ceremony 429s send as Retry-After.
 
-They sent ``Retry-After: 10`` on a ``require_ui(phi=True)`` view, and ``Retry-After: 30`` on
-``POST /ui/login``, ``/ui/mfa``, ``/ui/reauth`` and ``/ui/reauth/webauthn``, against a 60 s window.
-A client that honoured either would have retried inside the window and been refused again. The
-authenticated routes now send the caller's own wait, as BACKLOG #2144 did for the admin-write
-floor (``test_ui_admin_write_pacing.py``). ``POST /ui/login`` sends the whole sign-in window
-(owner ruling 2026-10-20): it is unauthenticated, and an exact wait would disclose the timing of
-other callers sharing its per-address bucket.
+A ``require_ui(phi=True)`` view sent a literal ``Retry-After: 10`` and ``POST /ui/login`` a literal
+``30``, against a 60 s window, so a client that honoured either would have retried inside the window
+and been refused again. The PHI view now sends the account's own wait, as BACKLOG #2144 did for the
+admin-write floor (``test_ui_admin_write_pacing.py``). ``POST /ui/login`` sends the whole sign-in
+window (owner ruling 2026-10-20). ``POST /ui/mfa``, ``/ui/reauth`` and ``/ui/reauth/webauthn`` keep
+the constant ``30`` (a Lander decision under the owner's Driver delegation, 2026-10-20).
+docs/SECURITY.md gives the reasons.
 
-Every window here is 37.5 s, not the shipped 60 s, so neither retired literal can pass by matching.
+Every window here is 37.5 s, not the shipped 60 s, so no literal can pass by matching an exact wait.
 The limiter's own clock is faked, so no test sleeps. All data here is synthetic.
 """
 
@@ -114,41 +114,30 @@ async def test_phi_view_429_is_the_actors_wait_and_matches_the_json_gate(
         assert (await ui.get("/ui/messages")).status_code == 200  # the header was honest
 
 
-async def test_sign_in_429_is_the_whole_window_while_a_ceremony_429_is_the_exact_wait(
-    engine: Engine, clock: list[float]
-) -> None:
+async def test_sign_in_429_is_the_whole_window(engine: Engine, clock: list[float]) -> None:
     """Owner ruling 2026-10-20: ``POST /ui/login`` sends the whole sign-in window, rounded up, both
     when its per-address bucket has just filled and when it is about to drain. An exact wait would
-    read 18 and then 1 here. The control is a ceremony 429 on the same limiter knobs at the same
-    instants, which still sends the account's exact wait, so a constant cannot pass for both."""
+    read 18 and then 1 here; the PHI-view test above is the control that still reads exact waits."""
     service = await _service(
         engine,
         login_rate_limit_per_ip=2,
         login_rate_limit_global=1000,
         login_rate_limit_window_seconds=WINDOW,
     )
-    uid = await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
-        await _ui_login(c, "op")  # t=1000: this address's first sign-in attempt
-        assert service.allow_reauth_attempt(uid)  # and this account's first ceremony
 
         async def sign_in() -> httpx.Response:
             return await c.post(
                 "/ui/login", data={"username": "nobody", "password": PW}, headers=SAME_ORIGIN
             )
 
-        async def ceremony() -> httpx.Response:
-            return await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
-
+        assert (await sign_in()).status_code != 429  # t=1000
         clock[0] = 1010.0
         assert (await sign_in()).status_code != 429  # the address's budget is now spent
-        assert service.allow_reauth_attempt(uid)  # and so is the account's ceremony budget
-        for now, exact in ((1020.0, "18"), (1037.4, "1")):
+        for now in (1020.0, 1037.4):
             clock[0] = now
             refused = await sign_in()
             assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38"), now
-            control = await ceremony()
-            assert (control.status_code, control.headers["Retry-After"]) == (429, exact), now
 
 
 async def test_sign_in_429_on_a_full_all_clients_budget_is_the_whole_window(
@@ -185,12 +174,13 @@ _CEREMONIES: dict[str, Callable[[httpx.AsyncClient], Awaitable[httpx.Response]]]
 
 
 @pytest.mark.parametrize("route", sorted(_CEREMONIES))
-async def test_ceremony_429_is_the_accounts_wait(
+async def test_ceremony_429_is_the_constant_30(
     engine: Engine, clock: list[float], route: str
 ) -> None:
-    """The three console ceremony 429s that carried ``Retry-After: 30`` send the per-actor
-    ceremony budget's wait for this account. The budget is spent through the service, so the test
-    is about the header and not about what a failed ceremony does to the session."""
+    """The three console ceremony 429s send ``Retry-After: 30`` whatever the per-actor bucket
+    holds: just after it fills, where the exact wait would be 18, and just before it drains, where
+    it would be 1. The budget is spent through the service, so the test is about the header and not
+    about what a failed ceremony does to the session."""
     service = await _service(
         engine,
         login_rate_limit_per_ip=2,
@@ -198,14 +188,13 @@ async def test_ceremony_429_is_the_accounts_wait(
         login_rate_limit_window_seconds=WINDOW,
     )
     uid = await _add(service, "op", Role.OPERATOR)
-    other = await _add(service, "op2", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _ui_login(c, "op")
         assert service.allow_reauth_attempt(uid)  # t=1000
         clock[0] = 1010.0
         assert service.allow_reauth_attempt(uid)  # this account's ceremony budget is spent
-        clock[0] = 1020.0
-        assert service.allow_reauth_attempt(other)  # another account changes nothing here
-        refused = await _CEREMONIES[route](c)
-        assert refused.status_code == 429, (route, refused.status_code)
-        assert refused.headers["Retry-After"] == "18", route
+        for now in (1020.0, 1037.4):
+            clock[0] = now
+            refused = await _CEREMONIES[route](c)
+            assert refused.status_code == 429, (route, now, refused.status_code)
+            assert refused.headers["Retry-After"] == "30", (route, now)

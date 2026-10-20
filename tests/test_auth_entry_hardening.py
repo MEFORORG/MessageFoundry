@@ -214,8 +214,8 @@ async def test_login_retry_after_is_the_whole_window_whatever_the_bucket_holds(
 
 async def test_retry_after_floor_is_1_with_the_limiter_off(engine: Engine) -> None:
     # No refusal happens with the limiter off; the accessor answers its floor rather than raising.
-    off = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
-    assert off.reauth_retry_after("a") == 1
+    off = await _service(engine, AuthSettings(phi_read_rate_limit_enabled=False))
+    assert off.phi_read_retry_after("a") == 1
 
 
 def test_admin_write_count_refuses_a_negative_value_at_load() -> None:

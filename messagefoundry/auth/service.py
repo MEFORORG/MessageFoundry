@@ -3165,15 +3165,9 @@ class AuthService:
         unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
         one of them when another's oldest attempt was made. The whole window is never too early: a
         per-address bucket clears within it once nothing else spends it. The authenticated
-        PHI-read and ceremony 429s keep the exact wait."""
+        PHI-read 429 keeps the exact wait."""
         # _settings, not the settings property: that returns a deep copy, and this runs per refusal.
         return max(1, math.ceil(self._settings.login_rate_limit_window_seconds))
-
-    def reauth_retry_after(self, actor: str) -> int:
-        """The ``Retry-After`` value for a credential ceremony just refused by
-        :meth:`allow_reauth_attempt` for ``actor`` (BACKLOG #3293). The ceremony limiter has no
-        all-accounts budget, so this is always that account's own wait."""
-        return _retry_after_seconds(self._reauth_limiter, actor)
 
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).

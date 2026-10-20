@@ -131,14 +131,15 @@ this line.**
   `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
   next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:
   the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
-- **A throttled PHI view, sign-in or ceremony now says how long to wait.** A `require_ui(phi=True)`
-  view's `429` carried a literal `Retry-After: 10`, and `POST /ui/login`, `/ui/mfa`, `/ui/reauth`
-  and `/ui/reauth/webauthn` a literal `30`, against a default 60 s window. The PHI view and the
-  three ceremony routes now carry the caller's own wait from the limiter that refused, in whole
-  seconds, and the PHI view sends the value the JSON API sends. `POST /ui/login` carries the whole
-  sign-in window, so it discloses no per-bucket timing. Seam change: the console calls the new `AuthService.phi_read_retry_after`,
-  `login_retry_after` and `reauth_retry_after`, and calls `allow_reauth_attempt` directly; the
-  `getattr` fallback to the sign-in budget is gone. (vault BACKLOG #3293)
+- **A throttled PHI view or sign-in now says how long to wait.** A `require_ui(phi=True)` view's
+  `429` carried a literal `Retry-After: 10`, and `POST /ui/login` a literal `30`, against a default
+  60 s window. The PHI view now carries the account's own wait from the limiter that refused, in
+  whole seconds, the value the JSON API sends. `POST /ui/login` carries the whole sign-in window, so
+  it discloses no per-bucket timing. `POST /ui/mfa`, `/ui/reauth` and `/ui/reauth/webauthn` keep
+  the constant `Retry-After: 30`, so a caller holding only the password gets no exact pacing for
+  second-factor guesses. Seam change: the console calls the new `AuthService.phi_read_retry_after`
+  and `login_retry_after`, and calls `allow_reauth_attempt` directly; the unreachable `getattr`
+  fallback to the sign-in budget is gone. (vault BACKLOG #3293)
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an

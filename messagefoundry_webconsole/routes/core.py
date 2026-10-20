@@ -109,6 +109,12 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
+#: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
+#: ``/ui/reauth/webauthn``. A constant, not the bucket's exact wait (BACKLOG #3293; docs/SECURITY.md
+#: says why, once): a caller holding only the password can reach ``/ui/mfa``, and an exact wait
+#: would pace its second-factor guesses.
+_CEREMONY_RETRY_AFTER = "30"
+
 #: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
 #: ``verify_mfa``, ``reauth``, ``finish_webauthn_assertion``, ``confirm_mfa_enrollment`` or
 #: ``finish_webauthn_registration`` refused a directory account the directory did not confirm
@@ -1724,12 +1730,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity):
             # Same per-ACTOR ceremony budget the reauth/password flows draw on, so code-guessing
-            # here cannot outrun it either. Its Retry-After is that budget's own wait for this
-            # account (BACKLOG #3293), the value POST /ui/reauth sends for the same limiter.
+            # here cannot outrun it either. Same constant Retry-After as POST /ui/reauth.
             raise HTTPException(
-                429,
-                "too many attempts",
-                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
+                429, "too many attempts", headers={"Retry-After": _CEREMONY_RETRY_AFTER}
             )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
@@ -1885,9 +1888,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity):  # per-ACTOR, not the sign-in budget
             raise HTTPException(
-                429,
-                "too many attempts",
-                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
+                429, "too many attempts", headers={"Retry-After": _CEREMONY_RETRY_AFTER}
             )
 
         # Satisfy whichever factor is pending — TOTP first (mirrors require_step_up), then
@@ -2059,7 +2060,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return JSONResponse(
                 {"ok": False, "error": "too many attempts"},
                 status_code=429,
-                headers={"Retry-After": str(auth.reauth_retry_after(identity.user_id))},
+                headers={"Retry-After": _CEREMONY_RETRY_AFTER},
             )
         try:
             body = await request.json()

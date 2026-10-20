@@ -615,9 +615,8 @@ def allow_reauth_attempt(auth: AuthService, identity: Identity) -> bool:
     which let anyone able to reach the login page lock every signed-in operator out of step-up.
 
     It used to fall back to the sign-in budget through ``getattr`` on an engine without this method.
-    The console pins one engine seam digest, so no such engine mounts it, and the 429s this guards
-    read ``AuthService.reauth_retry_after``, the ceremony limiter's wait (BACKLOG #3293). A fallback
-    would have charged one limiter and reported the other's wait, so it is gone."""
+    The console pins one engine seam digest, so no such engine mounts it, and the fallback was
+    unreachable; BACKLOG #3293 removed it."""
     return auth.allow_reauth_attempt(identity.user_id)
 
 

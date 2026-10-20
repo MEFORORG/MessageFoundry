@@ -2328,7 +2328,8 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
     ``POST /ui/mfa`` (ASVS 6.3.3) joined the set deliberately: it submits a second factor for a
     session that has already proven its password, so it draws the SAME per-actor ceremony budget as
     ``POST /ui/reauth`` and must report the same clear-time. A different Retry-After on one limiter
-    would misreport when the budget actually recovers.
+    would misreport when the budget actually recovers. All three send the constant ``30``
+    (BACKLOG #3293; docs/SECURITY.md says why).
     """
     emitting = _retry_after_routes()
     assert emitting == {
@@ -2343,18 +2344,19 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
     text = _doc_text()
     for route in sorted(emitting):
         assert f"`{route}`" in text, f"{route} sends Retry-After but the doc does not name it"
-    # BACKLOG #3293: these routes send the caller's own wait, so the doc may not quote the literal
-    # anywhere. That also retires the older "`Retry-After: 30` on `POST /ui/login` only" falsehood.
-    assert "Retry-After: 30" not in text, (
-        "docs/SECURITY.md quotes the retired Retry-After: 30; the sign-in and ceremony 429s now "
-        "send the limiter's own wait"
-    )
+    # BACKLOG #3293: POST /ui/login sends the whole window now, so the literal 30 belongs only to
+    # the ceremony routes. Both older falsehoods stay retired.
+    for retired in (
+        "`Retry-After: 30` on `POST /ui/login` only",
+        "429 + `Retry-After: 30` on `POST /ui/login`",
+    ):
+        assert retired not in text, f"docs/SECURITY.md says {retired!r} again"
     ceremony = next(
         line
         for line in _section(_H_LIMITS).splitlines()
         if line.strip().startswith("| Credential ceremonies")
     )
-    assert "`Retry-After` naming the account's wait" in ceremony and "/ui/reauth" in ceremony, (
+    assert "Retry-After: 30" in ceremony and "/ui/reauth" in ceremony, (
         "the 2.1.3 'Credential ceremonies' On-breach cell must split the per-route consequence the "
         "same way the sign-in row does — control 3 cannot be documented less completely than 2."
     )
