@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
@@ -2673,9 +2674,13 @@ async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
         resp = await c.get("/security/posture", headers=vw)
     assert resp.status_code == 200
     body = resp.json()
-    # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
+    # The additive field is present and matches the pure helper's read-out; inherited before 3.15.
     assert body["kex_groups"] == kex_groups_report()
-    assert "inherited" in body["kex_groups"]
+    # The value itself is the kex tripwires' to read (tests/test_tls_policy.py), and on 3.15 they are
+    # PY315_TLS_TRIPWIRE expected failures. The route's contract, the equality above and the audit row
+    # below, still holds on 3.15, so only this line is version-conditioned rather than the whole test.
+    if sys.version_info < (3, 15):
+        assert "inherited" in body["kex_groups"]
     # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
     rows = await engine.store.list_audit(limit=20, action="security.posture_view")
     assert rows  # at least the read above was recorded

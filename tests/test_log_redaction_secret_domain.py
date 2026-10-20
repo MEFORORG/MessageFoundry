@@ -1431,8 +1431,21 @@ _MAX_GROWTH = 24.0
 #: ``.finditer`` loop: the same walk, the same cost, and an arm below that stays green while a second
 #: pass runs on every line. That arm checks this set COVERS every public callable of ``re.Pattern``,
 #: because a name dropped or misspelled here narrows the reading and reports nothing.
+#: ``prefixmatch`` is CPython 3.15's new name for ``match``. It is listed on 3.14 too, where it simply
+#: never fires: a member the runtime lacks is the harmless direction, as the coverage arm says.
 _PATTERN_APPLICATIONS = frozenset(
-    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+    {
+        "findall",
+        "finditer",
+        "fullmatch",
+        "match",
+        "prefixmatch",
+        "scanner",
+        "search",
+        "split",
+        "sub",
+        "subn",
+    }
 )
 
 

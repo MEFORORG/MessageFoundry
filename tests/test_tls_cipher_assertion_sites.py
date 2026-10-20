@@ -280,9 +280,12 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
         "- the assertion has started substituting a context instead of checking urllib's"
     )
 
-    # The ONE deliberate difference (BACKLOG #300): the TLS 1.2 list is the approved names, in order,
+    # The deliberate differences: the TLS 1.2 list is the approved names, in order (BACKLOG #300),
     # where urllib's default also carries the six CBC-SHA2 suites. TLS 1.3 is out of set_ciphers'
-    # reach, so it must still match urllib's exactly.
+    # reach, so it must match urllib's once the stock copy gets the same narrow_tls13_suites call the
+    # engine makes; that function's docstring says when the call changes anything.
+    narrowed = tls_policy.narrow_tls13_suites(stock)
+
     def tls13(ctx: ssl.SSLContext) -> list[str]:
         return [c["name"] for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
 
@@ -290,6 +293,8 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
         return [c["name"] for c in ctx.get_ciphers() if c["protocol"] != "TLSv1.3"]
 
     assert tls13(engine) == tls13(stock)
+    if narrowed:  # the comparison above would move with a wrong narrowing, so pin what it applied
+        assert tls13(engine) == list(tls_policy.APPROVED_TLS13_SUITES)
     assert tls12(engine) == list(tls_policy.APPROVED_TLS12_SUITES)
     assert engine.verify_mode == stock.verify_mode
     assert engine.check_hostname == stock.check_hostname

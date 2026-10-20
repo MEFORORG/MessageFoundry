@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import ssl
+import tomllib
 import types
 from collections.abc import Iterator
 from itertools import product
@@ -57,6 +58,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
     validate_tls_ciphers,
 )
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 
 # --- _is_forward_secret: deterministic classification, no OpenSSL dependency -------------------
@@ -148,6 +150,7 @@ def test_harden_does_not_raise_on_real_context() -> None:
     harden_kex_groups(ctx)  # must never raise, whatever the runtime can or cannot pin
 
 
+@PY315_TLS_TRIPWIRE
 def test_the_group_pin_is_inert_on_this_runtime_and_says_so() -> None:
     """A liveness receipt for ASVS 11.6.2 — written to FAIL on the interpreter upgrade.
 
@@ -229,6 +232,7 @@ def test_approved_groups_are_ecdhe_curves() -> None:
 
 
 # --- kex_groups_report: report-only KEX read-out (#338, ASVS 11.6.2) ----------------------------
+@PY315_TLS_TRIPWIRE
 def test_kex_groups_report_reports_inherited_today() -> None:
     """#338: the report-only KEX read-out says the approved groups are INHERITED on this runtime.
 
@@ -244,6 +248,31 @@ def test_kex_groups_report_reports_inherited_today() -> None:
     assert "inherited" in report  # nothing is pinned on a pre-3.15 interpreter
     assert APPROVED_KEX_GROUPS in report  # names the approved list it WOULD pin
     assert "pinned:" not in report  # the "pinned:" branch is 3.15-only
+
+
+def test_the_py315_tripwire_mark_has_not_outlived_the_314_floor() -> None:
+    """``PY315_TLS_TRIPWIRE`` is an expected failure on 3.15, which is acceptable only while 3.15 runs
+    nowhere but the advisory canary. Two changes would make it a permanent silent pass: a floor that
+    leaves 3.14, or a 3.15 leg in any other workflow (``requires-python`` already admits 3.15, so the
+    second needs no floor change). This reds on either, so the change that makes it does the
+    re-derivation. The canary itself is the positive control: the scan must find 3.15 there."""
+    workflows = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+    naming = {p.name for p in workflows.glob("*.yml") if "3.15" in p.read_text(encoding="utf-8")}
+    assert "py315-canary.yml" in naming, f"the scan of {workflows} did not find the canary"
+    assert naming == {"py315-canary.yml"}, (
+        f"{sorted(naming - {'py315-canary.yml'})} mention Python 3.15. If that is a CI leg, the marked "
+        "tests xfail there for good: do the re-derivation PY315_TLS_TRIPWIRE's reason names, then "
+        "remove the mark (tests/_py315_tripwires.py) and this test."
+    )
+    project = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    requires = project["project"]["requires-python"]
+    assert requires == ">=3.14", (
+        f"requires-python is now {requires!r}. If it no longer admits 3.14, do the re-derivation "
+        "PY315_TLS_TRIPWIRE's reason names, then remove the mark (tests/_py315_tripwires.py) and this "
+        "test. If it still admits 3.14, update the expected string here."
+    )
 
 
 # --- harden_verify_flags -----------------------------------------------------------------------

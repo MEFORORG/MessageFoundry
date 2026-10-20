@@ -95,6 +95,7 @@ from messagefoundry.transports import dicom, mllp, remotefile, rest, soap
 from messagefoundry.verify import smoke
 from tests._ast_sites import callee_name
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 # --- TLS codepoints (RFC 8446 section 4.2.3; RFC 5246 section 7.4.1.4.1) ----------------------------
 
@@ -831,6 +832,7 @@ def test_the_hello_parser_round_trips_an_offer_it_did_not_come_from() -> None:
 # --- the seam ----------------------------------------------------------------------------------------
 
 
+@PY315_TLS_TRIPWIRE
 def test_the_runtime_still_has_no_signature_algorithm_seam() -> None:
     """TRIPWIRE, in the ``harden_kex_groups`` style. CPython 3.15 adds ``set_client_sigalgs`` and
     ``set_server_sigalgs``. When this goes red, a real pin excluding rsa_pkcs1 has become possible
