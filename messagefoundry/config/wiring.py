@@ -478,7 +478,8 @@ def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
     """Refuse a ``tls_ca_pin`` that is malformed or that nothing would check (vault BACKLOG #2371).
 
     The pin is the SHA-256 of ``tls_ca_file``; ``auth/trust_anchors.py``, module item 9, says when
-    the engine checks it. A literal is refused here if it is blank or not a SHA-256 hex digest, so
+    the engine checks it. A literal is refused here if it is blank or ``parse_anchor_pin`` refuses
+    it (a malformed digest, or a digest prefix the release does not support, BACKLOG #3425), so
     ``messagefoundry check`` and a dry run catch it; an ``env()`` value is checked once it resolves.
     With no ``tls_ca_file`` there is nothing to check, so the config would read as pinned while
     nothing is. :meth:`Registry.dialling_pin_problems` refuses a pin whose hop never reads the CA,

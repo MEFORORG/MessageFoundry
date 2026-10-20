@@ -30,10 +30,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 2. An **optional SHA-256 fingerprint pin** per anchor. A configured pin that the PEM's SHA-256 does not
    match **refuses** — always, independent of the enforcement dial — at construction and at reload.
    A pin may name its digest, as ``sha256:<hex>``; a bare pin is read as SHA-256. Each audit row
-   names the digest of its fingerprint in ``algorithm``, and a row is compared only with one in
-   the same digest. So a release that changed the digest, and kept the old one compiled in, would
-   neither refuse a pin written for the old one nor record a false ``changed`` (BACKLOG #3425). A digest name this release does
-   not compile in is refused (:data:`ANCHOR_DIGESTS`).
+   names the digest of its fingerprint in ``algorithm``. The change check compares the anchor in
+   the digest of the newest row that names a compiled-in digest. So a release that changed the
+   digest, and kept the old one compiled in, would neither refuse a pin written for the old one
+   nor record a false ``changed`` (BACKLOG #3425). A digest name this release does not compile in
+   is refused (:data:`ANCHOR_DIGESTS`): a pin naming one refuses, and a row naming one is skipped.
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
    observed load's, a first-class ``auth.trust_anchor`` audit row is written (reusing
    :meth:`~messagefoundry.store.base.Store.record_audit`, mirroring the ``config_reload`` fingerprint row).
@@ -258,15 +259,19 @@ class AnchorDigest:
     hex_chars: int
 
 
-#: The digest this release fingerprints an anchor with. A bare pin, and an ``auth.trust_anchor`` row
-#: with no ``algorithm`` field (every row written before BACKLOG #3425), are read as this one.
+#: The digest this release fingerprints an anchor with.
 ANCHOR_DIGEST = "sha256"
+
+#: What a bare pin, and an ``auth.trust_anchor`` row with no ``algorithm`` field (every row written
+#: before BACKLOG #3425), are read as. It names what was written before the marker existed, so it
+#: stays SHA-256 when :data:`ANCHOR_DIGEST` moves.
+UNMARKED_DIGEST = "sha256"
 
 #: Every digest a pin or a stored observation may name: the ones compiled into this release, each
 #: with an arm in :func:`anchor_digest_hex`. A marker only chooses from this table and never reaches
 #: ``hashlib.new``, so a name the table does not hold is refused rather than computed. A release
 #: that changes :data:`ANCHOR_DIGEST` adds its digest here and keeps the old one, so a pin written
-#: for the old digest still matches.
+#: for the old digest still matches. :data:`UNMARKED_DIGEST` must stay in it.
 ANCHOR_DIGESTS: Mapping[str, AnchorDigest] = MappingProxyType(
     {"sha256": AnchorDigest("SHA-256", 64)}
 )
@@ -282,8 +287,8 @@ def anchor_digest_hex(algorithm: str, data: bytes) -> str:
     raise TrustAnchorError(f"the digest {algorithm!r} is not compiled into this release")
 
 
-class AnchorPin(NamedTuple):
-    """A parsed pin: the digest it names and its lowercase hex."""
+class Fingerprint(NamedTuple):
+    """Lowercase hex and the digest it is in: a parsed pin, or an audited observation."""
 
     algorithm: str
     digest: str
@@ -293,23 +298,25 @@ def _is_hex(text: str) -> bool:
     return bool(text) and all(c in "0123456789abcdef" for c in text)
 
 
-def parse_anchor_pin(pin: str) -> AnchorPin:
+def parse_anchor_pin(pin: str) -> Fingerprint:
     """Parse a configured pin. ``sha256:<hex>`` names its digest; a bare ``<hex>`` is read as
-    :data:`ANCHOR_DIGEST`, so every pin written before BACKLOG #3425 still reads. Either form takes
+    :data:`UNMARKED_DIGEST`, so every pin written before BACKLOG #3425 still reads. Either form takes
     any case and ``:`` between the hex pairs. A digest name this release does not hold, or hex of
     the wrong length, raises :class:`TrustAnchorError` (fail loud, never silently never-match).
 
-    The text before the first ``:`` is a marker only when it is not hex: a bare pin's first ``:``
-    separates two hex characters, and no digest name is spelled in hex alone."""
+    The text before the first ``:`` is a marker when it starts with a letter, is not two
+    characters long, and is not all hex. A bare pin's first ``:`` follows two hex characters, so a
+    typo in that pair, such as ``3g:9a:...``, still reads as a malformed pin."""
     cleaned = pin.strip().lower()
-    algorithm = ANCHOR_DIGEST
+    algorithm = UNMARKED_DIGEST
     head, sep, rest = cleaned.partition(":")
-    if sep and head and not _is_hex(head):
+    head = head.strip()
+    if sep and len(head) != 2 and head[:1].isalpha() and not _is_hex(head):
         if head not in ANCHOR_DIGESTS:
             raise TrustAnchorError(
                 f"a trust-anchor pin names the digest {head!r}, which this release does not "
-                f"support. Supported prefixes: {', '.join(sorted(ANCHOR_DIGESTS))}; a pin with "
-                f"no prefix is read as {ANCHOR_DIGEST}"
+                f"support. Supported prefixes: {', '.join(sorted(ANCHOR_DIGESTS))}. A pin with "
+                f"no prefix is read as {UNMARKED_DIGEST}. Got {pin!r}"
             )
         algorithm, cleaned = head, rest.strip()
     digest = cleaned.replace(":", "")
@@ -319,7 +326,7 @@ def parse_anchor_pin(pin: str) -> AnchorPin:
             f"a trust-anchor pin must be a {want.title} hex digest ({want.hex_chars} hex chars, "
             f"optional ':', optionally prefixed '{algorithm}:'); got {pin!r}"
         )
-    return AnchorPin(algorithm, digest)
+    return Fingerprint(algorithm, digest)
 
 
 def anchor_fingerprint(path: str | os.PathLike[str]) -> str:
@@ -865,7 +872,10 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     if spec.pin is not None:
         # The pin is compared in the digest it names (BACKLOG #3425), so a release that changes
         # ANCHOR_DIGEST still matches a pin written for the old one.
-        pin = parse_anchor_pin(spec.pin)
+        try:
+            pin = parse_anchor_pin(spec.pin)
+        except TrustAnchorError as exc:
+            raise TrustAnchorError(f"{spec.pin_setting or spec.setting}: {exc}") from exc
         same = pin.algorithm == ANCHOR_DIGEST
         seen = fingerprint if same else anchor_digest_hex(pin.algorithm, data)
         # Constant-time (ASVS 11.2.4, BACKLOG #1167). A CA's fingerprint is public, so this hides no
@@ -1592,33 +1602,33 @@ _STORE_CALL_DEFECTS: tuple[type[Exception], ...] = (
 )
 
 
-def _observed_fingerprint(label: str, detail: Mapping[str, Any]) -> str | None:
-    """The fingerprint of ``detail``, a row for ``label``, when it is in :data:`ANCHOR_DIGEST`.
+async def _last_fingerprint(store: Store, label: str) -> Fingerprint | None:
+    """The most-recently audited fingerprint for ``label``, with the digest it is in, or ``None`` if
+    this anchor has never been observed. Reads the ``auth.trust_anchor`` audit rows
+    (most-recent-first), a page at a time, and reads the first matching label's row. Each page ends
+    at the oldest timestamp of the one before, inclusively, so a row at that instant is read twice
+    and never skipped.
 
-    Observations are compared only within one digest (BACKLOG #3425), so a row in another digest
-    is no baseline, and the next check records ``observed`` rather than a false ``changed``, with a
-    WARNING. A row with no ``algorithm`` was written before the field existed, and is
-    :data:`ANCHOR_DIGEST`. The stored marker never selects a digest to compute."""
-    algorithm = detail.get("algorithm", ANCHOR_DIGEST)
-    if algorithm != ANCHOR_DIGEST:
-        log.warning(
-            "trust anchor %r: the last audited observation names the digest %s, not this "
-            "release's %s; it is not compared, and this check records a new baseline",
-            label,
-            ascii(algorithm)[:64],  # a stored value: kept short and printable
-            ANCHOR_DIGEST,
-        )
-        return None
-    fp = detail.get("fingerprint")
-    return fp if isinstance(fp, str) else None
+    A row with no ``algorithm`` was written before BACKLOG #3425 and is :data:`UNMARKED_DIGEST`. A
+    row naming a digest this release does not compile in is skipped, with one WARNING per call,
+    and the look-back goes on to an older row: the stored marker never selects a digest to compute,
+    and the anchor is still compared with the newest row it can read."""
+    skipped: set[str] = set()
+    try:
+        return await _last_readable_fingerprint(store, label, skipped)
+    finally:
+        if skipped:
+            log.warning(
+                "trust anchor %r: skipped audited observations in digests this release does not "
+                "support (%s); they are not compared",
+                label,
+                ", ".join(sorted(skipped)),
+            )
 
 
-async def _last_fingerprint(store: Store, label: str) -> str | None:
-    """The most-recently audited fingerprint for ``label``, or ``None`` if this anchor has never been
-    observed, or if that row is in another digest (:func:`_observed_fingerprint`). Reads the
-    ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and reads the first
-    matching label's row. Each page ends at the oldest timestamp of the one before, inclusively, so
-    a row at that instant is read twice and never skipped."""
+async def _last_readable_fingerprint(
+    store: Store, label: str, skipped: set[str]
+) -> Fingerprint | None:
     until: float | None = None
     for _page in range(_FINGERPRINT_PAGES):
         try:
@@ -1635,8 +1645,14 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
                 detail = json.loads(detail_raw)
             except (ValueError, TypeError):
                 continue
-            if detail.get("label") == label:
-                return _observed_fingerprint(label, detail)
+            if not isinstance(detail, dict) or detail.get("label") != label:
+                continue
+            algorithm = detail.get("algorithm", UNMARKED_DIGEST)
+            if not isinstance(algorithm, str) or algorithm not in ANCHOR_DIGESTS:
+                skipped.add(ascii(algorithm)[:64])  # a stored value: kept short and printable
+                continue
+            fp = detail.get("fingerprint")
+            return Fingerprint(algorithm, fp) if isinstance(fp, str) else None
         if len(rows) < _FINGERPRINT_PAGE:
             return None
         oldest = float(rows[-1]["ts"])
@@ -1698,8 +1714,18 @@ async def _audit_verdict(
     else:
         if previous is None:
             await record("observed", fingerprint=verdict.fingerprint)
-        elif previous != verdict.fingerprint:
-            await record("changed", fingerprint=verdict.fingerprint, previous=previous)
+        else:
+            # Compared in the digest the earlier row is in (BACKLOG #3425), so a release that
+            # changed ANCHOR_DIGEST still sees a swap across the switch, and no false `changed`.
+            same = previous.algorithm == ANCHOR_DIGEST
+            now = (
+                verdict.fingerprint if same else anchor_digest_hex(previous.algorithm, verdict.data)
+            )
+            if now != previous.digest:
+                was = {} if same else {"previous_algorithm": previous.algorithm}
+                await record(
+                    "changed", fingerprint=verdict.fingerprint, previous=previous.digest, **was
+                )
     if verdict.pin_ok is False:
         await record("pin_mismatch", fingerprint=verdict.fingerprint)
     if verdict.acl_ok is False:
