@@ -236,6 +236,7 @@ certifi==2026.10.19 \
     # via
     #   httpcore
     #   httpx
+    #   messagefoundry
     #   requests
     #   signxml
 cffi==2.1.1 \

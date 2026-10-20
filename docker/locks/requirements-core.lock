@@ -62,6 +62,7 @@ certifi==2026.10.19 \
     # via
     #   httpcore
     #   httpx
+    #   messagefoundry
 cffi==2.1.1 \
     --hash=sha256:06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66 \
     --hash=sha256:0beceaabe56af686895136a2de78db54ecd8e4046b236b8fd6d6cb61389e9bf2 \

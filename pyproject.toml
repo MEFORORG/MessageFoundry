@@ -138,6 +138,7 @@ dependencies = [
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
     "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
     "truststore>=0.10",     # verify an https engine URL against the OS trust store (enterprise/AD-CS roots) — apiclient lazily imports it; base so the tray/monitor need no per-PC CA wrangling
+    "certifi>=2026.10.19",  # explicit floor — transitive via httpx/httpcore, whose specifiers admit the vulnerable releases; >=2026.10.19 drops the emSign ECC Root CA - G3 root (GHSA-6q48-6c7w-9gw2), so `pip install -U messagefoundry` cannot keep the vulnerable bundle
 ]
 
 # Shown on the PyPI sidebar; point at the PUBLIC repo/site (the wshallwshall repo is private).
