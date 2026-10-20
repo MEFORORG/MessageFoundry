@@ -487,12 +487,12 @@ def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
     if pin is None:
         return
     if isinstance(pin, str):
-        from messagefoundry.auth.trust_anchors import TrustAnchorError, _normalize_pin
+        from messagefoundry.auth.trust_anchors import TrustAnchorError, parse_anchor_pin
         from messagefoundry.config.settings import refuse_a_blank_anchor_pin
 
         refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
         try:
-            _normalize_pin(pin)
+            parse_anchor_pin(pin)
         except TrustAnchorError as exc:
             raise ValueError(f"{factory} tls_ca_pin: {exc}") from exc
     if ca is None or (isinstance(ca, str) and not ca.strip()):

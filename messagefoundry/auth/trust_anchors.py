@@ -29,6 +29,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    #1142). Item 6 says when it refuses.
 2. An **optional SHA-256 fingerprint pin** per anchor. A configured pin that the PEM's SHA-256 does not
    match **refuses** — always, independent of the enforcement dial — at construction and at reload.
+   A pin may name its digest, as ``sha256:<hex>``; a bare pin is read as SHA-256. Each audit row
+   names the digest of its fingerprint in ``algorithm``, and a row is compared only with one in
+   the same digest. So a release that changed the digest, and kept the old one compiled in, would
+   neither refuse a pin written for the old one nor record a false ``changed`` (BACKLOG #3425). A digest name this release does
+   not compile in is refused (:data:`ANCHOR_DIGESTS`).
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
    observed load's, a first-class ``auth.trust_anchor`` audit row is written (reusing
    :meth:`~messagefoundry.store.base.Store.record_audit`, mirroring the ``config_reload`` fingerprint row).
@@ -136,7 +141,8 @@ import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed t
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
@@ -207,7 +213,7 @@ class AnchorSpec:
     ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
     ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
-    is the optional configured SHA-256 pin (any case, optional ``:`` separators); ``pin_setting``
+    is the optional configured pin, as :func:`parse_anchor_pin` reads it; ``pin_setting``
     names where that pin is set, so a refusal can name the escape.
 
     With ``loads_verified_bytes`` True, the default, the consumer must load the bytes the check
@@ -244,13 +250,85 @@ class AnchorVerdict:
 # --- fingerprint --------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class AnchorDigest:
+    """One digest a pin or an audited observation may name (BACKLOG #3425)."""
+
+    title: str  # how a message spells it
+    hex_chars: int
+
+
+#: The digest this release fingerprints an anchor with. A bare pin, and an ``auth.trust_anchor`` row
+#: with no ``algorithm`` field (every row written before BACKLOG #3425), are read as this one.
+ANCHOR_DIGEST = "sha256"
+
+#: Every digest a pin or a stored observation may name: the ones compiled into this release, each
+#: with an arm in :func:`anchor_digest_hex`. A marker only chooses from this table and never reaches
+#: ``hashlib.new``, so a name the table does not hold is refused rather than computed. A release
+#: that changes :data:`ANCHOR_DIGEST` adds its digest here and keeps the old one, so a pin written
+#: for the old digest still matches.
+ANCHOR_DIGESTS: Mapping[str, AnchorDigest] = MappingProxyType(
+    {"sha256": AnchorDigest("SHA-256", 64)}
+)
+
+
+def anchor_digest_hex(algorithm: str, data: bytes) -> str:
+    """Lowercase hex of ``data`` under ``algorithm``, a key of :data:`ANCHOR_DIGESTS`.
+
+    Each arm calls ``hashlib`` by name, so the crypto inventory sees the hash and no stored or
+    configured name can select one. A name with no arm raises :class:`TrustAnchorError`."""
+    if algorithm == "sha256":
+        return hashlib.sha256(data).hexdigest()
+    raise TrustAnchorError(f"the digest {algorithm!r} is not compiled into this release")
+
+
+class AnchorPin(NamedTuple):
+    """A parsed pin: the digest it names and its lowercase hex."""
+
+    algorithm: str
+    digest: str
+
+
+def _is_hex(text: str) -> bool:
+    return bool(text) and all(c in "0123456789abcdef" for c in text)
+
+
+def parse_anchor_pin(pin: str) -> AnchorPin:
+    """Parse a configured pin. ``sha256:<hex>`` names its digest; a bare ``<hex>`` is read as
+    :data:`ANCHOR_DIGEST`, so every pin written before BACKLOG #3425 still reads. Either form takes
+    any case and ``:`` between the hex pairs. A digest name this release does not hold, or hex of
+    the wrong length, raises :class:`TrustAnchorError` (fail loud, never silently never-match).
+
+    The text before the first ``:`` is a marker only when it is not hex: a bare pin's first ``:``
+    separates two hex characters, and no digest name is spelled in hex alone."""
+    cleaned = pin.strip().lower()
+    algorithm = ANCHOR_DIGEST
+    head, sep, rest = cleaned.partition(":")
+    if sep and head and not _is_hex(head):
+        if head not in ANCHOR_DIGESTS:
+            raise TrustAnchorError(
+                f"a trust-anchor pin names the digest {head!r}, which this release does not "
+                f"support. Supported prefixes: {', '.join(sorted(ANCHOR_DIGESTS))}; a pin with "
+                f"no prefix is read as {ANCHOR_DIGEST}"
+            )
+        algorithm, cleaned = head, rest.strip()
+    digest = cleaned.replace(":", "")
+    want = ANCHOR_DIGESTS[algorithm]
+    if len(digest) != want.hex_chars or not _is_hex(digest):
+        raise TrustAnchorError(
+            f"a trust-anchor pin must be a {want.title} hex digest ({want.hex_chars} hex chars, "
+            f"optional ':', optionally prefixed '{algorithm}:'); got {pin!r}"
+        )
+    return AnchorPin(algorithm, digest)
+
+
 def anchor_fingerprint(path: str | os.PathLike[str]) -> str:
-    """Lowercase-hex SHA-256 of the anchor PEM's bytes.
+    """Lowercase-hex :data:`ANCHOR_DIGEST` of the anchor PEM's bytes.
 
     A missing/unreadable anchor raises the underlying :class:`OSError` — the engine already refuses to
     start on a missing/unreadable CA (``build_idp_opener`` / ``load_verify_locations`` do), and this
     preserves that fail-closed contract rather than masking it as a softer error."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return anchor_digest_hex(ANCHOR_DIGEST, Path(path).read_bytes())
 
 
 # --- the verified bytes as the text a TLS context loads (BACKLOG #1142, slice 2) -----------------
@@ -407,18 +485,6 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "that checks revocation reads its CRL from its own CRL setting"
         ) from exc
     return text
-
-
-def _normalize_pin(pin: str) -> str:
-    """A configured pin normalized to 64 lowercase hex chars. Accepts optional ``:`` separators and any
-    case. Raises :class:`TrustAnchorError` on a malformed pin (fail loud, never silently never-match)."""
-    cleaned = pin.strip().lower().replace(":", "")
-    if len(cleaned) != 64 or any(c not in "0123456789abcdef" for c in cleaned):
-        raise TrustAnchorError(
-            "a trust-anchor pin must be a SHA-256 hex digest (64 hex chars, optional ':'); "
-            f"got {pin!r}"
-        )
-    return cleaned
 
 
 # --- read-only DACL inspection (mirrors _secure_file's icacls mechanism, verify-only) -----------
@@ -794,13 +860,20 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     The file is read ONCE, and the verdict carries those bytes as ``data``, so a consumer can load
     what was hashed rather than open the file again (BACKLOG #1142, slice 2)."""
     data = Path(spec.path).read_bytes()
-    fingerprint = hashlib.sha256(data).hexdigest()
+    fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
     pin_ok: bool | None = None
     if spec.pin is not None:
+        # The pin is compared in the digest it names (BACKLOG #3425), so a release that changes
+        # ANCHOR_DIGEST still matches a pin written for the old one.
+        pin = parse_anchor_pin(spec.pin)
+        if pin.algorithm == ANCHOR_DIGEST:
+            seen = fingerprint
+        else:
+            seen = anchor_digest_hex(pin.algorithm, data)
         # Constant-time (ASVS 11.2.4, BACKLOG #1167). A CA's fingerprint is public, so this hides no
-        # secret; it keeps a short-circuit `==` off the pin check. Both sides are 64 lowercase hex
-        # chars: `hexdigest` emits that form, and `_normalize_pin` produces it or raises.
-        pin_ok = constant_time_equal(fingerprint, _normalize_pin(spec.pin))
+        # secret; it keeps a short-circuit `==` off the pin check. Both sides are lowercase hex of
+        # one digest: `hexdigest` emits that form, and `parse_anchor_pin` produces it or raises.
+        pin_ok = constant_time_equal(seen, pin.digest)
     path_check = anchor_path_verdict(spec.path)
     return AnchorVerdict(
         fingerprint=fingerprint,
@@ -1521,11 +1594,35 @@ _STORE_CALL_DEFECTS: tuple[type[Exception], ...] = (
 )
 
 
+def _observed_fingerprint(label: str, detail: Mapping[str, Any]) -> str | None:
+    """The fingerprint of ``detail``, a row for ``label``, when it is in :data:`ANCHOR_DIGEST`.
+
+    Observations are compared only within one digest (BACKLOG #3425), so a row in another digest
+    is no baseline, and the next check records ``observed`` rather than a false ``changed``. A row
+    with no ``algorithm`` was written before the field existed, and is :data:`ANCHOR_DIGEST`. A
+    marker this release does not compile in is refused the same way, with a WARNING: it never
+    selects a digest to compute."""
+    algorithm = detail.get("algorithm", ANCHOR_DIGEST)
+    if algorithm != ANCHOR_DIGEST:
+        if not isinstance(algorithm, str) or algorithm not in ANCHOR_DIGESTS:
+            log.warning(
+                "trust anchor %r: the last audited observation names the digest %s, which this "
+                "release does not support; it is not compared, and this check records a new "
+                "baseline",
+                label,
+                ascii(algorithm)[:64],  # a stored value: kept short and printable
+            )
+        return None
+    fp = detail.get("fingerprint")
+    return fp if isinstance(fp, str) else None
+
+
 async def _last_fingerprint(store: Store, label: str) -> str | None:
     """The most-recently audited fingerprint for ``label``, or ``None`` if this anchor has never been
-    observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and
-    returns the first matching label's fingerprint. Each page ends at the oldest timestamp of the one
-    before, inclusively, so a row at that instant is read twice and never skipped."""
+    observed, or if that row is in another digest (:func:`_observed_fingerprint`). Reads the
+    ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and reads the first
+    matching label's row. Each page ends at the oldest timestamp of the one before, inclusively, so
+    a row at that instant is read twice and never skipped."""
     until: float | None = None
     for _page in range(_FINGERPRINT_PAGES):
         try:
@@ -1543,8 +1640,7 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
             except (ValueError, TypeError):
                 continue
             if detail.get("label") == label:
-                fp = detail.get("fingerprint")
-                return fp if isinstance(fp, str) else None
+                return _observed_fingerprint(label, detail)
         if len(rows) < _FINGERPRINT_PAGE:
             return None
         oldest = float(rows[-1]["ts"])
@@ -1555,7 +1651,12 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
 
 
 async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -> None:
-    detail = json.dumps({"label": spec.label, "setting": spec.setting, "event": event, **extra})
+    fields: dict[str, object] = {"label": spec.label, "setting": spec.setting, "event": event}
+    fields.update(extra)
+    if "fingerprint" in extra:
+        # Every fingerprint this module writes is ANCHOR_DIGEST's; the row names it (BACKLOG #3425).
+        fields["algorithm"] = ANCHOR_DIGEST
+    detail = json.dumps(fields)
     try:
         await store.record_audit(AUDIT_ACTION, actor=None, detail=detail)
     except _STORE_CALL_DEFECTS:
