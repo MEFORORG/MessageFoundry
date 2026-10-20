@@ -79,7 +79,8 @@ YES, NO, NOT_RUN, INCONCLUSIVE = "YES", "NO", "NOT RUN", "INCONCLUSIVE"
 
 # secrets_dpapi.DpapiError carries the code only in its message, and this spike changes no product
 # code. If that wording changes, the code reads as None and the detail line still has the message.
-_WIN32_CODE = re.compile(r"Win32 error (\d+)")
+# ctypes.get_last_error() is signed, so an HRESULT such as NTE_BAD_KEY_STATE prints negative.
+_WIN32_CODE = re.compile(r"Win32 error (-?\d+)")
 _ADMINISTRATORS = "S-1-5-32-544"
 
 
@@ -111,13 +112,19 @@ def _token_probe() -> Any:
 
 
 def _attempt(call: Callable[[], bytes]) -> tuple[dict[str, Any], bytes | None]:
-    """Run one DPAPI call. The record never holds the bytes, only whether the call worked."""
+    """Run one DPAPI call. The record never holds the bytes, only whether the call worked.
+
+    Only what secrets_dpapi raises for a failed call is a measurement. Anything else is a defect in
+    this instrument, so it propagates and main() writes the traceback beside the reports.
+    """
+    dpapi = _dpapi()
     try:
         out = call()
-    except Exception as exc:  # every failure is the measurement, so it is recorded
+    except (dpapi.DpapiError, dpapi.DpapiUnavailable) as exc:
         text = f"{type(exc).__name__}: {exc}"
         found = _WIN32_CODE.search(text)
-        return {"ok": False, "error": text, "win32": int(found.group(1)) if found else None}, None
+        code = int(found.group(1)) & 0xFFFFFFFF if found else None
+        return {"ok": False, "error": text, "win32": code}, None
     return {"ok": True, "error": None, "win32": None}, out
 
 
@@ -142,33 +149,22 @@ def _protect(path: Path, *, machine_scope: bool) -> dict[str, Any]:
 
 
 def _facts() -> dict[str, Any]:
-    """Who this process runs as and what its token is. The judge checks every field.
+    """This process and its token, as read; the judge derives everything it checks from them.
 
-    Elevated means Administrators is in the token enabled, not deny-only: a standard user lacks it
-    and a filtered admin token holds it deny-only. The logon SID changes with each logon session,
-    so it shows whether a restart was a new logon. APPDATA is informational: where DPAPI keeps this
-    account's master keys, if its profile is loaded.
+    APPDATA is informational: where DPAPI keeps this account's master keys, if its profile is
+    loaded.
     """
     appdata = os.environ.get("APPDATA")
     facts: dict[str, Any] = {
         "pid": os.getpid(),
-        "elevated": None,
-        "logon_sid": None,
         "appdata": appdata,
         "protect_dir_exists": appdata is not None
         and (Path(appdata) / "Microsoft" / "Protect").is_dir(),
     }
     try:
-        token = _token_probe().read_token()
+        facts["token"] = _token_probe().read_token()
     except OSError as exc:
         facts["token"] = {"error": f"{type(exc).__name__}: {exc}"}
-        return facts
-    groups = token["groups"]
-    facts["token"] = token
-    facts["elevated"] = any(
-        g["sid"] == _ADMINISTRATORS and g["enabled"] and not g["deny_only"] for g in groups
-    )
-    facts["logon_sid"] = next((g["sid"] for g in groups if g["logon_id"]), None)
     return facts
 
 
@@ -252,9 +248,43 @@ def _held(controls: list[Control]) -> bool:
     return all(held for _, held, _ in controls)
 
 
-def _user(report: dict[str, Any]) -> object:
+def _groups(report: dict[str, Any]) -> list[dict[str, Any]] | None:
     token = report.get("token")
-    return token.get("user") if isinstance(token, dict) else None
+    groups = token.get("groups") if isinstance(token, dict) else None
+    return groups if isinstance(groups, list) else None
+
+
+def _elevated(report: dict[str, Any]) -> bool | None:
+    """Administrators in the token enabled, not deny-only. A standard user lacks it; a filtered
+    admin token holds it deny-only. None when no token was read."""
+    groups = _groups(report)
+    if groups is None:
+        return None
+    return any(
+        g.get("sid") == _ADMINISTRATORS and g.get("enabled") and not g.get("deny_only")
+        for g in groups
+    )
+
+
+def _logon_sid(report: dict[str, Any]) -> str | None:
+    """The token's logon SID, which a new logon session changes."""
+    found = [g.get("sid") for g in _groups(report) or [] if g.get("logon_id")]
+    return str(found[0]) if found else None
+
+
+def _not_elevated(report: dict[str, Any], label: str) -> Control:
+    found = _elevated(report)
+    return (f"{label} was not elevated", found is False, f"Administrators enabled={found}")
+
+
+def _account_token(report: dict[str, Any], sid: str, privileges: list[str]) -> Control:
+    """The token the installer gives a service run as another account (SID type none)."""
+    label = f"the other report ran as {sid} with the installer's token for such an account"
+    token = report.get("token")
+    if not isinstance(token, dict):
+        return (label, False, "no token was read")
+    problems = _token_probe().privilege_problems(token, account_sid=sid, privileges=privileges)
+    return (label, not problems, "; ".join(problems) or "ok")
 
 
 def _service_token(report: dict[str, Any], label: str, sid: str, privileges: list[str]) -> Control:
@@ -290,7 +320,7 @@ def judge_reports(
 
     q1_controls = [
         _service_token(s1, "start 1", owner_sid, privileges),
-        ("start 1 was not elevated", s1.get("elevated") is False, f"elevated={s1.get('elevated')}"),
+        _not_elevated(s1, "start 1"),
     ]
     protect, unprotect1 = s1.get("user_protect"), s1.get("user_unprotect")
     if not start1:
@@ -320,11 +350,12 @@ def judge_reports(
             f"Q1={q1}, copy byte-identical={user_copy_identical}",
         ),
         (
-            f"the other report ran as {other_sid}, an account other than the owner's",
-            _user(o) == other_sid and other_sid != owner_sid,
-            f"it ran as {_user(o)}",
+            "the other account is not the owner",
+            other_sid != owner_sid,
+            f"{other_sid} vs {owner_sid}",
         ),
-        ("the other account was not elevated", o.get("elevated") is False, f"{o.get('elevated')}"),
+        _account_token(o, other_sid, privileges),
+        _not_elevated(o, "the other account"),
         (
             "the other account opened the owner's MACHINE-scope blob",
             machine_copy_identical and _opened(o.get("foreign_machine_blob")),
@@ -357,9 +388,14 @@ def judge_reports(
     q3_controls = [
         ("the blob was valid at start 1 (Q1 is YES)", q1 == YES, f"Q1={q1}"),
         ("start 2 is the second start", s2.get("start") == 2, f"start={s2.get('start')}"),
+        # A new logon session, not only a new process id (ids are reused): the same session could
+        # answer from a master key it already holds, which would not show a restart.
         (
-            "start 2 is a new process",
-            s1.get("pid") != s2.get("pid"),
+            "start 2 is a new logon session",
+            _logon_sid(s1) is not None
+            and _logon_sid(s2) is not None
+            and _logon_sid(s1) != _logon_sid(s2),
+            f"logon SID {_logon_sid(s1)} then {_logon_sid(s2)}, "
             f"pid {s1.get('pid')} then {s2.get('pid')}",
         ),
         (
@@ -380,10 +416,7 @@ def judge_reports(
         q3, q3_detail = INCONCLUSIVE, "a control did not hold"
     elif _opened(unprotect2):
         q3 = YES
-        q3_detail = (
-            "the restarted service opened the blob; logon SID "
-            f"{s1.get('logon_sid')} then {s2.get('logon_sid')}"
-        )
+        q3_detail = "the restarted service, in a new logon session, opened the blob"
     elif _dpapi_refused(unprotect2) or _ok(unprotect2):
         q3 = NO
         q3_detail = f"the restarted service did not get PAYLOAD back: {_why(unprotect2)}"
@@ -427,7 +460,8 @@ def render(answers: list[Answer], *, image: str, os_build: str, accounts: str) -
     for a in answers:
         lines.append(f"DPAPI-SPIKE {image} {a.key} {a.question}: {a.answer}")
         lines.append(f"DPAPI-SPIKE {image} {a.key} detail: {a.detail}")
-        for name, held, why in a.controls:
+        # A NOT RUN answer was never measured, so its controls would read as failures that are not.
+        for name, held, why in () if a.answer == NOT_RUN else a.controls:
             lines.append(
                 f"DPAPI-SPIKE {image} {a.key} control {'HELD' if held else 'FAILED'}: {name} ({why})"
             )

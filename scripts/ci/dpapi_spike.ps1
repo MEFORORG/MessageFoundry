@@ -6,9 +6,11 @@
   builds nothing (vault BACKLOG #3411, wave 3.0).
 
 .DESCRIPTION
-  RUN ONLY ON A THROWAWAY HOSTED RUNNER. It registers two Windows services, creates a local user,
-  grants that user "Log on as a service" and writes under C:\. .github/workflows/dpapi-spike.yml is
-  the only caller. Never run it on a machine you keep.
+  RUN ONLY ON A THROWAWAY HOSTED RUNNER. .github/workflows/dpapi-spike.yml is the only caller. Never
+  run it on a machine you keep. It changes at least these: two Windows services, a local user and its
+  profile, "Log on as a service" for both run-as accounts, an NSSM download into an
+  administrator-only folder under Program Files, and folders under C:\. The finally block removes
+  the services and the user, and nothing else: the runner is thrown away after the job.
 
   The questions it answers, and what it leaves out, are in that workflow's header.
   scripts/ci/dpapi_spike_worker.py does the DPAPI calls, as each service, and judge_reports() there
@@ -170,7 +172,8 @@ function Register-SpikeService {
 function New-SpikeFolder([string]$Path, [string]$Grantee) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
     # The grant is to the account by name. Under the owner's restricted service SID that is the
-    # service SID itself, the one grant a write-restricted token still counts.
+    # service SID itself, which is on the write-restricted token's restricting list, so the grant
+    # counts for a write. A grant to Users would not.
     & icacls $Path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "${Grantee}:(OI)(CI)M" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls on $Path failed (exit $LASTEXITCODE)" }
 }
@@ -254,7 +257,8 @@ try {
     }
     Remove-LocalUser -Name $OtherUser -ErrorAction SilentlyContinue
 }
-if ($judged -ne 0) { throw "the judge found an answer the instrument could not give (exit $judged); read the DPAPI-SPIKE lines" }
+if ($judged -eq 1) { throw "the judge found an answer the instrument could not give; read the DPAPI-SPIKE lines" }
+if ($judged -ne 0) { throw "the judge itself failed (exit $judged), so no answer was judged; read its output above" }
 # The runner's powershell wrapper exits with $LASTEXITCODE, which the tidy-up's sc.exe set last. The
 # answers are in; a failed tidy-up on a runner about to be thrown away must not turn them red.
 $global:LASTEXITCODE = 0

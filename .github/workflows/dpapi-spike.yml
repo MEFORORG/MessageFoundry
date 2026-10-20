@@ -5,7 +5,7 @@
 # the Windows default wrap for the master key, and names three questions to run first. This job runs
 # them on both hosted Windows Server images, against a real service registered the way
 # scripts/service/install-service.ps1 registers the engine (virtual account NT SERVICE\<name>,
-# restricted service SID, one privilege), installed through the pinned and checked NSSM:
+# restricted service SID, the installer's privilege list), installed through the pinned and checked NSSM:
 #
 #   Q1  user-scope CryptProtectData, then CryptUnprotectData, as the same service. The round trip is
 #       also what proves the blob valid for the next two.
@@ -62,7 +62,7 @@ jobs:
     name: dpapi spike (${{ matrix.os }})
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
-    # The rig's own waits come to about five minutes. The NSSM download is uncached here, unlike
+    # The rig's own waits come to about six minutes (three 90-second report waits, three 30-second stops). The NSSM download is uncached here, unlike
     # windows-service-smoke's, and Save-PinnedNssm bounds a stalled source only by a read timeout of
     # about five minutes on Windows PowerShell 5.1, so two stalled sources need room too.
     timeout-minutes: 20

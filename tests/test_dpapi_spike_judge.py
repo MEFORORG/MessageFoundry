@@ -33,6 +33,7 @@ _INSTALLER = _REPO / "scripts" / "service" / "install-service.ps1"
 OWNER_SID = "S-1-5-80-1111111111-2222222222-3333333333-4444444444-555555555"
 OTHER_SID = "S-1-5-21-1000000001-1000000002-1000000003-1001"
 SYSTEM_SID = "S-1-5-18"
+ADMINS = "S-1-5-32-544"
 PRIVILEGES = ["SeChangeNotifyPrivilege"]
 
 
@@ -62,7 +63,7 @@ def _refused() -> dict[str, Any]:
         "read": True,
         "blob_len": 294,
         "matches": False,
-        "error": "DpapiError: CryptUnprotectData failed (Win32 error 2148073483)",
+        "error": "DpapiError: CryptUnprotectData failed (Win32 error -2146893813)",
         "win32": 2148073483,
     }
 
@@ -75,11 +76,22 @@ def _unread() -> dict[str, Any]:
     return {"ok": False, "read": False, "error": "could not read user.blob: [Errno 13]"}
 
 
-def _token(user: str, *, restricted: bool) -> dict[str, Any]:
+def _group(
+    sid: str, *, enabled: bool = True, deny_only: bool = False, logon: bool = False
+) -> dict[str, Any]:
+    return {"sid": sid, "enabled": enabled, "deny_only": deny_only, "logon_id": logon}
+
+
+def _token(user: str, *, restricted: bool, logon: str = "S-1-5-5-0-1") -> dict[str, Any]:
     """The shape service_token_probe.read_token returns."""
     return {
         "user": user,
-        "groups": [],
+        # Users, and a deny-only Administrators as a filtered admin token holds it: not elevated.
+        "groups": [
+            _group("S-1-5-32-545"),
+            _group(ADMINS, enabled=False, deny_only=True),
+            _group(logon, logon=True),
+        ],
         "privileges": list(PRIVILEGES),
         "restricting_sids": [user, "S-1-1-0"] if restricted else [],
         "flags": 8 if restricted else 0,
@@ -92,9 +104,7 @@ def _good() -> dict[str, Any]:
         "role": "owner",
         "start": 1,
         "pid": 100,
-        "token": _token(OWNER_SID, restricted=True),
-        "elevated": False,
-        "logon_sid": "S-1-5-5-0-1",
+        "token": _token(OWNER_SID, restricted=True, logon="S-1-5-5-0-1"),
         "user_protect": _ok(blob_len=294),
         "machine_protect": _ok(blob_len=294),
         "user_unprotect": _opened(),
@@ -103,16 +113,13 @@ def _good() -> dict[str, Any]:
         "role": "owner",
         "start": 2,
         "pid": 200,
-        "token": _token(OWNER_SID, restricted=True),
-        "elevated": False,
-        "logon_sid": "S-1-5-5-0-2",
+        "token": _token(OWNER_SID, restricted=True, logon="S-1-5-5-0-2"),
         "user_unprotect": _opened(),
     }
     other = {
         "role": "other",
         "pid": 300,
-        "token": _token(OTHER_SID, restricted=False),
-        "elevated": False,
+        "token": _token(OTHER_SID, restricted=False, logon="S-1-5-5-0-3"),
         "foreign_user_blob": _refused(),
         "foreign_machine_blob": _opened(),
         "own_protect": _ok(blob_len=294),
@@ -169,7 +176,7 @@ def _mutate(path: str, value: Any) -> dict[str, Any]:
         ),
         ("start1.token", {"error": "OSError: access denied"}, {"Q1": "INCONCLUSIVE"}),
         ("start1.token", None, {"Q1": "INCONCLUSIVE"}),
-        ("start1.elevated", True, {"Q1": "INCONCLUSIVE"}),
+        ("start1.token.groups", [_group(ADMINS)], {"Q1": "INCONCLUSIVE"}),
         ("start1", None, {"Q1": "INCONCLUSIVE", "Q2": "INCONCLUSIVE", "Q3": "INCONCLUSIVE"}),
         # Q1 measured NO: then there is no valid blob, so Q2 and Q3 are NOT RUN.
         ("start1.user_protect", _dpapi_failed(), {"Q1": "NO"}),
@@ -196,8 +203,10 @@ def _mutate(path: str, value: Any) -> dict[str, Any]:
             {"Q2": "INCONCLUSIVE"},
         ),
         ("other.token", None, {"Q2": "INCONCLUSIVE"}),
-        ("other.elevated", True, {"Q2": "INCONCLUSIVE"}),
-        ("other.elevated", None, {"Q2": "INCONCLUSIVE"}),
+        ("other.token.groups", [_group(ADMINS)], {"Q2": "INCONCLUSIVE"}),
+        ("other.token.groups", "not a list", {"Q2": "INCONCLUSIVE"}),
+        ("other.token.privileges", [*PRIVILEGES, "SeDebugPrivilege"], {"Q2": "INCONCLUSIVE"}),
+        ("other.token.write_restricted", True, {"Q2": "INCONCLUSIVE"}),
         ("other.foreign_machine_blob", _refused(), {"Q2": "INCONCLUSIVE"}),
         ("other.own_protect", {"ok": False, "error": "x", "win32": 5}, {"Q2": "INCONCLUSIVE"}),
         ("other.own_unprotect", _refused(), {"Q2": "INCONCLUSIVE"}),
@@ -209,7 +218,9 @@ def _mutate(path: str, value: Any) -> dict[str, Any]:
         ("other", None, {"Q2": "INCONCLUSIVE"}),
         # Q3: the restart must be a second start, a new process, on the same hardened token.
         ("start2", None, {"Q3": "INCONCLUSIVE"}),
-        ("start2.pid", 100, {"Q3": "INCONCLUSIVE"}),
+        # The same logon session is not a restart, whatever the process id says.
+        ("start2.token.groups", [_group("S-1-5-5-0-1", logon=True)], {"Q3": "INCONCLUSIVE"}),
+        ("start2.token.groups", [], {"Q3": "INCONCLUSIVE"}),
         ("start2.start", 3, {"Q3": "INCONCLUSIVE"}),
         ("start2.token.user", SYSTEM_SID, {"Q3": "INCONCLUSIVE"}),
         ("start2.token.write_restricted", False, {"Q3": "INCONCLUSIVE"}),
@@ -237,6 +248,18 @@ def test_an_other_report_that_is_the_owner_itself_is_not_a_second_account() -> N
     assert _answers(case)["Q2"] == "INCONCLUSIVE"
 
 
+def test_a_pid_reused_across_the_restart_is_still_a_restart() -> None:
+    # Windows reuses process ids; the new logon session is what shows the restart.
+    assert _answers(_mutate("start2.pid", 100))["Q3"] == "YES"
+
+
+def test_the_code_reader_turns_a_signed_hresult_back_into_its_unsigned_code() -> None:
+    # ctypes.get_last_error() is signed, so secrets_dpapi prints NTE_BAD_KEY_STATE negative.
+    found = W._WIN32_CODE.search("CryptUnprotectData failed (Win32 error -2146893813); the key")
+    assert found is not None
+    assert int(found.group(1)) & 0xFFFFFFFF == 0x8009000B
+
+
 def test_the_render_prints_every_answer_control_and_the_reboot_arm() -> None:
     text = W.render(
         W.judge_reports(**_good()), image="windows-2022", os_build="20348", accounts="a, b"
@@ -247,7 +270,7 @@ def test_the_render_prints_every_answer_control_and_the_reboot_arm() -> None:
             line.startswith(f"DPAPI-SPIKE windows-2022 {key} ") and line.endswith(": YES")
             for line in lines
         ), key
-    assert sum(" control HELD: " in line for line in lines) == 12
+    assert sum(" control HELD: " in line for line in lines) == 13
     assert not any(" control FAILED: " in line for line in lines)
     assert any("REBOOT arm: NOT RUN" in line and "hosted runners" in line for line in lines)
     # cp1252-safe: the summary is read on Windows consoles too.
@@ -299,6 +322,13 @@ def test_a_q1_no_is_a_finding_and_leaves_the_run_green(tmp_path: Path) -> None:
     text = summary.read_text(encoding="utf-8")
     assert "Q1 " in text and "as the service" in text
     assert sum(line.endswith(": NOT RUN") for line in text.splitlines()) == 2, text
+    # A NOT RUN answer prints no control lines: they would read as instrument failures.
+    assert not any(
+        line.startswith(
+            ("DPAPI-SPIKE windows-2025 Q2 control", "DPAPI-SPIKE windows-2025 Q3 control")
+        )
+        for line in text.splitlines()
+    ), text
 
 
 def test_a_copy_that_differs_on_disk_makes_the_run_red(tmp_path: Path) -> None:
@@ -330,7 +360,9 @@ $tree = $L::ParseFile($InstallerPath, [ref]$null, [ref]$null)
 $top = @($tree.EndBlock.Statements)
 $defs = @{}
 foreach ($f in @($top | Where-Object { $_ -is $fnType })) { $defs[$f.Name] = $f }
-$topVars = @($top | Where-Object { $_ -is $assign -and $_.Left -is
+# The installer's script parameters count too: in the rig a read of one is $null, or the rig's own
+# parameter of the same name.
+$topVars = @($tree.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) + @($top | Where-Object { $_ -is $assign -and $_.Left -is
   [System.Management.Automation.Language.VariableExpressionAst] } |
   ForEach-Object { $_.Left.VariablePath.UserPath })
 $gaps = @()
@@ -394,3 +426,12 @@ def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:
     # The control arm: Resolve-Nssm calls Get-FilePinProblem, so dropping it must be named.
     gaps = _lift_gaps(tmp_path, drop="Get-FilePinProblem")["gaps"]
     assert any("calls Get-FilePinProblem" in gap for gap in gaps), gaps
+
+
+def test_the_rig_waits_on_and_copies_the_names_the_worker_writes() -> None:
+    # The rig is PowerShell and cannot import the worker's constants, so they are pinned here.
+    rig = _RIG.read_text(encoding="utf-8")
+    names = [W.owner_report(1), W.owner_report(2), W.OTHER_REPORT, W.USER_BLOB, W.MACHINE_BLOB]
+    names += [W.FOREIGN_USER_BLOB, W.FOREIGN_MACHINE_BLOB]
+    missing = [name for name in names if f'"{name}"' not in rig]
+    assert not missing, f"scripts/ci/dpapi_spike.ps1 no longer names {missing}"
