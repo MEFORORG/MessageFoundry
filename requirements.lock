@@ -410,9 +410,9 @@ execnet==2.1.2 \
     --hash=sha256:63d83bfdd9a23e35b9c6a3261412324f964c2ec8dcd8d3c6916ee9373e0befcd \
     --hash=sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec
     # via pytest-xdist
-fastapi==0.143.0 \
-    --hash=sha256:1acffe48206a80917cf7dac21992b5c44b25384e8902bf745c1fd9dabcf6c51f \
-    --hash=sha256:3e9395fd35276425b61b516a31fdd7c77fe2af83e41b4da22e30696fb1304c5d
+fastapi==0.153.0 \
+    --hash=sha256:5dbf5dcf6cf86388326c147566077c56a14c55b0f1bef370195da98e724a503f \
+    --hash=sha256:77fbc9f41d2e5cd81f0c0a20482e627f8ebbb9b9005ac7586e415ee69dfea4ec
     # via messagefoundry
 fhir-core==1.1.11 \
     --hash=sha256:c726bd3da2b46292ddda5fa98330cde4707291ec33db8883779a2e0f539fec4b \
