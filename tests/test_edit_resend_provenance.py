@@ -38,6 +38,9 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus, Row
 from messagefoundry.store.crypto import (
     BODY_DIGEST_ALG,
+    BODY_DIGEST_KDF,
+    BODY_DIGEST_UNNAMED_ALG,
+    BODY_DIGEST_UNNAMED_KDF,
     audit_body_digests,
     generate_key,
     make_cipher,
@@ -73,10 +76,16 @@ def test_the_digest_is_keyed_reproducible_and_names_its_key() -> None:
     original, edited, key_id = got["original"], got["edited"], got["key_id"]
     assert isinstance(original, str) and isinstance(edited, str) and isinstance(key_id, str)
     assert original != edited
-    assert verify_audit_body_digest(cipher, ADT, key_id=key_id, digest=original)
-    assert verify_audit_body_digest(cipher, EDITED, key_id=key_id, digest=edited)
+    assert verify_audit_body_digest(
+        cipher, ADT, key_id=key_id, digest=original, alg=got["alg"], kdf=got["kdf"]
+    )
+    assert verify_audit_body_digest(
+        cipher, EDITED, key_id=key_id, digest=edited, alg=got["alg"], kdf=got["kdf"]
+    )
     # A guess that is not the body fails, and the digest is no plain hash anyone could recompute.
-    assert not verify_audit_body_digest(cipher, ADT, key_id=key_id, digest=edited)
+    assert not verify_audit_body_digest(
+        cipher, ADT, key_id=key_id, digest=edited, alg=got["alg"], kdf=got["kdf"]
+    )
     assert edited not in _plain_digests(EDITED) and original not in _plain_digests(ADT)
 
 
@@ -89,9 +98,16 @@ def test_without_the_store_key_the_digest_reveals_nothing() -> None:
     assert got is not None and isinstance(got["edited"], str) and isinstance(got["key_id"], str)
     theirs = audit_body_digests(other, edited=EDITED)
     assert theirs is not None and theirs["edited"] != got["edited"]
-    assert not verify_audit_body_digest(other, EDITED, key_id=got["key_id"], digest=got["edited"])
     assert not verify_audit_body_digest(
-        make_cipher(None), EDITED, key_id=got["key_id"], digest=got["edited"]
+        other, EDITED, key_id=got["key_id"], digest=got["edited"], alg=got["alg"], kdf=got["kdf"]
+    )
+    assert not verify_audit_body_digest(
+        make_cipher(None),
+        EDITED,
+        key_id=got["key_id"],
+        digest=got["edited"],
+        alg=got["alg"],
+        kdf=got["kdf"],
     )
 
 
@@ -100,7 +116,9 @@ def test_a_digest_still_verifies_after_the_key_rotates() -> None:
     got = audit_body_digests(make_cipher(old_key), edited=EDITED)
     assert got is not None and isinstance(got["edited"], str) and isinstance(got["key_id"], str)
     rotated = make_cipher(new_key, [old_key])
-    assert verify_audit_body_digest(rotated, EDITED, key_id=got["key_id"], digest=got["edited"])
+    assert verify_audit_body_digest(
+        rotated, EDITED, key_id=got["key_id"], digest=got["edited"], alg=got["alg"], kdf=got["kdf"]
+    )
 
 
 def test_a_blanked_body_digests_to_none_not_to_the_digest_of_nothing() -> None:
@@ -109,13 +127,73 @@ def test_a_blanked_body_digests_to_none_not_to_the_digest_of_nothing() -> None:
     assert got is not None and got["original"] is None and got["edited"] is not None
     # Checking the recorded null is an answer, not a crash.
     assert isinstance(got["key_id"], str)
-    assert not verify_audit_body_digest(cipher, ADT, key_id=got["key_id"], digest=got["original"])
-    assert not verify_audit_body_digest(cipher, ADT, key_id=got["key_id"], digest="not-hex")
+    assert not verify_audit_body_digest(
+        cipher, ADT, key_id=got["key_id"], digest=got["original"], alg=got["alg"], kdf=got["kdf"]
+    )
+    assert not verify_audit_body_digest(
+        cipher, ADT, key_id=got["key_id"], digest="not-hex", alg=got["alg"], kdf=got["kdf"]
+    )
 
 
 def test_a_body_named_like_a_field_is_refused() -> None:
     with pytest.raises(ValueError, match="collide"):
         audit_body_digests(make_cipher(generate_key()), key_id=EDITED)
+    with pytest.raises(ValueError, match="collide"):
+        audit_body_digests(make_cipher(generate_key()), kdf=EDITED)
+
+
+def test_the_digest_names_its_key_derivation_and_a_record_without_it_still_verifies() -> None:
+    """BACKLOG #3420: the record names both HKDF labels its key came through, beside ``alg``. A
+    record written before that, with no ``kdf``, is read as today's labels and still verifies."""
+    cipher = make_cipher(generate_key())
+    got = audit_body_digests(cipher, edited=EDITED)
+    assert got is not None and isinstance(got["edited"], str) and isinstance(got["key_id"], str)
+    assert got["kdf"] == BODY_DIGEST_KDF
+    assert (
+        "mefor/audit-chain/v1" in BODY_DIGEST_KDF
+        and "mefor/audit-body-digest/v1" in BODY_DIGEST_KDF
+    )
+    # As a record names them, and as one written before #3420 does not.
+    assert verify_audit_body_digest(
+        cipher, EDITED, key_id=got["key_id"], digest=got["edited"], alg=got["alg"], kdf=got["kdf"]
+    )
+    # A caller passes record.get(...), so a field the record does not carry arrives as None.
+    legacy = {k: v for k, v in got.items() if k != "kdf"}
+    assert verify_audit_body_digest(
+        cipher,
+        EDITED,
+        key_id=got["key_id"],
+        digest=got["edited"],
+        alg=legacy.get("alg"),
+        kdf=legacy.get("kdf"),
+    )
+    # What such a record is read as is a fixed name, not whatever this release writes.
+    assert (BODY_DIGEST_UNNAMED_ALG, BODY_DIGEST_UNNAMED_KDF) == (
+        "hmac-sha256",
+        "hkdf-sha256:mefor/audit-chain/v1,hkdf-sha256:mefor/audit-body-digest/v1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("alg", "kdf"),
+    [
+        ("hmac-sha3-256", BODY_DIGEST_KDF),  # an algorithm this release does not compile
+        (BODY_DIGEST_ALG, "hkdf-sha256:mefor/audit-chain/v2"),  # a label it does not derive under
+        ("sha256", BODY_DIGEST_KDF),  # a plain hash, which a digest record must never name
+        ("", ""),
+    ],
+)
+def test_a_digest_record_naming_another_scheme_is_refused(alg: object, kdf: object) -> None:
+    """An unknown scheme marker is refused even over the right body and digest. The control is the
+    same call with the names this release writes, which verifies."""
+    cipher = make_cipher(generate_key())
+    got = audit_body_digests(cipher, edited=EDITED)
+    assert got is not None and isinstance(got["edited"], str) and isinstance(got["key_id"], str)
+    common = {"key_id": got["key_id"], "digest": got["edited"]}
+    assert verify_audit_body_digest(
+        cipher, EDITED, **common, alg=BODY_DIGEST_ALG, kdf=BODY_DIGEST_KDF
+    )
+    assert not verify_audit_body_digest(cipher, EDITED, **common, alg=alg, kdf=kdf)
 
 
 # --- the origin column ------------------------------------------------------------------------------
@@ -276,8 +354,17 @@ async def test_the_audit_row_proves_what_was_sent(tmp_path: Path, payload: dict[
         assert digest["alg"] == BODY_DIGEST_ALG
         cipher = engine.store.cipher()
         kid = digest["key_id"]
-        assert verify_audit_body_digest(cipher, ADT, key_id=kid, digest=digest["original"])
-        assert verify_audit_body_digest(cipher, EDITED, key_id=kid, digest=digest["edited"])
+        assert verify_audit_body_digest(
+            cipher, ADT, key_id=kid, digest=digest["original"], alg=digest["alg"], kdf=digest["kdf"]
+        )
+        assert verify_audit_body_digest(
+            cipher,
+            EDITED,
+            key_id=kid,
+            digest=digest["edited"],
+            alg=digest["alg"],
+            kdf=digest["kdf"],
+        )
         # The row names the new message, and that message names the same operator.
         child = await engine.store.get_message(detail["new_message_id"])
         assert child is not None and child["raw"] == EDITED
