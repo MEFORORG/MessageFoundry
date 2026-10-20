@@ -132,7 +132,8 @@ param(
     # binds to a one-element array, which is why the existing callers that pass one path still work.
     [string[]]$TasksDir,
     # ABANDON THE WALK AND EXIT 3 if it has not finished within this many seconds. 0 = unbounded,
-    # which is the right default for a human at a prompt: a slow answer beats no answer.
+    # which is the right default for a human at a prompt: a slow answer beats no answer. Exit 3 also
+    # reports the cloud-session refusal after this param block, which prints nothing.
     #
     # It exists for the HOOK, which has the opposite need. collision_gate.ps1 spawns this script under
     # a harness timeout it does not control; when that timeout fires the hook process is killed, so it
@@ -168,6 +169,18 @@ param(
     # gain at 32. 1 or less runs the same body serially, which is what the tests pin against.
     [int]$ParallelLimit = 16
 )
+
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a read finds nothing there and the empty answer looks clean. CLAUDE.md
+# section 5, "A cloud session is a Builder in its own session"; tests/test_coord_cloud_refusal.py
+# holds the copies equal.
+# Exit 3 is this script's did-not-finish code (see -TimeBudgetSeconds), so a consumer
+# that reads the exit code, as collision_gate.ps1 does, takes a refusal as no all-clear. One that
+# reads only stdout, as session-context.ps1 does, sees nothing; neither hook loads in a cloud session.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('overlap.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\session-registry.ps1"

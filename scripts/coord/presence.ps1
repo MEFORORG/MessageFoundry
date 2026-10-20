@@ -85,6 +85,15 @@ param(
     [int]$StartSkewMinutes = 15
 )
 
+# A CLAUDE CODE CLOUD SESSION SEES NO OTHER SESSION THROUGH THIS SCRIPT: the config roots it scans are
+# the VM's own, so the roster lists nobody else and that empty answer looks like an empty repo. CLAUDE.md
+# section 5, "A cloud session is a Builder in its own session"; tests/test_coord_cloud_refusal.py
+# holds the line.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('presence.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s Claude config roots list no other session, so nothing was read.')
+    exit 3
+}
+
 $ErrorActionPreference = "Stop"
 
 # --- Registry access, the liveness fence, and the cwd -> worktree matcher ------------------------
