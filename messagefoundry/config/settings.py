@@ -3614,9 +3614,11 @@ class AuthSettings(_Section):
     # on local timing will not accept the number. That is why it is labelled provisional and why the
     # window is a setting.
     admin_write_rate_limit_enabled: bool = True
-    admin_write_rate_limit_per_actor: int = (
-        12  # max state-changing admin writes per actor per window
-    )
+    # Max state-changing admin writes per actor per window. 0 turns the count off (a loosening
+    # security_loosenings() names). A negative count is refused at load (BACKLOG #3293): the limiter
+    # read it as a budget of one write per window, a far tighter floor than any value an operator
+    # could have meant, and no loosening check reads a negative count.
+    admin_write_rate_limit_per_actor: int = Field(default=12, ge=0)
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
     admin_write_rate_limit_window_seconds: float = Field(
@@ -8248,7 +8250,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
-      before it is counted. A negative count refuses more, so it is not named. A NaN or infinite
+      before it is counted. A negative count refuses more, so it is not named; the admin-write
+      count refuses a negative value at load (BACKLOG #3293), so only the others reach here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.

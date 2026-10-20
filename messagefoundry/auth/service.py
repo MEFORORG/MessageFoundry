@@ -730,6 +730,18 @@ async def _sleep_until(deadline: float) -> None:
 _ACTION_STEP_UP_GRANT_MAX = 4096
 
 
+def _retry_after_seconds(limiter: SlidingWindowRateLimiter | None, key: str) -> int:
+    """A refusal's ``Retry-After``: ``limiter``'s wait for ``key``, rounded UP to whole seconds and
+    never below 1 (BACKLOG #2144, #3293). It is a reading, not a reservation. A client that waits
+    this long is admitted by THIS process's limiter only if nothing else spends the room first:
+    another attempt on the same key (callers can share one, such as an address behind NAT), or,
+    where the limiter has an all-callers budget, any other caller filling it. 1 when the limiter is
+    off, which no refusal reaches."""
+    if limiter is None:
+        return 1
+    return max(1, math.ceil(limiter.retry_after(key)))
+
+
 def _prune_grants(grants: dict[tuple[str, str], float], now: float) -> None:
     """Drop every expired entry from a per-action grant map (monotonic clock)."""
     for key in [k for k, deadline in grants.items() if deadline <= now]:
@@ -3167,14 +3179,35 @@ class AuthService:
 
         The wait until this actor's next write would be admitted: the rest of the window when the
         count fired, or the rest of the gap when the minimum interval did. Rounded UP and never
-        below 1, so a client that waits this long is admitted by THIS process's limiter, provided
-        the account makes no other write meanwhile. The limiter is in-process, so another engine
-        shard keeps its own count. It reflects this actor's own
+        below 1. This limiter has no all-actors budget, so a client that waits this long is
+        admitted by THIS process's limiter, provided the account makes no other write meanwhile;
+        that holds for no limiter with an all-callers budget. The limiter is in-process, so another
+        engine shard keeps its own count. It reflects this actor's own
         writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
         ``/ui`` console both send this value, so the same refusal reads the same on either."""
-        if self._admin_write_limiter is None:
-            return 1
-        return max(1, math.ceil(self._admin_write_limiter.retry_after(actor)))
+        return _retry_after_seconds(self._admin_write_limiter, actor)
+
+    def phi_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a PHI read just refused for ``actor`` (BACKLOG #3293).
+
+        Same rounding as :meth:`admin_write_retry_after`, on the PHI-read limiter, and a reading,
+        not a reservation (:func:`_retry_after_seconds`). While
+        ``phi_read_rate_limit_global`` is on and spent, it is the whole window, because the true wait
+        depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
+        API and the ``/ui`` console both send it."""
+        return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def login_retry_after(self) -> int:
+        """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:
+        the whole sign-in window, rounded UP to whole seconds, never below 1 (BACKLOG #3293).
+
+        A constant, never the bucket's own wait (owner ruling 2026-10-20). The sign-in surface is
+        unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
+        one of them when another's oldest attempt was made. The whole window is never too early: a
+        per-address bucket clears within it once nothing else spends it. The authenticated
+        PHI-read 429 keeps the exact wait."""
+        # _settings, not the settings property: that returns a deep copy, and this runs per refusal.
+        return max(1, math.ceil(self._settings.login_rate_limit_window_seconds))
 
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).

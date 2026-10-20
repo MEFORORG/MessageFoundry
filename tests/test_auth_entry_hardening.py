@@ -185,6 +185,48 @@ def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_j
         AuthSettings(admin_write_rate_limit_window_seconds=window)
 
 
+@pytest.mark.parametrize(("window", "expected"), [(37.5, 38), (60.0, 60), (0.2, 1)])
+async def test_login_retry_after_is_the_whole_window_whatever_the_bucket_holds(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, window: float, expected: int
+) -> None:
+    # BACKLOG #3293, owner ruling 2026-10-20: the sign-in 429 sends the whole window, rounded up and
+    # never below 1, so it carries no bucket's timing. It reads the same before any attempt, with
+    # the bucket full, and just before it drains.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    svc = await _service(
+        engine,
+        AuthSettings(
+            login_rate_limit_per_ip=1,
+            login_rate_limit_global=1000,
+            login_rate_limit_window_seconds=window,
+        ),
+    )
+    assert svc.login_retry_after() == expected
+    assert svc.allow_login_attempt(None)
+    assert not svc.allow_login_attempt(None)
+    assert svc.login_retry_after() == expected
+    clock[0] += window * 0.99
+    assert svc.login_retry_after() == expected
+
+
+async def test_retry_after_floor_is_1_with_the_limiter_off(engine: Engine) -> None:
+    # No refusal happens with the limiter off; the accessor answers its floor rather than raising.
+    off = await _service(engine, AuthSettings(phi_read_rate_limit_enabled=False))
+    assert off.phi_read_retry_after("a") == 1
+
+
+def test_admin_write_count_refuses_a_negative_value_at_load() -> None:
+    # BACKLOG #3293. A negative count loaded, and the limiter then read it as a budget of one write
+    # per window: a floor far tighter than any value an operator meant, and one no loosening check
+    # names. 0 still loads, as the named off value; the control shows the bound is not above 0.
+    with pytest.raises(ValidationError, match="admin_write_rate_limit_per_actor"):
+        AuthSettings(admin_write_rate_limit_per_actor=-1)
+    assert AuthSettings(admin_write_rate_limit_per_actor=0).admin_write_rate_limit_per_actor == 0
+
+
 # --- BACKLOG #2301 (ASVS 2.4.2): the minimum gap between two admin writes ----------------------
 
 
@@ -272,9 +314,10 @@ def test_limiter_retry_after_is_the_wait_of_the_gate_that_fired(
     clock[0] = 2037.5
     assert counted.retry_after("a") == 0.0
     assert counted.allow("a")
-    # A negative budget loads ([auth].admin_write_rate_limit_per_actor has no lower bound) and
-    # refuses every hit after a key's first. The wait must be a number, not an IndexError that
-    # would turn the 429 into a 500: here, until the one hit ages out.
+    # A negative budget still loads for the sign-in and PHI-read counts (only the admin-write
+    # count is refused at load, BACKLOG #3293) and refuses every hit after a key's first. The
+    # wait must be a number, not an IndexError that would turn the 429 into a 500: here, until
+    # the one hit ages out.
     negative = SlidingWindowRateLimiter(per_key=-1, glob=0, window_seconds=37.5)
     clock[0] = 3000.0
     assert negative.allow("a")
