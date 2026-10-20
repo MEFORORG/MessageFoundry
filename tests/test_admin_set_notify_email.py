@@ -168,8 +168,9 @@ def test_the_setter_unstrands_an_administrator_with_no_address(
     consistent with an app that starts whatever the store holds.
 
     ``provision-admin`` can no longer leave this state, since BACKLOG #1138 made ``--email``
-    required, so the Administrator is written through the service, as a store an earlier build
-    wrote would hold it. The old no-address invocation is pinned as refused here too.
+    required, and since #3391 the service refuses it too. So the Administrator is written through
+    the service and its address cleared after, the state a store an earlier build wrote can hold.
+    The old no-address invocation is pinned as refused here too.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()

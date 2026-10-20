@@ -142,7 +142,8 @@ async def forget_addresses(store: MessageStore, user_id: str) -> None:
     to write one since BACKLOG #3391, and no store method clears ``notify_email`` (its parameter is
     ``str``), so a test that needs that state on a provisioned account comes here. It goes through
     the SQLite store's own sealed-record writer, as every user write does, so the row still
-    verifies.
+    verifies. Only the account row changes: a provision audit row already written still reads
+    ``notified: true``, where an earlier build's no-address run wrote false.
     """
     async with _writer_guard(store._db, store._lock):
         written = await store._write_user(
@@ -159,21 +160,21 @@ async def provision_admin(
     password: str,
     notify_email: str | None,
     settings: AuthSettings | None = None,
-    totp: bool = True,
 ) -> ProvisionedAdministrator:
     """Provision an Administrator into ``store`` as ``provision-admin`` does, under ``settings``
-    (the shipped ones by default), enrolling TOTP unless ``totp`` is false.
+    (the shipped ones by default), enrolling TOTP exactly when they require MFA.
 
     ``notify_email=None`` leaves it with no address: the service is given :data:`PROVISION_EMAIL`,
     because it refuses none, and :func:`forget_addresses` then clears it. The state is one an
     admin-set-notify-email or start-gate test needs and the service will not write.
     """
-    outcome = await AuthService(store, settings or AuthSettings()).provision_first_administrator(
+    settings = settings or AuthSettings()
+    outcome = await AuthService(store, settings).provision_first_administrator(
         username=username,
         password=password,
         notify_email=PROVISION_EMAIL if notify_email is None else notify_email,
         actor="test",
-        **(provision_totp() if totp else {}),
+        **(provision_totp() if settings.require_mfa else {}),
     )
     if notify_email is None:
         await forget_addresses(store, outcome.user_id)

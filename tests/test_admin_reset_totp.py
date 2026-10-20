@@ -67,7 +67,6 @@ def _seed(
                 password=_PASSWORD,
                 notify_email=email,
                 settings=AuthSettings(require_mfa=not no_totp),
-                totp=not no_totp,
             )
             await store.create_session(
                 token_hash="synthetic-session-hash",

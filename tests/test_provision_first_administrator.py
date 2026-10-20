@@ -1686,6 +1686,33 @@ async def test_the_service_refuses_no_address_and_writes_nothing() -> None:
         await store.close()
 
 
+@pytest.mark.parametrize("notify_email", [PROVISION_EMAIL, None], ids=["address", "no-address"])
+async def test_the_pre_check_refuses_a_blank_name_first_as_the_write_does(
+    notify_email: str | None,
+) -> None:
+    """BACKLOG #3391 review: the pre-check asks in the write's order, so a blank name gets the name
+    refusal from both, whatever the address, and neither reads it as a go-ahead."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        with pytest.raises(FirstAdministratorRefused) as refused:
+            await service.provision_first_administrator(
+                username="   ",
+                password=_PASSWORD,
+                notify_email=notify_email,  # type: ignore[arg-type]
+                actor="test",
+                **provision_totp(),
+            )
+        assert "username is required" in str(refused.value)
+        assert await service.provision_refusal(
+            "   ",
+            notify_email=notify_email,  # type: ignore[arg-type]
+        ) == str(refused.value)
+        assert await store.count_users() == 0
+    finally:
+        await store.close()
+
+
 async def test_a_run_that_stopped_after_the_create_is_completed_by_the_same_command() -> None:
     """A run that stops after ``create_user`` leaves its own address on the row.
 
@@ -1752,6 +1779,11 @@ async def test_a_takeover_of_an_account_with_no_address_sends_nothing_and_says_s
             )
             await store._db.commit()
 
+        # The pre-check agrees with the write on this row (the control the #2288 test once held).
+        assert (
+            await service.provision_refusal("site-admin", notify_email="operator@example.invalid")
+            is None
+        )
         outcome = await service.provision_first_administrator(
             username="site-admin",
             password=_PASSWORD,
@@ -1923,7 +1955,9 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
 
 # The CLI half of BACKLOG #2288 (refuse a row holding an address without --email, before the
 # prompt) is now the parser's refusal of every run without --email (BACKLOG #1138), pinned by
-# test_cli_refuses_without_an_email_before_the_prompt_and_the_open. The service half stays above.
+# test_cli_refuses_without_an_email_before_the_prompt_and_the_open. The service half became the
+# service's refusal of every run with no address (BACKLOG #3391), pinned above by
+# test_the_service_refuses_no_address_and_writes_nothing.
 
 
 def test_cli_says_nobody_was_told_when_the_account_had_no_address(

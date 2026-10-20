@@ -16,7 +16,8 @@ ASYMMETRIC -- a control that failed on everything would not distinguish *"the pr
 deliverable admin"* from *"the predicate is just hard to satisfy"*:
 
 * the REAL first-administrator path yields True, and the same account with its address cleared
-  yields False (the defect, reproduced rather than described);
+  by a test-only store write yields False (the defect's state, which shipped code no longer
+  writes);
 * an administrator WITH an address yields True;
 * a non-administrator with an address still yields False -- so the predicate keys on the ROLE, not
   on "some mailbox exists somewhere", which is the scope the item asks for (``email`` is optional

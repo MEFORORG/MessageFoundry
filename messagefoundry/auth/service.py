@@ -2749,6 +2749,9 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " is nothing to provision -- create further accounts from the web console, and use"
     " `admin-unlock` if that administrator is locked out"
 )
+#: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
+#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391).
+_BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3589,7 +3592,7 @@ class AuthService:
         """
         username = username.strip()
         if not username:
-            raise FirstAdministratorRefused("a username is required and must not be blank")
+            raise FirstAdministratorRefused(_BLANK_USERNAME_REFUSAL)
         # Checked ONCE, so the two later readers (`users.email` and `notify_email`) cannot disagree.
         notify_email = provision_notify_email(notify_email)
         usable, standing_admins = await self._administrator_standing()
@@ -3947,7 +3950,8 @@ class AuthService:
         BACKLOG #2288 once refused here a row holding a notification address when no address was
         given, so an address nobody chose was never kept. Every caller now gives one, checked by
         :func:`provision_notify_email` before this runs (BACKLOG #1138, #3391), so that refusal
-        could not fire and is gone. The stored address is replaced, and its holder is told."""
+        could not fire and is gone. The stored address is replaced, and a takeover notice goes to
+        it where a notice channel is wired (``holder_notice`` records whether one did)."""
         if existing.auth_provider != AuthProvider.LOCAL.value:
             return (
                 f"{username!r} is a {existing.auth_provider} account -- provision a separate "
@@ -3974,6 +3978,9 @@ class AuthService:
         own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
         checked here as the write checks it (BACKLOG #1138, #3391)."""
         name = username.strip()
+        # In the write's order: the name first, then the address.
+        if not name:
+            return _BLANK_USERNAME_REFUSAL
         try:
             provision_notify_email(notify_email)
         except FirstAdministratorRefused as exc:
