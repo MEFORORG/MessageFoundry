@@ -17,6 +17,7 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 from __future__ import annotations
 
 import importlib.util
+import io
 import re
 from pathlib import Path
 
@@ -762,8 +763,6 @@ def test_the_pr_body_detector_reports_no_value(sf) -> None:
 
 def test_the_pr_body_mode_exit_codes(sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """1 on a hit, 0 on a clean body, 2 when the instrument cannot read -- never 0 for "could not look"."""
-    import io
-
     dirty = tmp_path / "dirty.md"
     dirty.write_text(_PR_VERDICT_MUST_FIRE[0], encoding="utf-8")
     clean = tmp_path / "clean.md"
@@ -782,20 +781,25 @@ def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> Non
     """The body is attacker-controlled. It must reach the scanner through ``env:``, never as an Actions
     expression in a ``run:`` script, and the job must run on an edit as well as a push. The job is not a
     required context: making it one is a separate branch-protection decision."""
-    yaml = pytest.importorskip("yaml")
-    path = _REPO_ROOT / ".github" / "workflows" / "pr-body-leak-scan.yml"
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    on = doc[True]  # PyYAML reads the bare `on:` key as the boolean True
-    assert set(on["pull_request"]["types"]) == {"opened", "edited", "reopened", "synchronize"}
-    (job,) = doc["jobs"].values()
-    fed = False
+    # Imported here, not at module scope: the helper skips its importer when PyYAML is absent, and that
+    # must skip this one test rather than every scanner test in the file.
+    from tests._workflow_contexts import (
+        context_of,
+        jobs_of,
+        required_contexts,
+        step_script,
+        triggers_of,
+    )
+
+    workflow = "pr-body-leak-scan.yml"
+    types = triggers_of(workflow)["pull_request"]["types"]
+    assert set(types) == {"opened", "edited", "reopened", "synchronize"}
+    ((key, job),) = jobs_of(workflow).items()
     for step in job["steps"]:
         assert "${{" not in step.get("run", ""), (
             "no Actions expression may sit inside a run: script"
         )
-        if "--pr-body" in step.get("run", ""):
-            assert step["env"]["PR_BODY"] == "${{ github.event.pull_request.body }}"
-            fed = True
-    assert fed, "no step runs the scanner's --pr-body mode"
-    required = (_REPO_ROOT / ".github" / "required-contexts.txt").read_text(encoding="utf-8")
-    assert job["name"] not in required
+    index, script = step_script(workflow, key, "Scan the pull request body")
+    assert "--pr-body" in script, "the scan step does not run the scanner's --pr-body mode"
+    assert job["steps"][index]["env"]["PR_BODY"] == "${{ github.event.pull_request.body }}"
+    assert context_of(key, job) not in required_contexts()

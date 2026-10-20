@@ -415,7 +415,7 @@ _RECORD_PAIR: tuple[re.Pattern[str], ...] = (
 # REASON-ONLY, like every record detector here: the identifier beside its verdict IS the disclosure, so
 # a hit names a line and a kind and never echoes the text into a public CI log.
 _PR_REQ_ID = re.compile(
-    r"(?<![\w.])(?:V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![\w.]|\.\d)"
+    r"(?<![\w.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![\w.]|\.\d)"
 )
 #: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
 #: rephrase around; it never hides a hit that carries its own requirement context.
@@ -436,9 +436,9 @@ _PR_VERSION_LEAD = re.compile(
 _PR_VERSION_TAIL = re.compile(r"^[*`_]*\s+(?:to|->|\u2192)\s+[*`_]*v?\d+\.\d+")
 _PR_FMT = r"[*`_\"']*"
 _PR_SEP = r"[\s*`_\"']+"
-_PR_VERDICT = (
-    r"(?:pass|fail|partial|n/?a|not[- ]applicable|needs[- ]review|not met|unmet|met)(?![\w/-])"
-)
+#: The tree scan's verdict words plus the spellings prose uses for them, so a word added to the record
+#: vocabulary reaches both surfaces.
+_PR_VERDICT = rf"(?:{_RECORD_VERDICT}|na|needs review|not met|unmet|met)(?![\w/-])"
 _PR_STATE_VERB = (
     r"(?:stays?|remains?|held at|holds? at|holding at|is(?: now| still)?|was|are|went to|goes to"
     r"|moves? to|moved to|back to|re-?scored(?: as)?|scored(?: as)?|scores|reads|now|at)"
@@ -448,7 +448,7 @@ _PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_S
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+cell)?"
     rf"(?:\s*[:=|\-\u2014>\]]+\s*|{_PR_SEP})"
-    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|to){_PR_SEP})?{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP})?{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
@@ -457,6 +457,8 @@ _PR_MOVE_LEAD = re.compile(
     rf"{_PR_SEP}(?:(?:the|vault|cells?){_PR_SEP})*$"
 )
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
+#: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
+_PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
 _PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*[:=|\-\u2014<\[(]+\s*{_PR_FMT}$")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
@@ -518,7 +520,7 @@ def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
             continue
         if _PR_BLOCK_START.match(line):
             flush()
-        offset = sum(len(p) + 1 for p in parts)
+        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
         marks.append((offset, lineno))
         parts.append(line)
     flush()
@@ -526,19 +528,14 @@ def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
 
 
 def _pr_line_at(marks: list[tuple[int, int]], offset: int) -> int:
-    line = marks[0][1]
-    for start, lineno in marks:
-        if start > offset:
-            break
-        line = lineno
-    return line
+    return max(lineno for start, lineno in marks if start <= offset)
 
 
 def _pr_requirement_ids(text: str) -> list[re.Match[str]]:
     return [
         m
         for m in _PR_REQ_ID.finditer(text)
-        if m.group(0)[0] in "VA"
+        if m.group("lead")
         or not (
             _PR_VERSION_LEAD.search(text[max(0, m.start() - 40) : m.start()])
             or _PR_VERSION_TAIL.match(text[m.end() : m.end() + 40])
@@ -555,8 +552,7 @@ def _pr_verdict_bound(text: str, m: re.Match[str]) -> bool:
     if hit is None:
         return False
     # A bare "to" is only a verdict binding after a move verb; every other state verb stands alone.
-    bound_by_to = re.match(rf"(?i){_PR_FMT}(?:\s+cell)?{_PR_SEP}{_PR_FMT}to{_PR_SEP}", after)
-    return bound_by_to is None or _PR_MOVE_LEAD.search(before) is not None
+    return hit.group("to") is None or _PR_MOVE_LEAD.search(before) is not None
 
 
 def _pr_table_verdict(row: str) -> bool:
@@ -564,8 +560,7 @@ def _pr_table_verdict(row: str) -> bool:
     cells = [c.strip(" *`_\"'") for c in row.strip().strip("|").split("|")]
     if not any(_PR_REQ_ID.fullmatch(c) for c in cells):
         return False
-    whole = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
-    return any(whole.fullmatch(c) for c in cells)
+    return any(_PR_CELL_VERDICT.fullmatch(c) for c in cells)
 
 
 def scan_pr_body(body: str) -> list[str]:
@@ -576,35 +571,37 @@ def scan_pr_body(body: str) -> list[str]:
     """
     hits: list[str] = []
     for marks, unit, is_row in _pr_units(body):
-        sentences = [(0, unit)] if is_row else []
-        if not is_row:
-            pos = 0
-            for piece in _PR_SENTENCE_SPLIT.split(unit):
-                start = unit.index(piece, pos)
-                sentences.append((start, piece))
-                pos = start + len(piece)
+        if is_row:
+            sentences = [(0, unit)]
+        else:
+            starts = [0, *(m.end() for m in _PR_SENTENCE_SPLIT.finditer(unit))]
+            ends = [m.start() for m in _PR_SENTENCE_SPLIT.finditer(unit)] + [len(unit)]
+            sentences = [(a, unit[a:b]) for a, b in zip(starts, ends, strict=True)]
         for start, sentence in sentences:
             ids = _pr_requirement_ids(sentence)
             if not ids:
                 continue
             found: dict[str, int] = {}
-            for m in ids:
-                if "verdict" not in found and _pr_verdict_bound(sentence, m):
-                    found["verdict"] = m.start()
-                lo, hi = (
-                    (0, len(sentence))
-                    if is_row
-                    else (max(0, m.start() - _PR_WINDOW), m.end() + _PR_WINDOW)
-                )
-                window = sentence[lo:hi]
-                if "verdict" not in found and not is_row and _PR_PROSE_VERDICT.search(window):
-                    found["verdict"] = m.start()
-                if "gap" not in found and _PR_GAP.search(window):
-                    found["gap"] = m.start()
-                if "map" not in found and _PR_CODE.search(window):
-                    found["map"] = m.start()
-            if is_row and "verdict" not in found and _pr_table_verdict(sentence):
-                found["verdict"] = ids[0].start()
+            if is_row:
+                # The whole row is one window: a table pairs an identifier cell with any other cell.
+                first = ids[0].start()
+                if any(_pr_verdict_bound(sentence, m) for m in ids) or _pr_table_verdict(sentence):
+                    found["verdict"] = first
+                if _PR_GAP.search(sentence):
+                    found["gap"] = first
+                if _PR_CODE.search(sentence):
+                    found["map"] = first
+            else:
+                for m in ids:
+                    window = sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
+                    if "verdict" not in found and (
+                        _pr_verdict_bound(sentence, m) or _PR_PROSE_VERDICT.search(window)
+                    ):
+                        found["verdict"] = m.start()
+                    if "gap" not in found and _PR_GAP.search(window):
+                        found["gap"] = m.start()
+                    if "map" not in found and _PR_CODE.search(window):
+                        found["map"] = m.start()
             for kind in PR_BODY_REASONS:
                 if kind in found:
                     line = _pr_line_at(marks, start + found[kind])
@@ -1754,6 +1751,15 @@ def _detector_count_report(counts: dict[str, int]) -> list[str]:
     return [f"mode={mode}"] + [f"{k}={v}" for k, v in sorted(counts.items())]
 
 
+def _report_hits(header: str, hits: list[str], advice: str) -> int:
+    """Print a hit report to stderr in the one shape every mode uses, and return the hit exit code."""
+    print(header, file=sys.stderr)
+    for h in hits:
+        print(f"  {h}", file=sys.stderr)
+    print(f"\n{len(hits)} hit(s). {advice}", file=sys.stderr)
+    return 1
+
+
 def _pr_body_mode(argv: list[str]) -> int:
     """``--pr-body PATH``: scan one pull request body for record content and exit.
 
@@ -1779,17 +1785,14 @@ def _pr_body_mode(argv: list[str]) -> int:
     )
     hits = scan_pr_body(body)
     if hits:
-        print("FORBIDDEN CONTENT in the pull request body (fail closed):", file=sys.stderr)
-        for h in hits:
-            print(f"  {h}", file=sys.stderr)
-        print(
-            f"\n{len(hits)} hit(s). A public pull request body must not state a requirement's verdict, "
-            "its gap, or the code that implements it; the per-requirement grid is private. Edit the "
-            "body to describe the change without them. A bare requirement number with none of the "
-            "three beside it is not flagged.",
-            file=sys.stderr,
+        return _report_hits(
+            "FORBIDDEN CONTENT in the pull request body (fail closed):",
+            hits,
+            "A public pull request body must not state a requirement's verdict, its gap, or the code "
+            "that implements it; the per-requirement grid is private. Edit the body to describe the "
+            "change without them. A bare requirement number with none of the three beside it is not "
+            "flagged.",
         )
-        return 1
     return 0
 
 
@@ -1942,16 +1945,12 @@ def main(argv: list[str]) -> int:
         return 2
 
     if hits:
-        print("FORBIDDEN CONTENT -- commit blocked (fail closed):", file=sys.stderr)
-        for h in hits:
-            print(f"  {h}", file=sys.stderr)
-        print(
-            f"\n{len(hits)} hit(s). A real customer/host string must be removed, not allowlisted. "
-            "For a genuine false positive, narrow the pattern or add a vetted line to "
-            "scripts/security/scan-allowlist.txt.",
-            file=sys.stderr,
+        return _report_hits(
+            "FORBIDDEN CONTENT -- commit blocked (fail closed):",
+            hits,
+            "A real customer/host string must be removed, not allowlisted. For a genuine false "
+            "positive, narrow the pattern or add a vetted line to scripts/security/scan-allowlist.txt.",
         )
-        return 1
     return 0
 
 
