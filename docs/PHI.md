@@ -2544,7 +2544,7 @@ traceability:
   extras (zero in the base install); external providers land per-provider in follow-on PRs.
 - **Retention/purge enforcement — `[retention]` body-null (keep metadata) + dead-letter window + WAL/VACUUM, audited; `audit_days` reserved/keep-forever by design** (§8) — was P1-2.
 - **Exception-path PHI redaction — the `safe_exc()` chokepoint (`redaction.py`) at every exception→`last_error`/`detail`/log site** (§7) — the security half of P1-3 (WP-6c). Structured-JSON logging + off-box (syslog/SIEM) forwarding + the cross-backend `audit_log` off-box tee are now **built** (sec-offbox-log #357/#361/#363), and **native RFC 5425 TLS-syslog shipped with ADR 0080** — the forwarding hop is gated on the shared posture gradient (§7).
-- **Outbound/egress allowlist — fail-closed `[egress]` (MLLP host:port + File dirs) enforced at config load/reload/start; webhook/SMTP host allowlists in `[alerts]`** (§4) — the data-plane half of P1-4 (WP-11c). MLLP-over-TLS is **built** (WP-13b, §4) — a non-loopback plaintext MLLP listener is refused at startup.
+- **Outbound/egress allowlist — fail-closed `[egress]` (MLLP host:port + File dirs) enforced at config load/reload/start; webhook/SMTP host allowlists in `[alerts]`** (§4) — the data-plane half of P1-4 (WP-11c). MLLP-over-TLS, the transport half (was P1-4′), is **built** (WP-13b, §4) — a non-loopback plaintext MLLP listener is refused at startup. The P1 table below listed it as remaining until 2026-10-20 (BACKLOG #3393).
 - **TLS on the engine API, always on** (§4, the Engine API row; ADR 0172) — was P2-1. The P2 table
   below listed it as remaining until 2026-10-10 (BACKLOG #1133).
 
@@ -2555,7 +2555,6 @@ separate follow-up.
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
 | **P1-3′** Structured (JSON) logging + off-box (syslog/SIEM) forwarding (§7) — ✅ **Built (sec-offbox-log #357/#361/#363)**, incl. **native RFC 5425 TLS-syslog** (ADR 0080) and the #1163 hop gate; residual: off unless a collector is named | Off-box log shipping / tamper-resistance | §164.312(b) · AU-9/AU-4 | M |
-| **P1-4′** MLLP-over-TLS (§4) — `[conditional]`, Phase 2 (the egress-allowlist half shipped — WP-11c, above) | Cleartext PHI on the wire | §164.312(e) Transmission · SC-8 (NIST 800-52r2) | L |
 
 ### P2 — remote / Phase-2 (deferrable while strictly localhost; each flips to mandatory on remote exposure)
 | Item | Closes | Maps to | Effort |
