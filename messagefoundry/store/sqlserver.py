@@ -7161,6 +7161,14 @@ class SqlServerStore:
         )
         return row is not None
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._fetchone(
+            "SELECT TOP 1 1 AS present FROM processed_files"
+            " WHERE channel_id=? AND file_key NOT LIKE '%:%'",
+            (channel_id,),
+        )
+        return row is not None
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:

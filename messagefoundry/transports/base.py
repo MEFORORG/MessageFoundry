@@ -58,6 +58,7 @@ __all__ = [
     "SyncReplyResolver",
     "ProcessedFileLedger",
     "FILE_KEY_SCHEME",
+    "FILE_KEY_SCHEMES",
     "FileKeyError",
     "check_file_key",
     "file_key_forms",
@@ -675,9 +676,9 @@ def file_key_forms(digest: str) -> tuple[str, ...]:
     the same hash with no tag, so a ledger row written before the tag existed still marks its file
     read. It needs looking up only while such a row can survive: the ledger's age prune
     (``PROCESSED_FILE_LEDGER_TTL_SECONDS``) removes it once its window has passed, but only on a
-    tick that records a new file, so a stable share can keep one longer. A release may drop the bare
-    form only once that window is known to have passed everywhere; today nothing proves it, so the
-    lookup stays.
+    tick that records a new file, so a stable share can keep one longer. The runner's ledger adapter
+    therefore asks the store whether the channel still holds an untagged row, and answers a
+    bare-digest lookup False without a round trip once it holds none.
     """
     return (f"{FILE_KEY_SCHEME}:{digest}", digest)
 

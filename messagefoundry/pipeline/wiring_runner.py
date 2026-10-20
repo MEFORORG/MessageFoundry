@@ -335,14 +335,27 @@ class _StoreProcessedLedger:
     Every key is checked against the schemes this release compiles in before the store sees it
     (BACKLOG #3424): a write must carry today's tag, a read may also be the bare pre-tag digest, and
     any other tag raises :class:`~messagefoundry.transports.base.FileKeyError` rather than being
-    looked up or recorded."""
+    looked up or recorded.
+
+    A bare-digest lookup is answered from the store only while the channel's ledger still holds an
+    untagged row. Nothing writes one any more, so once the age prune has removed the last of them
+    the answer is False without a round trip. ``_untagged`` caches that: ``None`` means not yet
+    asked, and a prune clears a True, since a prune is the only thing that can remove such a row."""
 
     def __init__(self, store: QueueStore, channel_id: str) -> None:
         self._store = store
         self._channel_id = channel_id
+        self._untagged: bool | None = None
 
     async def is_processed(self, file_key: str) -> bool:
         check_file_key(file_key, write=False)
+        if ":" not in file_key:
+            if self._untagged is None:
+                self._untagged = await self._store.has_untagged_processed_file(
+                    channel_id=self._channel_id
+                )
+            if not self._untagged:
+                return False
         return await self._store.is_file_processed(channel_id=self._channel_id, file_key=file_key)
 
     async def mark_processed(self, file_key: str) -> None:
@@ -355,6 +368,8 @@ class _StoreProcessedLedger:
             older_than=time.time() - PROCESSED_FILE_LEDGER_TTL_SECONDS,
             keep_last=PROCESSED_FILE_LEDGER_KEEP_MAX,
         )
+        if self._untagged:  # False stays False: nothing writes an untagged row
+            self._untagged = None
 
 
 class NotDeployedError(RuntimeError):

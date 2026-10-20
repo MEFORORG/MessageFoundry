@@ -215,7 +215,37 @@ async def test_the_ledger_refuses_a_key_scheme_it_does_not_know(store: MessageSt
     assert not await ledger.is_processed(digest)
     await ledger.mark_processed(f"{FILE_KEY_SCHEME}:{digest}")
     assert await ledger.is_processed(f"{FILE_KEY_SCHEME}:{digest}")
-    assert FILE_KEY_SCHEME in FILE_KEY_SCHEMES
+    assert frozenset({FILE_KEY_SCHEME}) == FILE_KEY_SCHEMES  # widen only with a compiled-in reader
+
+
+async def test_the_bare_lookup_stops_once_no_untagged_row_is_left(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bare pre-tag form is asked of the store only while the ledger still holds an untagged row;
+    once the age prune removes the last one, the lookup is answered without a round trip. Mutation:
+    drop the ``_untagged`` gate. Red: the store is asked on every bare lookup."""
+    from messagefoundry.pipeline.wiring_runner import _StoreProcessedLedger
+
+    old, new = "cd" * 32, "ef" * 32
+    await store.record_processed_file(channel_id="ch", file_key=old, now=1.0)
+    ledger = _StoreProcessedLedger(store, "ch")
+    assert await ledger.is_processed(old)  # the row written before the tag still reads
+    assert not await ledger.is_processed(new)
+    await ledger.mark_processed(f"{FILE_KEY_SCHEME}:{new}")
+    await ledger.prune()  # the old row is far past the age window
+    asked: list[str] = []
+    real = store.is_file_processed
+
+    async def counting(*, channel_id: str, file_key: str) -> bool:
+        asked.append(file_key)
+        return await real(channel_id=channel_id, file_key=file_key)
+
+    monkeypatch.setattr(store, "is_file_processed", counting)
+    assert not await ledger.is_processed(old)
+    assert not await ledger.is_processed(new)
+    assert asked == []
+    assert await ledger.is_processed(f"{FILE_KEY_SCHEME}:{new}")
+    assert asked == [f"{FILE_KEY_SCHEME}:{new}"]
 
 
 def test_every_form_is_the_same_digest_and_todays_comes_first() -> None:

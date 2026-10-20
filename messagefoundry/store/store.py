@@ -17318,6 +17318,15 @@ class MessageStore:
             )
             return await cur.fetchone() is not None
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        """True while this connection's ledger still holds a key with no scheme tag (BACKLOG #3424)."""
+        async with self._read() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM processed_files WHERE channel_id=? AND file_key NOT LIKE '%:%' LIMIT 1",
+                (channel_id,),
+            )
+            return await cur.fetchone() is not None
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:

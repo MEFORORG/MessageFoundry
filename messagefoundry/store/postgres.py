@@ -5665,6 +5665,13 @@ class PostgresStore:
         )
         return row is not None
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._pool.fetchval(
+            "SELECT 1 FROM processed_files WHERE channel_id=$1 AND file_key NOT LIKE '%:%' LIMIT 1",
+            channel_id,
+        )
+        return row is not None
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:
