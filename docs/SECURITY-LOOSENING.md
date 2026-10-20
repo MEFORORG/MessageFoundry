@@ -1125,12 +1125,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > The check reads each entry with the same parser as the load, and skips an entry the load
 > refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
 > `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
-> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording. An IPv4 entry also
+> counts toward IPv6 as its mapped twin, which uvicorn is handed too, so `0.0.0.0/0` beside
+> ranges covering the rest of `::/0` gets the whole-family wording for those ranges.
 >
 > **Each network is named once, under the first spelling the list gives it.** Within each wording
-> the networks keep list order; the whole-family wording comes first. So
-> `10.0.0.0/08` or `::ffff:10.0.0.0/104` beside `10.0.0.0/8` is not named again (BACKLOG #3393).
-> To clear a named range, remove every spelling of it from the list.
+> the networks keep list order; the whole-family wording comes first. A later spelling of the same
+> network is named in parentheses beside the first, as in
+> `10.0.0.0/8 (also written as ::ffff:10.0.0.0/104)` (BACKLOG #3393). To clear a named range,
+> remove every spelling of it from the list.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With

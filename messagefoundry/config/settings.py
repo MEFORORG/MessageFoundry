@@ -1454,14 +1454,19 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
     )
 
 
+def _mapped_twin(network: ipaddress.IPv4Network) -> ipaddress.IPv6Network:
+    """``network`` in its IPv4-mapped IPv6 spelling."""
+    start = _IPV4_MAPPED_BASE | int(network.network_address)
+    return ipaddress.IPv6Network((start, _IPV4_MAPPED.prefixlen + network.prefixlen))
+
+
 def _other_spelling(parsed: _TrustedProxy) -> _TrustedProxy | None:
     """``parsed`` in its other IPv4 spelling: the mapped twin of an IPv4 entry, the plain twin of a
     mapped one. None for any other entry."""
     if isinstance(parsed, ipaddress.IPv4Address):
         return ipaddress.IPv6Address(_IPV4_MAPPED_BASE | int(parsed))
     if isinstance(parsed, ipaddress.IPv4Network):
-        start = _IPV4_MAPPED_BASE | int(parsed.network_address)
-        return ipaddress.IPv6Network((start, _IPV4_MAPPED.prefixlen + parsed.prefixlen))
+        return _mapped_twin(parsed)
     if isinstance(parsed, ipaddress.IPv6Address):
         return parsed.ipv4_mapped
     meaning = _ipv4_meaning(parsed)
@@ -8176,12 +8181,16 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     """The ``[api].trusted_proxies`` entries that cover more than one address, as
     ``(whole_family, ranges)``. Each list keeps the input order across both families, and names each
     network once, under the first spelling given for it: ``10.0.0.0/08`` and ``::ffff:10.0.0.0/104``
-    both name the network ``10.0.0.0/8`` does, so beside it they add nothing (BACKLOG #1131, #3393).
+    both name the network ``10.0.0.0/8`` does (BACKLOG #1131, #3393). A later, different spelling
+    rides along as ``10.0.0.0/8 (also written as ::ffff:10.0.0.0/104)``, since uvicorn trusts the
+    network until every spelling is gone, so an operator who removes only the first is not misled.
 
     ``whole_family`` holds EVERY multi-address network of a family whose entries, together, cover
     every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
-    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. ``ranges`` holds the
-    multi-address networks of every other family. A single-host entry is in neither.
+    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. Each family is collapsed
+    over what :func:`uvicorn_trusted_hosts` hands uvicorn, both spellings of every IPv4 entry, so
+    ``0.0.0.0/0`` completes the IPv6 family for ranges covering the rest of ``::/0``. ``ranges``
+    holds the multi-address networks of every other family. A single-host entry is in neither.
 
     The cutoff is one address, not a size. Every host inside a trusted range may set its own
     ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
@@ -8192,17 +8201,19 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     skipped."""
     v4: list[ipaddress.IPv4Network] = []
     v6: list[ipaddress.IPv6Network] = []
-    # Keyed by the network an entry names, so a respelling is not named twice. The value is the
-    # first spelling and the family whose collapse decides its wording.
-    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[str, int]] = {}
+    # Keyed by the network an entry names, so a respelling is not named twice. The value is every
+    # distinct spelling, in list order (a dict as an ordered set), and the family whose collapse
+    # decides the wording.
+    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[dict[str, None], int]] = {}
     for entry in entries:
         try:
             parsed = _parse_trusted_proxy(entry)
         except ValueError:
             continue
-        # A host counts toward its family's collapse as its single-address network, and a mapped
-        # entry toward IPv4's, so ``::ffff:0:0/96`` is named as the whole family it trusts.
-        # A mapped entry also stays in IPv6's collapse, since uvicorn holds it as an IPv6 network.
+        # A host counts toward its family's collapse as its single-address network. Each entry
+        # counts toward both families in every spelling uvicorn_trusted_hosts hands uvicorn: a
+        # mapped entry toward IPv4's as the range it names, so ``::ffff:0:0/96`` is named as the
+        # whole family it trusts, and an IPv4 entry toward IPv6's as its mapped twin (BACKLOG #3393).
         net = ipaddress.ip_network(parsed)
         meaning = _ipv4_meaning(net)
         as_v4: ipaddress.IPv4Network | None
@@ -8214,15 +8225,14 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
             as_v4 = ipaddress.IPv4Network("0.0.0.0/0")
         else:
             as_v4 = None
-        if isinstance(net, ipaddress.IPv6Network):
-            v6.append(net)
+        v6.append(net if isinstance(net, ipaddress.IPv6Network) else _mapped_twin(net))
         if as_v4 is not None:
             v4.append(as_v4)
         if net.num_addresses > 1:
             # An entry that counts toward IPv4 is judged by IPv4's collapse alone. That loses
             # nothing: an IPv6 collapse covering every address covers the mapped block, and each
             # entry inside or around that block added its IPv4 view above, so IPv4 is whole too.
-            named.setdefault(meaning, (entry, 6 if as_v4 is None else 4))
+            named.setdefault(meaning, ({}, 6 if as_v4 is None else 4))[0].setdefault(entry)
     # collapse_addresses takes one family at a time, so each is collapsed on its own.
     covered = {
         version
@@ -8234,8 +8244,10 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     }
     whole_family: list[str] = []
     ranges: list[str] = []
-    for entry, family in named.values():
-        (whole_family if family in covered else ranges).append(entry)
+    for spellings, family in named.values():
+        first, *others = spellings
+        also = f" (also written as {' and '.join(others)})" if others else ""
+        (whole_family if family in covered else ranges).append(first + also)
     return whole_family, ranges
 
 

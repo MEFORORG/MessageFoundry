@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
     _classify_proxy_entries,
     load_settings,
     security_loosenings,
+    uvicorn_trusted_hosts,
 )
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline import Engine
@@ -1575,11 +1576,16 @@ def test_proxy_entries_keep_input_order_across_both_families() -> None:
 @pytest.mark.parametrize(
     ("entries", "named"),
     [
-        (["10.0.0.0/08", "10.0.0.0/8"], "10.0.0.0/08"),
-        (["10.0.0.0/8", "10.0.0.0/08"], "10.0.0.0/8"),
-        (["10.0.0.0/8", "::ffff:10.0.0.0/104"], "10.0.0.0/8"),
-        (["::ffff:10.0.0.0/104", "10.0.0.0/8"], "::ffff:10.0.0.0/104"),
-        (["::ffff:a00:0/104", "::ffff:10.0.0.0/104"], "::ffff:a00:0/104"),
+        (["10.0.0.0/08", "10.0.0.0/8"], "10.0.0.0/08 (also written as 10.0.0.0/8)"),
+        (["10.0.0.0/8", "10.0.0.0/08"], "10.0.0.0/8 (also written as 10.0.0.0/08)"),
+        (["10.0.0.0/8", "::ffff:10.0.0.0/104"], "10.0.0.0/8 (also written as ::ffff:10.0.0.0/104)"),
+        (["::ffff:10.0.0.0/104", "10.0.0.0/8"], "::ffff:10.0.0.0/104 (also written as 10.0.0.0/8)"),
+        (
+            ["::ffff:a00:0/104", "::ffff:10.0.0.0/104"],
+            "::ffff:a00:0/104 (also written as ::ffff:10.0.0.0/104)",
+        ),
+        # An identical repeat is the same spelling, so there is nothing else to name.
+        (["10.0.0.0/8", "10.0.0.0/8"], "10.0.0.0/8"),
     ],
 )
 def test_one_network_spelled_twice_is_named_once_under_its_first_spelling(
@@ -1587,14 +1593,35 @@ def test_one_network_spelled_twice_is_named_once_under_its_first_spelling(
 ) -> None:
     """BACKLOG #3393: duplicates were removed by spelling, so one network written two ways was
     named twice. A mapped entry names the IPv4 range it maps, since uvicorn is handed both
-    spellings of either (BACKLOG #3042)."""
+    spellings of either (BACKLOG #3042). The later spellings ride along in parentheses, since
+    uvicorn trusts the network until every one of them is removed."""
     assert _classify_proxy_entries(entries) == ([], [named])
 
 
+def test_every_later_spelling_of_a_named_network_is_carried_in_the_risk() -> None:
+    """BACKLOG #3393: an operator who removes only the named spelling still trusts the network
+    under the others, so the risk names them too, in list order, each once.
+
+    Mutation: drop the ``also written as`` suffix. Red: only the first spelling is named."""
+    entries = ["10.0.0.0/8", "::ffff:10.0.0.0/104", "10.0.0.0/08", "fd00::/8"]
+    risk = _proxy_risk(*entries)
+    assert _named(risk) == [
+        "10.0.0.0/8 (also written as ::ffff:10.0.0.0/104 and 10.0.0.0/08)",
+        "fd00::/8",
+    ]
+
+
 def test_a_respelled_whole_family_entry_is_named_once() -> None:
-    """The mapped block and ``0.0.0.0/0`` both trust every IPv4 peer, so the second adds nothing."""
-    assert _classify_proxy_entries(["::ffff:0:0/96", "0.0.0.0/0"]) == (["::ffff:0:0/96"], [])
-    assert _classify_proxy_entries(["0.0.0.0/0", "::ffff:0:0/96"]) == (["0.0.0.0/0"], [])
+    """The mapped block and ``0.0.0.0/0`` both trust every IPv4 peer, so the second adds nothing
+    but its spelling."""
+    assert _classify_proxy_entries(["::ffff:0:0/96", "0.0.0.0/0"]) == (
+        ["::ffff:0:0/96 (also written as 0.0.0.0/0)"],
+        [],
+    )
+    assert _classify_proxy_entries(["0.0.0.0/0", "::ffff:0:0/96"]) == (
+        ["0.0.0.0/0 (also written as ::ffff:0:0/96)"],
+        [],
+    )
 
 
 def test_a_whole_family_and_a_range_in_another_family_each_get_their_wording() -> None:
@@ -1632,6 +1659,8 @@ def test_the_trust_every_peer_check_reads_entries_with_the_load_s_own_parser() -
 
 
 _MAPPED_BLOCK = ipaddress.ip_network("::ffff:0:0/96")
+#: The IPv6 rest of ``::/0`` beside the mapped block: 96 ranges, none of them mapped.
+_MAPPED_REST = [str(n) for n in ipaddress.ip_network("::/0").address_exclude(_MAPPED_BLOCK)]
 
 
 def test_a_mapped_entry_counts_as_the_ipv4_range_it_names() -> None:
@@ -1651,14 +1680,31 @@ def test_a_mapped_entry_counts_as_the_ipv4_range_it_names() -> None:
     assert _classify_proxy_entries(["::/80", "fd00::/8"]) == (["::/80"], ["fd00::/8"])
     assert _classify_proxy_entries(["::fffe:0:0/95"]) == (["::fffe:0:0/95"], [])
     # The IPv6 rest of ::/0 beside the mapped block still covers every IPv6 address.
-    rest = [str(n) for n in ipaddress.ip_network("::/0").address_exclude(_MAPPED_BLOCK)]
-    whole, ranges = _classify_proxy_entries([*rest, str(_MAPPED_BLOCK)])
-    assert ranges == [] and len(whole) == len(rest) + 1
+    whole, ranges = _classify_proxy_entries([*_MAPPED_REST, str(_MAPPED_BLOCK)])
+    assert ranges == [] and len(whole) == len(_MAPPED_REST) + 1
     # Control: a narrow mapped range is a range, and a mapped host is neither.
     assert _classify_proxy_entries(["::ffff:10.0.0.0/120", "::ffff:10.0.0.1"]) == (
         [],
         ["::ffff:10.0.0.0/120"],
     )
+
+
+def test_an_ipv4_entry_s_mapped_twin_completes_the_ipv6_family() -> None:
+    """BACKLOG #3393: uvicorn is handed ``0.0.0.0/0``'s mapped twin ``::ffff:0:0/96`` too
+    (:func:`uvicorn_trusted_hosts`), so beside the IPv6 rest of ``::/0`` it trusts every IPv6 peer.
+    The rest was named as narrow ranges, because the twin never counted toward IPv6's collapse.
+
+    Mutation: drop the twin from IPv6's collapse. Red: the rest is classed as ranges."""
+    entries = [*_MAPPED_REST, "0.0.0.0/0"]
+    # What uvicorn is handed covers every IPv6 address: the premise this test rests on.
+    handed = [ipaddress.ip_network(h) for h in uvicorn_trusted_hosts(entries) if ":" in h]
+    assert list(ipaddress.collapse_addresses(handed)) == [ipaddress.ip_network("::/0")]
+    assert _classify_proxy_entries(entries) == (entries, [])
+    risk = _proxy_risk(*entries)
+    assert _WHOLE_FAMILY in risk and _RANGE not in risk
+    # Control: an IPv4 range whose twin leaves part of the mapped block out completes nothing.
+    narrow = [*_MAPPED_REST, "10.0.0.0/8"]
+    assert _classify_proxy_entries(narrow) == ([], narrow)
 
 
 def _split(network: str, bits: int) -> list[str]:
