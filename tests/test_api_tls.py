@@ -101,15 +101,19 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     # An encrypted key is written at the approved wrap: the loader refuses cryptography's own
-    # BestAvailableEncryption (2048 PBKDF2 iterations, BACKLOG #1352).
-    key_path.write_bytes(
+    # BestAvailableEncryption (2048 PBKDF2 iterations, BACKLOG #1352). Written restricted, as an
+    # operator's key must be: under enforce `serve` refuses one a broad group can read (#3402).
+    # The restricted create refuses an existing name, and a test may mint twice into one directory.
+    key_path.unlink(missing_ok=True)
+    write_restricted_file(
+        key_path,
         approved_pkcs8_pem(key, password)
         if password
         else key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
-        )
+        ),
     )
     return cert_path, key_path
 
@@ -124,7 +128,8 @@ def _self_signed_combined(tmp_path: Path) -> Path:
     """
     cert_path, key_path = _self_signed(tmp_path)
     combined = tmp_path / "combined.pem"
-    combined.write_bytes(cert_path.read_bytes() + key_path.read_bytes())
+    combined.unlink(missing_ok=True)
+    write_restricted_file(combined, cert_path.read_bytes() + key_path.read_bytes())  # holds a key
     cert_path.unlink()  # leave only the combined PEM, so a stray two-file path cannot pass by luck
     key_path.unlink()
     return combined

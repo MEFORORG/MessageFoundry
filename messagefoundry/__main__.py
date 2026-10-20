@@ -4594,16 +4594,26 @@ def _serve(args: argparse.Namespace) -> int:
     # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
     # serves no certificate of its own, so it has none to watch.
     _served_api_cert = _material[0] if _material is not None else None
-    # The key the engine minted is checked before it is served (vault BACKLOG #2601).
+    # The key the engine minted is checked before it is served (vault BACKLOG #2601), and so is an
+    # operator's own (BACKLOG #3402).
     if not _generated_tls_key_gate(settings, _state_dir, enforcing=enforcing):
         return 2
+    if not _operator_tls_key_gate(settings, _state_dir, enforcing=enforcing):
+        return 2
+
+    # BACKLOG #3402: the key files a graph's connections name are graph data, judged at each load.
+    from messagefoundry.config.key_file_access import make_connection_key_file_guard
 
     app = create_managed_app(
         store_settings=settings.store,
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
-        registry_guard=_chain_registry_guards(static_credential_guard, retention_override_guard),
+        registry_guard=_chain_registry_guards(
+            static_credential_guard,
+            retention_override_guard,
+            make_connection_key_file_guard(env_values, enforcing=enforcing, log=_credlog),
+        ),
         static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
@@ -5048,11 +5058,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # --project-root, else [environments].base_dir.
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
 
-    env_file = values_file_path(
-        resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd),
-        settings.environments.dir,
-        env_name,
-    )
+    env_base = resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
+    env_file = values_file_path(env_base, settings.environments.dir, env_name)
     if _start_files_refused(
         service_config,
         env_file,
@@ -5200,6 +5207,8 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     if not _generated_tls_key_gate(settings, state_dir, enforcing=enforcing):
         return 2
+    if not _operator_tls_key_gate(settings, state_dir, enforcing=enforcing):
+        return 2
 
     # Vault BACKLOG #2368: a connection's own keep-forever retention override. Each engine shard's
     # `serve` refuses the whole graph on it, so the supervisor would only restart them. It is a
@@ -5231,9 +5240,42 @@ def _supervise(args: argparse.Namespace) -> int:
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
-            registry_guard=refuse_keep_forever_overrides,
+            registry_guard=_chain_registry_guards(
+                refuse_keep_forever_overrides,
+                _fleet_connection_key_file_refusal(
+                    functools.partial(
+                        _read_environment_values,
+                        base_dir=env_base,
+                        dir_name=settings.environments.dir,
+                        environment=env_name,
+                    ),
+                    enforcing=enforcing,
+                ),
+            ),
         )
     )
+
+
+def _fleet_connection_key_file_refusal(
+    env_values: Callable[[], Mapping[str, Any]], *, enforcing: bool
+) -> Callable[[Registry], None]:
+    """``supervise``'s refusal of a graph whose connection key files each engine shard would
+    refuse (BACKLOG #3402). Refusal only: under ``warn`` each engine shard writes its own warning.
+    ``env_values`` reads the values as each engine shard reads them."""
+    from messagefoundry.config.key_file_access import connection_key_file_problem
+    from messagefoundry.config.wiring import WiringError
+
+    def refuse(registry: Registry) -> None:
+        if not enforcing:
+            return
+        problem = connection_key_file_problem(registry, env_values())
+        if problem is not None:
+            raise WiringError(
+                f"{problem}. Every engine shard would refuse this graph; refusing to start the "
+                "fleet."
+            )
+
+    return refuse
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -7281,26 +7323,26 @@ def _refuse_an_unauditable_write(store: Store) -> None:
         )
 
 
-def _key_file_access_gate(path: str, *, what: str, remedy: str, enforcing: bool) -> bool:
+def _key_file_access_gate(
+    path: str, *, what: str, remedy: str, enforcing: bool, absent_ok: bool = False
+) -> bool:
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
-    A broad group must not be able to read or change the file
-    (``restricted_file.broad_access_problem``, which also reports a file whose access could not be
-    read). Under ``[security].enforcement = enforce``
-    a problem is an error and the answer is ``False``; under ``warn`` it is a warning and the start
-    goes on. ``what`` names the file for the operator and ``remedy`` says what to do about it."""
-    from messagefoundry.restricted_file import broad_access_problem
+    The rule is :func:`~messagefoundry.config.key_file_access.key_file_problem`, which the registry
+    guard for connection key files applies too (BACKLOG #3402). Under
+    ``[security].enforcement = enforce`` a problem is an error and the answer is ``False``; under
+    ``warn`` it is a warning and the start goes on. ``what`` names the file for the operator and
+    ``remedy`` says what to do about it. With ``absent_ok`` a missing file passes, for the loader
+    to fail on."""
+    from messagefoundry.config.key_file_access import key_file_problem
 
-    problem = broad_access_problem(Path(path))
+    problem = key_file_problem(path, what=what, remedy=remedy, absent_ok=absent_ok)
     if problem is None:
         return True
     if enforcing:
-        print(
-            f"error: {what} is not restricted: {problem}. {remedy}; refusing to start.",
-            file=sys.stderr,
-        )
+        print(f"error: {problem}; refusing to start.", file=sys.stderr)
         return False
-    print(f"warning: {what} is not restricted: {problem}. {remedy}.", file=sys.stderr)
+    print(f"warning: {problem}.", file=sys.stderr)
     return True
 
 
@@ -7335,7 +7377,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
 
     The key is created restricted, so this catches a pair that was copied into a broader directory
     or re-granted since. Only the generated pair, as the plan names it: an operator's own
-    ``[api].tls_key_file`` is not judged here."""
+    ``[api].tls_key_file`` is judged by :func:`_operator_tls_key_gate`."""
     from messagefoundry.api.tls import plan_api_tls_material
 
     plan = plan_api_tls_material(settings.api, state_dir=state_dir)
@@ -7350,6 +7392,32 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
             "mount, set [api].tls_cert_file to a certificate of your own"
         ),
         enforcing=enforcing,
+    )
+
+
+def _operator_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enforcing: bool) -> bool:
+    """:func:`_key_file_access_gate` for the TLS private key an operator supplied (BACKLOG #3402).
+
+    That is ``[api].tls_key_file``, or ``[api].tls_cert_file`` when no key file is set, because
+    the key is then in the certificate PEM and the loader reads it from there. A file that is
+    absent is left to the loader at the TLS build, which fails the start on it."""
+    from messagefoundry.api.tls import plan_api_tls_material
+    from messagefoundry.config.key_file_access import KEY_FILE_REMEDY
+
+    plan = plan_api_tls_material(settings.api, state_dir=state_dir)
+    if plan.source != "operator" or plan.cert_file is None:
+        return True
+    if plan.key_file:
+        key_file, what = plan.key_file, "the TLS private key named by [api].tls_key_file"
+    else:
+        key_file = plan.cert_file
+        what = "the certificate named by [api].tls_cert_file, which holds the TLS private key"
+    return _key_file_access_gate(
+        key_file,
+        what=what,
+        remedy=KEY_FILE_REMEDY,
+        enforcing=enforcing,
+        absent_ok=True,
     )
 
 
