@@ -1201,13 +1201,17 @@ class MfaStatus:
 
     ``enabled`` stays == TOTP-enabled on the wire (the desktop console's boolean view is
     untouched); ``webauthn_enrolled`` is the ADR 0068 additive field — ``required`` accounts for
-    EITHER factor being enrolled (enrolled-any-factor ⇒ always required)."""
+    EITHER factor being enrolled (enrolled-any-factor ⇒ always required).
+    ``totp_reenrolment_recommended`` is set when the enabled TOTP enrolment was made with parameters
+    other than this release's default (BACKLOG #3422): it still verifies with the ones it records,
+    and a fresh enrolment moves it onto the default (the ``needs_rehash`` shape, applied to MFA)."""
 
     enabled: bool
     enrolled_at: float | None
     recovery_codes_remaining: int
     required: bool
     webauthn_enrolled: bool = False
+    totp_reenrolment_recommended: bool = False
 
 
 class FirstAdministratorRefused(RuntimeError):
@@ -2271,7 +2275,7 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
         )
     try:
         totp.totp(secret)
-    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
+    except ValueError:  # not base32 (binascii.Error), or a refused enrolment marker (#3422)
         return False
     return True
 
@@ -3595,6 +3599,9 @@ class AuthService:
                     "the requirement off"
                 )
         else:
+            # Checked and stored as the enrolment, so the code is proved with the parameters the
+            # store will record for it (BACKLOG #3422).
+            totp_secret = totp.new_enrolment(totp_secret)
             matched_step = totp.verify_totp_step(
                 totp_secret,
                 (totp_code or "").strip(),
@@ -11961,15 +11968,20 @@ class AuthService:
         if user.totp_enabled:
             raise ValueError(already_enabled)
         secret = totp.generate_secret()
+        # The stored cell records the parameters the enrolment is made with, and the URI advertises
+        # them from it (BACKLOG #3422).
+        enrolment = totp.new_enrolment(secret)
         # Conditional (BACKLOG #3025): a confirm that enabled TOTP after the check above makes the
         # stage write nothing, so a begin never replaces the secret of an enabled factor. Nothing
         # written can also mean the row is gone, which is told apart by reading it again.
-        if await self._store.set_totp_secret(identity.user_id, secret=secret) is None:
+        if await self._store.set_totp_secret(identity.user_id, secret=enrolment) is None:
             if await self._load_user(identity.user_id) is None:
                 raise ValueError("no such user")
             raise ValueError(already_enabled)
         await self._audit("auth.mfa_enroll_started", actor=identity.username)
-        return MfaEnrollment(secret=secret, otpauth_uri=totp.otpauth_uri(secret, identity.username))
+        return MfaEnrollment(
+            secret=secret, otpauth_uri=totp.otpauth_uri(enrolment, identity.username)
+        )
 
     async def confirm_mfa_enrollment(
         self, identity: Identity, code: str, *, token: str, client: str | None = None
@@ -13151,6 +13163,14 @@ class AuthService:
         webauthn_enrolled = user.has_passkeys or await self._store.has_webauthn_credentials(
             identity.user_id
         )
+        reenrol = False
+        if user.totp_enabled:
+            try:
+                secret = self._totp_secret(user)
+            except CipherError:
+                # Not this field's to report: the startup census names a cell that does not open.
+                secret = None
+            reenrol = secret is not None and totp.needs_reenrolment(secret)
         return MfaStatus(
             enabled=user.totp_enabled,
             enrolled_at=user.totp_enrolled_at,
@@ -13161,6 +13181,7 @@ class AuthService:
                 second_factor_enrolled=user.totp_enabled or webauthn_enrolled,
             ),
             webauthn_enrolled=webauthn_enrolled,
+            totp_reenrolment_recommended=reenrol,
         )
 
     # --- MFA: WebAuthn passkeys second factor (every account, WP-14b / ADR 0068) ---

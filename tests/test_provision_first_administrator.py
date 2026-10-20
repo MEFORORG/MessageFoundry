@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.auth import totp
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.notifications import FIRST_ADMINISTRATOR_TAKEOVER, SecurityEvent
@@ -2174,7 +2175,7 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
             row = await store.get_user_by_username("site-admin")
             assert row is not None and row.totp_enabled and not row.password_generated
             assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
-            assert await store.get_totp_secret(row.id) == _TERMINAL_SECRET
+            assert await store.get_totp_secret(row.id) == totp.new_enrolment(_TERMINAL_SECRET)
             assert len(await store.get_recovery_code_hashes(row.id)) == len(codes)
             service = AuthService(store, AuthSettings(lockout_threshold=3, lockout_minutes=15))
             for _ in range(3):
@@ -2463,7 +2464,7 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         assert await store.list_webauthn_credentials("earlier") == []
         row = await store.get_user("earlier")
         assert row is not None and row.totp_enabled
-        assert await store.get_totp_secret("earlier") == PROVISION_TOTP_SECRET
+        assert await store.get_totp_secret("earlier") == totp.new_enrolment(PROVISION_TOTP_SECRET)
         assert "h1" not in await store.get_recovery_code_hashes("earlier")
     finally:
         await store.close()
@@ -2940,7 +2941,7 @@ async def test_the_run_that_loses_an_enrolment_race_is_told_to_remove_its_dead_e
         # The #3025 invariant, measured: the secret turned on is the one the winning run showed.
         row = await store.get_user("roleless")
         assert row is not None and row.totp_enabled
-        assert await store.get_totp_secret("roleless") == _OTHER_TOTP_SECRET
+        assert await store.get_totp_secret("roleless") == totp.new_enrolment(_OTHER_TOTP_SECRET)
         message = str(lost.value)
         assert "did not turn TOTP on and granted no role" in message
         assert "remove the authenticator entry it showed" in message

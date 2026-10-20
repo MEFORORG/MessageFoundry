@@ -6763,7 +6763,8 @@ def _enrol_totp_at_terminal(
     label: str | None = None,
 ) -> tuple[str, str, float]:
     """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
-    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``. ``heading`` is the
+    Amendment A, N-A). Returns ``(enrolment, code, instant the code was read)``, the enrolment in
+    its stored form (:func:`totp.new_enrolment`, BACKLOG #3422). ``heading`` is the
     first sentence shown above the key and ``no_terminal`` opens the no-terminal refusal, so
     ``admin-reset-totp`` (ADR 0171 Amendment B) can name what it is doing. ``label`` is the account
     name the URI gives the app, ``username`` when unset; a replacement passes its own, so the app
@@ -6787,13 +6788,16 @@ def _enrol_totp_at_terminal(
             "interactively. Run this from a console."
         )
     secret = totp.generate_secret()
+    # What the store records and every check computes with; the URI advertises its parameters, so
+    # the app and the engine compute alike (BACKLOG #3422). The key line shows the bare secret.
+    enrolment = totp.new_enrolment(secret)
     _show_during_enrolment(
         f"\n{heading} Add this account "
         "to the app by its URI, which names the algorithm, then type the 6-digit code it shows. "
         "The codes use SHA-256: an app that takes only the key must be set to SHA-256, or its "
         "codes will never match.\n"
         f"  key: {secret}\n"
-        f"  URI: {totp.otpauth_uri(secret, username if label is None else label)}\n",
+        f"  URI: {totp.otpauth_uri(enrolment, username if label is None else label)}\n",
         refusal="could not open the console to show the authenticator key. Run this from a console",
     )
     went_away = "the console went away during enrolment"
@@ -6803,8 +6807,8 @@ def _enrol_totp_at_terminal(
         read_at = _time.time()
         if not code:
             raise _PasswordEntryRefused("empty authenticator code; nothing was written")
-        if totp.verify_totp_step(secret, code, now=read_at, window=skew_steps) is not None:
-            return secret, code, read_at
+        if totp.verify_totp_step(enrolment, code, now=read_at, window=skew_steps) is not None:
+            return enrolment, code, read_at
         if attempt < _PROVISION_TOTP_ATTEMPTS:  # never "try again" when no attempt is left
             _show_during_enrolment(
                 "That code did not match. Try the current one.\n", refusal=went_away
@@ -8558,6 +8562,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
         before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
         return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
+    # The stored form, with the parameters the prompt enrolled under (BACKLOG #3422). The prompt
+    # already returns it; marking here keeps a bare secret from reaching the store all the same.
+    secret = totp.new_enrolment(secret)
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)

@@ -447,13 +447,17 @@ class MfaStatusResponse(BaseModel):
 
     ``enabled`` stays == TOTP-enabled (the desktop console's boolean view is untouched);
     ``webauthn_enrolled`` is the ADR 0068 additive field (defaulted, so an older client's decode
-    is unaffected). ``required`` accounts for either factor being enrolled."""
+    is unaffected). ``required`` accounts for either factor being enrolled.
+    ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) says the TOTP
+    enrolment was made with parameters other than this release's default, so the holder should be
+    offered a fresh one."""
 
     enabled: bool
     enrolled_at: float | None = None
     recovery_codes_remaining: int = 0
     required: bool = False
     webauthn_enrolled: bool = False
+    totp_reenrolment_recommended: bool = False
 
 
 class RoleInfo(BaseModel):
