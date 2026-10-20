@@ -1259,7 +1259,7 @@ def test_a_client_sigalg_refusal_is_not_read_as_bad_tls_material(
         def refuse(self, sigalgs: str) -> bool:
             return True
 
-    client_contexts(_Refusing)
+    made = client_contexts(_Refusing)
     pin = "unused-ca.pem" if site.endswith("pinned") else None
     if site.startswith("apiclient"):
         # Through the constructor, whose OSError handler is what would relabel it "cannot load TLS
@@ -1273,6 +1273,9 @@ def test_a_client_sigalg_refusal_is_not_read_as_bad_tls_material(
             tray_probe.build_verify("https://localhost:8765", pin)
         raised = refused.value
     assert not isinstance(raised, OSError)
+    # One context built and refused: a second means a handler read the refusal as an unloadable
+    # pin and fell back to the OS store, which then refused too.
+    assert len(made) == 1, site
 
 
 @pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)

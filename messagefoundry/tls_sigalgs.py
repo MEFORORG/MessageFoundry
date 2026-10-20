@@ -46,9 +46,9 @@ class NarrowerRefused(RuntimeError):
 
     A :class:`RuntimeError` and never an :class:`ssl.SSLError`, so a caller that reads an
     ``SSLError`` as "cannot load the certificate", as the tray's ``load_pin`` does, cannot report a
-    build fault as a bad file. ``tls_policy`` turns it into a configuration refusal (BACKLOG #2484),
-    the apiclient into the ``ApiError`` its callers handle, and the tray lets it propagate, as it
-    does for a refused suite list."""
+    build fault as a bad file. ``tls_policy`` turns it into a configuration refusal (BACKLOG #2484)
+    and the apiclient into the ``ApiError`` its callers handle. The tray probe lets it propagate, as
+    it does for a refused suite list, and the tray's poller reads it as UNKNOWN."""
 
 
 @functools.cache

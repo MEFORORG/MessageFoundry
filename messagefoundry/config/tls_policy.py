@@ -1528,9 +1528,10 @@ def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     The two narrowers raise :class:`~messagefoundry.tls_sigalgs.NarrowerRefused`, a
     :class:`RuntimeError` subclass, on such a build; it lives beside the signature-scheme narrowing
     (BACKLOG #3414). Its own subclass, so this converts only that and not any other
-    :class:`RuntimeError`, such as a ``NotImplementedError``. Before #2484 only the ldap3 and hvac seam caught it. Converting here, in the two wrappers,
-    reaches every seam that calls one. The narrowers' own message names the list; this adds the
-    linked OpenSSL, because the fault is that build's.
+    :class:`RuntimeError`, such as a ``NotImplementedError``. Before #2484 only the ldap3 and hvac
+    seam caught it. Converting here, in the two wrappers, reaches every seam that calls one. The
+    narrowers' own message names the list; this adds the linked OpenSSL, because the fault is that
+    build's.
 
     It does not reach a context built at IMPORT. At least ``rest._NO_REDIRECT_OPENER`` and
     ``alert_sinks._NO_REDIRECT_OPENER`` are, so on such a build the import itself fails before any

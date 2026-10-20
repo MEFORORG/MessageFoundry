@@ -313,8 +313,7 @@ def load_pin(cacert: str) -> LoadedPin | None:
     still loads through ``cafile``, so what a pin may hold is unchanged.
 
     A build that refuses the approved TLS lists is not a pin that will not load, so it raises
-    ``RuntimeError`` (:func:`_narrow_to_approved_suites`) rather than returning ``None``. The
-    poller turns that into an UNKNOWN reading, at start as on a tick.
+    ``RuntimeError`` (:func:`_narrow_to_approved_suites`) rather than returning ``None``.
     """
     before = read_pin(cacert)
     if before is None:

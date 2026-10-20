@@ -831,7 +831,9 @@ class EngineClient:
                 # The builder's one ApiError: this build refused the signature scheme list (BACKLOG
                 # #3414). Kept like a refused file, so the caller gets the ordinary verification
                 # error and the reason is logged once, not raised over it on every request.
-                self._refuse_pin(current, f"a context cannot be built from it ({exc})")
+                self._refuse_pin(
+                    current, f"this Python/OpenSSL build cannot build a context for it ({exc})"
+                )
                 return False
             if _read_pin(pin) != current:
                 # Rewritten during the load: which bytes the context holds is unknown.
