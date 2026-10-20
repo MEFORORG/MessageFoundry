@@ -620,12 +620,24 @@ from typing import Any
 #: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
 #: removed. The digest moved again; re-derived with ``--write``.
 #:
+#: BACKLOG #3401: the four group-wide saves take a step-up bound to ``save_ends_own_sessions``
+#: when they would end the caller's own sessions. ``AuthService`` gained
+#: ``sessions_ended_by_ad_map_save`` and ``sessions_ended_by_custom_role_save``, which the
+#: console's new ``require_ui_step_up_when_own_sessions_end`` gate asks, and the four console
+#: routes moved to that gate. ``AdminHandlers.update_custom_role``, ``delete_custom_role``,
+#: ``set_ad_group_map`` and ``set_ad_group_scope_map`` are now the cores past the JSON routes'
+#: step-up, with the signatures the console already called, so no console call changed. The JSON
+#: routes themselves now take ``request``, which the seam does not carry. The digest moved from
+#: ``7f01058f7699dfe8`` because the discovered surface and the route gates did. An older console
+#: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
+#: two methods. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7f01058f7699dfe8"
+ENGINE_UI_SEAM: str = "a75c587ccc09a85c"
 
 
 @dataclass(frozen=True, slots=True)

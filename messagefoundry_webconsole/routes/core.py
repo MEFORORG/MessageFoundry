@@ -103,7 +103,11 @@ _log = logging.getLogger(__name__)
 #: 303 that sends the browser here already carries the header via ``clear_session_cookie`` — but a
 #: browser can reach this landing by another route (Back, a bookmark) with the cookie already gone,
 #: which is exactly the case ``_has_stale_session_cookie`` below cannot detect.
-_CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
+#: ``own_sessions_ended`` likewise: the AD map and custom-role saves land there when they ended the
+#: caller's own sessions (BACKLOG #3401).
+_CLEAR_SITE_DATA_LOGIN_CODES = frozenset(
+    {"expired", "loggedout", "pwchanged", "own_sessions_ended"}
+)
 
 #: How many report bodies of one CSP violation BATCH the WARNING line summarises before it is
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.

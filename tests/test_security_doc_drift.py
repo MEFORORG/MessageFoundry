@@ -1342,6 +1342,9 @@ _STEP_UP_GATES = frozenset(
         "require_reauth_only_action",
         "require_ui_step_up",
         "require_ui_step_up_action",
+        # BACKLOG #3401: the window, or the proof bound to its action when the save would end the
+        # caller's own sessions. Keeps the MFA gate.
+        "require_ui_step_up_when_own_sessions_end",
         "require_ui_reauth_only",
         "require_ui_reauth_only_action",
     }

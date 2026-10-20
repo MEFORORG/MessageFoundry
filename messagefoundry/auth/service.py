@@ -802,6 +802,12 @@ STEP_UP_ACTION_UPLOAD_RESEND = "upload_resend"
 STEP_UP_ACTION_MESSAGE_EXPORT = "message_export"
 STEP_UP_ACTION_CONNECTION_PURGE = "connection_purge"
 STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
+# BACKLOG #3401 (ASVS 7.5.2, a #1149 follow-up). The four group-wide saves -- both AD group maps,
+# custom-role edit and custom-role delete -- end the sessions of every account they reach, and that
+# can include the caller's own. Only then do they take this proof, single-use and bound here; a save
+# that ends nobody's session of the caller's keeps the session window. Its own id and not
+# `session_terminate`, so a grant minted for DELETE /me/sessions cannot be spent on a map save.
+STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS = "save_ends_own_sessions"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -11007,12 +11013,18 @@ class AuthService:
     #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014), and
     #: both enrolment legs, that one and ``confirm_mfa_enrollment`` (``mfa_confirm``), ask it again
     #: after their directory lookup (BACKLOG #3061).
+    #:
+    #: ``save_ends_own_sessions`` (BACKLOG #3401) rides an MFA-gated gate instead, so a pending
+    #: session never reaches its routes. It is listed anyway, for the owner's #1149 Reading B: a
+    #: password re-proof from an MFA-pending session does not count as authenticating again, so
+    #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
             STEP_UP_ACTION_MFA_CONFIRM,
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
             STEP_UP_ACTION_SESSION_TERMINATE,
+            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
         }
     )
 
@@ -14272,12 +14284,27 @@ class AuthService:
         await self._store.delete_custom_role(role_id)
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
+    async def _role_session_targets(self, role_id: str) -> list[str]:
+        """The ids of every account holding ``role_id``: whose sessions a custom-role edit or delete
+        ends. The one enumeration both :meth:`_revoke_sessions_for_role` and
+        :meth:`sessions_ended_by_custom_role_save` read, so the route's check and the revoke cannot
+        name different accounts."""
+        return [user.id for user in await self._load_users() if role_id in user.role_ids]
+
+    async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:
+        """The account ids whose sessions an edit or a delete of custom role ``role_id`` would end.
+
+        BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity,
+        by the same enumeration the revoke runs, so a route asking whether the save ends the
+        caller's own sessions gets the answer the revoke acts on. Empty for a role nobody holds,
+        including one that does not exist."""
+        return frozenset(await self._role_session_targets(role_id))
+
     async def _revoke_sessions_for_role(self, role_id: str) -> None:
         """Revoke the live sessions of every user currently holding ``role_id`` so a permission
         reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
-        for user in await self._load_users():
-            if role_id in user.role_ids:
-                await self._store.revoke_user_sessions(user.id)
+        for user_id in await self._role_session_targets(role_id):
+            await self._store.revoke_user_sessions(user_id)
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
@@ -15122,16 +15149,33 @@ class AuthService:
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
         revoked = 0
-        for user in await self._load_users():
-            if user.auth_provider != AuthProvider.AD.value or user.disabled:
-                continue
+        for user_id in await self._ad_session_targets():
             # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
             # row, and that read filters on the wall clock: after a forward clock step past the
             # absolute lifetime it found none, and those rows would come back on the old mapping
             # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
             # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += await self._store.revoke_user_sessions(user.id)
+            revoked += await self._store.revoke_user_sessions(user_id)
         return revoked
+
+    async def _ad_session_targets(self) -> list[str]:
+        """The ids of every enabled directory account: whose sessions an AD map save ends. The one
+        enumeration both :meth:`_revoke_ad_sessions` and :meth:`sessions_ended_by_ad_map_save`
+        read, so the route's check and the revoke cannot name different accounts."""
+        return [
+            user.id
+            for user in await self._load_users()
+            if user.auth_provider == AuthProvider.AD.value and not user.disabled
+        ]
+
+    async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
+        """The account ids whose sessions a save of either AD group map would end.
+
+        BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity,
+        by the same enumeration :meth:`_revoke_ad_sessions` runs, so a route asking whether the
+        save ends the caller's own sessions gets the answer the revoke acts on. The entries being
+        saved do not narrow it, for the reason that method's docstring gives."""
+        return frozenset(await self._ad_session_targets())
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""

@@ -844,9 +844,16 @@ the channel-scope write. The last three joined under BACKLOG #1149 (ASVS 7.5.2):
 target's sessions on the login window, so aimed at yourself it would end every session you hold
 with no fresh proof. The self-service `DELETE /me/sessions` ends your other sessions only behind a
 single-use `session_terminate` grant, and *Sign out* ends the current one. The refusal is per
-route and by target, so it does not reach a write that ends a whole group's sessions. At least the
-AD group-map and scope-map saves and the custom-role edit and delete can still end the caller's own
-sessions on the login window. The row names the actor, the route as `op`, the caller's
+route and by target, so it does not reach a write that ends a whole group's sessions. Four such
+writes, the AD group-map and scope-map saves and the custom-role edit and delete, are not refused
+(BACKLOG #3401): refusing them would lock an Administrator whose only account is a directory one out
+of the maps. Instead, a save that would end the caller's own sessions takes a single-use proof bound
+to `save_ends_own_sessions`, which only a re-proof made after sign-in mints, and an MFA-pending one
+never (the owner's #1149 Reading B). Any other save keeps the session window. The set it tests is
+the one the revoke ends, read from the stored accounts, and the revoke still ends the caller's own
+sessions, so the edit applies to them at once (BACKLOG #1154). On the console, such a save lands on
+the sign-in page. These four write no `auth.self_target_refused` row, because they refuse nothing.
+The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
 stored id matters on the console. A self-service revoke of one session that ends nothing, the
@@ -1167,8 +1174,8 @@ apply. What each **adds** over plain `require()`:
 | `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent) |
-| `require_step_up` | 26 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
-| `require_step_up_action` | 13 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
+| `require_step_up` | 22 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up_action` | 17 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
@@ -1376,8 +1383,8 @@ tuple: they act only on the caller's own account.
 | `GET` | `/roles` | `users:read` | `require` |
 | `GET` | `/roles/custom` | `users:read` | `require` |
 | `POST` | `/roles/custom` | `users:manage` | `require_step_up` |
-| `PUT` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up` |
-| `DELETE` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up` |
+| `PUT` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
+| `DELETE` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `GET` | `/users` | `users:read` | `require` |
 | `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector |
 | `POST` | `/users` | `users:manage` | `require_step_up` |
@@ -1394,9 +1401,9 @@ tuple: they act only on the caller's own account.
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
-| `PUT` | `/ad-group-map` | `users:manage` | `require_step_up` |
+| `PUT` | `/ad-group-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `GET` | `/ad-group-scope-map` | `users:manage` | `require` |
-| `PUT` | `/ad-group-scope-map` | `users:manage` | `require_step_up` |
+| `PUT` | `/ad-group-scope-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 
 #### Audit
 
@@ -1635,8 +1642,8 @@ the console routes with a rule of their own.
 | `POST` | `/ui/account/webauthn/verify` | *(authenticated session only)* | `require_ui_reauth_only` |
 | `POST` | `/ui/account/webauthn/{credential_id_hash}/delete` | *(authenticated session only)* | `require_ui_step_up_action` |
 | `GET` | `/ui/ad-groups` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/ad-groups/map` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/ad-groups/scope-map` | `users:manage` | `require_ui_step_up` |
+| `POST` | `/ui/ad-groups/map` | `users:manage` | `require_ui_step_up_when_own_sessions_end` (action `save_ends_own_sessions` only when the save would end the caller's own sessions, else the window; BACKLOG #3401) |
+| `POST` | `/ui/ad-groups/scope-map` | `users:manage` | `require_ui_step_up_when_own_sessions_end` (action `save_ends_own_sessions` only when the save would end the caller's own sessions, else the window; BACKLOG #3401) |
 | `GET` | `/ui/alerts` | `monitoring:read`**+**`monitoring:diagnose` | `require_ui` |
 | `GET` | `/ui/alerts/{alert_id}/reason` | `monitoring:read`**+**`monitoring:diagnose`**+**`messages:view_summary` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_ui` |
@@ -1700,8 +1707,8 @@ the console routes with a rule of their own.
 | `GET` | `/ui/roles` | `users:read` | `require_ui` |
 | `GET` | `/ui/session-status` | *(none — authenticated, no permission)* | `require_ui` |
 | `POST` | `/ui/roles/custom` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/roles/custom/{role_id}/delete` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/roles/custom/{role_id}/update` | `users:manage` | `require_ui_step_up` |
+| `POST` | `/ui/roles/custom/{role_id}/delete` | `users:manage` | `require_ui_step_up_when_own_sessions_end` (action `save_ends_own_sessions` only when the save would end the caller's own sessions, else the window; BACKLOG #3401) |
+| `POST` | `/ui/roles/custom/{role_id}/update` | `users:manage` | `require_ui_step_up_when_own_sessions_end` (action `save_ends_own_sessions` only when the save would end the caller's own sessions, else the window; BACKLOG #3401) |
 | `GET` | `/ui/roles/new` | `users:manage` | `require_ui_step_up` |
 | `GET` | `/ui/roles/{role_id}/edit` | `users:manage` | `require_ui_step_up` |
 | `GET` | `/ui/security-events` | *(authenticated session only)* | `require_ui` |
@@ -3072,16 +3079,18 @@ cannot finish the IdP step-up. It runs in a browser and re-keys the session it s
 [Session inventory](#session-inventory--targeted-revocation-wp-10) says what that costs on the
 action-bound terminate routes.
 
-**Gated operations — 38 route objects** (25 `require_step_up` + 13 action-bound `require_step_up_action`).
+**Gated operations — 38 route objects** (21 `require_step_up` + 17 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
 
 - **User / role administration** — `POST /users`, `POST /users/directory` (BACKLOG #2021),
   `DELETE /users/{id}`, `DELETE /users/{id}/sessions`, `PUT /users/{id}/roles`,
-  `PUT /users/{id}/channel-scope`, `PUT /ad-group-map`,
-  `PUT /ad-group-scope-map`, the three `/roles/custom` writes, and five action-bound routes:
+  `PUT /users/{id}/channel-scope`, `POST /roles/custom`, and nine action-bound routes:
   `PATCH /users/{id}` (`admin_user_update`), `POST /users/{id}/reset-password`
-  (`admin_reset_password`), `POST /users/{id}/reset-mfa` (`admin_reset_mfa`), and
-  `PUT` / `DELETE /users/{id}/federated-identity` (`admin_federated_identity`, BACKLOG #1143).
+  (`admin_reset_password`), `POST /users/{id}/reset-mfa` (`admin_reset_mfa`),
+  `PUT` / `DELETE /users/{id}/federated-identity` (`admin_federated_identity`, BACKLOG #1143), and
+  `PUT /ad-group-map`, `PUT /ad-group-scope-map`, `PUT` / `DELETE /roles/custom/{id}`
+  (`save_ends_own_sessions`, BACKLOG #3401). Those four spend the bound proof only when the save
+  would end the caller's own sessions, and otherwise check the session window in the route.
 - **Self-service** — `DELETE /me/mfa` (action-bound `mfa_disable`).
 - **Message / config operations** — `POST /dead-letters/replay`, `POST /messages/{id}/replay`,
   `POST /search/presets`, and four action-bound routes (vault BACKLOG #2625):

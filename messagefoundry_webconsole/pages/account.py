@@ -71,6 +71,9 @@ def login(
         # gets a reason instead of an unexplained login form.
         "expired": "Your session ended — sign in again.",
         "pwchanged": "Password changed — sign in with the new password.",
+        # BACKLOG #3401: an AD map or custom-role save that reached the caller's own account ended
+        # its sessions, this one included, so the change applies to the caller at once too.
+        "own_sessions_ended": "Saved. The change ended your own sessions, so sign in again.",
         # L5c (ADR 0068 §9) — allow-listed SSO outcome codes, never reflected text.
         # No remedy is named beyond "another way": a directory account has no password form, and
         # one bound to a federated identity signs in through its identity provider.

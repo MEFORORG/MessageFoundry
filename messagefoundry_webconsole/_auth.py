@@ -76,6 +76,7 @@ __all__ = [
     "require_ui_reauth_only_action",
     "require_ui_step_up",
     "require_ui_step_up_action",
+    "require_ui_step_up_when_own_sessions_end",
     "security_headers_context",
     "session_cookie_name",
     "session_token",
@@ -1475,6 +1476,57 @@ def require_ui_step_up_action(
         ):
             return identity
         raise _reauth_redirect(request, nxt)
+
+    return mark_route_gate(dependency)
+
+
+def require_ui_step_up_when_own_sessions_end(
+    action: str,
+    *permissions: Permission,
+    ended: Callable[[Request, AuthService], Awaitable[frozenset[str]]],
+    reauth_next: Callable[[Request], str] | None = None,
+) -> Callable[[Request], Awaitable[Identity]]:
+    """:func:`require_ui_step_up`, but the step-up is the single-use proof bound to ``action``
+    when the request would end the caller's own sessions. The cookie twin of the JSON plane's
+    ``_GROUP_SAVE_GATE`` and ``_prove_group_save`` in ``api.auth_routes`` (BACKLOG #3401, ASVS
+    7.5.2).
+
+    ``ended`` names the accounts whose sessions the request ends. It is read from the engine's
+    stored accounts, by the same enumeration the revoke runs, never from the caller's identity. A
+    caller it names spends the grant, through :func:`_ui_action_step_up_ok`, so the factor-binding
+    refusal and the org opt-out apply as on every action-bound lane. Every other caller keeps the
+    session window. ``new_ip`` is checked first, so a forced re-auth leaves the grant unspent.
+
+    It decides in the gate, before the body is read, because the answer never needs the body:
+    the AD maps end every directory account's sessions whatever they say, and a custom role's
+    holders are named by its path. The route then lands a caller whose session the save ended on
+    the sign-in page."""
+    # mfa_refusal, NOT allow_mfa_pending, for the reason require_ui_step_up gives.
+    base = require_ui(
+        *permissions,
+        mfa_refusal=_reauth_refusal(reauth_next),
+        new_address_check=False,
+    )
+
+    async def dependency(request: Request) -> Identity:
+        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
+        auth = get_auth(request)
+        if auth is None:  # pragma: no cover - base already handled this
+            raise _login_redirect()
+        token = session_token(request)
+        nxt = reauth_next(request) if reauth_next is not None else None
+        # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
+        if not await auth.mfa_satisfied(token):
+            raise _reauth_redirect(request, nxt)
+        if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
+            raise _reauth_redirect(request, nxt)
+        if identity.user_id in await ended(request, auth):
+            ok = await _ui_action_step_up_ok(auth, token, action)
+        else:
+            ok = await auth.has_recent_step_up(token)
+        if not ok:
+            raise _reauth_redirect(request, nxt)
+        return identity
 
     return mark_route_gate(dependency)
 

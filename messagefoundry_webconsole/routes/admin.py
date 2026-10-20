@@ -42,16 +42,20 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
+    STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     AuthService,
 )
 
 from .. import pages
 from .._auth import (
     assert_same_origin,
+    clear_session_cookie,
     register_ui_action,
     require_ui,
     require_ui_step_up,
     require_ui_step_up_action,
+    require_ui_step_up_when_own_sessions_end,
+    session_token,
 )
 from .._service import _service
 from ..pages.admin import (
@@ -143,23 +147,56 @@ register_ui_action(
     unlock=True,
     label="Open the create-role form",
 )
+# BACKLOG #3401 (ASVS 7.5.2): the three continuations of the four group-wide saves are TAGGED, so a
+# re-auth toward one mints the save_ends_own_sessions grant a save that ends the caller's own
+# sessions spends. A save that ends none of them takes the window and leaves that grant unspent:
+# single-use, bound to this one action and session, and expiring on the window's clock, the cost
+# the admin_user_update entry above accepts.
 register_ui_action(
     r"^/ui/roles/[^/?#]+/edit$",
     Permission.USERS_MANAGE,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     label="Edit a role",
 )
 register_ui_action(
-    r"^/ui/roles/custom/[^/?#]+/delete$", Permission.USERS_MANAGE, label="Delete a custom role"
+    r"^/ui/roles/custom/[^/?#]+/delete$",
+    Permission.USERS_MANAGE,
+    action=STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+    label="Delete a custom role",
 )
 register_ui_action(
     r"^/ui/ad-groups$",
     Permission.USERS_MANAGE,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     label="Open the AD group mappings",
 )
+
+
+async def _role_holders(request: Request, auth: AuthService) -> frozenset[str]:
+    """Whose sessions an edit or delete of the path's custom role ends (BACKLOG #3401)."""
+    return await auth.sessions_ended_by_custom_role_save(request.path_params["role_id"])
+
+
+async def _directory_accounts(_request: Request, auth: AuthService) -> frozenset[str]:
+    """Whose sessions a save of either AD group map ends (BACKLOG #3401)."""
+    return await auth.sessions_ended_by_ad_map_save()
+
+
+async def _after_group_save(request: Request, service: AuthService, to: str) -> Response:
+    """Where a group-wide save sends the browser: ``to``, or the sign-in page when the save ended
+    the caller's own session (BACKLOG #3401).
+
+    The session is read again rather than predicted, so the landing follows what the revoke did.
+    The cookie is cleared, with Clear-Site-Data, as on every other landing after a session ends."""
+    if await service.identity_for_token(session_token(request), activity=False) is not None:
+        return RedirectResponse(to, status_code=303)
+    resp = RedirectResponse("/ui/login?e=own_sessions_ended", status_code=303)
+    clear_session_cookie(resp, request)
+    return resp
 
 
 def _refusal_status(exc: Exception) -> int:
@@ -903,8 +940,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_when_own_sessions_end(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
                 Permission.USERS_MANAGE,
+                ended=_role_holders,
                 reauth_next=lambda r: f"/ui/roles/{r.path_params['role_id']}/edit",
             )
         ),
@@ -934,18 +973,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 pages.role_form_page(_role_catalog, role=current, error=detail),
                 status_code=400,
             )
-        return RedirectResponse("/ui/roles", status_code=303)
+        return await _after_group_save(request, service, "/ui/roles")
 
     @app.post("/ui/roles/custom/{role_id}/delete")
     async def ui_role_delete(
         role_id: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(
+            require_ui_step_up_when_own_sessions_end(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, ended=_role_holders
+            )
+        ),
     ) -> Response:
         assert_same_origin(request)
         await admin.delete_custom_role(role_id, service=service, identity=identity)
-        return RedirectResponse("/ui/roles", status_code=303)
+        return await _after_group_save(request, service, "/ui/roles")
 
     # --- AD group mappings --------------------------------------------------
 
@@ -976,7 +1019,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
-            require_ui_step_up(Permission.USERS_MANAGE, reauth_next=lambda _r: "/ui/ad-groups")
+            require_ui_step_up_when_own_sessions_end(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+                Permission.USERS_MANAGE,
+                ended=_directory_accounts,
+                reauth_next=lambda _r: "/ui/ad-groups",
+            )
         ),
     ) -> Response:
         assert_same_origin(request)
@@ -998,14 +1046,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)
-        return RedirectResponse("/ui/ad-groups", status_code=303)
+        return await _after_group_save(request, service, "/ui/ad-groups")
 
     @app.post("/ui/ad-groups/scope-map")
     async def ui_ad_group_scope_map(
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
-            require_ui_step_up(Permission.USERS_MANAGE, reauth_next=lambda _r: "/ui/ad-groups")
+            require_ui_step_up_when_own_sessions_end(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+                Permission.USERS_MANAGE,
+                ended=_directory_accounts,
+                reauth_next=lambda _r: "/ui/ad-groups",
+            )
         ),
     ) -> Response:
         assert_same_origin(request)
@@ -1024,4 +1077,4 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)
-        return RedirectResponse("/ui/ad-groups", status_code=303)
+        return await _after_group_save(request, service, "/ui/ad-groups")
