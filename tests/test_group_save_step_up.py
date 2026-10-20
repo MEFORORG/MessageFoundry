@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -319,16 +320,21 @@ async def test_a_pending_sessions_password_re_proof_mints_no_grant(engine: Engin
 
 
 async def test_the_check_reads_the_set_the_revoke_ends(engine: Engine) -> None:
-    """The route's question and the revoke's answer come from one enumeration. A disabled
-    directory account is in neither; a local account is in neither AD set."""
+    """The route's question and the revoke's answer agree. A disabled directory account and a
+    local account are outside the AD set, and the save leaves their sessions alone."""
     service = await _service(engine)
     for user_id, provider in (("ada", "ad"), ("dis", "ad"), ("len", "local")):
         await engine.store.create_user(
             user_id=user_id, username=user_id, auth_provider=provider, password_generated=False
         )
+        await engine.store.create_session(
+            token_hash=f"h-{user_id}", user_id=user_id, expires_at=time.time() + 3600
+        )
     await engine.store.set_user_disabled("dis", disabled=True)
     assert await service.sessions_ended_by_ad_map_save() == frozenset({"ada"})
-    assert await service._ad_session_targets() == ["ada"]
+    await service.set_ad_group_map([], actor="t")
+    assert await engine.store.list_sessions("ada") == []
+    assert await engine.store.list_sessions("len"), "a local session was ended"
 
 
 _ROUTES = {
