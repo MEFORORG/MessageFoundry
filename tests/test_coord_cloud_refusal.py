@@ -10,6 +10,11 @@ refusal now also guards ``handoff.ps1``, ``lane.ps1``, ``owner_log.py``,
 ``tombstone-retired-backlog-allocator.ps1`` and ``hygiene-report.ps1``, and a census below holds every
 script that names the directory to a decision about it.
 
+The readers refuse as well, because there a VM's empty answer looks clean: ``overlap.ps1`` would say
+nobody else is in a file, ``claim-adjudicate.ps1`` and ``claim-reconcile.ps1`` would judge an empty
+claim pool, and ``fleet.ps1`` would render an empty roster. ``presence.ps1`` reads the Claude config
+roots rather than the directory, and those are the VM's own too, so it refuses with a tail of its own.
+
 Each refusal is paired with a control that runs the same call without ``CLAUDE_CODE_REMOTE`` and
 must take the normal path, because a refusal test alone also passes against a script that refuses
 every call. tests/conftest.py drops the variable from the suite's own environment, so the controls
@@ -18,6 +23,7 @@ stay meaningful when the suite itself runs in a cloud VM.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -25,6 +31,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.test_coord_presence import write_session
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
@@ -36,9 +44,24 @@ REFUSAL_TAIL = (
     ": refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM's .git/mefor-coord"
     " reaches no other session, so nothing was read or recorded."
 )
+PRESENCE_TAIL = (
+    ": refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM's Claude config roots"
+    " list no other session, so nothing was read."
+)
 SEAT_DECLARE = ("-Declare", "-Seat", "builder", "-Goal", "cloud refusal test")
 # The report's offline shape: no gh, no fetch, no roots beyond the sandbox clone.
 HYGIENE_OFFLINE = ("-SkipGh", "-SkipFetch", "-NoExtraRoots")
+# Outside the census, which reads the directory's name: this script never names it.
+PRESENCE = "coord/presence.ps1"
+# The readers, each called so its control reads no real config root and asks no gh. The roots are
+# relative to the sandbox clone and do not exist, which each script reads as an empty one.
+NO_ROOT = ("-ConfigRoot", "no-config-root")
+READER_CALLS = (
+    pytest.param("coord/overlap.ps1", ("-Json", *NO_ROOT, "-TasksDir", "no-tasks"), id="overlap"),
+    pytest.param("coord/claim-adjudicate.ps1", (), id="claim-adjudicate"),
+    pytest.param("coord/claim-reconcile.ps1", (*NO_ROOT, "-NoPullRequests"), id="claim-reconcile"),
+    pytest.param("coord/fleet.ps1", (), id="fleet"),
+)
 
 needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="the scripts run under pwsh")
 # The normal paths of these scripts are exercised on Windows by their own suites; the controls here
@@ -90,6 +113,11 @@ def _coord_dir(repo: Path) -> Path:
     return repo / ".git" / "mefor-coord"
 
 
+def _refusal_line(rel: str) -> str:
+    name = rel.rsplit("/", 1)[-1]
+    return name + (PRESENCE_TAIL if rel == PRESENCE else REFUSAL_TAIL)
+
+
 def _run(repo: Path, script: str, *args: str, cloud: bool) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if cloud:
@@ -119,6 +147,8 @@ def _run(repo: Path, script: str, *args: str, cloud: bool) -> subprocess.Complet
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
+        *READER_CALLS,
+        pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
 )
 def test_each_coordination_script_refuses_in_a_cloud_session(
@@ -126,7 +156,7 @@ def test_each_coordination_script_refuses_in_a_cloud_session(
 ) -> None:
     proc = _run(repo, script, *args, cloud=True)
     assert proc.returncode == REFUSAL_EXIT, (proc.stdout, proc.stderr)
-    assert proc.stderr.strip() == script.rsplit("/", 1)[-1] + REFUSAL_TAIL, proc.stderr
+    assert proc.stderr.strip() == _refusal_line(script), proc.stderr
     assert proc.stdout == "", proc.stdout
     assert not _coord_dir(repo).exists(), "a refused call still created the coordination directory"
 
@@ -238,6 +268,7 @@ def test_seat_record_is_not_refused_in_the_cloud(repo: Path) -> None:
         pytest.param("coord/claim.ps1", ("-List",), id="claim-list"),
         pytest.param("coord/handoff.ps1", ("-Report",), id="handoff-report"),
         pytest.param("coord/lane.ps1", ("-Show",), id="lane-show"),
+        *READER_CALLS,
     ],
 )
 def test_each_coordination_script_takes_its_normal_path_outside_the_cloud(
@@ -246,6 +277,19 @@ def test_each_coordination_script_takes_its_normal_path_outside_the_cloud(
     proc = _run(repo, script, *args, cloud=False)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
+
+
+@needs_pwsh
+@needs_windows
+def test_presence_lists_a_fixture_session_outside_the_cloud(repo: Path, tmp_path: Path) -> None:
+    """The control for presence.ps1: the roster the refusal withholds is read from a fixture config
+    root holding one session, this test's own process, so the liveness fence passes."""
+    root = tmp_path / "config-root"
+    (root / "sessions").mkdir(parents=True)
+    write_session(root, pid=os.getpid(), cwd=repo, session_id="c1c1c1c1-0000")
+    proc = _run(repo, PRESENCE, "-ConfigRoot", str(root), "-Json", cloud=False)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert [r["Short"] for r in json.loads(proc.stdout)] == ["c1c1c1c1"], proc.stdout
 
 
 @needs_pwsh
@@ -325,17 +369,21 @@ GUARDED = (
     "coord/lane.ps1",
     "coord/tombstone-retired-backlog-allocator.ps1",
     "worktree/hygiene-report.ps1",
+    # The readers, whose empty answer in a VM looks clean.
+    "coord/overlap.ps1",
+    "coord/claim-adjudicate.ps1",
+    "coord/claim-reconcile.ps1",
+    "coord/fleet.ps1",
 )
 PY_GUARDED = "coord/owner_log.py"
 
 
-@pytest.mark.parametrize("rel", GUARDED)
+@pytest.mark.parametrize("rel", (*GUARDED, PRESENCE))
 def test_each_script_carries_the_one_refusal_line(rel: str) -> None:
     """The guard is inlined, so this holds every copy to one line without pwsh, which also runs
     where the refusal tests skip."""
-    name = rel.rsplit("/", 1)[-1]
     text = (ROOT / "scripts" / rel).read_text(encoding="utf-8")
-    line = f"[Console]::Error.WriteLine('{name}{REFUSAL_TAIL}')".replace("VM's", "VM''s")
+    line = f"[Console]::Error.WriteLine('{_refusal_line(rel)}')".replace("VM's", "VM''s")
     guard = f"    {line}\n    exit {REFUSAL_EXIT}\n"
     assert text.count(guard) == 1, f"{rel} lost or changed its cloud refusal line"
 
@@ -356,18 +404,15 @@ NOT_GUARDED = {
     "worktree/session-context.ps1": "user-scope hook",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
-    "coord/overlap.ps1": "a cache of its own answer; run by the user-scope hooks above",
-    # Reads mefor-coord and writes nothing there, or writes only through a guarded script.
-    "coord/claim-adjudicate.ps1": "reader",
-    "coord/claim-reconcile.ps1": "reader; -Apply writes only through claim.ps1",
-    "coord/fleet.ps1": "reader",
+    # Reads mefor-coord and writes nothing there, or writes only through a guarded script. A reader
+    # a person runs by hand, whose empty answer would look clean, is guarded instead.
     "hooks/claim_check.py": "reader, commit-msg hook",
     "hooks/ledger_check.py": "reader, pre-commit hook",
     "hooks/lane-level.ps1": "reader",
     "hooks/precompact-reprime.ps1": "reader, project hook",
     "hooks/worktree_gate.ps1": "reader; writes only its own log, outside mefor-coord",
-    "worktree/prune-merged.ps1": "reader",
-    "worktree/remove.ps1": "reader",
+    "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
+    "worktree/remove.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
     "coord/install-git-hooks.ps1": "mention",

@@ -169,6 +169,16 @@ param(
     [int]$ParallelLimit = 16
 )
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a read finds nothing there and the empty answer looks clean. CLAUDE.md
+# section 5, "A cloud session is a Builder in its own session"; tests/test_coord_cloud_refusal.py
+# holds the copies equal.
+# Exit 3 is this script's did-not-finish code, so every consumer reads a refusal as no all-clear.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('overlap.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\session-registry.ps1"
 
