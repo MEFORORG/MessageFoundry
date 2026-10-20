@@ -1342,10 +1342,11 @@ def _charges(tree: ast.AST, limiter: str) -> bool:
     """Whether ``tree`` calls ``limiter``: directly, or through a ``getattr(x, "<limiter>")``
     lookup whose result is called, either in place or after binding it to a plain name.
 
-    The lookup form is how ``_auth.py`` already reaches ``allow_reauth_attempt`` across the
-    engine/console wheel skew. A lookup that is never called charges nothing. A bound name counts
-    only when the same function calls it (nested functions included), because ``_auth.py`` already
-    calls an unrelated ``gate(...)`` elsewhere. At least these spellings are NOT recognised and
+    The lookup form is how ``_auth.py`` reached ``allow_reauth_attempt`` across the engine/console
+    wheel skew until BACKLOG #3293 removed that shim; it stays recognised so a reintroduced lookup
+    cannot hide a charge. A lookup that is never called charges nothing. A bound name counts only
+    when the same function calls it (nested functions included), so a same-named call in another
+    function is not read as a charge. At least these spellings are NOT recognised and
     read as no charge: binding to an attribute, and wrapping the lookup (``(getattr(...) or f)()``).
     """
     if calls_to(tree, {limiter}):
@@ -1439,8 +1440,8 @@ def test_console_charge_probe_can_fail() -> None:
             "builtins.py": "def f(auth):\n    return builtins.getattr(auth, 'allow_admin_write')('u')\n"
         }
     )
-    # A name bound in one function and a same-named call in ANOTHER is not a charge: _auth.py
-    # already calls an unrelated `gate(...)` in allow_reauth_attempt.
+    # A name bound in one function and a same-named call in ANOTHER is not a charge, so an
+    # unrelated `gate(...)` elsewhere in _auth.py cannot read as one.
     assert not _console_charges_admin_write(
         {
             "scoped.py": "def f(auth):\n"
@@ -2213,8 +2214,9 @@ def test_throttle_observability_split_is_documented() -> None:
 def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
     """6.1.1 scores the CONSEQUENCE of a triggered defense, so the doc must not flatten it.
 
-    Only ``POST /ui/login`` raises 429 + ``Retry-After`` (the caller's own wait since BACKLOG #3293,
-    a literal ``30`` before); the other three console entry routes
+    Only ``POST /ui/login`` raises 429 + ``Retry-After`` (the whole sign-in window since BACKLOG
+    #3293 and the owner ruling of 2026-10-20, a literal ``30`` before); the other three console
+    entry routes
     return a 303 redirect to ``/ui/login?e=rate_limited``. Derived from the AST of each route's
     rate-limit branch, so the split cannot rot back into one blanket sentence.
 

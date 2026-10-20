@@ -3166,7 +3166,8 @@ class AuthService:
         one of them when another's oldest attempt was made. The whole window is never too early: a
         per-address bucket clears within it once nothing else spends it. The authenticated
         PHI-read and ceremony 429s keep the exact wait."""
-        return max(1, math.ceil(self.settings.login_rate_limit_window_seconds))
+        # _settings, not the settings property: that returns a deep copy, and this runs per refusal.
+        return max(1, math.ceil(self._settings.login_rate_limit_window_seconds))
 
     def reauth_retry_after(self, actor: str) -> int:
         """The ``Retry-After`` value for a credential ceremony just refused by

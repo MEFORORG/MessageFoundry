@@ -603,7 +603,8 @@ from typing import Any
 #: ``AuthService.allow_reauth_attempt`` directly, so that method is on the discovered surface now.
 #: Owner ruling 2026-10-20 then made ``login_retry_after`` take no argument: it answers the whole
 #: sign-in window, so a skew raises TypeError at the ``POST /ui/login`` 429.
-#: Re-derived with ``--write`` on main at 45c5ebcfa; re-derive after any merge with another seam move.
+#: Re-derived with ``--write`` on this branch's tree, cut from main at 45c5ebcfa; re-derive after
+#: any merge with another seam move.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
