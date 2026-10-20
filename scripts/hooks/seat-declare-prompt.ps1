@@ -61,6 +61,15 @@ param()
 $ErrorActionPreference = 'Continue'
 
 try {
+    # A CLAUDE CODE CLOUD SESSION HAS NO SEAT REGISTRY TO DECLARE INTO. In a cloud VM --git-common-dir
+    # resolves to the clone's own .git, so the prompt would send the session to a seat.ps1 -Declare that
+    # writes where nobody reads -- which is why seat.ps1 -Declare now refuses there. Nothing is stamped
+    # either, for the same reason. One line instead of the prompt, and still exit 0 (see the header).
+    if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+        Write-Output "[seat] This is a Claude Code cloud session (CLAUDE_CODE_REMOTE=true): a cloud Builder with no seat registry, so do not declare. CLAUDE.md section 5, 'A cloud session is a Builder in its own session', says how it hands its PR over."
+        exit 0
+    }
+
     # Read stdin if a payload is there. SessionStart delivers session_id, and without it seat.ps1
     # keys the record by a fallback rather than by the session that is actually starting. It also
     # delivers cwd, the session's own directory, which this process may not be in.

@@ -85,6 +85,10 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Sign-out records where it came from.** `/ui/logout` passes the caller's `client_ip` address to
+  `AuthService.logout`, so the `auth.logout` audit row records it. Seam change: `logout` takes a
+  required `client` keyword, so the supported digest moved. A console from either side of this
+  change refuses an engine from the other at mount. (`BACKLOG #3339`)
 - **Seam only: the posture reports the deny-by-default refusal count.** `SecurityPosture` gains
   `undeclared_route_refusals` (vault `BACKLOG #2954`). The console does not show it yet, but the
   field is on the seam it pins, so the supported digest moved.

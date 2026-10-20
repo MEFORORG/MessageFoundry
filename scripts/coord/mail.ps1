@@ -134,6 +134,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
+# the VM's own clone, so a write would "succeed" where nobody reads. CLAUDE.md section 5, "A cloud
+# session is a Builder in its own session"; tests/test_coord_cloud_refusal.py holds the copies equal.
+if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
+    [Console]::Error.WriteLine('mail.ps1: refused in a Claude Code cloud session (CLAUDE_CODE_REMOTE=true). This VM''s .git/mefor-coord reaches no other session, so nothing was read or recorded.')
+    exit 3
+}
+
 # Send-set arguments without -Send: refuse by name, before anything is read or written. See $Send.
 if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
     throw "Send arguments were given without -Send. Nothing was sent. Add -Send and re-run."

@@ -40,11 +40,21 @@ param(
     # session runs this in its own worktree. Resolved to the checkout ROOT via git, so running it
     # from a subdirectory does the right thing instead of creating a stray .venv there.
     [string]$Path = $PWD.Path,
-    [string]$Python = "python",
+    # The interpreter that creates the venv. Defaults to `python` on Windows. Elsewhere it prefers
+    # `python3.14`, because the distro `python3` on Ubuntu, which a Claude Code cloud VM runs, is older
+    # than the >=3.14 pyproject requires and has no `python` beside it; then `python3`.
+    [string]$Python,
     [switch]$Sqlserver   # also install the [sqlserver] extra
 )
 
 $ErrorActionPreference = "Stop"
+
+# [Environment]::OSVersion rather than $IsWindows, which Windows PowerShell 5.1 does not define, so that
+# host would have read as Linux.
+$onWindows = [Environment]::OSVersion.Platform -eq 'Win32NT'
+if (-not $Python) {
+    $Python = if ($onWindows) { "python" } elseif (Get-Command python3.14 -ErrorAction SilentlyContinue) { "python3.14" } else { "python3" }
+}
 
 if (-not (Test-Path -LiteralPath $Path)) { throw "No such path: $Path" }
 
@@ -63,7 +73,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $root 'pyproject.toml'))) {
 }
 
 $venv = Join-Path $root ".venv"
-$venvPy = Join-Path $venv "Scripts\python.exe"
+# A venv puts its interpreter at Scripts\python.exe on Windows and at bin/python everywhere else. The
+# Linux layout is what a Claude Code cloud VM gets.
+$venvPy = if ($onWindows) { Join-Path $venv "Scripts\python.exe" } else { Join-Path $venv "bin/python" }
 
 # Where the venv imports the two packages from, judged by the venv's own interpreter (BACKLOG #2857).
 # One line per package: "<name> OK <how> <dir>" or "<name> BAD <why>".

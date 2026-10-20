@@ -31,10 +31,10 @@ Without it the extraction could be silently undone -- the two text gates would k
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -43,9 +43,11 @@ _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "worktree" / "ensure-venv.ps1"
 _NEW_PS1 = _REPO / "scripts" / "worktree" / "new.ps1"
 
+# Not Windows-only: a Claude Code cloud Builder runs this script on Linux, so the ubuntu legs, which
+# carry pwsh, drive the same paths against a bin/python venv.
 pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None or os.name != "nt",
-    reason="ensure-venv.ps1 is a PowerShell script driven through pwsh on Windows",
+    shutil.which("pwsh") is None,
+    reason="ensure-venv.ps1 is a PowerShell script driven through pwsh",
 )
 
 
@@ -95,8 +97,9 @@ def test_it_refuses_a_checkout_that_is_not_this_project(tmp_path: Path) -> None:
 def _template_venv(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One REAL venv with no pip, built once per session; each test gets its own copy of it.
 
-    Building one takes seconds. A Windows venv's launcher finds the ``pyvenv.cfg`` beside it, so a
-    copied tree is a working venv of its own, and no test can change another's."""
+    Building one takes seconds. A venv's interpreter finds the ``pyvenv.cfg`` beside it (on Linux
+    through the copied symlink's own path), so a copied tree is a working venv of its own, and no
+    test can change another's."""
     venv = tmp_path_factory.mktemp("template") / ".venv"
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(venv)],
@@ -122,7 +125,7 @@ def _venv_checkout(tmp_path: Path, template: Path) -> tuple[Path, Path]:
         (root / name / "__init__.py").write_text(f"# {name} source\n", encoding="utf-8")
     venv = root / ".venv"
     shutil.copytree(template, venv, symlinks=True)
-    site = venv / "Lib" / "site-packages"
+    site = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
     (site / "_editable_impl_messagefoundry.pth").write_text(f"{root}\n", encoding="utf-8")
     return root, site
 

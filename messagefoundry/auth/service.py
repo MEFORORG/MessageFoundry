@@ -9959,7 +9959,9 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def logout(self, token: str | None, *, actor: str | None = None) -> LogoutOutcome:
+    async def logout(
+        self, token: str | None, *, client: str | None, actor: str | None = None
+    ) -> LogoutOutcome:
         """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
         return that same outcome.
 
@@ -9983,7 +9985,16 @@ class AuthService:
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
         has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
-        feed; with nothing ended there is no owner, and the actor stays NULL."""
+        feed; with nothing ended there is no owner, and the actor stays NULL. That includes a
+        console sign-out that loses a rotation race (engine PR 2384, open finding 3). A
+        read before the revoke would name the owner only through :meth:`_load_session`, the one
+        sanctioned session reader, and that read ends and reports a row whose seal fails, so the
+        revoke would then record ``nothing_to_revoke`` for a session this call ended.
+
+        ``client`` is the caller's address, from ``client_ip`` on a request (ADR 0150). It is
+        ``None`` where ``client_ip`` finds no address, so on this row a NULL client does not by
+        itself mean no request was in scope. It has no default, so a new sign-out caller cannot
+        omit it silently (BACKLOG #3339)."""
         if not token:
             return "nothing_to_revoke"
         ended = await self._store.supersede_session(hash_token(token), now=time.time())
@@ -9993,7 +10004,9 @@ class AuthService:
             actor = owner.username if owner is not None else None
         # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
         # ended, so the trail still records the sign-out request.
-        await self._audit("auth.logout", actor=actor, detail=_json({"outcome": outcome}))
+        await self._audit(
+            "auth.logout", actor=actor, detail=_json({"outcome": outcome}), client=client
+        )
         return outcome
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
@@ -11606,11 +11619,15 @@ class AuthService:
         names = await self.administrators_needing_an_outside_service()
         if not names:
             return names
+        # The names come right after a neutral label and before the word "password". The shipped
+        # CredentialScrubFilter reads "password: <value>" as a credential, so the old wording, with
+        # the list after "no usable password:", masked the first name (BACKLOG #3282).
         _log.warning(
             "no enabled Administrator can sign in without an outside identity service (the "
-            "directory or a federated identity provider); each is a directory account or a local "
-            "one with no usable password: %s. If that service is down, no Administrator can sign "
-            "in to manage this engine. Create a local Administrator now, before an outage, from "
+            "directory or a federated identity provider). Accounts that need one: %s. Each is a "
+            "directory account, or a local account with no usable password. If that service is "
+            "down, no Administrator can sign in to manage this engine. Create a local "
+            "Administrator now, before an outage, from "
             "the web console. During an outage, `messagefoundry provision-admin`, run at the host "
             "with the engine stopped, is not blocked by these accounts "
             "(docs/SECURITY.md, 'Keep a local Administrator').",

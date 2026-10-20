@@ -475,6 +475,25 @@ gates a merge**, and no seat has to clear one.
    drift is a reason to re-check the rest. An item already answered is a good outcome: record it and
    stop. BACKLOG #1448; the evidence is in [`docs/METHOD.md`](docs/METHOD.md).
 
+### A cloud session is a Builder in its own session
+
+A Claude Code cloud session (`CLAUDE_CODE_REMOTE=true`) holds one seat only: a **Builder in its own
+session, on `MEFORORG/MessageFoundry` alone**. **Never attach a second repository**: a session with
+several repositories loads hooks from none of them. Its `.git/mefor-coord` belongs to its own clone
+and reaches no other session, so `seat.ps1 -Declare`, `mail.ps1`, `alloc.ps1` and `claim.ps1`
+refuse there, and the declare rule above does not apply. A brief that needs an ADR number is not a
+cloud brief. Cite the brief's item in the commit body, not the subject: the commit-msg claim gate
+refuses a code commit whose subject cites a ledger number nobody claimed, and no claim can be taken
+there. Commit under the allowlisted git identity the cloud environment sets, or `cla` blocks the PR.
+
+The GitHub proxy refuses GraphQL, so no `gh pr` and no `gh issue`. Open the PR over REST with
+`gh api -X POST repos/MEFORORG/MessageFoundry/pulls -f title=... -f head=<branch> -f base=main -F
+body=@<file>`, then hand it to the Lander with the `qa` label
+(`gh api -X POST repos/MEFORORG/MessageFoundry/issues/<N>/labels -f "labels[]=qa"`) and a PR comment,
+never with mail. The evidence is probe PR
+[2432](https://github.com/MEFORORG/MessageFoundry/pull/2432) (2026-10-19) and fleet wiki note
+`20261018T215116801Z-5lqiqo`.
+
 ### The Manager plans, dispatches, and holds the owner's attention
 
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and

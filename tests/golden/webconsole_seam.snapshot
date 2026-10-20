@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-59d55f046f916cff
+59f365a69d997684
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -188,7 +188,7 @@ kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
 login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None, totp_code: 'str | None' = None) -> 'LoginOutcome'
 login_retry_after: (self) -> 'int'
-logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'LogoutOutcome'
+logout: (self, token: 'str | None', *, client: 'str | None', actor: 'str | None' = None) -> 'LogoutOutcome'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
 must_enrol_before_rotating: (self, identity: 'Identity') -> 'bool'

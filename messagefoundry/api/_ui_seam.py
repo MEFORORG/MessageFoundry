@@ -594,6 +594,12 @@ from typing import Any
 #: covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
+#: BACKLOG #3339: ``AuthService.logout`` gained a required keyword ``client``, the caller's
+#: address, which ``/ui/logout`` now passes so the ``auth.logout`` row records it. The digest moved
+#: from ``5d9c162790077dfc`` because the discovered signature changed. A console on an engine from
+#: the other side of this change would fail its sign-out with a ``TypeError``; the pinned digest
+#: refuses that pair at mount. Re-derived with ``--write``.
+#:
 #: Vault BACKLOG #3293: ``AuthService`` gained ``phi_read_retry_after``, ``login_retry_after`` and
 #: ``reauth_retry_after``. ``require_ui``'s PHI-read 429 and the ``POST /ui/login``, ``/ui/mfa``,
 #: ``/ui/reauth`` and ``/ui/reauth/webauthn`` 429s call them for their ``Retry-After``, where they
@@ -603,15 +609,18 @@ from typing import Any
 #: ``AuthService.allow_reauth_attempt`` directly, so that method is on the discovered surface now.
 #: Owner ruling 2026-10-20 then made ``login_retry_after`` take no argument: it answers the whole
 #: sign-in window, so a skew raises TypeError at the ``POST /ui/login`` 429.
-#: Re-derived with ``--write`` on this branch's tree, cut from main at 45c5ebcfa; re-derive after
-#: any merge with another seam move.
+#: Re-derived with ``--write`` on this branch's tree, cut from main at 45c5ebcfa (59d55f046f916cff).
+#:
+#: Vault BACKLOG #3293 merged with main after BACKLOG #3339 (engine PR 2435) moved main's seam to
+#: 1f2d208818510f18. Neither parent's value covered both, so the move comes from the merge.
+#: Re-derived with ``--write`` on the merged tree, so the value below covers both entries above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "59d55f046f916cff"
+ENGINE_UI_SEAM: str = "59f365a69d997684"
 
 
 @dataclass(frozen=True, slots=True)
