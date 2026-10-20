@@ -1056,11 +1056,12 @@ async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
         us._paths = _paths
         # The middleware's own deadline, fired by the parked sweep (tests/_deadline_capture.py).
         capture = capture_deadlines(monkeypatch, app)
-        await expect_cut_off(
-            capture,
-            c.post("/uploads", files={"file": ("new.hl7", BATCH, "text/plain")}, headers=h),
+        upload = asyncio.ensure_future(
+            c.post("/uploads", files={"file": ("new.hl7", BATCH, "text/plain")}, headers=h)
         )
+        await asyncio.wait([upload])
         assert parked.is_set(), "the sweep never reached its second aged pair"
+        await expect_cut_off(capture, upload)
 
     deleted = aged - {m.file_id for m in await us.list_files()}
     rows = await engine.store.list_audit(action="upload.prune")

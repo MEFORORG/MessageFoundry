@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 # A helper module holding the content-free asserts several connector tests share. pytest rewrites
 # asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
 pytest.register_assert_rewrite("tests._content_free")
+# The same for the request-deadline helper the cut-off tests share (vault BACKLOG #3871).
+pytest.register_assert_rewrite("tests._deadline_capture")
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.

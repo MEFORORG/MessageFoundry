@@ -15,8 +15,9 @@ deadline long enough never to fire on its own. The operation the test holds awai
 next pass, wherever the request is, so the 503 lands mid-operation and nowhere else, then holds the
 operation until :meth:`DeadlineCapture.held` lets it go.
 
-Engine PR 2438 carries a simpler copy of the stand-in in the web console's ``test_ui_dr_outlive.py``:
-it fires the latest deadline, with none of the checks below.
+Engine PR 2438, open and not on ``main`` when this was written, carries a simpler copy of the
+stand-in in the web console's ``test_ui_dr_outlive.py``: it fires the latest deadline, with none of
+the checks below.
 """
 
 from __future__ import annotations
@@ -69,14 +70,25 @@ class DeadlineCapture:
         Exactly one, still armed: a test installs the capture just before the request it cuts off,
         so a second deadline means a request the test did not expect, and a disarmed one means the
         response has already started, where firing would cut the body rather than the operation.
-        The latest deadline is still fired then, so the test fails at once rather than waiting."""
+        Anything else fires nothing: it is recorded, and the hold is let go so the request ends
+        and the test reports it, rather than every await waiting on the next."""
         if len(self.deadlines) != 1:
-            self.problem = f"expected one request deadline, saw {len(self.deadlines)}"
-        elif self.deadlines[0].when() is None:
-            self.problem = "the request had already started its response"
-        if self.deadlines:
-            self.deadlines[-1].reschedule(asyncio.get_running_loop().time())
+            self._refuse(f"expected one request deadline, saw {len(self.deadlines)}")
+            return
+        deadline = self.deadlines[0]
+        if deadline.when() is None:
+            self._refuse("the request had already started its response")
+            return
+        try:
+            deadline.reschedule(asyncio.get_running_loop().time())
+        except RuntimeError as exc:  # it had already expired, or its request had ended
+            self._refuse(f"the deadline could not be fired: {exc}")
+            return
         self.fired = True
+
+    def _refuse(self, problem: str) -> None:
+        self.problem = problem
+        self._released.set()
 
     async def cut_off(self) -> None:
         """Awaited from inside the held operation: fire the deadline, then hold the operation until
@@ -117,8 +129,14 @@ async def expect_cut_off(capture: DeadlineCapture, request: Awaitable[httpx.Resp
     ``capture`` from inside the operation: not a route's 503, and not the deadline running out.
 
     The generous deadline bounds the wait: a deadline the operation never fires answers 503 there,
-    and the ``fired`` check fails."""
-    r = await request
+    and the ``fired`` check fails. A fire that went wrong is reported first, even when the request
+    raised because of it."""
+    try:
+        r = await request
+    except Exception as exc:
+        if capture.problem is not None:
+            raise AssertionError(capture.problem) from exc
+        raise
     assert capture.problem is None, capture.problem
     assert r.status_code == 503, r.text
     assert r.json() == {"detail": "the server timed out building a response"}
