@@ -5,17 +5,18 @@
 The PHI startup gate computes notification readiness from the SMTP transport alone
 (``notify_security_events`` + ``email_smtp_host`` + ``email_from``). That answers *"is a transport
 configured"* and never *"can the account that matters actually receive"* -- and the two come apart on
-exactly the instance the gate is meant to protect. ``provision-admin`` without ``--email`` creates the
+exactly the instance the gate is meant to protect. ``provision-admin`` without ``--email`` created the
 account holding ``frozenset(Permission)`` with no address, so every notice about it no-ops while the
 gate reports a healthy channel. (The item was found on the first-run bootstrap account, which ADR
-0183 Amendment A has since retired.)
+0183 Amendment A has since retired. ``provision-admin`` and its service require the address since
+BACKLOG #1138 and #3391, and a store an earlier build wrote can still hold the account.)
 
 ``has_notifiable_admin`` is the missing half of that question. These arms are deliberately
 ASYMMETRIC -- a control that failed on everything would not distinguish *"the predicate keys on a
 deliverable admin"* from *"the predicate is just hard to satisfy"*:
 
-* the REAL first-administrator path, with no address, yields False (the defect, reproduced
-  rather than described);
+* the REAL first-administrator path yields True, and the same account with its address cleared
+  yields False (the defect, reproduced rather than described);
 * an administrator WITH an address yields True;
 * a non-administrator with an address still yields False -- so the predicate keys on the ROLE, not
   on "some mailbox exists somewhere", which is the scope the item asks for (``email`` is optional
@@ -34,7 +35,8 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_admin, provision_totp
+from messagefoundry.store.store import MessageStore
+from tests._admin_account import PROVISION_EMAIL, create_admin, forget_addresses, provision_totp
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -84,21 +86,30 @@ async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str
     return await _rotated_session(c, admin.username, admin.password)
 
 
-async def test_an_administrator_provisioned_without_an_address_is_not_notifiable(
+async def test_a_provisioned_administrator_is_notifiable_and_an_addressless_one_is_not(
     engine: Engine,
 ) -> None:
-    """The defect, on the REAL first-administrator path rather than a hand-built fixture.
+    """The REAL first-administrator path, then the state it can no longer leave.
 
-    Since ADR 0183 the first administrator comes from ``provision-admin``, where ``--email`` is
-    optional. Without it the store holds one account, holding every permission, with no address any
-    notice could reach: the state a deploying site is in at the moment the SMTP-only gate passes.
+    Since ADR 0183 the first administrator comes from ``provision-admin``. ``--email`` was optional
+    there until BACKLOG #1138, and the service accepted no address until #3391, so the store could
+    hold one account, holding every permission, with no address any notice could reach. Both now
+    require one. The addressless arm is the state a store an earlier build wrote can still hold, so
+    the predicate must still read it as not notifiable.
     """
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    await service.provision_first_administrator(
-        username="site-admin", password=PW, actor="test", **provision_totp()
+    outcome = await service.provision_first_administrator(
+        username="site-admin",
+        password=PW,
+        notify_email=PROVISION_EMAIL,
+        actor="test",
+        **provision_totp(),
     )
     assert await service.has_enabled_administrator() is True  # control: the account is there
+    assert await service.has_notifiable_admin() is True
+    assert isinstance(engine.store, MessageStore)  # the helper writes through the SQLite store
+    await forget_addresses(engine.store, outcome.user_id)
     assert await service.has_notifiable_admin() is False
 
 

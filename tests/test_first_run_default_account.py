@@ -35,7 +35,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore, UserRow, new_user_record
-from tests._admin_account import provision_totp
+from tests._admin_account import PROVISION_EMAIL, provision_totp
 
 # The three store classes, reused rather than re-derived — that module's docstring establishes the
 # property this file depends on: the drivers are imported method-locally, so all three classes import
@@ -292,6 +292,7 @@ async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
         outcome = await service.provision_first_administrator(
             username="site-admin",
             password="a-long-enough-operator-passphrase",
+            notify_email=PROVISION_EMAIL,
             actor="test",
             **provision_totp(),
         )

@@ -32,14 +32,19 @@ from uuid import uuid4
 from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, ProvisionedAdministrator
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.store import MessageStore, _writer_guard
 
 __all__ = [
     "ADMIN_PASSWORD",
     "ADMIN_USERNAME",
+    "PROVISION_EMAIL",
     "AdminAccount",
     "create_admin",
     "create_local_user_chosen",
+    "forget_addresses",
+    "provision_admin",
     "provision_totp",
     "login_admin",
 ]
@@ -122,6 +127,57 @@ async def create_local_user_chosen(service: AuthService, *, password: str, **kwa
         password_generated=False,
     )
     return created.user_id
+
+
+#: The synthetic notification address a provisioning test gives where the address is not under
+#: test. ``provision_first_administrator`` requires one (BACKLOG #1138, #3391).
+PROVISION_EMAIL = "first-admin@example.invalid"
+
+
+async def forget_addresses(store: MessageStore, user_id: str) -> None:
+    """Clear an account's ``email`` and ``notify_email``, keeping its record's seal valid.
+
+    An enabled Administrator with no notification address is still reachable: a directory account
+    granted the role, or a store an earlier build wrote. ``provision_first_administrator`` refuses
+    to write one since BACKLOG #3391, and no store method clears ``notify_email`` (its parameter is
+    ``str``), so a test that needs that state on a provisioned account comes here. It goes through
+    the SQLite store's own sealed-record writer, as every user write does, so the row still
+    verifies.
+    """
+    async with _writer_guard(store._db, store._lock):
+        written = await store._write_user(
+            user_id, lambda r: r.changed(email=None, notify_email=None)
+        )
+        await store._commit()
+    assert written is not None, f"no account {user_id!r} to clear"
+
+
+async def provision_admin(
+    store: MessageStore,
+    *,
+    username: str,
+    password: str,
+    notify_email: str | None,
+    settings: AuthSettings | None = None,
+    totp: bool = True,
+) -> ProvisionedAdministrator:
+    """Provision an Administrator into ``store`` as ``provision-admin`` does, under ``settings``
+    (the shipped ones by default), enrolling TOTP unless ``totp`` is false.
+
+    ``notify_email=None`` leaves it with no address: the service is given :data:`PROVISION_EMAIL`,
+    because it refuses none, and :func:`forget_addresses` then clears it. The state is one an
+    admin-set-notify-email or start-gate test needs and the service will not write.
+    """
+    outcome = await AuthService(store, settings or AuthSettings()).provision_first_administrator(
+        username=username,
+        password=password,
+        notify_email=PROVISION_EMAIL if notify_email is None else notify_email,
+        actor="test",
+        **(provision_totp() if totp else {}),
+    )
+    if notify_email is None:
+        await forget_addresses(store, outcome.user_id)
+    return outcome
 
 
 #: A fixed synthetic TOTP secret for provisioning tests (ADR 0197 Amendment A, N-A). Not a secret.

@@ -35,7 +35,7 @@ from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
 from messagefoundry.store.store import AdminGrant, MessageStore
-from tests._admin_account import provision_totp
+from tests._admin_account import PROVISION_EMAIL, provision_totp
 from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
     assert_first_admin_grant_contract,
@@ -192,7 +192,11 @@ def _hold_both_after_the_read(
 
 async def _provision(service: AuthService, username: str) -> Any:
     return await service.provision_first_administrator(
-        username=username, password=_PASSWORD, actor="test", **provision_totp()
+        username=username,
+        password=_PASSWORD,
+        notify_email=PROVISION_EMAIL,
+        actor="test",
+        **provision_totp(),
     )
 
 

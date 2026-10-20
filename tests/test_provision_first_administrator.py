@@ -43,7 +43,7 @@ from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
-from tests._admin_account import PROVISION_TOTP_SECRET, provision_totp
+from tests._admin_account import PROVISION_EMAIL, PROVISION_TOTP_SECRET, provision_totp
 from tests._totp_clock import fresh_totp
 
 # The directory-sign-in precondition, imported rather than re-derived: that module is where it is
@@ -66,7 +66,11 @@ async def test_a_provisioned_administrator_is_usable_and_a_start_adds_no_account
     try:
         service = AuthService(store, AuthSettings())
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is False
 
@@ -98,13 +102,21 @@ async def test_it_refuses_once_an_enabled_administrator_exists() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         assert await service.has_enabled_administrator() is True
 
         with pytest.raises(FirstAdministratorRefused, match="already has an enabled Administrator"):
             await service.provision_first_administrator(
-                username="second", password=_PASSWORD, actor="test", **provision_totp()
+                username="second",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
         assert await store.get_user_by_username("second") is None
     finally:
@@ -128,7 +140,11 @@ async def test_the_guard_asks_for_an_administrator_not_an_empty_table() -> None:
 
         # The empty-table guard would have refused here. This one proceeds.
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None
@@ -177,7 +193,11 @@ async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after
         assert (await service.login("site-admin", _PASSWORD)).ok is False
 
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is True and outcome.user_id == "halfwritten"
         # The operator's just-typed credential is authoritative, which matters on the second arm:
@@ -211,7 +231,11 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
         await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test")
         with pytest.raises(FirstAdministratorRefused, match="holds roles"):
             await service.provision_first_administrator(
-                username="bob", password=_PASSWORD, actor="test", **provision_totp()
+                username="bob",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
 
         # Disabled is refused rather than silently revived -- and refusing rather than re-enabling
@@ -226,7 +250,11 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
         await store.set_user_disabled("off", disabled=True)
         with pytest.raises(FirstAdministratorRefused, match="is disabled"):
             await service.provision_first_administrator(
-                username="carol", password=_PASSWORD, actor="test", **provision_totp()
+                username="carol",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
 
         # A directory row is never promoted, whatever its role state: its authority comes from the
@@ -240,7 +268,11 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
         )
         with pytest.raises(FirstAdministratorRefused, match="provision a separate"):
             await service.provision_first_administrator(
-                username="dana", password=_PASSWORD, actor="test", **provision_totp()
+                username="dana",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
     finally:
         await store.close()
@@ -253,7 +285,11 @@ async def test_a_weak_password_is_refused_and_writes_nothing() -> None:
         service = AuthService(store, AuthSettings(password_min_length=20))
         with pytest.raises(FirstAdministratorRefused):
             await service.provision_first_administrator(
-                username="site-admin", password="short", actor="test", **provision_totp()
+                username="site-admin",
+                password="short",
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
         assert await store.count_users() == 0
     finally:
@@ -350,7 +386,11 @@ async def test_the_provision_is_audited() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="cli:tester", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="cli:tester",
+            **provision_totp(),
         )
         rows = [dict(r) for r in await store.list_audit(limit=50)]
         provisioned = [r for r in rows if r["action"] == "auth.first_administrator_provisioned"]
@@ -1469,7 +1509,7 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
 
     ``--email`` may replace it, and the new address belongs to the operator doing the takeover, so a
     notice sent after the write would tell the one person who already knows. The arm with no
-    ``--email`` is gone since BACKLOG #2288: that repair is refused, see the tests below.
+    ``--email`` is gone: the service refuses no address (BACKLOG #3391), see the tests below.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1561,20 +1601,19 @@ async def test_a_crash_after_the_address_write_still_told_the_earlier_holder() -
         await store.close()
 
 
-# --- BACKLOG #2288: a row that holds an address is completed only when --email is given ----------
+# --- BACKLOG #1138, #3391: the service requires the address, as the command does ------------------
 
 
-async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email() -> None:
-    """Kept silently, the stored address would receive the sole Administrator's notices.
+async def test_the_service_refuses_no_address_and_writes_nothing() -> None:
+    """BACKLOG #3391: ``provision-admin`` requires ``--email``, and the service now refuses ``None``
+    too, rather than leaving an Administrator nobody's notices can reach to any other caller.
 
-    A blank address had its own case here until BACKLOG #1138. The service now refuses a blank
-    address before it reads the row, which
-    ``test_a_blank_or_malformed_address_is_refused_and_writes_nothing`` pins.
-
-    The refusal writes nothing. The row keeps its address, password, factors and session, gains no
-    role, and nobody is told of a takeover that did not happen. The row holds all of those on
-    purpose: a refusal that ran after the factor and session clear would still pass on a bare row.
-    The text does not print the stored address, which may be somebody else's.
+    It replaces BACKLOG #2288's narrower refusal of a repair, which declined only a row that already
+    held an address, and so it is driven on that row: one holding an address, a password, factors
+    and a session. The refusal writes nothing. The row keeps all of them, gains no role, and nobody
+    is told of a takeover that did not happen. The row holds them on purpose: a refusal that ran
+    after the factor and session clear would still pass on a bare row. The text does not print the
+    stored address, which may be somebody else's.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1614,19 +1653,23 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
         notifier = _Recorder()
         service = AuthService(store, AuthSettings(), security_notifier=notifier)
 
-        with pytest.raises(FirstAdministratorRefused, match="--email") as refused:
+        # None is outside the type; the refusal is for a caller that does not check it.
+        with pytest.raises(
+            FirstAdministratorRefused, match=r"address is required \(--email\)"
+        ) as refused:
             await service.provision_first_administrator(
                 username="site-admin",
                 password=_PASSWORD,
-                notify_email=None,
+                notify_email=None,  # type: ignore[arg-type]
                 actor="test",
                 **provision_totp(),
             )
         assert "holder@example.invalid" not in str(refused.value)
         # The courtesy pre-check gives the same answer, so no prompt is shown first.
-        assert await service.provision_refusal("site-admin", notify_email=None) == str(
-            refused.value
-        )
+        assert await service.provision_refusal(
+            "site-admin",
+            notify_email=None,  # type: ignore[arg-type]
+        ) == str(refused.value)
 
         after = await store.get_user("roleless")
         assert after == before
@@ -1643,8 +1686,8 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
         await store.close()
 
 
-async def test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create() -> None:
-    """A run given ``--email`` that stops after ``create_user`` leaves its own address on the row.
+async def test_a_run_that_stopped_after_the_create_is_completed_by_the_same_command() -> None:
+    """A run that stops after ``create_user`` leaves its own address on the row.
 
     The same command run again carries the same ``--email``, so it completes the row. This is the
     case a flat refusal of every addressed row would strand.
@@ -1669,7 +1712,6 @@ async def test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_
         store.set_password = real_set_password  # type: ignore[method-assign]
         half = await store.get_user_by_username("site-admin")
         assert half is not None and half.notify_email == "operator@example.invalid"
-        assert await service.provision_refusal("site-admin", notify_email=None) is not None
         assert (
             await service.provision_refusal("site-admin", notify_email="operator@example.invalid")
             is None
@@ -1684,32 +1726,6 @@ async def test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_
         )
         assert outcome.repaired is True
         assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(half.id)
-    finally:
-        await store.close()
-
-
-@pytest.mark.parametrize("stored", [None, "   "], ids=["null", "blank"])
-async def test_a_row_with_no_address_is_still_completed_without_an_email(
-    stored: str | None,
-) -> None:
-    """The control: the refusal asks about the stored address, not about ``--email`` alone. A
-    blank stored address counts as none, as it does for the holder notice."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, AuthSettings())
-        await _roleless_account(store, email=None)
-        if stored is not None:
-            # No store API writes a blank address, so the legacy shape is written directly.
-            await store._db.execute(
-                "UPDATE users SET notify_email = ? WHERE id = 'roleless'", (stored,)
-            )
-            await store._db.commit()
-        assert await service.provision_refusal("site-admin", notify_email=None) is None
-        outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
-        )
-        assert outcome.repaired is True
-        assert outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS
     finally:
         await store.close()
 
@@ -2389,19 +2405,26 @@ async def test_the_service_refuses_no_totp_while_mfa_is_required_and_a_wrong_cod
         service = AuthService(store, AuthSettings())
         with pytest.raises(FirstAdministratorRefused, match="require_mfa"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test"
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
             )
         kw = provision_totp()
         kw["totp_code"] = "000000" if kw["totp_code"] != "000000" else "111111"
         with pytest.raises(FirstAdministratorRefused, match="nothing was written"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **kw
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **kw,
             )
         assert await store.count_users() == 0
         # With the requirement off, the service provisions without TOTP.
         off = AuthService(store, AuthSettings(require_mfa=False))
         outcome = await off.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, notify_email=PROVISION_EMAIL, actor="test"
         )
         assert outcome.recovery_codes == ()
     finally:
@@ -2455,7 +2478,11 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
 
         on = AuthService(store, AuthSettings())
         outcome = await on.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired and outcome.recovery_codes
         # The earlier holder's session is gone: it never becomes an Administrator session.
@@ -2495,7 +2522,11 @@ async def test_a_re_run_in_the_same_step_is_not_blocked_by_the_rows_old_step_mar
         )
         assert spent is not None and await store.consume_totp_step("half", spent)
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **kw
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **kw,
         )
         assert outcome.repaired and outcome.recovery_codes
         row = await store.get_user("half")
@@ -2536,7 +2567,11 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
         kw = provision_totp()
         with pytest.raises(FirstAdministratorRefused, match="changed while this command ran"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **kw
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **kw,
             )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and not row.totp_enabled
@@ -2544,7 +2579,11 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
 
         monkeypatch.setattr(store, "enable_totp", real_enable)
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **kw
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **kw,
         )
         assert outcome.repaired and outcome.recovery_codes
         done = await store.get_user(row.id)
@@ -2573,7 +2612,11 @@ async def test_a_re_stage_between_the_stage_and_the_enable_refuses_before_the_ro
         monkeypatch.setattr(store, "enable_totp", restaged_then_enable)
         with pytest.raises(FirstAdministratorRefused, match="changed while this command ran"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and not row.totp_enabled
@@ -2605,7 +2648,11 @@ async def test_a_stage_that_lands_after_another_runs_enable_refuses_before_the_r
         monkeypatch.setattr(store, "set_totp_secret", other_run_enabled_first)
         with pytest.raises(FirstAdministratorRefused, match="did not stage its authenticator"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.totp_enabled
@@ -2626,7 +2673,11 @@ async def test_the_provisioning_codes_step_stays_spent_after_the_stage() -> None
         service = AuthService(store, AuthSettings())
         kw = provision_totp()
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **kw
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **kw,
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.totp_enabled
@@ -2670,7 +2721,7 @@ async def test_a_sign_in_during_the_repair_does_not_survive_into_the_administrat
 
         store.set_password = sign_in_just_before_the_new_password  # type: ignore[method-assign]
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, notify_email=PROVISION_EMAIL, actor="test"
         )
         assert outcome.repaired and minted
         assert await service.identity_for_token(minted[0]) is None
@@ -2897,7 +2948,11 @@ async def test_the_run_that_loses_an_enrolment_race_is_told_to_remove_its_dead_e
         async def run_second() -> ProvisionedAdministrator:
             run.set("second")
             return await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="second", **second
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="second",
+                **second,
             )
 
         async def racing_enable(
@@ -2933,7 +2988,11 @@ async def test_the_run_that_loses_an_enrolment_race_is_told_to_remove_its_dead_e
         monkeypatch.setattr(store, "enable_totp", racing_enable)
         with pytest.raises(FirstAdministratorRefused) as lost:
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="first", **first
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="first",
+                **first,
             )
         won = await tasks[0]
         assert won.repaired
