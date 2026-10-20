@@ -35,7 +35,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    digest, and kept the old one compiled in, would neither refuse a pin written for the old one
    nor record a false ``changed`` (BACKLOG #3425). A digest name this release does not compile in
    is refused (:data:`ANCHOR_DIGESTS`): a pin naming one refuses, and a row naming one is skipped.
-3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
+3. An **anchor-changed audit event**: when a configured anchor's fingerprint differs from the previously
    observed load's, a first-class ``auth.trust_anchor`` audit row is written (reusing
    :meth:`~messagefoundry.store.base.Store.record_audit`, mirroring the ``config_reload`` fingerprint row).
 4. A **path check** (BACKLOG #1142, the directory arm): every object from the volume root down to the
@@ -131,6 +131,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -305,8 +306,9 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
     the wrong length, raises :class:`TrustAnchorError` (fail loud, never silently never-match).
 
     The text before the first ``:`` is a marker when it starts with a letter, is not two
-    characters long, and is not all hex. A bare pin's first ``:`` follows two hex characters, so a
-    typo in that pair, such as ``3g:9a:...``, still reads as a malformed pin."""
+    characters long, and is not all hex. A bare pin grouped in pairs therefore reads a typo in its
+    first pair, such as ``3g:9a:...``, as malformed. Other groupings can read a typo as a marker,
+    so that refusal names both causes."""
     cleaned = pin.strip().lower()
     algorithm = UNMARKED_DIGEST
     head, sep, rest = cleaned.partition(":")
@@ -315,8 +317,9 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
         if head not in ANCHOR_DIGESTS:
             raise TrustAnchorError(
                 f"a trust-anchor pin names the digest {head!r}, which this release does not "
-                f"support. Supported prefixes: {', '.join(sorted(ANCHOR_DIGESTS))}. A pin with "
-                f"no prefix is read as {UNMARKED_DIGEST}. Got {pin!r}"
+                f"support, or it is not a hex digest. Supported prefixes: "
+                f"{', '.join(sorted(ANCHOR_DIGESTS))}. A pin with no prefix is read as "
+                f"{UNMARKED_DIGEST}. Got {pin!r}"
             )
         algorithm, cleaned = head, rest.strip()
     digest = cleaned.replace(":", "")
@@ -894,9 +897,13 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
 
 
 def _pin_mismatch_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    algorithm = UNMARKED_DIGEST
+    with contextlib.suppress(TrustAnchorError):  # a mismatch needs a pin that parsed
+        algorithm = parse_anchor_pin(spec.pin or "").algorithm
+    title = ANCHOR_DIGESTS[algorithm].title
     return (
-        f"{spec.setting}: the trust anchor {spec.path!r} does not match its configured SHA-256 pin "
-        f"(loaded {verdict.fingerprint}); refusing to load a substituted anchor"
+        f"{spec.setting}: the trust anchor {spec.path!r} does not match its configured {title} pin "
+        f"(loaded {ANCHOR_DIGEST}:{verdict.fingerprint}); refusing to load a substituted anchor"
     )
 
 
@@ -1052,8 +1059,9 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-        f"{folder}. Or {pin} the SHA-256 of the CA you mean to trust; this file's is "
-        f"{verdict.fingerprint}. Check it against the CA first. With a matching pin the engine "
+        f"{folder}. Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+        f"trust; this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA "
+        "first. With a matching pin the engine "
         "loads exactly those bytes, so it may load them without this check."
     )
 
@@ -1602,7 +1610,15 @@ _STORE_CALL_DEFECTS: tuple[type[Exception], ...] = (
 )
 
 
-async def _last_fingerprint(store: Store, label: str) -> Fingerprint | None:
+class _Baseline(NamedTuple):
+    """What :func:`_last_fingerprint` found: the newest readable row, and whether a newer row for
+    the label was skipped as unreadable."""
+
+    found: Fingerprint | None
+    skipped: bool
+
+
+async def _last_fingerprint(store: Store, label: str) -> _Baseline:
     """The most-recently audited fingerprint for ``label``, with the digest it is in, or ``None`` if
     this anchor has never been observed. Reads the ``auth.trust_anchor`` audit rows
     (most-recent-first), a page at a time, and reads the first matching label's row. Each page ends
@@ -1615,7 +1631,7 @@ async def _last_fingerprint(store: Store, label: str) -> Fingerprint | None:
     and the anchor is still compared with the newest row it can read."""
     skipped: set[str] = set()
     try:
-        return await _last_readable_fingerprint(store, label, skipped)
+        return _Baseline(await _last_readable_fingerprint(store, label, skipped), bool(skipped))
     finally:
         if skipped:
             log.warning(
@@ -1663,7 +1679,9 @@ async def _last_readable_fingerprint(
 
 
 async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -> None:
-    # Every digest a row carries is ANCHOR_DIGEST's, and the row names it (BACKLOG #3425).
+    # `algorithm` names the digest of `fingerprint`, and of `in_use` and of a same-digest
+    # `previous`. A `changed` row across a digest switch names its `previous` in
+    # `previous_algorithm` (BACKLOG #3425).
     fields = {"label": spec.label, "setting": spec.setting, "event": event, **extra}
     detail = json.dumps(fields | {"algorithm": ANCHOR_DIGEST})
     try:
@@ -1708,10 +1726,11 @@ async def _audit_verdict(
             faults.append(exc)
 
     try:
-        previous = await _last_fingerprint(store, spec.label)
+        baseline = await _last_fingerprint(store, spec.label)
     except AnchorStoreUnavailable as exc:
         faults.append(exc)  # no baseline to compare with, so no observed/changed row
     else:
+        previous = baseline.found
         if previous is None:
             await record("observed", fingerprint=verdict.fingerprint)
         else:
@@ -1726,6 +1745,10 @@ async def _audit_verdict(
                 await record(
                     "changed", fingerprint=verdict.fingerprint, previous=previous.digest, **was
                 )
+            elif not same or baseline.skipped:
+                # Unchanged, but the newest row is in another digest. A row in ANCHOR_DIGEST
+                # moves the baseline, so the old digest can be retired, and the skip WARNING stops.
+                await record("observed", fingerprint=verdict.fingerprint)
     if verdict.pin_ok is False:
         await record("pin_mismatch", fingerprint=verdict.fingerprint)
     if verdict.acl_ok is False:
@@ -1877,11 +1900,12 @@ async def _report_restart_required(
             continue
         changed[spec.setting] = None
         log.warning(
-            "%s: the trust anchor %r changed on disk since the engine loaded it (sha256 %s, was "
+            "%s: the trust anchor %r changed on disk since the engine loaded it (%s %s, was "
             "%s). This reload checked the new file but does not apply it. The engine keeps "
             "trusting the CA it loaded until it restarts. Restart the engine to apply the new CA",
             spec.setting,
             spec.path,
+            ANCHOR_DIGEST,
             now,
             in_use,
         )

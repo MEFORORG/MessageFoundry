@@ -319,7 +319,7 @@ def _tls_row(
 
     Returns the opener too, or ``None`` when it did not build, so ``fed.idp_revocation`` reads the
     same context rather than building and checking the anchor a second time (BACKLOG #1923)."""
-    from messagefoundry.auth.trust_anchors import evaluate_anchor, oidc_anchor_spec
+    from messagefoundry.auth.trust_anchors import ANCHOR_DIGEST, evaluate_anchor, oidc_anchor_spec
 
     rid, title = _TLS_ROW
     ca = settings.auth.oidc_tls_ca_cert_file
@@ -349,7 +349,7 @@ def _tls_row(
     check = verdict.path_check
     account = check.engine if check is not None and check.engine else "the account running verify"
     evidence = (
-        f"sha256={verdict.fingerprint}; pin="
+        f"{ANCHOR_DIGEST}={verdict.fingerprint}; pin="
         f"{'not set' if verdict.pin_ok is None else 'matches'}; "
         f"acl={_ACL_WORDS[verdict.acl_ok]}; path={_PATH_WORDS[verdict.path_ok]}; checked as {account}"
     )

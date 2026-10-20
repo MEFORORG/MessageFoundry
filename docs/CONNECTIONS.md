@@ -3287,8 +3287,8 @@ replace it chooses which CA the hop trusts.
 ### The engine checks the file at every start and reload (`tls_ca_pin`)
 
 The engine checks the `tls_ca_file` of each connection that dials out (vault BACKLOG #2371).
-`tls_ca_pin` is optional. It is the file's SHA-256 in hex, with `:` separators allowed, and may
-carry a `sha256:` prefix ([CONFIGURATION.md](CONFIGURATION.md#api), *Trust-anchor pin syntax*). Every
+`tls_ca_pin` is optional. It pins the file's digest; *Trust-anchor pin syntax* in
+[CONFIGURATION.md](CONFIGURATION.md#api) says how to write it. Every
 factory that takes `tls_ca_file` for an outbound hop takes it: `Rest()`, `FHIR()`, `Soap()`,
 `DICOMweb()`, `FhirLookup()`, `Ftp()`, `Email()`, `Direct()`, and an outbound `MLLP()` or
 `DICOM()` with `tls = true`. An inbound `Ftp()` poller dials out too, so its CA takes the same
@@ -3334,7 +3334,7 @@ load, such as one holding a `TRUSTED CERTIFICATE` block.
 
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
 is empty or whitespace; leave it out for no pin. On the eight factories above, a literal pin that
-is not 64 hex characters is refused at load too, and an `env()` pin once it resolves. On `MLLP()`
+breaks the pin syntax is refused at load too, and an `env()` pin once it resolves. On `MLLP()`
 and `DICOM()` a pin with no `tls_ca_file` is refused when the connection is built, and a malformed
 one when the check runs. On an outbound `MLLP()` or `DICOM()`, a literal pin beside a `tls_ca_file` with `tls = false` is
 refused at load, as a pin beside any CA the hop never reads is.

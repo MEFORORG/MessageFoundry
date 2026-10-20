@@ -810,8 +810,8 @@ async def test_a_noisy_anchor_cannot_push_a_quiet_baseline_out_of_reach(
             await s.record_audit(
                 AUDIT_ACTION, actor=None, detail=json.dumps({"label": "ad", "n": i})
             )
-        assert await ta._last_fingerprint(s, "oidc") == ("sha256", "f1")  # unmarked: BACKLOG #3425
-        assert await ta._last_fingerprint(s, "api_client") is None
+        assert (await ta._last_fingerprint(s, "oidc")).found == ("sha256", "f1")  # BACKLOG #3425
+        assert (await ta._last_fingerprint(s, "api_client")).found is None
     finally:
         await s.close()
 

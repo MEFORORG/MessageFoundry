@@ -188,13 +188,18 @@ async def test_a_skipped_row_does_not_hide_the_older_baseline(
     store: MessageStore, tmp_path: Path
 ) -> None:
     """The look-back goes past a row it cannot read, so the anchor is still compared with the
-    newest row it can: the same bytes write nothing, a swap writes ``changed``."""
+    newest row it can. The same bytes write no ``changed``, only a new readable baseline, once; a
+    swap writes ``changed``."""
     p, fp = _anchor(tmp_path)
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p))
     await _seed(store, spec, fingerprint=fp)
     await _seed(store, spec, fingerprint="ab" * 64, algorithm="sha512")
     await run_anchor_preflight([spec], store, enforcing=True)
-    assert len(await _rows(store, "api_client")) == 2, "an unchanged anchor writes nothing"
+    rows = await _rows(store, "api_client")
+    assert [r["event"] for r in rows] == ["observed"] * 3
+    assert (rows[0]["algorithm"], rows[0]["fingerprint"]) == ("sha256", fp)
+    await run_anchor_preflight([spec], store, enforcing=True)
+    assert len(await _rows(store, "api_client")) == 3, "the baseline moved, so nothing more"
 
     p.write_bytes(_block(b"swapped"))
     await run_anchor_preflight([spec], store, enforcing=True)
@@ -220,9 +225,9 @@ def _sha512_release(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_a_release_that_changes_the_digest_reads_what_this_one_wrote(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The point of the marker. Under a SHA-512 release a bare pin written today still matches, an
-    unchanged anchor writes no false ``changed`` against today's SHA-256 row, and a swap across
-    the switch is still a ``changed``."""
+    """The point of the marker. Under a SHA-512 release a bare pin written today still matches, and
+    an unchanged anchor writes no false ``changed`` against today's SHA-256 row. It writes one
+    SHA-512 baseline, so SHA-256 could later be retired."""
     p, fp = _anchor(tmp_path)
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), fp)
     await run_anchor_preflight([spec], store, enforcing=True)  # today's release: sha256 row
@@ -230,8 +235,23 @@ async def test_a_release_that_changes_the_digest_reads_what_this_one_wrote(
     _sha512_release(monkeypatch)
     assert ta.evaluate_anchor(spec).pin_ok is True
     await run_anchor_preflight([spec], store, enforcing=True)
-    assert [r["event"] for r in await _rows(store, "api_client")] == ["observed"]
+    await run_anchor_preflight([spec], store, enforcing=True)
+    rows = await _rows(store, "api_client")
+    assert [(r["event"], r["algorithm"]) for r in rows] == [
+        ("observed", "sha512"),
+        ("observed", "sha256"),
+    ]
+    assert rows[0]["fingerprint"] == hashlib.sha512(p.read_bytes()).hexdigest()
 
+
+async def test_a_swap_across_the_digest_switch_is_a_change(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, fp = _anchor(tmp_path)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), fp)
+    await run_anchor_preflight([spec], store, enforcing=True)  # today's release: sha256 row
+
+    _sha512_release(monkeypatch)
     p.write_bytes(_block(b"swapped"))
     with pytest.raises(TrustAnchorError, match="does not match"):
         await run_anchor_preflight([spec], store, enforcing=True)
