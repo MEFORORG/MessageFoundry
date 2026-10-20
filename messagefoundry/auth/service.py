@@ -14290,13 +14290,24 @@ class AuthService:
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
         :meth:`_revoke_sessions_for_role` revokes exactly this set, so a route asking whether the
         save ends the caller's own sessions gets the answer the revoke acts on. Empty for a role
-        nobody holds, including one that does not exist."""
-        return frozenset(user.id for user in await self._load_users() if role_id in user.role_ids)
+        nobody holds, including one that does not exist.
+
+        Compared without case. A store whose id columns compare case-insensitively (SQL Server)
+        finds the role from another spelling, and the console passes its path to these routes as
+        a plain str, so an exact match would let a save under ``CUSTOM:...`` change the role and
+        end nobody's sessions, the caller's included (the vault BACKLOG #3259 class)."""
+        wanted = role_id.casefold()
+        return frozenset(
+            user.id
+            for user in await self._load_users()
+            if any(held.casefold() == wanted for held in user.role_ids)
+        )
 
     async def _revoke_sessions_for_role(self, role_id: str) -> None:
         """Revoke the live sessions of every user currently holding ``role_id`` so a permission
         reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
-        for user_id in await self.sessions_ended_by_custom_role_save(role_id):
+        # Sorted, so a revoke a store fault interrupts stops at a repeatable point.
+        for user_id in sorted(await self.sessions_ended_by_custom_role_save(role_id)):
             await self._store.revoke_user_sessions(user_id)
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
@@ -15142,7 +15153,7 @@ class AuthService:
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
         revoked = 0
-        for user_id in await self.sessions_ended_by_ad_map_save():
+        for user_id in sorted(await self.sessions_ended_by_ad_map_save()):
             # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
             # row, and that read filters on the wall clock: after a forward clock step past the
             # absolute lifetime it found none, and those rows would come back on the old mapping

@@ -844,15 +844,15 @@ the channel-scope write. The last three joined under BACKLOG #1149 (ASVS 7.5.2):
 target's sessions on the login window, so aimed at yourself it would end every session you hold
 with no fresh proof. The self-service `DELETE /me/sessions` ends your other sessions only behind a
 single-use `session_terminate` grant, and *Sign out* ends the current one. The refusal is per
-route and by target, so it does not reach a write that ends a whole group's sessions. Four such
-writes, the AD group-map and scope-map saves and the custom-role edit and delete, are not refused
+route and by target, so it does not reach a write that ends a whole group's sessions. At least four
+such writes, the AD group-map and scope-map saves and the custom-role edit and delete, are not refused
 (BACKLOG #3401): refusing them would lock an Administrator whose only account is a directory one out
 of the maps. Instead, a save that would end the caller's own sessions takes a single-use proof bound
 to `save_ends_own_sessions`, which only a re-proof made after sign-in mints, and an MFA-pending one
 never (the owner's #1149 Reading B). Any other save keeps the session window. The set it tests is
 the one the revoke ends, read from the stored accounts, and the revoke still ends the caller's own
 sessions, so the edit applies to them at once (BACKLOG #1154). On the console, such a save lands on
-the sign-in page. These four write no `auth.self_target_refused` row, because they refuse nothing.
+the sign-in page. Those four write no `auth.self_target_refused` row, because they refuse nothing.
 The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the

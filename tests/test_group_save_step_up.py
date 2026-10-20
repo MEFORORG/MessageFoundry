@@ -337,6 +337,20 @@ async def test_the_check_reads_the_set_the_revoke_ends(engine: Engine) -> None:
     assert await engine.store.list_sessions("len"), "a local session was ended"
 
 
+async def test_a_role_id_in_another_case_names_the_same_holders(engine: Engine) -> None:
+    """RED when: the holder set matches the role id exactly. A store that compares ids without
+    case finds the role from ``CUSTOM:...``, so an exact match would let that spelling save with
+    the window alone and revoke nobody (the vault BACKLOG #3259 class)."""
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="Lab readers", description=None, permissions=["messages:read"], actor="t"
+    )
+    holder = await _local(service, "holder", [Role.ADMINISTRATOR.value, role.id])
+    assert role.id != role.id.upper()
+    assert await service.sessions_ended_by_custom_role_save(role.id.upper()) == {holder}
+    assert await service.sessions_ended_by_custom_role_save(role.id) == {holder}
+
+
 _ROUTES = {
     "set_ad_group_map",
     "set_ad_group_scope_map",
