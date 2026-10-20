@@ -14,9 +14,10 @@ import pytest
 
 
 def route_context_forwarding_to_the_copy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``RouteContext``'s attribute fallback answer ``starlette_route`` as FastAPI 0.143.1 and
-    later do: the fallback forwards to the rebuilt copy itself, which has no such field. On a
-    release that already does, this changes nothing."""
+    """Make ``RouteContext``'s attribute fallback refuse ``starlette_route``, as FastAPI 0.143.1 and
+    later do for an included non-API route: there the fallback answers from the rebuilt copy, which
+    has no such field. It simulates that one read only. FastAPI 0.143.1 also moved the documented
+    properties, such as ``path``, onto the copy, and this does not."""
     original = fastapi.routing.RouteContext.__getattr__
 
     def patched(self: Any, attr: str) -> Any:

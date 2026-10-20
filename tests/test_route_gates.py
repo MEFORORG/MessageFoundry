@@ -677,7 +677,11 @@ def _route_context_hiding(
 ) -> None:
     """Make every effective-route record a ``RouteContext`` holds answer ``name`` as a FastAPI that
     renamed it would, by raising AttributeError, or as one that left it empty, by returning ``None``.
-    The record is where the walk reads the rebuilt route, so that is where a rename would show."""
+    The record is where the walk reads the rebuilt route, so that is where a rename would show.
+
+    Use it only on an app with no included API route. From FastAPI 0.143.1, FastAPI's own
+    ``RouteContext`` properties read this field too, so hiding it there makes reading such a
+    context's path recurse rather than fail by name."""
     record = fastapi.routing._EffectiveRouteContext
     original = record.__getattribute__
 
@@ -691,17 +695,37 @@ def _route_context_hiding(
     monkeypatch.setattr(record, "__getattribute__", patched)
 
 
-def test_the_walk_reads_the_rebuilt_route_whichever_way_route_context_forwards(
-    monkeypatch: pytest.MonkeyPatch,
+def _app_with_an_included_websocket() -> FastAPI:
+    sub = APIRouter()
+    sub.add_api_websocket_route("/ws/included", _dependency_gated)
+    app = FastAPI()
+    app.include_router(sub, prefix="/inc")
+    return app
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        _app_with_an_included_plain_route,
+        _app_with_an_included_websocket,
+        route_gates.full_surface_app,
+    ],
+)
+def test_the_walk_does_not_read_the_rebuilt_route_through_the_attribute_fallback(
+    monkeypatch: pytest.MonkeyPatch, build: Callable[[], FastAPI]
 ) -> None:
-    """FastAPI 0.143.1 changed what ``RouteContext``'s attribute fallback forwards to, and a walk
-    that read the rebuilt route through it failed every include of a plain route by name. The walk
-    reads the record instead, so the prefixed path survives either shape on one installed release."""
-    app = _app_with_an_included_plain_route()
+    """From FastAPI 0.143.1, ``RouteContext``'s attribute fallback answers ``starlette_route`` from
+    the rebuilt copy, which has none, and a walk that read it there failed every included non-API
+    route by name. This makes the fallback answer that way on whichever release is installed, and
+    the walk must read the same rows. It covers that one read, not every property 0.143.1 moved."""
+    app = build()
+    expected = route_gates.route_rows(app)
     route_context_forwarding_to_the_copy(monkeypatch)
-    rows = _rows_by_key(app)
-    assert ("GET", "/inc/plain") in rows, sorted(rows)
-    assert ("GET", "/plain") not in rows
+    assert route_gates.route_rows(app) == expected
+    if build is _app_with_an_included_plain_route:
+        rows = _rows_by_key(app)
+        assert ("GET", "/inc/plain") in rows, sorted(rows)
+        assert ("GET", "/plain") not in rows
 
 
 def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
