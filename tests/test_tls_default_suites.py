@@ -554,6 +554,10 @@ def test_every_operator_cipher_branch_narrows_tls13_too(
     seen.clear()  # constructing the settings may run the validator; only the build is measured
     built = build_api_ssl_context(api)
     assert seen == [built], "the API listener's operator branch did not narrow its own context"
+    if narrow_tls13_suites(ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)):  # where the narrowing acts
+        assert _tls13(built) == list(APPROVED_TLS13_SUITES), (
+            "the narrowing did not survive the build"
+        )
     seen.clear()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls_policy.apply_connection_tls_ciphers(ctx, {"tls_ciphers": one}, connector="MLLP test")

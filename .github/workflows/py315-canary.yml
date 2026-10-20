@@ -178,7 +178,7 @@ jobs:
         continue-on-error: true
         run: |
           STATUS=0
-          python -m pytest -q -rfE -p no:cacheprovider \
+          python -m pytest -q -rfEx -p no:cacheprovider \
             tests/test_tls_*.py tests/test_apiclient*.py tests/test_api_tls.py \
             tests/test_connection_tls_*.py tests/test_mllp_tls.py > tls.txt 2>&1 || STATUS=$?
           cat tls.txt
@@ -241,6 +241,11 @@ jobs:
               echo "::error title=3.15 canary measured nothing::the TLS step succeeded with no passing tests"
               FAILED=1
             fi
+          fi
+          # The TLS selection has no xfail of its own, so an xfailed count there is the 3.15 tripwires:
+          # known findings with a re-derivation owed, which a "flew clean" line must not hide.
+          if [ "${TLS_SUMMARY#*xfailed}" != "$TLS_SUMMARY" ]; then
+            echo "::warning title=3.15 TLS tripwires expected-failing::$TLS_SUMMARY. Each is a known finding whose security-record re-derivation is still owed; the TLS step log names them (tests/_py315_tripwires.py)."
           fi
           if [ -n "$SDISTS" ] && [ "$SDISTS" != "none" ]; then
             echo "::warning title=No cp315 wheel::installed from sdist: $SDISTS"

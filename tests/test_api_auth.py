@@ -2674,7 +2674,7 @@ async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
         resp = await c.get("/security/posture", headers=vw)
     assert resp.status_code == 200
     body = resp.json()
-    # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
+    # The additive field is present and matches the pure helper's read-out; inherited before 3.15.
     assert body["kex_groups"] == kex_groups_report()
     # The value itself is the kex tripwires' to read (tests/test_tls_policy.py), and on 3.15 they are
     # PY315_TLS_TRIPWIRE expected failures. The route's contract, the equality above and the audit row

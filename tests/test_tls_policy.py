@@ -251,9 +251,19 @@ def test_kex_groups_report_reports_inherited_today() -> None:
 
 
 def test_the_py315_tripwire_mark_has_not_outlived_the_314_floor() -> None:
-    """``PY315_TLS_TRIPWIRE`` is an expected failure on 3.15 only while 3.14 is still supported. Once
-    the floor leaves 3.14, every CI leg runs 3.15 and the marked tests would read as expected failures
-    for good. This reds on the floor change, so the change that makes it does the re-derivation."""
+    """``PY315_TLS_TRIPWIRE`` is an expected failure on 3.15, which is acceptable only while 3.15 runs
+    nowhere but the advisory canary. Two changes would make it a permanent silent pass: a floor that
+    leaves 3.14, or a 3.15 leg in any other workflow (``requires-python`` already admits 3.15, so the
+    second needs no floor change). This reds on either, so the change that makes it does the
+    re-derivation. The canary itself is the positive control: the scan must find 3.15 there."""
+    workflows = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+    naming = {p.name for p in workflows.glob("*.yml") if "3.15" in p.read_text(encoding="utf-8")}
+    assert "py315-canary.yml" in naming, f"the scan of {workflows} did not find the canary"
+    assert naming == {"py315-canary.yml"}, (
+        f"{sorted(naming - {'py315-canary.yml'})} mention Python 3.15. If that is a CI leg, the marked "
+        "tests xfail there for good: do the re-derivation PY315_TLS_TRIPWIRE's reason names, then "
+        "remove the mark (tests/_py315_tripwires.py) and this test."
+    )
     project = tomllib.loads(
         (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
     )
