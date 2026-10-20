@@ -37,6 +37,10 @@ from _ui_clients import HEADERLESS_UI_REQUEST
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
+# The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
+# asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.
+pytest.register_assert_rewrite("tests._deadline_capture")
+
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:

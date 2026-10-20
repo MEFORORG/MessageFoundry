@@ -15,9 +15,8 @@ deadline long enough never to fire on its own. The operation the test holds awai
 next pass, wherever the request is, so the 503 lands mid-operation and nowhere else, then holds the
 operation until :meth:`DeadlineCapture.held` lets it go.
 
-Engine PR 2438, open and not on ``main`` when this was written, carries a simpler copy of the
-stand-in in the web console's ``test_ui_dr_outlive.py``: it fires the latest deadline, with none of
-the checks below.
+The web console suite imports this module too (``test_ui_dr_outlive.py``), through the repository
+root the engine's editable install puts on the import path, so there is one copy of the stand-in.
 """
 
 from __future__ import annotations
@@ -129,15 +128,20 @@ async def expect_cut_off(capture: DeadlineCapture, request: Awaitable[httpx.Resp
     ``capture`` from inside the operation: not a route's 503, and not the deadline running out.
 
     The generous deadline bounds the wait: a deadline the operation never fires answers 503 there,
-    and the ``fired`` check fails. A fire that went wrong is reported first, even when the request
-    raised because of it."""
+    and the ``fired`` check fails. ``fired`` says the fire ran, not that it took effect, so the
+    answer must also come before the generous deadline could have given it. A fire that went wrong
+    is reported first, even when the request raised because of it."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     try:
         r = await request
     except Exception as exc:
         if capture.problem is not None:
             raise AssertionError(capture.problem) from exc
         raise
+    took = loop.time() - started
     assert capture.problem is None, capture.problem
     assert r.status_code == 503, r.text
     assert r.json() == {"detail": "the server timed out building a response"}
     assert capture.fired, "the deadline was not fired from inside the operation"
+    assert took < GENEROUS_DEADLINE_SECONDS, f"answered after {took:.1f} s: the deadline ran out"

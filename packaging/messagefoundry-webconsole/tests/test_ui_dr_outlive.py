@@ -9,33 +9,38 @@ console route with the middleware's own deadline firing while the release is in 
 checks the release still completes and records its row: the protection the handler carries reaches
 the console too.
 
-The deadline is not set to a short wall time any more (vault BACKLOG #3871). It is wall time from
-the start of the request, so on a loaded runner the auth dependencies alone outlasted 0.2 s: the
-503 came before the handler started the release, nothing was registered to outlive, and the box
-was still active when the test asserted. The test now captures the deadline the middleware opens
-and brings it forward from inside the drain, so it fires there and nowhere else. The drain is held
-until the 503 is in, and the test then waits on the operation itself, not on a clock.
+The deadline is fired from inside the drain rather than set to a short wall time (vault BACKLOG
+#3871), with the engine suite's ``tests/_deadline_capture.py``, which says why. This suite reaches
+it as ``tests._deadline_capture`` through the repository root, which the engine's editable install
+puts on the import path; a run without that install fails at this import rather than skipping.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision
 
-from messagefoundry.api import create_app, request_timeout
+from messagefoundry.api import create_app
 from messagefoundry.config.settings import DrSettings, EgressSettings, StoreSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from tests import _deadline_capture
+from tests._deadline_capture import capture_deadlines, expect_cut_off
 
-#: Long enough that the deadline never fires on its own during the test: the drain fires it.
-_GENEROUS_DEADLINE_SECONDS = 30.0
+# ``tests`` resolves through the import path, and an editable install from another worktree can put
+# that checkout first; its copy of the helper would then test this tree with no error. The engine
+# conftest refuses the same case for its tooling manifest.
+_ENGINE_TESTS = Path(__file__).resolve().parents[3] / "tests"
+if Path(_deadline_capture.__file__).resolve().parent != _ENGINE_TESTS:
+    raise RuntimeError(
+        f"tests._deadline_capture resolved to {_deadline_capture.__file__}, outside "
+        f"{_ENGINE_TESTS}: `tests` was imported from another checkout"
+    )
 
 
 @pytest.fixture
@@ -54,22 +59,6 @@ async def dr_engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-class _DeadlineCapture:
-    """Stands in for ``asyncio`` inside the deadline middleware's module only, and keeps each
-    deadline the middleware opens, so a test can make the real deadline fire when it chooses."""
-
-    def __init__(self) -> None:
-        self.deadlines: list[asyncio.Timeout] = []
-
-    def timeout(self, delay: float | None) -> asyncio.Timeout:
-        deadline = asyncio.timeout(delay)
-        self.deadlines.append(deadline)
-        return deadline
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(asyncio, name)
-
-
 async def _audit(engine: Engine, action: str) -> list[object]:
     return [json.loads(row["detail"]) for row in await engine.store.list_audit(action=action)]
 
@@ -83,54 +72,28 @@ async def test_a_console_release_cut_off_by_the_deadline_still_completes(
     coord._active = True
     dr_engine._dr_active = True
 
-    capture = _DeadlineCapture()
-    monkeypatch.setattr(request_timeout, "asyncio", capture)
-    loop = asyncio.get_running_loop()
-    drain_started = asyncio.Event()
-    let_drain_end = asyncio.Event()
+    service = await auth_service(dr_engine)
+    await provision(service, "boss", ["administrator"])
+    app = create_app(dr_engine, auth=service, serve_ui=True)
+    outliving = app.state.outliving_operations
 
     async def held_drain() -> dict[str, object]:
-        drain_started.set()
-        # The release request's deadline fires now, inside the drain, whatever the request spent
-        # reaching the handler. It is the last one opened: only that request is in flight.
-        capture.deadlines[-1].reschedule(loop.time())
-        # Held until the deadline has answered, so the drain cannot end first.
-        await let_drain_end.wait()
+        await capture.cut_off()  # the release request's deadline fires here, in the drain
         dr_engine._dr_active = False
         return {"depth_left": 0}
 
     coord._deactivate_profile = held_drain
 
-    service = await auth_service(dr_engine)
-    await provision(service, "boss", ["administrator"])
-    app = create_app(dr_engine, auth=service, serve_ui=True)
-    outliving = app.state.outliving_operations
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://t"
-        ) as c:
-            await cookie_login(c, "boss")  # under the default deadline
-            app.state.request_timeout_seconds = _GENEROUS_DEADLINE_SECONDS
-            # Bounded, so a deadline that never fires fails here rather than hanging the run.
-            r = await asyncio.wait_for(
-                c.post("/ui/dr/release", headers=SAME_ORIGIN),
-                timeout=_GENEROUS_DEADLINE_SECONDS + 10,
-            )
-            # The middleware's own 503, not a handler's: the deadline cut the request off.
-            assert r.status_code == 503, r.text
-            assert r.json() == {"detail": "the server timed out building a response"}
-            assert drain_started.is_set()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        await cookie_login(c, "boss")  # under the default deadline, before the capture
+        capture = capture_deadlines(monkeypatch, app)
+        async with capture.held():
+            # Fired in the drain, so this also says the drain was reached.
+            await expect_cut_off(capture, c.post("/ui/dr/release", headers=SAME_ORIGIN))
             # Cut off while the release was still running, and not cancelled with the request.
             assert outliving.inflight == ["DR release"]
             assert coord.active is True
             assert await _audit(dr_engine, "dr_release_failed") == []
-            let_drain_end.set()
-            assert await outliving.drain(timeout=10) == [], "the release never finished"
-    finally:
-        # After a failed assertion above, release the drain and wait for the release, so it does
-        # not run on into the fixture's engine stop or the session's next test.
-        let_drain_end.set()
-        await outliving.drain(timeout=10)
 
     assert coord.active is False and dr_engine.dr_active is False
     assert await _audit(dr_engine, "dr.release") == [
