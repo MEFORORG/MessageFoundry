@@ -856,8 +856,9 @@ class _CapturingNotifier:
     def __init__(self) -> None:
         self.events: list[Any] = []
 
-    async def notify(self, event: Any) -> None:
+    async def notify(self, event: Any) -> bool:
         self.events.append(event)
+        return True
 
 
 async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(

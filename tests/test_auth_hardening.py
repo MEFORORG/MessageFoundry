@@ -899,11 +899,17 @@ async def _run_reaper(
 
     class _Store:
         async def purge_expired_sessions(
-            self, *, now: float | None = None, idle_seconds: float | None = None
+            self,
+            *,
+            now: float | None = None,
+            idle_seconds: float | None = None,
+            lineage_seconds: float | None = None,
         ) -> None:
             purged.append(now)
             if inner is not None:
-                await inner.purge_expired_sessions(now=now, idle_seconds=idle_seconds)
+                await inner.purge_expired_sessions(
+                    now=now, idle_seconds=idle_seconds, lineage_seconds=lineage_seconds
+                )
 
     def _wall() -> float:
         try:

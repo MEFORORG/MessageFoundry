@@ -263,7 +263,7 @@ class UserCreateRequest(RequestModel):
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
     #: service refuses a blank value or anything but one plain mailbox, with the check the PATCH
-    #: route applies to ``notify_email``.
+    #: route applies to ``notify_email`` and to a changed ``email`` (BACKLOG #3278).
     email: str = Field(max_length=_NAME_MAX)
     roles: RoleIds = Field(default=[], max_length=64)
 
@@ -288,6 +288,7 @@ class DirectoryUserCreateRequest(RequestModel):
 class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
+    #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
     disabled: bool | None = None
     #: The engine-owned address security notices go to. Omitted leaves it as it is. A value moves it

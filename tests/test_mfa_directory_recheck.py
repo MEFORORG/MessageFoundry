@@ -33,6 +33,7 @@ from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
     LdapReferralError,
+    LdapUnansweredError,
 )
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService, DirectoryRefusal
 from messagefoundry.auth.tokens import hash_token
@@ -182,8 +183,14 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_renewal(
         (ValueError("synthetic: malformed objectGUID"), "probe_fault"),
         # A network-class error that escaped the directory layer is still unreachable.
         (TimeoutError("synthetic: read timed out"), "unavailable"),
+        # BACKLOG #3010: a code that points at the configuration, and one that does not.
+        (
+            LdapUnansweredError("synthetic: noSuchObject", code=32, code_name="noSuchObject"),
+            "misconfigured",
+        ),
+        (LdapUnansweredError("synthetic: busy", code=51, code_name="busy"), "unavailable"),
     ],
-    ids=["referral", "key-error", "value-error", "timeout"],
+    ids=["referral", "key-error", "value-error", "timeout", "no-such-object", "busy"],
 )
 async def test_a_lookup_that_raises_refuses_the_renewal_rather_than_failing(
     store: MessageStore,

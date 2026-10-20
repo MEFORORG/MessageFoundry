@@ -3384,12 +3384,20 @@ class AuthSettings(_Section):
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
     # --- mass-revoke circuit breaker ---
-    # A misconfigured search base, a moved OU, or a service account that lost read rights on the
-    # entries returns "not found" for EVERY user — indistinguishable from "everyone was deleted".
-    # Without a brake the reconciler would sign out the entire estate during exactly the incident when
-    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
+    # a service account that lost read rights on the entries while it can still read the base returns
+    # "not found" for EVERY user — indistinguishable from "everyone was deleted". Without a brake
+    # the reconciler would sign out the entire estate during exactly the incident when operators need
+    # the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).
+    #
+    # A base that was deleted or moved, or that the service account may not read at all, usually ends
+    # the search with a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights):
+    # a configuration refusal (BACKLOG #3010). It alerts on its own `ad_reconcile_aborted` source.
+    # The refused account is neither struck nor revoked, but it stays in this breaker's denominator,
+    # the accounts probed (`ReconcilePlan.probed`). When such a pass aborts before the breaker runs
+    # is stated once in docs/SECURITY.md.
     #
     # BOTH must be exceeded to trip, deliberately: the absolute floor stops the breaker firing on a tiny
     # estate where any proportion is meaningless (3 of 3 genuine offboardings is 100 %), and the
@@ -7941,15 +7949,13 @@ def _removed_key_message(
     """The refusal for a removed key: the decision (``reason``), then how to remove the key.
 
     The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
-    file and the environment, so it names both. A section built directly reads neither: code
-    passed the key (the loader's own ``cli`` overrides count as code), or ``security show``
-    read it from the file's table. Naming an environment
-    variable there would send the reader to a place the key cannot be."""
+    file and the environment, so it names both. A section built directly reads no environment:
+    code passed the key (the loader's own ``cli`` overrides count as code), or at least
+    ``security show`` and ``security set`` passed it from the file's table. Its refusal names no
+    variable, and makes no claim that none set the key (vault BACKLOG #3350): ``security show``
+    prints it for a key in the file while the service's environment may set the same key too."""
     if built_directly:
-        fix = (
-            f"The key was passed straight to the section, so no environment variable set it. "
-            f"Remove `{key}` from the arguments or the file table the section was built from"
-        )
+        fix = f"Remove `{key}` from the arguments or the file table the section was built from"
         if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
             fix = f"{fix}. {hint}"
     else:

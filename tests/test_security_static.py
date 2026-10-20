@@ -239,9 +239,21 @@ def _has_nested_quantifier(pattern: str) -> bool:
     return False
 
 
-# The re module functions whose first positional argument is a regex pattern.
+# The re module functions whose first positional argument is a regex pattern. ``prefixmatch`` is
+# CPython 3.15's new name for ``match``; on 3.14 no call can name it, so listing it costs nothing.
 _RE_FUNCS = frozenset(
-    {"compile", "match", "search", "fullmatch", "findall", "finditer", "sub", "subn", "split"}
+    {
+        "compile",
+        "match",
+        "prefixmatch",
+        "search",
+        "fullmatch",
+        "findall",
+        "finditer",
+        "sub",
+        "subn",
+        "split",
+    }
 )
 
 #: First-party functions that COMPILE a pattern handed to them, mapped to the positional index of

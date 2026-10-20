@@ -48,8 +48,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 async def _account(store: MessageStore, *, notify: str | None, profile: str | None) -> None:
@@ -521,3 +522,141 @@ async def test_patch_refuses_a_clear_or_a_malformed_address(
     assert user is not None
     assert user.notify_email == "owner@example.org"
     assert user.display_name is None  # refused whole, not half-applied
+
+
+# --- BACKLOG #3278: the profile email takes the user-creation mailbox rule ---------------------
+
+#: Each one ``POST /users`` refuses for its ``email`` (``create_local_user``).
+_REFUSED_PROFILE = [
+    "   ",
+    "not-an-address",
+    "a@b",
+    "a@example.test, b@example.test",
+    "a@example..test",
+    "bad name@example.test",
+]
+
+
+@pytest.mark.parametrize("bad", _REFUSED_PROFILE)
+async def test_a_changed_profile_email_creation_would_refuse_is_refused_whole(bad: str) -> None:
+    """Refused before anything is written, with a message that names the field and never the value,
+    and creation refuses the same value: one rule, not two."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _account(store, notify="owner@example.org", profile="dir@example.org")
+
+        with pytest.raises(InvalidNotifyEmail, match="profile email") as caught:
+            await service.update_user(
+                "u1", display_name="Renamed", email=bad, disabled=True, actor="admin"
+            )
+        if bad.strip():
+            assert bad not in str(caught.value)
+
+        user = await store.get_user("u1")
+        assert user is not None
+        assert user.display_name == "Bob" and user.email == "dir@example.org"
+        assert not user.disabled
+        assert notifier.events == []
+        audit = await store.list_audit(limit=200)
+        assert not [r for r in audit if r["action"] == "user.updated"]
+
+        with pytest.raises(InvalidNotifyEmail):
+            await service.create_local_user(
+                username="carol", display_name=None, email=bad, roles=[], actor="admin"
+            )
+        assert await store.get_user_by_username("carol") is None
+    finally:
+        await store.close()
+
+
+async def test_a_changed_profile_email_creation_accepts_is_stored_stripped() -> None:
+    """The accepting arm of the rule above, so the check can return the other answer."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _account(store, notify="owner@example.org", profile="dir@example.org")
+
+        await service.update_user(
+            "u1", display_name="Bob", email="  new@example.test ", disabled=None, actor="admin"
+        )
+
+        user = await store.get_user("u1")
+        assert user is not None
+        assert user.email == "new@example.test"
+        assert user.notify_email == "owner@example.org"
+        [event] = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert event.email == "owner@example.org"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("stored", "posted"),
+    [
+        ("not-an-address", "not-an-address"),
+        # The console strips what it posts back, so a stored value with spaces round it comes back
+        # without them and is still the stored value.
+        (" not-an-address ", "not-an-address"),
+    ],
+)
+async def test_the_stored_profile_email_posted_back_is_not_rechecked(
+    stored: str, posted: str
+) -> None:
+    """A value another writer stored, such as a directory sync's ``mail``, must not block an
+    unrelated save that posts it back, nor be announced as a change. A null still clears."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _account(store, notify="owner@example.org", profile=stored)
+
+        await service.update_user(
+            "u1", display_name="Renamed", email=posted, disabled=None, actor="admin"
+        )
+        user = await store.get_user("u1")
+        assert user is not None
+        assert user.display_name == "Renamed" and user.email == stored
+        assert notifier.events == []
+
+        await service.update_user("u1", display_name=None, email=None, disabled=None, actor="admin")
+        user = await store.get_user("u1")
+        assert user is not None and user.email is None
+    finally:
+        await store.close()
+
+
+async def test_patch_refuses_a_profile_email_creation_would_refuse(engine: Engine) -> None:
+    service, target = await _api(engine)
+    r = await _patch(engine, service, target, {"display_name": "Renamed", "email": "a@b"})
+    assert r.status_code == 400, r.text
+    assert "profile email" in r.json()["detail"]
+    user = await service.store.get_user(target)
+    assert user is not None
+    assert user.email == "dir@example.org" and user.display_name is None
+
+
+async def test_patch_accepts_a_profile_email_creation_would_accept(engine: Engine) -> None:
+    service, target = await _api(engine)
+    r = await _patch(engine, service, target, {"email": "new@example.test"})
+    assert r.status_code == 200, r.text
+    user = await service.store.get_user(target)
+    assert user is not None
+    assert user.email == "new@example.test"
+    assert user.notify_email == "owner@example.org"
+
+
+async def test_patch_without_email_saves_over_a_stored_address_the_rule_refuses(
+    engine: Engine,
+) -> None:
+    """The route fills an omitted ``email`` from the stored row, so a stored value the rule refuses
+    must not turn every later save into a 400."""
+    service, target = await _api(engine)
+    await service.store.update_user_profile(target, display_name=None, email="not-an-address")
+    r = await _patch(engine, service, target, {"display_name": "Renamed"})
+    assert r.status_code == 200, r.text
+    user = await service.store.get_user(target)
+    assert user is not None
+    assert user.display_name == "Renamed" and user.email == "not-an-address"

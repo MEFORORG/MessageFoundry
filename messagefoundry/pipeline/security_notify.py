@@ -541,7 +541,10 @@ def _build_body(event: SecurityEvent) -> str:
 
 
 class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
-    """Emails the affected user about a security event, on a bounded background queue."""
+    """Emails the affected user about a security event, on a bounded background queue.
+
+    Single use: once :meth:`aclose` has begun, :meth:`notify` refuses every event and :meth:`start`
+    raises ``RuntimeError`` (vault BACKLOG #3120). Build a new notifier rather than restart one."""
 
     def __init__(
         self,
@@ -579,12 +582,19 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         # The queue-full records still being written, held so the loop keeps them alive and so
         # aclose() can wait for them.
         self._recording: set[asyncio.Task[None]] = set()
+        # Set when aclose() begins, and never cleared: start() refuses (vault BACKLOG #3120). An event
+        # queued after that sits behind the stop sentinel, or on a queue nothing reads, and is never
+        # sent, so notify() refuses it; the contract on ``SecurityNotifier`` says why.
+        self._closing = False
         # Logged now, once, rather than at the first send (BACKLOG #1131): the first send may be a
         # lock notice, and a line appearing then would show a logs:view reader that a lock landed.
         if use_tls and not tls_verify:
             warn_smtp_verification_off(cell=ALERTS_SMTP_CELL, host=host)
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
+        # Returns whether the event was queued for sending, the contract on ``SecurityNotifier``,
+        # which lists why it may answer False. Never a delivery receipt.
+        #
         # No deliverable address means nothing to email. The caller has audited the event; which
         # events the /me/security-events feed shows is stated once, in auth/notifications.py.
         # Non-blocking enqueue.
@@ -629,23 +639,51 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     event.event_type,
                     event.username,
                 )
-            return
-        # Read before the enqueue, with no await between, so it is the queue the enqueue meets.
-        full = self._queue.full()
-        self._enqueue(
+            return False
+        if self._closing:
+            # At shutdown, for example a lock notice the teardown's cut drain left running (vault
+            # BACKLOG #3120). Recorded like a full queue's drop. A record started after aclose()
+            # has finished is not waited for, and may meet the closed store, where it fails and is
+            # swallowed like any other.
+            if event.event_type not in LOG_SILENT_EVENT_TYPES:
+                log.warning(
+                    "%s is closing; dropping %s for %s",
+                    type(self).__name__,
+                    notice_kind_log_label(event.event_type),
+                    scrub_log_argument(event.username),
+                )
+            self._record_dropped(event, "closing")
+            return False
+        queued = self._enqueue(
             event,
             dropped=None
             if event.event_type in LOG_SILENT_EVENT_TYPES
             else f"{event.event_type} for {event.username}",
         )
-        if full and self._audit is not None and len(self._recording) < _MAX_RECORDING:
-            # Off the caller's path: a notice must never block a sign-in or an admin action, and
-            # this write would wait on the store under exactly the overload that filled the queue.
-            task = asyncio.create_task(self._record_undelivered(event, {"reason": "queue_full"}))
-            self._recording.add(task)
-            task.add_done_callback(self._recording.discard)
+        if not queued:
+            self._record_dropped(event, "queue_full")
+        return queued
+
+    def _record_dropped(self, event: SecurityEvent, reason: str) -> None:
+        # Off the caller's path: a notice must never block a sign-in or an admin action, and this
+        # write would wait on the store under exactly the overload that filled the queue.
+        if self._audit is None or len(self._recording) >= _MAX_RECORDING:
+            return
+        task = asyncio.create_task(self._record_undelivered(event, {"reason": reason}))
+        self._recording.add(task)
+        task.add_done_callback(self._recording.discard)
+
+    def start(self) -> None:
+        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short can leave its
+        # stop sentinel on the queue, so a drain loop started again would read it and stop, and
+        # notify() would answer True for events nothing sends. The engine builds a new notifier for
+        # each lifespan rather than restart one.
+        if self._closing:
+            raise RuntimeError(f"{type(self).__name__} has been closed and cannot be started again")
+        super().start()
 
     async def aclose(self) -> None:
+        self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         try:
             await super().aclose()
         finally:

@@ -171,7 +171,11 @@ async def test_session_reaper_survives_purge_error(monkeypatch: pytest.MonkeyPat
 
     class _Store:
         async def purge_expired_sessions(
-            self, *, now: float | None = None, idle_seconds: float | None = None
+            self,
+            *,
+            now: float | None = None,
+            idle_seconds: float | None = None,
+            lineage_seconds: float | None = None,
         ) -> None:
             calls["n"] += 1
             if calls["n"] == 1:

@@ -31,6 +31,7 @@ import logging
 import socket
 import sys
 import tomllib
+import traceback
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -99,8 +100,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 @asynccontextmanager
-async def _served(app: Any, **config: Any) -> AsyncIterator[int]:
-    """Serve ``app`` on an ephemeral loopback port for the duration of the block."""
+async def _serving(app: Any, **config: Any) -> AsyncIterator[tuple[int, uvicorn.Server]]:
+    """Serve ``app`` on an ephemeral loopback port for the duration of the block, yielding the port
+    and the server, whose stop runs as the block exits."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = int(sock.getsockname()[1])
@@ -114,11 +116,26 @@ async def _served(app: Any, **config: Any) -> AsyncIterator[int]:
                 break
             await asyncio.sleep(0.01)
         assert server.started, "uvicorn did not start"
-        yield port
+        yield port, server
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, 10.0)
         sock.close()
+
+
+@asynccontextmanager
+async def _served(app: Any, **config: Any) -> AsyncIterator[int]:
+    """:func:`_serving`, for a caller that needs only the port."""
+    async with _serving(app, **config) as (port, _):
+        yield port
+
+
+def _assert_raised_in_websockets(exc: BaseException) -> None:
+    """``exc`` was raised inside the websockets PACKAGE, by directory: uvicorn's own file is named
+    websockets_sansio_impl, so a name match would not tell the two apart."""
+    raised_in = Path(traceback.extract_tb(exc.__traceback__)[-1].filename).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"raised outside websockets: {raised_in}"
 
 
 async def _exchange(port: int, request: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
@@ -421,10 +438,12 @@ async def test_a_parse_error_with_no_queued_answer_is_closed_with_nothing_writte
     assert raw == b""
 
 
-def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
+def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """What uvicorn does at server stop to a connection it already answered: a second
     send_response. On websockets' own ServerProtocol that asserts, which is the control. With the
-    floor's hook it returns, and queues nothing more."""
+    floor's hook it returns, queues nothing more, and says so at DEBUG, once per drop."""
     from websockets.server import ServerProtocol
 
     def _answered() -> Any:
@@ -442,8 +461,11 @@ def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
     floored.send_response(floored.reject(500, "first"))
     first = floored.data_to_send()
     assert b"nosniff" in first[0] and floored.eof_sent
-    floored.send_response(floored.reject(500, "second"))
+    with caplog.at_level(logging.DEBUG, logger=protocol_headers.__name__):
+        floored.send_response(floored.reject(500, "second"))
     assert floored.data_to_send() == []
+    dropped = [r for r in caplog.records if "dropped a handshake answer" in r.getMessage()]
+    assert [r.levelno for r in dropped] == [logging.DEBUG], caplog.records
 
 
 class _NeverLostTransport(asyncio.Transport):
@@ -510,10 +532,7 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     assert bool(bare_transport.written) is bare_answers
     with pytest.raises(AssertionError) as stopped:
         bare.shutdown()
-    # The websockets PACKAGE, by directory: uvicorn's own file is named websockets_sansio_impl.
-    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
-    library = Path(websockets_package.__file__).resolve().parent
-    assert library in raised_in.parents, f"shutdown raised outside websockets: {raised_in}"
+    _assert_raised_in_websockets(stopped.value)
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
@@ -560,9 +579,98 @@ async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() 
         if writer is not None:
             writer.close()
     assert answered is False, "the bare protocol answered; uvicorn changed this path"
-    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
-    library = Path(websockets_package.__file__).resolve().parent
-    assert library in raised_in.parents, f"the stop raised outside websockets: {raised_in}"
+    _assert_raised_in_websockets(stopped.value)
+
+
+#: A text frame with no mask. A server must refuse one from a client, so websockets ends the
+#: conn's stream with no answer written.
+_UNMASKED_FRAME = b"\x81\x05hello"
+
+
+async def _frame_error_before_accept(
+    ws_class: type[Any],
+) -> tuple[AssertionError | None, bool, bytes | None]:
+    """Serve ``ws_class`` on a real socket. The client sends a valid upgrade and, while the app has
+    not answered it, a frame websockets refuses, which ends the conn's stream with nothing
+    written. The server then stops with that connection still open, so ``Server.shutdown`` hands
+    it uvicorn's stop-time 500.
+
+    Returns what the stop raised (or the start check, which the caller tells apart by where it was
+    raised), whether the conn had ended its stream and was still in the server's set as the stop
+    began, and, when the stop returned, every byte the client read."""
+    connected = asyncio.Event()
+    app_tasks: list[asyncio.Task[Any]] = []
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            app_tasks.append(task)
+        await receive()  # websocket.connect
+        connected.set()
+        await receive()  # websocket.disconnect, once the stop has closed the connection
+
+    stopped: AssertionError | None = None
+    ended_and_open = False
+    raw: bytes | None = None
+    writer: asyncio.StreamWriter | None = None
+    try:
+        try:
+            async with _serving(app, ws=ws_class) as (port, server):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(_HANDSHAKE.format(path="/ws/stats").encode())
+                await writer.drain()
+                await asyncio.wait_for(connected.wait(), 10.0)
+                writer.write(_UNMASKED_FRAME)
+                await writer.drain()
+                for _ in range(500):
+                    conns: list[Any] = list(server.server_state.connections)
+                    ended_and_open = len(conns) == 1 and conns[0].conn.eof_sent is True
+                    if ended_and_open:
+                        break
+                    await asyncio.sleep(0.01)
+        except AssertionError as exc:
+            stopped = exc
+        if stopped is None:
+            raw = await asyncio.wait_for(reader.read(), 10.0)
+    finally:
+        if writer is not None:
+            writer.close()
+        # A raising stop leaves the connection open, so the app never sees its disconnect. Await
+        # the cancel, so what uvicorn's task raises on it is retrieved here and not at a later GC.
+        for task in app_tasks:
+            task.cancel()
+        await asyncio.gather(*app_tasks, return_exceptions=True)
+    return stopped, ended_and_open, raw
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the selector loop closes a transport whose data_received raised, and uvicorn 0.54.0's "
+    "data_received raises on this frame, so no ended conn is left open at stop there; the "
+    "Windows proactor loop, the service's, leaves it open",
+)
+async def test_a_frame_error_before_accept_stops_cleanly_with_nothing_written() -> None:
+    """``Server.shutdown`` on a real socket, on a floored connection whose conn has ended its
+    stream with no answer written and is still open (BACKLOG #3343, and #3358 item 6, which engine
+    PR 2210 inferred and did not measure). A client frame websockets refuses before the app answers
+    is one way there.
+
+    The control is the bare class: at stop, uvicorn sends that connection a 500, websockets
+    asserts on the second end of stream, and the raise comes out of ``Server.shutdown``, so the
+    engine's own shutdown would not run. Floored, the 500 is dropped, nothing is written, the
+    connection is closed and the stop returns. Remove the floor's ``eof_sent`` check and the
+    floored half fails as the bare one does."""
+    bare_stop, bare_ended, _ = await _frame_error_before_accept(WebSocketsSansIOProtocol)
+    assert bare_ended, "the bare conn was not ended and still open as the stop began"
+    assert bare_stop is not None, "the bare stop returned; uvicorn changed this path"
+    _assert_raised_in_websockets(bare_stop)
+
+    floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    assert floored is not None
+    stopped, ended, read = await _frame_error_before_accept(floored)
+    assert ended, "the floored conn was not ended and still open as the stop began"
+    assert stopped is None, f"the floored stop raised: {stopped!r}"
+    assert read == b"", read
 
 
 def test_the_sans_io_websocket_protocol_is_floored() -> None:

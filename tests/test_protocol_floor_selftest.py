@@ -19,7 +19,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import socket
+import sys
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -62,6 +65,18 @@ def _refusal(http: type[Any], ws: type[Any] | None) -> str:
     # Raised outside any handler, so nothing the drive raised rides on the refusal's chain.
     assert refused.value.__context__ is None and refused.value.__cause__ is None
     return message
+
+
+#: How a refusal for a raising drive names the running Python.
+_VERSION = sys.version_info
+_PYTHON = f"{sys.implementation.name} {_VERSION.major}.{_VERSION.minor}.{_VERSION.micro}"
+
+
+def _frames(message: str) -> list[str]:
+    """The ``module:line`` places a refusal for a raising drive lists, outermost first."""
+    places = message.partition("its frames, outermost first: ")[2].partition(" (uvicorn ")[0]
+    assert places, message
+    return places.split(" > ")
 
 
 def _names(message: str, response: str) -> None:
@@ -259,7 +274,9 @@ def test_a_response_that_never_arrives_is_refused() -> None:
     assert "the malformed-request 400 was never written" in _refusal(http, ws)
 
 
-def test_a_drive_that_raises_is_refused_by_type_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_drive_that_raises_is_refused_by_type_and_places(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refusal names the type, the Python version and each frame's module and line, outermost
+    first, and never the exception's message."""
     http, ws = _floored()
 
     def _raises(self: Any, data: bytes) -> None:
@@ -267,20 +284,119 @@ def test_a_drive_that_raises_is_refused_by_type_only(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(http, "data_received", _raises)
     message = _refusal(http, ws)
-    assert "the drive raised ValueError at test_protocol_floor_selftest.py:" in message, message
+    assert f"the drive raised ValueError on {_PYTHON} " in message, message
+    # The self-test's own frame first, the raising frame in this module last.
+    frames = _frames(message)
+    assert frames[0].startswith("messagefoundry.api.protocol_floor_selftest:"), message
+    assert re.fullmatch(r"(\w+\.)*test_protocol_floor_selftest:\d+", frames[-1]), message
     assert "synthetic text" not in message
+
+
+def test_a_recursion_is_listed_once_with_its_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run of one place is collapsed, so a RecursionError's refusal stays one readable line."""
+    http, ws = _floored()
+
+    def _recurses(self: Any, data: bytes) -> None:
+        _recurses(self, data)
+
+    monkeypatch.setattr(http, "data_received", _recurses)
+    message = _refusal(http, ws)
+    assert "the drive raised RecursionError" in message, message
+    assert re.fullmatch(
+        r"(\w+\.)*test_protocol_floor_selftest:\d+ \(\d+ times\)", _frames(message)[-1]
+    ), message
+    assert len(message) < 2000, len(message)
+
+
+def test_a_loop_internal_python_stops_supplying_is_a_clean_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private loop supplies CPython internals ``asyncio.BaseEventLoop`` calls. One it stops
+    supplying, as a later Python could make it, is a refusal naming the Python and the asyncio
+    frame, not a traceback out of ``serve``."""
+    monkeypatch.delattr(protocol_floor_selftest._NoIOLoop, "_process_events")
+    message = _refusal(*_floored())
+    assert f"the drive raised NotImplementedError on {_PYTHON} " in message, message
+    assert "in the Python under it" in message, message
+    assert re.fullmatch(r"asyncio\.base_events:\d+", _frames(message)[-1]), message
 
 
 def test_the_private_loop_raises_when_asked_to_wait() -> None:
     """The backstop no drive reaches: awaiting real time on the no-I/O loop ends at once."""
     loop = protocol_floor_selftest._NoIOLoop()
-    waits = asyncio.sleep(60)
     try:
+        waits = loop.create_task(asyncio.sleep(60))
         with pytest.raises(RuntimeError, match="asked to wait"):
             loop.run_until_complete(waits)
+        # This test finishes its own task, so nothing it made is left pending on a closed loop. A
+        # cancelled sleep needs only zero-timeout turns.
+        waits.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(waits)
+        assert waits.cancelled()
     finally:
-        waits.close()
         loop.close()
+
+
+#: Stands for an exception's message, which can carry what a driven connection held.
+_LOOP_ERROR_TEXT = "synthetic loop error text that must not be logged"
+
+
+_LoopHandler = Callable[[asyncio.AbstractEventLoop, dict[str, Any]], object]
+
+
+def _logged_loop_error(
+    caplog: pytest.LogCaptureFixture, handler: _LoopHandler | None = None
+) -> tuple[list[logging.LogRecord], str]:
+    """Hand the private loop's exception handler a context carrying an exception, as asyncio does
+    for a task that failed or was destroyed pending. ``handler`` replaces the one the loop installs.
+    Returns the records and their rendered text, traceback included, so text logged through
+    ``exc_info`` counts as well."""
+    loop = protocol_floor_selftest._NoIOLoop()
+    try:
+        if handler is not None:
+            loop.set_exception_handler(handler)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=protocol_floor_selftest._log.name):
+            try:
+                raise ValueError(_LOOP_ERROR_TEXT)
+            except ValueError as exc:
+                loop.call_exception_handler(
+                    {"message": "a discarded task failed", "exception": exc}
+                )
+    finally:
+        loop.close()
+    records = list(caplog.records)
+    return records, "\n".join(logging.Formatter().format(record) for record in records)
+
+
+def test_the_private_loops_error_handler_logs_no_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The handler the private loop installs logs the context's message and nothing of its
+    exception (BACKLOG #1789's exemption, pinned in ``tests/test_last_resort.py``). Read off the
+    captured log, so a second log line that printed ``context["exception"]`` fails it."""
+    records, text = _logged_loop_error(caplog)
+    # Matched by message, not by count: another private loop's pending task, collected while the
+    # log is captured, can add a record of its own.
+    ours = [r for r in records if "a discarded task failed" in r.getMessage()]
+    assert [r.name for r in ours] == [protocol_floor_selftest._log.name], text
+    assert _LOOP_ERROR_TEXT not in text and "ValueError" not in text, text
+
+    # The controls: the instrument sees exception text when a handler logs it.
+    def _also_logs_the_exception(loop: Any, context: dict[str, Any]) -> None:
+        protocol_floor_selftest._note_loop_error(loop, context)
+        protocol_floor_selftest._log.debug("%s", context["exception"])
+
+    def _logs_its_traceback(loop: Any, context: dict[str, Any]) -> None:
+        protocol_floor_selftest._log.debug(context["message"], exc_info=context["exception"])
+
+    def _asyncios_own(loop: Any, context: dict[str, Any]) -> None:
+        loop.default_exception_handler(context)
+
+    for leaky in (_also_logs_the_exception, _logs_its_traceback, _asyncios_own):
+        _, leaked = _logged_loop_error(caplog, leaky)
+        assert _LOOP_ERROR_TEXT in leaked, (leaky, leaked)
 
 
 async def test_a_loop_already_running_is_a_failed_drive() -> None:

@@ -110,8 +110,9 @@ def fastapi_symbol(owner: object, name: str) -> Any:
     A FastAPI name a guard reads that a release could drop or rename goes through here, so the run
     fails with the name in the message rather than reading less and passing. At least these do:
     ``iter_route_contexts``, the rebuilt route FastAPI serves for a non-API route reached through an
-    include, the low-priority route list, and the two callable classifiers the thread-pool guard
-    reads. Names FastAPI documents, such as ``RouteContext.original_route``, are read directly."""
+    include, the ``RouteContext._route_context`` record that route is read from, the low-priority
+    route list, and the two callable classifiers the thread-pool guard reads. Names FastAPI
+    documents, such as ``RouteContext.original_route``, are read directly."""
     try:
         return getattr(owner, name)
     except AttributeError:
@@ -543,12 +544,16 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
         # include's prefix and, for a WebSocket, its dependencies. A route registered on ``owner``
         # has no copy and is served as it is. The copy is read first, so a route object registered
         # both ways still reports its prefixed path through the include.
-        served = getattr(context, "starlette_route", None)
+        # The copy is read from the context's effective-route record, never through
+        # ``RouteContext``'s attribute fallback; ``_holder_of`` in messagefoundry/api/security.py
+        # says why.
+        # Only an included route has a record, so a direct one skips the read and is served as is.
+        record = fastapi_symbol(context, "_route_context")
+        served = fastapi_symbol(record, "starlette_route") if record is not None else None
         if not isinstance(served, BaseRoute):
             if original is not entry:
                 # Reached through an include, so the copy must exist. FastAPI does not promise the
                 # field, and the unprefixed original is the wrong path to report.
-                served = fastapi_symbol(context, "starlette_route")
                 raise ValueError(
                     f"FastAPI {fastapi.__version__} serves an included {type(original).__name__} "
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"

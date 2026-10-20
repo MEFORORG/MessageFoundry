@@ -120,7 +120,9 @@ dependencies = [
     # ``ws="auto"`` resolves to from uvicorn 0.50, and the legacy server before it. /ws/stats runs on
     # it. Without a WebSocket library uvicorn serves no WebSocket route at all.
     # Pinned exactly: the floor wraps ``ServerProtocol.send_response`` and the legacy
-    # ``write_http_response``, neither a public hook. 17.2 is the release read and driven, and
+    # ``write_http_response``, neither a public hook, and reads the ``eof_sent`` and
+    # ``handshake_exc`` attributes of that ServerProtocol; the class build refuses when either is
+    # no longer assigned (BACKLOG #3343). 17.2 is the release read and driven, and
     # tests/test_header_floor_wire.py holds the same version. Read a new release before moving the
     # pin (BACKLOG #1120).
     "websockets==17.2",

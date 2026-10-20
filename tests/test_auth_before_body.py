@@ -879,7 +879,9 @@ async def test_a_session_revoked_while_the_body_arrives_is_refused_by_the_gate(
     # The early step passes, the session ends, and then the gate runs.
     request = _request(app, bearer)
     await found.step(request)
-    await service.logout(bearer["Authorization"].removeprefix("Bearer "), actor="admin")
+    await service.logout(
+        bearer["Authorization"].removeprefix("Bearer "), actor="admin", client=None
+    )
     for gate in gates:
         with pytest.raises(HTTPException) as refused:
             await gate(request)

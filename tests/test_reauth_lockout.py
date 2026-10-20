@@ -71,8 +71,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 def _actions(feed: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
@@ -540,13 +541,13 @@ async def test_a_wrong_current_password_counts_and_is_audited_once() -> None:
 
 async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifies() -> None:
     store = await MessageStore.open(":memory:")
+    notifier = _FakeNotifier()
+    service = AuthService(
+        store,
+        AuthSettings(lockout_threshold=3, require_mfa=False),
+        security_notifier=notifier,
+    )
     try:
-        notifier = _FakeNotifier()
-        service = AuthService(
-            store,
-            AuthSettings(lockout_threshold=3, require_mfa=False),
-            security_notifier=notifier,
-        )
         await _local_user(store)
         identity, token = await _signed_in(service)
         for _ in range(3):
@@ -570,6 +571,8 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         assert notices[0].detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
         assert notices[0].client_ip == "10.0.0.9"
     finally:
+        # Again here, so a failure above cannot leave the notice running (vault BACKLOG #3120).
+        await service.drain_background(timeout=20.0)
         await store.close()
 
 

@@ -158,7 +158,7 @@ async def test_logout_emits_audit_event() -> None:
     try:
         service = AuthService(store, AuthSettings())
         identity, token, _ = await login_admin(service)
-        await service.logout(token, actor=identity.username)
+        await service.logout(token, actor=identity.username, client=None)
         actions = [row["action"] for row in await store.list_audit()]
         assert "auth.logout" in actions
     finally:

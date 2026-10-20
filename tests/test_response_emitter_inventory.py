@@ -22,12 +22,20 @@ site does not bypass the floor, or what covers it instead.
 | ``ws-close`` | A ``websocket.close`` message or a ``.close(code=...)`` call: pre-accept, it is a refusal. |
 | ``status-line`` | A literal that starts an HTTP status line: a raw writer below any ASGI stack. |
 | ``protocol-override`` | A def of, or assignment to, a server response writer (see below). |
+| ``transport-write`` | ``write`` or ``writelines`` on a name or attribute called ``transport``. |
 
 The server response writers are ``send_400_response``, ``send_500_response`` and
 ``write_http_response``. ``send_response``, the sans-I/O WebSocket conn's writer, counts only when
 it is ASSIGNED on an object (``x.send_response = ...``): the name is too common for a def of it to
 mean a server writer. "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
 annotated assignment, and ``setattr(x, "name", ...)`` with a literal name.
+
+``transport-write`` is for bytes put on an asyncio transport below every ASGI stack, which
+``status-line`` sees only when they are a literal. It finds the protocol floor's parser-rejection
+step, which writes bytes the websockets parser built (BACKLOG #3358 item 2). A write through a
+name other than ``transport`` evades it: at least the floor's ``_HeaderInjectingTransport``, which
+forwards the server's own writes through ``self._inner`` and is covered by the
+``protocol-override`` entries for the answers it serves.
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
 only emitters of a shape listed above, in the literal spelling the table gives: an aliased import
@@ -132,6 +140,12 @@ class _Collector(ast.NodeVisitor):
             self._add("protocol-override")
         if name in ("FastAPI", "Starlette"):
             self._add("asgi-app")
+        receiver = func.value if isinstance(func, ast.Attribute) else None
+        if name in ("write", "writelines") and (
+            (isinstance(receiver, ast.Name) and receiver.id == "transport")
+            or (isinstance(receiver, ast.Attribute) and receiver.attr == "transport")
+        ):
+            self._add("transport-write")
         if (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
@@ -147,7 +161,6 @@ class _Collector(ast.NodeVisitor):
                 self._add("error-handler")
         # Any close on a name that holds a WebSocket, however the code is passed or if it is not
         # passed at all (a bare close before accept is a refusal too), plus any close(code=...).
-        receiver = func.value if isinstance(func, ast.Attribute) else None
         if name == "close" and (
             (isinstance(receiver, ast.Name) and receiver.id in _WS_NAMES)
             or any(kw.arg == "code" for kw in node.keywords)
@@ -273,6 +286,12 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         "Adds the headers, where absent, to every handshake answer the sans-I/O WebSocket protocol "
         "hands its conn; tests/test_header_floor_wire.py.",
     ),
+    Site(_PROTOCOL, "_answer_a_parser_rejection", "transport-write"): (
+        1,
+        "Writes the answer the websockets parser queued for a request it rejected (a 414 or "
+        "431), which uvicorn 0.54.0 leaves unwritten. The conn's send_response hook added the "
+        "headers when the parser queued it; tests/test_header_floor_wire.py.",
+    ),
     Site("messagefoundry/api/protocol_floor_selftest.py", "_failing_app", "ws-close"): (
         1,
         "The startup self-test's stand-in app closes before accepting ON PURPOSE, so the server "
@@ -325,6 +344,7 @@ _PLANTED = {
     "ws-close": "async def route(websocket):\n    await websocket.close()\n",
     "status-line": "def raw(w, code):\n    w.write(f'HTTP/1.1 {code} OK'.encode())\n",
     "protocol-override": "class P:\n    def send_500_response(self):\n        pass\n",
+    "transport-write": "def answer(p, data):\n    p.transport.write(data)\n",
 }
 
 

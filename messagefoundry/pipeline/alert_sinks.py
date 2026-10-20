@@ -171,8 +171,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
 
-    def _enqueue(self, item: _T, *, dropped: str | None) -> None:
+    def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
         """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
+        Returns whether the item was queued.
 
         ``dropped=None`` drops without a line, for an item whose drop must not show in the general
         log (a lock notice, BACKLOG #1131; see ``auth.notifications.LOG_SILENT_EVENT_TYPES``)."""
@@ -181,6 +182,8 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         except asyncio.QueueFull:
             if dropped is not None:
                 log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
+            return False
+        return True
 
     def start(self) -> None:
         if self._task is None:
@@ -1178,8 +1181,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
-        # or more probes were referred (BACKLOG #2538) or faulted (BACKLOG #3100) and left unjudged;
-        # `reason` tells which. The
+        # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
+        # #3010) or faulted (BACKLOG #3100) and left unjudged; `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).

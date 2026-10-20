@@ -652,7 +652,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> SimpleMessage:
-        await service.logout(bearer_token(request), actor=identity.username)
+        await service.logout(
+            bearer_token(request), actor=identity.username, client=client_ip(request)
+        )
         return SimpleMessage(detail="logged out")
 
     @app.get("/auth/me", response_model=CurrentUser)

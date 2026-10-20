@@ -683,3 +683,4 @@ def test_a_rejected_password_still_unbinds_the_user_connection(
         "the user connection was NOT unbound on the rejected-password path — the release procedure "
         "documented in docs/CONNECTIONS.md Table B does not run where it matters most (ASVS 13.1.3)"
     )
+    assert len(rec.unbinds) == 2, f"expected the service and user connections; got {rec.unbinds}"

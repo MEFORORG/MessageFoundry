@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
@@ -647,8 +648,10 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     store = engine.store
-    async with _client(engine, service) as c:
+    # Signed in from another address, so the row's client is the sign-out's own (BACKLOG #3339).
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service) as c:
         rotations = rotate_after_first_call(
             monkeypatch, store, service, token, names=("get_session",)
         )
@@ -658,11 +661,34 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     rotated = rotations[0]
     assert rotated is not None, "the rotation failed closed, so the race was not driven"
     assert await service.identity_for_token(rotated, activity=False) is not None
-    outcomes = [
-        json.loads(str(row["detail"] or "{}")).get("outcome")
+    # BACKLOG #3339: a sign-out that ended nothing still names the caller and the address.
+    assert await _logout_rows(store) == [("u", _DEFAULT_PEER[0], "nothing_to_revoke")], (
+        "the auth.logout row claimed a revoke that missed, or lost its actor or address"
+    )
+
+
+async def _logout_rows(store: Any) -> list[tuple[object, object, object]]:
+    """Each ``auth.logout`` row as its actor, client address and ``detail.outcome``."""
+    return [
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
         for row in await store.list_audit(action="auth.logout")
     ]
-    assert outcomes == ["nothing_to_revoke"], "the auth.logout row claimed a revoke that missed"
+
+
+async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:
+    """BACKLOG #3339. ``POST /auth/logout`` passes the signed-in caller and the address from
+    ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``
+    assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
+    address, so the row cannot pass by recording the address the session was minted from. The
+    route's control, a token that names no session, is the rotation race test above: its dependency
+    refuses any other dead token."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
+        token = (await _login(c, "u")).json()["token"]
+    async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+    assert await _logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
@@ -2648,9 +2674,13 @@ async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
         resp = await c.get("/security/posture", headers=vw)
     assert resp.status_code == 200
     body = resp.json()
-    # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
+    # The additive field is present and matches the pure helper's read-out; inherited before 3.15.
     assert body["kex_groups"] == kex_groups_report()
-    assert "inherited" in body["kex_groups"]
+    # The value itself is the kex tripwires' to read (tests/test_tls_policy.py), and on 3.15 they are
+    # PY315_TLS_TRIPWIRE expected failures. The route's contract, the equality above and the audit row
+    # below, still holds on 3.15, so only this line is version-conditioned rather than the whole test.
+    if sys.version_info < (3, 15):
+        assert "inherited" in body["kex_groups"]
     # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
     rows = await engine.store.list_audit(limit=20, action="security.posture_view")
     assert rows  # at least the read above was recorded

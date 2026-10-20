@@ -735,7 +735,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         token = session_token(request)
         if auth is not None and token:
-            await auth.logout(token)
+            await auth.logout(token, client=client_ip(request))
         resp = RedirectResponse("/ui/login?e=loggedout", status_code=303)
         # ASVS 14.3.1: revoking server-side and deleting the cookie leaves the browser's CACHED
         # representations of the operator's PHI pages behind, which Back / bfcache can resurrect.

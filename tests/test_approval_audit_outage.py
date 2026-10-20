@@ -8,8 +8,9 @@ refuses, answer a mapped status rather than a raw 500 (finding 3), and a lost au
 ``audit_write_failed`` on at least the paths these tests name (finding 4). Not every lost row
 pages; docs/SECURITY.md lists at least the exceptions.
 
-The gate runs over a real SQLite store. Only the faults are injected, by a wrapper that fails the
-named audit actions or status writes with the error a full disk gives.
+The gate runs over a real SQLite store. Most faults are injected by a wrapper that fails the
+named audit actions or status writes with the error a full disk gives; a few tests raise from the
+executor or read the log lines instead.
 """
 
 from __future__ import annotations
@@ -449,6 +450,55 @@ async def test_a_lost_request_row_cannot_forge_a_log_line(
     assert "\r" not in lost and "\n" not in lost, lost
     assert "actor=maker\\r\\nFORGED approval operation=dead_letter_replay" in lost
     assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
+
+
+async def test_a_release_whose_effect_commit_lost_its_reply_is_recorded_failed(
+    store: MessageStore,
+) -> None:
+    """The case the ``Executor`` docstring and docs/SECURITY.md state (vault BACKLOG #3324). The
+    executor's effect row COMMITS, then the executor raises the error a lost COMMIT reply gives, and
+    the gate records ``failed`` for an operation whose row the store holds. Nothing reads the row
+    back. A gate that did would record something else here, which is a behaviour change."""
+    from tests._pending_approval_store_contract import _gate as _contract_gate
+
+    async def _commit_landed_reply_lost(_p: Mapping[str, Any]) -> dict[str, Any]:
+        await store.record_audit(
+            "dead_letter_replay", actor="maker", detail=json.dumps({"requeued": 1})
+        )
+        raise sqlite3.OperationalError(_FAULT)
+
+    gate = _contract_gate(store, _commit_landed_reply_lost)
+    approval_id = await _request(gate)
+    with pytest.raises(sqlite3.OperationalError):
+        await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert len(await store.list_audit(action="dead_letter_replay")) == 1
+    assert await _status(store, approval_id) == "failed"
+
+
+async def test_a_repeat_request_cannot_forge_a_log_line(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The INFO lines a repeat writes, from ``guard`` and from ``rejoin``, name the requester too
+    (vault BACKLOG #3324). caplog's handler has no ControlCharScrubFilter, so this reads the call
+    sites' scrub."""
+    gate = _gate(store, _Sink())
+    first = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=_REQUESTER_ID
+    )
+    forged = "maker\r\nFORGED approval"
+    with caplog.at_level(logging.INFO, logger="messagefoundry.api.approvals"):
+        joined = await gate.guard(
+            "dead_letter_replay", {}, requester=forged, requester_user_id=_REQUESTER_ID
+        )
+        rejoined = await gate.rejoin(
+            "dead_letter_replay", {}, requester=forged, requester_user_id=_REQUESTER_ID
+        )
+    assert first is not None and joined == first and rejoined == first
+    lines = [r.getMessage() for r in caplog.records if "nothing new is held" in r.getMessage()]
+    assert len(lines) == 2, lines
+    for line in lines:
+        assert "\r" not in line and "\n" not in line, line
+        assert "by maker\\r\\nFORGED approval" in line, line
 
 
 # --- vault BACKLOG #3193: a failed request write is read back, and outlives its caller -----------

@@ -287,6 +287,7 @@ from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    MISCONFIGURED_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
@@ -1350,7 +1351,9 @@ def _app_drain_steps(
     if auth is not None and owns_auth:
         # close_background is the shutdown call the service names, with its own bound (its drain
         # and cancel grace, in auth/service.py). Only a bound below that cuts it before it cancels
-        # its notices itself; a notice cut that way meets the closed store and logs its own failure.
+        # its notices itself. A notice cut that way runs on: the security notifier queues it if it
+        # arrives before that notifier begins to close, and refuses it after, so its row reads
+        # mailed: false, or meets the closed store and logs its own failure (vault BACKLOG #3120).
         steps.append(
             _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.close_background())
         )
@@ -10192,13 +10195,16 @@ async def _session_reaper(
     store: Store,
     *,
     idle_seconds: float | None = None,
+    lineage_seconds: float | None = None,
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
 ) -> None:
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
-    uses.
+    uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
+    the earlier instant below only keeps a link longer, never shortens that window.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -10257,7 +10263,9 @@ async def _session_reaper(
             continue
         try:
             await store.purge_expired_sessions(
-                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+                now=now - _SESSION_REAP_STEP_TOLERANCE,
+                idle_seconds=idle_seconds,
+                lineage_seconds=lineage_seconds,
             )
         except asyncio.CancelledError:
             raise
@@ -10337,6 +10345,9 @@ _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
 #: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
 #: from the breaker's and the referral's for the same reason.
 _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
+#: The source label of the configuration refusal's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3010), apart from the others for the same reasons.
+_MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 #: The source label prefix of a paging refusal's ``ad_reconcile_aborted`` instance (vault BACKLOG
 #: #3696). The account name follows it, so each account is its own instance and throttle, as
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
@@ -10382,22 +10393,38 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert with reason ``probe_fault``, under its own source label
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
+    A search the directory refused for its configuration (BACKLOG #3010) is not an outage either: a
+    search base that was deleted or moved, or that the service account may not read, ends every
+    search with noSuchObject, invalidDNSyntax or insufficientAccessRights on every pass. Any pass
+    with such a refusal is ``auth.ad_reconcile_misconfigured`` and becomes one
+    ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
+    label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
+    such a base read as "not found" for every account, so it tripped the breaker on an estate
+    large enough; read as an outage, it would page nobody.
+
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, after
     the revocations and on an outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
-    :func:`_alert_paging_refusals` says how.
+    :func:`_alert_paging_refusals` says how. It is a bound the engine set, on an account the
+    directory answered for, so it is not the configuration refusal above, which is a result code
+    the directory returned; the two never describe one probe.
+
+    The breaker's alert counts the accounts the pass judged, its denominator, and so does each
+    paging refusal's. The referral's, the refusal's and the fault's count the probes the pass
+    asked, which leaves out an id-less row (BACKLOG #3170): only a probe that was sent can be
+    referred, refused or raise a fault.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred, faulted or unkeyed-binding row no longer ends the pass
-    (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts still fire.
-    Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked`` row and a
-    rename's rows. A pass that still raises part-way, such as on a store fault ending one account's
-    sessions, returns no plan, so no alert is raised for the revocations it applied before that
-    point. Their rows stand, except a row that was refused: that account has neither its row nor
-    its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
+    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
+    the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts
+    still fire. Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked``
+    row and a rename's rows. A pass that still raises part-way, such as on a store fault ending one
+    account's sessions, returns no plan, so no alert is raised for the revocations it applied before
+    that point. Their rows stand, except a row that was refused: that account has neither its row
+    nor its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
-    Each standing alert but the probe fault's and a paging refusal's also gets its inverse, which
-    pages nobody and resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared``
-    and ``ad_reconcile_hold_released``, and
+    Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
+    also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
+    ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
@@ -10412,9 +10439,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
         return
-    if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
-        # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
-        # Nor is a pass of faults only (BACKLOG #3100): its one alert is the fault's below.
+    if plan.aborted is not None and not plan.judged_nothing:
+        # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
+        # refusal's or the fault's below (BACKLOG #2538, #3010, #3100), and an outage has none.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -10432,17 +10459,24 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_aborted(
             _REFERRAL_ALERT_SOURCE,
             reason=REFERRAL_ABORT,
-            # The probes ASKED (BACKLOG #3170): an UNKEYED row was never sent, so no referral
-            # could answer it. The breaker's count above stays its judged denominator.
+            # The probes ASKED, as the refusal's and the fault's below (BACKLOG #3170).
             probed=plan.asked,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
         )
+    if plan.misconfigured:
+        # BACKLOG #3010. Beside the referral's, in the same order the service records them.
+        sink.ad_reconcile_aborted(
+            _MISCONFIGURED_ALERT_SOURCE,
+            reason=MISCONFIGURED_ABORT,
+            probed=plan.asked,
+            detail=auth.directory_reconcile_misconfigured or MISCONFIGURED_ABORT,
+        )
     if plan.faulted:
-        # BACKLOG #3100. Beside the referral's, in the same order the service records them.
+        # BACKLOG #3100.
         sink.ad_reconcile_aborted(
             _PROBE_FAULT_ALERT_SOURCE,
             reason=PROBE_FAULT_ABORT,
-            probed=plan.probed,
+            probed=plan.asked,
             detail=auth.directory_reconcile_fault or PROBE_FAULT_ABORT,
         )
     if plan.hold:
@@ -11590,7 +11624,11 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(
-                    _session_reaper(store, idle_seconds=auth.session_idle_seconds)
+                    _session_reaper(
+                        store,
+                        idle_seconds=auth.session_idle_seconds,
+                        lineage_seconds=auth.supersession_lineage_seconds,
+                    )
                 )
                 if _initial_credential_warn_lead(auth) is not None:
                     # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an

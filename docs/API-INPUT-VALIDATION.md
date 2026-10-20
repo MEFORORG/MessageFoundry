@@ -174,14 +174,22 @@ Three routes add a rule of their own:
 `email` on `PATCH /users/{user_id}` is the profile address. It does not move the notification
 address.
 
-**This field has a length rule and no shape rule.** The model is `UserUpdateRequest`, in
-[`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py), and it allows up to 256
-characters. Neither
-the model nor the service checks what the characters are, so the engine stores the value as sent.
-Omitting the field keeps the stored value, and an explicit `null` clears it.
+**A changed value takes the mailbox rule `email` on `POST /users` takes** (BACKLOG #3278). The model
+is `UserUpdateRequest`, in [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py),
+and it allows up to 256 characters. The service then applies the whole notification-address rule
+above, rules 1 to 9, and stores the value with the spaces around it stripped. A refusal is a 400 and
+leaves the whole save undone.
 
-`email` on `POST /users` is a different case. It seeds the notification address as well, so it takes
-the whole notification-address rule above.
+At least these cases differ from `POST /users`:
+
+- Omitting the field keeps the stored value.
+- An explicit `null` clears it.
+- A value equal to the address stored at the time of the save, ignoring the whitespace around
+  either, keeps the stored value without a second check. So an address another writer stored, such
+  as a directory sync, does not refuse a save that posts it back unchanged. A save that posts a
+  different value, such as one from a page read before that write, is checked.
+- `email` on `POST /users` also seeds the notification address. On `PATCH /users/{user_id}` it does
+  not.
 
 ### Federated subject
 

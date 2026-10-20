@@ -145,6 +145,15 @@ class LdapUnansweredError(LdapError):
         self.code = code
         self.code_name = code_name
 
+    @property
+    def configuration(self) -> bool:
+        """Whether the code points at the configuration rather than at a passing load
+        (:data:`_CONFIGURATION_CODES`): noSuchObject (32), invalidDNSyntax (34) and
+        insufficientAccessRights (50). Such a code recurs on every attempt until the configuration
+        changes, so the session reconciler reads it as misconfigured, which alerts, and not as
+        unavailable, which pages nobody (BACKLOG #3010)."""
+        return self.code in _CONFIGURATION_CODES
+
 
 class LdapUndecodableError(LdapError):
     """ldap3 could not decode the directory's response to an operation (BACKLOG #3010).
@@ -808,6 +817,11 @@ _UNANSWERED_HINTS: dict[int, str] = {
     50: " insufficientAccessRights means the service account may not read it.",
 }
 
+#: The codes that point at the configuration rather than at a passing load
+#: (:attr:`LdapUnansweredError.configuration`). Kept apart from the hints on purpose: a hint added
+#: for a transient code must not make it page as a misconfiguration.
+_CONFIGURATION_CODES = frozenset({32, 34, 50})
+
 
 def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
     """Raise :class:`LdapReferralError` for a referral, and otherwise :class:`LdapUnansweredError`
@@ -832,18 +846,17 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     read as absence it would read every account absent at once, which the reconciler's mass-revoke
     breaker does not stop at or under its floor.
 
-    **What each caller makes of it.** The session reconciler reads an :class:`LdapError` as
-    unavailable, which never strikes; a sign-in writes ``auth.login_error``; the nested group search
-    raising means no caller sees a shorter group list.
+    **What each caller makes of it.** The session reconciler reads one of the configuration codes
+    (:attr:`LdapUnansweredError.configuration`) as misconfigured and any other as unavailable.
+    Neither strikes. A sign-in writes ``auth.login_error``; the nested group search raising means
+    no caller sees a shorter group list.
 
-    **The cost, named.** Unavailable never revokes, so a code that recurs on every pass, such as a
-    deleted search base, stops offboarding and the role re-diff for as long as it lasts, and nothing
-    latches an alert for it. Making a standing one visible is #3010's item 4, which the batch
-    deferred to vault BACKLOG #3100's item 3. As filed, that item names the reconciler's broad
-    ``except Exception`` arm, which this error does not reach, so it must widen to cover the
-    ``except LdapError`` arm before the deferral holds. This warns once per operation and code, and
-    the text carries no directory text: the code, ldap3's name for it and the operation, never the
-    diagnostic message the directory sent.
+    **The cost, named.** Neither reading revokes, so a code that recurs on every pass, such as a
+    deleted search base, stops offboarding and the role re-diff for as long as it lasts. A
+    configuration code alerts on every pass it answers, and a pass where nothing else answered
+    aborts as ``directory_misconfigured``. Any other code reads as an outage, which pages nobody.
+    This warns once per operation and code, and the text carries no directory text: the code,
+    ldap3's name for it and the operation, never the diagnostic message the directory sent.
 
     **A result that is not a dict is let through.** ldap3's synchronous strategy, the only one built
     here, reads ``self.result['type']`` straight after every search, so a real search cannot return
@@ -878,9 +891,16 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
     else:
         name = RESULT_CODES.get(code, "an unknown result code")
         shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
+    # A configuration code is not read as the directory not answering: the session reconciler
+    # reads it as a configuration refusal, which alerts (LdapUnansweredError.configuration).
+    reading = (
+        "a fault in the configuration"
+        if code in _CONFIGURATION_CODES
+        else "the directory not answering"
+    )
     message = (
         f"AD ended the {operation} with {shown}, which is not an answer; the engine reads it as "
-        f"the directory not answering (BACKLOG #3010).{hint}"
+        f"{reading} (BACKLOG #3010).{hint}"
     )
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
