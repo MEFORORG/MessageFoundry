@@ -1259,10 +1259,11 @@ once the API/MLLP binds off-loopback (when the engine terminates TLS).
 **Handshake signature schemes `[PARTIAL — the SHA-224 pin acts on Python 3.15 only]` (ASVS 11.4.1,
 BACKLOG #1171).** By owner ruling of 2026-09-29, every context the engine narrows drops the three
 SHA-224 signature schemes where the interpreter can: `narrow_signature_algorithms` in
-[config/tls_policy.py](../messagefoundry/config/tls_policy.py). On Python 3.14 it changes nothing,
+[tls_sigalgs.py](../messagefoundry/tls_sigalgs.py), which `config/tls_policy.py` re-exports. On Python 3.14 it changes nothing,
 so those contexts still offer and accept SHA-224. On 3.15 they stop, unless the linked OpenSSL is
-older than 3.4. The LDAPS hop is reached too, since BACKLOG #2494. That function's docstring is the one statement of
-what it does, what else it changes, and what it cannot reach.
+older than 3.4. The LDAPS hop is reached too, since BACKLOG #2494, and so are the apiclient's and
+the tray probe's client contexts, since BACKLOG #3414. That function's docstring is the one
+statement of what it does, what else it changes, and what it cannot reach.
 
 **Outbound destination allowlist `[BUILT]` (WP-11c).** The `[egress]` section
 ([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed** allowlist for where the engine

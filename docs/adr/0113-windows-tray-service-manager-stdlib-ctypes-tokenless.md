@@ -430,3 +430,19 @@ the 260-character refusal.
 `tests/test_tray_branding.py` starts a real process from that command, and a real branded child
 through `relaunch_branded`. `tests/test_dependency_boundaries.py` pins what `tray.branding`,
 `tray.autostart` and the bootstrap import, on every interpreter, the 3.14 floor included.
+
+## Amendment (2026-10-20) -- one more stdlib-only module: `messagefoundry.tls_sigalgs`, for the signature-scheme narrowing (BACKLOG #3414)
+
+The tray probe's two verifying contexts narrowed their TLS suites from pinned copies of the engine's
+lists, and did not narrow their signature schemes. The engine's SHA-224 narrowing,
+`tls_policy.narrow_signature_algorithms`, lives in `config/`, which section 1 forbids the tray. Reaching
+it through `messagefoundry.apiclient`, which section 1 permits, would load `config/` behind it, and
+`tests/test_tray_logscrub.py` refuses that at the tray entrypoint.
+
+So the narrowing's logic moved into `messagefoundry.tls_sigalgs`, and `tls_policy` now calls it. This
+adds that module to the tray-importable list, on the same terms as the modules above. It imports only
+`functools`, `logging` and `ssl`, so it brings none of the packages the tray must never import. The
+apiclient takes it too. One copy serves the engine, the apiclient and the tray, so there is no second
+copy to drift. It acts on Python 3.15 only; on 3.14 it changes nothing.
+
+The **Must never import** list is unchanged.
