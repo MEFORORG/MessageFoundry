@@ -815,8 +815,12 @@ def undeclared_route_refusal_counts(routes: Sequence[BaseRoute]) -> dict[str, in
 def _holder_of(context: RouteContext) -> tuple[BaseRoute, str | None]:
     """``(holder, template)`` for one served route: the object a refusal's count lands on, and the
     path it is served under, prefix included. :func:`undeclared_route_refusal_counts` says which
-    object that is for an API route and for an included WebSocket."""
-    rebuilt = getattr(context, "starlette_route", None)
+    object that is for an API route and for an included WebSocket.
+
+    The rebuilt copy is read from the context's effective-route record, never through
+    ``RouteContext``'s attribute fallback: from FastAPI 0.143.1 that fallback forwards to the copy
+    itself, which has no ``starlette_route``, so an included WebSocket's count went unreported."""
+    rebuilt = getattr(getattr(context, "_route_context", None), "starlette_route", None)
     if isinstance(rebuilt, BaseRoute):
         return rebuilt, getattr(rebuilt, "path", None)
     return context.original_route, context.path

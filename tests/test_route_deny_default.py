@@ -59,6 +59,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
+from tests._route_context_shapes import route_context_forwarding_to_the_copy
 
 pytest.importorskip("messagefoundry_webconsole")
 
@@ -571,13 +572,18 @@ async def test_the_posture_reports_every_refusal_by_template_with_the_no_route_f
     assert "SECRET-MRN" not in response.text
 
 
+@pytest.mark.parametrize("forwarding_to_the_copy", [False, True])
 def test_the_count_reads_an_included_websocket_and_a_route_served_under_two_templates(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, forwarding_to_the_copy: bool
 ) -> None:
     """Vault BACKLOG #2954. FastAPI counts an included WebSocket's refusals on the copy it rebuilds to
     serve it, not on the route the router holds, so a walk that read only the latter would drop
     them. A router included twice serves one route object under two templates, and that object
-    holds one count, so the key names both templates rather than crediting the first."""
+    holds one count, so the key names both templates rather than crediting the first.
+
+    FastAPI 0.143.1 changed what ``RouteContext``'s attribute fallback forwards to, and a walk that
+    read the copy through it dropped the WebSocket's count. The second case puts the newer shape
+    on whichever release is installed, so both shapes run in every leg."""
     monkeypatch.setattr(security_module, "_UNKNOWN_ROUTE_REFUSALS", security_module._RefusalTally())
     monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
     app = create_app(allow_no_auth=True)
@@ -607,6 +613,8 @@ def test_the_count_reads_an_included_websocket_and_a_route_served_under_two_temp
         assert client.get("/zz/a/x").status_code == 403
         assert client.get("/zz/b/x").status_code == 403
         assert client.get("/zz/b/x").status_code == 403
+    if forwarding_to_the_copy:
+        route_context_forwarding_to_the_copy(monkeypatch)
     assert security_module.undeclared_route_refusal_counts(app.routes) == {
         "/zz/a/x, /zz/b/x": 3,
         "/zz/inc/sock": 1,

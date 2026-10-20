@@ -42,6 +42,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth.permissions import Permission
 from scripts.security import route_gates
+from tests._route_context_shapes import route_context_forwarding_to_the_copy
 
 # --- the live app ------------------------------------------------------------------------------------
 
@@ -674,9 +675,11 @@ def test_an_included_plain_route_is_walked_under_its_include_prefix() -> None:
 def _route_context_hiding(
     monkeypatch: pytest.MonkeyPatch, name: str, *, empty: bool = False
 ) -> None:
-    """Make every ``RouteContext`` answer ``name`` as a FastAPI that renamed it would, by raising
-    AttributeError, or as one that left it empty, by returning ``None``."""
-    original = fastapi.routing.RouteContext.__getattr__
+    """Make every effective-route record a ``RouteContext`` holds answer ``name`` as a FastAPI that
+    renamed it would, by raising AttributeError, or as one that left it empty, by returning ``None``.
+    The record is where the walk reads the rebuilt route, so that is where a rename would show."""
+    record = fastapi.routing._EffectiveRouteContext
+    original = record.__getattribute__
 
     def patched(self: Any, attr: str) -> Any:
         if attr != name:
@@ -685,7 +688,20 @@ def _route_context_hiding(
             return None
         raise AttributeError(attr)
 
-    monkeypatch.setattr(fastapi.routing.RouteContext, "__getattr__", patched)
+    monkeypatch.setattr(record, "__getattribute__", patched)
+
+
+def test_the_walk_reads_the_rebuilt_route_whichever_way_route_context_forwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FastAPI 0.143.1 changed what ``RouteContext``'s attribute fallback forwards to, and a walk
+    that read the rebuilt route through it failed every include of a plain route by name. The walk
+    reads the record instead, so the prefixed path survives either shape on one installed release."""
+    app = _app_with_an_included_plain_route()
+    route_context_forwarding_to_the_copy(monkeypatch)
+    rows = _rows_by_key(app)
+    assert ("GET", "/inc/plain") in rows, sorted(rows)
+    assert ("GET", "/plain") not in rows
 
 
 def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -696,7 +712,7 @@ def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.Monk
     _route_context_hiding(monkeypatch, "starlette_route")
     with pytest.raises(route_gates.MissingFastAPISymbol) as caught:
         route_gates.route_rows(app)
-    assert "RouteContext.starlette_route" in str(caught.value)
+    assert "_EffectiveRouteContext.starlette_route" in str(caught.value)
     assert f"FastAPI {fastapi.__version__}" in str(caught.value)
 
 
