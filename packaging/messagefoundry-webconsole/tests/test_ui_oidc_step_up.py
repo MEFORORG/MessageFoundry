@@ -460,3 +460,28 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         assert retry.status_code == 200, retry.text
         new = c.cookies.get("mf_session")
         assert new and await service.has_recent_step_up(new)
+
+
+@pytest.mark.parametrize("flow_id", [b"not-a-live-flow", b"caf\xe9"])
+async def test_a_return_naming_no_live_step_up_flow_still_draws_the_sign_in_window(
+    engine: Engine, flow_id: bytes
+) -> None:
+    """BACKLOG #3374. RED when: a forged flow cookie reaches the ceremony budget, or a cookie the
+    flow cache cannot key raises before any limiter. The callback reads the flow before it charges
+    anything, so a non-ASCII id once answered an unthrottled 500 here."""
+    service = await _service(engine, _FakeLdap())
+    _drain_sign_in_window(service)
+    names = (b"mf_oidc_flow", b"__Secure-mf_oidc_flow", b"__Host-mf_oidc_flow")
+    cookie = b"; ".join(name + b"=" + flow_id for name in names)
+    async with _client(engine, service) as c:
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "authcode", "state": "s"},
+            headers=[
+                (b"cookie", cookie),
+                *((k.encode(), v.encode()) for k, v in _CROSS_SITE_NAV.items()),
+            ],
+            follow_redirects=False,
+        )
+    assert r.status_code == 303, r.text
+    assert r.headers["location"] == "/ui/login?e=rate_limited"

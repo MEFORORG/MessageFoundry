@@ -136,9 +136,6 @@ class PendingFlow:
     #: with this set elevates THAT session and never mints a new one, and a sign-in flow never
     #: elevates anything, so each completion refuses the other kind.
     step_up_session_hash: str | None = None
-    #: STEP-UP flows only, set with ``step_up_session_hash``: the id of the user whose session
-    #: staged the flow. ``AuthService.oidc_step_up_flow`` says why the callback needs it (#3374).
-    step_up_user_id: str | None = None
     #: The ADR 0077 action the step-up is for, if any, so the single-use grant is minted for the
     #: action the operator started from. ``None`` refreshes only the session window.
     step_up_purpose: str | None = None
@@ -149,6 +146,10 @@ class PendingFlow:
     #: Stamped by :meth:`FlowCache.put` on the cache's own clock, so :meth:`FlowCache.age` reads the
     #: same clock (BACKLOG #2301). ``0.0`` on a flow never staged, which reads as staged long ago.
     started: float = 0.0
+    #: STEP-UP flows only, set with ``step_up_session_hash``: the id of the user whose session
+    #: staged the flow. ``AuthService.oidc_step_up_flow`` says why the callback needs it (#3374).
+    #: Declared last so the positional order of the fields above did not move.
+    step_up_user_id: str | None = None
 
     def __post_init__(self) -> None:
         # A step-up flow names both its session and its user, or neither, so every reader may ask
@@ -185,7 +186,10 @@ class FlowCache:
 
     @staticmethod
     def _key(flow_id: str) -> str:
-        return hashlib.sha256(flow_id.encode("ascii")).hexdigest()
+        # ``flow_id`` arrives from a cookie, before the callback charges any limiter, so this must
+        # not raise on any str: ``ascii`` raised UnicodeEncodeError on ``caf\xe9``, an unthrottled
+        # 500 (BACKLOG #3374). A minted id is base64url ASCII, so a non-ASCII one keys nothing.
+        return hashlib.sha256(flow_id.encode("utf-8", "surrogatepass")).hexdigest()
 
     def _prune(self, now: float) -> None:
         for k in [k for k, e in self._entries.items() if e.deadline <= now]:

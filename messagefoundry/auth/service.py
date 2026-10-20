@@ -5591,9 +5591,8 @@ class AuthService:
         if self._oidc_flows is None:
             return None
         flow = self._oidc_flows.peek(flow_id)
-        # PendingFlow sets the two step-up fields together; the hash is the discriminator every
-        # other reader uses, and the user id is read for the type checker.
-        if flow is None or flow.step_up_session_hash is None or flow.step_up_user_id is None:
+        # PendingFlow holds the two step-up fields together, so the user id alone decides.
+        if flow is None or flow.step_up_user_id is None:
             return None
         return OidcStepUpFlow(user_id=flow.step_up_user_id, return_to=flow.return_to)
 

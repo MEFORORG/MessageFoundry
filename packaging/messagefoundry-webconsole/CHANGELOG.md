@@ -161,8 +161,8 @@ this line.**
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already
   draws, so the return spends none of the user's other ceremony attempts. A flood
   that spent the shared sign-in budget would otherwise refuse every federated step-up while a
-  password step-up kept working. A refused return answers 429 with the step-up page for the action
-  the operator started from, and keeps the flow for a retry. Every other callback still draws the sign-in budget. This console needs an
+  password step-up kept working. A refused return answers 429 with the step-up page for the staged
+  continuation, and consumes nothing. Every other callback still draws the sign-in budget. This console needs an
   engine with `oidc_step_up_flow`, and refuses an older one at startup. (BACKLOG #3374)
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope

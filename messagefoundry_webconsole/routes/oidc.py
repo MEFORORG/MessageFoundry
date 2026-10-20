@@ -497,8 +497,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if staged is not None:
             if not auth.allow_reauth_attempt(_step_up_return_key(staged.user_id)):
                 # A _log.warning, never an audit, as on the sign-in branch below. The flow consumed
-                # nothing: a reload of this return retries it once the budget refills, and the
-                # page's own button starts a fresh flow, leaving this one to lapse at its TTL.
+                # nothing: a reload of this return retries it once the budget refills, if the IdP's
+                # code still redeems, and the page's own button starts a fresh flow.
                 _log.warning(
                     "federated step-up return rate limit exceeded for %s", client or "<unknown>"
                 )
