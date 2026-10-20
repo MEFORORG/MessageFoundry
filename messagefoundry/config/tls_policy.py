@@ -1521,21 +1521,14 @@ class EngineTlsListRefused(ValueError):
     without prefixing "tls_ciphers rejected", which would blame the operator."""
 
 
-#: What :func:`narrow_tls13_suites` and :func:`narrow_signature_algorithms` raise when there is no
-#: engine list the build will take. The signature-scheme narrowing lives in the stdlib-only
-#: :mod:`messagefoundry.tls_sigalgs` (BACKLOG #3414), so the class does too, and both narrowers
-#: share it. Its own :class:`RuntimeError` subclass, so the wrappers convert only that and not any
-#: other :class:`RuntimeError`, such as a ``NotImplementedError``. Bound here under the private name
-#: the wrappers and the tests use.
-_NarrowerRefused = NarrowerRefused
-
-
 def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     """Narrow the two halves a cipher string cannot reach, and refuse as a config error if the build
     will not take the engine's list (BACKLOG #2484).
 
-    The two narrowers raise :class:`_NarrowerRefused`, a :class:`RuntimeError`, on such a build.
-    Before #2484 only the ldap3 and hvac seam caught it. Converting here, in the two wrappers,
+    The two narrowers raise :class:`~messagefoundry.tls_sigalgs.NarrowerRefused`, a
+    :class:`RuntimeError` subclass, on such a build; it lives beside the signature-scheme narrowing
+    (BACKLOG #3414). Its own subclass, so this converts only that and not any other
+    :class:`RuntimeError`, such as a ``NotImplementedError``. Before #2484 only the ldap3 and hvac seam caught it. Converting here, in the two wrappers,
     reaches every seam that calls one. The narrowers' own message names the list; this adds the
     linked OpenSSL, because the fault is that build's.
 
@@ -1545,7 +1538,7 @@ def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     try:
         narrow_tls13_suites(ctx)
         narrow_signature_algorithms(ctx)
-    except _NarrowerRefused as exc:
+    except NarrowerRefused as exc:
         raise EngineTlsListRefused(
             f"{ssl.OPENSSL_VERSION} refused a list the engine sets on every TLS context. This is "
             f"the engine's own list, not an operator tls_ciphers string: {exc}"
@@ -1586,7 +1579,7 @@ def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
     try:
         target.set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
     except ssl.SSLError as exc:
-        raise _NarrowerRefused(
+        raise NarrowerRefused(
             f"this OpenSSL build refused the engine's approved TLS 1.3 suites "
             f"{APPROVED_TLS13_SUITES} (BACKLOG #2042): {exc}"
         ) from exc

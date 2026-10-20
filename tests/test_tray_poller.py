@@ -1203,3 +1203,49 @@ def test_a_pin_on_a_plain_http_url_is_not_followed(tmp_path: Path) -> None:
         assert poller._client is first
     finally:
         poller.stop()
+
+
+def test_a_build_refusing_the_tls_lists_at_start_reads_unknown_instead_of_ending_the_tray(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3414. A build that refuses the probe's signature-scheme list raises RuntimeError
+    from building the first client, which is the probe module's contract. ``start()`` must absorb
+    it as a failed tick would: the thread runs, the icon reads UNKNOWN, the failure is logged, and
+    the client is retried until it builds. Red before the fix: ``start()`` raises and the tray
+    never shows an icon."""
+    from messagefoundry import pki, tls_sigalgs
+
+    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
+    pin = tmp_path / "api-generated-cert.pem"
+    pin.write_bytes(pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)[0])
+    refusals = iter([True, True])  # the build at start, then the first tick's retry
+
+    def narrow(_ctx: ssl.SSLContext) -> bool:
+        if next(refusals, False):
+            raise tls_sigalgs.NarrowerRefused("synthetic refusal of the list without SHA-224")
+        return False
+
+    monkeypatch.setattr("messagefoundry.tray.probe.narrow_signature_algorithms", narrow)
+    published: queue.Queue[PollResult] = queue.Queue()
+    poller = StatusPoller(
+        TrayConfig(engine_url="https://127.0.0.1:8765", engine_cacert=str(pin)),
+        on_update=published.put,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller.start()  # must not raise
+    try:
+        refused = published.get(timeout=10.0)
+        recovered = published.get(timeout=10.0)
+        thread = poller._thread
+        assert thread is not None and thread.is_alive()
+    finally:
+        poller.stop()
+
+    assert refused.snapshot.state is TrayState.UNKNOWN
+    assert recovered.snapshot.state is TrayState.RUNNING  # the retry built the client
+    failures = _faults(caplog)
+    assert failures, "the refusal at start was not logged"
+    assert "could not be built" in failures[0].getMessage()

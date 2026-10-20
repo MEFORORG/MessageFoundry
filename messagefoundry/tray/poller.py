@@ -207,9 +207,22 @@ class StatusPoller:
         self._callback_failures = FailureRun()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: True while the first client could not be built; see :meth:`start`.
+        self._open_pending = False
 
     def start(self) -> None:
-        self._open_client()
+        # A build that refuses the probe's approved TLS lists raises RuntimeError from here, which
+        # is the probe module's documented contract (`probe._narrow_to_approved_suites`). Raised
+        # out of start() it would end the tray before its icon exists. So it is recorded like a
+        # failed tick, and the first tick tries again inside the poll guard, where a raise is
+        # published as UNKNOWN and logged with the same backoff (BACKLOG #3414).
+        try:
+            self._open_client()
+        except RuntimeError as exc:
+            self._open_pending = True
+            self._poll_failures = self._poll_failures.record(
+                log, exc, "tray probe client could not be built; publishing UNKNOWN until it can"
+            )
         self._thread = threading.Thread(target=self._run, name="mefor-tray-poller", daemon=True)
         self._thread.start()
 
@@ -284,6 +297,9 @@ class StatusPoller:
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
+        if self._open_pending:
+            self._open_client()  # a raise here is the tick guard's, so it reads UNKNOWN
+            self._open_pending = False
         self._follow_the_pin()
         reading = self._scm_reader(self._config.service_name)
         client = self._client

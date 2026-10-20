@@ -311,6 +311,10 @@ def load_pin(cacert: str) -> LoadedPin | None:
     correct that on its next tick, so the second read saves a spare rebuild rather than closing a
     permanent gap. It cannot see a file that changes and changes back within the load. The context
     still loads through ``cafile``, so what a pin may hold is unchanged.
+
+    A build that refuses the approved TLS lists is not a pin that will not load, so it raises
+    ``RuntimeError`` (:func:`_narrow_to_approved_suites`) rather than returning ``None``. The
+    poller turns that into an UNKNOWN reading, at start as on a tick.
     """
     before = read_pin(cacert)
     if before is None:

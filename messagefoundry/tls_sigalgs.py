@@ -142,10 +142,7 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     (``_narrow_to_approved_suites``, both branches), which call this function directly.
 
     **At least one context is deliberately not reached: the startup TLS-floor probe's offers in**
-    ``config/tls_probe._offer_context``. They verify no certificate (``CERT_NONE``), so the
-    signature they would bound authenticates nothing; the legacy offers are TLS 1.0 and 1.1, which
-    carry no ``signature_algorithms`` extension; and the third offer is a default-capability client
-    by design, so it stays the interpreter's stock offer. The comment there records it.
+    ``config/tls_probe._offer_context``. The comment at the end of that function gives the reasons.
 
     A ``truststore.SSLContext`` is narrowed through its inner context, as in
     ``tls_policy.narrow_tls13_suites`` and for the same reason."""

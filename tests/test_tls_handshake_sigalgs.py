@@ -1185,13 +1185,22 @@ _Install = Callable[[type[_SigalgCapableContext]], list[_SigalgCapableContext]]
 
 
 def _build_client_context(site: str, cacert: str) -> ssl.SSLContext:
-    """The context each client builds, through its real seam."""
+    """The context each client builds, through its real seam, checked to be the named branch.
+
+    The check matters for the tray: ``build_verify`` falls back to the OS store when a pin does not
+    load, so without it a "pinned" arm could measure the OS-store context and still pass."""
     pin = cacert if site.endswith("pinned") else None
     if site.startswith("apiclient"):
-        return apiclient._build_verify_context(pin, None, None)
-    verify = tray_probe.build_verify("https://localhost:8765", pin)
-    assert isinstance(verify, ssl.SSLContext), verify
-    return verify
+        ctx = apiclient._build_verify_context(pin, None, None)
+    else:
+        verify = tray_probe.build_verify("https://localhost:8765", pin)
+        assert isinstance(verify, ssl.SSLContext), verify
+        ctx = verify
+    from_os_store = "truststore" in type(ctx).__module__
+    assert from_os_store is (pin is None), (
+        f"{site}: built {type(ctx).__module__}.{type(ctx).__name__}"
+    )
+    return ctx
 
 
 @pytest.fixture
@@ -1251,11 +1260,19 @@ def test_a_client_sigalg_refusal_is_not_read_as_bad_tls_material(
             return True
 
     client_contexts(_Refusing)
-    expected = apiclient.ApiError if site.startswith("apiclient") else tls_sigalgs.NarrowerRefused
-    with pytest.raises(expected, match="without SHA-224") as caught:
-        _build_client_context(site, "unused-ca.pem")
-    assert not isinstance(caught.value, OSError)
-    assert "TLS material" not in str(caught.value)
+    pin = "unused-ca.pem" if site.endswith("pinned") else None
+    if site.startswith("apiclient"):
+        # Through the constructor, whose OSError handler is what would relabel it "cannot load TLS
+        # material", so the message check below can fail.
+        with pytest.raises(apiclient.ApiError, match="without SHA-224") as api_error:
+            apiclient.EngineClient("https://127.0.0.1:8765", cacert=pin)
+        assert "TLS material" not in str(api_error.value)
+        raised: BaseException = api_error.value
+    else:
+        with pytest.raises(tls_sigalgs.NarrowerRefused, match="without SHA-224") as refused:
+            tray_probe.build_verify("https://localhost:8765", pin)
+        raised = refused.value
+    assert not isinstance(raised, OSError)
 
 
 @pytest.mark.parametrize("site", _CLIENT_CONTEXT_SITES)
@@ -1281,9 +1298,9 @@ def test_one_module_sets_the_signature_schemes() -> None:
     found = set()
     for path in sorted(p for root in roots for p in root.rglob("*.py")):
         text = path.read_text(encoding="utf-8-sig")
-        if (
-            "_sigalgs" not in text
-        ):  # both setter names hold it; skip the parse, as derived_sites does
+        # Both setter names hold "_sigalgs", so a file without it is skipped unparsed, as
+        # derived_sites does for its own gate.
+        if "_sigalgs" not in text:
             continue
         tree = ast.parse(text)
         if any(call_sites(tree, name) for name in ("set_server_sigalgs", "set_client_sigalgs")):
