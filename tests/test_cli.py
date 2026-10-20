@@ -734,6 +734,50 @@ def test_rotate_key_completes_over_an_upload_whose_body_is_gone(
     assert stamped == dek_fingerprint(new_key_id)
 
 
+def test_rotate_key_keeps_the_dates_of_a_stamp_under_an_unknown_scheme(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3421: a stored stamp under a scheme this release does not know is refused. The run
+    cannot tell whether the key changed, so it re-stamps under today's scheme and keeps the dates:
+    never a reset, and the warning says what to set if the key was rotated."""
+    import asyncio
+
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "rot-unknown.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    _seed_store_and_upload(db, uploads, key_a)
+
+    async def stamp(key: str, **row: str) -> dict[str, str]:
+        store = await MessageStore.open(db, cipher=make_cipher(key))
+        try:
+            if row:
+                await store.upsert_secret_rotation_meta("MEFOR_STORE_ENCRYPTION_KEY", **row)
+            got = (await store.get_secret_rotation_meta())["MEFOR_STORE_ENCRYPTION_KEY"]
+            return {"fingerprint": got.fingerprint, "last_rotated": got.last_rotated}
+        finally:
+            await store.close()
+
+    asyncio.run(
+        stamp(
+            key_a,
+            fingerprint="sha3-16:" + "d" * 16,
+            tracked_since="2025-01-01",
+            last_rotated="2025-01-01",
+        )
+    )
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert "names a scheme this release does not know" in capsys.readouterr().err
+    new_key_id = _key_id_and_stamp(db, key_b)[0]
+    assert asyncio.run(stamp(key_b)) == {
+        "fingerprint": dek_fingerprint(new_key_id),
+        "last_rotated": "2025-01-01",
+    }
+
+
 def test_rotate_key_requires_a_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

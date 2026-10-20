@@ -683,8 +683,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
     # with zero direct stdlib-crypto import in the module. rotate-key stamps a new DEK key-id only
     # when it CHANGED, and compares it to the stored fingerprint through
-    # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
-    # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
+    # pipeline.secret_rotation.fingerprint_changed (fingerprints_equal): constant-time over bytes, the
+    # same compare the rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`. A
+    # stored scheme tag it does not know is refused and re-stamped with its dates kept (#3421).
     # BACKLOG #296: provision-admin also imports SigningError, to give a refused OIDC
     # private_key_jwt key a fixed text; it signs nothing.
     "messagefoundry/__main__.py": frozenset(

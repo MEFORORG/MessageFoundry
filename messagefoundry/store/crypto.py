@@ -684,9 +684,10 @@ def _fingerprint(key: bytes | bytearray) -> str:
     ``bytearray`` so it can fingerprint an owned DEK buffer *before* it is zeroized, without forcing an
     immutable copy.
 
-    Where its output is STORED -- a ``cipher_meta`` row and the DEK row of ``secret_rotation_meta``
-    -- it carries :data:`KEY_ID_SCHEME` (BACKLOG #3421). Changing this function means a new scheme
-    tag, read beside this one, or every stored count and age clock would restart at zero."""
+    Its output is persisted in at least the ``mfenc:`` marker of every sealed value, the DR archive
+    key check, a ``cipher_meta`` row and the DEK row of ``secret_rotation_meta``. The last two carry
+    :data:`KEY_ID_SCHEME` (BACKLOG #3421), so a change here needs a new scheme tag read beside this
+    one, or their counts and age clocks would restart at zero, as well as a new marker version."""
     return hashlib.sha256(key).hexdigest()[:_KEY_ID_LEN]
 
 
@@ -712,7 +713,9 @@ def read_scheme_tag(stored: str, scheme: str) -> str:
 
     A tag is the text before the first ``:`` when it is not lowercase hex. Every value written
     before tags existed starts with a hex key id or MAC, so an untagged value reads as written under
-    ``scheme`` and is returned as it is. A tag other than ``scheme`` raises
+    ``scheme`` and is returned as it is. That holds while ``scheme`` is the one each value was
+    written under before tags; a release that adds a scheme must map an untagged value to the old
+    one, not the new. A tag other than ``scheme`` raises
     :class:`UnknownSchemeError`. Every tag therefore holds a character that is not lowercase hex."""
     head, sep, rest = stored.partition(":")
     if not sep or (head and not head.strip("0123456789abcdef")):

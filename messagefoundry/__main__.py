@@ -9266,7 +9266,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     topped up after **every committed batch** (so an interrupted rotation still accounts for
     everything it already re-encrypted — it cannot silently under-count the new key), and
     ``store.close()`` settles the remainder exactly. The key-age stamp below stays keyed on the DEK's
-    own fingerprint (``active_key_id``), never the sub-key (ADR 0196 AC-7).
+    own fingerprint (``active_key_id``, stored scheme-tagged, BACKLOG #3421), never the sub-key (ADR
+    0196 AC-7).
     """
     from pathlib import Path
 
@@ -9406,17 +9407,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         if prior is None
                         else fingerprint_changed(prior.fingerprint, fingerprint)
                     )
-                    if changed is None:
-                        # BACKLOG #3421: refused and left as stored, as the watcher leaves it.
+                    if changed is None and prior is not None:
+                        # BACKLOG #3421: refused. Nothing says whether this run changed the key, so
+                        # it is re-stamped with its dates kept, as the watcher does: never a reset.
+                        await store.upsert_secret_rotation_meta(
+                            "MEFOR_STORE_ENCRYPTION_KEY",
+                            fingerprint=fingerprint,
+                            tracked_since=prior.tracked_since,
+                            last_rotated=prior.last_rotated,
+                        )
                         print(
                             "warning: the stored store-key fingerprint names a scheme this release"
-                            " does not know, so its rotation stamp was left as stored and this"
-                            " rotation is not recorded. Set [secret_rotation].store_key_last_rotated"
-                            " to today, or delete the MEFOR_STORE_ENCRYPTION_KEY row of"
-                            " secret_rotation_meta and start the engine to restart its clock.",
+                            " does not know, so this run could not tell whether the key changed."
+                            " Its rotation dates were kept. If this run rotated the key, set"
+                            " [secret_rotation].store_key_last_rotated to today's date.",
                             file=sys.stderr,
                         )
-                    if changed:
+                    elif changed:
                         await store.upsert_secret_rotation_meta(
                             "MEFOR_STORE_ENCRYPTION_KEY",
                             fingerprint=fingerprint,

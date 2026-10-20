@@ -174,7 +174,7 @@ def test_fingerprint_change_resets_the_clock() -> None:
 
 def test_unchanged_class_is_not_rewritten() -> None:
     # Same fingerprint as stored → no rotation, no upsert (the stored dates are carried through).
-    prior = SecretRotationMetaRow(_DEK, "dekid-SAME", "2025-01-01", "2025-03-01")
+    prior = SecretRotationMetaRow(_DEK, dek_fingerprint("dekid-SAME"), "2025-01-01", "2025-03-01")
     store = _FakeMetaStore(rows={_DEK: prior})
     stamps = _reconcile(store, dek_key_id="dekid-SAME")
     assert store.upserts == []  # untouched

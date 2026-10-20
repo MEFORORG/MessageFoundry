@@ -141,15 +141,17 @@ async def test_two_writers_fold_a_pre_tag_row_once(tmp_path: Path) -> None:
             ("feedfacefeedface", 100),
         )
     a = await MessageStore.open(db)
-    b = await MessageStore.open(db)
     try:
-        totals = await asyncio.gather(
-            a.add_cipher_invocations("feedfacefeedface", 1),
-            b.add_cipher_invocations("feedfacefeedface", 1),
-        )
+        b = await MessageStore.open(db)
+        try:
+            totals = await asyncio.gather(
+                a.add_cipher_invocations("feedfacefeedface", 1),
+                b.add_cipher_invocations("feedfacefeedface", 1),
+            )
+        finally:
+            await b.close()
     finally:
         await a.close()
-        await b.close()
     assert sorted(totals) == [101, 102]
     assert dict(_rows(db))[cipher_meta_key("feedfacefeedface")] == 102
     assert "feedfacefeedface" not in dict(_rows(db))
@@ -158,22 +160,23 @@ async def test_two_writers_fold_a_pre_tag_row_once(tmp_path: Path) -> None:
 # --- secret_rotation_meta: the age clocks carry over ------------------------------------------
 
 
-_Out = tuple[dict[str, str], dict[str, str], dict[str, str]]
+_Out = tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]
 
 
 async def _reconcile(db: Path, key: str, rows: dict[str, str] | None = None) -> _Out:
     """Reconcile a keyed store as the engine does at start, after seeding ``rows`` (class id to
     stored fingerprint, ``""`` for the class's pre-tag form) dated 2020. Returns the stamps'
-    last-rotated dates, the stored fingerprints, and each class's pre-tag form."""
+    last-rotated dates, the stored fingerprints, and each class's pre-tag and tagged forms."""
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
         dek_id = store.cipher_info().active_key_id
         assert dek_id
         fp_key = store.secret_rotation_fingerprint_key()
         assert fp_key is not None
+        tagged = {_DEK: sr.dek_fingerprint(dek_id), _AD: sr._keyed_fingerprint(fp_key, _VALUE)}
         pre_tag = {
-            _DEK: dek_id,
-            _AD: read_scheme_tag(sr._keyed_fingerprint(fp_key, _VALUE), sr._FP_SCHEME),
+            _DEK: read_scheme_tag(tagged[_DEK], KEY_ID_SCHEME),
+            _AD: read_scheme_tag(tagged[_AD], sr._FP_SCHEME),
         }
         for class_id, fingerprint in (rows or {}).items():
             await store.upsert_secret_rotation_meta(
@@ -192,23 +195,25 @@ async def _reconcile(db: Path, key: str, rows: dict[str, str] | None = None) -> 
         )
         stored = await store.get_secret_rotation_meta()
         dates = {c: s.last_rotated.isoformat() for c, s in stamps.items()}
-        return dates, {c: r.fingerprint for c, r in stored.items()}, pre_tag
+        return dates, {c: r.fingerprint for c, r in stored.items()}, pre_tag, tagged
     finally:
         await store.close()
 
 
 async def test_fingerprints_are_stored_tagged(tmp_path: Path) -> None:
-    _, stored, _ = await _reconcile(tmp_path / "s.db", generate_key())
+    _, stored, _, tagged = await _reconcile(tmp_path / "s.db", generate_key())
+    assert stored == tagged
     assert stored[_DEK].startswith(f"{KEY_ID_SCHEME}:")
     assert stored[_AD].startswith(f"{sr._FP_SCHEME}:")
 
 
 async def test_pre_tag_fingerprints_compare_equal_and_keep_their_clocks(tmp_path: Path) -> None:
-    dates, stored, pre_tag = await _reconcile(
-        tmp_path / "s.db", generate_key(), {_DEK: "", _AD: ""}
-    )
+    db = tmp_path / "s.db"
+    dates, stored, pre_tag, tagged = await _reconcile(db, generate_key(), {_DEK: "", _AD: ""})
+    assert pre_tag != tagged  # premise: the seeded rows are untagged
     assert dates == {_DEK: _OLD, _AD: _OLD}  # neither clock reset on upgrade
-    assert stored == pre_tag  # read as today's scheme, so left as written
+    # Read as today's scheme, then re-stamped tagged, so no untagged row outlives this release.
+    assert stored == tagged
 
 
 async def test_an_unknown_scheme_is_refused_and_resets_nothing(
@@ -216,10 +221,13 @@ async def test_an_unknown_scheme_is_refused_and_resets_nothing(
 ) -> None:
     unknown = {_DEK: "sha3-32:" + "b" * 32, _AD: "hmac-sha3-64:0123456789abcdef:" + "c" * 64}
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
-        dates, stored, _ = await _reconcile(tmp_path / "s.db", generate_key(), dict(unknown))
+        dates, stored, _, tagged = await _reconcile(
+            tmp_path / "s.db", generate_key(), dict(unknown)
+        )
     # Read as a change, the DEK's clock would restart today and lift its ENFORCE escalation.
     assert dates == {_DEK: _OLD, _AD: _OLD}
-    assert stored == unknown  # left for a release that knows the scheme
+    # Re-stamped under today's scheme with the dates kept, so the next rotation is detected.
+    assert stored == tagged
     assert "2 stored fingerprint(s) name a scheme this release does not know" in caplog.text
 
 

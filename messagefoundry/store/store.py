@@ -14457,7 +14457,8 @@ class MessageStore:
         row_id = cipher_meta_key(key_id)
         # The pre-tag row is read inside the upsert, its first write, so the write lock is held from
         # the read through the commit and no second writer can fold the same count. The DELETE
-        # follows it: if it fails after the upsert, the next add folds the row again, an over-count,
+        # follows it. If it fails, the writer guard rolls both back; on the lock-held burst path the
+        # caller may commit the upsert alone, and the next add folds the row again: an over-count,
         # the direction this bound may drift in.
         await self._db.execute(
             "INSERT INTO cipher_meta (key_id, invocations, updated_at)"

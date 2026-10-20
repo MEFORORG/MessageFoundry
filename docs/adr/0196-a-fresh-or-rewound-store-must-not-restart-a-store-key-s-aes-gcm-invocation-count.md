@@ -554,6 +554,8 @@ write transaction on all three backends. That fold does not keep the bare row, s
 to a release from before the tag would count that key from zero.
 
 The DEK row of `secret_rotation_meta` carries the same tag, and its non-DEK rows carry
-`hmac-sha256-32`. There the stored value is parsed, so an unknown tag is refused: the row is left as
-stored and its dates kept. The `mfenc:` markers and DR archives are unchanged, because their format
+`hmac-sha256-32`. There the stored value is parsed. An unknown tag is refused: it is not read under
+any scheme, its dates are kept, and the row is re-stamped under this release's scheme, so the next
+rotation is detected. An untagged value that compares equal is re-stamped in its tagged form, dates
+kept. The `mfenc:` markers and DR archives are unchanged, because their format
 version can name a new function.

@@ -33,8 +33,9 @@ and does **not** retroactively alert — the stamp records when tracking began, 
 Modelled **verbatim** on :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`: an injected
 clock + a pure :meth:`run_once` make it deterministically testable; the loop only governs cadence. The
 set of secrets to watch is supplied by an injected **callable** so it is recomputed each pass (a config
-reload is picked up automatically, and tests can drive it with a literal list). Engine-side and stdlib-
-only, so it never pulls the API or console into the engine.
+reload is picked up automatically, and tests can drive it with a literal list). Engine-side, so it never
+pulls the API or console into the engine. It imports ``store.crypto`` for the stored fingerprints'
+scheme tags (BACKLOG #3421).
 """
 
 from __future__ import annotations
@@ -170,8 +171,8 @@ def _fingerprint_bytes(value: str) -> bytes:
     :func:`hmac.compare_digest` (ASVS 11.2.4, BACKLOG #1167).
 
     ``compare_digest`` is applied to **bytes**, not ``str``, deliberately — the same reasoning as
-    :func:`messagefoundry.store.store.audit_mac_bytes`, restated here rather than imported because this
-    module is engine-side and must not pull a store backend in. Its ``str``
+    :func:`messagefoundry.store.store.audit_mac_bytes`, restated here rather than imported so this
+    module does not depend on a store backend's helpers. Its ``str``
     overload raises ``TypeError`` on any non-ASCII input, and ``secret_rotation_meta.fingerprint`` is
     out-of-band writable. A raise would not surface: :meth:`~messagefoundry.pipeline.engine.Engine`'s
     reconcile call site wraps :func:`reconcile_rotation_meta` in a blanket ``except Exception`` that logs
@@ -207,7 +208,9 @@ def fingerprints_equal(stored: str, current: str) -> bool:
 def fingerprint_changed(stored: str, current: str) -> bool | None:
     """Whether ``stored`` differs from ``current``, by :func:`fingerprints_equal`. ``None`` when
     ``stored`` names a scheme this release does not compile in: it is refused, not read under any
-    scheme, and the caller leaves the row as stored so its dates stand (BACKLOG #3421)."""
+    scheme, so nothing can say whether the secret changed. The caller keeps the row's dates and
+    re-stamps it under ``current``, as an undecided re-key is: the clock never resets, and the next
+    rotation is detected (BACKLOG #3421)."""
     try:
         return not fingerprints_equal(stored, current)
     except UnknownSchemeError:
@@ -469,7 +472,7 @@ async def reconcile_rotation_meta(
         # the comparison total; read its docstring before changing either side. Pinned by the
         # monkeypatched-comparator call-count test in tests\test_secret_rotation_watcher.py, whose
         # positive control asserts a plain `!=` counts zero compares.
-        elif changed_fp := fingerprint_changed(prior.fingerprint, fingerprint):
+        elif changed_fp := fingerprint_changed(prior.fingerprint, fingerprint):  # True: changed
             tracked_since = datetime.date.fromisoformat(prior.tracked_since)
             # The DEK row carries no value: its fingerprint is its key-id, never re-keyed. A value is
             # only ever held with a fingerprint key; the second test narrows the type.
@@ -494,13 +497,20 @@ async def reconcile_rotation_meta(
                 if rekeyed is None:
                     undecided.append(class_id)
             changed = True
+        elif changed_fp is None:
+            # BACKLOG #3421: refused. Its dates are kept, as for an undecided re-key, and it is
+            # re-stamped under today's scheme so the next rotation is detected.
+            refused += 1
+            tracked_since = datetime.date.fromisoformat(prior.tracked_since)
+            last_rotated = _parsed_date(prior.last_rotated) or tracked_since
+            changed = True
         else:
-            # Equal, or refused (None): a refused row is left as stored, so its dates stand and a
-            # release that knows its scheme still finds its own value (BACKLOG #3421).
-            refused += changed_fp is None
             tracked_since = datetime.date.fromisoformat(prior.tracked_since)
             last_rotated = datetime.date.fromisoformat(prior.last_rotated)
-            changed = False
+            # Equal. A value written before tags is re-stamped in its tagged form, dates kept, so no
+            # untagged row outlives this release for a later scheme to misread (BACKLOG #3421). The
+            # tag is public, so a prefix test is not a secret-dependent compare.
+            changed = not prior.fingerprint.startswith(fingerprint.partition(":")[0] + ":")
         if changed:
             await meta_store.upsert_secret_rotation_meta(
                 class_id,
@@ -519,10 +529,9 @@ async def reconcile_rotation_meta(
     if refused:
         log.warning(
             "secret rotation: %d stored fingerprint(s) name a scheme this release does not know, "
-            "so they were not compared. Their dates are kept and the rows left as stored, so a "
-            "rotation cannot be detected for them. To restart tracking, delete those "
-            "secret_rotation_meta rows; for the store key, [secret_rotation].store_key_last_rotated "
-            "records its real rotation date.",
+            "so they were not compared. Their dates are kept and they were re-stamped under this "
+            "release's scheme, so a change made before this start is not detected. If the store "
+            "key was rotated, [secret_rotation].store_key_last_rotated records its real date.",
             refused,
         )
     if undecided:
