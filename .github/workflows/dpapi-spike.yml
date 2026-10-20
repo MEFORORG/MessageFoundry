@@ -1,0 +1,109 @@
+# User-scope DPAPI under a real NT SERVICE account -- a SPIKE, NOT A GATE (vault BACKLOG #3411,
+# wave 3.0; the Windows half of the key-custody drafts-index item 6).
+#
+# WHAT IT MEASURES. The key-custody draft makes user-scope DPAPI, done by the service account itself,
+# the Windows default wrap for the master key, and names three questions to run first. This job runs
+# them on both hosted Windows Server images, against a real service registered the way
+# scripts/service/install-service.ps1 registers the engine (virtual account NT SERVICE\<name>,
+# restricted service SID, one privilege), installed through the pinned and checked NSSM:
+#
+#   Q1  user-scope CryptProtectData, then CryptUnprotectData, as the same service. The round trip is
+#       also what proves the blob valid for the next two.
+#   Q2  a second, non-elevated local account, under a service of its own, is refused that blob.
+#       Controls: Q1 on the same bytes, the same account opening the owner's MACHINE-scope blob, and
+#       its own user-scope round trip. A garbage blob or a broken account cannot pass as a refusal.
+#   Q3  the blob opens after a service restart, in a new process.
+#
+# THE REBOOT ARM OF Q3 IS NOT RUN. A hosted runner cannot reboot inside a job. The summary says so.
+#
+# HOW TO READ IT. Each leg's job summary holds lines starting `DPAPI-SPIKE <image> Q1|Q2|Q3`, an
+# answer of YES, NO or INCONCLUSIVE, and one line per control. The rule for each answer is
+# judge_reports() in scripts/ci/dpapi_spike_worker.py; scripts/ci/dpapi_spike.ps1 is the rig. A NO
+# is a finding and leaves the job green. Only INCONCLUSIVE, an answer the instrument could not
+# give, or a rig failure turns it red.
+#
+# IT CAN NEVER BLOCK A MERGE, by structure:
+#   * a separate workflow, not in ci.yml, so not in the `CI gate` roll-up's `needs`;
+#   * its job is not a required context, and must not become one. The live required set is branch
+#     protection's (gh api repos/MEFORORG/MessageFoundry/branches/main/protection/required_status_checks);
+#   * nothing here touches the windows-service-smoke legs, which the draft named as the place to run
+#     this. A separate job keeps a spike red off them.
+#
+# TRIGGERS. Manual dispatch, and pull requests that touch this job's own three files, so the pull
+# request that changes the spike carries its result. No schedule: a spike answers once. A change to
+# install-service.ps1 or messagefoundry/secrets_dpapi.py, which this job also exercises, does NOT
+# re-run it; dispatch it by hand when one of those changes the answer could depend on.
+#
+# COST AND FORKS. Two 2x-billed Windows legs, free on this public repository and billed to a fork's
+# owner, so the job runs only here, as windows-service-smoke does.
+#
+# DATA. Synthetic only: one constant payload, never a key. The second account's password is drawn
+# for the run, masked, and dies with the runner.
+
+name: dpapi spike
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/dpapi-spike.yml
+      - scripts/ci/dpapi_spike.ps1
+      - scripts/ci/dpapi_spike_worker.py
+
+concurrency:
+  group: dpapi-spike-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only: no gh writes, no secrets.
+permissions:
+  contents: read
+
+jobs:
+  dpapi-spike:
+    name: dpapi spike (${{ matrix.os }})
+    if: github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ${{ matrix.os }}
+    # The rig's waits are bounded at about five minutes in all, plus setup and the NSSM download.
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two Windows Server images the windows-service-smoke legs run on.
+        os: [windows-2022, windows-2025]
+    env:
+      # An administrator-only folder for the nssm.exe the installer's own Resolve-Nssm downloads
+      # and checks against its pins. No run: line below names any other nssm (tests/test_nssm_pin.py).
+      SPIKE_NSSM_DIR: C:\Program Files\MeforDpapiSpike\nssm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # read-only job; keep the token out of .git/config (zizmor: artipacked)
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # The second account's password, drawn here and masked before anything can echo it, as the
+      # windows-service-smoke localuser leg draws its own. The server's complexity policy wants three
+      # character classes and hex alone is two, so the hex is wrapped in the other two.
+      - name: Draw the second account's password for this run
+        id: other
+        shell: pwsh
+        run: |
+          $drawn = (& python -c "import secrets; print('Mf-' + secrets.token_hex(24) + '-Q9')").Trim()
+          if (-not $drawn) { throw "could not draw the second account's password" }
+          "::add-mask::$drawn"
+          "password=$drawn" >> $env:GITHUB_OUTPUT
+
+      # Windows PowerShell 5.1, as the windows-service-smoke install step runs the installer whose
+      # definitions this rig lifts, and because New-LocalUser is a Windows PowerShell module.
+      - name: Run the DPAPI spike
+        shell: powershell
+        env:
+          DPAPI_SPIKE_OTHER_PASSWORD: ${{ steps.other.outputs.password }}
+          SPIKE_PYTHON: ${{ steps.py.outputs.python-path }}
+          SPIKE_IMAGE: ${{ matrix.os }}
+        run: |
+          .\scripts\ci\dpapi_spike.ps1 -NssmDir $env:SPIKE_NSSM_DIR -PythonExe $env:SPIKE_PYTHON -Image $env:SPIKE_IMAGE -Summary $env:GITHUB_STEP_SUMMARY

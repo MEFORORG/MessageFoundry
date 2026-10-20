@@ -128,6 +128,7 @@ tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py
 tests/test_dependabot_cap_ignores.py
 tests/test_docs_runbooks.py
+tests/test_dpapi_spike_judge.py
 tests/test_failure_signal.py
 tests/test_feature_map_claims.py
 tests/test_freethread_smoke_liveness.py
