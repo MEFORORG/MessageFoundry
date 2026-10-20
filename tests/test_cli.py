@@ -21,6 +21,7 @@ import pytest
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import AuthSettings, _env_overrides, load_settings
+from messagefoundry.pipeline.secret_rotation import dek_fingerprint
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_TOML,
     RETENTION_WINDOWS_ENV,
@@ -673,7 +674,7 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     blob.write_bytes(body)
     assert main(["rotate-key", "--db", str(db)]) == 0
     assert "OK:" in capsys.readouterr().out
-    assert _key_id_and_stamp(db, key_b) == (new_key_id, new_key_id)
+    assert _key_id_and_stamp(db, key_b) == (new_key_id, dek_fingerprint(new_key_id))
 
 
 def test_rotate_key_fails_when_no_key_opens_an_uploaded_file(
@@ -730,7 +731,7 @@ def test_rotate_key_completes_over_an_upload_whose_body_is_gone(
     assert "note: 1 uploaded file(s) have a body that is missing or is not text" in captured.out
     assert "NOT fully re-sealed" not in captured.err
     new_key_id, stamped = _key_id_and_stamp(db, key_b)
-    assert stamped == new_key_id
+    assert stamped == dek_fingerprint(new_key_id)
 
 
 def test_rotate_key_requires_a_key(

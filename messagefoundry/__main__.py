@@ -9352,7 +9352,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
-        from messagefoundry.pipeline.secret_rotation import fingerprints_equal
+        from messagefoundry.pipeline.secret_rotation import dek_fingerprint, fingerprint_changed
         from messagefoundry.store.store import SecretRotationMetaStore
 
         # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
@@ -9400,10 +9400,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     # would reset the key-age clock for a key that was never rotated.
                     # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
                     # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
-                    if prior is None or not fingerprints_equal(prior.fingerprint, key_id):
+                    fingerprint = dek_fingerprint(key_id)
+                    changed = (
+                        True
+                        if prior is None
+                        else fingerprint_changed(prior.fingerprint, fingerprint)
+                    )
+                    if changed is None:
+                        # BACKLOG #3421: refused and left as stored, as the watcher leaves it.
+                        print(
+                            "warning: the stored store-key fingerprint names a scheme this release"
+                            " does not know, so its rotation stamp was left as stored",
+                            file=sys.stderr,
+                        )
+                    if changed:
                         await store.upsert_secret_rotation_meta(
                             "MEFOR_STORE_ENCRYPTION_KEY",
-                            fingerprint=key_id,
+                            fingerprint=fingerprint,
                             tracked_since=prior.tracked_since if prior is not None else today,
                             last_rotated=today,
                         )

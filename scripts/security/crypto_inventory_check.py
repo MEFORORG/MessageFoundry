@@ -454,8 +454,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # in store/crypto.py, HKDF), never a salted hash — to auto-detect rotation without persisting or
     # logging any value. hashlib supplies the SHA-256 digestmod for that HMAC. The DEK-derived key is
     # obtained through the store cipher (store.crypto seam), delegated, so this module keeps only the
-    # keyed-MAC primitive.
-    "messagefoundry/pipeline/secret_rotation.py": frozenset({"hashlib", "hmac"}),
+    # keyed-MAC primitive. BACKLOG #3421: it imports the store.crypto seam for the stored
+    # fingerprints' scheme tags only (KEY_ID_SCHEME, scheme_tagged, read_scheme_tag): string
+    # tagging and parsing, no primitive.
+    "messagefoundry/pipeline/secret_rotation.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+    ),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a

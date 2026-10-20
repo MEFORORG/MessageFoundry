@@ -533,3 +533,15 @@ seal Transit-mode archives under a salted sub-key, or seal them through Transit.
 Per engine `CLAUDE.md` section 0 there are no deployments. Take a first site on `vault_transit`
 that configures a key for the backup. It would seal every archive under that DEK in process. No
 enforced ceiling would cover that key's archive use.
+
+## Amendment (2026-10-20): the stored row id names the fingerprint scheme (BACKLOG #3421)
+
+Context item 4 still holds for `key_id` in memory. What `cipher_meta` stores is that id behind a
+scheme tag, `sha256-16:<key_id>` (`cipher_meta_key` and `KEY_ID_SCHEME` in `store/crypto.py`). The
+tag names the function, not the key, so a release that changed `_fingerprint` could find the row an
+unchanged key already has. Without it, that key's count would restart at zero, the reset this ADR
+exists to prevent. A row keyed on the bare id, written before the tag, is read as today's scheme:
+`cipher_invocations` sums both forms, and `add_cipher_invocations` folds the bare row into the
+tagged one in the same transaction on all three backends. The DEK row of `secret_rotation_meta`
+carries the same tag, so a changed `_fingerprint` would not reset the key-age clock either. The
+`mfenc:` markers and DR archives are unchanged: their format version can name a new function.

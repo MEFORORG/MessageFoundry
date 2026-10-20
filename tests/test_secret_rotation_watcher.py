@@ -36,6 +36,7 @@ from messagefoundry.pipeline.secret_rotation import (
     SecretStamp,
     _fingerprint_bytes,
     _keyed_fingerprint,
+    dek_fingerprint,
     held_env_secret_values,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
@@ -156,7 +157,7 @@ def test_new_class_stamps_tracked_since_today_as_age_floor() -> None:
     dek = stamps[_DEK]
     assert dek.tracked_since == _TODAY
     assert dek.last_rotated == _TODAY
-    assert store.rows[_DEK].fingerprint == "dekid-aaa"
+    assert store.rows[_DEK].fingerprint == dek_fingerprint("dekid-aaa")
 
 
 def test_fingerprint_change_resets_the_clock() -> None:
@@ -168,7 +169,7 @@ def test_fingerprint_change_resets_the_clock() -> None:
     dek = stamps[_DEK]
     assert dek.last_rotated == _TODAY  # reset on change
     assert dek.tracked_since == datetime.date(2025, 1, 1)  # floor preserved
-    assert store.rows[_DEK].fingerprint == "dekid-NEW"
+    assert store.rows[_DEK].fingerprint == dek_fingerprint("dekid-NEW")
 
 
 def test_unchanged_class_is_not_rewritten() -> None:
@@ -538,7 +539,7 @@ def test_non_ascii_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
     dek = stamps[_DEK]
     assert dek.last_rotated == _TODAY
     assert dek.tracked_since == datetime.date(2025, 1, 1)
-    assert store.rows[_DEK].fingerprint == "dekid-aaa"
+    assert store.rows[_DEK].fingerprint == dek_fingerprint("dekid-aaa")
 
 
 def test_lone_surrogate_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:

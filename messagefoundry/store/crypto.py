@@ -696,8 +696,6 @@ def _fingerprint(key: bytes | bytearray) -> str:
 #: can name a new function.
 KEY_ID_SCHEME = "sha256-16"
 
-_HEX_DIGITS = frozenset("0123456789abcdef")
-
 
 class UnknownSchemeError(ValueError):
     """A stored value names a scheme this release does not compile in (BACKLOG #3421). A stored tag
@@ -717,7 +715,7 @@ def read_scheme_tag(stored: str, scheme: str) -> str:
     ``scheme`` and is returned as it is. A tag other than ``scheme`` raises
     :class:`UnknownSchemeError`. Every tag therefore holds a character that is not lowercase hex."""
     head, sep, rest = stored.partition(":")
-    if not sep or (head and _HEX_DIGITS.issuperset(head)):
+    if not sep or (head and not head.strip("0123456789abcdef")):
         return stored
     if head != scheme:
         raise UnknownSchemeError(f"stored value names an unknown scheme {head[:32]!r}")
