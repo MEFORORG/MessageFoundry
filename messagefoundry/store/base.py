@@ -2374,6 +2374,10 @@ class AuthStore(Protocol):
 
     async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool: ...
 
+    async def rehash_webauthn_credential(
+        self, user_id: str, old_hash: str, new_hash: str
+    ) -> bool: ...
+
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 
     # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey

@@ -5826,3 +5826,10 @@ async def test_processed_files_key_forms(store) -> None:
     from tests.test_processed_files_ledger import check_processed_files_key_forms
 
     await check_processed_files_key_forms(store)
+
+
+async def test_webauthn_rehash_contract(store) -> None:
+    # BACKLOG #3423: the tagged credential-id hash fits VARCHAR(128) and a passkey moves to it.
+    from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
+
+    await _assert_webauthn_rehash_contract(store)

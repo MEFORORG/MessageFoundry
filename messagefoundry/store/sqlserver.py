@@ -878,6 +878,10 @@ _MSSQL_WEBAUTHN_DELETE_ONE: Final = (
 _MSSQL_WEBAUTHN_DELETE_ALL: Final = (
     "DELETE FROM webauthn_credentials OUTPUT deleted.credential_id_hash WHERE user_id=?"
 )
+_MSSQL_WEBAUTHN_REHASH: Final = (
+    "UPDATE webauthn_credentials SET credential_id_hash=? OUTPUT inserted.credential_id_hash"
+    " WHERE user_id=? AND credential_id_hash=?"
+)
 
 
 # --- ADR 0071 B5 PR1: hoisted handoff SQL + pure param-builders (async/sync shared) --------------
@@ -2482,12 +2486,29 @@ _SCHEMA: list[str] = [
     # sign_count is BIGINT (WebAuthn uint32 overflows signed INT). label is capped at 100 so the
     # UNIQUE (user_id, label) index key stays bounded (64+100 chars).
     """IF OBJECT_ID('webauthn_credentials','U') IS NULL CREATE TABLE webauthn_credentials (
-        credential_id_hash NVARCHAR(64) NOT NULL PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
+        credential_id_hash NVARCHAR(128) NOT NULL
+            CONSTRAINT pk_webauthn_credentials PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
         user_id NVARCHAR(64) NOT NULL, rp_id NVARCHAR(256) NOT NULL,
         public_key NVARCHAR(MAX) NOT NULL, sign_count BIGINT NOT NULL,
         transports NVARCHAR(MAX) NULL, device_type NVARCHAR(32) NOT NULL,
         backed_up BIT NOT NULL DEFAULT 0, label NVARCHAR(100) NOT NULL,
         aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL)""",
+    # BACKLOG #3423: widen a hash column created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128)
+    # to hold the "wc1:" scheme tag. A table created before this change carries a SYSTEM-NAMED
+    # primary key, which SQL Server will not let a column under it be altered, so the key is looked
+    # up, dropped and rebuilt under a fixed name. EXEC defers each parse, as for processed_files.
+    """IF COL_LENGTH('webauthn_credentials','credential_id_hash') = 128
+    BEGIN
+        DECLARE @pk sysname = (SELECT name FROM sys.key_constraints
+            WHERE parent_object_id = OBJECT_ID('webauthn_credentials') AND type = 'PK');
+        DECLARE @drop nvarchar(400) =
+            N'ALTER TABLE webauthn_credentials DROP CONSTRAINT ' + QUOTENAME(@pk);
+        EXEC(@drop);
+        EXEC(N'ALTER TABLE webauthn_credentials
+               ALTER COLUMN credential_id_hash NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE webauthn_credentials ADD CONSTRAINT pk_webauthn_credentials
+               PRIMARY KEY (credential_id_hash)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ix_webauthn_credentials_user','IndexID') IS NULL
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
@@ -13472,6 +13493,14 @@ class SqlServerStore:
         count is read from ``OUTPUT`` (BACKLOG #2283)."""
         count = await self._write_passkeys_txn(
             user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+        )
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423); store.py's
+        ``MessageStore.rehash_webauthn_credential`` states the contract. Counted from ``OUTPUT``."""
+        count = await self._write_passkeys_txn(
+            user_id, _MSSQL_WEBAUTHN_REHASH, (new_hash, user_id, old_hash), counted=True
         )
         return count > 0
 

@@ -2131,7 +2131,8 @@ SignCountAnswer = Literal["moved", "mismatch", "gone"]
 class WebAuthnCredential:
     """One enrolled WebAuthn passkey (WP-14b, ADR 0068 §4).
 
-    ``credential_id_hash`` — SHA-256 hex of the *raw* credential id (the ``sessions.token_hash``
+    ``credential_id_hash`` — the scheme tag ``wc1:`` and SHA-256 hex of the *raw* credential id
+    (BACKLOG #3423, :func:`messagefoundry.auth.tokens.credential_id_hash`; the ``sessions.token_hash``
     precedent) — is the primary key on all three backends: WebAuthn ids may legitimately be up to
     1023 raw bytes, unboundable as a SQL Server index key, so the fixed-width digest is the
     parity-safe key; the full base64url ``credential_id`` rides alongside as a body column.
@@ -2483,6 +2484,9 @@ _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
 )
 _WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+_WEBAUTHN_REHASH: Final = (
+    "UPDATE webauthn_credentials SET credential_id_hash=? WHERE user_id=? AND credential_id_hash=?"
+)
 _WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1"
 
 # The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
@@ -7225,7 +7229,7 @@ CREATE TABLE IF NOT EXISTS session_lineage (
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
-    credential_id_hash TEXT PRIMARY KEY,       -- sha256 hex of the RAW credential id (sessions.token_hash
+    credential_id_hash TEXT PRIMARY KEY,       -- "wc1:" + sha256 hex of the RAW credential id (BACKLOG #3423) (sessions.token_hash
                                                -- precedent): WebAuthn ids may be up to 1023 raw bytes —
                                                -- unboundable as a SQL Server index key, so the digest is
                                                -- the parity-safe PK on all 3 backends (ADR 0068 §4)
@@ -15321,6 +15325,17 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             count = await self._write_passkeys(
                 user_id, _WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash)
+            )
+            await self._commit()
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423), re-sealing the account
+        over its new passkey digest in the same transaction. True iff a row moved. Raises
+        :class:`RowSealError` when the account's record or passkeys fail their seal."""
+        async with _writer_guard(self._db, self._lock):
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_REHASH, (new_hash, user_id, old_hash)
             )
             await self._commit()
         return count > 0

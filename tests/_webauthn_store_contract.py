@@ -75,6 +75,30 @@ async def _assert_integrity_refused(write: Awaitable[object], what: str) -> None
         raise AssertionError(f"{what} was accepted")
 
 
+async def _assert_webauthn_rehash_contract(store: Any) -> None:
+    """BACKLOG #3423: a passkey moves to a new ``credential_id_hash`` that fits the column (the
+    68-character ``wc1:`` form), only on its own account, and the account stays sealed over it, so
+    a later passkey write on the same account still succeeds."""
+    await store.create_user(
+        user_id="wa-r1",
+        username="wa-rehash",
+        auth_provider="local",
+        password_hash="h",
+        now=100.0,
+        password_generated=False,
+    )
+    bare, tagged = "ab" * 32, "wc1:" + "ab" * 32
+    await store.add_webauthn_credential(_cred("wa-r1", "key", id_hash=bare))
+    assert await store.rehash_webauthn_credential("someone-else", bare, tagged) is False
+    assert await store.rehash_webauthn_credential("wa-r1", bare, tagged) is True
+    assert await store.get_webauthn_credential(bare) is None
+    moved = await store.get_webauthn_credential(tagged)
+    assert moved is not None and moved.credential_id == "cred-id-b64url"
+    assert await store.rehash_webauthn_credential("wa-r1", bare, tagged) is False  # already moved
+    await store.add_webauthn_credential(_cred("wa-r1", "second", id_hash="wc1:" + "cd" * 32))
+    assert await store.delete_webauthn_credential("wa-r1", tagged) is True
+
+
 async def _assert_webauthn_store_contract(store: Any) -> None:
     """The webauthn_credentials contract every backend must satisfy (ADR 0068 §4)."""
     await store.create_user(

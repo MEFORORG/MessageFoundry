@@ -154,6 +154,45 @@ async def test_register_then_assert_e2e() -> None:
         await store.close()
 
 
+async def test_a_passkey_stored_under_the_untagged_hash_still_signs_in() -> None:
+    """BACKLOG #3423: a passkey stored under the bare digest every earlier release wrote is moved to
+    today's tagged hash by the start-up pass, and then signs in. One stored under a tag this release
+    does not know is refused: left in place, counted, and it does not sign in. Mutation: make the
+    pass skip untagged rows. Red: the bare row never moves and the second assertion fails."""
+    from messagefoundry.auth.tokens import credential_id_hash, hash_bytes
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        tagged = credential_id_hash(base64url_to_bytes(auth.credential_id_b64))
+        assert tagged.startswith("wc1:")
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        assert cred.credential_id_hash == tagged
+        bare = hash_bytes(base64url_to_bytes(auth.credential_id_b64))
+        # The row as a pre-#3423 release would have written it (the store re-seals the account).
+        assert await store.rehash_webauthn_credential(identity.user_id, tagged, bare)
+        ok, token = await _assert_once(service, token, auth, sign_count=1)
+        assert ok is False  # sign-in looks the passkey up by today's hash only
+
+        await service.initialize()  # start-up runs the pass
+        assert await store.get_webauthn_credential(tagged) is not None
+        assert await store.get_webauthn_credential(bare) is None
+        ok, token = await _assert_once(service, token, auth, sign_count=2)
+        assert ok is True
+        assert await service.rehash_webauthn_credentials() == (0, 0)  # nothing left to move
+
+        unknown = "wc9:" + tagged.partition(":")[2]
+        assert await store.rehash_webauthn_credential(identity.user_id, tagged, unknown)
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+        assert await store.get_webauthn_credential(unknown) is not None  # left as it is
+        ok, token = await _assert_once(service, token, auth, sign_count=3)
+        assert ok is False
+    finally:
+        await store.close()
+
+
 async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
     store = await MessageStore.open(":memory:")
     try:
