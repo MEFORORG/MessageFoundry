@@ -333,7 +333,9 @@ def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
     The protocol floor's startup self-test (BACKLOG #1120) is the other. ``run_guarded`` calls
     ``asyncio.run``, whose loop opens a socket pair, and that self-test must open none. So it runs
     one private loop and installs its own handler, which logs the context message and no exception
-    text. Both halves are pinned below: one loop start, and that handler installed.
+    text. The loop start is pinned below, one and only one. The handler is pinned by behaviour, off
+    the captured log, in ``tests/test_protocol_floor_selftest.py``
+    (``test_the_private_loops_error_handler_logs_no_exception_text``).
 
     Controls keep a zero from being a dead instrument. The scanner must find ``run_guarded``'s own
     two calls in the REAL tree, and it must fire on each spelling in the test above."""
@@ -358,12 +360,6 @@ def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
     assert len(files) > 100, f"scanned only {len(files)} files under {root}"
     assert len(allowed_hits) == 2, f"run_guarded's own calls were not found: {allowed_hits}"
     assert len(selftest_hits) == 1, f"the self-test must start exactly one loop: {selftest_hits}"
-    selftest_source = selftest.read_text(encoding="utf-8")
-    assert "self.set_exception_handler(_note_loop_error)" in selftest_source
-    assert (
-        '_log.debug("protocol floor self-test: discarded loop reported: %s", context.get("message"))'
-        in (selftest_source)
-    ), "the self-test loop's handler must log the context message only"
     assert hits == [], (
         "a loop is started without the last-resort handler; use "
         f"messagefoundry.last_resort.run_guarded instead: {hits}"
