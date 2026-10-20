@@ -6371,3 +6371,11 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     )
     assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
     assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"
+
+
+async def test_processed_files_key_forms(store) -> None:
+    # BACKLOG #3424: the 68-character tagged key must fit file_key (NVARCHAR(128)), and the bare
+    # pre-tag one still reads, at SQLite parity.
+    from tests.test_processed_files_ledger import check_processed_files_key_forms
+
+    await check_processed_files_key_forms(store)

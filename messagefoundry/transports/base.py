@@ -629,8 +629,9 @@ SyncReplyResolver = Callable[[str], Awaitable[InboundReply]]
 class ProcessedFileLedger(Protocol):
     """The store-backed **process-in-place dedup ledger** a leave-in-place (``after_read='leave'``) poll
     source uses (ADR 0129, BACKLOG #142). The runner injects an adapter closing over the store + the
-    inbound's channel id; the source passes only a **HASHED** ``file_key`` (a derived id — sha256 of the
-    file's path + mtime/size), so ``transports/`` never imports the store and **no cleartext path crosses
+    inbound's channel id; the source passes only a **HASHED** ``file_key`` (a derived id — the scheme
+    tag :data:`FILE_KEY_SCHEME`, ``:``, then sha256 hex of the file's path + mtime/size, BACKLOG #3424;
+    a lookup may also present the bare pre-tag digest), so ``transports/`` never imports the store and **no cleartext path crosses
     the seam** (a filename/path can embed an MRN). ``None`` on the source means no durable ledger (a
     direct caller / test), and the connector falls back to a bounded in-process cache. Same
     runtime-injection shape as :data:`ConnectionEventSink`.
@@ -651,14 +652,16 @@ class ProcessedFileLedger(Protocol):
 
 
 #: The scheme tag every ``processed_files.file_key`` this release WRITES carries (BACKLOG #3424, ASVS
-#: 11.2.2 census row 15). It names how the key was derived: SHA-256, hex, over the source's identity
+#: 11.2.2). It names how the key was derived: SHA-256, hex, over the source's identity
 #: string, which each source computes itself (``_file_key_forms`` in ``file.py`` and
 #: ``remotefile.py``). A release that changes the derivation adds a new tag, writes it, and keeps
 #: computing the old forms for lookup only, so a file left in place is not read again just because
 #: its key changed. Compiled in, never a setting: no operator selects a scheme.
 FILE_KEY_SCHEME = "fk1"
 
-#: Every tag this release can read. A stored or presented key with any other tag is refused.
+#: Every tag this release can read. A key PRESENTED to the ledger with any other tag is refused
+#: (:func:`check_file_key`). A STORED row with an unknown tag is never parsed: every lookup is by the
+#: exact key a source derives, so such a row is simply never matched.
 FILE_KEY_SCHEMES = frozenset({FILE_KEY_SCHEME})
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -695,16 +698,19 @@ async def ledger_holds(ledger: ProcessedFileLedger | None, forms: tuple[str, ...
 
 
 def check_file_key(file_key: str, *, write: bool) -> None:
-    """Refuse a key this release did not derive. A write must carry :data:`FILE_KEY_SCHEME`; a read
-    may also be the bare pre-#3424 digest. Any other tag is unknown here, and is refused rather than
-    looked up, so a marker can only ever choose among the schemes compiled into the release."""
+    """Refuse a key this release did not derive, before the store sees it. A write must carry
+    :data:`FILE_KEY_SCHEME`; a read may carry any tag in :data:`FILE_KEY_SCHEMES`, or be the bare
+    pre-#3424 digest. Any other tag is refused rather than looked up or recorded. The message never
+    echoes the key: a refused key is by definition not a derived hash, so it may be cleartext."""
     scheme, sep, digest = file_key.partition(":")
     if not sep:
         if not write and _HEX64.fullmatch(file_key):
             return
         raise FileKeyError("a dedup-ledger key carries no scheme tag")
     if scheme not in FILE_KEY_SCHEMES:
-        raise FileKeyError(f"unknown dedup-ledger key scheme {scheme[:16]!r}")
+        raise FileKeyError("a dedup-ledger key carries a scheme tag this release does not know")
+    if write and scheme != FILE_KEY_SCHEME:
+        raise FileKeyError("a dedup-ledger write carries a scheme tag other than today's")
     if not _HEX64.fullmatch(digest):
         raise FileKeyError("a dedup-ledger key's digest is not 64 lowercase hex")
 

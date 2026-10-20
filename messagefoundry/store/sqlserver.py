@@ -2578,6 +2578,17 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('processed_files','U') IS NULL CREATE TABLE processed_files (
         channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(128) NOT NULL, processed_at FLOAT NOT NULL,
         CONSTRAINT pk_processed_files PRIMARY KEY (channel_id, file_key))""",
+    # BACKLOG #3424: widen a table created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128) to hold
+    # the "fk1:" tag. The guarded CREATE above never reaches an existing table, and SQL Server will
+    # not ALTER a primary-key column in place, so the key is dropped and rebuilt around it. EXEC
+    # defers each parse, the same way as the users backfills, so the batch compiles on any shape.
+    """IF COL_LENGTH('processed_files','file_key') = 128
+    BEGIN
+        EXEC(N'ALTER TABLE processed_files DROP CONSTRAINT pk_processed_files');
+        EXEC(N'ALTER TABLE processed_files ALTER COLUMN file_key NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE processed_files ADD CONSTRAINT pk_processed_files
+               PRIMARY KEY (channel_id, file_key)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('processed_files'),'ix_processed_files_channel','IndexID') IS NULL
         CREATE INDEX ix_processed_files_channel ON processed_files(channel_id, processed_at)""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and

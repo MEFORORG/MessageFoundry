@@ -5819,3 +5819,10 @@ async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
     )
 
     await check_config_changed_reason_survives_a_long_node(store)
+
+
+async def test_processed_files_key_forms(store) -> None:
+    # BACKLOG #3424: the scheme-tagged dedup key and the bare pre-tag one, at SQLite parity.
+    from tests.test_processed_files_ledger import check_processed_files_key_forms
+
+    await check_processed_files_key_forms(store)

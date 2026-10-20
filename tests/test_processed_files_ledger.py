@@ -4,14 +4,17 @@
 
 Covers the SQLite `processed_files` store methods (`is_file_processed` / `record_processed_file` /
 `prune_processed_files`) and an end-to-end runner test proving a leave-in-place File source ingests a
-file ONCE across many polls, leaving it in place, with the durable store ledger. SQL Server / Postgres
-parity is validated on the CI legs (no live server DB here)."""
+file ONCE across many polls, leaving it in place, with the durable store ledger. On SQL Server and
+Postgres, only :func:`check_processed_files_key_forms` runs, from the gated server-store suites
+(``test_postgres_store.py`` / ``test_sqlserver_store.py``); the rest is SQLite only."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -128,23 +131,7 @@ async def test_leave_in_place_ingests_once_across_polls(
     share = tmp_path / "share"
     share.mkdir()
     (share / "a.hl7").write_bytes(ADT.encode("utf-8"))
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "file_in",
-            ConnectionSpec(
-                ConnectorType.FILE,
-                {
-                    "directory": str(share),
-                    "pattern": "*.hl7",
-                    "poll_seconds": 0.02,
-                    "after_read": "leave",
-                },
-            ),
-            router="r",
-        )
-    )
-    reg.add_router("r", lambda m: [])  # UNROUTED — still counted RECEIVED (count-and-log)
+    reg = _leave_registry(share)  # UNROUTED — still counted RECEIVED (count-and-log)
     expected_key = _expected_key(share, share / "a.hl7")
     runner = RegistryRunner(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
@@ -167,7 +154,7 @@ async def test_leave_in_place_ingests_once_across_polls(
     assert not await store.is_file_processed(channel_id="file_in", file_key=bare)
 
 
-# --- the key's scheme tag (BACKLOG #3424, ASVS 11.2.2 census row 15) -------------
+# --- the key's scheme tag (BACKLOG #3424, ASVS 11.2.2) ---------------------------
 
 
 async def test_a_file_recorded_under_the_untagged_key_is_not_read_again(
@@ -175,10 +162,12 @@ async def test_a_file_recorded_under_the_untagged_key_is_not_read_again(
 ) -> None:
     """A ledger row written before the tag existed still marks its file read, so a share left in
     place does not arrive downstream again after the upgrade. Mutation: drop the bare digest from
-    ``file_key_forms``. Red: the file is ingested once."""
+    ``file_key_forms``. Red: the file is ingested once. ``b.hl7``, never recorded, is the positive
+    control: it must arrive, so a scan that failed on every tick cannot pass as a skip."""
     share = tmp_path / "share"
     share.mkdir()
     (share / "a.hl7").write_bytes(ADT.encode("utf-8"))
+    (share / "b.hl7").write_bytes(ADT.encode("utf-8"))
     bare = _bare_digest(share, share / "a.hl7")
     await store.record_processed_file(channel_id="file_in", file_key=bare)
     runner = RegistryRunner(
@@ -189,11 +178,14 @@ async def test_a_file_recorded_under_the_untagged_key_is_not_read_again(
     )
     await runner.start()
     try:
-        await asyncio.sleep(0.3)  # many poll cycles
+        await _wait_count(store, "file_in", 1)  # b.hl7
+        await asyncio.sleep(0.2)  # many more poll cycles; a.hl7 must not arrive
     finally:
         await runner.stop()
-    assert await store.count_messages(channel_id="file_in", allowed_channels=None) == 0
+    assert await store.count_messages(channel_id="file_in", allowed_channels=None) == 1
     assert (share / "a.hl7").exists()
+    b_key = _expected_key(share, share / "b.hl7")
+    assert await store.is_file_processed(channel_id="file_in", file_key=b_key)
 
 
 async def test_the_ledger_refuses_a_key_scheme_it_does_not_know(store: MessageStore) -> None:
@@ -234,18 +226,51 @@ async def test_the_bare_lookup_stops_once_no_untagged_row_is_left(
     await ledger.mark_processed(f"{FILE_KEY_SCHEME}:{new}")
     await ledger.prune()  # the old row is far past the age window
     asked: list[str] = []
+    probes: list[str] = []
     real = store.is_file_processed
+    real_probe = store.has_untagged_processed_file
 
     async def counting(*, channel_id: str, file_key: str) -> bool:
         asked.append(file_key)
         return await real(channel_id=channel_id, file_key=file_key)
 
+    async def counting_probe(*, channel_id: str) -> bool:
+        probes.append(channel_id)
+        return await real_probe(channel_id=channel_id)
+
     monkeypatch.setattr(store, "is_file_processed", counting)
+    monkeypatch.setattr(store, "has_untagged_processed_file", counting_probe)
     assert not await ledger.is_processed(old)
     assert not await ledger.is_processed(new)
     assert asked == []
+    assert probes == ["ch"]  # asked once after the prune, then cached
     assert await ledger.is_processed(f"{FILE_KEY_SCHEME}:{new}")
     assert asked == [f"{FILE_KEY_SCHEME}:{new}"]
+
+
+async def check_processed_files_key_forms(store: Any) -> None:
+    """The ledger store contract the scheme tag rests on, shared by every backend's suite (the
+    Postgres and SQL Server legs call this too): a tagged key fits the column and reads back, a bare
+    pre-tag key still reads, and ``has_untagged_processed_file`` sees only the bare one, per channel,
+    until the age prune removes it."""
+    ch = f"pf-{uuid.uuid4().hex}"
+    other = f"pf-{uuid.uuid4().hex}"
+    bare, tagged = "12" * 32, f"{FILE_KEY_SCHEME}:{'34' * 32}"
+    await store.record_processed_file(channel_id=ch, file_key=tagged, now=1000.0)
+    assert await store.is_file_processed(channel_id=ch, file_key=tagged)
+    assert not await store.has_untagged_processed_file(channel_id=ch)
+    await store.record_processed_file(channel_id=ch, file_key=bare, now=1.0)
+    await store.record_processed_file(channel_id=other, file_key=tagged, now=1.0)
+    assert await store.is_file_processed(channel_id=ch, file_key=bare)
+    assert await store.has_untagged_processed_file(channel_id=ch)
+    assert not await store.has_untagged_processed_file(channel_id=other)
+    await store.prune_processed_files(channel_id=ch, older_than=500.0, keep_last=100)
+    assert not await store.has_untagged_processed_file(channel_id=ch)
+    assert await store.is_file_processed(channel_id=ch, file_key=tagged)
+
+
+async def test_processed_files_key_forms_sqlite(store: MessageStore) -> None:
+    await check_processed_files_key_forms(store)
 
 
 def test_every_form_is_the_same_digest_and_todays_comes_first() -> None:
