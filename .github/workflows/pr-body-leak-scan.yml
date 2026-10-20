@@ -22,9 +22,18 @@ name: PR body leak scan
 # to run on `edited`. security.yml's `pull_request` arm takes the default activity types, and adding
 # `edited` there would re-run every scanner in that file on each description edit.
 #
-# INJECTION. The body is attacker-controlled text. It reaches the scanner as a step-level environment
-# variable fed on stdin, never as an Actions expression inside the `run:` script, so no body can become
-# shell. The job needs no secret and writes nothing, so it runs the same on a fork pull request.
+# INJECTION. The body is attacker-controlled text. The scanner reads it from the webhook payload file
+# GitHub writes for every run ($GITHUB_EVENT_PATH), so it never passes through an Actions expression, a
+# shell variable or an environment block: no body can become shell, and no body is too large for an
+# environment string (a 65536-character description in a multibyte script is). The job needs no secret
+# and writes nothing, so it runs the same on a fork pull request.
+#
+# WHERE IT DOES NOT RUN, at least these. GitHub starts no `pull_request` run while the pull request has
+# a merge conflict, so a body edited during a conflict is read only once the conflict clears and the
+# author pushes. And it runs the pull request's own copy of the scanner, as every `pull_request` check
+# here does, so a change that loosens the detector is scanned by the loosened detector. The second is
+# what code review of that change is for; `pull_request_target` with a base-branch checkout would close
+# both, and is a separate decision.
 
 on:
   pull_request:
@@ -56,6 +65,4 @@ jobs:
           python-version: "3.14"
       - name: Scan the pull request body for requirement verdicts, gaps and code maps
         shell: bash
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: python scripts/security/scan_forbidden.py --pr-body - <<< "$PR_BODY"
+        run: python scripts/security/scan_forbidden.py --pr-body-event "$GITHUB_EVENT_PATH"

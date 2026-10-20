@@ -58,7 +58,8 @@ Usage:
                                     #   it would copy the leak into public CI logs; default is
                                     #   reasons-only: location + category, never the matched text)
   scan_forbidden.py                 # scan all git-tracked files in the current repo
-  scan_forbidden.py --pr-body FILE  # scan one pull request body (``-`` for stdin) for security-record
+  scan_forbidden.py --pr-body FILE  # scan one pull request body (``-`` for stdin; --pr-body-event
+                                    #   EVENT.json reads it from a webhook payload) for security-record
                                     #   content: a requirement id beside its verdict, its gap, or a
                                     #   code path. Reasons-only; needs no token source. Run by
                                     #   .github/workflows/pr-body-leak-scan.yml (BACKLOG #3364).
@@ -75,6 +76,7 @@ self-test failure (an instrument that cannot see is not a content hit; the two n
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -415,7 +417,7 @@ _RECORD_PAIR: tuple[re.Pattern[str], ...] = (
 # REASON-ONLY, like every record detector here: the identifier beside its verdict IS the disclosure, so
 # a hit names a line and a kind and never echoes the text into a public CI log.
 _PR_REQ_ID = re.compile(
-    r"(?<![\w.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![\w.]|\.\d)"
+    r"(?<![\w.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?!\w|\.\d)"
 )
 #: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
 #: rephrase around; it never hides a hit that carries its own requirement context.
@@ -423,7 +425,7 @@ _PR_VERSION_LEAD = re.compile(
     r"(?i)(?:\b(?:c?python|pypy|openssl|libressl|versions?|releases?|v|from|to|pwsh|powershell"
     r"|node(?:js)?|npm|pip(?:-audit)?|pytest|mypy|ruff|uv|uvicorn|uvloop|fastapi|starlette|pydantic"
     r"|httpx|anyio|lxml|cryptography|signxml|paramiko|zizmor|gh|git|sqlite|postgres(?:ql)?|ubuntu"
-    r"|windows|macos|requests|hl7apy|semgrep|bandit|gitleaks|trivy|actionlint|go|rust|bumps?)"
+    r"|windows|macos|requests|hl7apy|hl7|semgrep|bandit|gitleaks|trivy|actionlint|go|rust|bumps?)"
     # A word carrying a digit (`ldap3`), a word cut at a hyphen (`openssl-bin-`), or a hyphenated
     # package name (`js-yaml`). Each starts at a word boundary, and `re-` is excluded so the record's
     # own verbs ("re-scores", "re-read") are not mistaken for a package.
@@ -432,8 +434,12 @@ _PR_VERSION_LEAD = re.compile(
     # field, `VER=`): neither is how prose or a markdown table cell introduces a requirement.
     r"|(?:[=@~<>^]|\S\|)[\s*`_]*$"
 )
-#: "<version> to <version>" is a dependency bump, whichever side the requirement shape lands on.
-_PR_VERSION_TAIL = re.compile(r"^[*`_]*\s+(?:to|->|\u2192)\s+[*`_]*v?\d+\.\d+")
+#: "<version> to <version>" is a dependency bump, whichever side the requirement shape lands on, and a
+#: triple followed by an HL7 message type is the HL7 version this engine is built around.
+_PR_VERSION_TAIL = re.compile(
+    r"^[*`_]*\s+(?:(?:to|->|\u2192)\s+[*`_]*v?\d+\.\d+"
+    r"|(?:ADT|ORU|ORM|OML|SIU|MDM|DFT|BAR|VXU|RDE|MFN|ACK|QBP|RSP)\b)"
+)
 _PR_FMT = r"[*`_\"']*"
 _PR_SEP = r"[\s*`_\"']+"
 #: The tree scan's verdict words plus the spellings prose uses for them, so a word added to the record
@@ -441,14 +447,17 @@ _PR_SEP = r"[\s*`_\"']+"
 _PR_VERDICT = rf"(?:{_RECORD_VERDICT}|na|needs review|not met|unmet|met)(?![\w/-])"
 _PR_STATE_VERB = (
     r"(?:stays?|remains?|held at|holds? at|holding at|is(?: now| still)?|was|are|went to|goes to"
-    r"|moves? to|moved to|back to|re-?scored(?: as)?|scored(?: as)?|scores|reads|now|at)"
+    r"|moves? to|moved to|back to|re-?scored(?: as)?|scored(?: as)?|scores|reads|now|at"
+    # "<id> went from partial to pass" names the old verdict as surely as the new one.
+    r"|(?:went|goes|moves?|moved)? ?from)"
 )
 _PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+cell)?"
-    rf"(?:\s*[:=|\-\u2014>\]]+\s*|{_PR_SEP})"
-    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP})?{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"(?:\s*[:=|\-\u2014\u2192>\](]+\s*|{_PR_SEP})"
+    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
+    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
@@ -471,7 +480,7 @@ _PR_PROSE_VERDICT = re.compile(
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 _PR_GAP = re.compile(
-    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|uncovered|unmet"
+    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
     r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
 )
 #: A source path, a path under one of this repository's code roots, or a dotted engine module. Docs are
@@ -566,26 +575,37 @@ def _pr_table_verdict(row: str) -> bool:
 def scan_pr_body(body: str) -> list[str]:
     """Record-content hits in a pull request body, as ``pr-body:<line>: <reason>`` strings.
 
-    Reasons only, never the matched text. One hit per kind per unit (a sentence or table row), so a
-    paragraph restating one verdict three ways reports once per kind rather than storming.
+    Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
+    restate a verdict on the same line report it once, rather than storming.
     """
     hits: list[str] = []
     for marks, unit, is_row in _pr_units(body):
         if is_row:
             sentences = [(0, unit)]
         else:
-            starts = [0, *(m.end() for m in _PR_SENTENCE_SPLIT.finditer(unit))]
-            ends = [m.start() for m in _PR_SENTENCE_SPLIT.finditer(unit)] + [len(unit)]
-            sentences = [(a, unit[a:b]) for a, b in zip(starts, ends, strict=True)]
+            sentences, start = [], 0
+            for split in _PR_SENTENCE_SPLIT.finditer(unit):
+                sentences.append((start, unit[start : split.start()]))
+                start = split.end()
+            sentences.append((start, unit[start:]))
         for start, sentence in sentences:
-            ids = _pr_requirement_ids(sentence)
-            if not ids:
-                continue
             found: dict[str, int] = {}
-            if is_row:
+            # The tree scan's tight pair first, before the version filter below can drop its identifier:
+            # whatever that scan flags in a file, this one flags in a body.
+            pair = next((m for p in _RECORD_PAIR if (m := p.search(sentence))), None)
+            if pair is not None:
+                found["verdict"] = pair.start()
+            ids = _pr_requirement_ids(sentence)
+            if not ids and not found:
+                continue
+            if not ids:
+                pass
+            elif is_row:
                 # The whole row is one window: a table pairs an identifier cell with any other cell.
                 first = ids[0].start()
-                if any(_pr_verdict_bound(sentence, m) for m in ids) or _pr_table_verdict(sentence):
+                if "verdict" not in found and (
+                    any(_pr_verdict_bound(sentence, m) for m in ids) or _pr_table_verdict(sentence)
+                ):
                     found["verdict"] = first
                 if _PR_GAP.search(sentence):
                     found["gap"] = first
@@ -604,8 +624,9 @@ def scan_pr_body(body: str) -> list[str]:
                         found["map"] = m.start()
             for kind in PR_BODY_REASONS:
                 if kind in found:
-                    line = _pr_line_at(marks, start + found[kind])
-                    hits.append(f"pr-body:{line}: {PR_BODY_REASONS[kind]}")
+                    hit = f"pr-body:{_pr_line_at(marks, start + found[kind])}: {PR_BODY_REASONS[kind]}"
+                    if hit not in hits:
+                        hits.append(hit)
     return hits
 
 
@@ -1761,21 +1782,40 @@ def _report_hits(header: str, hits: list[str], advice: str) -> int:
 
 
 def _pr_body_mode(argv: list[str]) -> int:
-    """``--pr-body PATH``: scan one pull request body for record content and exit.
+    """``--pr-body PATH`` or ``--pr-body-event PATH``: scan one pull request body and exit.
 
-    ``-`` reads stdin, which is how CI feeds it: the body arrives as an environment variable piped in,
-    never as an Actions expression inside a ``run:`` script, so a crafted body cannot become shell.
-    Needs no token source -- the three record kinds are structural -- so it runs the same on a fork.
+    ``--pr-body`` reads a text file, or stdin for ``-``: the form for an author checking a draft.
+    ``--pr-body-event`` reads ``pull_request.body`` from a webhook payload, which is how CI feeds it --
+    ``$GITHUB_EVENT_PATH``, so the body never passes through an Actions expression, a shell variable or
+    an environment block, and is neither shell input nor bound by the size limit on one. Needs no token
+    source -- the three record kinds are structural -- so it runs the same on a fork.
+
+    The mode must be the WHOLE command line. A staged file that happened to be named like the flag
+    reaches pre-commit's argv after ``--require-tokens``, and must not switch the commit gate into
+    scanning one file as a body.
     """
-    i = argv.index("--pr-body")
-    if i + 1 >= len(argv):
-        print("scan_forbidden: --pr-body needs a file path, or - for stdin.", file=sys.stderr)
+    if len(argv) != 2 or argv[0] not in ("--pr-body", "--pr-body-event"):
+        print(
+            "scan_forbidden: usage: --pr-body FILE (- for stdin) | --pr-body-event EVENT.json, alone.",
+            file=sys.stderr,
+        )
         return 2
-    source = argv[i + 1]
+    mode, source = argv
     try:
-        body = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        print(f"scan_forbidden: --pr-body: cannot read {source}: {exc}", file=sys.stderr)
+        if mode == "--pr-body":
+            body = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+        else:
+            event = json.loads(Path(source).read_text(encoding="utf-8"))
+            # A payload with no pull request is a misrouted run, not an empty body: refuse it.
+            if not isinstance(event, dict) or not isinstance(event.get("pull_request"), dict):
+                print(
+                    f"scan_forbidden: {mode}: {source} is not a pull request event.",
+                    file=sys.stderr,
+                )
+                return 2
+            body = event["pull_request"].get("body") or ""
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(f"scan_forbidden: {mode}: cannot read {source}: {exc}", file=sys.stderr)
         return 2
     # Say what was read, as the tree scan does: a body that silently arrived empty would otherwise pass
     # exactly as a clean one does.
@@ -1799,7 +1839,7 @@ def _pr_body_mode(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     # BACKLOG #3364. A terminal mode read before the token load: it scans text that is not a file in the
     # tree, and none of its detectors come from the token source.
-    if "--pr-body" in argv:
+    if argv and argv[0].startswith("--pr-body"):
         return _pr_body_mode(argv)
     reload_tokens()
     # SEC-04 / BACKLOG #1368. Both are read BEFORE the require/floor parsing below, because each is a

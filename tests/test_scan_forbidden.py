@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import re
 from pathlib import Path
 
@@ -655,8 +656,17 @@ _PR_VERDICT_MUST_FIRE = [
     f"| #1 | {_REQ} | Stay **{_PARTIAL}**. The row's basis is replaced. |",
     f"| {_REQ} | the outbound limb | {_PASS} |",
     f"{_REQ}{': '}{_FAIL}",
+    f"Assessed as ASVS {_REQ} (`{_PARTIAL}`, the control covers only bound accounts).",
+    f"ASVS {_REQ} \u2192 {_PASS}",
+    f"ASVS {_REQ} remains at {_PARTIAL} for now.",
+    f"A vault re-read moved {_REQ} from {_PASS} to {_PARTIAL} on item 1.",
+    # The tree scan's tight pair, behind words the version filter would otherwise read as a lead.
+    f"Applies to {_REQ}{': '}{_PARTIAL}",
+    f"The follow-up {_REQ}{' = '}{_FAIL}",
 ]
 _PR_GAP_MUST_FIRE = [
+    # Sentence-final: the identifier's own full stop must not hide it.
+    f"The shortfall is tracked under ASVS {_REQ}.",
     f"BACKLOG #1, one limb: the unvalidated input residual (ASVS {_REQ}).",
     f"It is the gap that keeps ASVS {_REQ} open on the record.",
     f"## #1 (ASVS {_REQ}) -- verified, and deliberately not built",
@@ -698,6 +708,10 @@ _PR_VERSION_MUST_STAY_QUIET = [
     "E    MSH|^~\\&|SAPP|FAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1  at pkg/example_parser.py:40",
     "the suite will pass; see 1.2.2 later for the rationale",
     "requires 3.14.6 to pass the collection step",
+    # An id-SHAPED version before a bare "to <verdict>": only the move-verb guard keeps this quiet.
+    "requires 6.1.1 to pass the collection step",
+    "Parses a 2.5.1 ADT^A01 in tests/test_example_parse.py without the strict validator.",
+    "This uncovered a bug in 1.2.3 handling, now fixed.",
 ]
 
 
@@ -751,6 +765,13 @@ def test_a_hard_wrapped_sentence_is_read_whole_and_reported_at_the_identifier_li
     assert hits == [f"pr-body:3: {sf.PR_BODY_REASONS['map']}"], hits
 
 
+def test_one_line_restating_a_verdict_reports_it_once(sf) -> None:
+    body = (
+        f"{_REQ} stays {_PARTIAL}. It stays {_PARTIAL}: {_REQ} again. Again {_REQ} is {_PARTIAL}."
+    )
+    assert sf.scan_pr_body(body) == [f"pr-body:1: {sf.PR_BODY_REASONS['verdict']}"]
+
+
 def test_the_pr_body_detector_reports_no_value(sf) -> None:
     """The identifier beside its verdict IS the disclosure; a public CI log must not repeat it."""
     body = "\n".join(_PR_VERDICT_MUST_FIRE + _PR_GAP_MUST_FIRE + _PR_MAP_MUST_FIRE)
@@ -775,15 +796,48 @@ def test_the_pr_body_mode_exit_codes(sf, tmp_path: Path, monkeypatch: pytest.Mon
     assert sf.main(["--pr-body", "-"]) == 1
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     assert sf.main(["--pr-body", "-"]) == 0
+    # The flag form a typo produces must refuse, not scan nothing and pass.
+    assert sf.main([f"--pr-body={dirty}"]) == 2
+
+
+def test_the_pr_body_event_mode_reads_the_webhook_payload(sf, tmp_path: Path) -> None:
+    """CI's form. A payload with no pull request is a misrouted run and refuses; a null body is empty."""
+
+    def event(name: str, payload: object) -> str:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    assert (
+        sf.main(["--pr-body-event", event("a", {"pull_request": {"body": _PR_MAP_MUST_FIRE[0]}})])
+        == 1
+    )
+    assert sf.main(["--pr-body-event", event("b", {"pull_request": {"body": _PR_CLEAN_BODY}})]) == 0
+    assert sf.main(["--pr-body-event", event("c", {"pull_request": {"body": None}})]) == 0
+    assert sf.main(["--pr-body-event", event("d", {"push": {}})]) == 2
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert sf.main(["--pr-body-event", str(bad)]) == 2
+
+
+def test_a_staged_file_named_like_the_flag_does_not_switch_the_commit_gate(
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pre-commit passes ``--require-tokens`` and then the staged names, so the body modes only count as
+    the WHOLE command line. Anywhere else the tree scan must run, and here fail closed on no tokens."""
+    monkeypatch.setattr(sf, "LOCAL_TOKEN_FILE", tmp_path / "absent-tokens.txt")
+    monkeypatch.delenv("MEFOR_FORBIDDEN_TOKENS", raising=False)
+    assert sf.main(["--require-tokens", "--pr-body", str(tmp_path / "x.md")]) == 2
 
 
 def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> None:
-    """The body is attacker-controlled. It must reach the scanner through ``env:``, never as an Actions
-    expression in a ``run:`` script, and the job must run on an edit as well as a push. The job is not a
-    required context: making it one is a separate branch-protection decision."""
+    """The body is attacker-controlled. The scanner must read it from the event payload file, so no
+    Actions expression carries it anywhere in the workflow, and the job must run on an edit as well as
+    a push. The job is not a required context: making it one is a separate branch-protection decision."""
     # Imported here, not at module scope: the helper skips its importer when PyYAML is absent, and that
     # must skip this one test rather than every scanner test in the file.
     from tests._workflow_contexts import (
+        WORKFLOWS,
         context_of,
         jobs_of,
         required_contexts,
@@ -799,7 +853,8 @@ def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> Non
         assert "${{" not in step.get("run", ""), (
             "no Actions expression may sit inside a run: script"
         )
-    index, script = step_script(workflow, key, "Scan the pull request body")
-    assert "--pr-body" in script, "the scan step does not run the scanner's --pr-body mode"
-    assert job["steps"][index]["env"]["PR_BODY"] == "${{ github.event.pull_request.body }}"
+    text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+    assert "pull_request.body" not in text, "the body must not pass through an Actions expression"
+    _, script = step_script(workflow, key, "Scan the pull request body")
+    assert '--pr-body-event "$GITHUB_EVENT_PATH"' in script
     assert context_of(key, job) not in required_contexts()
