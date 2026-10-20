@@ -4601,19 +4601,17 @@ def _serve(args: argparse.Namespace) -> int:
     if not _operator_tls_key_gate(settings, _state_dir, enforcing=enforcing):
         return 2
 
-    # BACKLOG #3402: the key files a graph's connections name are graph data, judged at each load.
-    from messagefoundry.config.key_file_access import make_connection_key_file_guard
+    # BACKLOG #3402: the key files a graph's connections name are graph data, judged by an awaited
+    # preflight at each load the engine runs, with that load's env() values, off the event loop.
+    from messagefoundry.config.key_file_access import make_connection_key_file_preflight
 
     app = create_managed_app(
         store_settings=settings.store,
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
-        registry_guard=_chain_registry_guards(
-            static_credential_guard,
-            retention_override_guard,
-            make_connection_key_file_guard(env_values, enforcing=enforcing, log=_credlog),
-        ),
+        registry_guard=_chain_registry_guards(static_credential_guard, retention_override_guard),
+        registry_preflight=make_connection_key_file_preflight(enforcing=enforcing, log=_credlog),
         static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
@@ -5258,21 +5256,23 @@ def _supervise(args: argparse.Namespace) -> int:
 
 def _fleet_connection_key_file_refusal(
     env_values: Callable[[], Mapping[str, Any]], *, enforcing: bool
-) -> Callable[[Registry], None]:
-    """``supervise``'s refusal of a graph whose connection key files each engine shard would
-    refuse (BACKLOG #3402). Refusal only: under ``warn`` each engine shard writes its own warning.
-    ``env_values`` reads the values as each engine shard reads them."""
+) -> Callable[[Registry], None] | None:
+    """``supervise``'s refusal of a graph whose connection key files an engine shard would refuse
+    (BACKLOG #3402). The supervisor judges the whole graph, before the engine-shard filter, and each
+    engine shard then judges its own inbound connections and every outbound one at each load.
+    Refusal only, so ``None`` under ``warn``, where each engine shard writes its own warning.
+    ``env_values`` reads the values as each engine shard reads them. It reads files, so the
+    supervisor calls it in a worker thread, as it does the rest of shard discovery."""
+    if not enforcing:
+        return None
     from messagefoundry.config.key_file_access import connection_key_file_problem
     from messagefoundry.config.wiring import WiringError
 
     def refuse(registry: Registry) -> None:
-        if not enforcing:
-            return
         problem = connection_key_file_problem(registry, env_values())
         if problem is not None:
             raise WiringError(
-                f"{problem}. Every engine shard would refuse this graph; refusing to start the "
-                "fleet."
+                f"{problem}. An engine shard would refuse this graph; refusing to start the fleet."
             )
 
     return refuse
@@ -7329,7 +7329,7 @@ def _key_file_access_gate(
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
     The rule is :func:`~messagefoundry.config.key_file_access.key_file_problem`, which the registry
-    guard for connection key files applies too (BACKLOG #3402). Under
+    preflight for connection key files applies too (BACKLOG #3402). Under
     ``[security].enforcement = enforce`` a problem is an error and the answer is ``False``; under
     ``warn`` it is a warning and the start goes on. ``what`` names the file for the operator and
     ``remedy`` says what to do about it. With ``absent_ok`` a missing file passes, for the loader

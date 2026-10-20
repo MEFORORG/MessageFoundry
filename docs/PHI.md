@@ -353,14 +353,17 @@ engine refuses to start under `[security].enforcement = "enforce"` and warns und
 other command that reads the store key file, such as `provision-admin` and `rotate-key`, logs a
 warning and goes on.
 
-A connection's key file is checked each time the engine loads the graph, at the start and on every
-reload, with `env()` values resolved. That is at least `tls_key_file` on MLLP, the HTTP listener,
+A connection's key file is checked each time the engine is about to run a graph: at the start, on
+every reload that applies one, and on a DR activation, which re-applies the running graph. The
+check resolves `env()` against the values that load uses, and reads the files off the event loop.
+That is at least `tls_key_file` on MLLP, the HTTP listener,
 DICOM and FTPS, and `Soap(client_key_file=...)`. Where a TLS connection leaves `tls_key_file`
 unset, or its `env()` value blank, the key is in its certificate PEM, so `tls_cert_file` is
 checked instead. A connection that loads no TLS identity has neither file checked.
-Under `"enforce"` a file a broad group can read would refuse the start, or the reload, which keeps
-the running graph. Under `"warn"` it is logged. `supervise` refuses such a graph before it starts
-an engine shard. A value that holds PEM text rather than a path is not checked
+Under `"enforce"` a file a broad group can read would refuse the start, or the reload or activation,
+which keeps the running graph. Under `"warn"` it is logged. `supervise` refuses such a graph, judged
+whole, before it starts an engine shard, and each engine shard then checks its own inbound
+connections and every outbound one. A value that holds PEM text rather than a path is not checked
 ([key_file_access.py](../messagefoundry/config/key_file_access.py), BACKLOG #3402).
 
 **What this does not cover.** Know these before you rely on it:
@@ -384,9 +387,10 @@ an engine shard. A value that holds PEM text rather than a path is not checked
   such as `sign_private_key` or `Direct(signing_key=...)`, and a path in
   `[auth].oidc_client_private_key`. Restrict those yourself. `Sftp(private_key=...)` holds key
   text, not a path, so it has no file to check.
-- A connection's key file is checked when the graph loads, not each time a connection starts. A DR
-  activation re-applies the running graph without checking it again, and so does an operator start
-  of a connection whose key file was missing when the graph loaded.
+- A connection's key file is checked when a graph is about to run, not each time a connection
+  starts. A key file that was missing then passes, for the connection's own build to refuse, so an
+  operator start of that connection after the file appears would not check it. A dry-run reload
+  checks nothing, because it starts no connection.
 - A key file is created for the account that creates it. `cert import` and `cert self-signed` have
   no grant option, so run them as the account that will read the key, or grant that account
   yourself. If an administrator runs `serve` by hand before the service first starts, the minted

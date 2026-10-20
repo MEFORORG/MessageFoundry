@@ -4,7 +4,8 @@
 
 One rule, :func:`key_file_problem`, and every caller applies it. ``serve`` and ``supervise`` call it
 through their start gates for the store key file, the TLS key the engine minted, and an operator's
-``[api].tls_key_file``. The registry guard here calls it for each key file the graph names. Under
+``[api].tls_key_file``. The registry preflight here calls it for each key file the graph names, and
+``supervise`` calls it for the whole graph before it starts an engine shard. Under
 ``[security].enforcement = enforce`` a key file a broad group can read refuses; under ``warn`` it is
 reported and the start or load goes on. What counts as broad is
 :func:`messagefoundry.restricted_file.broad_access_problem`'s answer.
@@ -12,27 +13,31 @@ reported and the start or load goes on. What counts as broad is
 **Why the connector keys are judged as graph data.** A connection's key path can come from
 ``env()``, which resolves against this instance's environment values, and a ``/config/reload`` can
 change both the graph and those values without a restart. So the start gates cannot see these
-files. A registry guard judges each graph the engine loads, at least at the first load and on every
-reload. A refused reload leaves the running graph in place.
+files. The engine awaits a registry preflight over each graph it is about to run, with the values
+that load resolves: at the first load, on every real reload, and on a DR activation, which
+re-applies the running graph. A refused reload or activation leaves the running graph in place. A
+dry-run reload skips the preflight, and starts no connection. The file checks run in a worker
+thread, so they never block the event loop.
 
-**What the guard judges, at least.** The TLS identity of a connection: ``tls_key_file`` (MLLP, the
-HTTP listener, DICOM, and the FTPS key :mod:`messagefoundry.transports.remotefile` reads) and
+**What the preflight judges, at least.** The TLS identity of a connection: ``tls_key_file`` (MLLP,
+the HTTP listener, DICOM, and the FTPS key :mod:`messagefoundry.transports.remotefile` reads) and
 ``Soap(client_key_file=...)``. Where the key setting is unset, the private key is in the certificate
 PEM, so the certificate file is judged instead, as the loaders read it. A value holding PEM text is
 key material, not a path, and is never judged as one. Not judged, at least: a ``Database``
 connection's ``odbc_params`` ``sslkey``, ``smart_private_key`` (on a connection or a ``FhirLookup``),
 a signing key such as ``sign_private_key`` or ``Direct(signing_key=...)``, the syslog client PEM, and
-``[auth].oidc_client_private_key``. ``Sftp(private_key=...)`` is key text, not a file. A DR
-activation re-applies the running graph without the registry guard, so it does not judge these
-files again.
+``[auth].oidc_client_private_key``. ``Sftp(private_key=...)`` is key text, not a file. A key file
+that was missing at the load passes, for the connection's build to refuse, and an operator start of
+that connection later does not judge it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -46,7 +51,7 @@ __all__ = [
     "connection_key_file_problem",
     "connection_key_files",
     "key_file_problem",
-    "make_connection_key_file_guard",
+    "make_connection_key_file_preflight",
 ]
 
 #: Each (certificate setting, key setting, TLS-gated) a connector loads as its own TLS identity. A
@@ -172,15 +177,19 @@ def connection_key_files(
 def connection_key_file_problem(registry: Registry, env_values: Mapping[str, Any]) -> str | None:
     """Why the engine may not use the key files a graph's connections name, or ``None``.
 
-    The decision behind :func:`make_connection_key_file_guard` and the ``supervise`` pre-check, so
-    both reach it in the same words. Each file is judged by :func:`key_file_problem`, and a missing
-    one passes, because the connection's build refuses it. Every problem is named in one reason, so
-    one start shows the operator every file to fix."""
-    reasons: list[str] = []
+    The decision behind :func:`make_connection_key_file_preflight` and the ``supervise`` pre-check,
+    so both reach it in the same words. It reads each file's access list, so an async caller runs it
+    in a worker thread. Each file is judged once by :func:`key_file_problem`, however many settings
+    name it, and a missing one passes, because the connection's build refuses it. Every problem is
+    named in one reason, so one start shows the operator every file to fix."""
+    labels_by_path: dict[str, list[str]] = {}
     for label, path in connection_key_files(registry, env_values):
+        labels_by_path.setdefault(path, []).append(label)
+    reasons: list[str] = []
+    for path, labels in labels_by_path.items():
         reason = key_file_problem(
             path,
-            what=f"the private key file named by {label}",
+            what=f"the private key file named by {' and '.join(labels)}",
             remedy=KEY_FILE_REMEDY,
             absent_ok=True,
         )
@@ -189,23 +198,24 @@ def connection_key_file_problem(registry: Registry, env_values: Mapping[str, Any
     return "; ".join(reasons) if reasons else None
 
 
-def make_connection_key_file_guard(
-    env_values: Callable[[], Mapping[str, Any]], *, enforcing: bool, log: logging.Logger
-) -> Callable[[Registry], None]:
-    """The engine registry guard for the key files a graph's connections name.
+def make_connection_key_file_preflight(
+    *, enforcing: bool, log: logging.Logger
+) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
+    """The engine registry preflight for the key files a graph's connections name.
 
-    ``env_values`` is the engine's own provider, read again for each graph, so a reload is judged
-    against the values that reload resolves. Under ``enforce`` a problem raises ``WiringError``: a
-    first load fails the start, and a ``/config/reload`` is refused with the running graph kept.
-    Under ``warn`` the guard writes the reason to the logger AND to stderr, as the retention
-    override guard does, and passes the graph. A failure to read the values raises the
-    ``WiringError`` the provider raises.
+    The engine awaits it with the graph and the ``env()`` values that load resolves: its own values
+    at the first load and on a DR activation, and on a real reload the values that reload read and
+    has not yet applied, so the check and the swap use one read. A dry-run reload skips it, which
+    is acceptable because a dry run starts no connection. The file checks run in a worker thread,
+    off the event loop. Under ``enforce`` a problem raises ``WiringError``: a first load fails the start, and a reload or a DR activation is refused with
+    the running graph kept. Under ``warn`` it writes the reason to the logger AND to stderr, as the
+    retention override guard does, and passes the graph.
 
-    It runs only where the engine calls its registry guard, which is before the engine-shard
-    filter, so each engine shard judges the whole graph and reaches the verdict its siblings do."""
+    The engine runs it after the engine-shard filter, so an engine shard judges its own inbound
+    connections and every outbound one. ``supervise`` judges the whole graph before it starts any."""
 
-    def guard(registry: Registry) -> None:
-        problem = connection_key_file_problem(registry, env_values())
+    async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
+        problem = await asyncio.to_thread(connection_key_file_problem, registry, env_values)
         if problem is None:
             return
         if enforcing:
@@ -215,4 +225,4 @@ def make_connection_key_file_guard(
         log.warning("%s", problem)
         print(f"warning: {problem}.", file=sys.stderr)
 
-    return guard
+    return preflight

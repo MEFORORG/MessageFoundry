@@ -586,7 +586,8 @@ class Engine:
         # managed app) and every real reload, after the shard filter, before the swap. Dry runs skip
         # it, because it writes audit rows. It gets the graph and this instance's env() values and
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
-        # (BACKLOG #1142, slice 3); None = no preflight.
+        # (BACKLOG #1142, slice 3), followed by the connection key-file check (BACKLOG #3402); None =
+        # no preflight. A DR activation runs it too, over the running graph (_dr_preflight).
         self._registry_preflight = registry_preflight
         # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
         # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
@@ -1133,13 +1134,12 @@ class Engine:
         (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
         after the graph loaded. Skipping the guard is safe only while every guard in the
         chain reads just the graph and the startup settings, because neither input has changed.
-        The static-credential guard and, since vault BACKLOG #2368, the per-connection keep-forever
-        retention guard do. The connection key-file guard ``serve`` chains since BACKLOG #3402 does
-        not: it reads the environment values and each key file's access list, both of which can
-        change after the load, and an activation does not judge them again. That gap is open. A
-        guard that reads anything else would need to run here. The chain already judged this graph
-        when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
-        whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
+        The two ``serve`` chains today do: the static-credential guard and, since vault BACKLOG
+        #2368, the per-connection keep-forever retention guard. A guard that reads anything else
+        would need to run here, which is why the connection key-file check (BACKLOG #3402), which
+        reads each key file's access list, is a preflight and not a guard. The chain already judged
+        this graph when it loaded, through :meth:`reload_detail` or the managed app's first load,
+        over the whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder
         hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
         and an activation is not where it changes."""
@@ -1153,10 +1153,10 @@ class Engine:
         # an activation must not swap in bytes edited since then with no second person, nor the
         # startup dir's older graph (vault BACKLOG #2840). It also applies nothing from the config
         # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
-        # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
-        # runs before a swap; they read anchor files and write audit rows, and they refuse before
-        # anything changes. The graph guard is not repeated; the docstring says why. Nor is the
-        # env-values re-read: the values are the ones the runner holds. rr.reload still runs
+        # the VIP. The settings and registry preflights are the checks reload_detail runs before a
+        # swap: the trust anchors, which read anchor files and write audit rows, and in `serve` the
+        # connection key files (BACKLOG #3402). They refuse before anything changes. The graph
+        # guard is not repeated; the docstring says why. Nor is the env-values re-read: the values are the ones the runner holds. rr.reload still runs
         # build_check, so the egress and exposure gates still run. The threshold goes to the runner
         # after the preflights and before the reload, which is where the runner re-evaluates every
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
@@ -1235,7 +1235,7 @@ class Engine:
             if not bound.expired():
                 raise  # a TimeoutError from inside the preflight is its own error
             raise TimeoutError(
-                f"the trust-anchor preflight did not answer within {timeout:g}s"
+                f"the activation preflight did not answer within {timeout:g}s"
             ) from exc
         if coord is not None:
             coord.note_profile_preflight(False)

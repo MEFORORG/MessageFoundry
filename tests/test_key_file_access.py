@@ -6,8 +6,9 @@ Two halves, each with a control that gives the opposite answer:
 
 * ``[api].tls_key_file``, or the certificate PEM that holds the key when it is unset, is judged by a
   start gate in ``serve`` and in ``supervise``, beside the gate for the key the engine mints;
-* a connection's key file is graph data, judged by a registry guard at each load, and by
-  ``supervise`` before it spawns an engine shard.
+* a connection's key file is graph data, judged by an awaited registry preflight, off the event
+  loop, at the first load, every real reload and a DR activation, and by ``supervise`` before it
+  spawns an engine shard.
 
 Each file is broadened with :func:`tests.test_restricted_file._broaden`, which grants the local
 Users group read on Windows and sets mode 0644 on POSIX, so every test here runs on every leg.
@@ -16,8 +17,10 @@ Users group read on Windows and sets mode 0644 on POSIX, so every test here runs
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
-from collections.abc import Callable, Mapping
+import threading
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,12 +28,14 @@ import pytest
 
 from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
+from messagefoundry.config import key_file_access
 from messagefoundry.config.key_file_access import (
     connection_key_file_problem,
     connection_key_files,
-    make_connection_key_file_guard,
+    make_connection_key_file_preflight,
 )
-from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.models import ConnectorType, Priority
+from messagefoundry.config.settings import DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     DICOM,
     MLLP,
@@ -39,12 +44,18 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     Registry,
+    Send,
     Soap,
     WiringError,
+    build_inbound_connection,
+    build_outbound_connection,
     env,
 )
+from messagefoundry.pipeline import Engine
 from messagefoundry.restricted_file import write_restricted_file
+from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key
+from tests._harness_engine import free_port
 from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_TOML, setenv_declared_egress
 from tests.test_api_tls import _self_signed, _self_signed_combined
 from tests.test_restricted_file import _broaden
@@ -181,7 +192,7 @@ def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
     assert problem is not None and "could not be examined" in problem
 
 
-# --- the registry guard ---------------------------------------------------------------------------
+# --- the registry preflight -----------------------------------------------------------------------
 
 
 def _soap_graph(key: Path) -> Registry:
@@ -194,41 +205,40 @@ def _soap_graph(key: Path) -> Registry:
     )
 
 
-def test_the_guard_refuses_a_broad_connection_key_under_enforce(tmp_path: Path) -> None:
-    guard = make_connection_key_file_guard(dict, enforcing=True, log=_LOG)
-    guard(_soap_graph(_key(tmp_path / "restricted.key", broad=False)))  # the control
-    guard(_soap_graph(tmp_path / "missing.key"))  # left to the connector, which names it
+async def test_the_preflight_refuses_a_broad_connection_key_under_enforce(tmp_path: Path) -> None:
+    preflight = make_connection_key_file_preflight(enforcing=True, log=_LOG)
+    await preflight(_soap_graph(_key(tmp_path / "restricted.key", broad=False)), {})  # the control
+    await preflight(_soap_graph(tmp_path / "missing.key"), {})  # left to the connector
 
     broad = _key(tmp_path / "broad.key", broad=True)
     with pytest.raises(WiringError) as refused:
-        guard(_soap_graph(broad))
+        await preflight(_soap_graph(broad), {})
     text = str(refused.value)
     assert "outbound connection 'OB_SOAP' setting 'client_key_file'" in text
     assert "is not restricted" in text
     assert str(broad) not in text  # the label names the setting, never the path
 
 
-def test_the_guard_warns_and_passes_under_warn(
+async def test_the_preflight_warns_and_passes_under_warn(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    guard = make_connection_key_file_guard(dict, enforcing=False, log=_LOG)
+    preflight = make_connection_key_file_preflight(enforcing=False, log=_LOG)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
-        guard(_soap_graph(_key(tmp_path / "restricted.key", broad=False)))  # the control
+        await preflight(_soap_graph(_key(tmp_path / "restricted.key", broad=False)), {})  # control
         assert "is not restricted" not in caplog.text
-        guard(_soap_graph(_key(tmp_path / "broad.key", broad=True)))
+        await preflight(_soap_graph(_key(tmp_path / "broad.key", broad=True)), {})
     assert "'client_key_file' is not restricted" in caplog.text
     assert "warning: the private key file named by outbound connection 'OB_SOAP'" in (
         capsys.readouterr().err
     )
 
 
-def test_the_guard_reads_the_values_again_for_each_graph(tmp_path: Path) -> None:
-    """A reload can change the env() values without a restart, so each graph is judged against
-    the values the provider returns for it."""
+async def test_the_preflight_judges_the_values_it_is_handed(tmp_path: Path) -> None:
+    """A reload can change the env() values without a restart. The engine hands the preflight the
+    values that reload read, so the check and the swap resolve one read, never a second one."""
     restricted = _key(tmp_path / "restricted.key", broad=False)
     broad = _key(tmp_path / "broad.key", broad=True)
-    values = {"soap_key": str(restricted)}
-    guard = make_connection_key_file_guard(lambda: values, enforcing=True, log=_LOG)
+    preflight = make_connection_key_file_preflight(enforcing=True, log=_LOG)
     graph = _registry(
         outbound={
             "OB_SOAP": Soap(
@@ -236,27 +246,23 @@ def test_the_guard_reads_the_values_again_for_each_graph(tmp_path: Path) -> None
             )
         }
     )
-    guard(graph)
-    values["soap_key"] = str(broad)
+    await preflight(graph, {"soap_key": str(restricted)})
     with pytest.raises(WiringError, match="OB_SOAP"):
-        guard(graph)
+        await preflight(graph, {"soap_key": str(broad)})
 
 
-async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
-    """The engine's own reload path raises the guard's refusal, before any connector is built. A
-    dry run, so this does not show that a running graph is kept; the engine's reload tests own
-    that ordering, as tests/test_retention_override_gate.py says of its guard."""
-    from messagefoundry.config.settings import EgressSettings
-    from messagefoundry.pipeline.engine import Engine
-
-    key = _key(tmp_path / "broad.key", broad=True)
+def _tls_feed(tmp_path: Path, cert: Path, key: Path) -> Path:
+    """A config dir whose one inbound serves TLS from ``cert`` and ``key``, on a free port."""
     cfg = tmp_path / "cfg"
-    cfg.mkdir()
+    cfg.mkdir(exist_ok=True)
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
     (cfg / "feed.py").write_text(
-        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
-        "inbound('IB_FEED', MLLP(port=2611, tls=True, tls_cert_file='c.crt',\n"
-        f"        tls_key_file={key.as_posix()!r}), router='r')\n"
-        "outbound('OB_FEED', MLLP(host='127.0.0.1', port=2612))\n"
+        "from messagefoundry import File, MLLP, Send, handler, inbound, outbound, router\n"
+        f"inbound('IB_FEED', MLLP(port={free_port()}, tls=True,\n"
+        f"        tls_cert_file={cert.as_posix()!r}, tls_key_file={key.as_posix()!r}),\n"
+        "        router='r')\n"
+        f"outbound('OB_FEED', File(directory={out.as_posix()!r}))\n"
         "@router('r')\n"
         "def route(msg):\n"
         "    return ['h']\n"
@@ -265,17 +271,157 @@ async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
         "    return Send('OB_FEED', msg)\n",
         encoding="utf-8",
     )
-    eng = await Engine.create(
-        tmp_path / "e.db",
+    return cfg
+
+
+async def _engine(tmp_path: Path, **kwargs: Any) -> Engine:
+    store = await MessageStore.open(tmp_path / "e.db")
+    return Engine(
+        store,
         poll_interval=0.02,
-        registry_guard=make_connection_key_file_guard(dict, enforcing=True, log=_LOG),
+        config_dir=None,
         egress_settings=EgressSettings(deny_by_default=False),
+        registry_preflight=make_connection_key_file_preflight(enforcing=True, log=_LOG),
+        **kwargs,
     )
+
+
+async def test_a_real_reload_refuses_a_broad_key_and_keeps_the_running_graph(
+    tmp_path: Path,
+) -> None:
+    cert, key = _self_signed(tmp_path)
+    cfg = _tls_feed(tmp_path, cert, key)
+    eng = await _engine(tmp_path)
     try:
+        await eng.reload_detail(cfg)  # the control: a restricted key loads and serves
+        runner = eng.registry_runner
+        assert runner is not None and runner.inbound_running("IB_FEED")
+
+        _broaden(key)
         with pytest.raises(WiringError, match="'IB_FEED' setting 'tls_key_file' is not restricted"):
-            await eng.reload_detail(cfg, dry_run=True)
+            await eng.reload_detail(cfg)
+        assert eng.registry_runner is runner and runner.inbound_running("IB_FEED")
+        # A dry run skips the preflight, and starts no connection.
+        await eng.reload_detail(cfg, dry_run=True)
     finally:
         await eng.stop()
+
+
+async def test_the_reload_path_judges_key_files_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3402 round 3: the check reads each key file's access list, so it must not run on
+    the loop thread. The stand-in records the thread it ran on and refuses, so the reload fails on
+    it rather than on anything else."""
+    seen: list[int] = []
+
+    def stand_in(registry: Registry, env_values: Mapping[str, Any]) -> str:
+        seen.append(threading.get_ident())
+        return "stand-in key file problem"
+
+    monkeypatch.setattr(key_file_access, "connection_key_file_problem", stand_in)
+    cert, key = _self_signed(tmp_path)
+    eng = await _engine(tmp_path)
+    try:
+        with pytest.raises(WiringError, match="stand-in key file problem"):
+            await eng.reload_detail(_tls_feed(tmp_path, cert, key))
+    finally:
+        await eng.stop()
+    assert len(seen) == 1 and seen[0] != threading.get_ident()
+
+
+@pytest.mark.parametrize("broad", [False, True])
+async def test_a_dr_activation_judges_the_running_graphs_key_files(
+    broad: bool, tmp_path: Path
+) -> None:
+    """The activation re-applies the running graph, and the key file may have been re-granted
+    since it loaded. The control activates and binds; a broad key refuses and binds nothing."""
+    cert, key = _self_signed(tmp_path)
+    eng = await _engine(
+        tmp_path,
+        store_settings=StoreSettings(path=str(tmp_path / "e.db")),
+        dr_settings=DrSettings(enabled=True, activate=False),
+    )
+    try:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection(
+                "IB_FEED",
+                MLLP(port=free_port(), tls=True, tls_cert_file=str(cert), tls_key_file=str(key)),
+                router="r",
+                priority=Priority.CRITICAL,
+            )
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB_FEED",
+                ConnectionSpec(ConnectorType.FILE, {"directory": str(out)}),
+                priority=Priority.CRITICAL,
+            )
+        )
+        reg.add_router("r", lambda m: ["h"])
+        reg.add_handler("h", lambda m: Send("OB_FEED", m))
+        eng.add_registry(reg)
+        await eng.start()
+        runner = eng.registry_runner
+        assert runner is not None and not runner.inbound_running("IB_FEED")  # passive
+
+        if broad:
+            _broaden(key)
+            with pytest.raises(WiringError, match="'IB_FEED' setting 'tls_key_file'"):
+                await eng._dr_activate_profile()
+            assert not runner.inbound_running("IB_FEED") and not eng.dr_active
+        else:
+            await eng._dr_activate_profile()
+            assert runner.inbound_running("IB_FEED") and eng.dr_active
+    finally:
+        await eng.stop()
+
+
+@pytest.mark.parametrize("broad", [False, True])
+async def test_the_managed_app_awaits_the_preflight_at_the_first_load(
+    broad: bool, tmp_path: Path
+) -> None:
+    """``create_managed_app`` chains the caller's preflight after the trust-anchor one, so the
+    start's own first load is judged as a reload is."""
+    from messagefoundry.api import create_managed_app
+
+    cert, key = _self_signed(tmp_path)
+    if broad:
+        _broaden(key)
+    app = create_managed_app(
+        db_path=tmp_path / "app.db",
+        config_dir=_tls_feed(tmp_path, cert, key),
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+        registry_preflight=make_connection_key_file_preflight(enforcing=True, log=_LOG),
+    )
+    if broad:
+        with pytest.raises(WiringError, match="'IB_FEED' setting 'tls_key_file'"):
+            async with app.router.lifespan_context(app):
+                pass
+    else:
+        async with app.router.lifespan_context(app):
+            runner = app.state.engine.registry_runner
+            assert runner is not None and runner.inbound_running("IB_FEED")
+
+
+async def test_the_chained_preflight_runs_the_anchor_one_first_and_keeps_it_alone() -> None:
+    from messagefoundry.api.app import _then_preflight
+
+    calls: list[str] = []
+
+    async def first(registry: Registry, env_values: Mapping[str, Any]) -> None:
+        calls.append("first")
+
+    async def then(registry: Registry, env_values: Mapping[str, Any]) -> None:
+        calls.append("then")
+
+    assert _then_preflight(first, None) is first
+    await _then_preflight(first, then)(Registry(), {})
+    assert calls == ["first", "then"]
 
 
 def test_every_broad_file_is_named_in_one_refusal(tmp_path: Path) -> None:
@@ -301,6 +447,29 @@ def test_every_broad_file_is_named_in_one_refusal(tmp_path: Path) -> None:
     problem = connection_key_file_problem(graph, {})
     assert problem is not None
     assert "'IB_A'" in problem and "'OB_B'" in problem
+
+
+def test_a_key_file_two_connections_share_is_judged_once_and_names_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = str(_key(tmp_path / "shared.key", broad=True))
+    graph = _registry(
+        inbound={
+            name: MLLP(port=port, tls=True, tls_cert_file="c.crt", tls_key_file=shared)
+            for name, port in (("IB_A", 2575), ("IB_B", 2576))
+        }
+    )
+    judged: list[str] = []
+    real = key_file_access.key_file_problem
+
+    def counting(path: str, **kwargs: Any) -> str | None:
+        judged.append(path)
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(key_file_access, "key_file_problem", counting)
+    problem = connection_key_file_problem(graph, {})
+    assert judged == [shared]  # one access-list read for the file, not one per setting
+    assert problem is not None and "'IB_A'" in problem and "'IB_B'" in problem
 
 
 # --- serve ----------------------------------------------------------------------------------------
@@ -381,19 +550,26 @@ def test_serve_leaves_a_missing_api_key_file_to_the_loader(
 
 
 @pytest.mark.parametrize(("toml", "refuses"), [("", True), (_WARN, False)])
-def test_serve_hands_the_app_a_guard_that_judges_connection_keys(
+def test_serve_hands_the_app_a_preflight_that_judges_connection_keys(
     toml: str, refuses: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rc, captured = _serve(tmp_path, monkeypatch, toml + PHI_GATE_PROVISIONS_TOML)
     assert rc == 0
-    guard = cast("Callable[[Registry], None]", captured["registry_guard"])
-    guard(_soap_graph(_key(tmp_path / "restricted.key", broad=False)))  # the control
+    preflight = cast(
+        "Callable[[Registry, Mapping[str, Any]], Awaitable[None]]", captured["registry_preflight"]
+    )
+    asyncio.run(
+        preflight(_soap_graph(_key(tmp_path / "restricted.key", broad=False)), {})
+    )  # control
     broad = _soap_graph(_key(tmp_path / "broad.key", broad=True))
     if refuses:
         with pytest.raises(WiringError, match="'client_key_file' is not restricted"):
-            guard(broad)
+            asyncio.run(preflight(broad, {}))
     else:
-        guard(broad)
+        asyncio.run(preflight(broad, {}))
+    # The synchronous guard no longer judges key files, so it does no such file I/O on the loop.
+    guard = cast("Callable[[Registry], None]", captured["registry_guard"])
+    guard(broad)
 
 
 # --- supervise ------------------------------------------------------------------------------------
@@ -448,8 +624,8 @@ def test_supervise_refuses_an_operator_api_tls_key_before_it_spawns(
 def test_supervise_refuses_a_graph_with_a_broad_connection_key_only_under_enforce(
     enforcement: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each engine shard would refuse the graph, so the supervisor refuses it once. Under warn each
-    engine shard writes its own warning, and the supervisor passes the graph."""
+    """An engine shard would refuse the graph, so the supervisor refuses it once, over the whole
+    graph. Under warn each engine shard writes its own warning, and the supervisor passes it."""
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", enforcement)
     rc, handed = _supervise(tmp_path, monkeypatch)
     assert rc == 0
@@ -461,3 +637,28 @@ def test_supervise_refuses_a_graph_with_a_broad_connection_key_only_under_enforc
             guard(broad)
     else:
         guard(broad)
+
+
+async def test_supervise_runs_its_graph_guard_off_the_event_loop(tmp_path: Path) -> None:
+    """The fleet refusal reads each key file's access list, and the supervisor runs on a loop, so
+    shard discovery and its guard run in a worker thread (BACKLOG #3402 round 3)."""
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.pipeline.supervisor import supervise
+
+    seen: list[int] = []
+
+    def guard(registry: Registry) -> None:
+        seen.append(threading.get_ident())
+        raise WiringError("stand-in refusal")
+
+    cfg = _tls_feed(tmp_path, tmp_path / "c.crt", tmp_path / "c.key")
+    rc = await supervise(
+        str(cfg),
+        store_backend=StoreBackend.SQLITE,
+        db_base=str(tmp_path / "fleet.db"),
+        base_port=18791,
+        install_signal_handlers=False,
+        registry_guard=guard,
+    )
+    assert rc == 2
+    assert len(seen) == 1 and seen[0] != threading.get_ident()

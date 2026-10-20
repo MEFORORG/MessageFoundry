@@ -10762,6 +10762,22 @@ async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink
         await asyncio.sleep(interval)
 
 
+def _then_preflight(
+    first: Callable[[Registry, Mapping[str, Any]], Awaitable[None]],
+    then: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None,
+) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
+    """One registry preflight that awaits ``first`` and then ``then``; ``first`` alone when ``then``
+    is ``None``. The engine takes a single preflight, and the first refusal wins (BACKLOG #3402)."""
+    if then is None:
+        return first
+
+    async def chained(registry: Registry, env_values: Mapping[str, Any]) -> None:
+        await first(registry, env_values)
+        await then(registry, env_values)
+
+    return chained
+
+
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -10845,6 +10861,7 @@ def create_managed_app(
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
     registry_guard: Callable[[Registry], None] | None = None,
+    registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
     static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
@@ -10869,7 +10886,10 @@ def create_managed_app(
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
     every reload (``serve`` chains its guards into one; at least the opt-in static-credential gate,
-    BACKLOG #1182, is among them). ``static_credential_settings`` is
+    BACKLOG #1182, is among them). ``registry_preflight`` is an async refusal awaited after the
+    trust-anchor preflight, never in its place, with the graph and its ``env()`` values: at the
+    first load, every real reload and a DR activation, after the shard filter (``serve`` passes the
+    connection key-file check, BACKLOG #3402). ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
     """
@@ -11187,8 +11207,10 @@ def create_managed_app(
             # it read. Since vault BACKLOG #2371 it also checks each FhirLookup's CA; the lane
             # CAs are the runner's, below. Module item 9 of auth/trust_anchors.py says when.
             # Dormant when no connection names a CA: no store call, no audit row.
-            registry_preflight=make_registry_anchor_preflight(
-                store, enforcing=trust_anchors_enforcing
+            # BACKLOG #3402: the caller's own preflight runs after it, never in its place.
+            registry_preflight=_then_preflight(
+                make_registry_anchor_preflight(store, enforcing=trust_anchors_enforcing),
+                registry_preflight,
             ),
             # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
             # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
