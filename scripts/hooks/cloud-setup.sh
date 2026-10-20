@@ -90,8 +90,12 @@ fi
 
 # The venv is NOT built here. A full install runs for minutes, and a hook that reaches its timeout
 # loses all of its output, including the warnings above. Build it as the first step of the work.
-if [ -n "$py" ]; then
-    say "no venv yet. Before running checks: uv venv --python 3.14 .venv, then uv pip install --python .venv/bin/python with the install line in scripts/worktree/ensure-venv.ps1 (that script itself does not run on Linux yet)."
+if [ -n "$py" ] && [ ! -x .venv/bin/python ]; then
+    if command -v pwsh >/dev/null 2>&1; then
+        say "no venv yet. Before running checks: pwsh -NoProfile -File scripts/worktree/ensure-venv.ps1 -Python '$py'"
+    else
+        say "no venv yet, and no pwsh to run scripts/worktree/ensure-venv.ps1. Before running checks: '$py' -m venv .venv, then .venv/bin/python -m pip install with that script's install line."
+    fi
 fi
 
 # Hooks for one event start together, so on a fresh VM the role-card hook ran before pwsh existed

@@ -159,6 +159,31 @@ def test_the_identity_is_the_pushing_accounts_own_noreply(tmp_path: Path) -> Non
     assert result.returncode == 0, result.stderr
     assert _local_git_config(repo, "user.name") == "Jane Doe", result.stdout
     assert _local_git_config(repo, "user.email") == "12345+jdoe@users.noreply.github.com"
+    # The printed venv command must be runnable as-is: the script and parameter that exist today.
+    assert "ensure-venv.ps1 -Python '/stub/python3.14'" in result.stdout
+    assert (_ROOT / "scripts" / "worktree" / "ensure-venv.ps1").is_file()
+
+
+@needs_bash
+def test_no_venv_instruction_once_the_venv_exists(tmp_path: Path) -> None:
+    """SessionStart also fires on resume and compact; a built venv must not be rebuilt on advice."""
+    assert _BASH is not None
+    repo = _checkout(tmp_path)
+    venv_py = repo / ".venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_bytes(b"#!/bin/sh\n")
+    venv_py.chmod(0o755)
+    stubs = _stub_tools(tmp_path, "12345\tjdoe\tJane Doe")
+    env = {
+        "CLAUDE_CODE_REMOTE": "true",
+        "CLAUDE_PROJECT_DIR": repo.as_posix(),
+        "PATH": str(stubs) + os.pathsep + os.environ.get("PATH", ""),
+    }
+    result = _run([_BASH, str(_SCRIPT)], env, repo)
+    assert result.returncode == 0, result.stderr
+    assert "no venv yet" not in result.stdout
+    # Control: the same run reached the end, so the absence above is the gate, not an early exit.
+    assert "[cloud-setup] cloud session." in result.stdout
 
 
 @needs_bash
