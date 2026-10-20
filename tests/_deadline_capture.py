@@ -15,8 +15,10 @@ deadline long enough never to fire on its own. The operation the test holds awai
 next pass, wherever the request is, so the 503 lands mid-operation and nowhere else, then holds the
 operation until :meth:`DeadlineCapture.held` lets it go.
 
-The web console suite imports this module too (``test_ui_dr_outlive.py``), through the repository
-root the engine's editable install puts on the import path, so there is one copy of the stand-in.
+The web console suite imports this module too (``test_ui_dr_outlive.py``), so there is one copy of
+the stand-in. It finds it as ``tests._deadline_capture`` only while the repository root is on the
+import path: the engine's editable install puts it there for a bare ``pytest``, and ``python -m
+pytest`` run from the root does too.
 """
 
 from __future__ import annotations
@@ -51,6 +53,9 @@ class DeadlineCapture:
     def __init__(self, outliving: OutlivingOperations) -> None:
         self.deadlines: list[asyncio.Timeout] = []
         self.fired = False
+        #: The loop time the deadline was brought forward to, so :func:`expect_cut_off` can tell a
+        #: deadline the fire expired from one that ran out at its own, generous time.
+        self.fired_at: float | None = None
         #: Why a fire went wrong. Recorded rather than raised: :meth:`fire` runs on the operation's
         #: task, where the code under test may catch an error and turn it into its own outcome.
         #: :func:`expect_cut_off` reports it on the test's task.
@@ -78,12 +83,14 @@ class DeadlineCapture:
         if deadline.when() is None:
             self._refuse("the request had already started its response")
             return
+        now = asyncio.get_running_loop().time()
         try:
-            deadline.reschedule(asyncio.get_running_loop().time())
+            deadline.reschedule(now)
         except RuntimeError as exc:  # it had already expired, or its request had ended
             self._refuse(f"the deadline could not be fired: {exc}")
             return
         self.fired = True
+        self.fired_at = now
 
     def _refuse(self, problem: str) -> None:
         self.problem = problem
@@ -107,6 +114,8 @@ class DeadlineCapture:
             self._released.set()
             cancelled = await self._outliving.drain(timeout=_DRAIN_SECONDS)
         assert cancelled == [], f"never finished once let go: {cancelled}"
+        # A fire refused after expect_cut_off returned, such as a second cut_off, is reported here.
+        assert self.problem is None, self.problem
 
 
 def capture_deadlines(monkeypatch: pytest.MonkeyPatch, app: Any) -> DeadlineCapture:
@@ -129,19 +138,19 @@ async def expect_cut_off(capture: DeadlineCapture, request: Awaitable[httpx.Resp
 
     The generous deadline bounds the wait: a deadline the operation never fires answers 503 there,
     and the ``fired`` check fails. ``fired`` says the fire ran, not that it took effect, so the
-    answer must also come before the generous deadline could have given it. A fire that went wrong
+    deadline must also have expired at the fire's time rather than its own. A fire that went wrong
     is reported first, even when the request raised because of it."""
-    loop = asyncio.get_running_loop()
-    started = loop.time()
     try:
         r = await request
     except Exception as exc:
         if capture.problem is not None:
             raise AssertionError(capture.problem) from exc
         raise
-    took = loop.time() - started
     assert capture.problem is None, capture.problem
     assert r.status_code == 503, r.text
     assert r.json() == {"detail": "the server timed out building a response"}
     assert capture.fired, "the deadline was not fired from inside the operation"
-    assert took < GENEROUS_DEADLINE_SECONDS, f"answered after {took:.1f} s: the deadline ran out"
+    deadline = capture.deadlines[0]
+    assert deadline.expired() and deadline.when() == capture.fired_at, (
+        f"the deadline expired at {deadline.when()}, not at the fire's {capture.fired_at}"
+    )

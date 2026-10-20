@@ -39,6 +39,7 @@ from messagefoundry.pipeline import Engine
 
 # The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
 # asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.
+# An unrewritten assert vanishes under `python -O`.
 pytest.register_assert_rewrite("tests._deadline_capture")
 
 
