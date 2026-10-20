@@ -1127,7 +1127,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
 > the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
 >
-> **Each network is named once, in list order, under the first spelling the list gives it.** So
+> **Each network is named once, under the first spelling the list gives it.** Within each wording
+> the networks keep list order; the whole-family wording comes first. So
 > `10.0.0.0/08` or `::ffff:10.0.0.0/104` beside `10.0.0.0/8` is not named again (BACKLOG #3393).
 > To clear a named range, remove every spelling of it from the list.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
