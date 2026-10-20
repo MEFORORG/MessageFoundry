@@ -156,6 +156,13 @@ this line.**
 
 ### Security
 
+- **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
+  sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
+  charges that user's per-actor budget, the one `POST /ui/reauth/oidc` already charges. A flood
+  that spent the shared sign-in budget would otherwise refuse every federated step-up while a
+  password step-up kept working. A refused return answers 429 with the step-up page and keeps the
+  flow for a retry. Every other callback still draws the sign-in budget. This console needs an
+  engine with `oidc_step_up_actor`, and refuses an older one at startup. (BACKLOG #3374)
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".

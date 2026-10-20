@@ -1014,6 +1014,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
+        # BACKLOG #3374: the federated step-up's return, charged on that branch only.
+        "GET /ui/oidc/callback",
         "POST /ui/account/mfa/verify",
         "POST /ui/account/webauthn/verify",  # BACKLOG #3014: the passkey registration finish
         "POST /ui/mfa",
@@ -1561,14 +1563,51 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
             "consults neither lock."
         )
 
-    # 4. The callback charges the sign-in window before it picks the step-up branch.
+    # 4. The callback reads the staged flow's actor before it charges either limiter, then charges
+    # the ceremony budget on a step-up return and the sign-in window otherwise (BACKLOG #3374).
     routes = _console_route_funcs()
     callback = routes["GET /ui/oidc/callback"]
-    charge_at = [i for i, s in enumerate(callback.body) if _called(s, "allow_login_attempt")]
-    branch_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_flow_is_step_up")]
-    assert charge_at and branch_at and charge_at[0] < branch_at[0], (
-        "GET /ui/oidc/callback no longer charges allow_login_attempt before its step-up branch; the "
-        "limiter-split residual in the 6.1.1 section says it does."
+    peek_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_step_up_actor")]
+    charge_at = [
+        i
+        for i, s in enumerate(callback.body)
+        if _called(s, "allow_login_attempt") or _called(s, "allow_reauth_attempt")
+    ]
+    assert peek_at and charge_at and peek_at[0] < charge_at[0], (
+        "GET /ui/oidc/callback no longer reads oidc_step_up_actor before it charges a limiter; the "
+        "limiter split in the 6.1.1 section says it picks the budget from the staged flow."
+    )
+    splits = [
+        s
+        for s in callback.body
+        if isinstance(s, ast.If)
+        and _called(ast.Module(body=s.body, type_ignores=[]), "allow_reauth_attempt")
+        and not _called(ast.Module(body=s.body, type_ignores=[]), "allow_login_attempt")
+        and _called(ast.Module(body=s.orelse, type_ignores=[]), "allow_login_attempt")
+        and not _called(ast.Module(body=s.orelse, type_ignores=[]), "allow_reauth_attempt")
+    ]
+    assert len(splits) == 1, (
+        "GET /ui/oidc/callback no longer charges exactly one budget per return: the ceremony budget "
+        "on a step-up return, the sign-in window on any other. The 6.1.1 limiter split says it does."
+    )
+    actor_names = {
+        t.id
+        for s in callback.body
+        if isinstance(s, ast.Assign) and _called(s, "oidc_step_up_actor")
+        for t in s.targets
+        if isinstance(t, ast.Name)
+    }
+    charged_with = {
+        ast.unparse(n.args[0])
+        for n in ast.walk(splits[0])
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "allow_reauth_attempt"
+        and n.args
+    }
+    assert actor_names and charged_with == actor_names, (
+        f"the callback charges the ceremony budget under {sorted(charged_with)}, not the actor "
+        f"oidc_step_up_actor read from the staged flow ({sorted(actor_names)})."
     )
     reauth_oidc = routes["POST /ui/reauth/oidc"]
     assert _called(reauth_oidc, "allow_reauth_attempt") and not _called(
@@ -1681,6 +1720,12 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "which the start leg turns into a **303 redirect",
         "flooding the OIDC start leg (`POST /ui/oidc/start`",
         "limiter 2 (the same routes charge `allow_login_attempt` first)",
+        # BACKLOG #3374: the callback no longer charges the sign-in window on a step-up return.
+        "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
+        "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
+        "and the callback draws the sign-in window, so a flood that fills that window also refuses",
+        "and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window",
+        "which charges the sign-in window as above",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; against the two-lock code it is false or "
@@ -1719,8 +1764,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     for token in ("The sign-in lock has **two** exceptions", "it refuses **no** second-factor leg"):
         assert token in table_a, f"Table A's failures row must state {token!r}."
     for token in (
-        "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
-        "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
+        "**An `oidc` session's step-up draws limiter 3 at both of its legs (BACKLOG #3374).**",
+        "`oidc_step_up_actor` runs ahead of both limiters",
+        "Only a callback whose cookie names no live step-up flow charges limiter 2",
         "Only the second-step lock refuses the code leg.",
         "Three of the four can end a lock that is still live",
         "The successful-login write can end a live **sign-in** lock only",

@@ -42,6 +42,9 @@ Two deliberate departures a reviewer will want to check rather than "fix":
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
+The callback picks its limiter from the flow its cookie names: a live step-up flow's return draws
+the staged user's ceremony budget, as the step-up's start leg does, and anything else draws the
+sign-in window (BACKLOG #3374).
 """
 
 from __future__ import annotations
@@ -460,7 +463,31 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if auth is None or not auth.oidc_enabled:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         client = client_ip(request)
-        if not auth.allow_login_attempt(client):
+        flow_id = request.cookies.get(oidc_flow_cookie_name(request))
+        # BACKLOG #3374: a STEP-UP return is charged to the per-ACTOR ceremony budget its start leg
+        # drew, so a flood on the sign-in surface cannot refuse it. This leg cannot read the
+        # session cookie, so the actor is the one the start leg staged on the flow, never a value
+        # from the request. Only a holder of a live step-up flow's cookie reaches that budget; every
+        # other caller, a forged or expired cookie included, still draws the sign-in window.
+        step_up_actor = auth.oidc_step_up_actor(flow_id) if flow_id else None
+        if step_up_actor is not None:
+            if not auth.allow_reauth_attempt(step_up_actor):
+                # A _log.warning, never an audit, as on the sign-in branch below. The flow consumed
+                # nothing, so its cookie stays and the real return can be retried once the budget
+                # refills. The staged continuation is not read back here, so the page offers the
+                # IdP leg again with nothing to continue to.
+                _log.warning(
+                    "federated step-up return rate limit exceeded for %s", client or "<unknown>"
+                )
+                return reauth_idp_response(
+                    deps,
+                    auth,
+                    "/ui",
+                    continues=False,
+                    error="Too many attempts. Wait a moment.",
+                    status_code=429,
+                )
+        elif not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.
             _log.warning("federated callback rate limit exceeded for %s", client or "<unknown>")
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
@@ -471,14 +498,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _fail(request, "oidc_failed", keep_flow=True)
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
 
-        flow_id = request.cookies.get(oidc_flow_cookie_name(request))
         if not flow_id:
             # AC-7: without the browser-binding cookie the request is refused even when state and
             # code are otherwise valid — server-side `state` alone would let whoever presents a valid
             # (state, code) pair have the session minted into THEIR browser.
             await auth.audit_oidc_reject("flow_binding_missing", client=client)
             return _fail(request, "flow_binding_missing")
-        if auth.oidc_flow_is_step_up(flow_id):
+        if step_up_actor is not None:
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
             # The service pops the flow and re-checks its kind, so this branch only picks the leg.
             step_up = (

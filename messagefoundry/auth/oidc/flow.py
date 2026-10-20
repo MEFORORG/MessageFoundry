@@ -136,6 +136,10 @@ class PendingFlow:
     #: with this set elevates THAT session and never mints a new one, and a sign-in flow never
     #: elevates anything, so each completion refuses the other kind.
     step_up_session_hash: str | None = None
+    #: STEP-UP flows only: the id of the user whose session staged the flow, read from that session
+    #: at the start leg. The callback charges the per-actor ceremony budget under it, since it
+    #: cannot read the session cookie to learn who is stepping up (BACKLOG #3374).
+    step_up_user_id: str | None = None
     #: The ADR 0077 action the step-up is for, if any, so the single-use grant is minted for the
     #: action the operator started from. ``None`` refreshes only the session window.
     step_up_purpose: str | None = None
@@ -255,6 +259,7 @@ def start_flow(
     clock: Callable[[], float] = time.monotonic,
     prior_session_hash: str | None = None,
     step_up_session_hash: str | None = None,
+    step_up_user_id: str | None = None,
     step_up_purpose: str | None = None,
     wall_clock: Callable[[], float] = time.time,
 ) -> tuple[str, PendingFlow]:
@@ -273,6 +278,7 @@ def start_flow(
         deadline=clock() + ttl_seconds,
         prior_session_hash=prior_session_hash,
         step_up_session_hash=step_up_session_hash,
+        step_up_user_id=step_up_user_id,
         step_up_purpose=step_up_purpose,
         issued_at=wall_clock(),
     )

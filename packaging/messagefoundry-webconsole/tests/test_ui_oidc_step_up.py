@@ -357,3 +357,76 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
         assert 'action="/ui/reauth/oidc"' in r.text
         assert "did not complete the confirmation" in r.text  # BACKLOG #3221: a step-up word
         assert await service.identity_for_token(token) is not None
+
+
+def _flow_id(c: httpx.AsyncClient) -> str:
+    """The flow cookie's value, under whichever of its prefixed names this origin uses."""
+    return next(v for k, v in c.cookies.items() if k.endswith("mf_oidc_flow"))
+
+
+def _drain_sign_in_window(service: AuthService) -> None:
+    """Spend the sign-in window's GLOBAL budget from many addresses, as a flood would."""
+    for i in range(200):
+        service.allow_login_attempt(f"203.0.113.{i}")
+    assert not service.allow_login_attempt("127.0.0.1"), "fixture: the window is not spent"
+
+
+async def test_a_spent_sign_in_window_does_not_refuse_an_idp_step_up_return(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3374. RED when: the callback charges the sign-in window before it tells a step-up
+    return from a sign-in. A flood that spends that window's global budget then refuses every IdP
+    step-up return, while a password step-up, on the per-actor budget, keeps working."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        old = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _NEXT)
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        _drain_sign_in_window(service)
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 200, r.text
+        assert f'action="{_NEXT}"' in r.text
+        new = c.cookies.get("mf_session")
+        assert new and new != old
+        assert await service.has_recent_step_up(new)
+
+
+async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3374. RED when: the step-up return draws no budget at all once it left the sign-in
+    window. It draws the staged user's ceremony budget, which the start leg also draws, and a spent
+    budget refuses it with a 429 that writes no audit row and consumes nothing."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        token = await _federated_sign_in(service, c, monkeypatch)
+        identity = await service.identity_for_token(token)
+        assert identity is not None
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        flow_id = _flow_id(c)
+        while service.allow_reauth_attempt(identity.user_id):
+            pass
+        assert service.allow_login_attempt("127.0.0.1"), "the sign-in window must be untouched"
+        rows_before = len(await service.store.list_audit(limit=1000))
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 429, r.text
+        assert "Too many attempts" in r.text
+        assert 'action="/ui/reauth/oidc"' in r.text and 'name="password"' not in r.text
+        assert "retry-after" not in r.headers
+        assert len(await service.store.list_audit(limit=1000)) == rows_before
+        assert await service.identity_for_token(token) is not None
+        assert not await service.has_recent_step_up(token)
+        # Nothing was consumed: the flow and its cookie wait for a retry of the real return.
+        assert service.oidc_step_up_actor(flow_id) == identity.user_id
+        assert _flow_id(c) == flow_id
+        monkeypatch.setattr(service, "_reauth_limiter", None)  # the budget refilled
+        retry = await _callback(c, start.headers["location"])
+        assert retry.status_code == 200, retry.text
+        new = c.cookies.get("mf_session")
+        assert new and await service.has_recent_step_up(new)

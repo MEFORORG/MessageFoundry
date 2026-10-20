@@ -253,7 +253,12 @@ async def test_the_step_up_request_sends_max_age_zero_and_prompt_login(
         assert flow.step_up_session_hash == hash_token(token)
         assert flow.return_to == NEXT
         assert flow.issued_at > 0
-        assert service.oidc_flow_is_step_up(flow_id)
+        # BACKLOG #3374: the flow names the user whose session staged it, which the callback
+        # charges the ceremony budget under because it cannot read the session cookie.
+        identity = await service.identity_for_token(token)
+        assert identity is not None
+        assert flow.step_up_user_id == identity.user_id
+        assert service.oidc_step_up_actor(flow_id) == identity.user_id
     finally:
         await store.close()
 
@@ -314,7 +319,7 @@ async def test_a_fresh_idp_proof_elevates_rotates_and_grants(
         rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
         assert rows[-1]["ok"] is True and rows[-1]["mech"] == "oidc"
         # Single use: the flow is gone.
-        assert not service.oidc_flow_is_step_up(flow_id)
+        assert service.oidc_step_up_actor(flow_id) is None
     finally:
         await store.close()
 
@@ -1015,7 +1020,7 @@ async def test_a_wrong_state_is_refused(
         assert not out.ok and out.reason == "state_mismatch"
         await _assert_untouched(service, token)
         # PEEKED, not popped: a forged callback must not cancel the step-up in flight.
-        assert service.oidc_flow_is_step_up(flow_id)
+        assert service.oidc_step_up_actor(flow_id) is not None
         rows = await _audit_rows(store, "auth.reauth")
         assert rows[-1]["actor"] == "<oidc>", "an unverified refusal was filed under the account"
     finally:
@@ -1100,14 +1105,14 @@ async def test_an_abandoned_step_up_consumes_the_flow_and_keeps_the_continuation
         )
         # A cancel without the flow's own state (any page can send error=) consumes nothing.
         assert not forged.ok and forged.reason == "state_mismatch"
-        assert service.oidc_flow_is_step_up(flow_id)
+        assert service.oidc_step_up_actor(flow_id) is not None
 
         out = await service.abandon_oidc_step_up(
             flow_id, state=_staged(service, flow_id).state, reason="idp_error", client=None
         )
 
         assert not out.ok and out.reason == "idp_error" and out.return_to == NEXT
-        assert not service.oidc_flow_is_step_up(flow_id)
+        assert service.oidc_step_up_actor(flow_id) is None
         await _assert_untouched(service, token)
     finally:
         await store.close()

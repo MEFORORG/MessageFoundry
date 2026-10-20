@@ -2909,9 +2909,9 @@ class AuthService:
         # throttle another's, and an unauthenticated flood can no longer reach these at all.
         # Entry-to-session legs (login, negotiate, /ui/sso, the OIDC legs, JSON /auth/mfa-verify)
         # deliberately STAY on _login_limiter. The console's POST /ui/mfa and /ui/reauth* legs
-        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them. It
-        # can still refuse an oidc session's IdP step-up, whose return lands on the OIDC callback
-        # and draws _login_limiter (the residual in docs/SECURITY.md, ASVS 6.1.1).
+        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them. So
+        # does an oidc session's IdP step-up, at its start and at its return to the OIDC callback,
+        # which keys it on the user the staged flow names (BACKLOG #3374).
         self._reauth_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -3151,11 +3151,11 @@ class AuthService:
         password and re-bind step-up legs (``POST /me/reauth``, ``POST /ui/reauth``) and the passkey
         leg (``POST /ui/reauth/webauthn``) draw this budget instead, so such a flood cannot deny them.
 
-        An ``oidc`` session's step-up is only partly covered. Its start, ``POST /ui/reauth/oidc``,
-        draws this budget, but the IdP's return lands on ``GET /ui/oidc/callback``, which draws the
-        sign-in window before it tells a step-up from a sign-in. So a flood that fills that window
-        refuses the IdP step-up too: a residual, stated in docs/SECURITY.md under the ASVS 6.1.1
-        protection set. True = proceed; always True when the limiter is disabled."""
+        An ``oidc`` session's step-up draws it at both legs. Its start, ``POST /ui/reauth/oidc``,
+        charges the session's user. The IdP's return to ``GET /ui/oidc/callback`` cannot read the
+        session cookie, so it charges the user :meth:`oidc_step_up_actor` reads from the staged
+        flow, and only a callback with no live step-up flow draws the sign-in window (BACKLOG
+        #3374). True = proceed; always True when the limiter is disabled."""
         if self._reauth_limiter is None:
             return True
         return self._reauth_limiter.allow(actor)
@@ -5522,6 +5522,7 @@ class AuthService:
             client_ip=client or "",
             ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             step_up_session_hash=token_hash,
+            step_up_user_id=session.user_id,
             step_up_purpose=purpose,
         )
         url = oidc.build_authorization_url(
@@ -5564,17 +5565,23 @@ class AuthService:
         """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
         return oidc.accepted_claim_values(self._settings.oidc_callback_floor_exempt_amr)
 
-    def oidc_flow_is_step_up(self, flow_id: str) -> bool:
-        """Whether the live flow behind this cookie is a step-up flow, WITHOUT consuming it.
+    def oidc_step_up_actor(self, flow_id: str) -> str | None:
+        """The user id the live STEP-UP flow behind this cookie was staged for, WITHOUT consuming
+        it; None for a sign-in flow, or an unknown or expired one.
 
-        The callback route uses it to pick the completion. Each completion pops the flow and
-        re-checks its kind, so a wrong answer here refuses. It never elevates or mints on the wrong
-        leg. An unknown or expired flow answers False and the sign-in completion refuses it.
+        The callback route uses it twice: to pick the completion, and to charge the step-up return
+        to that user's ceremony budget (:meth:`allow_reauth_attempt`) rather than the sign-in window
+        (BACKLOG #3374). The id comes from the session the start leg verified, never from the
+        request. Each completion pops the flow and re-checks its kind, so a wrong answer here
+        refuses. It never elevates or mints on the wrong leg. A None sends the callback to the
+        sign-in completion, which refuses a step-up flow, and to the sign-in window.
         """
         if self._oidc_flows is None:
-            return False
+            return None
         flow = self._oidc_flows.peek(flow_id)
-        return flow is not None and flow.step_up_session_hash is not None
+        if flow is None or flow.step_up_session_hash is None:
+            return None
+        return flow.step_up_user_id
 
     async def abandon_oidc_step_up(
         self, flow_id: str, *, state: str | None, reason: str, client: str | None
