@@ -53,14 +53,17 @@ SEAT_DECLARE = ("-Declare", "-Seat", "builder", "-Goal", "cloud refusal test")
 HYGIENE_OFFLINE = ("-SkipGh", "-SkipFetch", "-NoExtraRoots")
 # Outside the census, which reads the directory's name: this script never names it.
 PRESENCE = "coord/presence.ps1"
-# The readers, each called so its control reads no real config root and asks no gh. The roots are
-# relative to the sandbox clone and do not exist, which each script reads as an empty one.
+# The readers, each with a call and a line of its normal answer in the sandbox clone. Where a reader
+# takes -ConfigRoot, the root is relative to the clone and does not exist, so no real registry is
+# read; fleet.ps1 takes none, so its control points USERPROFILE at a fixture home instead. No call
+# asks gh.
 NO_ROOT = ("-ConfigRoot", "no-config-root")
-READER_CALLS = (
-    pytest.param("coord/overlap.ps1", ("-Json", *NO_ROOT, "-TasksDir", "no-tasks"), id="overlap"),
-    pytest.param("coord/claim-adjudicate.ps1", (), id="claim-adjudicate"),
-    pytest.param("coord/claim-reconcile.ps1", (*NO_ROOT, "-NoPullRequests"), id="claim-reconcile"),
-    pytest.param("coord/fleet.ps1", (), id="fleet"),
+NOT_SCANNED = "-- nothing was scanned."
+READERS = (
+    ("coord/overlap.ps1", ("-Json", *NO_ROOT, "-TasksDir", "no-tasks"), "[]"),
+    ("coord/claim-adjudicate.ps1", (), NOT_SCANNED),
+    ("coord/claim-reconcile.ps1", (*NO_ROOT, "-NoPullRequests"), NOT_SCANNED),
+    ("coord/fleet.ps1", (), "fenceAvailable             True"),
 )
 
 needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="the scripts run under pwsh")
@@ -113,15 +116,23 @@ def _coord_dir(repo: Path) -> Path:
     return repo / ".git" / "mefor-coord"
 
 
+def _stem(rel: str) -> str:
+    return rel.rsplit("/", 1)[-1].removesuffix(".ps1")
+
+
 def _refusal_line(rel: str) -> str:
     name = rel.rsplit("/", 1)[-1]
     return name + (PRESENCE_TAIL if rel == PRESENCE else REFUSAL_TAIL)
 
 
-def _run(repo: Path, script: str, *args: str, cloud: bool) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, script: str, *args: str, cloud: bool, home: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if cloud:
         env["CLAUDE_CODE_REMOTE"] = "true"
+    if home is not None:
+        env["USERPROFILE"] = str(home)
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(repo / "scripts" / script), *args],
         cwd=str(repo),
@@ -147,7 +158,7 @@ def _run(repo: Path, script: str, *args: str, cloud: bool) -> subprocess.Complet
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
-        *READER_CALLS,
+        *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
         pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
 )
@@ -268,7 +279,6 @@ def test_seat_record_is_not_refused_in_the_cloud(repo: Path) -> None:
         pytest.param("coord/claim.ps1", ("-List",), id="claim-list"),
         pytest.param("coord/handoff.ps1", ("-Report",), id="handoff-report"),
         pytest.param("coord/lane.ps1", ("-Show",), id="lane-show"),
-        *READER_CALLS,
     ],
 )
 def test_each_coordination_script_takes_its_normal_path_outside_the_cloud(
@@ -277,6 +287,23 @@ def test_each_coordination_script_takes_its_normal_path_outside_the_cloud(
     proc = _run(repo, script, *args, cloud=False)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
+
+
+@needs_pwsh
+@needs_windows
+@pytest.mark.parametrize(
+    ("script", "args", "answer"), [pytest.param(*r, id=_stem(r[0])) for r in READERS]
+)
+def test_each_reader_gives_its_normal_answer_outside_the_cloud(
+    repo: Path, tmp_path: Path, script: str, args: tuple[str, ...], answer: str
+) -> None:
+    """The control for each reader: the answer the refusal withholds is printed here. The fixture
+    home holds one empty config root, so fleet.ps1's fence reads it rather than the host's."""
+    home = tmp_path / "home"
+    (home / ".claude" / "sessions").mkdir(parents=True)
+    proc = _run(repo, script, *args, cloud=False, home=home)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert any(ln.strip().endswith(answer) for ln in proc.stdout.splitlines()), proc.stdout
 
 
 @needs_pwsh
