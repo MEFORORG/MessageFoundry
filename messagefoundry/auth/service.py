@@ -1391,7 +1391,8 @@ def _adopts_directory_mail(principal: AdPrincipal) -> bool:
 
 
 class InvalidNotifyEmail(ValueError):
-    """A notification address was refused before anything was written (BACKLOG #1139).
+    """A notification address, or an account ``email`` that takes its rule
+    (:func:`_require_account_email`), was refused before anything was written (BACKLOG #1139).
 
     A ``ValueError``, so a caller that catches that still does. Its own type lets a route turn
     exactly this refusal into a ``400``, and not some other ``ValueError`` raised after a write."""
@@ -1416,6 +1417,17 @@ def _require_single_mailbox(value: str) -> str:
             message += f"; this one {problem}"
         raise InvalidNotifyEmail(message)
     return address
+
+
+def _require_account_email(value: str, *, blank: str) -> str:
+    """``value`` stripped, when it may be an account's ``email``; else :class:`InvalidNotifyEmail`.
+
+    The one rule ``POST /users`` and a changed ``email`` on ``PATCH /users/{user_id}`` apply
+    (BACKLOG #2018, #3278): :func:`_require_single_mailbox`, with ``blank`` as the message for a
+    blank value, because that helper's own message is about ``notify_email``."""
+    if not value.strip():
+        raise InvalidNotifyEmail(blank)
+    return _require_single_mailbox(value)
 
 
 class NotifyEmailAlreadySet(RuntimeError):
@@ -13860,11 +13872,9 @@ class AuthService:
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
         if email is not None:
-            if not email.strip():
-                raise InvalidNotifyEmail(
-                    "a new account needs a notification address, such as name@example.org"
-                )
-            email = _require_single_mailbox(email)
+            email = _require_account_email(
+                email, blank="a new account needs a notification address, such as name@example.org"
+            )
         user_id = uuid4().hex
         temp = await self._generate_issued_credential(
             "create", username=username, actor=actor, roles=roles, client=client
@@ -13947,6 +13957,14 @@ class AuthService:
         written (:func:`_require_single_mailbox`), so a refusal leaves the whole save undone. Raises
         :class:`InvalidNotifyEmail` for it.
 
+        **The profile ``email`` takes the rule :meth:`create_local_user` applies to its ``email``
+        (BACKLOG #3278, :func:`_require_account_email`).** A changed value must be one plain mailbox
+        and is stored stripped; a blank one is refused. As above, the stored value posted back, with
+        or without the whitespace around it, is kept as stored and not re-checked, so an address a
+        directory sync wrote does not refuse a save that posts it back unchanged, and ``None`` still
+        clears. "Stored" is the row read here, not the one the caller's page showed. A refusal is
+        :class:`InvalidNotifyEmail`, raised before anything is written.
+
         **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
         :class:`LastAdministratorRefused`. The guard is the disable write itself: the store checks
         and writes in one transaction (``remove_unless_last_admin``). That write stays after the
@@ -13962,6 +13980,20 @@ class AuthService:
             # (SQL Server) finds the row from a different spelling, and the early read below
             # compares ids in Python, so it must be given the one the store holds.
             user_id = before.id
+        # BACKLOG #3278: the profile `email` rule, as the docstring states it.
+        stored_email = before.email if before is not None else None
+        if email is not None and stored_email is not None and email.strip() == stored_email.strip():
+            email = stored_email
+        elif email is not None:
+            try:
+                email = _require_account_email(
+                    email,
+                    blank="it cannot be blank; give one address, such as name@example.org, "
+                    "or clear it",
+                )
+            except InvalidNotifyEmail as exc:
+                # Named, because the same save may carry `notify_email` too.
+                raise InvalidNotifyEmail(f"the profile email was refused: {exc}") from exc
         stored_notify = ((before.notify_email if before is not None else None) or "").strip()
         new_notify: str | None = None
         if notify_email is not None and (
