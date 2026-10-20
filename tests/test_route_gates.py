@@ -42,6 +42,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth.permissions import Permission
 from scripts.security import route_gates
+from tests._route_context_shapes import route_context_forwarding_to_the_copy
 
 # --- the live app ------------------------------------------------------------------------------------
 
@@ -674,9 +675,15 @@ def test_an_included_plain_route_is_walked_under_its_include_prefix() -> None:
 def _route_context_hiding(
     monkeypatch: pytest.MonkeyPatch, name: str, *, empty: bool = False
 ) -> None:
-    """Make every ``RouteContext`` answer ``name`` as a FastAPI that renamed it would, by raising
-    AttributeError, or as one that left it empty, by returning ``None``."""
-    original = fastapi.routing.RouteContext.__getattr__
+    """Make every effective-route record a ``RouteContext`` holds answer ``name`` as a FastAPI that
+    renamed it would, by raising AttributeError, or as one that left it empty, by returning
+    ``None``. The record is where the walk reads the rebuilt route, so that is where a rename would show.
+
+    Use it only on an app with no included API route. From FastAPI 0.143.1, FastAPI's own
+    ``RouteContext`` properties read this field too, so hiding it there makes reading such a
+    context's path recurse rather than fail by name."""
+    record = fastapi.routing._EffectiveRouteContext
+    original = record.__getattribute__
 
     def patched(self: Any, attr: str) -> Any:
         if attr != name:
@@ -685,7 +692,33 @@ def _route_context_hiding(
             return None
         raise AttributeError(attr)
 
-    monkeypatch.setattr(fastapi.routing.RouteContext, "__getattr__", patched)
+    monkeypatch.setattr(record, "__getattribute__", patched)
+
+
+def _app_with_an_included_websocket() -> FastAPI:
+    sub = APIRouter()
+    sub.add_api_websocket_route("/ws/included", _dependency_gated)
+    app = FastAPI()
+    app.include_router(sub, prefix="/inc")
+    return app
+
+
+@pytest.mark.parametrize(
+    "build", [_app_with_an_included_plain_route, _app_with_an_included_websocket]
+)
+def test_the_walk_does_not_read_the_rebuilt_route_through_the_attribute_fallback(
+    monkeypatch: pytest.MonkeyPatch, build: Callable[[], FastAPI]
+) -> None:
+    """With the fallback refusing ``starlette_route`` as FastAPI 0.143.1 and later do
+    (``tests/_route_context_shapes.py`` says what that simulates), the walk reads the same rows."""
+    app = build()
+    expected = route_gates.route_rows(app)
+    route_context_forwarding_to_the_copy(monkeypatch)
+    assert route_gates.route_rows(app) == expected
+    if build is _app_with_an_included_plain_route:
+        rows = _rows_by_key(app)
+        assert ("GET", "/inc/plain") in rows, sorted(rows)
+        assert ("GET", "/plain") not in rows
 
 
 def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -696,7 +729,7 @@ def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.Monk
     _route_context_hiding(monkeypatch, "starlette_route")
     with pytest.raises(route_gates.MissingFastAPISymbol) as caught:
         route_gates.route_rows(app)
-    assert "RouteContext.starlette_route" in str(caught.value)
+    assert "_EffectiveRouteContext.starlette_route" in str(caught.value)
     assert f"FastAPI {fastapi.__version__}" in str(caught.value)
 
 
