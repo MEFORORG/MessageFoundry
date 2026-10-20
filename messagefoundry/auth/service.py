@@ -3593,7 +3593,10 @@ class AuthService:
         username = username.strip()
         if not username:
             raise FirstAdministratorRefused(_BLANK_USERNAME_REFUSAL)
-        # Checked ONCE, so the two later readers (`users.email` and `notify_email`) cannot disagree.
+        # Checked ONCE, so every later write of it carries the same value: `create_user` seeds both
+        # `users.email` and `notify_email` on a fresh create, and `set_user_notify_email` writes
+        # `notify_email` alone. A REPAIR writes no `users.email`, so that column keeps what the row
+        # held, which may be the earlier holder's, and can differ from `notify_email` afterwards.
         notify_email = provision_notify_email(notify_email)
         usable, standing_admins = await self._administrator_standing()
         if usable:
@@ -3950,8 +3953,10 @@ class AuthService:
         BACKLOG #2288 once refused here a row holding a notification address when no address was
         given, so an address nobody chose was never kept. Every caller now gives one, checked by
         :func:`provision_notify_email` before this runs (BACKLOG #1138, #3391), so that refusal
-        could not fire and is gone. The stored address is replaced, and a takeover notice goes to
-        it where a notice channel is wired (``holder_notice`` records whether one did)."""
+        could not fire and is gone. A repair replaces the stored ``notify_email``, and a takeover
+        notice goes to the old one where a notice channel is wired (``holder_notice`` records whether
+        one did). The profile ``users.email`` is not written on a repair, so it keeps what the row
+        held, which may be the earlier holder's."""
         if existing.auth_provider != AuthProvider.LOCAL.value:
             return (
                 f"{username!r} is a {existing.auth_provider} account -- provision a separate "
@@ -3971,12 +3976,22 @@ class AuthService:
 
     async def provision_refusal(self, username: str, *, notify_email: str) -> str | None:
         """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
-        prompt (ADR 0197 Amendment A): an enabled local Administrator with a usable password exists
-        (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711), or the named row is one this
-        command will not complete. ``provision-admin`` asks it first, so an operator is never shown
+        prompt (ADR 0197 Amendment A). It checks these, in this order, and returns the first that
+        holds as the write words it, or ``None``:
+
+        1. the username is blank (BACKLOG #3391);
+        2. ``notify_email``, the ``--email`` value, is missing, blank or not one plain mailbox, by
+           :func:`provision_notify_email` (BACKLOG #1138, #3391);
+        3. an enabled local Administrator with a usable password exists
+           (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711);
+        4. the account with that name fails its integrity seal;
+        5. the named row is one this command will not complete: a directory account, a disabled
+           one, or one that holds roles (:meth:`_existing_row_refusal`).
+
+        The write can still refuse for reasons asked only later, at least the password policy and
+        the authenticator code. ``provision-admin`` asks this first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
-        own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
-        checked here as the write checks it (BACKLOG #1138, #3391)."""
+        own; this is the courtesy, that is the control."""
         name = username.strip()
         # In the write's order: the name first, then the address.
         if not name:

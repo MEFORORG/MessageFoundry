@@ -713,9 +713,11 @@ The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that 
 keeps the earlier holder's address with a warning is replaced there.
 
 *Retired 2026-10-20 by BACKLOG #3391. The service now requires the address from every caller, so
-this refusal could not fire, and `_existing_row_refusal` no longer carries it. Its purpose holds by
-the wider rule: every run writes the address it was given, so a repaired row never keeps one nobody
-chose.*
+this refusal could not fire, and `_existing_row_refusal` no longer carries it. Its purpose holds for
+the notification address by the wider rule: every run writes the `notify_email` it was given, so a
+repaired row's security notices never go to an address nobody chose. The profile `users.email` is
+not written on a repair and keeps what the account held, which may be the earlier holder's; see
+`docs/SECURITY.md`, *Provisioning the first administrator*.*
 
 ## Amendment D (2026-10-10) -- `--email` is required
 

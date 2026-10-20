@@ -161,8 +161,13 @@ async def provision_admin(
     notify_email: str | None,
     settings: AuthSettings | None = None,
 ) -> ProvisionedAdministrator:
-    """Provision an Administrator into ``store`` as ``provision-admin`` does, under ``settings``
-    (the shipped ones by default), enrolling TOTP exactly when they require MFA.
+    """Provision an Administrator into ``store`` through the service ``provision-admin`` calls,
+    under ``settings`` (the shipped ones by default).
+
+    This helper enrols TOTP exactly when ``settings`` require MFA. The command differs: it enrols
+    TOTP unless ``--no-totp`` is given, whatever ``require_mfa`` says, and refuses ``--no-totp``
+    while MFA is required. So with ``require_mfa=False`` this matches ``provision-admin --no-totp``,
+    not the command's default.
 
     ``notify_email=None`` leaves it with no address: the service is given :data:`PROVISION_EMAIL`,
     because it refuses none, and :func:`forget_addresses` then clears it. The state is one an
