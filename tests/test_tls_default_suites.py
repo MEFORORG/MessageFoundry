@@ -539,15 +539,14 @@ def test_every_operator_cipher_branch_narrows_tls13_too(
     ``apply_operator_tls_ciphers``, which narrows TLS 1.3 after it. So does the validator's probe,
     which models an engine context. The spy records which context each narrowing reached.
 
-    The spy still narrows, through the real function. Where ``set_ciphersuites`` exists (3.15) the
-    allow-list drops TLS 1.3 AES-128, so a spy that skipped the narrowing left the validator's probe
-    holding that suite and the settings below were refused. On 3.14 the real call is a no-op."""
+    The spy still narrows, through the real function. Where the narrowing acts, the allow-list drops
+    TLS 1.3 AES-128, so a spy that skipped it left the validator's probe holding that suite and the
+    settings below were refused (measured on the 3.15 canary)."""
     seen: list[ssl.SSLContext] = []
-    real = tls_policy.narrow_tls13_suites
 
     def spy(ctx: ssl.SSLContext) -> bool:
         seen.append(ctx)
-        return real(ctx)
+        return narrow_tls13_suites(ctx)  # the name imported above, so never this spy
 
     monkeypatch.setattr(tls_policy, "narrow_tls13_suites", spy)
     one = "ECDHE-ECDSA-AES256-GCM-SHA384"

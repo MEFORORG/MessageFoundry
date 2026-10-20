@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import ssl
+import tomllib
 import types
 from collections.abc import Iterator
 from itertools import product
@@ -247,6 +248,21 @@ def test_kex_groups_report_reports_inherited_today() -> None:
     assert "inherited" in report  # nothing is pinned on a pre-3.15 interpreter
     assert APPROVED_KEX_GROUPS in report  # names the approved list it WOULD pin
     assert "pinned:" not in report  # the "pinned:" branch is 3.15-only
+
+
+def test_the_py315_tripwire_mark_has_not_outlived_the_314_floor() -> None:
+    """``PY315_TLS_TRIPWIRE`` is an expected failure on 3.15 only while 3.14 is still supported. Once
+    the floor leaves 3.14, every CI leg runs 3.15 and the marked tests would read as expected failures
+    for good. This reds on the floor change, so the change that makes it does the re-derivation."""
+    project = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    requires = project["project"]["requires-python"]
+    assert requires == ">=3.14", (
+        f"requires-python is now {requires!r}. If it no longer admits 3.14, do the re-derivation "
+        "PY315_TLS_TRIPWIRE's reason names, then remove the mark (tests/_py315_tripwires.py) and this "
+        "test. If it still admits 3.14, update the expected string here."
+    )
 
 
 # --- harden_verify_flags -----------------------------------------------------------------------

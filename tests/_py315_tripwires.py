@@ -4,14 +4,25 @@
 
 Each marked test asserts a 3.14 fact about the ``ssl`` module: no ``set_ciphersuites``, no
 ``set_client_sigalgs``, no key-exchange group list. CPython 3.15 adds all three, so on 3.15 each one
-fails on purpose and names the security record that must be re-derived. That re-derivation belongs
-to the change that raises the floor to 3.15, not to the advisory canary that runs on 3.15 today.
+fails on purpose and names the security record that must be re-derived. The advisory 3.15 canary
+measured exactly that (run 39418750602). The re-derivation is still owed; this mark does not do it,
+it only stops the canary reporting the same known finding every week.
 
-The condition keeps 3.14 exactly as before: the mark is inert there and every test asserts as it did.
-``strict=True`` makes the mark a tripwire of its own on 3.15. A marked test that PASSES there turns
-the canary red, because the fact it measures changed again. ``raises=AssertionError`` keeps any other
-exception red too: every marked test fires through an ``assert``, so a ``TypeError`` or an import
-failure is a new break, not the tripwire.
+On 3.14, the supported floor, the mark is inert and every test asserts as it did.
+
+On 3.15 the mark is a tripwire of its own, and a coarse one:
+
+* ``strict=True``: a marked test that PASSES there turns the canary red, because the fact it measures
+  changed again.
+* ``raises=AssertionError``: an exception that is not an ``AssertionError`` stays red, for example a
+  ``TypeError`` or an ``ImportError``.
+* WHAT IT DOES NOT DO. Any ``AssertionError`` in a marked test reads as the expected failure on 3.15,
+  including one from a non-tripwire control in the same test, such as a handshake that should
+  succeed. So on 3.15 these tests positively check nothing. Real 3.15 arms that assert the pin and
+  the narrowing took belong to the re-derivation.
+
+``test_the_py315_tripwire_mark_has_not_outlived_the_314_floor`` in ``tests/test_tls_policy.py`` goes
+red when the floor leaves 3.14, so the mark cannot become a permanent expected failure there.
 """
 
 from __future__ import annotations

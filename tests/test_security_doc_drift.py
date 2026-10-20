@@ -1796,9 +1796,10 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
 _TEXT_TO_CODE = frozenset({"parse", "_parse", "_code_only", "_code_text"})
 #: Calls that return raw source or prose.
 _RAW_TEXT_READS = frozenset({"read_text", "read_bytes", "getsource", "getsourcelines"})
-#: Regex functions that scan the raw text passed to them.
+#: Regex functions that scan the raw text passed to them. ``prefixmatch`` is CPython 3.15's new name
+#: for ``match``.
 _TEXT_SCANS = frozenset(
-    {"search", "match", "fullmatch", "findall", "finditer", "split", "sub", "subn"}
+    {"search", "match", "prefixmatch", "fullmatch", "findall", "finditer", "split", "sub", "subn"}
 )
 #: String methods that scan the raw text they are called on.
 _TEXT_METHODS = frozenset(

@@ -22,8 +22,10 @@
 # diagnostic step is continue-on-error so all outcomes are collected, and a final verdict step rules
 # on them. A canary that cannot fail cannot tell "flew clean" from "never flew".
 #
-# EXPECT RED AT FIRST. Several TLS tests are tripwires built to fire once the 3.15 APIs appear. The
-# local 3.15 prerelease measurements are in the pull request that added this file.
+# Several TLS tests are tripwires built to fire once the 3.15 APIs appear, and they did. On 3.15 they
+# are strict expected failures through tests/_py315_tripwires.py, which says what that mark does and
+# does not check. A tripwire that stops firing turns this red again. The local 3.15 prerelease
+# measurements are in the pull request that added this file.
 
 name: python 3.15 canary
 

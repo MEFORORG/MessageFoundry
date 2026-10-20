@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
@@ -34,7 +35,6 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 from tests._role_pairing import bypass_view_raw_pairing_rule
 from tests._session_race import rotate_after_first_call
 
@@ -2660,7 +2660,6 @@ async def test_security_posture_reports_fips_attestation(engine: Engine) -> None
     assert rows  # at least the read above was recorded
 
 
-@PY315_TLS_TRIPWIRE
 async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
     # #338 / ASVS 11.6.2: the posture route reports whether the approved TLS key-exchange groups are
     # PINNED on built contexts or INHERITED from OpenSSL's default group list — report-only metadata,
@@ -2677,7 +2676,11 @@ async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
     body = resp.json()
     # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
     assert body["kex_groups"] == kex_groups_report()
-    assert "inherited" in body["kex_groups"]
+    # The value itself is the kex tripwires' to read (tests/test_tls_policy.py), and on 3.15 they are
+    # PY315_TLS_TRIPWIRE expected failures. The route's contract, the equality above and the audit row
+    # below, still holds on 3.15, so only this line is version-conditioned rather than the whole test.
+    if sys.version_info < (3, 15):
+        assert "inherited" in body["kex_groups"]
     # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
     rows = await engine.store.list_audit(limit=20, action="security.posture_view")
     assert rows  # at least the read above was recorded
