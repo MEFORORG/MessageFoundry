@@ -198,7 +198,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     reads, and with it ``RolesGained``, the type of one of its fields.
 
     BACKLOG #3082 added ``DirectoryRefusal``, the type of ``Elevation.directory_refusal``, which the
-    console imports to pick the text for each fix."""
+    console imports to pick the text for each fix.
+
+    BACKLOG #3374 added ``OidcStepUpFlow``, the live step-up flow the ``/ui/oidc`` callback reads
+    to charge a step-up return to the staged user's ceremony budget."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
@@ -208,6 +211,7 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "MfaStatus",
         "NotifyEmailAlreadySet",
         "OidcStepUp",
+        "OidcStepUpFlow",
         "RolesGained",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
         "STEP_UP_ACTION_ADMIN_RESET_MFA",

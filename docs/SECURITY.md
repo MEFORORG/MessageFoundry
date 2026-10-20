@@ -5650,11 +5650,12 @@ the sign-in surface cannot deny those, or the step-up actions behind them.
 session steps up only at the IdP. Its start, `POST /ui/reauth/oidc`, draws limiter 3 under the
 session's user. The IdP returns through `GET /ui/oidc/callback`, which cannot read the session
 cookie. So before it charges anything, the callback reads the user that the start leg staged on the
-flow its cookie names (`oidc_step_up_actor` runs ahead of both limiters), and charges limiter 3
+flow its cookie names (`oidc_step_up_flow` runs ahead of both limiters), and charges limiter 3
 under that user. Only a callback whose cookie names no live step-up flow charges limiter 2: a
 sign-in return, or a forged, missing or expired cookie. So a flood on the sign-in surface cannot
 refuse an IdP step-up, and one IdP step-up spends two of its user's limiter 3 attempts, one per leg.
-A refused return answers **429** with the step-up page, no `Retry-After` and no audit row, and
+A refused return answers **429** with the step-up page for the staged continuation, no
+`Retry-After` and no audit row, and
 consumes nothing, so the real return can be retried once the budget refills. The flow cookie is
 SameSite=Lax, so a foreign page can send a browser that holds a live step-up flow to the callback.
 Each such navigation spends that one user's limiter 3 budget while the flow lives. That is no

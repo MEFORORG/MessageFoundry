@@ -365,9 +365,11 @@ def _flow_id(c: httpx.AsyncClient) -> str:
 
 
 def _drain_sign_in_window(service: AuthService) -> None:
-    """Spend the sign-in window's GLOBAL budget from many addresses, as a flood would."""
-    for i in range(200):
-        service.allow_login_attempt(f"203.0.113.{i}")
+    """Spend the sign-in window's GLOBAL budget from many addresses, as a flood would. The sign-in
+    before it already spent some, so the loop stops at the first refusal."""
+    for i in range(_settings().login_rate_limit_global):
+        if not service.allow_login_attempt(f"203.0.113.{i}"):
+            break
     assert not service.allow_login_attempt("127.0.0.1"), "fixture: the window is not spent"
 
 
@@ -405,25 +407,30 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         token = await _federated_sign_in(service, c, monkeypatch)
         identity = await service.identity_for_token(token)
         assert identity is not None
+        issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
         assert start.status_code == 303
         flow_id = _flow_id(c)
-        while service.allow_reauth_attempt(identity.user_id):
-            pass
+        # The start leg spent one attempt of the user's budget; spend the rest.
+        for _ in range(_settings().login_rate_limit_per_ip - 1):
+            assert service.allow_reauth_attempt(identity.user_id), "fixture: refused before the cap"
+        assert not service.allow_reauth_attempt(identity.user_id), "fixture: budget not spent"
         assert service.allow_login_attempt("127.0.0.1"), "the sign-in window must be untouched"
-        rows_before = len(await service.store.list_audit(limit=1000))
+        rows_before = await service.store.count_audit(limit=None)
 
         r = await _callback(c, start.headers["location"])
 
         assert r.status_code == 429, r.text
         assert "Too many attempts" in r.text
+        assert "Reload the engine configuration" in r.text  # the action the operator started from
         assert 'action="/ui/reauth/oidc"' in r.text and 'name="password"' not in r.text
         assert "retry-after" not in r.headers
-        assert len(await service.store.list_audit(limit=1000)) == rows_before
+        assert await service.store.count_audit(limit=None) == rows_before
         assert await service.identity_for_token(token) is not None
         assert not await service.has_recent_step_up(token)
         # Nothing was consumed: the flow and its cookie wait for a retry of the real return.
-        assert service.oidc_step_up_actor(flow_id) == identity.user_id
+        staged = service.oidc_step_up_flow(flow_id)
+        assert staged is not None and staged.user_id == identity.user_id
         assert _flow_id(c) == flow_id
         monkeypatch.setattr(service, "_reauth_limiter", None)  # the budget refilled
         retry = await _callback(c, start.headers["location"])

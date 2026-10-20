@@ -136,9 +136,8 @@ class PendingFlow:
     #: with this set elevates THAT session and never mints a new one, and a sign-in flow never
     #: elevates anything, so each completion refuses the other kind.
     step_up_session_hash: str | None = None
-    #: STEP-UP flows only: the id of the user whose session staged the flow, read from that session
-    #: at the start leg. The callback charges the per-actor ceremony budget under it, since it
-    #: cannot read the session cookie to learn who is stepping up (BACKLOG #3374).
+    #: STEP-UP flows only, set with ``step_up_session_hash``: the id of the user whose session
+    #: staged the flow. ``AuthService.oidc_step_up_flow`` says why the callback needs it (#3374).
     step_up_user_id: str | None = None
     #: The ADR 0077 action the step-up is for, if any, so the single-use grant is minted for the
     #: action the operator started from. ``None`` refreshes only the session window.
@@ -266,7 +265,11 @@ def start_flow(
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
     ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks.
+    A step-up flow names both its session and its user, or neither: a step-up flow with no user
+    would draw the sign-in window at the callback (BACKLOG #3374).
     """
+    if (step_up_session_hash is None) != (step_up_user_id is None):
+        raise ValueError("a step-up flow stages both its session hash and its user id")
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
     flow = PendingFlow(

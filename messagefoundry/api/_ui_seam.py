@@ -620,8 +620,9 @@ from typing import Any
 #: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
 #: removed. The digest moved again; re-derived with ``--write``.
 #:
-#: BACKLOG #3374: ``AuthService.oidc_flow_is_step_up`` became ``oidc_step_up_actor``, which returns
-#: the user id a live step-up flow was staged for, or None, where it returned a bool. The
+#: BACKLOG #3374: ``AuthService.oidc_flow_is_step_up`` became ``oidc_step_up_flow``, which returns
+#: a live step-up flow's user id and continuation as the new ``OidcStepUpFlow``, or None, where it
+#: returned a bool. The route types its value so discovery sees the DTO. The
 #: ``/ui/oidc/callback`` route charges an IdP step-up's return to that user's ceremony budget
 #: rather than the sign-in window, so a newer console on an older engine would raise
 #: AttributeError on every callback, and an older console on this engine would on every one too.
@@ -633,7 +634,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7ab6eb61afe4dae7"
+ENGINE_UI_SEAM: str = "b6270406897ee7c6"
 
 
 @dataclass(frozen=True, slots=True)

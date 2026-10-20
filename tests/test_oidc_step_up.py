@@ -43,6 +43,7 @@ from messagefoundry.auth.service import (
     STEP_UP_NOT_FRESH,
     STEP_UP_SUBJECT_MISMATCH,
     AuthService,
+    OidcStepUpFlow,
 )
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
@@ -258,7 +259,7 @@ async def test_the_step_up_request_sends_max_age_zero_and_prompt_login(
         identity = await service.identity_for_token(token)
         assert identity is not None
         assert flow.step_up_user_id == identity.user_id
-        assert service.oidc_step_up_actor(flow_id) == identity.user_id
+        assert service.oidc_step_up_flow(flow_id) == OidcStepUpFlow(identity.user_id, NEXT)
     finally:
         await store.close()
 
@@ -319,7 +320,7 @@ async def test_a_fresh_idp_proof_elevates_rotates_and_grants(
         rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
         assert rows[-1]["ok"] is True and rows[-1]["mech"] == "oidc"
         # Single use: the flow is gone.
-        assert service.oidc_step_up_actor(flow_id) is None
+        assert service.oidc_step_up_flow(flow_id) is None
     finally:
         await store.close()
 
@@ -1020,7 +1021,7 @@ async def test_a_wrong_state_is_refused(
         assert not out.ok and out.reason == "state_mismatch"
         await _assert_untouched(service, token)
         # PEEKED, not popped: a forged callback must not cancel the step-up in flight.
-        assert service.oidc_step_up_actor(flow_id) is not None
+        assert service.oidc_step_up_flow(flow_id) is not None
         rows = await _audit_rows(store, "auth.reauth")
         assert rows[-1]["actor"] == "<oidc>", "an unverified refusal was filed under the account"
     finally:
@@ -1105,14 +1106,14 @@ async def test_an_abandoned_step_up_consumes_the_flow_and_keeps_the_continuation
         )
         # A cancel without the flow's own state (any page can send error=) consumes nothing.
         assert not forged.ok and forged.reason == "state_mismatch"
-        assert service.oidc_step_up_actor(flow_id) is not None
+        assert service.oidc_step_up_flow(flow_id) is not None
 
         out = await service.abandon_oidc_step_up(
             flow_id, state=_staged(service, flow_id).state, reason="idp_error", client=None
         )
 
         assert not out.ok and out.reason == "idp_error" and out.return_to == NEXT
-        assert service.oidc_step_up_actor(flow_id) is None
+        assert service.oidc_step_up_flow(flow_id) is None
         await _assert_untouched(service, token)
     finally:
         await store.close()
@@ -1383,3 +1384,22 @@ async def test_an_account_change_during_the_token_exchange_is_not_elevated(
             assert session is not None and session.reauth_at is None
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize(
+    ("session_hash", "user_id"), [("a-session-hash", None), (None, "a-user-id")]
+)
+def test_a_step_up_flow_stages_its_session_and_user_together(
+    session_hash: str | None, user_id: str | None
+) -> None:
+    """BACKLOG #3374. RED when: a step-up flow can be staged naming its session but no user. The
+    callback would then find no user to charge, and draw the sign-in window for that return."""
+    cache = oidc.FlowCache()
+    with pytest.raises(ValueError, match="both its session hash and its user id"):
+        oidc.start_flow(
+            cache,
+            return_to="/ui",
+            client_ip="198.51.100.7",
+            step_up_session_hash=session_hash,
+            step_up_user_id=user_id,
+        )

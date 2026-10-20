@@ -56,6 +56,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
+from tests._ast_sites import call_sites
 from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -1567,47 +1568,47 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     # the ceremony budget on a step-up return and the sign-in window otherwise (BACKLOG #3374).
     routes = _console_route_funcs()
     callback = routes["GET /ui/oidc/callback"]
-    peek_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_step_up_actor")]
+    peek_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_step_up_flow")]
     charge_at = [
         i
         for i, s in enumerate(callback.body)
         if _called(s, "allow_login_attempt") or _called(s, "allow_reauth_attempt")
     ]
     assert peek_at and charge_at and peek_at[0] < charge_at[0], (
-        "GET /ui/oidc/callback no longer reads oidc_step_up_actor before it charges a limiter; the "
+        "GET /ui/oidc/callback no longer reads oidc_step_up_flow before it charges a limiter; the "
         "limiter split in the 6.1.1 section says it picks the budget from the staged flow."
     )
+
+    def _any_called(stmts: list[ast.stmt], name: str) -> bool:
+        return any(_called(st, name) for st in stmts)
+
     splits = [
         s
         for s in callback.body
         if isinstance(s, ast.If)
-        and _called(ast.Module(body=s.body, type_ignores=[]), "allow_reauth_attempt")
-        and not _called(ast.Module(body=s.body, type_ignores=[]), "allow_login_attempt")
-        and _called(ast.Module(body=s.orelse, type_ignores=[]), "allow_login_attempt")
-        and not _called(ast.Module(body=s.orelse, type_ignores=[]), "allow_reauth_attempt")
+        and _any_called(s.body, "allow_reauth_attempt")
+        and not _any_called(s.body, "allow_login_attempt")
+        and _any_called(s.orelse, "allow_login_attempt")
+        and not _any_called(s.orelse, "allow_reauth_attempt")
     ]
     assert len(splits) == 1, (
         "GET /ui/oidc/callback no longer charges exactly one budget per return: the ceremony budget "
         "on a step-up return, the sign-in window on any other. The 6.1.1 limiter split says it does."
     )
-    actor_names = {
+    # The budget is charged under the staged flow's user, whatever the peek's result is named.
+    flow_names = {
         t.id
         for s in callback.body
-        if isinstance(s, ast.Assign) and _called(s, "oidc_step_up_actor")
-        for t in s.targets
+        if isinstance(s, ast.Assign | ast.AnnAssign) and _called(s, "oidc_step_up_flow")
+        for t in (s.targets if isinstance(s, ast.Assign) else [s.target])
         if isinstance(t, ast.Name)
     }
     charged_with = {
-        ast.unparse(n.args[0])
-        for n in ast.walk(splits[0])
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "allow_reauth_attempt"
-        and n.args
+        ast.unparse(n.args[0]) for n in call_sites(splits[0], "allow_reauth_attempt") if n.args
     }
-    assert actor_names and charged_with == actor_names, (
-        f"the callback charges the ceremony budget under {sorted(charged_with)}, not the actor "
-        f"oidc_step_up_actor read from the staged flow ({sorted(actor_names)})."
+    assert flow_names and charged_with == {f"{name}.user_id" for name in flow_names}, (
+        f"the callback charges the ceremony budget under {sorted(charged_with)}, not the user "
+        f"oidc_step_up_flow read from the staged flow ({sorted(flow_names)})."
     )
     reauth_oidc = routes["POST /ui/reauth/oidc"]
     assert _called(reauth_oidc, "allow_reauth_attempt") and not _called(
@@ -1765,7 +1766,7 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         assert token in table_a, f"Table A's failures row must state {token!r}."
     for token in (
         "**An `oidc` session's step-up draws limiter 3 at both of its legs (BACKLOG #3374).**",
-        "`oidc_step_up_actor` runs ahead of both limiters",
+        "`oidc_step_up_flow` runs ahead of both limiters",
         "Only a callback whose cookie names no live step-up flow charges limiter 2",
         "Only the second-step lock refuses the code leg.",
         "Three of the four can end a lock that is still live",
