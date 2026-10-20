@@ -663,6 +663,17 @@ _PR_VERDICT_MUST_FIRE = [
     # The tree scan's tight pair, behind words the version filter would otherwise read as a lead.
     f"Applies to {_REQ}{': '}{_PARTIAL}",
     f"The follow-up {_REQ}{' = '}{_FAIL}",
+    # Markdown around the identifier or the verdict: emphasis, a link, a wrapped quote, an en dash.
+    f"ASVS _{_REQ}_ stays __{_PARTIAL}__.",
+    f"[ASVS {_REQ}](https://example.org/asvs/v16) stays {_PARTIAL}.",
+    f"> The vault re-read held ASVS {_REQ}\n> at {_PARTIAL} on review.",
+    f"> ASVS {_REQ} stays\n> {_PARTIAL} until the re-read.",
+    f"ASVS {_REQ} \u2013 {_PARTIAL}",
+    # A record verb binds even where the word before the identifier reads as a version lead.
+    f"Applies to {_REQ} which stays {_PARTIAL}.",
+    f"Cross-cutting {_REQ} stays {_PARTIAL}.",
+    f"Downgrades ASVS {_REQ} to {_PARTIAL}.",
+    f"ASVS {_REQ} now passes.",
 ]
 _PR_GAP_MUST_FIRE = [
     # Sentence-final: the identifier's own full stop must not hide it.
@@ -675,6 +686,7 @@ _PR_MAP_MUST_FIRE = [
     f"`pkg/example_module.py` states the ASVS {_REQ} guarantee for every caller.",
     f"| `tests/test_example_widget.py` | {_REQ} | extracts one shared helper |",
     f"Vault cell {_REQ} anchors on the `pkg/example.py:12` citation.",
+    f"ASVS {_REQ} is enforced at https://github.com/example/repo/blob/main/pkg/example_guard.py#L40",
 ]
 
 #: Ordinary pull request text with NO requirement number at all -- the Lander's negative control. It
@@ -712,6 +724,15 @@ _PR_VERSION_MUST_STAY_QUIET = [
     "requires 6.1.1 to pass the collection step",
     "Parses a 2.5.1 ADT^A01 in tests/test_example_parse.py without the strict validator.",
     "This uncovered a bug in 1.2.3 handling, now fixed.",
+    "Parses HL7 V2.5.1 ADT messages in pkg/example_peek.py.",
+    "Adds HL7 V2.3.1 support; the gap in segment handling is closed.",
+    f"- Python 3.14.6{': '}{_PASS}",
+    "Per RFC 6455 section 5.5.1, ping handling lives in pkg/example_ws.py.",
+    "<p>Changes in 7.1.2: fix</p><p>the residual leak in pkg/example_linux.py</p>",
+    # A heading is its own unit, so the next paragraph's identifier is not beside the heading's path.
+    f"## Changes to pkg/example_app.py\nContext: ASVS {_REQ} is cited in the brief.",
+    # The failure MODE of a control is not a verdict.
+    f"ASVS {_REQ} is now fail closed on a bad input.",
 ]
 
 
@@ -821,13 +842,17 @@ def test_the_pr_body_event_mode_reads_the_webhook_payload(sf, tmp_path: Path) ->
 
 
 def test_a_staged_file_named_like_the_flag_does_not_switch_the_commit_gate(
-    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """pre-commit passes ``--require-tokens`` and then the staged names, so the body modes only count as
-    the WHOLE command line. Anywhere else the tree scan must run, and here fail closed on no tokens."""
+    the WHOLE command line. Anywhere else the TREE scan's own argument handling owns the flag and refuses
+    it as an unknown option. Both paths exit 2, so the assertion is on which one spoke."""
     monkeypatch.setattr(sf, "LOCAL_TOKEN_FILE", tmp_path / "absent-tokens.txt")
     monkeypatch.delenv("MEFOR_FORBIDDEN_TOKENS", raising=False)
     assert sf.main(["--require-tokens", "--pr-body", str(tmp_path / "x.md")]) == 2
+    err = capsys.readouterr().err
+    assert "unknown option" in err, err
+    assert "usage" not in err and "pull request body" not in err, err
 
 
 def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> None:

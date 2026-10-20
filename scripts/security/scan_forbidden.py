@@ -417,19 +417,24 @@ _RECORD_PAIR: tuple[re.Pattern[str], ...] = (
 # REASON-ONLY, like every record detector here: the identifier beside its verdict IS the disclosure, so
 # a hit names a line and a kind and never echoes the text into a public CI log.
 _PR_REQ_ID = re.compile(
-    r"(?<![\w.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?!\w|\.\d)"
+    # Letters and digits, not `\w`, bound the shape: `_` is markdown emphasis here, and an underscore
+    # beside the identifier must not hide it.
+    r"(?<![A-Za-z0-9.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![A-Za-z0-9]|\.\d)"
 )
 #: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
-#: rephrase around; it never hides a hit that carries its own requirement context.
+#: rephrase around; a lead never hides a verdict stated with a record verb (see _PR_STRONG_VERB).
 _PR_VERSION_LEAD = re.compile(
-    r"(?i)(?:\b(?:c?python|pypy|openssl|libressl|versions?|releases?|v|from|to|pwsh|powershell"
+    r"(?i)(?:\b(?:c?python|pypy|openssl|libressl|versions?|releases?|v|to|pwsh|powershell|qt"
     r"|node(?:js)?|npm|pip(?:-audit)?|pytest|mypy|ruff|uv|uvicorn|uvloop|fastapi|starlette|pydantic"
     r"|httpx|anyio|lxml|cryptography|signxml|paramiko|zizmor|gh|git|sqlite|postgres(?:ql)?|ubuntu"
-    r"|windows|macos|requests|hl7apy|hl7|semgrep|bandit|gitleaks|trivy|actionlint|go|rust|bumps?)"
+    r"|windows|macos|requests|hl7apy|hl7|semgrep|bandit|gitleaks|trivy|actionlint|go|rust|bumps?"
+    r"|hypothesis|psutil|pyotp|sigstore|mutmut|websockets|sections?)"
     # A word carrying a digit (`ldap3`), a word cut at a hyphen (`openssl-bin-`), or a hyphenated
     # package name (`js-yaml`). Each starts at a word boundary, and `re-` is excluded so the record's
     # own verbs ("re-scores", "re-read") are not mistaken for a package.
-    r"|\b[A-Za-z][\w-]*\d[\w-]*|\b[A-Za-z]\w*-|\b(?!re-)[a-z]+(?:-[a-z]+)+)[\s*`_]*$"
+    r"|\b[A-Za-z][\w-]*\d[\w-]*|\b[A-Za-z]\w*-|\b(?!re-)[a-z]+(?:-[a-z]+)+|\u00a7)"
+    # A table cell edge is transparent, so `| lxml | <version> |` reads the package name.
+    r"[\s*`_|]*$"
     # A pin operator (`==`, `~=`, `@`) or a field separator with no space before it (an HL7 version
     # field, `VER=`): neither is how prose or a markdown table cell introduces a requirement.
     r"|(?:[=@~<>^]|\S\|)[\s*`_]*$"
@@ -440,35 +445,48 @@ _PR_VERSION_TAIL = re.compile(
     r"^[*`_]*\s+(?:(?:to|->|\u2192)\s+[*`_]*v?\d+\.\d+"
     r"|(?:ADT|ORU|ORM|OML|SIU|MDM|DFT|BAR|VXU|RDE|MFN|ACK|QBP|RSP)\b)"
 )
+#: Even a `V` lead is a version after "HL7": `HL7 V2.5.1` is the message standard, not a requirement.
+_PR_HL7_LEAD = re.compile(r"(?i)\bhl7[\s*`_]*$")
 _PR_FMT = r"[*`_\"']*"
 _PR_SEP = r"[\s*`_\"']+"
+#: Binds a label to a value: colon, equals, pipe, the dashes and arrows, a bracket or table cell edge.
+_PR_BIND = r"[:=|\-\u2013\u2014\u2192"
 #: The tree scan's verdict words plus the spellings prose uses for them, so a word added to the record
-#: vocabulary reaches both surfaces.
-_PR_VERDICT = rf"(?:{_RECORD_VERDICT}|na|needs review|not met|unmet|met)(?![\w/-])"
-_PR_STATE_VERB = (
-    r"(?:stays?|remains?|held at|holds? at|holding at|is(?: now| still)?|was|are|went to|goes to"
-    r"|moves? to|moved to|back to|re-?scored(?: as)?|scored(?: as)?|scores|reads|now|at"
-    # "<id> went from partial to pass" names the old verdict as surely as the new one.
-    r"|(?:went|goes|moves?|moved)? ?from)"
+#: vocabulary reaches both surfaces. "fail closed" and its kin name a control's failure MODE, which is
+#: what a security pull request describes; they are not a verdict.
+_PR_VERDICT = (
+    rf"(?:{_RECORD_VERDICT}|passes|fails|passing|failing|na|needs review|not met|unmet|met)"
+    r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
 )
+#: Verbs that only a record uses of a verdict. A version does not "stay partial", so these bind even an
+#: identifier the version filter set aside ("Applies to <id>, which stays partial").
+_PR_STRONG_VERB = (
+    r"(?:stays?|remains?|held at|holds? at|holding at|went to|goes to|moves? to|moved to|back to"
+    r"|re-?scored(?: as)?|scored(?: as)?|scores"
+    # "<id> went from partial to pass" names the old verdict as surely as the new one.
+    r"|(?:went|goes|moves?|moved) from)"
+)
+_PR_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
 _PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+cell)?"
-    rf"(?:\s*[:=|\-\u2014\u2192>\](]+\s*|{_PR_SEP})"
-    rf"(?:{_PR_FMT}(?:{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
+    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP})"
+    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?"
+    rf"(?:(?P<strong>{_PR_STRONG_VERB})|{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
 _PR_MOVE_LEAD = re.compile(
-    r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of)"
-    rf"{_PR_SEP}(?:(?:the|vault|cells?){_PR_SEP})*$"
+    r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
+    r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped)"
+    rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
 )
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
+_PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
 _PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
-_PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*[:=|\-\u2014<\[(]+\s*{_PR_FMT}$")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
@@ -483,17 +501,25 @@ _PR_GAP = re.compile(
     r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
     r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
 )
-#: A source path, a path under one of this repository's code roots, or a dotted engine module. Docs are
-#: deliberately not code here: the ruled kind is a map to the code that implements a requirement.
+#: A source path, a path under one of this repository's code roots, a dotted engine module, or a link to
+#: a file on GitHub. Docs are deliberately not code here: the ruled kind is a map to the code that
+#: implements a requirement.
 _PR_CODE = re.compile(
     r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)\b"
     r"|(?<![\w/.-])(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
     r"|\bmessagefoundry\w*(?:\.\w+)+"
+    r"|\bgithub\.com/[\w.-]+/[\w.-]+/(?:blob|tree)/\S+"
 )
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
-_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])")
-_PR_BLOCK_START = re.compile(r"(?:[-*+]|\d+[.)])\s|#|>")
+#: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
+#: HTML, and a tag is a block edge there however the text runs on.
+_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+_PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
+_PR_HEADING = re.compile(r"#{1,6}\s")
+_PR_QUOTE = re.compile(r"(?:>\s?)+")
+#: A markdown link reads as its text: `[<id>](url) stays partial` is the identifier beside its verdict.
+_PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
@@ -502,10 +528,11 @@ PR_BODY_REASONS = {
 
 
 def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
-    """Split a PR body into the units a sentence can live in.
+    """Split a PR body into the units a sentence can live in, as markdown renders them.
 
-    A blank line, a list item, a heading, a quote or a table row starts a new unit; any other line
-    continues the paragraph above it, so a hard-wrapped sentence is read whole. Each unit carries
+    A blank line, a list item or a table row starts a new unit, and a heading is a unit of its own; any
+    other line continues the paragraph above it, so a hard-wrapped sentence is read whole. A quote is
+    read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
     (offset, line) marks so a hit can be reported at the line its identifier sits on.
     """
     units: list[tuple[list[tuple[int, int]], str, bool]] = []
@@ -519,15 +546,15 @@ def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        line = raw.strip()
+        line = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", raw.strip(), count=1).strip())
         if not line:
             flush()
             continue
-        if line.startswith("|"):
+        if line.startswith("|") or _PR_HEADING.match(line):
             flush()
-            units.append(([(0, lineno)], line, True))
+            units.append(([(0, lineno)], line, line.startswith("|")))
             continue
-        if _PR_BLOCK_START.match(line):
+        if _PR_LIST_ITEM.match(line):
             flush()
         offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
         marks.append((offset, lineno))
@@ -540,36 +567,49 @@ def _pr_line_at(marks: list[tuple[int, int]], offset: int) -> int:
     return max(lineno for start, lineno in marks if start <= offset)
 
 
-def _pr_requirement_ids(text: str) -> list[re.Match[str]]:
-    return [
-        m
-        for m in _PR_REQ_ID.finditer(text)
-        if m.group("lead")
-        or not (
-            _PR_VERSION_LEAD.search(text[max(0, m.start() - 40) : m.start()])
-            or _PR_VERSION_TAIL.match(text[m.end() : m.end() + 40])
-        )
-    ]
+def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:
+    """Every requirement-shaped triple, each paired with whether its context says it is a version."""
+    found = []
+    for m in _PR_REQ_ID.finditer(text):
+        before = text[max(0, m.start() - 40) : m.start()]
+        tail = _PR_VERSION_TAIL.match(text[m.end() : m.end() + 40]) is not None
+        if m.group("lead"):
+            version = m.group("lead") == "V" and (tail or _PR_HL7_LEAD.search(before) is not None)
+        else:
+            version = tail or _PR_VERSION_LEAD.search(before) is not None
+        found.append((m, version))
+    return found
 
 
-def _pr_verdict_bound(text: str, m: re.Match[str]) -> bool:
+def _pr_verdict_bound(text: str, m: re.Match[str], version: bool) -> bool:
     before = text[max(0, m.start() - 60) : m.start()]
     after = text[m.end() : m.end() + 80]
-    if _PR_VERDICT_BEFORE.search(before):
+    if not version and _PR_VERDICT_BEFORE.search(before):
         return True
     hit = _PR_VERDICT_AFTER.match(after)
     if hit is None:
         return False
+    if version:
+        return hit.group("strong") is not None
     # A bare "to" is only a verdict binding after a move verb; every other state verb stands alone.
     return hit.group("to") is None or _PR_MOVE_LEAD.search(before) is not None
 
 
-def _pr_table_verdict(row: str) -> bool:
+def _pr_table_verdict(row: str, ids: set[str]) -> bool:
     """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits."""
     cells = [c.strip(" *`_\"'") for c in row.strip().strip("|").split("|")]
-    if not any(_PR_REQ_ID.fullmatch(c) for c in cells):
-        return False
-    return any(_PR_CELL_VERDICT.fullmatch(c) for c in cells)
+    return any(c in ids for c in cells) and any(_PR_CELL_VERDICT.fullmatch(c) for c in cells)
+
+
+def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+    if is_row:
+        return [(0, unit)]
+    sentences, start = [], 0
+    for split in _PR_SENTENCE_SPLIT.finditer(unit):
+        sentences.append((start, unit[start : split.start()]))
+        start = split.end()
+    sentences.append((start, unit[start:]))
+    return sentences
 
 
 def scan_pr_body(body: str) -> list[str]:
@@ -580,48 +620,38 @@ def scan_pr_body(body: str) -> list[str]:
     """
     hits: list[str] = []
     for marks, unit, is_row in _pr_units(body):
-        if is_row:
-            sentences = [(0, unit)]
-        else:
-            sentences, start = [], 0
-            for split in _PR_SENTENCE_SPLIT.finditer(unit):
-                sentences.append((start, unit[start : split.start()]))
-                start = split.end()
-            sentences.append((start, unit[start:]))
-        for start, sentence in sentences:
+        for start, sentence in _pr_sentences(unit, is_row):
             found: dict[str, int] = {}
-            # The tree scan's tight pair first, before the version filter below can drop its identifier:
-            # whatever that scan flags in a file, this one flags in a body.
-            pair = next((m for p in _RECORD_PAIR if (m := p.search(sentence))), None)
-            if pair is not None:
-                found["verdict"] = pair.start()
+            # The tree scan's tight pair, before the version filter can set its identifier aside: what
+            # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
+            # requirement shape, since the tree scan's own shape admits every dotted triple.
+            for p in _RECORD_PAIR:
+                pair = p.search(sentence)
+                if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
+                    found["verdict"] = pair.start()
+                    break
             ids = _pr_requirement_ids(sentence)
-            if not ids and not found:
-                continue
-            if not ids:
-                pass
-            elif is_row:
-                # The whole row is one window: a table pairs an identifier cell with any other cell.
-                first = ids[0].start()
+            for m, version in ids:
+                # A table pairs an identifier cell with any other cell, so a row is one whole window.
+                window = (
+                    sentence
+                    if is_row
+                    else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
+                )
                 if "verdict" not in found and (
-                    any(_pr_verdict_bound(sentence, m) for m in ids) or _pr_table_verdict(sentence)
+                    _pr_verdict_bound(sentence, m, version)
+                    or (not version and not is_row and _PR_PROSE_VERDICT.search(window))
                 ):
-                    found["verdict"] = first
-                if _PR_GAP.search(sentence):
-                    found["gap"] = first
-                if _PR_CODE.search(sentence):
-                    found["map"] = first
-            else:
-                for m in ids:
-                    window = sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
-                    if "verdict" not in found and (
-                        _pr_verdict_bound(sentence, m) or _PR_PROSE_VERDICT.search(window)
-                    ):
-                        found["verdict"] = m.start()
-                    if "gap" not in found and _PR_GAP.search(window):
-                        found["gap"] = m.start()
-                    if "map" not in found and _PR_CODE.search(window):
-                        found["map"] = m.start()
+                    found["verdict"] = m.start()
+                if version:
+                    continue
+                if "gap" not in found and _PR_GAP.search(window):
+                    found["gap"] = m.start()
+                if "map" not in found and _PR_CODE.search(window):
+                    found["map"] = m.start()
+            requirement_ids = {m.group(0) for m, version in ids if not version}
+            if is_row and "verdict" not in found and _pr_table_verdict(sentence, requirement_ids):
+                found["verdict"] = 0
             for kind in PR_BODY_REASONS:
                 if kind in found:
                     hit = f"pr-body:{_pr_line_at(marks, start + found[kind])}: {PR_BODY_REASONS[kind]}"
@@ -1837,8 +1867,8 @@ def _pr_body_mode(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    # BACKLOG #3364. A terminal mode read before the token load: it scans text that is not a file in the
-    # tree, and none of its detectors come from the token source.
+    # BACKLOG #3364. A terminal mode taken before any token-floor handling: it scans text that is not a
+    # file in the tree, and none of its detectors come from the token source.
     if argv and argv[0].startswith("--pr-body"):
         return _pr_body_mode(argv)
     reload_tokens()
