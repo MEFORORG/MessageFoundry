@@ -1,5 +1,8 @@
-- **certifi moves to 2026.10.19 in every lock, for GHSA-6q48-6c7w-9gw2.** certifi 2026.7.22, the
-  version locked before, still trusted the emSign ECC Root CA - G3 root, and eight eMudhra
-  intermediates that chain to it have compromised private keys. A client trusting that bundle would
-  accept a certificate issued with one of those keys for any hostname. certifi 2026.10.19 drops the
-  affected roots. Only certifi and its hashes change.
+- **The repository's locks pin certifi 2026.10.19, past
+  [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2).** The version locked
+  before, 2026.7.22, trusted a root whose intermediates have compromised keys, and certifi
+  2026.10.19 drops that root. A hop that trusts the certifi bundle, such as a Vault hop with no CA
+  file set, would otherwise accept a forged certificate from an on-path attacker. Not covered by
+  this change: `pyproject.toml` declares no certifi floor, so an upgrade into an existing
+  environment can keep the old version; the copy pip vendors; and the container image's own trust
+  store.
