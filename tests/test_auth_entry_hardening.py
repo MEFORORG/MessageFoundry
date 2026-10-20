@@ -185,12 +185,13 @@ def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_j
         AuthSettings(admin_write_rate_limit_window_seconds=window)
 
 
-async def test_login_retry_after_reads_the_bucket_the_gate_charged(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("window", "expected"), [(37.5, 38), (60.0, 60), (0.2, 1)])
+async def test_login_retry_after_is_the_whole_window_whatever_the_bucket_holds(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, window: float, expected: int
 ) -> None:
-    # BACKLOG #3293. An attempt with no address is charged to the "unknown" bucket, so its wait
-    # must be read from that bucket too. Read from any other key it would be 1 while the gate still
-    # refused. With the limiter off, no refusal happens and the accessor answers its floor of 1.
+    # BACKLOG #3293, owner ruling 2026-10-20: the sign-in 429 sends the whole window, rounded up and
+    # never below 1, so it carries no bucket's timing. It reads the same before any attempt, with
+    # the bucket full, and just before it drains.
     clock = [1000.0]
     monkeypatch.setattr(
         "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
@@ -200,16 +201,21 @@ async def test_login_retry_after_reads_the_bucket_the_gate_charged(
         AuthSettings(
             login_rate_limit_per_ip=1,
             login_rate_limit_global=1000,
-            login_rate_limit_window_seconds=37.5,
+            login_rate_limit_window_seconds=window,
         ),
     )
+    assert svc.login_retry_after() == expected
     assert svc.allow_login_attempt(None)
-    clock[0] = 1020.0
     assert not svc.allow_login_attempt(None)
-    assert svc.login_retry_after(None) == svc.login_retry_after("unknown") == 18
-    assert svc.login_retry_after("127.0.0.1") == 1  # another address has room: the control
+    assert svc.login_retry_after() == expected
+    clock[0] += window * 0.99
+    assert svc.login_retry_after() == expected
+
+
+async def test_retry_after_floor_is_1_with_the_limiter_off(engine: Engine) -> None:
+    # No refusal happens with the limiter off; the accessor answers its floor rather than raising.
     off = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
-    assert off.login_retry_after(None) == off.reauth_retry_after("a") == 1
+    assert off.reauth_retry_after("a") == 1
 
 
 def test_admin_write_count_refuses_a_negative_value_at_load() -> None:

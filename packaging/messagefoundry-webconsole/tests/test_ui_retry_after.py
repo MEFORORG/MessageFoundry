@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #3293 -- the console's PHI-read, sign-in and ceremony 429s send the caller's own wait.
+"""BACKLOG #3293 -- the console's PHI-read, sign-in and ceremony 429s stop sending literals.
 
-They sent literals: ``Retry-After: 10`` on a ``require_ui(phi=True)`` view against a 60 s window,
-and ``Retry-After: 30`` on ``POST /ui/login``, ``/ui/mfa``, ``/ui/reauth`` and
-``/ui/reauth/webauthn`` against a 60 s window. A client that honoured either would have retried
-inside the window and been refused again. BACKLOG #2144 had already done this for the admin-write floor
-(``test_ui_admin_write_pacing.py``).
+They sent ``Retry-After: 10`` on a ``require_ui(phi=True)`` view, and ``Retry-After: 30`` on
+``POST /ui/login``, ``/ui/mfa``, ``/ui/reauth`` and ``/ui/reauth/webauthn``, against a 60 s window.
+A client that honoured either would have retried inside the window and been refused again. The
+authenticated routes now send the caller's own wait, as BACKLOG #2144 did for the admin-write
+floor (``test_ui_admin_write_pacing.py``). ``POST /ui/login`` sends the whole sign-in window
+(owner ruling 2026-10-20): it is unauthenticated, and an exact wait would disclose the timing of
+other callers sharing its per-address bucket.
 
 Every window here is 37.5 s, not the shipped 60 s, so neither retired literal can pass by matching.
 The limiter's own clock is faked, so no test sleeps. All data here is synthetic.
@@ -112,37 +114,47 @@ async def test_phi_view_429_is_the_actors_wait_and_matches_the_json_gate(
         assert (await ui.get("/ui/messages")).status_code == 200  # the header was honest
 
 
-async def test_sign_in_429_is_this_addresss_wait(engine: Engine, clock: list[float]) -> None:
+async def test_sign_in_429_is_the_whole_window_while_a_ceremony_429_is_the_exact_wait(
+    engine: Engine, clock: list[float]
+) -> None:
+    """Owner ruling 2026-10-20: ``POST /ui/login`` sends the whole sign-in window, rounded up, both
+    when its per-address bucket has just filled and when it is about to drain. An exact wait would
+    read 18 and then 1 here. The control is a ceremony 429 on the same limiter knobs at the same
+    instants, which still sends the account's exact wait, so a constant cannot pass for both."""
     service = await _service(
         engine,
         login_rate_limit_per_ip=2,
         login_rate_limit_global=1000,
         login_rate_limit_window_seconds=WINDOW,
     )
+    uid = await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
+        await _ui_login(c, "op")  # t=1000: this address's first sign-in attempt
+        assert service.allow_reauth_attempt(uid)  # and this account's first ceremony
 
-        async def attempt() -> httpx.Response:
+        async def sign_in() -> httpx.Response:
             return await c.post(
                 "/ui/login", data={"username": "nobody", "password": PW}, headers=SAME_ORIGIN
             )
 
-        assert (await attempt()).status_code != 429  # t=1000
+        async def ceremony() -> httpx.Response:
+            return await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
+
         clock[0] = 1010.0
-        assert (await attempt()).status_code != 429  # this address's budget is spent
-        clock[0] = 1020.0
-        refused = await attempt()
-        assert (refused.status_code, refused.headers["Retry-After"]) == (429, "18")
-        clock[0] = 1037.4
-        early = await attempt()
-        assert (early.status_code, early.headers["Retry-After"]) == (429, "1")
-        clock[0] = 1038.0
-        assert (await attempt()).status_code != 429
+        assert (await sign_in()).status_code != 429  # the address's budget is now spent
+        assert service.allow_reauth_attempt(uid)  # and so is the account's ceremony budget
+        for now, exact in ((1020.0, "18"), (1037.4, "1")):
+            clock[0] = now
+            refused = await sign_in()
+            assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38"), now
+            control = await ceremony()
+            assert (control.status_code, control.headers["Retry-After"]) == (429, exact), now
 
 
 async def test_sign_in_429_on_a_full_all_clients_budget_is_the_whole_window(
     engine: Engine, clock: list[float]
 ) -> None:
-    """The true wait would be set by OTHER addresses' attempts, so the caller is told the window."""
+    """The same constant when the all-clients budget, not this address's, refused the attempt."""
     service = await _service(
         engine,
         login_rate_limit_per_ip=50,
@@ -156,7 +168,6 @@ async def test_sign_in_429_on_a_full_all_clients_budget_is_the_whole_window(
         assert (await c.post("/ui/login", data=form, headers=SAME_ORIGIN)).status_code != 429
         clock[0] = 1031.0
         refused = await c.post("/ui/login", data=form, headers=SAME_ORIGIN)
-        # Not the 7 s until the first attempt ages out: the whole window, rounded up.
         assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38")
 
 

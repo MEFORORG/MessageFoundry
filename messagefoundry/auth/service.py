@@ -3157,15 +3157,16 @@ class AuthService:
         API and the ``/ui`` console both send it."""
         return _retry_after_seconds(self._phi_read_limiter, actor)
 
-    def login_retry_after(self, client: str | None) -> int:
-        """The ``Retry-After`` value for a sign-in attempt just refused by
-        :meth:`allow_login_attempt` for ``client`` (BACKLOG #3293).
+    def login_retry_after(self) -> int:
+        """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:
+        the whole sign-in window, rounded UP to whole seconds, never below 1 (BACKLOG #3293).
 
-        Keyed as that gate keys, so an attempt with no address reads the ``"unknown"`` bucket. A full
-        all-clients budget answers the whole window rather than a wait set by other addresses'
-        attempts. Callers that share an address (NAT, an untrusted proxy, or no address at all)
-        share its bucket, so the wait does reflect each other's attempts."""
-        return _retry_after_seconds(self._login_limiter, client or "unknown")
+        A constant, never the bucket's own wait (owner ruling 2026-10-20). The sign-in surface is
+        unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
+        one of them when another's oldest attempt was made. The whole window is never too early: a
+        per-address bucket clears within it once nothing else spends it. The authenticated
+        PHI-read and ceremony 429s keep the exact wait."""
+        return max(1, math.ceil(self.settings.login_rate_limit_window_seconds))
 
     def reauth_retry_after(self, actor: str) -> int:
         """The ``Retry-After`` value for a credential ceremony just refused by

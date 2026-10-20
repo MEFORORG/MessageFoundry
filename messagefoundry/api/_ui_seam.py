@@ -601,6 +601,8 @@ from typing import Any
 #: belongs; they force a bump. ``require_ui``'s body changed too, which moved the route-gate lines.
 #: The console's ``allow_reauth_attempt`` lost its ``getattr`` fallback and calls
 #: ``AuthService.allow_reauth_attempt`` directly, so that method is on the discovered surface now.
+#: Owner ruling 2026-10-20 then made ``login_retry_after`` take no argument: it answers the whole
+#: sign-in window, so a skew raises TypeError at the ``POST /ui/login`` 429.
 #: Re-derived with ``--write`` on main at 45c5ebcfa; re-derive after any merge with another seam move.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
@@ -608,7 +610,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7be4eb854c1c0f25"
+ENGINE_UI_SEAM: str = "59d55f046f916cff"
 
 
 @dataclass(frozen=True, slots=True)

@@ -2265,7 +2265,7 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
         f"the console routes answering with a 303 redirect changed: {redirecting}"
     )
     text = _doc_text()
-    assert "429 + a `Retry-After` naming the caller's wait on `POST /ui/login`" in text, (
+    assert "429 + a `Retry-After` of the whole sign-in window on `POST /ui/login`" in text, (
         "the doc must state the 429 + Retry-After shape of the POST /ui/login sign-in throttle"
     )
     # Pinned inside the two rows that state the breach shape, not anywhere in the file: a token

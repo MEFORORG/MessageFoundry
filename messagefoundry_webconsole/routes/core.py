@@ -661,12 +661,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             raise HTTPException(503, "authentication is not configured")
         client = client_ip(request)
         if not auth.allow_login_attempt(client):
-            # BACKLOG #3293: this address's own wait, or the whole window while the all-clients
-            # budget is spent, never a literal shorter than the window.
+            # BACKLOG #3293, owner ruling 2026-10-20: the whole sign-in window, never the bucket's
+            # own wait, so an unauthenticated caller reads no other caller's timing.
             raise HTTPException(
                 429,
                 "too many login attempts",
-                headers={"Retry-After": str(auth.login_retry_after(client))},
+                headers={"Retry-After": str(auth.login_retry_after())},
             )
         # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
         # Form()/request.form() would fail; a same-origin login POST is always urlencoded here.

@@ -129,9 +129,10 @@ this line.**
   the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
 - **A throttled PHI view, sign-in or ceremony now says how long to wait.** A `require_ui(phi=True)`
   view's `429` carried a literal `Retry-After: 10`, and `POST /ui/login`, `/ui/mfa`, `/ui/reauth`
-  and `/ui/reauth/webauthn` a literal `30`, against a default 60 s window. Each now carries the
-  caller's own wait from the limiter that refused, in whole seconds, and the PHI view sends the
-  value the JSON API sends. Seam change: the console calls the new `AuthService.phi_read_retry_after`,
+  and `/ui/reauth/webauthn` a literal `30`, against a default 60 s window. The PHI view and the
+  three ceremony routes now carry the caller's own wait from the limiter that refused, in whole
+  seconds, and the PHI view sends the value the JSON API sends. `POST /ui/login` carries the whole
+  sign-in window, so it discloses no per-bucket timing. Seam change: the console calls the new `AuthService.phi_read_retry_after`,
   `login_retry_after` and `reauth_retry_after`, and calls `allow_reauth_attempt` directly; the
   `getattr` fallback to the sign-in budget is gone. (vault BACKLOG #3293)
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
