@@ -2230,9 +2230,21 @@ _UVICORN_ACCESS_FORMAT = '%s - "%s %s HTTP/%s" %d'
 
 #: At least the ``re.Pattern`` methods that apply the pattern to text. A recorder that watched ``sub``
 #: alone would stay quiet if ``_run`` moved to ``subn`` or ``finditer``. The growth test checks this
-#: set covers every public callable of ``re.Pattern``.
+#: set covers every public callable of ``re.Pattern``. ``prefixmatch`` is CPython 3.15's new name for
+#: ``match``; on 3.14 it is absent and never fires, which is harmless.
 _APPLYING_METHODS = frozenset(
-    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+    {
+        "findall",
+        "finditer",
+        "fullmatch",
+        "match",
+        "prefixmatch",
+        "scanner",
+        "search",
+        "split",
+        "sub",
+        "subn",
+    }
 )
 
 

@@ -34,6 +34,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 from tests._role_pairing import bypass_view_raw_pairing_rule
 from tests._session_race import rotate_after_first_call
 
@@ -2659,6 +2660,7 @@ async def test_security_posture_reports_fips_attestation(engine: Engine) -> None
     assert rows  # at least the read above was recorded
 
 
+@PY315_TLS_TRIPWIRE
 async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
     # #338 / ASVS 11.6.2: the posture route reports whether the approved TLS key-exchange groups are
     # PINNED on built contexts or INHERITED from OpenSSL's default group list — report-only metadata,

@@ -71,6 +71,7 @@ from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.tray import probe as tray_probe
 from messagefoundry.verify.smoke import live_smoke_ssl_context
 from tests._ast_sites import call_sites
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -501,6 +502,7 @@ def test_narrow_tls13_suites_reports_nothing_done_without_the_method() -> None:
     assert narrow_tls13_suites(_NoMethod()) is False  # type: ignore[arg-type]
 
 
+@PY315_TLS_TRIPWIRE
 def test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap() -> None:
     """RECORDED GAP of ruling R4, measured rather than restated, and a TRIPWIRE.
 
@@ -535,12 +537,17 @@ def test_every_operator_cipher_branch_narrows_tls13_too(
 ) -> None:
     """An operator string reaches TLS 1.2 only, so the two seams that apply one go through
     ``apply_operator_tls_ciphers``, which narrows TLS 1.3 after it. So does the validator's probe,
-    which models an engine context. The spy records which context each narrowing reached."""
+    which models an engine context. The spy records which context each narrowing reached.
+
+    The spy still narrows, through the real function. Where ``set_ciphersuites`` exists (3.15) the
+    allow-list drops TLS 1.3 AES-128, so a spy that skipped the narrowing left the validator's probe
+    holding that suite and the settings below were refused. On 3.14 the real call is a no-op."""
     seen: list[ssl.SSLContext] = []
+    real = tls_policy.narrow_tls13_suites
 
     def spy(ctx: ssl.SSLContext) -> bool:
         seen.append(ctx)
-        return False
+        return real(ctx)
 
     monkeypatch.setattr(tls_policy, "narrow_tls13_suites", spy)
     one = "ECDHE-ECDSA-AES256-GCM-SHA384"

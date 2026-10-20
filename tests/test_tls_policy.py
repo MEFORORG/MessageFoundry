@@ -57,6 +57,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
     validate_tls_ciphers,
 )
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 
 # --- _is_forward_secret: deterministic classification, no OpenSSL dependency -------------------
@@ -148,6 +149,7 @@ def test_harden_does_not_raise_on_real_context() -> None:
     harden_kex_groups(ctx)  # must never raise, whatever the runtime can or cannot pin
 
 
+@PY315_TLS_TRIPWIRE
 def test_the_group_pin_is_inert_on_this_runtime_and_says_so() -> None:
     """A liveness receipt for ASVS 11.6.2 — written to FAIL on the interpreter upgrade.
 
@@ -229,6 +231,7 @@ def test_approved_groups_are_ecdhe_curves() -> None:
 
 
 # --- kex_groups_report: report-only KEX read-out (#338, ASVS 11.6.2) ----------------------------
+@PY315_TLS_TRIPWIRE
 def test_kex_groups_report_reports_inherited_today() -> None:
     """#338: the report-only KEX read-out says the approved groups are INHERITED on this runtime.
 

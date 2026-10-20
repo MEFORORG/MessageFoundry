@@ -79,6 +79,7 @@ from messagefoundry.pki import IssuerIndex, canonical_dn
 from messagefoundry.restricted_file import write_restricted_file
 from tests._admin_account import create_local_user_chosen
 from tests._approved_key_wrap import approved_pkcs8_pem
+from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -3197,6 +3198,7 @@ def _kex_group_accepted(server_ctx: ssl.SSLContext, ca: Path, group: str) -> boo
         return False
 
 
+@PY315_TLS_TRIPWIRE
 def test_which_kex_groups_the_built_context_actually_accepts(tmp_path: Path) -> None:
     """MEASURE the built context's key-exchange groups (ASVS 11.6.2).
 
