@@ -841,12 +841,13 @@ carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-c
 in the table above. **With `-Until merged`, `dirty` is acted on:** a PR read `dirty` on repeated
 checks of one head and base ends the wait with its own exit code instead of running to the timeout,
 and the fix is a conflict to resolve by hand, not a mechanical rebase (see the table above).
-**`behind` is only printed and does not end the wait** (the script's header says why), so a
-background wait on a PR that went stale wakes you at its timeout, and the went-stale arm described
-just above is the last state line to read then, not an exit code. Nor is the failing arm an exit: a
-red required check reads `blocked` and still runs to the timeout. With `closed` the state is only
-printed, and the `checks-complete` line does not carry it. `checks-complete` waits for every context
-the base branch requires, not only the checks that already exist.
+**`behind` is only printed and does not end the wait**, so a background wait on a PR that stays
+stale wakes you at its timeout, with the state in its output. Whether that PR then needs an update
+depends on whether its base requires the merge queue; the script's header says which case is which,
+and why. Nor is the failing arm an exit: a red required check reads `blocked` and still runs to the
+timeout. With `closed` the state is only printed, and the `checks-complete` line does not carry it.
+`checks-complete` waits for every context the base branch requires, not only the checks that already
+exist.
 
 Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
 options: the two test seams that replace the sleep and the timeout are refused unless
