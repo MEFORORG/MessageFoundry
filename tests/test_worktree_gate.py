@@ -295,6 +295,32 @@ def test_nested_first_party_worktree_is_allowed(primary: Path, repos_file: Path)
     assert run_gate(edit(worktree, cwd=primary), repos_file) is None
 
 
+#: Each is a directory INSIDE the primary, not under its .claude/worktrees/. A culture-sensitive StartsWith
+#: ignores these characters, so it read each one as the nested-worktree prefix and exempted it.
+_INVISIBLE_LOOKALIKES = [
+    ".claude/worktrees\u200b/wt-1",  # zero-width space
+    ".claude/work\u00adtrees/wt-1",  # soft hyphen
+    ".claude\u200d/worktrees/wt-1",  # zero-width joiner
+]
+
+
+@pytest.mark.parametrize("lookalike", _INVISIBLE_LOOKALIKES)
+def test_an_invisible_character_does_not_reach_the_nested_worktree_exemption(
+    primary: Path, repos_file: Path, lookalike: str
+) -> None:
+    target = primary.joinpath(*lookalike.split("/"), "src", "app.py")
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+@pytest.mark.parametrize("lookalike", _INVISIBLE_LOOKALIKES)
+def test_an_invisible_character_does_not_exempt_a_dispatch_cwd(
+    primary: Path, repos_file: Path, lookalike: str
+) -> None:
+    """Rule 2 asks the same function about the session's cwd."""
+    cwd = primary.joinpath(*lookalike.split("/"))
+    assert_denied(run_gate(dispatch(cwd, "Agent", "general-purpose"), repos_file))
+
+
 def test_relative_path_is_resolved_against_cwd_then_denied(primary: Path, repos_file: Path) -> None:
     assert_denied(run_gate(edit("src/app.py", cwd=primary), repos_file))
 
@@ -680,10 +706,24 @@ def test_other_dispatches_from_the_primary_stay_denied(
 def test_a_wrong_case_subagent_type_key_is_not_read(primary: Path, repos_file: Path) -> None:
     """A PSCustomObject property read ignores case, so the KEY must be matched ordinally too: the Agent
     tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash. This covers a
-    lone wrong-case key only. A payload carrying both spellings makes ConvertFrom-Json throw, and the
-    gate's parse fails open for every rule; that predates this exemption."""
+    lone wrong-case key only; the next test covers both spellings at once."""
     payload = dispatch(primary, "Agent", "web-fetch", key="SUBAGENT_TYPE")
     assert_denied(run_gate(payload, repos_file))
+
+
+@pytest.mark.parametrize(
+    "shadow", [{"SUBAGENT_TYPE": "general-purpose"}, {"Subagent_Type": "web-fetch"}]
+)
+def test_both_spellings_of_subagent_type_are_denied_as_unparseable(
+    primary: Path, repos_file: Path, shadow: dict[str, str]
+) -> None:
+    """PowerShell 7's ConvertFrom-Json refuses keys that differ only by case, and that refusal used to
+    exit 0 for every rule. The gate does not judge such a payload by its rules: it denies it as
+    unparseable, so neither spelling can hide the other."""
+    payload = dispatch(primary, "Agent", "web-fetch")
+    payload["tool_input"].update(shadow)
+    reason = assert_denied(run_gate(payload, repos_file))
+    assert "could not parse" in reason
 
 
 def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -> None:
@@ -844,11 +884,30 @@ def test_missing_allowlist_file_is_off(tmp_path: Path, primary: Path) -> None:
     assert run_gate(edit(primary / "x.py", primary), tmp_path / "nope.txt") is None
 
 
-@pytest.mark.parametrize("junk", ["", "not json", "[]", '{"tool_name": "Edit"}'])
-def test_malformed_input_fails_open(repos_file: Path, junk: str) -> None:
+@pytest.mark.parametrize("junk", ["", "[]", '{"tool_name": "Edit"}'])
+def test_input_that_parses_but_names_nothing_governed_fails_open(
+    repos_file: Path, junk: str
+) -> None:
     """A guardrail that wedges every tool call on a bad payload gets uninstalled, and then it guards
-    nothing. Every error path must allow."""
+    nothing. Input that parses, or is empty, but carries no governed field is allowed. Input that does
+    not parse is the one exception, below."""
     assert run_gate(junk, repos_file) is None
+
+
+_UNPARSEABLE = ["not json", '{"tool_name": "Edit", ', '{"tool_name": "Edit"} trailing']
+
+
+@pytest.mark.parametrize("junk", _UNPARSEABLE)
+def test_unparseable_input_is_denied(repos_file: Path, junk: str) -> None:
+    """The gate cannot tell whether a call it cannot parse is governed, so it must not allow it."""
+    reason = assert_denied(run_gate(junk, repos_file))
+    assert "could not parse" in reason
+
+
+@pytest.mark.parametrize("junk", _UNPARSEABLE)
+def test_unparseable_input_is_allowed_when_the_gate_is_off(empty_repos: Path, junk: str) -> None:
+    """The allowlist is still the kill switch: with nothing governed, a parse failure denies nothing."""
+    assert run_gate(junk, empty_repos) is None
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
