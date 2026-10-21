@@ -12,14 +12,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import pytest
+from starlette.websockets import WebSocket
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.api.security import recheck_standing, recheck_standing_or_refusal
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -269,6 +272,25 @@ async def test_revoke_before_first_send_yields_no_frames(
     assert harness.close_code == 1008
 
 
+def _during_first_stats(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, act: Callable[[], Awaitable[object]]
+) -> None:
+    """Run ``act`` once, inside the first frame's ``store.stats()`` call: after that frame's
+    re-check and before its send, so that frame goes out and the second frame's re-check sees
+    ``act``'s effect."""
+    real_stats = engine.store.stats
+    calls = 0
+
+    async def stats_then_act() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await act()
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", stats_then_act)
+
+
 async def test_no_frame_follows_a_revocation(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -284,17 +306,9 @@ async def test_no_frame_follows_a_revocation(
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
-    real_stats = engine.store.stats
-    calls = 0
-
-    async def stats_then_revoke() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await service.revoke_sessions_for_user(uid, actor="admin")
-        return await real_stats()
-
-    monkeypatch.setattr(engine.store, "stats", stats_then_revoke)
+    _during_first_stats(
+        monkeypatch, engine, lambda: service.revoke_sessions_for_user(uid, actor="admin")
+    )
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
     await harness.run(timeout=_HARNESS_TIMEOUT)
@@ -315,17 +329,9 @@ async def test_an_administrator_narrowing_closes_the_feed_rather_than_shrinking_
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
-    real_stats = engine.store.stats
-    calls = 0
-
-    async def stats_then_narrow() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await service.set_channel_scope(uid, ["IB_A"], actor="admin")
-        return await real_stats()
-
-    monkeypatch.setattr(engine.store, "stats", stats_then_narrow)
+    _during_first_stats(
+        monkeypatch, engine, lambda: service.set_channel_scope(uid, ["IB_A"], actor="admin")
+    )
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
     await harness.run(timeout=_HARNESS_TIMEOUT)
@@ -337,7 +343,9 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control for the test above: with nothing withdrawn, the per-frame re-check passes and
-    the feed keeps sending. A re-check that refused every caller would pass the revocation test."""
+    the feed keeps sending. A re-check that refused every caller would pass the revocation test.
+    It also records no stop, so a stop row written on every frame, or on every pass of the
+    re-check, cannot pass the stop-row tests below."""
     monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -352,3 +360,132 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    assert await _stop_rows(engine) == []
+
+
+# --- BACKLOG #3404: a refused re-check records one stop row, naming why ----------------------------
+
+
+async def _stop_rows(engine: Engine) -> list[dict[str, object]]:
+    """Every ``ws_stats.stopped`` audit row, oldest first, as actor, client and parsed detail."""
+    return [
+        {"actor": row["actor"], "client": row["client"], **json.loads(row["detail"])}
+        for row in reversed(await engine.store.list_audit(action="ws_stats.stopped", limit=50))
+    ]
+
+
+class _Notifier:
+    """A wired security-notice channel. Wiring one is what makes an account with no notification
+    address owe one (``AuthService.notify_email_required``)."""
+
+    async def notify(self, event: object) -> bool:
+        return True
+
+
+async def _wire_a_notifier(service: AuthService, uid: str) -> None:
+    service._security_notifier = _Notifier()
+
+
+async def _unmeet_the_second_factor(service: AuthService, uid: str) -> None:
+    async def unmet(token: str | None) -> bool:
+        return False
+
+    service.mfa_satisfied = unmet  # type: ignore[method-assign]
+
+
+async def _require_a_password_change(service: AuthService, uid: str) -> None:
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid,
+        password_hash=user.password_hash,
+        must_change_password=True,
+        password_generated=False,
+    )
+
+
+async def _revoke(service: AuthService, uid: str) -> None:
+    await service.revoke_sessions_for_user(uid, actor="admin")
+
+
+@pytest.mark.parametrize(
+    ("act", "reason"),
+    [
+        (_unmeet_the_second_factor, "mfa_unmet"),
+        (_wire_a_notifier, "notify_email_due"),
+        (_require_a_password_change, "password_change_due"),
+        (_revoke, "session_ended"),
+    ],
+    ids=["second-factor", "notification-address", "password-change", "revoked"],
+)
+async def test_a_refused_recheck_records_one_stop_row_naming_why(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    act: Callable[[AuthService, str], Awaitable[None]],
+    reason: str,
+) -> None:
+    """BACKLOG #3404. The per-frame re-check closed the feed with 1008 and recorded nothing, so an
+    unmet second factor or a missing notification address ended a live feed with no trail. The
+    gate's own refusals are audited (``auth.mfa_denied``, ``auth.permission_denied``); the
+    re-check's were not.
+
+    ``act`` runs inside the first frame's ``store.stats()``, as in
+    :func:`test_no_frame_follows_a_revocation`, so exactly one frame goes out and the second
+    frame's re-check refuses. The feed then writes exactly one row, naming the reason and the frames
+    sent, and never the token."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    _during_first_stats(monkeypatch, engine, lambda: act(service, uid))
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+    stops = await _stop_rows(engine)
+    assert stops == [{"actor": "op", "client": "127.0.0.1", "reason": reason, "frames": 1}]
+    assert token not in json.dumps(stops)
+
+
+async def test_a_refusal_before_the_first_frame_records_a_stop_with_no_frames(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404, the pre-first-send re-check: a refusal between the handshake and the first
+    frame records its stop too, with no frames sent."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    app = create_app(engine, auth=service)
+    real_accept = WebSocket.accept
+
+    async def accept_then_unmeet(self: WebSocket) -> None:
+        await real_accept(self)
+        await _unmeet_the_second_factor(service, uid)
+
+    monkeypatch.setattr(WebSocket, "accept", accept_then_unmeet)
+    harness = _WSHarness(app, token)
+    await harness.run(timeout=5.0)
+    assert harness.frames == []
+    assert harness.close_code == 1008
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": "mfa_unmet", "frames": 0}
+    ]
+
+
+async def test_the_refusal_names_a_permission_the_caller_does_not_hold(engine: Engine) -> None:
+    """BACKLOG #3404, the reason the route cannot reach: a role change revokes the session, so the
+    feed sees ``session_ended``. Asked directly, a permission the caller lacks names its own reason,
+    and :func:`recheck_standing` still answers ``None`` for it and the identity for a live caller."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.USERS_MANAGE)
+        == "permission_withdrawn"
+    )
+    assert await recheck_standing(service, token, Permission.USERS_MANAGE) is None
+    current = await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+    assert isinstance(current, Identity) and current.username == "op"
+    assert await recheck_standing(service, token, Permission.MONITORING_READ) == current

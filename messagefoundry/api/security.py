@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any, Literal, get_args
 
 from fastapi import (
     Depends,
@@ -1986,8 +1986,8 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # ASVS 6.3.3: an MFA-pending session does not stream either. No exempt set here — every WS route
     # is a data feed, none is part of the enroll/verify escape path. Audited for the same reason as
     # require(): the refusal sits above the permission loop, so nothing else would record it. The
-    # /ws/stats route asks it again before every frame, through recheck_standing; a new WS route
-    # gets that only if it calls recheck_standing too.
+    # /ws/stats route asks it again before every frame, through recheck_standing_or_refusal; a new
+    # WS route gets that only if it calls it too, and records its own stop row (BACKLOG #3404).
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None
@@ -2057,6 +2057,40 @@ def quiet_deliberate_export_stops() -> None:
     logging.getLogger("uvicorn.error").addFilter(_EXPORT_STOP_FILTER)
 
 
+#: Why :func:`recheck_standing_or_refusal` refused, as a closed set of slugs an audit row may name
+#: (BACKLOG #3404). Each names a rule, never a value: no token, address or permission set.
+StandingRefusal = Literal[
+    "session_ended",
+    "password_change_due",
+    "notify_email_due",
+    "permission_withdrawn",
+    "mfa_unmet",
+]
+
+
+async def recheck_standing_or_refusal(
+    auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
+) -> Identity | StandingRefusal:
+    """:func:`recheck_standing`, returning the refusal's reason where that returns ``None``.
+
+    For a caller whose stop row names the rule that refused (BACKLOG #3404): the ``/ws/stats`` feed.
+    ``session_ended`` covers every way the token stops resolving, a revoke, an expiry, an idle
+    timeout, a disabled or deleted account among them, since the lookup does not say which.
+    The standing rules live here; :func:`recheck_standing` is this with the reason dropped."""
+    identity = await auth.identity_for_token(token, activity=activity)
+    if identity is None:
+        return "session_ended"
+    if identity.must_change_password:
+        return "password_change_due"
+    if identity.must_set_notify_email:
+        return "notify_email_due"
+    if not all(identity.has(permission) for permission in permissions):
+        return "permission_withdrawn"
+    if not await auth.mfa_satisfied(token):
+        return "mfa_unmet"
+    return identity
+
+
 async def recheck_standing(
     auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
 ) -> Identity | None:
@@ -2074,18 +2108,13 @@ async def recheck_standing(
     act has started. It moves no idle clock unless ``activity`` is True: a live feed is passive,
     but a download the caller asked for is that caller's act, and the export passes True now and
     then so a long download does not idle its own session out. It writes no audit row; the caller
-    records the stop. :func:`require`, :func:`authorize_ws` and the
+    records the stop, and :func:`recheck_standing_or_refusal` gives one that names the rule the
+    reason. :func:`require`, :func:`authorize_ws` and the
     console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
     standing rule goes in all four.
 
     Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
     one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
     differs from the scope the export started with."""
-    identity = await auth.identity_for_token(token, activity=activity)
-    if identity is None or identity.must_change_password or identity.must_set_notify_email:
-        return None
-    if not all(identity.has(permission) for permission in permissions):
-        return None
-    if not await auth.mfa_satisfied(token):
-        return None
-    return identity
+    result = await recheck_standing_or_refusal(auth, token, *permissions, activity=activity)
+    return result if isinstance(result, Identity) else None

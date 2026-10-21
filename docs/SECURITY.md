@@ -4561,7 +4561,11 @@ those ran at the gate. Each resolves the token it started with, so a session rot
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
-  with 1008 before the next frame. An administrator's scope change revokes the session, as the
+  with 1008 before the next frame, and records one `ws_stats.stopped` audit row with the frames
+  sent and the reason (BACKLOG #3404). The reasons are the slugs `StandingRefusal` lists in
+  `messagefoundry/api/security.py`, such as `mfa_unmet` or `notify_email_due`. `session_ended`
+  covers every way the token stops resolving, a revoke or an idle timeout among them. A client
+  that disconnects records no row. An administrator's scope change revokes the session, as the
   export bullet below says, so the feed closes. Each frame's connections table uses the identity
   resolved for that frame. So a scope change that reaches a live session without a revoke shapes
   the next frame. A direct store write does that. So can a frame resolved in the export bullet's
