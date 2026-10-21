@@ -839,7 +839,7 @@ were not measured.
 push and error apart. It prints one line per state change, and for `merged` and `closed` that line
 carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
 in the table above. **With `-Until merged` that state is acted on:** a PR read `behind` or `dirty`
-on consecutive checks of one head ends the wait with its own exit code instead of running to the
+on two checks of one head and base ends the wait with its own exit code instead of running to the
 timeout. That adds the went-stale arm described just above, not the failing arm: a red required
 check reads `blocked` and still runs to the timeout. The exit line names which state it read, and
 the two need different fixes, so read it before you act: `behind` is an update from `main`,
