@@ -542,6 +542,13 @@ ci-quality = [
     "pytest-timeout>=2.3.1",
 ]
 
+# uv resolves the [webconsole] extra to the IN-TREE console, so uv.lock and `uv sync` carry the
+# console that matches this tree's engine seam, and the release PR can raise the extra's floor with
+# the console bump. uv alone reads this table: the built wheel's metadata names the distribution and
+# its floor only, and pip resolves it from the index.
+[tool.uv.sources]
+messagefoundry-webconsole = { path = "packaging/messagefoundry-webconsole", editable = true }
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Run the whole suite on ONE shared asyncio event loop (tests AND fixtures). pytest-asyncio's default

@@ -159,10 +159,10 @@ jobs:
           # Re-export to the same path and fail if it differs from what's committed (keeps the
           # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
           # The console is first-party, like the engine --no-emit-project drops, so neither all-extras
-          # export emits the console the [webconsole] extra declares. Pinned here, its unpinned
-          # `messagefoundry>=X` requirement fails the --require-hashes install below. Pinned in
-          # constraints.lock, it refuses every editable console install in CI once the console's
-          # __version__ moves past the pin, which a console release commit does before PyPI has it.
+          # export emits the console the [webconsole] extra declares. uv resolves it from the tree
+          # (pyproject.toml's [tool.uv.sources]), so it would be an `-e ./packaging/...` line: the
+          # --require-hashes install below refuses an editable, and pip and uv both refuse one as a
+          # constraint, which would break every CI install that passes --constraint constraints.lock.
           uv export --all-extras --no-emit-project --no-emit-package messagefoundry-webconsole --format requirements.txt -o requirements.lock
           # The container image installs from SCOPED, per-profile locks (not the all-extras lock above,
           # which drags PySide6/dev/etc. into a slim runtime image) — keep them in sync too. The -o paths
@@ -1638,10 +1638,10 @@ jobs:
           # Re-export to the same path and fail if it differs from what's committed (keeps the
           # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
           # The console is first-party, like the engine --no-emit-project drops, so neither all-extras
-          # export emits the console the [webconsole] extra declares. Pinned here, its unpinned
-          # `messagefoundry>=X` requirement fails the --require-hashes install below. Pinned in
-          # constraints.lock, it refuses every editable console install in CI once the console's
-          # __version__ moves past the pin, which a console release commit does before PyPI has it.
+          # export emits the console the [webconsole] extra declares. uv resolves it from the tree
+          # (pyproject.toml's [tool.uv.sources]), so it would be an `-e ./packaging/...` line: the
+          # --require-hashes install below refuses an editable, and pip and uv both refuse one as a
+          # constraint, which would break every CI install that passes --constraint constraints.lock.
           uv export --all-extras --no-emit-project --no-emit-package messagefoundry-webconsole --format requirements.txt -o requirements.lock
           # The container image installs from SCOPED, per-profile locks (not the all-extras lock above,
           # which drags PySide6/dev/etc. into a slim runtime image) — keep them in sync too. The -o paths
