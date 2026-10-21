@@ -532,13 +532,16 @@ def test_two_dirty_reads_on_one_head_exit_3(tmp_path: Path) -> None:
     assert run.sleeps == [120]
 
 
-def test_two_behind_reads_on_one_head_do_not_exit_3(tmp_path: Path) -> None:
-    """The merge queue merges a behind branch without an update, so `behind` is waited out."""
-    run = wait_pr(tmp_path, "merged", {PR_PATH: [BEHIND, BEHIND, MERGED]})
-    assert run.code == 0, run.err
+def test_behind_reads_on_one_head_do_not_exit_3(tmp_path: Path) -> None:
+    """The merge queue merges a behind branch without an update, so `behind` is waited out.
+
+    Three reads at 4 minutes, so a threshold of two or three behind reads would both fail here.
+    """
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [BEHIND]}, "-MaxMinutes", "4")
+    assert run.code == 2, run.err
     assert "needs a push" not in run.out
     assert f"mergeable_state=behind head={SHA}" in run.out
-    assert run.sleeps == [120] * 2
+    assert run.paths().count(PR_PATH) == 3
 
 
 @pytest.mark.parametrize(
@@ -546,7 +549,7 @@ def test_two_behind_reads_on_one_head_do_not_exit_3(tmp_path: Path) -> None:
     [
         # A clean read between two dirty ones resets the count, so the merge is waited for.
         ([DIRTY, ok(pr(mergeable="clean")), DIRTY, MERGED], 0, 3),
-        # So does a behind read: it is a computed value, and not one that needs a push.
+        # So does a behind read: it is a computed value, and under a merge queue no push.
         ([DIRTY, BEHIND, DIRTY, MERGED], 0, 3),
         # Dirty on head A, then on head B: B has been read dirty once, not twice.
         ([DIRTY, ok(pr(mergeable="dirty", sha="b" * 40)), MERGED], 0, 2),
