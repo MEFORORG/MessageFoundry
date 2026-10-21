@@ -6,18 +6,20 @@
     complete, with a hard floor on the polling interval and a hard ceiling on the total wait.
 
 .DESCRIPTION
-    This is the bounded wait helper of the AFK-autonomy plan, docs/AUTONOMY-PLAN.md section 6.2. A
-    session runs it with run_in_background and is woken when it exits, so it can carry a PR to
+    This is the bounded wait helper of the AFK-autonomy plan, section 6.2 of docs/AUTONOMY-PLAN.md
+    (owner-approved 2026-10-21; on branch `autonomy-plan`, not yet on main, when this was written).
+    A session runs it with run_in_background and is woken when it exits, so it can carry a PR to
     completion without the owner typing "resume", and without writing its own poll loop.
 
         pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr 2466 -Until merged
 
-    -Until merged           exit 0 once the PR is merged. A PR closed WITHOUT merging can never meet
-                            it, so that is exit 1, not a wait until the timeout.
+    -Until merged           exit 0 once the PR is merged. A PR read as closed WITHOUT merging on two
+                            checks in a row is exit 1, not a wait until the timeout. One such read is
+                            not enough, because closing and reopening is a common way to re-run CI.
     -Until closed           exit 0 once the PR is closed, merged or not.
     -Until checks-complete  exit 0 once every check run and every commit status on the PR's CURRENT
-                            head has finished, whatever its conclusion, and every context branch
-                            protection requires has reported. The final line counts the conclusions;
+                            head has finished, whatever its conclusion, and every context its base
+                            branch requires has reported. The final line counts the conclusions;
                             reading them is the caller's job.
 
     EXIT CODES: 0 the condition is met, 2 the wait timed out, 1 anything else (bad arguments, too
@@ -27,22 +29,32 @@
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints two lines, not
-    thirty. For merged and closed the line carries GitHub's mergeable_state, so a branch that went
-    BEHIND while you waited shows up as a change (docs/WORKTREES.md, "If you poll for 'is it merged
-    yet', watch for three outcomes, not two").
+    thirty. For merged and closed the line carries GitHub's REST `mergeable_state`, in lower case
+    (`behind`, `dirty`, `blocked`, `clean`), so a branch that went stale while you waited is in the
+    output. IT IS PRINTED, NOT ACTED ON: a `behind` or `dirty` PR does not end the wait, and the
+    session reads that line only when the script exits, so a stall still costs the full timeout.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
     header of scripts/hooks/block-api-burn.ps1 says why). The interval is clamped UP to 120 s and the
-    total DOWN to 60 minutes, so one wait is at most 31 checks. Each check is a conditional request:
-    the ETag of the last 200 goes back as If-None-Match, and GitHub does not count a 304 against
-    the primary rate limit. The 304 behaviour was measured 2026-10-21 with gh 2.102.0: `gh api -i`
-    prints the 304 status line and headers to stdout, writes "gh: HTTP 304" to stderr, exits 1, and
-    X-Ratelimit-Remaining did not move.
+    total DOWN to 60 minutes, so one wait is at most 31 checks. A check is one read of the PR for
+    merged and closed, and at least three for checks-complete (the PR, each page of check runs, the
+    commit statuses), plus two reads of the base's required contexts at the start and on a retarget.
+    Every read is conditional: the ETag of the last 200 goes back as If-None-Match, and GitHub does
+    not count a 304 against the primary rate limit, so an unchanging PR costs little. The 304
+    behaviour was measured 2026-10-21 with gh 2.102.0: `gh api -i` prints the 304 status line and
+    headers to stdout, writes "gh: HTTP 304" to stderr, exits 1, and X-Ratelimit-Remaining did not
+    move. The total is counted in intervals slept, so a wait overshoots its ceiling by at most the
+    time its reads take.
 
     THE STARTING BUDGET IS READ ONCE. `gh api rate_limit` is free and runs before anything else;
     fewer than 500 core requests left refuses the start with exit 1, because a wait is never urgent
-    enough to drain the last of a budget every other seat shares.
+    enough to drain the last of a budget every other seat shares. Because it runs first, a gh that
+    is missing or not logged in is exit 1 at once.
+
+    A TRANSIENT FAILURE DOES NOT END THE WAIT. Inside the loop a 5xx, a 429, or a call that printed
+    no status line at all (a reset connection) becomes the state line and the next interval reads
+    again. A 4xx other than 429 is still exit 1: that answer will not change by waiting.
 
     REST ONLY, NEVER `gh pr`. `gh pr` speaks GraphQL, which the cloud GitHub proxy refuses
     (CLAUDE.md section 5, "A cloud session is a Builder in its own session"), and GraphQL has no
@@ -56,26 +68,29 @@
     of its three deny rules (`gh run watch`, `--watch`, a hand-rolled loop with a sleep) is reached.
     The guard cannot see inside this script. That is acceptable rather than a loophole only because
     of the bounds above: the guard exists to stop UNBOUNDED loops, and this one is capped at 31
-    conditional reads. Its deny reasons do not name this script yet; that is a change to the hook,
-    not made here. Chaining a plain `gh` call in front of it on one line is still allowed, because
-    that line has no loop keyword and no `--watch`.
+    checks of conditional reads. Its deny reasons do not name this script yet; that is a change to
+    the hook, not made here. Chaining a plain `gh` call in front of it on one line is still allowed,
+    because that line has no loop keyword and no `--watch`.
 
     WHAT checks-complete CANNOT SEE. A required context with no check run on the head yet is
     invisible to a list of the runs that exist (CLAUDE.md section 5, the Lander's safeguard 1). So
-    the required set is read once, from classic protection and from rulesets, through the same two
-    endpoints scripts/ci/required_contexts.py reads, and every name in it must have reported. When
-    both name nothing (an unprotected base) the script says so in its output and falls back to "at
-    least one check exists and none is still running", which can end early on a roll-up that has not
-    started. A failed read is exit 1, never an empty set.
+    the required set is read from classic protection and from rulesets, through the same two
+    endpoints scripts/ci/required_contexts.py reads, and every name in it must have reported, matched
+    case-sensitively so a near-miss name never satisfies it. It is read again if the PR's base
+    changes. A protected base whose payload names no contexts list is exit 1, never an empty set,
+    which is that reader's rule too. Only an UNPROTECTED base with no ruleset check falls back, out
+    loud, to "at least one check exists and none is still running", which can end early on a
+    roll-up that has not started.
 
     THE DESKTOP'S PR MONITOR IS NOT A SUBSTITUTE, READ 2026-10-21 from its tool description: it
     watches the one PR bound to the session, wakes it on CI failures, conflicts and review comments,
     and cannot be told to wait for a merge, for checks to finish, or for another session's PR. It
     also does not exist in a cloud session.
 
-    -GhCommand and -SleepCommand are test seams. The tests point them at a stub `gh` and at a
-    sleeper that records the seconds instead of sleeping. -SleepCommand receives the already
-    clamped interval, so the clamp is tested through it.
+    TEST SEAMS. -GhCommand names the gh to run; a stand-in can only fake answers, never shorten a
+    sleep. -SleepCommand replaces Start-Sleep, which would remove the interval floor, so it is
+    refused unless MEFOR_WAIT_PR_TEST_SEAMS=1 is set in the environment. The tests set it and point
+    it at a sleeper that records the already clamped interval instead of sleeping.
 #>
 [CmdletBinding()]
 param(
@@ -112,6 +127,7 @@ $script:Etags = @{}
 $script:Bodies = @{}
 $script:Requests = 0
 $script:NotModified = 0
+$script:ClosedUnmerged = 0
 
 function Say([string]$Message) {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -122,6 +138,19 @@ function Say([string]$Message) {
 function Fail([string]$Message) {
     [Console]::Error.WriteLine("wait-pr $Repo#${Pr}: error: $Message")
     exit 1
+}
+
+# A property of a parsed JSON object, or $null when the object does not carry it. StrictMode makes
+# a plain `.name` on a missing property throw.
+function Prop($Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $null }
+}
+
+# Thrown for an answer that may change by waiting; the loop catches it, Fail is for the rest.
+class TransientReadException : System.Exception {
+    TransientReadException([string]$Message) : base($Message) {}
 }
 
 # One REST GET through `gh api -i`, conditional on the last ETag seen for the same path. Returns
@@ -150,7 +179,7 @@ function Get-Rest {
     $text = (@($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") -replace "`r", ''
 
     if ($text -notmatch '^HTTP/\S+ (\d{3})') {
-        Fail "gh api $Path printed no HTTP status line (exit $code). $err"
+        throw [TransientReadException]::new("gh api $Path printed no HTTP status line (exit $code). $err")
     }
     $status = [int]$Matches[1]
     $split = $text.IndexOf("`n`n")
@@ -162,21 +191,23 @@ function Get-Rest {
             Fail "gh api $Path answered 304 to a request that sent no ETag this script holds a body for."
         }
         $script:NotModified++
-        return $script:Bodies[$Path]
+        return , $script:Bodies[$Path]
+    }
+    if ($status -ge 500 -or $status -eq 429) {
+        throw [TransientReadException]::new("gh api $Path answered HTTP $status")
     }
     if ($status -lt 200 -or $status -ge 300) { Fail "gh api $Path answered HTTP $status. $err" }
     if (-not $body) { Fail "gh api $Path answered HTTP $status with an empty body." }
 
-    $parsed = $body | ConvertFrom-Json
+    # -NoEnumerate keeps a JSON array an array, even an empty one.
+    $parsed = ConvertFrom-Json -InputObject $body -NoEnumerate
     $etag = [regex]::Match($head, '(?im)^etag:[ \t]*(.+)$')
     if ($etag.Success) {
         $script:Etags[$Path] = $etag.Groups[1].Value.Trim()
         $script:Bodies[$Path] = $parsed
     }
-    return $parsed
+    return , $parsed
 }
-
-function Read-Pr { Get-Rest "repos/$Repo/pulls/$Pr" }
 
 function Test-Merged($p) {
     $state = "state=$($p.state) merged=$($p.merged) mergeable_state=$($p.mergeable_state) head=$($p.head.sha)"
@@ -184,9 +215,10 @@ function Test-Merged($p) {
         $met = $p.state -eq 'closed'
     } else {
         $met = $p.merged -eq $true
-        if (-not $met -and $p.state -eq 'closed') {
+        if (-not $met -and $p.state -eq 'closed') { $script:ClosedUnmerged++ } else { $script:ClosedUnmerged = 0 }
+        if ($script:ClosedUnmerged -ge 2) {
             Say $state
-            Fail 'the PR was closed without merging, so -Until merged can no longer be met.'
+            Fail 'the PR was read as closed without merging on two checks in a row, so -Until merged will not be met.'
         }
     }
     @{ Met = $met; State = $state; Summary = "head=$($p.head.sha)" }
@@ -215,7 +247,7 @@ function Test-Checks($p) {
     foreach ($s in $statuses) {
         if ($s.state -eq 'pending') { $pending += $s } else { $reported += [string]$s.context }
     }
-    $missing = @($script:Required | Where-Object { $reported -notcontains $_ })
+    $missing = @($script:Required | Where-Object { $reported -cnotcontains $_ })
 
     $met = ($runs.Count + $statuses.Count) -gt 0 -and $running.Count -eq 0 -and
         $pending.Count -eq 0 -and $missing.Count -eq 0
@@ -233,23 +265,31 @@ function Test-Checks($p) {
 function Read-Required([string]$Base) {
     $branch = Get-Rest "repos/$Repo/branches/$Base"
     $classic = @()
-    $protection = $branch.PSObject.Properties['protection']
-    if ($protection -and $protection.Value) {
-        $checks = $protection.Value.PSObject.Properties['required_status_checks']
-        if ($checks -and $checks.Value -and $checks.Value.PSObject.Properties['contexts']) {
-            $classic = @($checks.Value.contexts | ForEach-Object { [string]$_ })
+    if ((Prop $branch 'protected') -eq $true) {
+        $contexts = Prop (Prop (Prop $branch 'protection') 'required_status_checks') 'contexts'
+        if ($null -eq $contexts) {
+            Fail "base $Base is protected but its branch payload names no required_status_checks.contexts; that is not an empty required set."
         }
+        $classic = @($contexts | ForEach-Object { [string]$_ })
     }
-    $ruleset = @(
-        @(Get-Rest "repos/$Repo/rules/branches/$Base") |
-            Where-Object { $_.type -eq 'required_status_checks' } |
-            ForEach-Object { @($_.parameters.required_status_checks) } |
-            ForEach-Object { [string]$_.context }
-    )
-    @($classic + $ruleset | Sort-Object -Unique)
+    $ruleset = @()
+    $page = 1
+    do {
+        $rules = @(Get-Rest "repos/$Repo/rules/branches/${Base}?per_page=100&page=$page" | ForEach-Object { $_ })
+        $ruleset += @(
+            $rules | Where-Object { (Prop $_ 'type') -eq 'required_status_checks' } |
+                ForEach-Object { @(Prop (Prop $_ 'parameters') 'required_status_checks') } |
+                ForEach-Object { [string](Prop $_ 'context') }
+        )
+        $page++
+    } while ($rules.Count -ge 100)
+    @($classic + $ruleset | Sort-Object -Unique -CaseSensitive)
 }
 
 try {
+    if ($SleepCommand -and $env:MEFOR_WAIT_PR_TEST_SEAMS -ne '1') {
+        Fail '-SleepCommand is a test seam and would remove the interval floor; it needs MEFOR_WAIT_PR_TEST_SEAMS=1.'
+    }
     if ($IntervalSeconds -lt $MinIntervalSeconds) {
         Say "interval raised from $IntervalSeconds s to the $MinIntervalSeconds s floor"
         $IntervalSeconds = $MinIntervalSeconds
@@ -267,24 +307,28 @@ try {
     }
     Say "waiting until $Until, every $IntervalSeconds s for at most $MaxMinutes min ($remaining core requests remain)"
 
-    $p = Read-Pr
-    $script:Required = @()
-    if ($Until -eq 'checks-complete') {
-        $base = [string]$p.base.ref
-        $script:Required = @(Read-Required $base)
-        if ($script:Required.Count -eq 0) {
-            Say "no required contexts found on $base; waiting on the visible checks only, which cannot see a check that has not started"
-        } else {
-            Say "required contexts on ${base}: $($script:Required.Count)"
-        }
-    }
-
     $maxSeconds = $MaxMinutes * 60
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $slept = 0
     $last = $null
+    $base = $null
+    $script:Required = @()
     while ($true) {
-        $r = if ($Until -eq 'checks-complete') { Test-Checks $p } else { Test-Merged $p }
+        try {
+            $p = Get-Rest "repos/$Repo/pulls/$Pr"
+            if ($Until -eq 'checks-complete' -and [string]$p.base.ref -cne $base) {
+                $base = [string]$p.base.ref
+                $script:Required = @(Read-Required $base)
+                if ($script:Required.Count -eq 0) {
+                    Say "no required contexts on unprotected $base; waiting on the visible checks only, which cannot see a check that has not started"
+                } else {
+                    Say "required contexts on ${base}: $($script:Required.Count)"
+                }
+            }
+            $r = if ($Until -eq 'checks-complete') { Test-Checks $p } else { Test-Merged $p }
+        } catch [TransientReadException] {
+            $r = @{ Met = $false; State = "transient, reading again next interval: $($_.Exception.Message)" }
+        }
         if ($r.State -ne $last) {
             Say $r.State
             $last = $r.State
@@ -294,15 +338,14 @@ try {
             Say "met: $Until. $($r.Summary). $accounting"
             exit 0
         }
-        # A recording sleeper takes no wall time, so the seconds slept count as elapsed too.
-        $elapsed = [math]::Max($slept, $clock.Elapsed.TotalSeconds)
-        if ($elapsed + $IntervalSeconds -gt $maxSeconds) {
+        # Counted in intervals slept, so the last interval is waited too; the wall clock is only a
+        # backstop for reads that hang.
+        if ($slept + $IntervalSeconds -gt $maxSeconds -or $clock.Elapsed.TotalSeconds -gt $maxSeconds) {
             Say "timeout: $Until not met within $MaxMinutes min. $accounting"
             exit 2
         }
         if ($SleepCommand) { & $SleepCommand $IntervalSeconds } else { Start-Sleep -Seconds $IntervalSeconds }
         $slept += $IntervalSeconds
-        $p = Read-Pr
     }
 } catch {
     Fail "$($_.Exception.Message)"
