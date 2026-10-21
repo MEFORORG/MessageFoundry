@@ -1126,3 +1126,70 @@ async def test_the_way_past_gates_open_the_totp_cell_off_the_event_loop(
         assert loop_thread not in threads, "a TOTP cell was opened on the event loop"
     finally:
         await store.close()
+
+
+async def test_a_totp_enabled_after_it_was_judged_is_not_removed() -> None:
+    """The store judges the TOTP before it takes its lock and confirms the cell under it. A usable
+    TOTP enabled between the two is declined by the conditional removal, never wiped as if it
+    counted for nothing; for the rotation a moved cell counts for nothing, the closed direction."""
+    from messagefoundry.store.store import judge_totp, password_change, totp_removal
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        before = await store.get_user(identity.user_id)  # TOTP off: the judged cell is None
+        judgement = await judge_totp(store.open_totp_secret, _opened_totp_usable, before)
+        assert judgement is not None
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)  # lands after the judgement
+        record = await store._read_user_record(identity.user_id)
+        assert record is not None
+        removal = totp_removal(1.0, require_way_past=True, totp_counts=judgement)
+        assert removal(record) is None, "a TOTP enabled after the judgement was removed"
+        rotation = password_change(
+            password_hash="h",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=True,
+            now=1.0,
+            totp_counts=judgement,
+        )
+        assert rotation(record) is None, "a TOTP nobody judged opened the rotation"
+    finally:
+        await store.close()
+
+
+async def test_a_totp_cell_that_does_not_open_counts_for_nothing_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cell that does not open (a store-key or cipher-service fault) is no way past, and the
+    account is named once in a WARNING, never the cell."""
+    import logging
+
+    from messagefoundry.store import store as store_module
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.store import judge_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        user = await store.get_user(identity.user_id)
+        record = await store._read_user_record(identity.user_id)
+        assert user is not None and record is not None
+
+        def refuse(_user_id: str, _cell: str | None) -> str | None:
+            raise CipherError("the cell did not open")
+
+        store_module._UNOPENED_TOTP_LOGGED.pop(identity.user_id, None)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+            judgement = await judge_totp(refuse, _opened_totp_usable, user)
+            again = await judge_totp(refuse, _opened_totp_usable, user)
+        assert judgement is not None and again is not None
+        assert not judgement(record) and not again(record)
+        warned = [r.getMessage() for r in caplog.records if "did not open" in r.getMessage()]
+        assert len(warned) == 1 and identity.user_id in warned[0], warned
+        assert _TOTP_SECRET not in warned[0]
+    finally:
+        await store.close()

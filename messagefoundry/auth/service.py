@@ -12226,9 +12226,9 @@ class AuthService:
         """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its cell opens, and the
         engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one on the record
-        read is the one the record's seal covered, opened OFF THE EVENT LOOP, since a Transit
-        cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). The service's way-past
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one this checked
+        record's seal covered (BACKLOG #3510), opened OFF THE EVENT LOOP, since a Transit cipher's
+        decrypt is a blocking HTTP call (CLAUDE.md section 6). The service's way-past
         decisions ask this: the rotation and removal gates, the last-factor rule and the lock
         notice; the store's conditional writes and the lock escalation ask the same rule
         (``totp_usable``) on the cell they lock."""
@@ -14389,10 +14389,9 @@ class AuthService:
         # account that now has none. The flag still gates the refusal above, which is about intent.
         # The re-read account's sealed passkey digest says whether a passkey remains (#2592).
         after = await self._load_user(identity.user_id)
-        # A TOTP this release refuses is no remaining factor (BACKLOG #3422).
-        factor_remains = after is not None and (
-            after.has_passkeys or await self._totp_way_past(after)
-        )
+        # An enrolled TOTP, usable or not, still MFA-binds the account, so it is a remaining factor
+        # for the wording of the notice; MFA_DISABLED would say no factor is left while one is.
+        factor_remains = after is not None and (after.has_passkeys or after.totp_enabled)
         if not factor_remains:
             await self._notify_security(
                 MFA_DISABLED,

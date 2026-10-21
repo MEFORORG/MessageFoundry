@@ -245,7 +245,6 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
-    TotpCounts,
     TotpUsable,
     UserAuthzRecord,
     UserChange,
@@ -274,6 +273,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_verdict,
     existing_roles_only,
     federated_bind,
     federated_unbind,
@@ -13913,29 +13913,6 @@ class SqlServerStore:
             ),
         )
 
-    async def _escalation_verdict(
-        self,
-        user_id: str,
-        counter: LockoutCounter,
-        *,
-        threshold: int,
-        totp_usable: TotpUsable | None,
-    ) -> TotpCounts | None:
-        """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
-        held and only where it can matter: a local account with TOTP on whose failure may set the
-        lock. Everywhere else ``None``, which escalates nothing, and no cell is opened."""
-        if counter != "sign_in" or totp_usable is None:
-            return None
-        pre = await self.get_user(user_id)
-        if (
-            pre is None
-            or pre.auth_provider != "local"
-            or not pre.totp_enabled
-            or pre.failed_attempts + 1 < threshold
-        ):
-            return None
-        return await judge_totp(self.open_totp_secret, totp_usable, pre)
-
     async def increment_login_failure(
         self,
         user_id: str,
@@ -13964,8 +13941,13 @@ class SqlServerStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
-            totp_counts=await self._escalation_verdict(
-                user_id, counter, threshold=threshold, totp_usable=totp_usable
+            totp_counts=await escalation_verdict(
+                self.get_user,
+                self.open_totp_secret,
+                user_id,
+                counter,
+                totp_usable=totp_usable,
+                now=now,
             ),
         )
         written = await self._write_user_txn(user_id, change)
