@@ -1006,7 +1006,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
         # BACKLOG #1147, #3393: the offer's count, read after the confirm's own session-cap run and
-        # against the rotated token. count_other_sessions answers 0 rather than raise, so a store
+        # against the rotated token. count_other_sessions answers None rather than raise, so a store
         # fault here cannot cost the recovery codes.
         others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         return MfaConfirmResponse(
@@ -1047,7 +1047,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         ``other_sessions`` is the offer to end the caller's other sessions (BACKLOG #1147), read
         after the disable committed. It is 0 when TOTP was never on, since that disable changed no
-        factor, and on a store fault, which ``count_other_sessions`` logs rather than raises."""
+        factor, and None on a store fault, which ``count_other_sessions`` logs rather than raises."""
         try:
             was_on = await service.disable_mfa(identity, client=client)
         except ValueError as exc:

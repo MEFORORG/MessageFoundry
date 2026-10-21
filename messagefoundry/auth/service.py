@@ -10350,30 +10350,33 @@ class AuthService:
             )
         return revoked
 
-    async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int:
+    async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
         """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
         of the read: the number the offer after a factor change shows (BACKLOG #1147, #3393). It is
         the store's count with the revoke's own predicate, so it includes a session that has gone
-        idle or expired but was never revoked, which :meth:`list_sessions` hides. A sign-in, the
-        reaper or a cap run before the revoke can still move it.
+        idle or expired but was never revoked, which :meth:`list_sessions` hides. At least a sign-in,
+        the reaper, a cap run or another revoke before the revoke runs can still move it.
 
         Read it AFTER the factor change has committed, against the token the caller holds NOW: a
         confirm re-keys the session and then runs the session cap, which can end rows itself, so a
         count read before it would offer sessions that are already gone.
 
-        **A store fault answers 0 and is logged, never raised.** Every caller reads this after the
-        change committed, and a confirm's reply carries recovery codes shown once, so a raise would
-        lose them for a number. 0 costs the offer and nothing else, the failure docs/SECURITY.md
-        already accepts for a lost mark. The catch is broad for the reason
-        :meth:`_enforce_session_cap_after_elevation` gives: each backend raises its own driver's
-        errors. A cancellation is not an ``Exception``, so it still propagates."""
+        **A refused store call answers None, "could not count", and is logged, never raised.** The
+        confirm reads this after the change committed, and its reply carries recovery codes shown
+        once, so a raise would lose them for a number. None is not 0: the console keeps its mark
+        for the next load, and a JSON client can tell "unknown" from "none". What counts as refused
+        is :func:`~messagefoundry.store.base.store_call_errors`; a defect in
+        :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` still raises, so a bug is not read as
+        a store fault."""
         try:
             return await self._store.count_user_sessions(
                 user_id, except_token_hash=current_token_hash
             )
-        except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
+        except AUDIT_WRITE_DEFECTS:
+            raise
+        except store_call_errors():
             _log.exception("counting the other sessions for the sign-out offer failed; no offer")
-            return 0
+            return None
 
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.

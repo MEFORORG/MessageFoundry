@@ -4917,8 +4917,9 @@ session loads shows the offer and spends the mark. So a typed `/ui/account?m=mfa
 notice and no offer, and so does a failed attempt or a disable of TOTP that was never on. With no
 other session to end, there is no offer. The count is read with the revoke's own rule: every other
 session not yet signed out, one gone idle included (BACKLOG #3393). It is what the revoke would end
-when it is read, after the change, and a sign-in, the hourly reaper or a session-cap run before the
-click can still move it. A store fault while counting answers no offer rather than an error. The
+when it is read, after the change, and at least a sign-in, the hourly reaper, a session-cap run or
+another revoke before the click can still move it. A store fault while counting answers no offer
+rather than an error, and the console keeps the mark for the next load. The
 confirm and the passkey add rotate the session. The confirm's count is read after its own
 session-cap run and excludes this session, and the passkey add marks the new token.
 Accepting posts to `POST /ui/account/sessions/revoke-others`.
@@ -4927,8 +4928,8 @@ nothing, and no session ends unasked. The mark is process-local, like the re-aut
 lost mark costs the offer, and the **Active sessions…** view still has the control. The page spends
 the mark only once it has rendered, so a page that fails to render keeps the offer for the next
 load. The JSON twins carry the offer as `other_sessions`, on `POST /me/mfa/confirm` and
-`DELETE /me/mfa` (BACKLOG #3393): the same count, read after the change, and 0 for a disable of
-TOTP that was never on. A client would offer `DELETE /me/sessions` when it is not 0, and nothing ends
+`DELETE /me/mfa` (BACKLOG #3393): the same count, read after the change, 0 for a disable of TOTP
+that was never on, and `null` when the engine could not count. A client would offer `DELETE /me/sessions` when it is not 0, and nothing ends
 unless it calls that. Passkey add and removal have no JSON route. A password change is unchanged: it
 ends every session, the caller's included.
 

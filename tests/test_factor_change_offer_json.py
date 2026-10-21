@@ -163,15 +163,24 @@ async def test_the_confirm_offers_only_what_the_revoke_then_ends(engine: Engine)
 async def test_a_store_fault_while_counting_costs_the_offer_and_nothing_else(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The count is read after the change committed, so a fault there answers 0 rather than raise:
-    a raise on the confirm would lose the recovery codes in its reply. RED when it propagates."""
+    """The count is read after the change committed, so a refused store call answers None, "could
+    not count", rather than raise: a raise on the confirm would lose the recovery codes in its
+    reply. RED when it propagates, or when it answers 0, which reads as "no other session". A
+    defect still raises, so a bug is not passed off as a store fault."""
     service = await _service(engine)
 
     async def _fault(*_args: object, **_kwargs: object) -> int:
         raise RuntimeError("synthetic store fault")
 
     monkeypatch.setattr(service.store, "count_user_sessions", _fault)
-    assert await service.count_other_sessions("u", hash_token(mint_token())) == 0
+    assert await service.count_other_sessions("u", hash_token(mint_token())) is None
+
+    async def _defect(*_args: object, **_kwargs: object) -> int:
+        raise NotImplementedError("synthetic defect")
+
+    monkeypatch.setattr(service.store, "count_user_sessions", _defect)
+    with pytest.raises(NotImplementedError):
+        await service.count_other_sessions("u", hash_token(mint_token()))
 
 
 def _mock_client(replies: dict[str, object]) -> EngineClient:

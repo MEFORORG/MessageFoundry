@@ -159,8 +159,9 @@ class _SessionOffers:
     Keyed by ``hash_token(session token)``, so the raw token is never held. Mark the token the
     browser will present next: after a rotation, that is the new one. Process-local, bounded and
     TTL'd, with the same per-process caveat as the issued re-auth continuations, and that caveat is
-    ACCEPTED (BACKLOG #3393): a restart, or a load another engine process answers, loses the mark,
-    and a lost mark costs the offer and nothing else, since the sessions page still carries the same
+    ACCEPTED (BACKLOG #3393): at least a restart, a load another engine process answers, the TTL
+    lapsing, eviction from the bounded table and a rotation the mark did not follow lose it, and a
+    lost mark costs the offer and nothing else, since the sessions page still carries the same
     control and docs/SECURITY.md says so. It is kept apart from ``_IssuedContinuations`` in
     ``_auth.py`` on purpose, though the two are built alike: ``/ui/reauth`` auto-submits what that
     table holds, and a mark there would sit one lookup away from an action that runs."""
@@ -296,6 +297,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         offer = None
         if token and serial is not None:
             offer = await service.count_other_sessions(identity.user_id, hash_token(token))
+            # None: the count failed, so this load shows no offer and keeps the mark for the next.
         response = await _account_response(
             service,
             identity,
@@ -303,7 +305,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             notice=await _account_notice(service, identity, m),
             session_offer=offer,
         )
-        if token and serial is not None:
+        if token and serial is not None and offer is not None:
             _SESSION_OFFERS.spend(token, serial)
         return response
 
@@ -559,7 +561,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # answers 0 rather than raise, so a store fault cannot cost the codes (BACKLOG #3393).
         others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         resp = HTMLResponse(
-            pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others)
+            pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others or 0)
         )
         rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
@@ -593,8 +595,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service, identity, request, error=str(exc.detail), status_code=exc.status_code
             )
         # BACKLOG #1147: the handler answers 0 for a disable of TOTP that was never on, which changed
-        # no factor, and for one with no other session to end; neither earns an offer.
-        if disabled.other_sessions:
+        # no factor, and for one with no other session to end; neither earns an offer. None (could
+        # not count) marks, so the account page counts again.
+        if disabled.other_sessions != 0:
             _SESSION_OFFERS.mark(token)
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 

@@ -153,11 +153,12 @@ class MfaConfirmed:
     """What :meth:`EngineClient.confirm_mfa` hands back: the one-time recovery codes, and the offer
     to end the caller's other sessions after the factor change (BACKLOG #1147, #3393).
 
-    ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end.
-    The rotated session token is not here: the client has already adopted it."""
+    ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end,
+    or None when the engine could not count them. The rotated session token is not here: the
+    client has already adopted it."""
 
     recovery_codes: tuple[str, ...]
-    other_sessions: int
+    other_sessions: int | None
 
 
 class ApiError(RuntimeError):
@@ -1232,8 +1233,8 @@ class EngineClient:
 
     def disable_mfa(self) -> MfaDisableResponse:
         """Turn off the signed-in user's TOTP MFA (step-up gated). ``other_sessions`` on the reply
-        is how many sessions :meth:`revoke_other_sessions` would end, 0 when TOTP was never on
-        (BACKLOG #1147, #3393)."""
+        is how many sessions :meth:`revoke_other_sessions` would end, 0 when TOTP was never on and
+        None when the engine could not count them (BACKLOG #1147, #3393)."""
         return _decode(self._request("DELETE", "/me/mfa"), MfaDisableResponse)
 
     def reset_user_mfa(self, user_id: str) -> MfaResetResponse:

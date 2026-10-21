@@ -347,3 +347,31 @@ def test_spending_a_mark_keeps_one_set_again_meanwhile() -> None:
     assert again is not None
     offers.spend("tok", again)
     assert offers.pending("tok") is None
+
+
+async def test_a_count_that_fails_keeps_the_offer_for_the_next_load(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3393, review round 2: a refused count is "unknown", not "none". The page renders
+    without the offer and keeps the mark, so the next load offers. RED when a failed count spends
+    the mark."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        user_id = await provision(service, "op", ["operator"])
+        assert (await service.login("op", PW)).ok
+        await cookie_login(c, "op")
+        await _synthetic_passkey(service, user_id, "synthetic-hash-3393-count")
+        path = "/ui/account/webauthn/synthetic-hash-3393-count/delete"
+        await mint_bound_proof(c, path)
+        r = await c.post(path, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+
+        async def _fault(*_args: object, **_kwargs: object) -> int:
+            raise RuntimeError("synthetic store fault")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(service.store, "count_user_sessions", _fault)
+            page = await c.get(r.headers["location"])
+        assert page.status_code == 200 and OFFER not in page.text
+        page = await c.get(r.headers["location"])
+        assert OFFER in page.text and "Sign out my other sessions (1)" in page.text

@@ -648,14 +648,16 @@ from typing import Any
 #: console reads to decide the mark. The snapshot records none of that, because ``AdminHandlers``
 #: fields are typed ``Callable[..., Awaitable[Any]]``; the new ``AuthService`` method moved the
 #: digest from ``382cd35a6af61f7b``, so a skew in either direction is refused at mount, before a
-#: call with the wrong keywords. Re-derived with ``--write``.
+#: call with the wrong keywords. Re-derived with ``--write``. Review round 2 made
+#: ``count_other_sessions`` return ``int | None``, None for a count the store refused, which the
+#: account page reads to keep its mark, so the digest moved again, from ``108e906e98fd66f0``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "108e906e98fd66f0"
+ENGINE_UI_SEAM: str = "35b9f58cdc447306"
 
 
 @dataclass(frozen=True, slots=True)
