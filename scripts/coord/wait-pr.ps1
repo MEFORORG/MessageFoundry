@@ -3,7 +3,8 @@
 <#
 .SYNOPSIS
     Wait, in the background, until a pull request is merged, is closed, or has every check
-    complete, with a hard floor on the polling interval and a hard ceiling on the total wait.
+    complete, with a hard floor on the polling interval, a hard ceiling on the time it sleeps, and
+    a timeout on every gh call.
 
 .DESCRIPTION
     This is the bounded wait helper of the AFK-autonomy plan, section 6.2 of docs/AUTONOMY-PLAN.md
@@ -16,23 +17,35 @@
     -Until merged           exit 0 once the PR is merged. A PR read as closed WITHOUT merging on two
                             checks in a row is exit 1, not a wait until the timeout. One such read is
                             not enough, because closing and reopening is a common way to re-run CI.
+                            An open PR whose `mergeable_state` reads `dirty` or `behind` on two checks
+                            in a row of the same head SHA is exit 3, "needs a push" (see below).
     -Until closed           exit 0 once the PR is closed, merged or not.
     -Until checks-complete  exit 0 once every check run and every commit status on the PR's CURRENT
                             head has finished, whatever its conclusion, and every context its base
                             branch requires has reported. The final line counts the conclusions;
                             reading them is the caller's job.
 
-    EXIT CODES: 0 the condition is met, 2 the wait timed out, 1 anything else (bad arguments, too
-    little rate budget to start, a gh call that failed, a PR that can no longer meet the condition).
-    Exit 2 is not exit 1 on purpose: a timeout means "still waiting, decide whether to wait again",
-    an error means "this instrument did not work".
+    EXIT CODES: 0 the condition is met, 2 the wait timed out, 3 the PR needs a push before it can
+    merge (-Until merged only), 1 anything else (bad arguments, too little rate budget to start, a
+    gh call that failed, a PR that can no longer meet the condition). Exit 2 is not exit 1 on
+    purpose: a timeout means "still waiting, decide whether to wait again", an error means "this
+    instrument did not work". Exit 3 is neither: the instrument worked and waiting longer will not
+    help, because someone has to update or rebase the branch first.
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints a start line,
-    one state line and a timeout line, not thirty-odd. For merged and closed the line carries GitHub's REST `mergeable_state`, in lower case
-    (`behind`, `dirty`, `blocked`, `clean`), so a branch that went stale while you waited is in the
-    output. IT IS PRINTED, NOT ACTED ON: a `behind` or `dirty` PR does not end the wait, and the
-    session reads that line only when the script exits, so a stall still costs the full timeout.
+    one state line and a timeout line, not thirty-odd. For merged and closed the line carries
+    GitHub's REST `mergeable_state`, in lower case (`behind`, `dirty`, `blocked`, `clean`), so a
+    branch that went stale while you waited is in the output.
+
+    NEEDS A PUSH IS EXIT 3, FOR -Until merged ONLY. docs/WORKTREES.md ("watch for three outcomes,
+    not two") says a merge watcher must not sit out its whole budget on a PR that cannot merge
+    without a push. So an open PR read as `dirty` or `behind` on two checks in a row of the SAME
+    head SHA ends the wait with exit 3 and one line naming the state and the SHA. Two reads, because
+    GitHub computes mergeability lazily and a transient value is common. An `unknown` or missing
+    value, or a transient failure, counts for nothing and resets nothing; any other value, a closed
+    read, or a new head SHA resets the count. For closed and checks-complete the state is printed
+    and never acted on.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -46,22 +59,27 @@
     limit, so an unchanging PR costs little after the first check. The 304
     behaviour was measured 2026-10-21 with gh 2.102.0: `gh api -i` prints the 304 status line and
     headers to stdout, writes "gh: HTTP 304" to stderr, exits 1, and X-Ratelimit-Remaining did not
-    move. The total is counted in intervals slept, so a wait overshoots its ceiling by the time its
-    reads take. NO SINGLE READ HAS A TIMEOUT: gh sets none, so a read that never returns holds the
-    script past its ceiling. That gap is known and not closed here.
+    move.
+
+    EVERY gh CALL HAS A 60 s TIMEOUT. gh sets none of its own, so each call runs as a child process
+    that is killed, with its process tree, if it has not finished within 60 s. A killed call is a
+    transient failure under the three-in-a-row rule below. The ceiling is on time SLEPT: intervals
+    slept never exceed it, and the wall clock ends the wait at the first check that finishes past
+    it. So a wait can run past its ceiling by at most one interval plus the reads of one check, and
+    with the timeout each of those reads is bounded too.
 
     THE STARTING BUDGET IS READ ONCE. `gh api rate_limit` is free and runs before anything else;
     fewer than 500 core requests left refuses the start with exit 1, because a wait is never urgent
     enough to drain the last of a budget every other seat shares. Because it runs first, a gh that
     is missing or not logged in is exit 1 at once.
 
-    ONE TRANSIENT FAILURE DOES NOT END THE WAIT. Inside the loop a 5xx, a 429, or a call that
-    printed no status line at all (a reset connection) becomes the state line and the next interval
-    reads again. Three in a row is exit 1, because by then the failure is more likely a broken gh
-    (logged out, removed) than a blip, and a timeout would misreport it as "still waiting". A 403
-    or 429 that says the rate budget is spent (X-Ratelimit-Remaining: 0) is exit 1 at once, with a
-    message naming the budget: polling a spent budget every seat shares is the thing to stop. Any
-    other 4xx is exit 1 too.
+    ONE TRANSIENT FAILURE DOES NOT END THE WAIT. Inside the loop a 5xx, a 429, a call that printed
+    no status line at all (a reset connection), or a call killed at its timeout becomes the state
+    line and the next interval reads again. Three in a row is exit 1, because by then the failure
+    is more likely a broken gh (logged out, removed) than a blip, and a timeout would misreport it
+    as "still waiting". A 403 or 429 that says the rate budget is spent (X-Ratelimit-Remaining: 0)
+    is exit 1 at once, with a message naming the budget: polling a spent budget every seat shares
+    is the thing to stop. Any other 4xx is exit 1 too.
 
     REST ONLY, NEVER `gh pr`. `gh pr` speaks GraphQL, which the cloud GitHub proxy refuses
     (CLAUDE.md section 5, "A cloud session is a Builder in its own session"), and GraphQL has no
@@ -100,9 +118,12 @@
     also does not exist in a cloud session.
 
     TEST SEAMS. -GhCommand names the gh to run; a stand-in can only fake answers, never shorten a
-    sleep. -SleepCommand replaces Start-Sleep, which would remove the interval floor, so it is
-    refused unless MEFOR_WAIT_PR_TEST_SEAMS=1 is set in the environment. The tests set it and point
-    it at a sleeper that records the already clamped interval instead of sleeping.
+    sleep. A .ps1 stand-in runs as its own child process under this pwsh, so it goes through the
+    same timeout and kill as a real gh. -SleepCommand replaces Start-Sleep, which would remove the
+    interval floor, and -GhTimeoutSeconds replaces the 60 s per-call timeout; both are refused
+    unless MEFOR_WAIT_PR_TEST_SEAMS=1 is set in the environment. The tests set it, point the sleep
+    at a sleeper that records the already clamped interval instead of sleeping, and shorten the
+    timeout only where a stand-in hangs on purpose.
 #>
 [CmdletBinding()]
 param(
@@ -125,7 +146,10 @@ param(
 
     [string]$GhCommand = 'gh',
 
-    [string]$SleepCommand = ''
+    [string]$SleepCommand = '',
+
+    [ValidateRange(1, 3600)]
+    [int]$GhTimeoutSeconds = 60
 )
 
 Set-StrictMode -Version Latest
@@ -140,6 +164,9 @@ $script:Bodies = @{}
 $script:Requests = 0
 $script:NotModified = 0
 $script:ClosedUnmerged = 0
+$script:StaleSha = $null
+$script:StaleReads = 0
+$script:Utf8 = [System.Text.UTF8Encoding]::new($false)
 
 function Say([string]$Message) {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -171,6 +198,60 @@ class TransientReadException : System.Exception {
     TransientReadException([string]$Message) : base($Message) {}
 }
 
+# The program and leading arguments that run -GhCommand as a child process. A .ps1 stand-in runs
+# under this same pwsh, so the timeout and the kill below apply to it exactly as to a real gh.
+function Resolve-Gh {
+    $cmd = Get-Command $GhCommand -CommandType Application, ExternalScript -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $cmd) { Fail "cannot find gh as '$GhCommand'; is the GitHub CLI installed and on PATH?" }
+    if ($cmd.CommandType -eq 'ExternalScript') {
+        return @{ File = [Environment]::ProcessPath; Args = @('-NoProfile', '-NonInteractive', '-File', $cmd.Source) }
+    }
+    @{ File = $cmd.Source; Args = @() }
+}
+
+# One gh call as a child process, killed with its tree past -GhTimeoutSeconds. ArgumentList, not a
+# command-line string, so a weak ETag (W/"...") keeps its quotes on Windows. Both streams are read
+# asynchronously so a full stderr pipe cannot stall the child while stdout is drained.
+function Invoke-Gh([string[]]$GhArgs) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($script:Gh.File)
+    foreach ($a in $script:Gh.Args + $GhArgs) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $script:Utf8
+    $psi.StandardErrorEncoding = $script:Utf8
+    # A gh that wants to prompt fails at once instead of sitting out the timeout.
+    $psi.Environment['GH_PROMPT_DISABLED'] = '1'
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $proc.StandardInput.Close()
+        $out = $proc.StandardOutput.ReadToEndAsync()
+        $err = $proc.StandardError.ReadToEndAsync()
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $ms = $GhTimeoutSeconds * 1000
+        # EOF on both pipes is waited for under the same deadline: a grandchild holding a pipe open
+        # would otherwise hang the read after gh itself exited.
+        $finished = $proc.WaitForExit($ms) -and
+            [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($out, $err),
+                [int][math]::Max(0, $ms - $clock.ElapsedMilliseconds))
+        if (-not $finished) {
+            try {
+                $proc.Kill($true)
+                [void]$proc.WaitForExit(5000)
+            } catch [System.InvalidOperationException], [System.ComponentModel.Win32Exception], [System.AggregateException] {
+                [Console]::Error.WriteLine("wait-pr $Repo#${Pr}: could not kill gh process $($proc.Id): $($_.Exception.Message)")
+            }
+            throw [TransientReadException]::new("gh api $($GhArgs[-1]) did not finish within $GhTimeoutSeconds s and was killed")
+        }
+        [pscustomobject]@{ Out = $out.Result; Err = $err.Result; Code = $proc.ExitCode }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
 # One REST GET through `gh api -i`, conditional on the last ETag seen for the same path. Returns
 # the parsed body; on a 304 returns the body cached with that ETag.
 function Get-Rest {
@@ -182,19 +263,14 @@ function Get-Rest {
     }
     $ghArgs += $Path
 
+    # Counted before the call: a call killed at its timeout may still have reached GitHub.
+    if (-not $Free) { $script:Requests++ }
     # gh exits 1 on a 304 and on every 4xx, and writes "gh: HTTP <code>" to stderr. The status line
     # on stdout is what decides, so the exit code and stderr are kept only for the error message.
-    $eap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $all = @(& $GhCommand @ghArgs 2>&1)
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $eap
-    }
-    if (-not $Free) { $script:Requests++ }
-    $err = @($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join ' '
-    $text = (@($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") -replace "`r", ''
+    $res = Invoke-Gh $ghArgs
+    $code = $res.Code
+    $err = @(($res.Err -split '\r?\n') | Where-Object { $_ }) -join ' '
+    $text = $res.Out -replace "`r", ''
 
     if ($text -notmatch '^HTTP/\S+ (\d{3})') {
         throw [TransientReadException]::new("gh api $Path printed no HTTP status line (exit $code). $err")
@@ -231,7 +307,10 @@ function Get-Rest {
 }
 
 function Test-Merged($p) {
-    $state = "state=$($p.state) merged=$($p.merged) mergeable_state=$($p.mergeable_state) head=$($p.head.sha)"
+    $ms = [string](Prop $p 'mergeable_state')
+    $sha = [string]$p.head.sha
+    $state = "state=$($p.state) merged=$($p.merged) mergeable_state=$ms head=$sha"
+    $needsPush = $null
     if ($Until -eq 'closed') {
         $met = $p.state -eq 'closed'
     } else {
@@ -241,8 +320,28 @@ function Test-Merged($p) {
             Say $state
             Fail 'the PR was read as closed without merging on two checks in a row, so -Until merged will not be met.'
         }
+        if ((Measure-NeedsPush $p.state $ms $sha) -ge 2) {
+            $needsPush = "mergeable_state=$ms on two checks in a row of head $sha"
+        }
     }
-    @{ Met = $met; State = $state; Summary = "head=$($p.head.sha)" }
+    @{ Met = $met; NeedsPush = $needsPush; State = $state; Summary = "head=$sha" }
+}
+
+# Counts reads of an open PR that cannot merge without a push, per head SHA, and returns the
+# count. `unknown` and a missing value are GitHub still computing, so they neither count nor reset.
+function Measure-NeedsPush([string]$State, [string]$Mergeable, [string]$Sha) {
+    if ($Sha -cne $script:StaleSha) {
+        $script:StaleSha = $Sha
+        $script:StaleReads = 0
+    }
+    if ($State -ne 'open') {
+        $script:StaleReads = 0
+    } elseif ($Mergeable -eq 'dirty' -or $Mergeable -eq 'behind') {
+        $script:StaleReads++
+    } elseif ($Mergeable -and $Mergeable -ne 'unknown') {
+        $script:StaleReads = 0
+    }
+    $script:StaleReads
 }
 
 function Test-Checks($p) {
@@ -316,9 +415,15 @@ function Read-Required([string]$Base) {
 }
 
 try {
-    if ($SleepCommand -and $env:MEFOR_WAIT_PR_TEST_SEAMS -ne '1') {
-        Fail '-SleepCommand is a test seam and would remove the interval floor; it needs MEFOR_WAIT_PR_TEST_SEAMS=1.'
+    # -SleepCommand would remove the interval floor and -GhTimeoutSeconds the per-call timeout.
+    if ($env:MEFOR_WAIT_PR_TEST_SEAMS -ne '1') {
+        $bound = $PSBoundParameters
+        $seams = @('SleepCommand', 'GhTimeoutSeconds' | Where-Object { $bound.ContainsKey($_) })
+        if ($seams) {
+            Fail "$(($seams | ForEach-Object { "-$_ is a test seam" }) -join '; '); it needs MEFOR_WAIT_PR_TEST_SEAMS=1."
+        }
     }
+    $script:Gh = Resolve-Gh
     if ($IntervalSeconds -lt $MinIntervalSeconds) {
         Say "interval raised from $IntervalSeconds s to the $MinIntervalSeconds s floor"
         $IntervalSeconds = $MinIntervalSeconds
@@ -381,8 +486,13 @@ try {
             Say "met: $Until. $($r.Summary). $accounting"
             exit 0
         }
-        # Counted in intervals slept, so the last interval is waited too; the wall clock is only a
-        # backstop for reads that hang.
+        # Indexed, not dotted: only Test-Merged sets the key, and StrictMode throws on a missing one.
+        if ($r['NeedsPush']) {
+            Say "needs a push: $($r['NeedsPush']), so -Until merged will not be met without one. $accounting"
+            exit 3
+        }
+        # Counted in intervals slept, so the last interval is waited too; the wall clock also ends
+        # a wait whose reads, each cut off at its timeout, have added up past the ceiling.
         if ($slept + $IntervalSeconds -gt $maxSeconds -or $clock.Elapsed.TotalSeconds -gt $maxSeconds) {
             Say "timeout: $Until not met within $MaxMinutes min. $accounting"
             exit 2
