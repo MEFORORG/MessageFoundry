@@ -830,6 +830,11 @@ To carry a PR to completion without a hand-written poll loop, run
 pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr <N> -Until merged
 ```
 
+Measured 2026-10-21 in a worktree-isolated subagent: the PowerShell tool ran this form in the
+foreground and returned the script's exit code, a `run_in_background` run's task notification
+reported its exit 1, and the Bash tool refused the form there. Exits 0 and 2 in the background were
+not measured.
+
 `-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out and error
 apart. It prints one line per state change, and for `merged` and `closed` that line carries REST's
 lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values in the table
