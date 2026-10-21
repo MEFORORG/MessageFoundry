@@ -520,16 +520,25 @@ def test_a_refused_required_context_read_is_an_error_not_an_empty_set(tmp_path: 
     assert "answered HTTP 404" in run.err
 
 
-@pytest.mark.parametrize("stale", ["dirty", "behind"])
-def test_two_reads_that_need_a_push_on_one_head_exit_3(tmp_path: Path, stale: str) -> None:
-    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr(mergeable=stale))]})
+DIRTY = ok(pr(mergeable="dirty"))
+BEHIND = ok(pr(mergeable="behind"))
+MERGED = ok(pr("closed", merged=True))
+
+
+def test_two_dirty_reads_on_one_head_exit_3(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [DIRTY]})
     assert run.code == 3, run.err
-    assert f"needs a push: mergeable_state={stale} on two checks of head {SHA}" in run.out
+    assert f"needs a push: mergeable_state=dirty on two checks of head {SHA}" in run.out
     assert run.sleeps == [120]
 
 
-DIRTY = ok(pr(mergeable="dirty"))
-MERGED = ok(pr("closed", merged=True))
+def test_two_behind_reads_on_one_head_do_not_exit_3(tmp_path: Path) -> None:
+    """The merge queue merges a behind branch without an update, so `behind` is waited out."""
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [BEHIND, BEHIND, MERGED]})
+    assert run.code == 0, run.err
+    assert "needs a push" not in run.out
+    assert f"mergeable_state=behind head={SHA}" in run.out
+    assert run.sleeps == [120] * 2
 
 
 @pytest.mark.parametrize(
@@ -537,6 +546,8 @@ MERGED = ok(pr("closed", merged=True))
     [
         # A clean read between two dirty ones resets the count, so the merge is waited for.
         ([DIRTY, ok(pr(mergeable="clean")), DIRTY, MERGED], 0, 3),
+        # So does a behind read: it is a computed value, and not one that needs a push.
+        ([DIRTY, BEHIND, DIRTY, MERGED], 0, 3),
         # Dirty on head A, then on head B: B has been read dirty once, not twice.
         ([DIRTY, ok(pr(mergeable="dirty", sha="b" * 40)), MERGED], 0, 2),
         # A retarget resets too: the first read against the new base is its first read.
@@ -551,6 +562,7 @@ MERGED = ok(pr("closed", merged=True))
     ],
     ids=[
         "clean-resets",
+        "behind-resets",
         "new-head-resets",
         "new-base-resets",
         "closed-resets",
