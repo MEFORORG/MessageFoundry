@@ -625,6 +625,9 @@ def test_a_gh_call_that_hangs_is_killed_and_counted_as_transient(tmp_path: Path)
     assert f"gh api {PR_PATH} did not finish within 8 s and was killed" in run.out
     assert "three transient failures in a row" in run.err
     assert run.sleeps == [120, 120, 120]
+    # The survivor walk below proves nothing over an empty run.hung. The vacuous-absence lint does
+    # not read the exact count as a guard against that, so the floor is stated before it.
+    assert len(run.hung) >= 3, (run.hung, run.out)
     assert len(run.hung) == 3
     survivors = [pid for pid in run.hung if psutil.pid_exists(pid)]
     for pid in survivors:  # so a regression fails here and does not leave 600 s sleepers behind
