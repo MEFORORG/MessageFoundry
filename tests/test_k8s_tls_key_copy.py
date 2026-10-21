@@ -91,12 +91,16 @@ def _mount_at(container: dict[str, Any], directory: PurePosixPath) -> dict[str, 
     return found[0]
 
 
-def _secret_mode(volume: dict[str, Any], name: str) -> int:
-    """The mode the kubelet gives ``name`` in a Secret volume, or fail if the volume lacks it."""
+def _secret_mode(pod: dict[str, Any], volume: dict[str, Any], name: str) -> int:
+    """The mode the kubelet serves ``name`` at in a Secret volume, or fail if the volume lacks it.
+
+    Under ``fsGroup`` the kubelet's volume-ownership step ORs a group-read mask into each file of a
+    read-only volume, so a declared ``0400`` is served as ``0440``."""
     secret = volume["secret"]
+    widen = 0o440 if "fsGroup" in pod.get("securityContext", {}) else 0
     for item in secret.get("items", []):
         if item["path"] == name:
-            return int(item.get("mode", secret.get("defaultMode", 0o644)))
+            return int(item.get("mode", secret.get("defaultMode", 0o644))) | widen
     raise AssertionError(f"Secret volume {volume['name']} serves no {name}")
 
 
@@ -128,7 +132,7 @@ def _engine_tls_modes(pod: dict[str, Any]) -> dict[str, int]:
     for path in _engine_tls_paths(pod):
         volume = _volumes(pod)[_mount_at(engine, path.parent)["name"]]
         if "secret" in volume:
-            modes[str(path)] = _secret_mode(volume, path.name)
+            modes[str(path)] = _secret_mode(pod, volume, path.name)
         elif "emptyDir" in volume:
             modes[str(path)] = _installed_mode(pod, volume["name"], path.name)
         else:
@@ -224,14 +228,21 @@ def test_copy_tls_runs_as_the_engine_with_the_engine_s_hardening(
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
 def test_copy_tls_can_read_the_root_owned_secret(name: str, pod: dict[str, Any]) -> None:
     """The kubelet writes Secret files root-owned, so copy-tls (uid 10001) reads them only through
-    fsGroup and a group-read bit. Tightening the Secret to 0400, or dropping fsGroup, would leave
-    the pod stuck in Init."""
+    fsGroup, which serves them group-readable. Dropping fsGroup would leave the pod stuck in Init.
+    And no Secret file is served to other accounts."""
     pod_ctx = pod["securityContext"]
     assert pod_ctx["fsGroup"] == pod_ctx["runAsGroup"] == 10001, name
-    secret = _volumes(pod)["tls-secret"]["secret"]
-    modes = [item.get("mode", secret["defaultMode"]) for item in secret["items"]]
-    assert all(mode & 0o040 for mode in modes), name
-    assert not any(mode & 0o007 for mode in modes), name
+    volume = _volumes(pod)["tls-secret"]
+    for item in volume["secret"]["items"]:
+        mode = _secret_mode(pod, volume, item["path"])
+        assert mode & 0o040 and not mode & 0o007, (name, item["path"], oct(mode))
+
+
+def test_fsgroup_widens_a_0400_secret_the_engine_would_mount() -> None:
+    """The control for the fsGroup widening: a 0400 Secret on the engine is still refused."""
+    pod = yaml.safe_load(_PRE_FIX_POD.replace("defaultMode: 0440", "defaultMode: 0400"))
+    assert _engine_tls_modes(pod)["/etc/mefor/tls/api.key"] == 0o440
+    assert "/etc/mefor/tls/api.key" in _refused(_engine_tls_modes(pod))
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)

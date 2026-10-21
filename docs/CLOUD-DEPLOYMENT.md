@@ -229,8 +229,9 @@ The reference manifest ([`ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml)) se
 > do a **coordinated** restart instead: scale the Deployment to `0` then back to `3` (or otherwise avoid a
 > mixed-version leader window) so no two nodes run divergent graphs. `kubectl rollout restart` is **also**
 > rolling and is **not** a substitute. Cert note: **API TLS cert rotation needs a pod restart** (uvicorn
-> builds the TLS context once; only MLLP certs hot-reload on `/config/reload`) — fold the cert-renewal into
-> your runbook.
+> builds the TLS context once). MLLP certs hot-reload on `/config/reload`, except a key this manifest's
+> `copy-tls` copies, which needs a new pod too ([`docker/README.md`](../docker/README.md), *Cert
+> rotation*) — fold the cert-renewal into your runbook.
 
 ---
 

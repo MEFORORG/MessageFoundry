@@ -177,9 +177,10 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 
 - **Healthcheck:** `GET /health` is tokenless and always 200 — a **liveness** signal (it answers before
   the engine finishes starting; there is no unauthenticated readiness endpoint). The image probe uses
-  `curl -k https://127.0.0.1:8443/health` (the container presents its own, often self-signed, cert on
-  loopback, so `-k`/`--cacert` is **mandatory**). It has no cleartext fallback, so a container whose
-  TLS is broken reports unhealthy (BACKLOG #1179; the port follows `MEFOR_API_PORT`).
+  `curl -k https://127.0.0.1:${MEFOR_API_PORT:-8765}/health`, which is 8443 under compose and the k8s
+  manifests (the container presents its own, often self-signed, cert on loopback, so `-k`/`--cacert`
+  is **mandatory**). It has no cleartext fallback, so a container whose TLS is broken reports
+  unhealthy (BACKLOG #1179).
   **CORRECTED 2026-10-20:** this said the probe then fell back to `http://127.0.0.1:8765/health`.
 - **Graceful shutdown:** PID 1 is `tini`, which forwards `SIGTERM` → uvicorn lifespan → `engine.stop()`
   (drains MLLP clients within the `_CLIENT_SHUTDOWN_GRACE` bound). Give the orchestrator a stop grace of

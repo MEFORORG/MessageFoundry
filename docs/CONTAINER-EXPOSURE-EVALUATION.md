@@ -290,7 +290,7 @@ So: **server TLS required** (the gate enforces it), **mTLS opt-in per partner**,
 
 | Item | Type | How into the container | Notes |
 |---|---|---|---|
-| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`. A Swarm secret or config surfaces at `0444` unless its long syntax sets `uid: "10001"` and `mode: 0400`. A k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
+| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret: the API pair as shipped, and a connection's files once added to the Secret's items and the `copy-tls` command) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`. A Swarm secret or config surfaces at `0444` unless its long syntax sets `uid: "10001"` and `mode: 0400`. A k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
 | `tls_key_password` (API + MLLP) | secret | API: env `MEFOR_API_TLS_KEY_PASSWORD`. MLLP: per-connection `tls_key_password=env(...)` | Decrypts an encrypted private key. The API key uses the env var; an encrypted **MLLP** key uses the per-connection `tls_key_password` (env-sourced) — see §7. |
 | Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either ([PHI.md](PHI.md) §3). Mint with `messagefoundry gen-key`. |
 | DB password / `tls_client_ca_file` etc. | secret / file | env (`MEFOR_STORE_PASSWORD`) / mounted file | Prefer the orchestrator's secret store over plain `-e` where possible. |
@@ -392,7 +392,7 @@ The console stays a **host-side process**; only its target URL changes.
 
 4. **API cert rotation needs a container restart** (§4), and a new pod on the shipped Kubernetes
    manifests — the uvicorn TLS context is built once. Plan a rolling restart; MLLP certs rotate on
-   config reload, the API cert does not.
+   config reload, the API cert does not, and nor does a key the manifests copy (§4, *Rotation*).
 
 5. **Raw TCP / X12 inbound have *no* transport guard.** Unlike MLLP/DICOM, a non-loopback raw-TCP or
    X12 listener is **not refused** — it would publish plaintext PHI with no startup error (operator
