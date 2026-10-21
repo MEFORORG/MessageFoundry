@@ -64,6 +64,11 @@ _PEM_MARKER: Final = "-----BEGIN"
 KEY_FILE_REMEDY: Final = "Restrict it to the account the engine runs as"
 
 
+#: Windows errors CPython raises as FileNotFoundError for a path it could not reach:
+#: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67).
+_UNREACHABLE_WINERRORS: Final = frozenset({53, 67})
+
+
 def _absent(path: str) -> bool:
     """Whether nothing is at ``path``. Only a missing name counts: a file whose status cannot be
     read is not absent, and :func:`broad_access_problem` reports it as a problem."""
@@ -71,7 +76,12 @@ def _absent(path: str) -> bool:
         # The same call broad_access_problem makes: lstat on Windows, stat on POSIX, so a dangling
         # link is missing on POSIX, as the loader that follows it finds it.
         os.lstat(path) if sys.platform == "win32" else os.stat(path)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError as exc:
+        # Windows also reports a share or network path it cannot reach as FileNotFoundError. That
+        # is a file nobody examined, not a missing one, so it goes to the access check, which
+        # refuses what it cannot read rather than passing it.
+        return getattr(exc, "winerror", None) not in _UNREACHABLE_WINERRORS
+    except NotADirectoryError:
         return True
     except OSError:
         return False  # not a missing name: the access check that follows reports it
@@ -105,8 +115,9 @@ def connection_key_files(
 ) -> list[tuple[str, str]]:
     """``(label, path)`` for each private-key file a connection in ``registry`` names.
 
-    ``env()`` references are resolved against ``env_values``. Every inbound and outbound connection
-    is read, deployed or not, so a key is judged before a deploy can load it. A setting that does
+    ``env()`` references are resolved against ``env_values``. Every deployed inbound and outbound
+    connection is read. One with ``deployed=False`` is not: the engine never builds it, and ADR 0111
+    forbids resolving its ``env()`` values, so the reload that deploys it judges its key. A setting that does
     not resolve is skipped with its pair: the connection's own build refuses it and names the
     missing value. So is a value that is not a path, or that holds PEM text. A key whose certificate
     setting is unset is skipped too, because every loader loads an identity only from a certificate,
@@ -151,6 +162,8 @@ def connection_key_files(
     )
     for direction, connections in groups:
         for conn in sorted(connections, key=lambda c: c.name):
+            if not conn.deployed:
+                continue  # ADR 0111: never built, and its env() values are never resolved
             settings = conn.spec.settings
             for cert_setting, key_setting, tls_identity in _IDENTITY_SETTINGS:
                 if tls_identity and not loads_tls_identity(settings):

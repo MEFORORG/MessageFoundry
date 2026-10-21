@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -181,6 +182,40 @@ def test_a_path_typed_key_is_judged_and_files_without_a_tls_identity_are_not() -
         ("inbound connection 'IB_PATH' setting 'tls_key_file'", "p.key"),
         ("outbound connection 'OB_FTPS' setting 'tls_cert_file'", "f.pem"),
     ]
+
+
+def test_a_connection_that_is_not_deployed_is_not_judged(tmp_path: Path) -> None:
+    """ADR 0111: the engine never builds it and never resolves its env() values, so its key is
+    judged by the reload that deploys it. The control is the same connection deployed."""
+    spec = ConnectionSpec(
+        ConnectorType.MLLP, {"tls": True, "tls_cert_file": "c.crt", "tls_key_file": env("idle_key")}
+    )
+    values = {"idle_key": str(_key(tmp_path / "broad.key", broad=True))}
+    for deployed, expected in ((True, 1), (False, 0)):
+        graph = Registry(
+            inbound={"IB_IDLE": InboundConnection("IB_IDLE", spec, router="r", deployed=deployed)}
+        )
+        assert len(connection_key_files(graph, values)) == expected
+
+
+def test_a_key_on_a_share_that_does_not_answer_is_refused_not_passed_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows raises FileNotFoundError for an unreachable network path too. A missing file
+    passes, for the loader to refuse; a file nobody could examine must not."""
+
+    class _NetPathGone(FileNotFoundError):
+        winerror = 53
+
+    def unreachable(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        raise _NetPathGone(2, "The network path was not found")
+
+    graph = _soap_graph(tmp_path / "on-share.key")
+    assert connection_key_file_problem(graph, {}) is None  # the control: a missing name passes
+    monkeypatch.setattr(os, "lstat", unreachable)
+    monkeypatch.setattr(os, "stat", unreachable)
+    problem = connection_key_file_problem(graph, {})
+    assert problem is not None and "could not be examined" in problem
 
 
 def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:

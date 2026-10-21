@@ -361,9 +361,11 @@ DICOM and FTPS, and `Soap(client_key_file=...)`. Where a TLS connection leaves `
 unset, or its `env()` value blank, the key is in its certificate PEM, so `tls_cert_file` is
 checked instead. A connection that loads no TLS identity has neither file checked.
 Under `"enforce"` a file a broad group can read would refuse the start, or the reload or activation,
-which keeps the running graph. Under `"warn"` it is logged. `supervise` refuses such a graph, judged
-whole, before it starts an engine shard, and each engine shard then checks its own inbound
-connections and every outbound one. A value that holds PEM text rather than a path is not checked
+which keeps the running graph, and `supervise` would refuse such a graph, judged whole, before it
+starts an engine shard. Under `"warn"` each engine shard logs it, and `supervise` refuses nothing.
+Each engine shard checks its own inbound connections and every outbound one. A connection with
+`deployed = false` is not checked until a reload deploys it. A value that holds PEM text rather
+than a path is not checked
 ([key_file_access.py](../messagefoundry/config/key_file_access.py), BACKLOG #3402).
 
 **What this does not cover.** Know these before you rely on it:
@@ -376,8 +378,10 @@ connections and every outbound one. A value that holds PEM text rather than a pa
   SERVICE are accounts that many services share, and the check does not report them.
 - On POSIX the test is a group or other read or write bit, whoever is in the group. A volume that
   makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
-  the first start mint a key and makes every later start refuse it. Supply your own certificate
-  there, as the shipped manifest does.
+  the first start mint a key and makes every later start refuse it. Supplying your own certificate
+  does not avoid this under `"enforce"`: an `[api].tls_key_file` on such a volume is judged by the
+  same test. The shipped Kubernetes manifests mount the API key from a Secret at mode `0440` with
+  `fsGroup`, so as shipped they would not start under `"enforce"`. That gap is open.
 - The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds
