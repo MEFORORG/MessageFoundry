@@ -610,10 +610,15 @@ def test_a_crafted_target_cannot_forge_an_instruction_in_the_deny_text(
 # --------------------------------------------------------------------------- rule 2: dispatch
 
 
-def dispatch(cwd: Path, tool: str, subagent_type: object = None) -> dict[str, Any]:
+_NO_TYPE = object()
+
+
+def dispatch(
+    cwd: Path, tool: str, subagent_type: object = _NO_TYPE, key: str = "subagent_type"
+) -> dict[str, Any]:
     tool_input: dict[str, Any] = {"prompt": "go"}
-    if subagent_type is not None:
-        tool_input["subagent_type"] = subagent_type
+    if subagent_type is not _NO_TYPE:
+        tool_input[key] = subagent_type
     return {"session_id": "s-1", "cwd": str(cwd), "tool_name": tool, "tool_input": tool_input}
 
 
@@ -628,7 +633,12 @@ def test_dispatch_from_the_primary_is_denied(primary: Path, repos_file: Path, to
 
 @pytest.mark.parametrize(
     ("tool", "subagent_type"),
-    [("Agent", "web-fetch"), ("Agent", "claude-code-guide"), ("Task", "web-fetch")],
+    [
+        ("Agent", "web-fetch"),
+        ("Agent", "claude-code-guide"),
+        ("Task", "web-fetch"),
+        ("Task", "claude-code-guide"),
+    ],
 )
 def test_shell_less_subagent_types_may_dispatch_from_the_primary(
     primary: Path, repos_file: Path, tool: str, subagent_type: str
@@ -648,7 +658,13 @@ def test_shell_less_subagent_types_may_dispatch_from_the_primary(
         ("Agent", "explore"),
         ("Agent", "Web-Fetch"),  # the match is case-sensitive
         ("Agent", " web-fetch"),  # and exact: no trimming
+        # The match is ORDINAL: PowerShell's culture comparison ignores these characters, so -ceq/-cin
+        # would let each through.
+        ("Agent", "web-fetch​"),
+        ("Agent", "web­-fetch"),
+        ("Agent", "claude-code‍-guide"),
         ("Agent", ["web-fetch"]),  # a non-string must not be cast into a match
+        ("Agent", None),  # an explicit JSON null
         ("Workflow", "web-fetch"),  # the exemption is for Agent/Task only
     ],
 )
@@ -657,6 +673,13 @@ def test_other_dispatches_from_the_primary_stay_denied(
 ) -> None:
     reason = assert_denied(run_gate(dispatch(primary, tool, subagent_type), repos_file))
     assert "subagent" in reason.lower()
+
+
+def test_a_wrong_case_subagent_type_key_is_not_read(primary: Path, repos_file: Path) -> None:
+    """A PSCustomObject property read ignores case, so the KEY must be matched ordinally too: the Agent
+    tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash."""
+    payload = dispatch(primary, "Agent", "web-fetch", key="SUBAGENT_TYPE")
+    assert_denied(run_gate(payload, repos_file))
 
 
 def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -> None:
