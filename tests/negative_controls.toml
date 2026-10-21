@@ -236,12 +236,14 @@ plants = """
 A hallucinated distribution name, a registered-but-empty project, and a freshly registered one, fed to
 `scripts/security/new_dependency_check.py` -- the step in this job that answers what pip-audit
 structurally cannot: a hallucinated name has no advisory, so it resolves, locks, hashes and installs
-through every other DEP-1 control clean.
+through every other DEP-1 control clean. Also a PyPI that never answers (BACKLOG #3089): the step
+retries transient failures, and the plant proves the retries end in exit 2 rather than a pass.
 """
 red = [
   "tests/test_new_dependency_check.py::test_a_nonexistent_name_is_caught",
   "tests/test_new_dependency_check.py::test_main_exits_1_on_a_hallucinated_name",
   "tests/test_new_dependency_check.py::test_main_exits_2_when_the_sweep_examines_nothing",
+  "tests/test_new_dependency_check.py::test_main_exits_2_after_retrying_a_persistent_handshake_timeout",
 ]
 holds = """
 A clean tree must produce no findings AND a non-zero examined count -- "found nothing" and "did not

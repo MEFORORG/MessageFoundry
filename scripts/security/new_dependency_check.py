@@ -59,16 +59,18 @@ degrades to green when it cannot see is the failure mode this repo has already c
 reason the summary prints the number of distributions actually EXAMINED, and exits non-zero if that
 number is zero.
 
-TRANSIENT RETRY (BACKLOG #3089). The sweep makes one PyPI request per declared distribution, about 56
-in sequence, inside a REQUIRED job, so a single TLS handshake timeout used to evict a clean pull
-request from the merge queue. A request that fails TRANSIENTLY -- a network-level OSError such as a
-connect, TLS handshake or read timeout, a reset, refused or unreachable connection or a DNS failure, a
-truncated body, or an HTTP 429 or 5xx -- gets up to ``_ATTEMPTS`` attempts in total (two retries),
-with exponential backoff of about 1s then 2s plus up to 0.5s of jitter. A DEFINITIVE answer is never
-retried: a 404 still means "no such project" on the first reply; a 4xx other than 429, a certificate
-verification failure and an unparsable or wrongly shaped body still fail at once. When the retries are
-spent the last error propagates and the run exits 2 exactly as before; a retry never turns an
-unreachable PyPI into a pass.
+TRANSIENT RETRY (BACKLOG #3089). The sweep makes one PyPI request per declared distribution, in
+sequence, inside a REQUIRED job, so a single TLS handshake timeout used to evict a clean pull request
+from the merge queue. A request that fails TRANSIENTLY gets up to ``_ATTEMPTS`` attempts in total
+(two retries), with exponential backoff of about 1s then 2s plus up to 0.5s of jitter. Transient is
+an allowlist, and ``_is_transient`` is the one place it is written down: at least a connect, TLS
+handshake or read timeout, a reset or refused connection, an unreachable network or host, a temporary
+DNS failure, a body cut short with IncompleteRead, and an HTTP 429 or 5xx. Everything else fails at
+once, and in particular a DEFINITIVE answer is never retried: a 404 still means "no such project" on
+the first reply, and a 4xx other than 429, any TLS error other than a timeout (a certificate failure
+above all), a proxy refusal, and a body that is not UTF-8 JSON naming an object keep their meaning.
+When the retries are spent the last error propagates and the run exits 2 exactly as before; a retry
+never turns an unreachable PyPI into a pass.
 
 Worst case added time. The whole run gets at most ``_RUN_RETRY_BUDGET`` (6) retries, and none starts
 once the sweep has been running ``_RETRY_WINDOW_S`` (120s). So retries add at most those 120s plus
@@ -85,11 +87,13 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import errno
 import functools
 import http.client
 import json
 import random
 import re
+import socket
 import sys
 import time
 import tomllib
@@ -333,29 +337,45 @@ class RetryBudget:
         return True
 
 
-def _is_certificate_failure(reason: BaseException) -> bool:
-    # Matched by class name so this file need not import ssl, which would enrol it in the crypto
-    # inventory for an exception class. ssl.CertificateError is an alias of this class.
-    return any(cls.__name__ == "SSLCertVerificationError" for cls in type(reason).__mro__)
+class UnreadableReply(ValueError):
+    """PyPI answered, but not with UTF-8 JSON naming an object. Definitive: never retried.
+
+    Its message names the failure class only, never the body, which can be large and arbitrary.
+    """
+
+
+# Plain-OSError errnos that mean the link, not the answer. Matched only on an exception whose type is
+# exactly OSError (how socket reports these), so an ssl error's own small error numbers cannot collide.
+_TRANSIENT_ERRNOS = frozenset(
+    {
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ENOTCONN,  # "Transport endpoint is not connected", the BACKLOG #3089 pip-audit log
+        errno.EADDRNOTAVAIL,  # an unusable IPv6 address tried last on an IPv4-only runner
+        errno.ETIMEDOUT,
+        errno.ECONNABORTED,
+    }
+)
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """True only for a failure that says nothing about the package: the link, not the answer.
+    """The transient ALLOWLIST: True only for a failure that is the link, not the answer.
 
-    HTTPError is checked first because it subclasses URLError. A 404 is the definitive "no such
-    project" and never reaches here; any other 4xx except 429 is a definitive refusal. Below HTTP, any
-    network-level OSError is the link -- a timeout (the 2026-10-20 evictions logged
-    URLError(TimeoutError) from a TLS handshake), a reset, refused or unreachable connection, a DNS
-    failure, a TLS session dropped mid-handshake -- EXCEPT a certificate verification failure, which is
-    an answer about who is on the other end and must not be retried. A truncated body
-    (IncompleteRead; RemoteDisconnected is a ConnectionError) is the link too.
+    The module docstring summarizes this; the code is the record. HTTPError is checked first because it
+    subclasses URLError, and a 404 never reaches here. Anything not matched below -- a certificate or
+    other TLS error that is not a timeout, a proxy refusal (a bare OSError with no errno), an
+    UnreadableReply -- is definitive and fails at once.
     """
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    if isinstance(reason, http.client.IncompleteRead):
+    # TimeoutError: the 2026-10-20 evictions logged URLError(TimeoutError) from a TLS handshake.
+    # ConnectionError: reset, refused, aborted, and http.client.RemoteDisconnected.
+    if isinstance(reason, TimeoutError | ConnectionError | http.client.IncompleteRead):
         return True
-    return isinstance(reason, OSError) and not _is_certificate_failure(reason)
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    return type(reason) is OSError and reason.errno in _TRANSIENT_ERRNOS
 
 
 def _describe(exc: BaseException) -> str:
@@ -385,8 +405,14 @@ def _http_fetch(
         try:
             return _fetch_once(name, timeout=timeout)
         except (OSError, http.client.HTTPException) as exc:
-            if attempt >= _ATTEMPTS or not _is_transient(exc) or not budget.spend():
+            if attempt >= _ATTEMPTS or not _is_transient(exc):
                 raise
+            # Checked separately and last, because spend() consumes a retry: a definitive error or a
+            # final attempt must not draw down the run's budget.
+            if not budget.spend():
+                raise
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()  # release the 429/5xx response's socket now, not at garbage collection
             # Jitter only de-synchronises retries; it guards nothing, so a non-crypto PRNG is right.
             jitter = random.uniform(0, _BACKOFF_JITTER_S)  # nosec B311
             delay = _BACKOFF_BASE_S * 2 ** (attempt - 1) + jitter
@@ -417,15 +443,20 @@ def _fetch_once(name: str, *, timeout: float) -> dict | None:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            exc.close()
             return None
         raise
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError or JSONDecodeError; both carry the whole body
+        raise UnreadableReply(
+            f"PyPI's reply for {name!r} is not UTF-8 JSON ({type(exc).__name__})"
+        ) from None
     if not isinstance(payload, dict):
-        # Valid JSON of the wrong shape is a definitive bad answer, not a flaky link; raised here as a
-        # ValueError so main reports it as unreadable (exit 2) rather than vet crashing on .get.
-        raise ValueError(f"PyPI returned a JSON {type(payload).__name__}, not an object")
+        raise UnreadableReply(f"PyPI's reply for {name!r} is a JSON {type(payload).__name__}")
     return payload
 
 
@@ -438,6 +469,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     declared = declared_distributions(args.pyproject.read_text(encoding="utf-8"))
+    # FAIL CLOSED on both branches below. Passing here would mean "PyPI was unreachable (or answered
+    # nonsense), so every dependency is fine". Either one escaping as a traceback would exit 1, the
+    # code that means "a dependency failed vetting", rather than 2, "could not see".
     try:
         findings, examined = vet(
             declared,
@@ -445,16 +479,16 @@ def main(argv: list[str] | None = None) -> int:
             now=datetime.now(UTC),
             min_age_days=args.min_age_days,
         )
-    except (
-        # OSError covers URLError, HTTPError and every timeout; ValueError covers JSONDecodeError, a
-        # non-UTF-8 body and a wrongly shaped one; HTTPException covers IncompleteRead, which is not an
-        # OSError. Anything escaping here would exit 1, the code that means "a dependency failed
-        # vetting", rather than 2, "could not see".
-        OSError,
-        ValueError,
-        http.client.HTTPException,
-    ) as exc:
-        # FAIL CLOSED. Passing here would mean "PyPI was unreachable, so every dependency is fine".
+    except UnreadableReply as exc:
+        print(
+            f"::error::dependency vetting got an unreadable reply from PyPI ({exc}). Treating this as "
+            "a FAILURE: a supply-chain gate that goes green while blind is worse than no gate.",
+            file=sys.stderr,
+        )
+        return 2
+    # OSError covers URLError, HTTPError and every timeout; HTTPException covers IncompleteRead, which
+    # is not an OSError.
+    except (OSError, http.client.HTTPException) as exc:
         print(
             f"::error::dependency vetting could not reach PyPI ({exc!r}). Treating this as a FAILURE: "
             "a supply-chain gate that goes green while blind is worse than no gate.",

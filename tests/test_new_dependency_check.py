@@ -382,10 +382,12 @@ def _http_error(code: int) -> urllib.error.HTTPError:
 
 
 _GOOD_BODY = json.dumps(_fetch_all_good("fastapi")).encode()
-# The exact shape the 2026-10-20 merge-group evictions logged.
-_HANDSHAKE_TIMEOUT = urllib.error.URLError(
-    TimeoutError("_ssl.c:1064: The handshake operation timed out")
-)
+
+
+def _handshake_timeout() -> urllib.error.URLError:
+    """The exact shape the 2026-10-20 merge-group evictions logged. A fresh instance per use: one
+    shared exception re-raised across tests would accumulate every raise's frames on its traceback."""
+    return urllib.error.URLError(TimeoutError("_ssl.c:1064: The handshake operation timed out"))
 
 
 def _budget(remaining: int = 6) -> RetryBudget:
@@ -395,13 +397,13 @@ def _budget(remaining: int = 6) -> RetryBudget:
 @pytest.mark.parametrize(
     "transient",
     [
-        _HANDSHAKE_TIMEOUT,
+        _handshake_timeout(),
         TimeoutError("timed out"),
         ConnectionResetError(104, "Connection reset by peer"),
         urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
         urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable")),
         urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, "Temporary failure")),
-        urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+        urllib.error.URLError(OSError(errno.ENOTCONN, "Transport endpoint is not connected")),
         _ReadFails(http.client.IncompleteRead(b"{", 100)),
         _ReadFails(TimeoutError("The read operation timed out")),
         _http_error(429),
@@ -414,7 +416,7 @@ def _budget(remaining: int = 6) -> RetryBudget:
         "refused",
         "net-unreachable",
         "dns-eai-again",
-        "tls-eof",
+        "not-connected",
         "incomplete-read-on-body",
         "timeout-on-body",
         "http-429",
@@ -440,7 +442,7 @@ def test_a_persistent_timeout_fails_after_the_attempts_are_spent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """FAIL CLOSED: retries delay the failure, they never replace it with a payload."""
-    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
     sleeps: list[float] = []
 
     with pytest.raises(urllib.error.URLError):
@@ -467,6 +469,10 @@ def test_a_404_is_not_retried_and_still_means_absent(monkeypatch: pytest.MonkeyP
         b"[]",
         b"\xff\xfe not utf-8",
         urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        urllib.error.URLError(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")),
+        urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+        urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden")),
+        urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, "Name or service not known")),
         urllib.error.URLError("unknown url type: ftp"),
     ],
     ids=[
@@ -476,6 +482,10 @@ def test_a_404_is_not_retried_and_still_means_absent(monkeypatch: pytest.MonkeyP
         "json-not-an-object",
         "not-utf-8",
         "cert-verify-failed",
+        "tls-wrong-version",
+        "tls-eof",
+        "proxy-tunnel-403",
+        "dns-no-such-name",
         "urlerror-with-text-reason",
     ],
 )
@@ -493,7 +503,7 @@ def test_a_definitive_failure_is_raised_at_once(
 
 def test_the_run_budget_caps_retries_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """A PyPI that is flaky on EVERY name must fail closed in minutes, not after 56 x 3 attempts."""
-    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
     budget = _budget(remaining=1)
 
     with pytest.raises(urllib.error.URLError):
@@ -507,7 +517,7 @@ def test_the_run_budget_caps_retries_across_requests(monkeypatch: pytest.MonkeyP
 
 def test_no_retry_starts_once_the_run_window_has_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """The time bound, not just the count: a closed window fails the first transient error at once."""
-    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT, _GOOD_BODY])
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout(), _GOOD_BODY])
     budget = RetryBudget(remaining=6, window_ends=time.monotonic() - 1.0)
 
     with pytest.raises(urllib.error.URLError):
@@ -538,7 +548,7 @@ def test_main_exits_2_after_retrying_a_persistent_handshake_timeout(
 ) -> None:
     """The CLI end of the contract: exit 2 (unreachable), each retry logged with attempt and host."""
     _zero_backoff(monkeypatch)
-    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
 
     assert main([]) == 2
     assert len(calls) == 3, "the sweep must stop at the first request whose retries are spent"
@@ -554,19 +564,25 @@ def test_main_exits_2_after_retrying_a_persistent_handshake_timeout(
     ids=["incomplete-read", "not-utf-8", "json-not-an-object"],
 )
 def test_main_exits_2_not_1_when_the_body_cannot_be_read(
-    monkeypatch: pytest.MonkeyPatch, outcome: bytes | _ReadFails
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: bytes | _ReadFails,
 ) -> None:
-    """Exit 1 means "a dependency failed vetting"; an unreadable reply is "could not see" -- exit 2."""
+    """Exit 1 means "a dependency failed vetting"; an unreadable reply is "could not see" -- exit 2.
+
+    And the reply itself stays out of the CI log: a UnicodeDecodeError's repr carries the whole body.
+    """
     _zero_backoff(monkeypatch)
     _script_urlopen(monkeypatch, [outcome])
 
     assert main([]) == 2
+    assert "not utf-8" not in capsys.readouterr().err, "the response body leaked into the log"
 
 
 def _fail_once_then_good(name: str, *, timeout: float, seen: set[str]) -> dict:
     if name not in seen:
         seen.add(name)
-        raise _HANDSHAKE_TIMEOUT
+        raise _handshake_timeout()
     return _fetch_all_good(name)
 
 
@@ -591,7 +607,8 @@ def test_main_shares_one_budget_across_every_request(
 ) -> None:
     """Three names each failing once need three retries; a run budget of two must fail closed.
 
-    A budget made per request (a bare _http_fetch, or a partial built per name) would pass this run.
+    A budget made per request (a partial or lambda that builds a RetryBudget per call) would pass
+    this run.
     """
     import scripts.security.new_dependency_check as mod
 
