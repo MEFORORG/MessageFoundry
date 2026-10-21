@@ -495,6 +495,7 @@ def test_no_tracked_file_names_a_fragment_the_release_fold_deletes() -> None:
     )
     assert found.returncode == 0, found.stderr.decode("utf-8", "replace")  # 1 would mean no line
     lines = found.stdout.decode("utf-8", "replace").splitlines()
+    assert lines, "git grep printed no line"
     assert any("changelog.d/README.md" in line for line in lines), "git grep read nothing usable"
     offenders = [line for line in lines if _FRAGMENT_PATH.search(line)]
     assert not offenders, f"tracked files name changelog fragments: {offenders}"
