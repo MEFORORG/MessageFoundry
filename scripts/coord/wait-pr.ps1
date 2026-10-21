@@ -17,8 +17,8 @@
     -Until merged           exit 0 once the PR is merged. A PR read as closed WITHOUT merging on two
                             checks in a row is exit 1, not a wait until the timeout. One such read is
                             not enough, because closing and reopening is a common way to re-run CI.
-                            An open PR whose `mergeable_state` reads `dirty` or `behind` on two checks
-                            in a row of the same head SHA is exit 3, "needs a push" (see below).
+                            An open PR whose `mergeable_state` reads `dirty` on two checks in a row
+                            of the same head SHA is exit 3, "needs a push" (see below).
     -Until closed           exit 0 once the PR is closed, merged or not.
     -Until checks-complete  exit 0 once every check run and every commit status on the PR's CURRENT
                             head has finished, whatever its conclusion, and every context its base
@@ -29,10 +29,9 @@
     merge (-Until merged only), 1 anything else (bad arguments, too little rate budget to start, a
     gh call that failed, a PR that can no longer meet the condition). Exit 2 is not exit 1 on
     purpose: a timeout means "still waiting, decide whether to wait again", an error means "this
-    instrument did not work". Exit 3 is neither: the instrument worked and, outside a merge queue
-    (see UNMEASURED below), waiting longer will not help. Its line names the state, and the two need different fixes: `behind` needs the branch
-    updated with its base, `dirty` needs a conflict resolved (docs/WORKTREES.md warns that treating
-    one as the other is destructive).
+    instrument did not work". Exit 3 is neither: the instrument worked, the PR has a real conflict,
+    and waiting longer will not help. It needs the conflict resolved, not an update from the base
+    (docs/WORKTREES.md warns that treating one as the other is destructive).
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints a start line,
@@ -40,20 +39,20 @@
     GitHub's REST `mergeable_state`, in lower case (`behind`, `dirty`, `blocked`, `clean`), so a
     branch that went stale while you waited is in the output.
 
-    NEEDS A PUSH IS EXIT 3, FOR -Until merged ONLY. docs/WORKTREES.md ("watch for three outcomes,
-    not two") says a merge watcher must not sit out its whole budget on a PR that cannot merge
-    without a push. So an open PR read as `dirty` or `behind` on two checks of the SAME head SHA and
-    base, with nothing but `unknown`, a missing value or a transient failure between them, ends the
-    wait with exit 3 and one line naming the state and the SHA. Two reads, because GitHub computes
-    mergeability lazily and a transient value is common. Those in-between reads count for nothing
-    and reset nothing; any other value, a closed read, a new head SHA or a new base resets the
-    count. For closed the state is printed and never acted on; the checks-complete line does not
-    carry it. A red required check is not acted on either: it reads `blocked`, and the wait runs to
-    its timeout. UNMEASURED: how REST reads a PR that a merge queue could still merge while it is
-    behind, on a base that requires the queue, queued or not yet queued. The queue builds its own
-    merge group on the base, so on such a base `behind` may not need a push at all. A seat that
-    gets exit 3 for `behind` there reads the line before it pushes, and dequeues first (CLAUDE.md
-    section 5, "Dequeue before pushing").
+    NEEDS A PUSH IS EXIT 3, FOR -Until merged ONLY, AND ONLY FOR `dirty`. docs/WORKTREES.md ("watch
+    for three outcomes, not two") says a merge watcher must not sit out its whole budget on a PR
+    that cannot merge without a push. So an open PR read as `dirty` on two checks of the SAME head
+    SHA and base, with nothing but `unknown`, a missing value or a transient failure between them,
+    ends the wait with exit 3 and one line naming the state and the SHA. Two reads, because GitHub
+    computes mergeability lazily and a transient value is common. Those in-between reads count for
+    nothing and reset nothing; any other value, `behind` included, a closed read, a new head SHA or
+    a new base resets the count. `behind` is printed and never ends the wait: the engine's `main`
+    requires the merge queue, the queue merges a behind branch without an update, and REST exposes
+    no merge-queue field that would tell a behind PR the queue will merge from one it will not. So
+    a `behind` wait runs to its timeout, and the state line shows it; on a base with no queue, such
+    as the vault's `main`, that line is the cue to update the branch. For closed the state is
+    printed and never acted on; the checks-complete line does not carry it. A red required check is
+    not acted on either: it reads `blocked`, and the wait runs to its timeout.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -177,8 +176,8 @@ $script:Bodies = @{}
 $script:Requests = 0
 $script:NotModified = 0
 $script:ClosedUnmerged = 0
-$script:StaleKey = $null
-$script:StaleReads = 0
+$script:DirtyKey = $null
+$script:DirtyReads = 0
 $script:Utf8 = [System.Text.UTF8Encoding]::new($false)
 
 function Say([string]$Message) {
@@ -351,22 +350,22 @@ function Test-Merged($p) {
     @{ Met = $met; NeedsPush = $needsPush; State = $state; Summary = "head=$sha" }
 }
 
-# Counts reads of an open PR that cannot merge without a push, per head SHA and base, and returns
-# the count. `unknown` and a missing value are GitHub still computing, so they neither count nor
-# reset.
+# Counts `dirty` reads of an open PR, per head SHA and base, and returns the count. `unknown` and a
+# missing value are GitHub still computing, so they neither count nor reset. The header says why
+# `behind` resets rather than counts.
 function Measure-NeedsPush([string]$State, [string]$Mergeable, [string]$Key) {
-    if ($Key -cne $script:StaleKey) {
-        $script:StaleKey = $Key
-        $script:StaleReads = 0
+    if ($Key -cne $script:DirtyKey) {
+        $script:DirtyKey = $Key
+        $script:DirtyReads = 0
     }
     if ($State -ne 'open') {
-        $script:StaleReads = 0
-    } elseif ($Mergeable -eq 'dirty' -or $Mergeable -eq 'behind') {
-        $script:StaleReads++
+        $script:DirtyReads = 0
+    } elseif ($Mergeable -eq 'dirty') {
+        $script:DirtyReads++
     } elseif ($Mergeable -and $Mergeable -ne 'unknown') {
-        $script:StaleReads = 0
+        $script:DirtyReads = 0
     }
-    $script:StaleReads
+    $script:DirtyReads
 }
 
 function Test-Checks($p) {
