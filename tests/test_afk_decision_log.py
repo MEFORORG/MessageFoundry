@@ -109,21 +109,24 @@ def test_a_cached_issue_that_is_gone_is_listed_again_on_the_next_flush(sb: Sandb
     assert len(_comments(sb)) == 2
 
 
-def test_days_older_than_a_full_listing_reaches_are_incomplete(sb: Sandbox) -> None:
+def test_the_whole_issue_listing_is_read_not_only_its_first_page(sb: Sandbox) -> None:
+    """A day behind 100 newer issues is still found: the listing is paginated."""
+    assert sb.run(DECISION, *B_DECISION).returncode == 0
     state = sb.state
-    issues = [
-        {"number": n + 1, "title": f"decision-log 2026-{1 + n // 28:02d}-{1 + n % 28:02d}"}
-        for n in range(100)
-    ]
-    for i in issues:
-        i.update(labels=["decision-log"], comments=[])
-    state.setdefault("repos", {})["MEFORORG/MessageFoundry-vault"] = {
-        "issues": issues,
-        "labels": ["decision-log"],
-    }
+    store = state["repos"]["MEFORORG/MessageFoundry-vault"]
+    for n in range(150):
+        store["issues"].append(
+            {
+                "number": n + 2,
+                "title": f"decision-log 2027-{1 + n // 28:02d}-{1 + n % 28:02d}",
+                "labels": ["decision-log"],
+                "comments": [],
+            }
+        )
     sb.state_path.write_text(json.dumps(state), encoding="utf-8")
-    proc = sb.run(DECISION, "-List", "-Day", "2025-12-31")
-    assert proc.returncode == 4 and "reaches back only to 2026-01-01" in proc.stderr
+    assert len(_list(sb)) == 1
+    listing = next(c for c in sb.calls[::-1] if any("/issues?" in a for a in c))
+    assert "--paginate" in listing and "--slurp" in listing
 
 
 def test_no_post_spools_with_no_network_call_and_flush_posts_it(sb: Sandbox) -> None:

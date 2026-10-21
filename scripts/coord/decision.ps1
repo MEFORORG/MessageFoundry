@@ -98,7 +98,8 @@ function Resolve-SeatFromRegistry([string]$Sid) {
     $Sid = $Sid -replace '[^A-Za-z0-9._-]', '-'
     if ($Sid.Length -gt 80) { $Sid = $Sid.Substring(0, 80) }
     if ($Sid -match '^\.+$') { return '' }
-    $seats = Join-Path $coord 'seats'
+    # seat.ps1 keeps a Codex session's records in their own directory.
+    $seats = Join-Path $coord $(if ($env:KORUS_AGENT -eq 'codex') { 'codex-seats' } else { 'seats' })
     if (-not [System.IO.Directory]::Exists($seats)) { return '' }
     foreach ($box in [System.IO.Directory]::EnumerateDirectories($seats)) {
         $f = Join-Path $box "$Sid.json"

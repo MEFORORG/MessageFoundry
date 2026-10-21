@@ -135,24 +135,21 @@ function ConvertFrom-DecisionComment([string]$Body) {
 
 function Get-DecisionDayIssues {
     <#
-      Day -> issue numbers, from the 100 most recently created log issues: one request. Oldest is
-      the oldest day listed when the page came back full, so a reader can tell a day it could not
-      reach from a day with no issue.
+      Day -> issue numbers, from every log issue: one request per 100 issues, so about one per
+      quarter-year of log. The whole listing is read, so a day missing from it has no issue.
     #>
     param([string]$Repo)
-    $r = Invoke-DecisionGh @('api', "repos/$Repo/issues?labels=$script:DecisionLabel&state=all&sort=created&direction=desc&per_page=100")
+    $r = Invoke-DecisionGh @('api', '--paginate', '--slurp', "repos/$Repo/issues?labels=$script:DecisionLabel&state=all&per_page=100")
     if ($r.Code -ne 0) { throw "could not list the decision-log issues on ${Repo}: $($r.Err)" }
     $map = @{}
-    $listed = @($r.Out | ConvertFrom-Json)
-    foreach ($i in $listed) {
+    foreach ($i in @(@($r.Out | ConvertFrom-Json) | ForEach-Object { $_ })) {
         $t = [string]$i.title
         if (-not $t.StartsWith($script:DecisionTitlePrefix)) { continue }
         $day = $t.Substring($script:DecisionTitlePrefix.Length).Trim()
         if (-not $map.ContainsKey($day)) { $map[$day] = [System.Collections.Generic.List[int]]::new() }
         $map[$day].Add([int]$i.number)
     }
-    $oldest = if ($listed.Count -ge 100 -and $map.Count) { @($map.Keys | Sort-Object)[0] } else { $null }
-    return [pscustomobject]@{ Map = $map; Oldest = $oldest }
+    return $map
 }
 
 function Get-DecisionIssueCachePath([string]$CoordRoot) {
@@ -191,7 +188,7 @@ function Get-DecisionDayIssue {
     $held = $false
     try {
         try { $held = $mutex.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
-        $map = (Get-DecisionDayIssues -Repo $Repo).Map
+        $map = Get-DecisionDayIssues -Repo $Repo
         if ($map.ContainsKey($Day)) {
             $n = $map[$Day] | Sort-Object | Select-Object -First 1
             $cache["$Repo|$Day"] = $n
@@ -275,6 +272,9 @@ function Send-DecisionSpool {
         $id = $f.Name.Substring(0, $f.Name.IndexOf('.json'))
         $claim = Join-Path $dir "$id.json.$PID.posting"
         try { [System.IO.File]::Move($f.FullName, $claim) } catch { continue }
+        # A rename keeps the old write time; stamp the claim's own, or a record spooled long ago
+        # would look like an abandoned claim the moment it is taken.
+        try { [System.IO.File]::SetLastWriteTimeUtc($claim, [DateTime]::UtcNow) } catch { $null = $_ }
         try {
             $rec = [System.IO.File]::ReadAllText($claim) | ConvertFrom-Json -ErrorAction Stop
             $day = Get-DecisionIdDay ([string]$rec.id)
@@ -308,13 +308,7 @@ function Read-DecisionLog {
     $byId = [ordered]@{}
     $errors = [System.Collections.Generic.List[string]]::new()
     try {
-        $listing = Get-DecisionDayIssues -Repo $Repo
-        $map = $listing.Map
-        # A day older than a full listing reaches is unread, not empty.
-        $unreached = @($Days | Where-Object { $listing.Oldest -and $_ -lt $listing.Oldest })
-        if ($unreached.Count) {
-            $errors.Add("the listing reaches back only to $($listing.Oldest), so $($unreached.Count) older day(s) were not read")
-        }
+        $map = Get-DecisionDayIssues -Repo $Repo
         foreach ($d in $Days) {
             if (-not $map.ContainsKey($d)) { continue }
             foreach ($n in $map[$d]) {

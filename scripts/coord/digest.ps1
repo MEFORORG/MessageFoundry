@@ -15,21 +15,29 @@
     IT IS WRITTEN WHERE ONLY THIS MACHINE READS IT: <git-common-dir>/mefor-coord/digests/<day>.md,
     and to stdout. It is never committed: it quotes decisions from the private vault.
 
-    THE BLIND SAMPLE. Class B decisions from the day that have no rating yet, drawn at random: -Sample
-    N draws N afresh, and with no -Sample the day's saved draw is reused, or a draw of 5 or 10 percent
-    of the day's Class B decisions, whichever is more. Each sampled decision shows its options in an
-    order fixed by a hash of its id, with no mark on the recommendation, and without the confidence,
-    the undo path or the outcome, which would give it away. The day's decision list leaves the
-    recommendation off a sampled decision for the same reason.
+    THE BLIND SAMPLE. Class B decisions from the day, drawn at random and saved, so a rerun shows the
+    same sample. The target is 5 or 10 percent of the day's Class B decisions, whichever is more, or
+    N with -Sample N; a run keeps the saved draw and tops it up from decisions logged since, so a
+    digest run early in the day does not freeze the sample. Each sampled decision shows its options
+    in an order fixed by a hash of its id, with no mark on the recommendation, and without the
+    confidence, the undo path, the review or the outcome, which would give it away. The day's
+    decision list and the reversals section leave the same things off a sampled decision.
 
-    -Rate <id> <agree|disagree|N> records the owner's verdict on one decision as a `rating` record.
-    N is the option number the digest showed; the script compares it with the hidden recommendation.
-    Only a user turn in the owner's own chat carries that verdict (plan R5): a session runs -Rate on
-    the owner's word, never on its own judgment or a peer's message.
+    -Rate <id> <agree|disagree|N> records the owner's verdict on one sampled decision as a `rating`
+    record; a decision that was not in the day's saved sample is refused, because its
+    recommendation was visible. N is the option number the digest showed, compared with the hidden
+    recommendation.
+
+    WHO RATES IS A RULE, NOT A CONTROL. Every seat writes as the one GitHub identity, so nothing can
+    tell the owner's rating from a session's: `decision.ps1 -Log -Kind rating` writes one too. Only
+    a user turn in the owner's own chat carries a verdict (plan R5), and a session runs -Rate on the
+    owner's word, never on its own judgment or a peer's message. The calibration below is only as
+    good as that rule.
 
     CALIBRATION, per seat and class, over the records -Window days back (default 60):
       * the owner's disagreement on the trailing 60 rated decisions -- calibrated at 60 samples with
-        3 or fewer disagreements, otherwise on the review path;
+        3 or fewer disagreements. After a breach the class stays on the review path until 60 ratings
+        newer than the breach pass (plan section 4.2), not until the trailing count drops back;
       * the 14-day reversal rate -- decisions marked `reversed` by an `outcome` record, over the
         decisions logged in the 14 days ending -Day; above 5 percent is a breach.
     A rating older than the window is not read, so the trailing 60 is a trailing 60 within it.
@@ -79,6 +87,12 @@ function Get-Latest($Records, [string]$Kind) {
     return $map
 }
 
+function Read-DigestSample([string]$Path) {
+    # The ids drawn into a day's blind sample on this machine; none when there is no draw.
+    if (-not [System.IO.File]::Exists($Path)) { return @() }
+    return @([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json | ForEach-Object { [string]$_ })
+}
+
 function Get-Short([string]$Text, [int]$Max = 100) {
     $t = ($Text -replace '\s+', ' ').Trim()
     if ($t.Length -gt $Max) { return $t.Substring(0, $Max - 3) + '...' }
@@ -101,6 +115,10 @@ if ($Rate) {
     }
     if ($rec.class -ne 'B') {
         [Console]::Error.WriteLine("digest.ps1: $Rate is Class $($rec.class); only Class B decisions are sampled. Nothing was recorded.")
+        exit 2
+    }
+    if (@(Read-DigestSample (Join-Path (Join-Path $coord 'digests') "$rday.sample.json")) -notcontains $Rate) {
+        [Console]::Error.WriteLine("digest.ps1: $Rate was not in the $rday blind sample on this machine, so its recommendation was not hidden. Nothing was recorded.")
         exit 2
     }
     $note = 'rated in the owner''s digest'
@@ -127,24 +145,23 @@ $ratings = Get-Latest $all 'rating'
 $outcomes = Get-Latest $all 'outcome'
 function Get-Outcome($r) { if ($outcomes.ContainsKey([string]$r.id)) { [string]$outcomes[[string]$r.id].outcome } else { [string]$r.outcome } }
 
-# The blind sample: a saved draw is reused unless -Sample asks for a fresh one.
+# The blind sample: the saved draw, every id ever drawn that day, topped up at random to the target
+# from the day's Class B decisions not yet drawn or rated. Nothing is ever dropped from it, so a
+# rated decision still proves it was drawn blind when -Rate checks.
 $digests = Join-Path $coord 'digests'
 $null = [System.IO.Directory]::CreateDirectory($digests)
 $sampleFile = Join-Path $digests "$Day.sample.json"
-$pool = @($todayDecisions | Where-Object { $_.class -eq 'B' -and -not $ratings.ContainsKey([string]$_.id) })
-$sampleIds = @()
-if ($Sample -lt 0 -and [System.IO.File]::Exists($sampleFile)) {
-    $sampleIds = @([System.IO.File]::ReadAllText($sampleFile) | ConvertFrom-Json | ForEach-Object { [string]$_ })
-} else {
-    $size = if ($Sample -ge 0) { $Sample } else {
-        $b = @($todayDecisions | Where-Object { $_.class -eq 'B' }).Count
-        [Math]::Max(5, [int][Math]::Ceiling($b * 0.1))
-    }
-    $sampleIds = @($pool | Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32([int]::MaxValue) } |
-            Select-Object -First $size | ForEach-Object { [string]$_.id })
-    [System.IO.File]::WriteAllText($sampleFile, (ConvertTo-Json -InputObject @($sampleIds) -Compress))
-}
-$sampled = @($pool | Where-Object { $sampleIds -contains [string]$_.id })
+$sampleIds = [System.Collections.Generic.List[string]]::new()
+foreach ($id in (Read-DigestSample $sampleFile)) { $sampleIds.Add($id) }
+$dayB = @($todayDecisions | Where-Object { $_.class -eq 'B' })
+$target = if ($Sample -ge 0) { $Sample } else { [Math]::Max(5, [int][Math]::Ceiling($dayB.Count * 0.1)) }
+$fresh = @($dayB | Where-Object { -not $sampleIds.Contains([string]$_.id) -and -not $ratings.ContainsKey([string]$_.id) } |
+        Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32([int]::MaxValue) })
+foreach ($r in ($fresh | Select-Object -First ([Math]::Max(0, $target - $sampleIds.Count)))) { $sampleIds.Add([string]$r.id) }
+[System.IO.File]::WriteAllText($sampleFile, (ConvertTo-Json -InputObject @($sampleIds) -Compress))
+# What the owner still has to rate: drawn and not yet rated. Their give-aways stay hidden below.
+$sampled = @($dayB | Where-Object { $sampleIds.Contains([string]$_.id) -and -not $ratings.ContainsKey([string]$_.id) })
+$hidden = @($sampled | ForEach-Object { [string]$_.id })
 
 $kill = @(& (Join-Path $PSScriptRoot 'afk-kill.ps1') -Status 2>$null) | Select-Object -Last 1
 $md = [System.Collections.Generic.List[string]]::new()
@@ -166,9 +183,12 @@ $md.Add('|---|---|')
 foreach ($c in 'A', 'B', 'C', 'D') { $md.Add("| $c | $(@($todayDecisions | Where-Object { $_.class -eq $c }).Count) |") }
 $md.Add('')
 foreach ($r in $todayDecisions) {
-    $what = if ($sampleIds -contains [string]$r.id) { '(in your blind sample below)' } else { Get-Short ([string]$r.recommendation) }
+    if ($hidden -contains [string]$r.id) {
+        $md.Add("- ``$($r.id)`` class $($r.class), $($r.seat), item $($r.item): (in your blind sample below)")
+        continue
+    }
     $rev = if ($r.reviewed -eq 'yes') { "reviewed by $($r.reviewedBy)" } else { 'not reviewed' }
-    $md.Add("- ``$($r.id)`` class $($r.class), $($r.seat), item $($r.item): $what; $rev; outcome $(Get-Outcome $r)")
+    $md.Add("- ``$($r.id)`` class $($r.class), $($r.seat), item $($r.item): $(Get-Short ([string]$r.recommendation)); $rev; outcome $(Get-Outcome $r)")
 }
 $md.Add('')
 
@@ -193,7 +213,10 @@ $md.Add('')
 $rev = @($today | Where-Object { $_.kind -eq 'outcome' -and $_.outcome -eq 'reversed' })
 $trip = @($today | Where-Object { $_.kind -eq 'tripwire' })
 if (-not ($rev.Count + $trip.Count)) { $md.Add('None.') }
-foreach ($r in $rev) { $md.Add("- reversal of ``$($r.ref)`` by $($r.seat): $(Get-Short ([string]$r.note))") }
+foreach ($r in $rev) {
+    if ($hidden -contains [string]$r.ref) { $md.Add('- a reversal of a decision in your blind sample, shown once you rate it'); continue }
+    $md.Add("- reversal of ``$($r.ref)`` by $($r.seat): $(Get-Short ([string]$r.note))")
+}
 foreach ($r in $trip) {
     $flag = if ($r.posted) { '' } else { ' (spooled, not yet posted)' }
     $md.Add("- tripwire ``$($r.id)``, $(if ($r.seat) { $r.seat } else { 'unknown seat' }), session $($r.session): $(Get-Short ([string]$r.note))$flag")
@@ -241,15 +264,26 @@ $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
-    $rated = @($g.Group | Where-Object { $ratings.ContainsKey([string]$_.id) } |
-            Sort-Object { [string]$ratings[[string]$_.id].ts } -Descending | Select-Object -First 60)
-    $dis = @($rated | Where-Object { $ratings[[string]$_.id].rating -eq 'disagree' }).Count
-    $blind = if ($rated.Count -lt 60) { "review path, $($rated.Count)/60 samples" } elseif ($dis -le 3) { 'calibrated' } else { 'BREACH: review path' }
+    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
+    # the latest one, 60 newer ratings must pass before the class is calibrated again.
+    $verdicts = @($g.Group | Where-Object { $ratings.ContainsKey([string]$_.id) } |
+            Sort-Object { [string]$ratings[[string]$_.id].ts } | ForEach-Object { [string]$ratings[[string]$_.id].rating -eq 'disagree' })
+    $n = $verdicts.Count
+    $lastBreach = -1
+    for ($i = 59; $i -lt $n; $i++) {
+        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
+    }
+    $rated = [Math]::Min($n, 60)
+    $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
+    $since = $n - 1 - $lastBreach
+    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
+    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    else { 'calibrated' }
     $last14 = @($g.Group | Where-Object { $recent -contains (Get-DecisionIdDay ([string]$_.id)) })
     $revd = @($last14 | Where-Object { (Get-Outcome $_) -eq 'reversed' }).Count
     $revRate = if ($last14.Count) { $revd / $last14.Count } else { 0 }
     $rateText = if ($last14.Count) { ('{0:P1}' -f $revRate) + $(if ($revRate -gt 0.05) { ' BREACH' } else { '' }) } else { 'n/a' }
-    $md.Add("| $seat | $class | $($rated.Count) | $dis | $blind | $($last14.Count) | $revd | $rateText |")
+    $md.Add("| $seat | $class | $rated | $dis | $blind | $($last14.Count) | $revd | $rateText |")
 }
 
 $path = Join-Path $digests "$Day.md"

@@ -44,7 +44,7 @@ def rec(kind: str = "decision", day: str = TODAY, **fields: Any) -> dict[str, An
     base: dict[str, Any] = {
         "v": 1,
         "id": f"d{day.replace('-', '')}T1200{n % 100000:05d}-{n % 0xFFFFFF:06x}",
-        "ts": f"{day}T12:00:00.{n % 1000:03d}Z",
+        "ts": f"{day}T12:00:00.{n:07d}Z",
         "kind": kind,
         "item": "",
         "seat": "manager",
@@ -167,14 +167,30 @@ def test_the_blind_sample_hides_the_recommendation(sb: Sandbox) -> None:
     assert "merge the two rows" not in listing and "(in your blind sample below)" in listing
 
 
-def test_a_saved_draw_is_reused_and_sample_n_draws_afresh(sb: Sandbox) -> None:
+def _drawn(sb: Sandbox) -> list[str]:
+    drawn: list[str] = json.loads(
+        (sb.coord / "digests" / f"{TODAY}.sample.json").read_text("utf-8")
+    )
+    return drawn
+
+
+def test_a_saved_draw_is_kept_and_topped_up_never_redrawn(sb: Sandbox) -> None:
     seed(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(8)])
     first = digest(sb, "-Sample", "3")
-    picked = json.loads((sb.coord / "digests" / f"{TODAY}.sample.json").read_text("utf-8"))
-    assert len(picked) == 3
+    picked = _drawn(sb)
+    assert len(picked) == 3 and first.count("### `d") == 3
+    assert digest(sb, "-Sample", "3").count("### `d") == 3 and _drawn(sb) == picked
     again = digest(sb)
-    assert json.loads((sb.coord / "digests" / f"{TODAY}.sample.json").read_text("utf-8")) == picked
-    assert first.count("### `d") == again.count("### `d") == 3
+    assert _drawn(sb)[:3] == picked and len(_drawn(sb)) == 5
+    assert again.count("### `d") == 5
+
+
+def test_an_early_empty_draw_does_not_freeze_the_days_sample(sb: Sandbox) -> None:
+    """A digest run before any Class B decision is logged must not leave the day unsampled."""
+    digest(sb)
+    assert _drawn(sb) == []
+    seed(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(4)])
+    assert digest(sb).count("### `d") == 4
 
 
 def test_the_default_draw_is_five_or_ten_percent(sb: Sandbox) -> None:
@@ -190,6 +206,7 @@ def test_rate_by_option_number_compares_with_the_hidden_recommendation(
     seed(sb, [r])
     order = blind_order(r)
     n = order.index("yes") + 1 if pick_recommended else order.index("no") + 1
+    digest(sb)
     proc = sb.run(DIGEST, "-Rate", r["id"], str(n))
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     (rating,) = ratings(sb)
@@ -203,6 +220,7 @@ def test_rate_takes_agree_or_disagree_and_drops_a_rated_decision_from_the_pool(
 ) -> None:
     r = rec(item="5", recommendation="yes", alternatives=["no"])
     seed(sb, [r])
+    digest(sb)
     assert sb.run(DIGEST, "-Rate", r["id"], "disagree").returncode == 0
     assert [x["rating"] for x in ratings(sb)] == ["disagree"]
     assert "No unrated Class B decision today." in digest(sb, "-Sample", "5")
@@ -221,8 +239,21 @@ def test_rate_refuses_what_it_cannot_record(
 ) -> None:
     r = make()
     seed(sb, [r])
+    digest(sb)
     proc = sb.run(DIGEST, "-Rate", r["id"], verdict)
     assert proc.returncode == code, (proc.stdout, proc.stderr)
+    assert ratings(sb) == []
+
+
+def test_rate_refuses_a_decision_that_was_not_drawn_blind(sb: Sandbox) -> None:
+    """Its recommendation was in the day's list, so a rating of it is not blind."""
+    drawn, seen = rec(recommendation="a"), rec(recommendation="b")
+    seed(sb, [drawn])
+    digest(sb, "-Sample", "1")
+    seed(sb, [seen])
+    digest(sb, "-Sample", "1")
+    proc = sb.run(DIGEST, "-Rate", seen["id"], "agree")
+    assert proc.returncode == 2 and "was not in the" in proc.stderr
     assert ratings(sb) == []
 
 
@@ -239,22 +270,46 @@ def _calibration_row(out: str, seat: str, klass: str) -> list[str]:
     raise AssertionError(f"no calibration row for {seat}/{klass}:\n{out}")
 
 
-@pytest.mark.parametrize(("disagree", "status"), [(3, "calibrated"), (4, "BREACH: review path")])
-def test_sixty_rated_samples_calibrate_at_three_disagreements_or_fewer(
-    sb: Sandbox, disagree: int, status: str
-) -> None:
+def _rated(count: int, disagree_first: int) -> list[dict[str, Any]]:
+    """`count` Class B decisions over the last 20 days, each rated, the oldest ratings disagreeing."""
     day = datetime.now(UTC) - timedelta(days=20)
     decided = [
         rec(day=(day + timedelta(days=i % 20)).strftime("%Y-%m-%d"), recommendation="r")
-        for i in range(60)
+        for i in range(count)
     ]
     rated = [
-        rec("rating", seat="owner", ref=d["id"], rating="disagree" if i < disagree else "agree")
+        rec(
+            "rating",
+            seat="owner",
+            ref=d["id"],
+            rating="disagree" if i < disagree_first else "agree",
+        )
         for i, d in enumerate(decided)
     ]
-    seed(sb, decided + rated)
+    return decided + rated
+
+
+@pytest.mark.parametrize(
+    ("disagree", "status"),
+    [(3, "calibrated"), (4, "BREACH: review path, 0/60 fresh samples")],
+)
+def test_sixty_rated_samples_calibrate_at_three_disagreements_or_fewer(
+    sb: Sandbox, disagree: int, status: str
+) -> None:
+    seed(sb, _rated(60, disagree))
     cells = _calibration_row(digest(sb, "-Sample", "0"), "manager", "B")
     assert cells[2:5] == ["60", str(disagree), status]
+
+
+@pytest.mark.parametrize(
+    ("count", "status"),
+    [(61, "BREACH: review path, 1/60 fresh samples"), (120, "calibrated")],
+)
+def test_after_a_breach_sixty_fresh_samples_must_pass(sb: Sandbox, count: int, status: str) -> None:
+    """One agreement that pushes the fourth disagreement out of the window is not 60 fresh."""
+    seed(sb, _rated(count, 4))
+    cells = _calibration_row(digest(sb, "-Sample", "0", "-Window", "60"), "manager", "B")
+    assert cells[4] == status
 
 
 def test_under_sixty_samples_stay_on_the_review_path(sb: Sandbox) -> None:

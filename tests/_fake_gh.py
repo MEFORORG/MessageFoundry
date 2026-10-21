@@ -83,7 +83,7 @@ def _answer(state: dict[str, Any], argv: list[str]) -> tuple[int, str, str]:
             for x in sorted(store["issues"], key=lambda x: -int(x["number"]))
             if not label or label in x["labels"]
         ]
-        return 0, json.dumps(found), ""
+        return 0, json.dumps([found] if slurp else found), ""
     if rest == ["issues"] and method == "POST":
         assert body is not None
         issue = {
