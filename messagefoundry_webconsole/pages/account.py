@@ -56,8 +56,13 @@ def login(
     *,
     sso_enabled: bool = False,
     oidc_enabled: bool = False,
+    passkey_enabled: bool = False,
 ) -> Markup:
     """The sign-in form. Same-origin POST to /ui/login (form-action 'self').
+
+    ``passkey_enabled`` adds the combined passkey sign-in (ADR 0197 Amendment A, wave 2): a button
+    that runs the usernameless ceremony and submits the form with the assertion beside the
+    password. Shown to every caller, so its presence says nothing about an account.
 
     Local credentials only. The AD provider selector was removed with the simple-bind login pathway
     it drove (BACKLOG #1137); ``sso_enabled`` / ``oidc_enabled`` are the surviving directory routes
@@ -131,6 +136,20 @@ def login(
             ),
         ),
         el("button", "Sign in", type="submit"),
+        *(
+            (
+                el("input", type="hidden", name="passkey_assertion", value=""),
+                el(
+                    "button",
+                    "Sign in with password and passkey",
+                    type="button",
+                    data_mf_passkey_sign_in="/ui/login/passkey",
+                ),
+                el("p", "", class_="muted", data_mf_webauthn_status=""),
+            )
+            if passkey_enabled
+            else ()
+        ),
         method="post",
         action="/ui/login",
         class_="login",

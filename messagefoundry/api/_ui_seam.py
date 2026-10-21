@@ -620,12 +620,18 @@ from typing import Any
 #: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
 #: removed. The digest moved again; re-derived with ``--write``.
 #:
+#: Vault BACKLOG #3373 (ADR 0197 Amendment A, wave 2): ``AuthService`` gained
+#: ``begin_passkey_sign_in`` and ``login`` gained the ``passkey`` keyword, carrying the new
+#: ``PasskeyProof``, for the combined passkey sign-in. ``POST /ui/login/passkey`` calls the first and
+#: ``POST /ui/login`` passes the second, so a skew is an AttributeError or a TypeError at sign-in;
+#: they force a bump. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7f01058f7699dfe8"
+ENGINE_UI_SEAM: str = "e45be008d9bd193a"
 
 
 @dataclass(frozen=True, slots=True)

@@ -712,8 +712,9 @@ def assert_same_origin(request: Request) -> None:
     only way the /ui buttons submit) passes both. Token-free — so it needs no crypto import (avoids
     the ASVS 11.1.3 inventory gate).
 
-    It needs **no session**, which is why it is also the first statement of the two UNAUTHENTICATED
-    state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
+    It needs **no session**, which is why it is also the first statement of the UNAUTHENTICATED
+    state-changing POSTs (ASVS 3.5.1), at least these: ``POST /ui/login/passkey`` (the passkey
+    sign-in's begin leg, ADR 0197 Amendment A) and ``POST /ui/login``, where SameSite=Strict supplies nothing
     because no session cookie exists yet, and ``POST /ui/logout``, which has no ``Depends`` gate at all
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
     no other request-provenance control.
@@ -1954,6 +1955,57 @@ def clear_oidc_flow_cookie(response: Response, request: Request) -> None:
         secure=effective_https(request.app.state, request.url.scheme),
         httponly=True,
         samesite="lax",
+    )
+
+
+# --- ADR 0197 Amendment A, wave 2: the passkey sign-in cookie ---------------------------
+
+#: The passkey sign-in cookie (ADR 0197 Amendment A, option N-G). Carries only the opaque handle
+#: ``AuthService.begin_passkey_sign_in`` minted, which names a staged challenge and never an account.
+PASSKEY_SIGN_IN_COOKIE_NAME = "mf_passkey_signin"
+
+#: The ``__Host-`` and ``__Secure-`` twins, on the same terms as the session and flow cookies.
+HOST_PASSKEY_SIGN_IN_COOKIE_NAME = "__Host-mf_passkey_signin"
+SECURE_PASSKEY_SIGN_IN_COOKIE_NAME = "__Secure-mf_passkey_signin"
+
+
+def passkey_sign_in_cookie_name(conn: Request | WebSocket) -> str:
+    """The passkey sign-in cookie's name for this connection: the one resolver the begin leg, the
+    sign-in and the clear share. Mirrors :func:`oidc_flow_cookie_name` rung for rung."""
+    if not effective_https(conn.app.state, conn.url.scheme):
+        return PASSKEY_SIGN_IN_COOKIE_NAME
+    if browser_hardening_enabled():
+        return HOST_PASSKEY_SIGN_IN_COOKIE_NAME
+    return SECURE_PASSKEY_SIGN_IN_COOKIE_NAME
+
+
+def set_passkey_sign_in_cookie(
+    response: Response, handle: str, *, request: Request, max_age: int
+) -> None:
+    """Stage the passkey sign-in handle in the browser, HttpOnly and ``SameSite=Strict``: the begin
+    fetch and the sign-in POST are both same-origin, so nothing cross-site ever needs it. ``max_age``
+    bounds it to the challenge's own lifetime."""
+    response.set_cookie(
+        passkey_sign_in_cookie_name(request),
+        handle,
+        max_age=max_age,
+        httponly=True,
+        samesite="strict",
+        secure=effective_https(request.app.state, request.url.scheme),
+        path="/",
+    )
+
+
+def clear_passkey_sign_in_cookie(response: Response, request: Request) -> None:
+    """Delete the passkey sign-in cookie, on every sign-in that carried one: the engine pops the
+    challenge on any outcome, so a surviving handle would only name a spent challenge. Carries the
+    guards the set wrote, keyed on :func:`effective_https` (BACKLOG #1117)."""
+    response.delete_cookie(
+        passkey_sign_in_cookie_name(request),
+        path="/",
+        secure=effective_https(request.app.state, request.url.scheme),
+        httponly=True,
+        samesite="strict",
     )
 
 

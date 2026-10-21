@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-7f01058f7699dfe8
+e45be008d9bd193a
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -136,6 +136,7 @@ LoginOutcome: constructor (ok: 'bool', token: 'str | None' = None, identity: 'Id
 MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled; properties: none
 NotifyEmailAlreadySet: exception (RuntimeError < Exception < BaseException)
 OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reason: 'str | None' = None, error: 'str | None' = None, flow_consumed: 'bool' = True) -> None; fields: elevation, error, flow_consumed, reason, return_to; properties: ok
+PasskeyProof: constructor (handle: 'str', response_json: 'str', rp_id: 'str', origin: 'str') -> None; fields: handle, origin, response_json, rp_id; properties: none
 RolesGained: constructor (username: 'str', roles: 'frozenset[str]') -> None; fields: roles, username; properties: none
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
@@ -169,6 +170,7 @@ audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', 
 authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_oidc_step_up: (self, token: 'str', *, return_to: 'str', purpose: 'str | None', client: 'str | None', public_origin: 'str') -> 'tuple[str, str]'
+begin_passkey_sign_in: (self, *, rp_id: 'str', client: 'str | None') -> 'tuple[str, str] | None'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
@@ -186,7 +188,7 @@ holds_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
 kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
-login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None, totp_code: 'str | None' = None) -> 'LoginOutcome'
+login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None, totp_code: 'str | None' = None, passkey: 'PasskeyProof | None' = None) -> 'LoginOutcome'
 login_retry_after: (self) -> 'int'
 logout: (self, token: 'str | None', *, client: 'str | None', actor: 'str | None' = None) -> 'LogoutOutcome'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
@@ -383,6 +385,7 @@ POST /ui/messages/search/presets/{preset_id}/delete: deps.get_engine + gate mess
 GET /ui/messages/search/layered: deps.get_engine + gate messagefoundry_webconsole._auth:require_ui_step_up.<locals>.dependency#36df330fe44d(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d21c509d111c(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#340dba718e1d(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[messages:read]; phi=False); reauth_next=None)
 GET /ui/session-status: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d21c509d111c(activity=False; allow_mfa_pending=True; allow_missing_notify_email=False; allow_must_change=True; mfa_refusal=None; new_address_check=True; pending_refusal=None; permissions=[]; phi=False)
 GET /ui/login: no gate, public
+POST /ui/login/passkey: no gate, public
 POST /ui/login: no gate, public
 POST /ui/logout: no gate, public
 GET /ui: deps.get_engine + gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d21c509d111c(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=True; pending_refusal=None; permissions=[monitoring:read]; phi=False)

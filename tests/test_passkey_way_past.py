@@ -13,6 +13,7 @@ here is real: the in-repo soft authenticator drives py_webauthn's own verify fun
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     TOTP_REMOVAL_REFUSED,
     AuthService,
     FactorEnrolmentRequired,
+    PasskeyProof,
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
@@ -289,5 +291,323 @@ async def test_a_passkey_flipped_to_discoverable_outside_the_store_opens_nothing
         )
         census = await lockable_account_census(store, AuthSettings())
         assert census.no_way_past == (identity.username,)
+    finally:
+        await store.close()
+
+
+# --- parts 2 and 3: the usernameless begin leg and the combined passkey sign-in ---------------------
+
+_LOCK_THRESHOLD = 3
+
+
+def _lock_service(store: MessageStore, **settings: Any) -> AuthService:
+    settings.setdefault("lockout_threshold", _LOCK_THRESHOLD)
+    settings.setdefault("lockout_minutes", 15)
+    return _service(store, **settings)
+
+
+def _columns(user: Any) -> tuple[Any, ...]:
+    return (
+        user.failed_attempts,
+        user.locked_until,
+        user.lock_cycles,
+        user.second_step_failed_attempts,
+        user.second_step_locked_until,
+        user.second_step_lock_cycles,
+    )
+
+
+async def _set_sign_in_lock(store: MessageStore, user_id: str) -> None:
+    """A live sign-in lock a quarter hour out, as a caller who knows only the username sets it."""
+    await store.record_login_failure(user_id, failed_attempts=3, locked_until=time.time() + 900)
+
+
+async def _passkey_owner(
+    store: MessageStore, **settings: Any
+) -> tuple[AuthService, Identity, str, SoftAuthenticator]:
+    """A covered local Administrator whose only factor is a discoverable passkey. Returns the
+    service, the identity, the password and the authenticator."""
+    service = _lock_service(store, **settings)
+    identity, token, password = await login_admin(service)
+    auth, _ = await _register(service, identity, token)
+    return service, identity, password, auth
+
+
+def _proof(service: AuthService, auth: SoftAuthenticator) -> PasskeyProof:
+    """Run the begin leg, then the browser's get() against what it staged."""
+    begun = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.10")
+    assert begun is not None
+    handle, options = begun
+    challenge = base64url_to_bytes(json.loads(options)["challenge"])
+    return PasskeyProof(
+        handle=handle, response_json=auth.get_response(challenge), rp_id=RP, origin=ORIGIN
+    )
+
+
+async def _audit_rows(store: MessageStore, after: int) -> list[tuple[str, Any]]:
+    """Every audit row past the first ``after``, as ``(action, detail)``, oldest first."""
+    rows = await store.list_audit(limit=500)
+    ordered = sorted(rows, key=lambda r: r["id"])
+    return [(str(r["action"]), r["detail"]) for r in ordered[after:]]
+
+
+async def test_AC_A7_the_begin_leg_takes_no_username_and_names_no_credential() -> None:
+    """AC-A7: the challenge is staged with no username and an empty credential list, so the
+    options are the same shape for every caller."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        first = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.10")
+        second = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.11")
+        assert first is not None and second is not None
+        a, b = json.loads(first[1]), json.loads(second[1])
+        assert a["allowCredentials"] == [] and b["allowCredentials"] == []
+        assert sorted(a) == sorted(b) and a["rpId"] == RP
+        assert a["challenge"] != b["challenge"] and first[0] != second[0]
+        assert "user" not in a
+    finally:
+        await store.close()
+
+
+async def test_AC_A7_the_begin_leg_charges_the_sign_in_limiter_first() -> None:
+    """AC-A7: control 2 is charged before anything is staged. Its per-address budget is the one the
+    sign-in spends, and once spent the begin leg stages nothing and answers None (a 429)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store, login_rate_limit_enabled=True, login_rate_limit_per_ip=2)
+        assert service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.20") is not None
+        assert service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.20") is not None
+        assert service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.20") is None
+        assert len(service._preauth_challenges) == 2
+        assert not service.allow_login_attempt("192.0.2.20"), "the begin leg did not charge it"
+    finally:
+        await store.close()
+
+
+async def test_AC_A6_a_passkey_owner_signs_in_with_password_and_assertion_under_a_live_lock() -> (
+    None
+):
+    """AC-A6, first half: the way past. The full authentication satisfies the second factor and
+    clears both counters, as option E's combined sign-in does."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        await _set_sign_in_lock(store, identity.user_id)
+        assert not (await service.login(identity.username, password)).ok, "the lock is not live"
+
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert out.ok and out.token is not None, "the combined passkey sign-in was refused"
+        assert out.mfa_required is False
+        assert await service.mfa_satisfied(out.token) is True
+        user = await store.get_user(identity.user_id)
+        assert user is not None and _columns(user) == (0, None, 0, 0, None, 0)
+        success = [d for a, d in await _audit_rows(store, 0) if a == "auth.login_success"]
+        assert json.loads(success[-1])["second_factor"] == "webauthn"
+    finally:
+        await store.close()
+
+
+async def test_AC_A6_right_invalid_is_recorded_exactly_as_wrong_invalid() -> None:
+    """AC-A6, second half: "right password, invalid assertion" and "wrong password, invalid
+    assertion" leave identical counters and identical audit rows, so no record tells a reader which
+    password was right. Run on two identical owners, one cell each."""
+    seen: list[tuple[tuple[Any, ...], list[tuple[str, Any]]]] = []
+    for right in (True, False):
+        store = await MessageStore.open(":memory:")
+        try:
+            service, identity, password, _auth = await _passkey_owner(store)
+            stranger = SoftAuthenticator(
+                rp_id=RP, origin=ORIGIN, user_handle=identity.user_id.encode()
+            )
+            await _set_sign_in_lock(store, identity.user_id)
+            before = await store.get_user(identity.user_id)
+            assert before is not None
+            marker = len(await store.list_audit(limit=500))
+            out = await service.login(
+                identity.username,
+                password if right else "not-the-passphrase",
+                passkey=_proof(service, stranger),
+            )
+            assert not out.ok
+            after = await store.get_user(identity.user_id)
+            assert after is not None
+            delta = (
+                after.failed_attempts - before.failed_attempts,
+                after.locked_until == before.locked_until,
+                after.second_step_failed_attempts - before.second_step_failed_attempts,
+                after.second_step_locked_until,
+            )
+            seen.append((delta, await _audit_rows(store, marker)))
+        finally:
+            await store.close()
+    (right_delta, right_rows), (wrong_delta, wrong_rows) = seen
+    assert right_delta == wrong_delta == (1, True, 0, None), seen
+    assert right_rows == wrong_rows and right_rows, seen
+    assert [a for a, _ in right_rows] == ["auth.login_failed"]
+    assert json.loads(right_rows[0][1]) == {
+        "provider": "local",
+        "reason": "bad_credentials",
+        "combined": True,
+    }
+
+
+async def test_a_valid_assertion_beside_a_wrong_password_counts_on_the_second_step() -> None:
+    """The "wrong, valid" cell: a device holder guessing passwords. Counted on the second-step
+    counter, and its lock refuses even the owner's full combined sign-in, as option E's does."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        for i in range(_LOCK_THRESHOLD):
+            out = await service.login(
+                identity.username, f"wrong-{i}", passkey=_proof(service, auth)
+            )
+            assert not out.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == 0
+        assert user.second_step_failed_attempts == _LOCK_THRESHOLD
+        assert user.second_step_locked_until is not None
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok, "the second-step lock did not refuse the combined passkey sign-in"
+    finally:
+        await store.close()
+
+
+async def test_a_user_handle_for_another_account_is_an_invalid_assertion() -> None:
+    """The ``userHandle`` binds the usernameless assertion to the named account. A valid signature
+    from this account's own credential that carries another account's handle counts as invalid."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        await _set_sign_in_lock(store, identity.user_id)
+        auth.user_handle = b"another-account-id"
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 0
+        assert user.failed_attempts == 4, "an invalid assertion counts on the sign-in counter"
+    finally:
+        await store.close()
+
+
+async def test_an_assertion_on_an_account_with_no_discoverable_passkey_is_refused_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The twin of AC-2a: on an account whose only passkey is not discoverable an assertion changes
+    nothing, so a live sign-in lock refuses it before the password is verified."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _lock_service(store, require_mfa=False)
+        identity, token, password = await login_admin(setup)
+        auth, _ = await _register(setup, identity, token, resident_key=False)
+        service = _lock_service(store)
+        await _set_sign_in_lock(store, identity.user_id)
+        before = await store.get_user(identity.user_id)
+        assert before is not None and before.password_hash is not None
+        seen: list[str] = []
+        real = service._argon2
+
+        async def spy(fn: Any, *args: Any) -> Any:
+            if args and isinstance(args[0], str) and args[0].startswith("$argon2"):
+                seen.append(args[0])
+            return await real(fn, *args)
+
+        monkeypatch.setattr(service, "_argon2", spy)
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok
+        assert before.password_hash not in seen, "the stored password was verified under the lock"
+        after = await store.get_user(identity.user_id)
+        assert after is not None and _columns(after) == _columns(before)
+    finally:
+        await store.close()
+
+
+async def test_a_challenge_is_single_use() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        proof = _proof(service, auth)
+        assert (await service.login(identity.username, password, passkey=proof)).ok
+        await _set_sign_in_lock(store, identity.user_id)
+        replay = await service.login(identity.username, password, passkey=proof)
+        assert not replay.ok, "a spent challenge was accepted again"
+    finally:
+        await store.close()
+
+
+async def test_a_challenge_expires() -> None:
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        clock = [1_000.0]
+        service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
+        proof = _proof(service, auth)
+        clock[0] += wa.CHALLENGE_TTL_SECONDS + 1
+        await _set_sign_in_lock(store, identity.user_id)
+        out = await service.login(identity.username, password, passkey=proof)
+        assert not out.ok, "an expired challenge was accepted"
+    finally:
+        await store.close()
+
+
+def test_the_pre_auth_pool_evicts_its_oldest_rather_than_refusing() -> None:
+    """A full pool never refuses a new challenge; it drops the oldest. Expired entries answer
+    nothing, and a pop is single use."""
+    from messagefoundry.auth import webauthn as wa
+
+    clock = [0.0]
+    pool = wa.PreAuthChallengePool(ttl_seconds=10.0, cap=3, clock=lambda: clock[0])
+    for i in range(3):
+        clock[0] += 1
+        pool.put(f"k{i}", bytes([i]))
+    pool.put("k3", b"\x03")
+    assert len(pool) == 3
+    assert pool.pop("k0") is None and pool.pop("k1") == b"\x01"
+    assert pool.pop("k1") is None
+    clock[0] += 10
+    assert pool.pop("k2") is None and pool.pop("k3") is None
+
+
+async def test_every_refused_passkey_outcome_is_padded_into_the_first_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A8, against ``_FAILURE_BUDGET_SECONDS``: every refused shape of the combined passkey
+    sign-in reaches the failure pad once and is held to its first slot. The pad's sleep is replaced
+    so the arm reads the slot each attempt was given; the budget is widened for this arm only, so a
+    loaded host cannot push one branch into a later slot."""
+    from messagefoundry.auth import service as service_module
+
+    monkeypatch.setattr(service_module, "_FAILURE_BUDGET_SECONDS", 5.0)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store, lockout_threshold=50)
+        stranger = SoftAuthenticator(rp_id=RP, origin=ORIGIN, user_handle=b"nobody")
+        slots: list[int] = []
+        real_deadline = service_module._failure_deadline
+
+        def spy(started: float, now: float, budget: float | None = None) -> float:
+            deadline = real_deadline(started, now, budget)
+            slots.append(round((deadline - started) / 5.0))
+            return deadline
+
+        async def no_sleep(_deadline: float) -> None:
+            return None
+
+        monkeypatch.setattr(service_module, "_failure_deadline", spy)
+        monkeypatch.setattr(service_module, "_sleep_until", no_sleep)
+        shapes = [
+            ("unknown user", "nobody-by-this-name", password, auth),
+            ("right password, invalid assertion", identity.username, password, stranger),
+            ("wrong password, invalid assertion", identity.username, "wrong", stranger),
+            ("wrong password, valid assertion", identity.username, "wrong", auth),
+        ]
+        for label, username, pw, key in shapes:
+            out = await service.login(username, pw, passkey=_proof(service, key))
+            assert not out.ok, label
+        await _set_sign_in_lock(store, identity.user_id)
+        out = await service.login(identity.username, "wrong", passkey=_proof(service, stranger))
+        assert not out.ok
+        assert slots == [1] * (len(shapes) + 1), slots
     finally:
         await store.close()

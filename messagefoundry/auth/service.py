@@ -1023,6 +1023,22 @@ class RolesGained:
 
 
 @dataclass(frozen=True)
+class PasskeyProof:
+    """The passkey half of a COMBINED passkey sign-in (ADR 0197 Amendment A, wave 2, option N-G):
+    the password and a passkey assertion in one request.
+
+    ``handle`` is the opaque value :meth:`AuthService.begin_passkey_sign_in` returned, which the
+    console carries in an HttpOnly cookie; it names the staged challenge, never an account.
+    ``response_json`` is the browser's ``navigator.credentials.get`` answer. ``rp_id`` and
+    ``origin`` are the relying party the request arrived on, as on every other passkey leg."""
+
+    handle: str
+    response_json: str
+    rp_id: str
+    origin: str
+
+
+@dataclass(frozen=True)
 class LoginOutcome:
     """Result of a login attempt. ``error`` is for logs/audit — never leak the reason to clients."""
 
@@ -1830,6 +1846,27 @@ def _route_combined_failure(
         return "second_step", _LOCAL_REFUSAL_REASON, "password"
     if code_ok:
         return "second_step", _LOCAL_REFUSAL_REASON, "code"
+    return "sign_in", _LOCAL_REFUSAL_REASON, None
+
+
+def _route_passkey_failure(
+    *, password_ok: bool, assertion_ok: bool
+) -> tuple[LockoutCounter, str, str | None]:
+    """Where one refused COMBINED PASSKEY sign-in counts: ``(counter, audit reason, factor that was
+    right)`` (ADR 0197 Amendment A, option N-G's routing table).
+
+    Only "wrong password, valid assertion" counts on the SECOND-STEP counter: a device holder
+    guessing passwords. "Right password, invalid assertion" counts on the SIGN-IN counter exactly as
+    "wrong, invalid" does, ON PURPOSE. Uncounted, it was a silent password oracle: a right guess
+    moved no counter where a wrong one moved the sign-in count, and the lock-state surface shows
+    both. Routed together the two cells leave identical counters and identical audit rows, and a
+    password holder loses nothing, since a signature cannot be guessed. **This is not a model for
+    the TOTP path** (:func:`_route_combined_failure`): a code can be guessed, so uncounting "right
+    password, wrong code" there would hand a password holder uncounted code guesses.
+
+    The reason is :data:`_LOCAL_REFUSAL_REASON` on every arm, as on the TOTP path."""
+    if assertion_ok and not password_ok:
+        return "second_step", _LOCAL_REFUSAL_REASON, "passkey"
     return "sign_in", _LOCAL_REFUSAL_REASON, None
 
 
@@ -2988,6 +3025,10 @@ class AuthService:
         # the rate-limiter precedent (single API process is structural). Keys are token-hashes the
         # SERVICE computes; the cache module never sees a session token.
         self._webauthn_challenges = webauthn.ChallengeCache()
+        # ADR 0197 Amendment A, wave 2: the usernameless sign-in's challenges, staged before anyone
+        # is authenticated. Their own pool, apart from the per-user ceremonies above, and it evicts
+        # its oldest when full rather than refusing (webauthn.PreAuthChallengePool says why).
+        self._preauth_challenges = webauthn.PreAuthChallengePool()
         # Single-use per-action step-up grants (ADR 0077): (token_hash, action) -> monotonic deadline.
         # Bounded, TTL'd, process-local — the same shape as the WebAuthn ceremony cache above (and the
         # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
@@ -4233,12 +4274,20 @@ class AuthService:
         client: str | None = None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        passkey: PasskeyProof | None = None,
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
 
         ``totp_code`` is the optional authenticator code of the COMBINED sign-in (ADR 0197, BACKLOG
         #1131): the password and a TOTP code in one request. Absent or blank means today's two-step
         flow, unchanged. :meth:`_login_local` states when a code changes anything.
+
+        ``passkey`` is the optional passkey assertion of the COMBINED PASSKEY sign-in (ADR 0197
+        Amendment A, wave 2): the password and an assertion against a challenge
+        :meth:`begin_passkey_sign_in` staged. **Its challenge is popped here, on arrival, before the
+        account's queue**, whatever the outcome: single use, and its age is judged as of the
+        request's arrival, as ``arrived`` judges a TOTP code, so a wait in the queue cannot expire
+        it. :meth:`_login_local` states when an assertion changes anything.
 
         ``supersedes`` is the session token the caller is replacing, if any: the one a browser
         presented, or the one a bearer client names. On success it is
@@ -4303,6 +4352,10 @@ class AuthService:
         """
         started = time.monotonic()
         arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
+        # Popped before the queue, on every outcome: the handle names a challenge, never an account.
+        staged = (
+            None if passkey is None else self._preauth_challenges.pop(hash_token(passkey.handle))
+        )
         async with self._account_credential_lock(username):
             queued = time.monotonic() - started
             # A refused local sign-in's audit rows are written at a FIXED point of the padded
@@ -4328,6 +4381,8 @@ class AuthService:
                     client=client,
                     supersedes=supersedes,
                     totp_code=totp_code,
+                    passkey=passkey,
+                    passkey_challenge=staged,
                     arrived=arrived,
                     after_pad=after_pad,
                 )
@@ -4338,7 +4393,7 @@ class AuthService:
                     username,
                     after_pad,
                     client=client,
-                    combined=bool(totp_code and totp_code.strip()),
+                    combined=bool(totp_code and totp_code.strip()) or passkey is not None,
                 )
             # The room is set on every branch, whether it deferred rows or not, so every refusal
             # answers on the same slot.
@@ -4395,6 +4450,8 @@ class AuthService:
         client: str | None = None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        passkey: PasskeyProof | None = None,
+        passkey_challenge: bytes | None = None,
         arrived: float | None = None,
         after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
@@ -4427,6 +4484,8 @@ class AuthService:
             client=client,
             supersedes=supersedes,
             totp_code=totp_code,
+            passkey=passkey,
+            passkey_challenge=passkey_challenge,
             arrived=arrived,
             after_pad=after_pad,
         )
@@ -4444,6 +4503,8 @@ class AuthService:
         client: str | None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        passkey: PasskeyProof | None = None,
+        passkey_challenge: bytes | None = None,
         arrived: float | None = None,
         after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
@@ -4470,6 +4531,15 @@ class AuthService:
         counts on the SIGN-IN counter. Every refusal is the same ``invalid credentials``, and the
         ``login`` wrapper holds every one to the same padded deadline, so the caller learns a verdict
         only when both factors are right.
+
+        **THE COMBINED PASSKEY SIGN-IN (ADR 0197 Amendment A, wave 2, option N-G)** is the same
+        shape with a passkey assertion in place of the code. It exists only when the row read before
+        any verify shows a local account holding at least one passkey recorded as discoverable under
+        the request's ``rp_id`` (the twin of AC-2a), read from the set the account's seal covers;
+        on any other account an assertion changes nothing, so it is refused under a live lock before
+        any verify. It takes precedence over a code sent beside it. Both factors are always checked
+        (:meth:`_check_password_and_passkey`) and routed by :func:`_route_passkey_failure`, whose
+        docstring says why "right password, invalid assertion" counts as "wrong, invalid".
 
         Kept inside this method on purpose rather than in a ``_login*`` sibling:
         ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine as a new 6.1.3
@@ -4504,7 +4574,14 @@ class AuthService:
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
-        combined = bool(code) and user.totp_enabled
+        # Wave 2: the discoverable passkeys an assertion could answer for, under this request's
+        # relying party, from the set the account's seal covers. None read without an assertion.
+        passkey_creds: list[WebAuthnCredential] = []
+        if passkey is not None:
+            held = await self._verified_passkeys(user)
+            passkey_creds = [c for c in held or () if c.discoverable and c.rp_id == passkey.rp_id]
+        with_passkey = passkey is not None and bool(passkey_creds)
+        combined = with_passkey or (bool(code) and user.totp_enabled)
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
 
@@ -4524,7 +4601,20 @@ class AuthService:
             await later(locked_rows)
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
-        if combined:
+        if with_passkey and passkey is not None:
+            password_ok, assertion_ok = await self._check_password_and_passkey(
+                user,
+                password,
+                passkey,
+                passkey_challenge,
+                passkey_creds,
+                now=now,
+                client=client,
+                later=later,
+            )
+            if not (password_ok and assertion_ok):
+                refused = _route_passkey_failure(password_ok=password_ok, assertion_ok=assertion_ok)
+        elif combined:
             password_ok, code_ok = await self._check_both_factors(
                 user, password, code, arrived=arrived
             )
@@ -4644,7 +4734,7 @@ class AuthService:
             await self._mark_login_address_known(user.id, client)
         success_detail: dict[str, Any] = {"provider": "local", "mfa_required": mfa_required}
         if combined:
-            success_detail["second_factor"] = "totp"
+            success_detail["second_factor"] = "webauthn" if with_passkey else "totp"
         await self._audit(
             "auth.login_success",
             actor=user.username,
@@ -4753,6 +4843,125 @@ class AuthService:
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
+    async def _check_password_and_passkey(
+        self,
+        user: VerifiedUser,
+        password: str,
+        passkey: PasskeyProof,
+        challenge: bytes | None,
+        creds: Sequence[WebAuthnCredential],
+        *,
+        now: float,
+        client: str | None,
+        later: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
+    ) -> tuple[bool, bool]:
+        """The combined passkey sign-in's verify: ``(password_ok, assertion_ok)``, with BOTH always
+        checked (ADR 0197 Amendment A, N-G), for the reason :meth:`_check_both_factors` gives.
+
+        The assertion is invalid when the challenge was not staged or expired, the response is
+        malformed, its credential is not one of ``creds`` (the account's discoverable passkeys under
+        this relying party), its ``userHandle`` is not this account's id, its signature or origin
+        fails, or the sign-count compare-and-set misses. The ``userHandle`` test is what binds the
+        usernameless assertion to the account the form named. A valid signature moves the sign
+        count whatever the password was, as a matching TOTP code is consumed whatever the password
+        was; the challenge is single use, so the assertion cannot be replayed.
+
+        No ``auth.webauthn_failed`` row is written for an invalid assertion: the one
+        ``auth.login_failed`` row is the record, so a reader cannot tell the routing table's cells
+        apart by a row the password decided. The clone signal and a refused stored key are still
+        written (deferred with the other refused rows), and both depend on the assertion alone."""
+        stored = user.password_hash
+        verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
+        password_ok = stored is not None and verified
+        assertion_ok = await self._passkey_assertion_ok(
+            user, passkey, challenge, creds, now=now, client=client, later=later
+        )
+        return password_ok, assertion_ok
+
+    async def _passkey_assertion_ok(
+        self,
+        user: VerifiedUser,
+        passkey: PasskeyProof,
+        challenge: bytes | None,
+        creds: Sequence[WebAuthnCredential],
+        *,
+        now: float,
+        client: str | None,
+        later: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
+    ) -> bool:
+        """Whether ``passkey`` is a valid assertion for ``user`` (see
+        :meth:`_check_password_and_passkey`). Never raises for bad input."""
+        if challenge is None:
+            return False
+        try:
+            raw_id = webauthn.credential_id_from_response(passkey.response_json)
+        except webauthn.WebAuthnVerificationError:
+            return False
+        # ASVS 11.2.4: every candidate compared, each in constant time, as the delete path does.
+        wanted = hash_bytes(raw_id)
+        cred: WebAuthnCredential | None = None
+        for candidate in creds:
+            if constant_time_equal(candidate.credential_id_hash, wanted) and cred is None:
+                cred = candidate
+        handle = webauthn.user_handle_from_response(passkey.response_json)
+        if cred is None or handle is None or not constant_time_equal(handle, user.id.encode()):
+            return False
+        try:
+            new_count = webauthn.verify_assertion(
+                response_json=passkey.response_json,
+                challenge=challenge,
+                rp_id=passkey.rp_id,
+                origin=passkey.origin,
+                public_key=self._b64url_decode(cred.public_key),
+                current_sign_count=cred.sign_count,
+            )
+        except webauthn.StoredKeyRefusedError:
+            # BACKLOG #1963, as on finish_webauthn_assertion: this passkey will never sign in again.
+            _log.warning(
+                "passkey sign-in refused for %s: stored credential %r fails the registration key "
+                "check and must be registered again",
+                user.username,
+                cred.label,
+            )
+            label = cred.label
+
+            async def stored_key_row() -> None:
+                await self._audit(
+                    "auth.webauthn_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "stored_key_refused", "label": label}),
+                    client=client,
+                )
+
+            await later(stored_key_row)
+            return False
+        except webauthn.WebAuthnVerificationError as exc:
+            if "sign count" in str(exc).lower():  # py_webauthn's own regression check (ADR 0068)
+                suspect = cred
+
+                async def clone_row() -> None:
+                    await self._audit(
+                        "auth.webauthn_clone_suspected",
+                        actor=user.username,
+                        detail=_json({"label": suspect.label}),
+                        client=client,
+                    )
+
+                await later(clone_row)
+            return False
+        answer = await self._store.update_webauthn_sign_count(
+            cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
+        )
+        if answer != "moved":
+            missed, suspect = answer, cred
+
+            async def cas_row() -> None:
+                await self._clone_suspected(user, suspect, client, answer=missed)
+
+            await later(cas_row)
+            return False
+        return True
+
     async def _record_lock(
         self,
         user: UserRecord,
@@ -4768,7 +4977,8 @@ class AuthService:
         The notice carries which lock it was and its cycle count (ADR 0197 Decision item 7), as a
         closed-set detail on the one ``ACCOUNT_LOCKED`` event type. ``factor`` names the factor a
         second-step failure proved right (``"password"`` or ``"code"`` on a combined sign-in,
-        ``"first_step"`` on ``verify_mfa``), so the notice can tell the owner which one to replace;
+        ``"passkey"`` on a combined passkey sign-in, ``"first_step"`` on ``verify_mfa``), so the
+        notice can tell the owner which one to replace;
         only the owner receives it. A sign-in lock on a local account with TOTP enrolled tells the
         owner the combined sign-in gets them in now."""
         if not failure.just_locked:
@@ -4782,7 +4992,7 @@ class AuthService:
             # A second step on an existing session proved the FIRST step, which for a directory
             # account is its directory sign-in, not a password this engine can reset.
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
-            notice["factor_right"] = factor if factor in ("password", "code") else first
+            notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
         elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
             notice["combined_sign_in"] = True
         await self._record_suspicious_login(
@@ -13498,6 +13708,29 @@ class AuthService:
             # vault BACKLOG #2145, as in confirm_mfa_enrollment, and last for the same reason.
             await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
+
+    def begin_passkey_sign_in(self, *, rp_id: str, client: str | None) -> tuple[str, str] | None:
+        """Stage the usernameless sign-in's assertion challenge (ADR 0197 Amendment A, wave 2,
+        option N-G, AC-A7). Returns ``(handle, options JSON)``, or ``None`` when the sign-in limiter
+        (control 2) refuses, which the route answers 429.
+
+        **The limiter is charged FIRST**, before anything is staged, so the pre-auth pool fills no
+        faster than sign-ins are admitted. **No username is taken and the credential list is
+        empty**, so the options are the same shape for every caller and say nothing about any
+        account. The challenge is staged under the hash of a fresh opaque ``handle``, which the
+        console sets as an HttpOnly cookie and :meth:`login` pops on arrival. Never keyed by
+        client address (:class:`webauthn.PreAuthChallengePool` says why). Raises ``RuntimeError``
+        on an install without the ``[webauthn]`` extra; the route asks
+        :meth:`webauthn_available` first."""
+        if not self.allow_login_attempt(client):
+            return None
+        challenge = webauthn.new_challenge()
+        options = webauthn.assertion_options(
+            rp_id=rp_id, challenge=challenge, allow_credential_ids=()
+        )
+        handle = mint_token()
+        self._preauth_challenges.put(hash_token(handle), challenge)
+        return handle, options
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options

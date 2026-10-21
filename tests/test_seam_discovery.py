@@ -198,7 +198,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     reads, and with it ``RolesGained``, the type of one of its fields.
 
     BACKLOG #3082 added ``DirectoryRefusal``, the type of ``Elevation.directory_refusal``, which the
-    console imports to pick the text for each fix."""
+    console imports to pick the text for each fix.
+
+    Vault BACKLOG #3373 added ``PasskeyProof``, which ``POST /ui/login`` builds for the combined
+    passkey sign-in (ADR 0197 Amendment A, wave 2)."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
@@ -208,6 +211,7 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "MfaStatus",
         "NotifyEmailAlreadySet",
         "OidcStepUp",
+        "PasskeyProof",
         "RolesGained",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
         "STEP_UP_ACTION_ADMIN_RESET_MFA",

@@ -227,6 +227,12 @@ _SECOND_STEP_FACTOR = {
         "Your authenticator code was right and the password was wrong.",
         _LOCAL_REMEDY + "replace your authenticator",
     ),
+    # ADR 0197 Amendment A, wave 2: the combined passkey sign-in counts only "wrong password, valid
+    # passkey" on this counter, so the passkey is the factor that was right.
+    "passkey": (
+        "Your passkey was right and the password was wrong.",
+        _LOCAL_REMEDY + "remove that passkey from your account",
+    ),
     "first_step": (
         "The first sign-in step succeeded and the authenticator code was wrong.",
         _LOCAL_REMEDY + "change your password",
