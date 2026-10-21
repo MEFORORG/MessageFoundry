@@ -2261,7 +2261,8 @@ class LockableAccountCensus:
     none carries a secret.
 
     ``passkey_only`` is informational and not a finding: the covered accounts whose only working way
-    past is a passkey recorded as discoverable, an account whose TOTP is unusable included. The record
+    past is a passkey recorded as discoverable, an account whose TOTP is refused included. One whose
+    TOTP could not be judged is named in ``unknown_beside_a_passkey`` instead. The record
     is what the client reported, or the requirement the registration sent when it reported nothing,
     so on a client that does not conform it can overstate, and ADR 0197 Amendment A (N-G) has the
     census name these accounts for that reason. An account in both lists keeps a working passkey that
@@ -2274,6 +2275,10 @@ class LockableAccountCensus:
     #: as the plain enabled-TOTP rule does; this names them as unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
+    #: The covered accounts in ``unknown_totp`` that also hold a discoverable passkey, which a
+    #: factor reset would remove. Kept apart from ``passkey_only``, which reads as "the TOTP is no
+    #: way past", a thing nobody knows of an unknown TOTP.
+    unknown_beside_a_passkey: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
@@ -2285,7 +2290,8 @@ class LockableAccountCensus:
         the population ``passkey_only`` covers: ``reset-mfa`` would also remove that passkey. The cure
         is the store key for a cell that does not open, and removing and enrolling the app again for
         an enrolment this release refuses."""
-        return tuple(sorted(set(self.undecryptable_totp) & set(self.passkey_only)))
+        named = set(self.undecryptable_totp) & set(self.passkey_only)
+        return tuple(sorted(named | set(self.unknown_beside_a_passkey)))
 
 
 @dataclass(frozen=True)
@@ -2380,12 +2386,6 @@ class CensusNeedsTheStoreKey(RuntimeError):
     (ADR 0197 Amendment A). ``messagefoundry verify`` reports it as an ERROR naming the key."""
 
 
-async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
-    """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with:
-    :func:`_totp_secret_state` is ``"usable"``."""
-    return await _totp_secret_state(store, user) == "usable"
-
-
 async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
@@ -2422,7 +2422,7 @@ def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None
     """Why an OPENED TOTP secret is no key the engine can compute codes with, or ``None`` when it
     is one. ``"refused"``: its enrolment marker names parameters this release refuses
     (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"malformed"``: not base32, so no key. The one
-    statement of the rule: :func:`_totp_secret_usable` (the census) and :func:`_opened_totp_usable`
+    statement of the rule: :func:`_totp_secret_state` (the census) and :func:`_opened_totp_state`
     (every way-past gate) both ask it, so they cannot disagree about one account."""
     try:
         totp.totp(secret)
@@ -2450,12 +2450,6 @@ def _opened_totp_state(secret: str | None) -> TotpState:
     return "usable" if reason is None else "unknown"
 
 
-def _opened_totp_usable(secret: str | None) -> bool:
-    """Whether an opened TOTP secret is one the engine can compute codes with
-    (:func:`_opened_totp_state` is ``"usable"``)."""
-    return _opened_totp_state(secret) == "usable"
-
-
 async def lockable_account_census(
     store: AdminStore, settings: AuthSettings
 ) -> LockableAccountCensus:
@@ -2481,6 +2475,7 @@ async def lockable_account_census(
     no_way_past: list[str] = []
     undecryptable: list[str] = []
     unknown: list[str] = []
+    unknown_beside_a_passkey: list[str] = []
     passkey_only: list[str] = []
     sealed = store.row_sealer() is not None
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
@@ -2489,18 +2484,17 @@ async def lockable_account_census(
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
-        if user.totp_enabled:
-            state = await _totp_secret_state(store, user)
-            if state == "usable":
-                continue
+        state = await _totp_secret_state(store, user) if user.totp_enabled else None
+        if state == "usable":
+            continue
+        if state is not None:
             undecryptable.append(user.username)
             if state == "unknown":
                 # Named as unknown, never as refused or as usable. The gates count it as the plain
-                # enabled-TOTP rule does, so it is not read as an account with no way past.
+                # enabled-TOTP rule does, so it is never read as an account with no way past.
                 unknown.append(user.username)
-                continue
-            # A KNOWN refusal: the account still falls through, since a discoverable passkey may be
-            # its working way past, which reset-mfa would remove (named in passkey_only).
+            # Either way the account falls through, since a discoverable passkey may be its working
+            # way past, which reset-mfa would remove.
         if (
             user.password_generated
             or user.password_hash is None
@@ -2522,7 +2516,10 @@ async def lockable_account_census(
         creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
         digest = user.row.cred_digest if user.row is not None else ""
         if discoverable_way_past(creds, digest, sealed=sealed):
-            passkey_only.append(user.username)
+            if state == "unknown":
+                unknown_beside_a_passkey.append(user.username)
+            else:
+                passkey_only.append(user.username)
         elif not user.totp_enabled:
             no_way_past.append(user.username)
     return LockableAccountCensus(
@@ -2530,6 +2527,7 @@ async def lockable_account_census(
         undecryptable_totp=tuple(sorted(undecryptable)),
         unknown_totp=tuple(sorted(unknown)),
         passkey_only=tuple(sorted(passkey_only)),
+        unknown_beside_a_passkey=tuple(sorted(unknown_beside_a_passkey)),
     )
 
 
@@ -4988,8 +4986,8 @@ class AuthService:
         cheaper way to reach the same answer."""
         return await self._store.increment_login_failure(
             user.id,
-            # BACKLOG #3422: the sign-in lock escalates only where the TOTP is a way past, judged
-            # by the store on the locked row's cell, and only where the failure may set the lock.
+            # BACKLOG #3422: the sign-in lock keeps its fixed length beside a TOTP the store KNOWS
+            # is refused, judged on the locked row's cell; otherwise totp_enabled decides, as before.
             totp_usable=_opened_totp_state,
             counter=counter,
             threshold=self._policy.lockout_threshold,
@@ -5218,7 +5216,9 @@ class AuthService:
         notice can tell the owner which one to replace;
         only the owner receives it. A sign-in lock on a local account with a usable TOTP tells the
         owner the combined sign-in gets them in now; one on a local account with a discoverable
-        passkey tells it the combined passkey sign-in does. A record nobody checked against its seal
+        passkey and no usable TOTP tells it the combined passkey sign-in does. A TOTP nobody could
+        judge (a cell that did not open) is offered as the plain rule offers it and reported as
+        unknown, beside the passkey when there is one. A record nobody checked against its seal
         claims neither (BACKLOG #3422)."""
         if not failure.just_locked:
             return
@@ -5232,22 +5232,17 @@ class AuthService:
             # account is its directory sign-in, not a password this engine can reset.
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
-        elif (
-            user.auth_provider == AuthProvider.LOCAL.value
-            and isinstance(user, VerifiedUser)
-            and (totp_state := await self._totp_state(user)) in ("usable", "unknown")
-        ):
-            notice["combined_sign_in"] = True
+        elif user.auth_provider == AuthProvider.LOCAL.value and isinstance(user, VerifiedUser):
+            totp_state = await self._totp_state(user)
+            if totp_state in ("usable", "unknown"):
+                notice["combined_sign_in"] = True
             if totp_state == "unknown":
                 # Reported as unknown, never as usable or as refused (BACKLOG #3422).
                 notice["totp_state"] = "unknown"
-        elif (
-            user.auth_provider == AuthProvider.LOCAL.value
-            and isinstance(user, VerifiedUser)
-            and await self._holds_discoverable_passkey(user)
-        ):
-            # ADR 0197 Amendment A, wave 2: the way past is the combined passkey sign-in.
-            notice["combined_passkey_sign_in"] = True
+            # ADR 0197 Amendment A, wave 2: the way past is the combined passkey sign-in. Beside a
+            # TOTP nobody could check, the passkey is named too, since it needs no TOTP cell.
+            if totp_state != "usable" and await self._holds_discoverable_passkey(user):
+                notice["combined_passkey_sign_in"] = True
         await self._record_suspicious_login(
             ACCOUNT_LOCKED, user, client=client, audit_detail=audit_detail, notice_detail=notice
         )
@@ -12252,7 +12247,8 @@ class AuthService:
 
     async def _has_way_past(self, user: VerifiedUser) -> bool:
         """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A):
-        a usable TOTP (:meth:`_totp_way_past`), which has option E's combined sign-in, or (wave 2) a
+        a TOTP not known to be refused (:meth:`_totp_way_past`), which has option E's combined
+        sign-in, or (wave 2) a
         passkey recorded as discoverable, which has the usernameless passkey sign-in (option N-G).
 
         A passkey registered before wave 2, or one whose client reported it was not made
@@ -12424,7 +12420,9 @@ class AuthService:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
                 "value would not compute): %s. Until they can be, every gate treats each as an "
-                "enabled TOTP. Check the store key and the cipher service before anything else.",
+                "enabled TOTP. For a cell that does not open, check the store key and the cipher "
+                "service; a value that opens and will not compute needs the holder to remove the "
+                "authenticator app and enrol it again.",
                 len(census.unknown_totp),
                 ", ".join(census.unknown_totp),
             )

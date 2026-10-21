@@ -13949,6 +13949,7 @@ class SqlServerStore:
                 user_id,
                 counter,
                 totp_usable=totp_usable,
+                threshold=threshold,
                 now=now,
             ),
         )

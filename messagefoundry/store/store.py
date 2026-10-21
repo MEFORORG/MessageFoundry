@@ -2772,15 +2772,19 @@ async def escalation_verdict(
     counter: LockoutCounter,
     *,
     totp_usable: TotpUsable,
+    threshold: int,
     now: float,
 ) -> TotpCounts | None:
     """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
     held (:func:`judge_totp`) on a local account with TOTP on whose sign-in lock is not already
-    live and can arm. It is judged on every such failure, not only near the threshold: a pre-lock
-    read of the count cannot tell which of a parallel burst sets the lock. Everywhere else ``None``,
-    and no cell is opened; :func:`lockout_increment` then applies the plain ``totp_enabled`` rule to
-    the locked row, so a pre-read that a racing write made stale never skips an escalation. The one
-    copy every backend calls."""
+    live and can arm, and only where the pre-lock read says THIS failure sets a lock that the
+    verdict could shorten: the count reaches ``threshold`` and the lock is not the first of its
+    cycle count, since a first lock has the base length either way. So a wrong password below the
+    threshold opens no cell, and a username alone cannot drive one cipher call per guess.
+    Everywhere else ``None``, and no cell is opened; :func:`lockout_increment` then applies the
+    plain ``totp_enabled`` rule to the locked row, so a pre-read that a racing write made stale
+    (a parallel burst whose crossing failure read a lower count) escalates as before that rule
+    rather than skipping an escalation. The one copy every backend calls."""
     if totp_usable is None:  # typed never None; refused loudly for a caller typed ``Any``
         raise TypeError("increment_login_failure needs totp_usable, never None")
     if counter != "sign_in":
@@ -2793,6 +2797,10 @@ async def escalation_verdict(
         or pre.password_generated
         or pre.sign_in_locked(now)
     ):
+        return None
+    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
+    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
+    if reaches < threshold or pre.lock_cycles < 1:
         return None
     return await judge_totp(opener, totp_usable, pre)
 
@@ -2836,7 +2844,8 @@ def holds_way_past(
     totp_counts: TotpCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
-    a usable TOTP (:func:`_totp_is_way_past`), or a passkey recorded as discoverable (wave 2).
+    a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
+    discoverable (wave 2).
     ``passkeys`` is the account's set, read in the same transaction as the write that asks
     (:func:`discoverable_way_past` says how it is trusted)."""
     if _totp_is_way_past(record, totp_counts):
@@ -6904,7 +6913,7 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with a usable TOTP enrolled, because that owner can use
+    * the SIGN-IN lock on a local account with a TOTP enrolled, because that owner can use
       the combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
       account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
       account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
@@ -6912,9 +6921,10 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
 
     Read by every backend inside its atomic increment, from ``auth_provider`` on the row it locked.
-    For the SIGN-IN lock ``totp_enabled`` is the TOTP's usability (BACKLOG #3422), judged before the
-    lock on a cell the locked row must still hold (:func:`escalation_verdict`); a cell that moved
-    meanwhile escalates nothing. The count itself stays atomic."""
+    For the SIGN-IN lock ``totp_enabled`` is the row's flag, cleared only by a KNOWN refusal of the
+    TOTP (BACKLOG #3422) judged before the lock on a cell the locked row still holds
+    (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
+    all leave the flag standing, as before that rule. The count itself stays atomic."""
     if auth_provider != "local":
         return False
     return counter == "second_step" or totp_enabled
@@ -16133,6 +16143,7 @@ class MessageStore:
                 user_id,
                 counter,
                 totp_usable=totp_usable,
+                threshold=threshold,
                 now=now,
             ),
         )

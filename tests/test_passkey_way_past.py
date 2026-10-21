@@ -31,7 +31,6 @@ from messagefoundry.auth.service import (  # noqa: E402
     FactorEnrolmentRequired,
     PasskeyProof,
     _opened_totp_state,
-    _opened_totp_usable,
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
@@ -759,12 +758,14 @@ async def _enable_totp(store: MessageStore, user_id: str, secret: str) -> None:
 
 
 def test_the_way_past_rule_reads_an_opened_totp_as_the_census_does() -> None:
-    """One rule for the census and the gates: a refused marker, a non-base32 value and nothing at
-    all are no way past; a usable enrolment, marked or bare, is."""
-    assert not _opened_totp_usable(_REFUSED_TOTP)
-    assert not _opened_totp_usable("not base32 at all!")
-    assert not _opened_totp_usable(None) and not _opened_totp_usable("")
-    assert _opened_totp_usable(_USABLE_TOTP) and _opened_totp_usable(_TOTP_SECRET)
+    """One rule for the census and the gates, pinned state by state: a refused marker and nothing at
+    all are a KNOWN refusal; a non-base32 value cannot be judged, so it is unknown and the plain
+    enabled-TOTP rule applies; a usable enrolment, marked or bare, is usable."""
+    assert _opened_totp_state(_REFUSED_TOTP) == "refused"
+    assert _opened_totp_state(None) == "refused" and _opened_totp_state("") == "refused"
+    assert _opened_totp_state("not base32 at all!") == "unknown"
+    assert _opened_totp_state(_USABLE_TOTP) == "usable"
+    assert _opened_totp_state(_TOTP_SECRET) == "usable"
 
 
 @pytest.mark.parametrize(("secret", "removable"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
@@ -1014,15 +1015,18 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
 # --- the refused-TOTP rule at the remaining sites, and off the event loop ---------------------------
 
 
-def test_a_keyless_open_ciphertext_cell_is_no_way_past(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A keyless open hands the stored ciphertext through unchanged; that is no usable TOTP. The
-    compute check is stubbed to pass, so only the ciphertext guard can answer."""
+def test_a_keyless_open_ciphertext_cell_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A keyless open hands the stored ciphertext through unchanged; that is no TOTP the engine can
+    judge, so it is unknown, never usable. The compute check is stubbed to pass, so only the
+    ciphertext guard can answer."""
     from messagefoundry.auth import service as service_module
     from messagefoundry.store.crypto import MARKER_PREFIX
 
     monkeypatch.setattr(service_module, "_totp_unusable_reason", lambda _secret: None)
-    assert not _opened_totp_usable(MARKER_PREFIX + "v2:opaque-ciphertext")
-    assert _opened_totp_usable(_TOTP_SECRET), "the stub should let a plain secret through"
+    assert _opened_totp_state(MARKER_PREFIX + "v2:opaque-ciphertext") == "unknown"
+    assert _opened_totp_state(_TOTP_SECRET) == "usable", (
+        "the stub should let a plain secret through"
+    )
 
 
 @pytest.mark.parametrize(("secret", "escalates"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
@@ -1235,45 +1239,64 @@ async def test_the_escalation_rule_cannot_be_omitted() -> None:
 # --- an UNKNOWN TOTP (a cell that does not open, as in a Transit outage) behaves as before #3422 ----
 
 
-def _cipher_outage(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stub cipher for the TOTP cell: every open raises ``CipherError``, as a Transit outage does."""
-    from messagefoundry.store.crypto import CipherError
+def _cipher_outage(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, kind: str = "outage"
+) -> list[str]:
+    """A stub cipher for the TOTP cell. ``"outage"``: every open raises ``CipherError``, as a Transit
+    outage does. ``"keyless"``: every open hands the stored ciphertext back unchanged, as a store
+    opened without its key does. Returns the list each open appends its account id to, so a test can
+    show the stub was reached rather than a judgement skipped."""
+    from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 
-    def outage(_user_id: str, _cell: str | None) -> str | None:
-        raise CipherError("the cipher service did not answer")
+    opened: list[str] = []
 
-    async def outage_read(_user_id: str) -> str | None:
-        raise CipherError("the cipher service did not answer")
+    def unjudgeable(user_id: str, _cell: str | None) -> str | None:
+        opened.append(user_id)
+        if kind == "outage":
+            raise CipherError("the cipher service did not answer")
+        return MARKER_PREFIX + "v2:opaque-ciphertext"
 
-    monkeypatch.setattr(store, "open_totp_secret", outage)
+    async def outage_read(user_id: str) -> str | None:
+        return unjudgeable(user_id, None)
+
+    monkeypatch.setattr(store, "open_totp_secret", unjudgeable)
     monkeypatch.setattr(store, "get_totp_secret", outage_read)
+    return opened
 
 
+_UNJUDGEABLE = pytest.mark.parametrize("kind", ["outage", "keyless"])
+
+
+@_UNJUDGEABLE
 async def test_an_unknown_totp_is_not_removed_beside_a_passkey_that_is_not_discoverable(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """During the outage a covered account holding a non-discoverable passkey cannot remove its
-    TOTP, exactly as the plain enabled-TOTP rule refused it before BACKLOG #3422."""
+    """During the outage, or on a keyless open, a covered account holding a non-discoverable
+    passkey cannot remove its TOTP, exactly as the plain enabled-TOTP rule refused it before
+    BACKLOG #3422."""
     store = await MessageStore.open(":memory:")
     try:
         setup = _service(store, require_mfa=False)
         identity, token, _ = await login_admin(setup)
         await _register(setup, identity, token, resident_key=False)
         await _enable_totp(store, identity.user_id, _USABLE_TOTP)
-        _cipher_outage(store, monkeypatch)
+        opened = _cipher_outage(store, monkeypatch, kind)
         with pytest.raises(ValueError) as refused:
             await _service(store).disable_mfa(identity)
         assert str(refused.value) == TOTP_REMOVAL_REFUSED
+        assert opened, "the removal judged nothing, so the stub measured nothing"
         row = await store.get_user(identity.user_id)
         assert row is not None and row.totp_enabled
     finally:
         await store.close()
 
 
+@_UNJUDGEABLE
 async def test_an_unknown_totp_still_escalates_the_sign_in_lock(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """During the outage the sign-in lock still doubles on the second cycle, as before."""
+    """During the outage, or on a keyless open, the sign-in lock still doubles on the second
+    cycle, as before; the crossing failure of that cycle opened the stubbed cell."""
     store = await MessageStore.open(":memory:")
     try:
         service = _lock_service(store)
@@ -1281,15 +1304,98 @@ async def test_an_unknown_totp_still_escalates_the_sign_in_lock(
         await _enable_totp(store, identity.user_id, _USABLE_TOTP)
         user = await service._load_user(identity.user_id)
         assert user is not None
-        _cipher_outage(store, monkeypatch)
+        opened = _cipher_outage(store, monkeypatch, kind)
         start = 1_000_000.0
         for cycle in range(2):
             at = start + cycle * 10_000.0
             for i in range(_LOCK_THRESHOLD):
                 await service._register_failure(user, at + i, counter="sign_in")
+        assert opened, "the escalation judged nothing, so the stub measured nothing"
         row = await store.get_user(identity.user_id)
         assert row is not None and row.locked_until is not None
         assert row.locked_until - (start + 10_000.0 + _LOCK_THRESHOLD - 1) == 1800.0
+    finally:
+        await store.close()
+
+
+async def test_a_first_passkey_that_is_not_discoverable_is_taken_beside_an_unknown_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A3 during the outage: the registration refusal asks the way-past rule, and an enabled
+    TOTP it cannot judge counts as the plain rule counts it, so a covered account may register a
+    passkey that is not discoverable, as before BACKLOG #3422. The control: where the same cell
+    opens to an enrolment this release refuses, the same registration is refused."""
+    from tests._totp_clock import fresh_totp
+
+    for outage in (True, False):
+        store = await MessageStore.open(":memory:")
+        try:
+            service = _service(store)
+            identity, token, _ = await login_admin(service)
+            enroll = await service.begin_mfa_enrollment(identity)
+            confirmed = await service.confirm_mfa_enrollment(
+                identity, fresh_totp(enroll.secret), token=token
+            )
+            assert confirmed.ok and confirmed.token is not None
+            token = confirmed.token
+            if outage:
+                opened = _cipher_outage(store, monkeypatch)
+            else:
+                opened = []
+
+                def refused(
+                    user_id: str, _cell: str | None, seen: list[str] = opened
+                ) -> str | None:
+                    seen.append(user_id)
+                    return _REFUSED_TOTP
+
+                monkeypatch.setattr(store, "open_totp_secret", refused)
+            auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+            options = json.loads(
+                await service.begin_webauthn_registration(
+                    identity, token=token, rp_id=RP, rp_name="M"
+                )
+            )
+            finish = service.finish_webauthn_registration(
+                identity,
+                auth.create_response(base64url_to_bytes(options["challenge"]), resident_key=False),
+                label="key",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+            if outage:
+                assert (await finish).ok
+                assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+            else:
+                with pytest.raises(ValueError) as refusal:
+                    await finish
+                assert str(refusal.value) == PASSKEY_NOT_DISCOVERABLE
+            assert opened, "the registration judged nothing, so the stub measured nothing"
+        finally:
+            monkeypatch.undo()
+            await store.close()
+
+
+async def test_the_last_discoverable_passkey_can_go_beside_an_unknown_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A3a during the outage: the removal refusal asks the way-past rule in the service and
+    again in the store's conditional delete, and an enabled TOTP neither can judge counts as the
+    plain rule counts it, so the account's only discoverable passkey may go, as before BACKLOG
+    #3422."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        assert cred.discoverable
+        opened = _cipher_outage(store, monkeypatch)
+        assert await service.delete_webauthn_credential(identity, cred.credential_id_hash)
+        assert len(opened) >= 2, "the service gate and the store re-check should each judge"
+        assert await store.list_webauthn_credentials(identity.user_id) == []
     finally:
         await store.close()
 
@@ -1317,8 +1423,9 @@ async def test_the_census_names_an_unknown_totp_as_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The census reports a TOTP it could not judge as unknown: named in ``unknown_totp`` (and, as
-    before, among the TOTP secrets it cannot decrypt), never as a refusal with a passkey way past,
-    and never as an account with no way past."""
+    before, among the TOTP secrets it cannot decrypt), never as a refusal with a passkey way past
+    (``passkey_only``), and never as an account with no way past. The discoverable passkey beside it
+    is still named as one a factor reset would remove."""
     store = await MessageStore.open(":memory:")
     try:
         service = _service(store)
@@ -1331,6 +1438,51 @@ async def test_the_census_names_an_unknown_totp_as_unknown(
         assert census.unknown_totp == (identity.username,)
         assert census.undecryptable_totp == (identity.username,)
         assert census.passkey_only == () and census.no_way_past == ()
-        assert census.reset_would_remove_a_passkey == ()
+        assert census.unknown_beside_a_passkey == (identity.username,)
+        assert census.reset_would_remove_a_passkey == (identity.username,)
+    finally:
+        await store.close()
+
+
+async def test_a_lock_notice_beside_an_unknown_totp_says_so_and_names_the_passkey(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """During the outage the sign-in lock notice offers the code sign-in as the plain rule did,
+    reports the TOTP as unknown, and also names the passkey sign-in, which needs no TOTP cell; the
+    rendered lines carry all three."""
+    from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
+    from messagefoundry.pipeline.security_notify import _lock_lines
+
+    events: list[SecurityEvent] = []
+
+    class _Notifier:
+        async def notify(self, event: SecurityEvent) -> bool:
+            events.append(event)
+            return True
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0,
+                login_rate_limit_enabled=False,
+                lockout_threshold=3,
+            ),
+            security_notifier=_Notifier(),
+        )
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        _cipher_outage(store, monkeypatch)
+        for i in range(3):
+            assert not (await service.login(identity.username, f"wrong-{i}")).ok
+        (lock,) = [e for e in events if e.event_type == ACCOUNT_LOCKED]
+        assert lock.detail.get("combined_sign_in") is True
+        assert lock.detail.get("totp_state") == "unknown"
+        assert lock.detail.get("combined_passkey_sign_in") is True
+        _description, lines, _closing = _lock_lines(lock)
+        text = " ".join(lines)
+        assert "authenticator code" in text and "could not check" in text and "passkey" in text
     finally:
         await store.close()

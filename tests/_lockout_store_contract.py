@@ -124,8 +124,12 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_conditional_rotation_on_a_passkey(store)
     await _assert_refused_totp_is_no_way_past(store)
     await _assert_refused_totp_keeps_the_fixed_sign_in_lock(store)
-    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store)
+    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store, "outage")
+    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store, "keyless")
     await _assert_a_stale_pre_read_still_escalates(store)
+    for race in ("enabled", "replaced", "rekeyed"):
+        await _assert_no_verdict_falls_back_to_the_enabled_rule(store, race)
+    await _assert_a_wrong_password_below_the_threshold_opens_no_cell(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -497,52 +501,62 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     await store.delete_user("rot-pk1")
 
 
-async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any) -> None:
-    """BACKLOG #3422, on every backend: a TOTP cell that does not open (a stub cipher raising
-    ``CipherError``, as a Transit outage does) is UNKNOWN, and every store decision then follows
-    the plain ``totp_enabled`` rule, never the refused-TOTP one. The sign-in lock still escalates;
-    the TOTP cannot be removed while only a passkey that is not discoverable would remain; and that
-    passkey may go, because the TOTP still counts."""
-    from messagefoundry.store.crypto import CipherError
+async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any, kind: str) -> None:
+    """BACKLOG #3422, on every backend: a TOTP the store cannot judge is UNKNOWN, and every store
+    decision then follows the plain ``totp_enabled`` rule, never the refused-TOTP one. ``kind`` is
+    ``"outage"``, a stub cipher raising ``CipherError`` as a Transit outage does, or ``"keyless"``,
+    an open that hands the stored ciphertext back unchanged, as a store opened without its key
+    does. The sign-in lock still escalates; the TOTP cannot be removed while only a passkey that is
+    not discoverable would remain; and that passkey may go, because the TOTP still counts. Each
+    decision opened the stubbed cell, so the stub, not a skipped judgement, is what was measured."""
+    from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
     from tests._webauthn_store_contract import _cred
 
+    uid = f"lock-uk-{kind}"
     await store.create_user(
-        user_id="lock-uk1",
-        username="lock-uk-alice",
+        user_id=uid,
+        username=f"lock-uk-{kind}-alice",
         auth_provider="local",
         password_hash="h",
         now=1.0,
         password_generated=False,
     )
-    cell = await store.set_totp_secret("lock-uk1", secret="JBSWY3DPEHPK3PXP", now=1.0)
-    assert await store.enable_totp(
-        "lock-uk1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
-    )
-    plain = credential_id_hash(b"lock-uk-plain")
-    await store.add_webauthn_credential(_cred("lock-uk1", "plain", id_hash=plain))
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
+    plain = credential_id_hash(f"lock-uk-{kind}-plain".encode())
+    await store.add_webauthn_credential(_cred(uid, "plain", id_hash=plain))
+    opened: list[str] = []
 
-    def outage(_user_id: str, _cell: str | None) -> str | None:
-        raise CipherError("the cipher service did not answer")
+    def unjudgeable(user_id: str, _cell: str | None) -> str | None:
+        opened.append(user_id)
+        if kind == "outage":
+            raise CipherError("the cipher service did not answer")
+        return MARKER_PREFIX + "v2:opaque-ciphertext"
 
-    store.open_totp_secret = outage
+    store.open_totp_secret = unjudgeable
     try:
-        first = await _lock_cycle(store, "lock-uk1", start=10_000.0, counter="sign_in")
-        second = await _lock_cycle(store, "lock-uk1", start=first + 1.0, counter="sign_in")
+        first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+        second = await _lock_cycle(store, uid, start=first + 1.0, counter="sign_in")
+        assert opened, "the escalation judged nothing, so the stub measured nothing"
         assert second - (first + 1.0 + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
-            "an unknown TOTP lost the sign-in lock's escalation"
+            f"an unknown ({kind}) TOTP lost the sign-in lock's escalation"
         )
+        opened.clear()
         assert not await store.disable_totp(
-            "lock-uk1", now=50_000.0, require_way_past=True, totp_usable=_opened_totp_state
-        ), "an unknown TOTP was removed beside a passkey that is not discoverable"
-        user = await store.get_user("lock-uk1")
+            uid, now=50_000.0, require_way_past=True, totp_usable=_opened_totp_state
+        ), f"an unknown ({kind}) TOTP was removed beside a passkey that is not discoverable"
+        assert opened, "the removal judged nothing"
+        user = await store.get_user(uid)
         assert user is not None and user.totp_enabled
+        opened.clear()
         assert await store.delete_webauthn_credential(
-            "lock-uk1", plain, require_way_past=True, totp_usable=_opened_totp_state
-        ), "an unknown TOTP did not count as the account's way past"
+            uid, plain, require_way_past=True, totp_usable=_opened_totp_state
+        ), f"an unknown ({kind}) TOTP did not count as the account's way past"
+        assert opened, "the passkey removal judged nothing"
     finally:
         del store.open_totp_secret
-    await store.disable_totp("lock-uk1", now=60_000.0)
-    await store.delete_user("lock-uk1")
+    await store.disable_totp(uid, now=60_000.0)
+    await store.delete_user(uid)
 
 
 async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
@@ -585,6 +599,125 @@ async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
     )
     await store.disable_totp("lock-st1", now=60_000.0)
     await store.delete_user("lock-st1")
+
+
+#: Two enrolments whose marker this release refuses (SHA1), with different secrets so their cells
+#: differ on a keyless store too.
+_REFUSED_A = "totp1:SHA1:6:30:JBSWY3DPEHPK3PXP"
+_REFUSED_B = "totp1:SHA1:6:30:KRSXG5CTMVRXEZLU"
+
+
+async def _assert_no_verdict_falls_back_to_the_enabled_rule(store: Any, race: str) -> None:
+    """Finding 25, each trigger that needs no burst, on every backend. The verdict is judged on a
+    read taken before the write's lock, and a write that lands between the two leaves the locked
+    row holding a TOTP nobody judged. Each time the locked row holds a REFUSED enrolment, so only
+    the fallback to the plain ``totp_enabled`` rule escalates, which is what the store did before
+    BACKLOG #3422:
+
+    * ``"enabled"``: TOTP was off at the read (``totp_enable`` leaves the count standing), so
+      :func:`escalation_verdict` judged nothing;
+    * ``"replaced"``: the enrolment was removed and enrolled again with another secret, so the cell
+      the verdict holds is not the locked row's (:meth:`TotpJudgement.moved`);
+    * ``"rekeyed"``: the read saw the cell as it was under an earlier store key. Simulated by a read
+      that carries another cell, opened by a stub to a refused enrolment."""
+    import dataclasses
+
+    uid = f"lock-nv-{race}"
+    await store.create_user(
+        user_id=uid,
+        username=f"lock-nv-{race}-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+
+    async def enrol(secret: str, now: float) -> None:
+        cell = await store.set_totp_secret(uid, secret=secret, now=now)
+        assert await store.enable_totp(
+            uid, expected_secret_cell=cell, recovery_code_hashes=[], now=now
+        )
+
+    if race != "enabled":
+        await enrol(_REFUSED_A, 1.0)
+    first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+    start = first + 1.0
+    for i in range(THRESHOLD - 1):
+        await _fail(store, uid, now=start + i)
+    real_get_user = store.get_user
+    real_open = store.open_totp_secret
+
+    async def racing(user_id: str) -> Any:
+        pre = await real_get_user(user_id)
+        store.__dict__.pop("get_user", None)  # only the crossing failure's read races
+        if race == "enabled":
+            await enrol(_REFUSED_A, start)
+        elif race == "replaced":
+            assert await store.disable_totp(uid, now=start)
+            await enrol(_REFUSED_B, start)
+        else:
+            assert pre is not None and pre.row is not None
+            pre = dataclasses.replace(
+                pre, row=dataclasses.replace(pre.row, totp_secret="cell-under-an-earlier-key")
+            )
+        return pre
+
+    store.get_user = racing
+    if race == "rekeyed":
+        # Bound before the read, as the backend reads the opener when it calls the verdict.
+        store.open_totp_secret = lambda _u, _c: _REFUSED_A
+    try:
+        await _fail(store, uid, now=start + THRESHOLD - 1)
+    finally:
+        store.__dict__.pop("get_user", None)
+        store.__dict__.pop("open_totp_secret", None)
+    assert store.open_totp_secret == real_open
+    user = await store.get_user(uid)
+    assert user is not None and user.locked_until is not None and user.totp_enabled
+    assert user.locked_until - (start + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+        f"a TOTP nobody judged ({race}) skipped the sign-in lock's escalation"
+    )
+    await store.disable_totp(uid, now=99_999.0)
+    await store.delete_user(uid)
+
+
+async def _assert_a_wrong_password_below_the_threshold_opens_no_cell(store: Any) -> None:
+    """The cost bound on every backend: the escalation verdict opens the TOTP cell (a Transit
+    decrypt) only for the failure that sets a lock the verdict could shorten. A wrong password
+    below the threshold opens nothing, nor does the crossing failure of the first cycle, whose lock
+    has the base length either way; the crossing failure of a later cycle opens the cell once."""
+    uid = "lock-cost1"
+    await store.create_user(
+        user_id=uid,
+        username="lock-cost-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
+    real_open = store.open_totp_secret
+    opened: list[str] = []
+
+    def spy(user_id: str, stored: str | None) -> str | None:
+        opened.append(user_id)
+        return real_open(user_id, stored)
+
+    store.open_totp_secret = spy
+    try:
+        first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+        assert opened == [], "the first cycle opened the TOTP cell"
+        start = first + 1.0
+        for i in range(THRESHOLD - 1):
+            await _fail(store, uid, now=start + i)
+        assert opened == [], "a wrong password below the threshold opened the TOTP cell"
+        await _fail(store, uid, now=start + THRESHOLD - 1)
+        assert opened == [uid], opened
+    finally:
+        del store.open_totp_secret
+    await store.disable_totp(uid, now=99_999.0)
+    await store.delete_user(uid)
 
 
 async def _assert_refused_totp_keeps_the_fixed_sign_in_lock(store: Any) -> None:

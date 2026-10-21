@@ -458,10 +458,10 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     # BACKLOG #3422 beside wave 2: a factor reset would also remove these accounts' working passkey.
     keep_passkey = census.reset_would_remove_a_passkey
     reset_note = (
-        ". Do NOT reset the factors of these accounts with an unusable TOTP, which also hold a "
-        "discoverable passkey that still gets them past a lock, since a reset removes it; fix the "
-        "store key, or have the holder remove the authenticator app and enrol it again: "
-        + ", ".join(keep_passkey)
+        ". Do NOT reset the factors of these accounts with a TOTP that is unusable or could not "
+        "be checked, which also hold a discoverable passkey that still gets them past a lock, since "
+        "a reset removes it; fix the store key, or have the holder remove the authenticator app and "
+        "enrol it again: " + ", ".join(keep_passkey)
         if keep_passkey
         else ""
     )
