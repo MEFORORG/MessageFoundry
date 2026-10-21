@@ -2333,26 +2333,26 @@ $hookUnparseable = $false
 # The fallback is for shell-guard-dispatch.ps1, which runs this gate in-process: it has already read
 # stdin to the end and hands the payload over through [Console]::SetIn, so the byte read finds EOF
 # and returns nothing. Reading only the bytes there allowed every Bash and PowerShell call (measured:
-# tests/test_shell_guard_dispatch.py went red). A byte read that throws also falls back. On that
-# path the text is only as good as the dispatcher's own read of stdin.
+# tests/test_shell_guard_dispatch.py went red). ON THAT PATH THE TEXT IS ONLY AS GOOD AS THE
+# DISPATCHER'S OWN READ: while it reads through [Console]::In, every Bash and PowerShell call it
+# dispatches still meets both defects above. A byte read that throws is denied below, not retried
+# through [Console]::In, which would decode only what the failed read left behind.
 $hookParseError = ""
+$hookRead = $false
 try {
     if ([Console]::IsInputRedirected) {
-        try {
-            $hookText = [System.IO.StreamReader]::new(
-                [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
-        } catch {
-            # Left empty, so the [Console]::In read below runs as it always did.
-            $null = $_
-        }
+        $hookText = [System.IO.StreamReader]::new(
+            [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
     }
     if (-not $hookText) { $hookText = [Console]::In.ReadToEnd() }
+    $hookRead = $true
     $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
 } catch {
     $hookUnparseable = $true
     # A fixed class for the receipt, never the message: the message can quote the payload.
     $m = "$($_.Exception.Message)"
-    $hookParseError = if ($m -match 'different casing') { "case-duplicate-key" }
+    $hookParseError = if (-not $hookRead) { "read-failed" }
+                      elseif ($m -match 'different casing') { "case-duplicate-key" }
                       elseif ($m -match 'empty string') { "empty-key" }
                       elseif ($m -match '(?i)depth') { "depth" }
                       else { "other" }
@@ -2379,8 +2379,8 @@ if ($hookUnparseable) {
     # error's class and the input's length: enough to tell one payload shape from many, and nothing
     # the payload says.
     Write-Deny -Rule "parse" -Detail "unparseable-input class=$hookParseError length=$($hookText.Length)" -Reason @"
-BLOCKED: the worktree gate could not parse this tool call's hook input as JSON. It cannot tell
-whether the call is governed, so it does not allow it.
+BLOCKED: the worktree gate could not parse this tool call's hook input as JSON, or could not read
+it. It cannot tell whether the call is governed, so it does not allow it.
 
 PowerShell's JSON parser refuses at least these shapes in a tool input:
   * two keys that differ only by case, such as subagent_type and SUBAGENT_TYPE;

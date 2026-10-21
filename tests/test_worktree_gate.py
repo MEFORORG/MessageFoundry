@@ -964,47 +964,75 @@ def test_unparseable_input_is_allowed_when_the_gate_is_off(
 #: [Console]::In fallback as the only reader: the gate as it read its input before.
 _BYTE_READ_GUARD = "if ([Console]::IsInputRedirected) {"
 
+#: Named by code point, so no invisible character sits in this file. Each ends, in UTF-8, in a byte
+#: that cp932 reads as a lead byte, except E_ACUTE (C3 A9), which cp932 reads as two single bytes.
+E_ACUTE = chr(0xE9)
+A_ACUTE = chr(0xC1)  # C3 81
+ZWSP = chr(0x200B)  # E2 80 8B
+
 _windows_only = pytest.mark.skipif(
     sys.platform != "win32", reason="console code pages are a Windows concept"
 )
-_console_pages = pytest.mark.parametrize("codepage", [437, 932])
+
+
+def _rebuilt_gate(dst: Path, old: str, new: str, why: str) -> Path:
+    """The shipped gate with ``old`` replaced by ``new``, for a control. The rewrite is ASSERTED to
+    have happened: a pattern that silently matched nothing would produce a control byte-identical to
+    the gate under test, and the pair would then agree for the wrong reason."""
+    src = GATE.read_text(encoding="utf-8")
+    assert src.count(old) == 1, why
+    dst.write_text(src.replace(old, new), encoding="utf-8")
+    return dst
 
 
 @pytest.fixture
 def console_reader_gate(tmp_path: Path) -> Path:
-    """The gate reading through [Console]::In alone, rebuilt from the shipped file. The rewrite is
-    asserted, so a guard that moved cannot leave this control identical to the gate under test."""
-    src = GATE.read_text(encoding="utf-8")
-    assert src.count(_BYTE_READ_GUARD) == 1, "the byte read's guard moved; fix _BYTE_READ_GUARD"
-    dst = tmp_path / "worktree_gate_console_reader.ps1"
-    dst.write_text(src.replace(_BYTE_READ_GUARD, "if ($false) {"), encoding="utf-8")
-    return dst
+    """The gate reading through [Console]::In alone: the gate as it read its input before."""
+    return _rebuilt_gate(
+        tmp_path / "worktree_gate_console_reader.ps1",
+        _BYTE_READ_GUARD,
+        "if ($false) {",
+        "the byte read's guard moved; fix _BYTE_READ_GUARD rather than deleting the control",
+    )
 
 
 def _run_gate_in_console(
     gate: Path, raw: bytes, repos_file: Path, codepage: int
 ) -> dict[str, Any] | None:
     """Run ``gate`` on raw stdin bytes in a console of its own set to ``codepage``. Returns the deny
-    object, or None for allow, as ``run_gate`` does. The console is private (CREATE_NO_WINDOW),
-    because chcp sets the page of a whole console and pytest's is shared with its xdist siblings;
-    tests/test_coord_alloc_floor.py has the incident. A bare chcp in that console reports its page
-    first, so a launch that never reached the page fails here rather than passing for the wrong
-    reason."""
+    object, or None for allow, as ``run_gate`` does.
+
+    The console is private (CREATE_NO_WINDOW), because chcp sets the page of a whole console and
+    pytest's is shared with its xdist siblings; tests/test_coord_alloc_floor.py has the incident. A
+    bare chcp in that console reports its page first: a host that cannot take the page skips, and a
+    launch that never reached it cannot pass for the wrong reason. A launch that never returns is
+    labelled as run_gate labels it (BACKLOG #1304), after its whole process tree is killed, since
+    cmd sits between this process and pwsh."""
     if sys.platform != "win32":  # the callers' skipif already skips; this line tells mypy
         pytest.skip("Windows only")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     # shell=True for cmd's own quoting; the list form hands pwsh the quotes as part of the filename.
     with single_spawn():
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             f"chcp {codepage} >nul && chcp"
             f' && pwsh -NoProfile -NonInteractive -File "{gate}" -ReposFile "{repos_file}"',
             shell=True,
-            input=raw,
-            capture_output=True,
-            timeout=GATE_TIMEOUT_S,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
+        try:
+            stdout, stderr = proc.communicate(raw, timeout=GATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            proc.communicate()
+            raise AssertionError(
+                f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304). A process launch "
+                "that never returned, NOT evidence that the gate's behaviour changed; run_gate's "
+                f"docstring says what to do. LAUNCHED {_pwsh_identity()}"
+            ) from exc
     after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
     if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
@@ -1017,10 +1045,11 @@ def _run_gate_in_console(
                 else f"putting it back FAILED, {ctypes.get_last_error()}"
             )
         )
-    out = proc.stdout.decode(f"cp{codepage}", errors="replace")
-    assert proc.returncode == 0, out + proc.stderr.decode(f"cp{codepage}", errors="replace")
+    out = stdout.decode(f"cp{codepage}", errors="replace")
     page, _, decision = out.partition("\n")
-    assert page.strip().endswith(f" {codepage}"), f"the console did not take cp{codepage}: {out!r}"
+    if not page.strip().endswith(f" {codepage}"):
+        pytest.skip(f"this host's console did not take cp{codepage}: {out!r}")
+    assert proc.returncode == 0, out + stderr.decode(f"cp{codepage}", errors="replace")
     return json.loads(decision) if decision.strip() else None
 
 
@@ -1029,44 +1058,67 @@ def _raw(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-@_windows_only
-@_console_pages
-@pytest.mark.parametrize("name", ["Repo-\u00e9", "Repo-\u200b"])
-def test_a_non_ascii_primary_is_governed_whatever_the_console_code_page(
-    tmp_path: Path, console_reader_gate: Path, codepage: int, name: str
-) -> None:
-    """Read through [Console]::In, the path arrived mangled under cp437 (U+00E9 as two characters),
-    never matched its allowlist entry, and the write into the primary was allowed. The control is
-    that console reader: it allows the write under cp437. Under cp932 it denies too, but for the
-    wrong reason (the payload stops parsing), so only the gate under test is asserted there."""
-    primary = tmp_path / name
+def _governed_non_ascii(tmp_path: Path, char: str) -> tuple[Path, bytes]:
+    """An allowlist naming a primary with ``char`` in its name, and a write into that primary."""
+    primary = tmp_path / f"Repo-{char}"
     allowlist = tmp_path / "repos.txt"
     allowlist.write_text(f"{primary}\n", encoding="utf-8")
-    raw = _raw(edit(primary / "x.py", primary))
-    reason = assert_denied(_run_gate_in_console(GATE, raw, allowlist, codepage))
-    assert "could not parse" not in reason
-    if codepage == 437:
-        assert _run_gate_in_console(console_reader_gate, raw, allowlist, codepage) is None, (
+    return allowlist, _raw(edit(primary / "x.py", primary))
+
+
+@pytest.mark.parametrize("char", [E_ACUTE, ZWSP])
+def test_a_non_ascii_primary_is_governed_on_raw_utf8_input(tmp_path: Path, char: str) -> None:
+    """On every host, whatever its console: raw UTF-8 bytes on stdin, not json.dumps escapes. The
+    console-page cases below are the ones that tell the old reader from the new one."""
+    allowlist, raw = _governed_non_ascii(tmp_path, char)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GATE), "-ReposFile", str(allowlist)],
+        input=raw,
+        capture_output=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip(), f"expected a DENY, got allow (stderr: {proc.stderr!r})"
+    assert "could not parse" not in assert_denied(json.loads(proc.stdout))
+
+
+@_windows_only
+@pytest.mark.parametrize("codepage", [437, 932])
+@pytest.mark.parametrize("char", [E_ACUTE, ZWSP])
+def test_a_non_ascii_primary_is_governed_whatever_the_console_code_page(
+    tmp_path: Path, console_reader_gate: Path, codepage: int, char: str
+) -> None:
+    """Read through [Console]::In, the path arrived mangled (cp437 reads U+00E9 as two characters,
+    cp932 as two half-width katakana), never matched its allowlist entry, and the write into the
+    primary was allowed. The control is that console reader, and it allows in every case but one:
+    under cp932, U+200B swallows the next `\\`, so the control denies, for the wrong reason."""
+    allowlist, raw = _governed_non_ascii(tmp_path, char)
+    assert "could not parse" not in assert_denied(
+        _run_gate_in_console(GATE, raw, allowlist, codepage)
+    )
+    control = _run_gate_in_console(console_reader_gate, raw, allowlist, codepage)
+    if codepage == 932 and char == ZWSP:
+        assert "could not parse" in assert_denied(control)
+    else:
+        assert control is None, (
             "the console-reader control denied, so this case does not discriminate"
         )
 
 
 @_windows_only
-@_console_pages
-@pytest.mark.parametrize("char", ["\u00c1", "\u200b"])
+@pytest.mark.parametrize("char", [A_ACUTE, ZWSP])
 def test_a_double_byte_code_page_does_not_wedge_an_ungoverned_call(
-    tmp_path: Path, repos_file: Path, console_reader_gate: Path, codepage: int, char: str
+    tmp_path: Path, repos_file: Path, console_reader_gate: Path, char: str
 ) -> None:
     """Each character's last UTF-8 byte is a cp932 lead byte, so a `\\` after it was swallowed, the
     payload stopped parsing, and the parse deny refused a write nowhere near a governed root. That
-    would wedge every such call in every session. The control is the console reader, which denies
-    under cp932; under cp437 it parses, so there only the gate under test is asserted."""
+    would wedge every such call in every session. Under cp437 the old reader parsed these too, so
+    only cp932 discriminates."""
     other = tmp_path / f"Other{char}" / "x.py"
     raw = _raw(edit(other, other.parent))
-    assert _run_gate_in_console(GATE, raw, repos_file, codepage) is None
-    if codepage == 932:
-        control = _run_gate_in_console(console_reader_gate, raw, repos_file, codepage)
-        assert "could not parse" in assert_denied(control)
+    assert _run_gate_in_console(GATE, raw, repos_file, 932) is None
+    control = _run_gate_in_console(console_reader_gate, raw, repos_file, 932)
+    assert "could not parse" in assert_denied(control)
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
@@ -1249,14 +1301,13 @@ def prefix_gate(tmp_path: Path) -> Path:
     control byte-identical to the gate under test, and the pair would then agree for the wrong reason
     -- which is the failure mode a control exists to rule out.
     """
-    src = GATE.read_text(encoding="utf-8")
-    assert src.count(CLASS_B_ASSIGNMENT) == 1, (
+    return _rebuilt_gate(
+        tmp_path / "worktree_gate_prefix.ps1",
+        CLASS_B_ASSIGNMENT,
+        "$hijackHeadMoveVerbs = @()",
         "the class B verb assignment moved or was reformatted, so this control no longer rebuilds "
-        "the pre-#1359 gate. Fix CLASS_B_ASSIGNMENT rather than deleting the control."
+        "the pre-#1359 gate. Fix CLASS_B_ASSIGNMENT rather than deleting the control.",
     )
-    dst = tmp_path / "worktree_gate_prefix.ps1"
-    dst.write_text(src.replace(CLASS_B_ASSIGNMENT, "$hijackHeadMoveVerbs = @()"), encoding="utf-8")
-    return dst
 
 
 @pytest.mark.parametrize(("verb", "args"), CLASS_B_VERBS)
