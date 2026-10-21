@@ -2862,8 +2862,22 @@ What to do instead:
 # ---------------------------------------------------------------------------------------------------
 # Rule 2 -- dispatching a fan-out FROM the primary. Checked first: it is the cheapest place to stop a
 # workflow that would otherwise burn 40 minutes and then report success while having written nothing.
+#
+# EXEMPT: a Task/Agent call whose tool_input.subagent_type is EXACTLY "web-fetch" or "claude-code-guide"
+# (case-sensitive, and only when the value is a string). Owner authorization 2026-10-21, AFK-autonomy plan
+# section 6.1. Those two built-in types carry no shell and no write tool (WebFetch; Glob/Grep/Read/
+# WebFetch/WebSearch), so inheriting the primary's cwd cannot build or swap anything there, which is the
+# harm this rule exists for. Everything else stays denied: Explore and Plan have Bash, and a shell redirect
+# evades rules 1 and 3; general-purpose, fork, a missing or non-string type, any other spelling of the two
+# names, and every Workflow. RESIDUAL: the match is on the NAME, not on the tool list, so a project- or
+# user-scope agent defined under one of these two names, with a shell, would pass this rule too.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("Task", "Agent", "Workflow")) {
+    $shellLessTypes = @("web-fetch", "claude-code-guide")
+    $subagentType = $hook.tool_input.subagent_type
+    if ($tool -ne "Workflow" -and $subagentType -is [string] -and $subagentType -cin $shellLessTypes) {
+        exit 0
+    }
     $root = Test-Governed $cwd
     if ($root) {
         $display = Get-SafeForMessage $root.Display
@@ -2877,7 +2891,8 @@ Create a worktree first, then dispatch from it:
     pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
 
 That prints a worktree path. Ask the user to start the session there (or continue there yourself), then
-re-dispatch. If you were only going to READ, do it directly -- reads are never blocked.
+re-dispatch. If you were only going to READ, do it directly -- reads are never blocked. The only
+subagent types this rule lets through from here are $($shellLessTypes -join ' and '), which have no shell.
 "@
     }
     exit 0
