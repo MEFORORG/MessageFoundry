@@ -684,21 +684,22 @@ never with mail. The evidence is probe PR
   ruling 2026-10-21),** including one handed to the owner or written into a file. A `hostname;`
   prefix alone does not count: it shows the mistake only after the command has run. Read the host
   from `[Environment]::MachineName`, not `$env:COMPUTERNAME`, which is inherited and can be
-  overwritten. A pasted command puts its whole body inside an if/else that runs nothing on another
-  host. It never uses `exit`, because pasted, that closes the owner's PowerShell window. Nor does it
-  use `return`, which is easy to get wrong in a pasted line.
+  overwritten. On Windows, `<HOST>` is the NetBIOS name, at most 15 characters, as
+  `[Environment]::MachineName` prints it on that machine. No form uses `exit`, which closes the
+  owner's PowerShell window when the text runs there. Nor `return`, which is easy to get wrong in a
+  pasted line. A pasted command puts its whole body inside
+  an if/else that runs nothing on another host:
 
       if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { ... }
 
   A machine-specific script checks its own host at the top, right after any `param()` block, or
   inside `begin {}` if it has one. Keep `param()` first. Wrapped inside a check, it is not parsed as
-  one, so the script runs with its defaults and drops the caller's arguments. The ban on `exit` is
-  for text run in the owner's window, such as a paste, `iex` or Run Selection. A script run as a
-  file ends its check with `exit 1`, which stops it even when the caller silences errors and
-  `throw` is skipped. The `MachineName` read and this script form are Manager decisions of
+  one, so the script runs with its defaults and drops the caller's arguments. The scoped `Stop`
+  makes the throw hold even when the caller silences errors, inline or in a dot-sourced helper, and
+  a caller can still catch it. The `MachineName` read and this script form are Manager decisions of
   2026-10-21:
 
-      if ([Environment]::MachineName -ne '<HOST>') { throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran"; exit 1 }
+      if ([Environment]::MachineName -ne '<HOST>') { & { $ErrorActionPreference = 'Stop'; throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } }
 
 ---
 
