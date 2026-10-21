@@ -46,6 +46,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from messagefoundry import tls_sigalgs
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.apiclient import client as apiclient
 from messagefoundry.auth.oidc_http import build_idp_opener
@@ -842,7 +843,7 @@ def test_a_refused_engine_list_at_settings_load_is_a_validation_error(
     is made to refuse. Settings load must report it as a ValueError, not crash."""
 
     def refuse(ctx: ssl.SSLContext) -> bool:
-        raise tls_policy._NarrowerRefused(
+        raise tls_sigalgs.NarrowerRefused(
             "this OpenSSL refused the engine's approved TLS 1.3 suites"
         )
 

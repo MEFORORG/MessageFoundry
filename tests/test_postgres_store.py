@@ -38,7 +38,13 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.content_search import make_spec
-from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
+    cell_aad,
+    cipher_meta_key,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
@@ -93,6 +99,7 @@ _TABLES = (
     "session_lineage",  # vault BACKLOG #3028 (no FK): a link left behind would lead a later test's
     #                     supersession into a session it never retired
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+    "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",
@@ -5197,6 +5204,26 @@ async def test_cipher_invocations_are_keyed_per_key_id(store) -> None:
     assert await store.cipher_invocations(b) == 3
 
 
+async def test_a_pre_tag_cipher_meta_row_is_folded_once(store) -> None:
+    # BACKLOG #3421: a row keyed on the bare id, as a release before scheme tags wrote it, keeps its
+    # count. The CTE's DELETE row lock makes concurrent adds fold it exactly once.
+    key_id = uuid4().hex[:16]
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES ($1, 100, 0)", key_id
+        )
+    assert await store.cipher_invocations(key_id) == 100
+    await asyncio.gather(*(store.add_cipher_invocations(key_id, 1) for _ in range(10)))
+    assert await store.cipher_invocations(key_id) == 110
+    async with store._pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT key_id FROM cipher_meta WHERE key_id IN ($1, $2)",
+            key_id,
+            cipher_meta_key(key_id),
+        )
+    assert [r["key_id"] for r in rows] == [cipher_meta_key(key_id)]
+
+
 async def test_checkpoint_is_a_noop_without_a_bounded_cipher(store) -> None:
     # The gated fixtures open with the default (identity) cipher, so there is no birthday budget to
     # bound and the checkpoint must return None rather than writing a row.
@@ -5251,7 +5278,9 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
             async with cleanup._pool.acquire() as conn:
                 for table in ("message_events", "queue", "response", "messages"):
                     await conn.execute(f"DELETE FROM {table}")  # FK order: children first
-                await conn.execute("DELETE FROM cipher_meta WHERE key_id = $1", key_id)
+                await conn.execute(
+                    "DELETE FROM cipher_meta WHERE key_id = $1", cipher_meta_key(key_id)
+                )
         finally:
             await cleanup.close()
 
@@ -5747,7 +5776,8 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
             for c in ciphers:
                 if isinstance(c, AesGcmCipher):
                     await conn.execute(
-                        "DELETE FROM cipher_meta WHERE key_id = $1", c.invocation_key_id
+                        "DELETE FROM cipher_meta WHERE key_id = $1",
+                        cipher_meta_key(c.invocation_key_id),
                     )
 
 
@@ -5819,3 +5849,17 @@ async def test_the_config_changed_reason_survives_a_long_node_pg(store) -> None:
     )
 
     await check_config_changed_reason_survives_a_long_node(store)
+
+
+async def test_processed_files_key_forms(store) -> None:
+    # BACKLOG #3424: the scheme-tagged dedup key and the bare pre-tag one, at SQLite parity.
+    from tests.test_processed_files_ledger import check_processed_files_key_forms
+
+    await check_processed_files_key_forms(store)
+
+
+async def test_webauthn_rehash_contract(store) -> None:
+    # BACKLOG #3423: the tagged credential-id hash fits VARCHAR(128) and a passkey moves to it.
+    from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
+
+    await _assert_webauthn_rehash_contract(store)

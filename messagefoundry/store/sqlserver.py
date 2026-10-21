@@ -116,6 +116,7 @@ from messagefoundry.store.crypto import (
     allows_unmarked,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
@@ -885,6 +886,10 @@ _MSSQL_WEBAUTHN_DELETE_ONE: Final = (
 )
 _MSSQL_WEBAUTHN_DELETE_ALL: Final = (
     "DELETE FROM webauthn_credentials OUTPUT deleted.credential_id_hash WHERE user_id=?"
+)
+_MSSQL_WEBAUTHN_REHASH: Final = (
+    "UPDATE webauthn_credentials SET credential_id_hash=? OUTPUT inserted.credential_id_hash"
+    " WHERE user_id=? AND credential_id_hash=?"
 )
 
 
@@ -2490,12 +2495,29 @@ _SCHEMA: list[str] = [
     # sign_count is BIGINT (WebAuthn uint32 overflows signed INT). label is capped at 100 so the
     # UNIQUE (user_id, label) index key stays bounded (64+100 chars).
     """IF OBJECT_ID('webauthn_credentials','U') IS NULL CREATE TABLE webauthn_credentials (
-        credential_id_hash NVARCHAR(64) NOT NULL PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
+        credential_id_hash NVARCHAR(128) NOT NULL
+            CONSTRAINT pk_webauthn_credentials PRIMARY KEY, credential_id NVARCHAR(MAX) NOT NULL,
         user_id NVARCHAR(64) NOT NULL, rp_id NVARCHAR(256) NOT NULL,
         public_key NVARCHAR(MAX) NOT NULL, sign_count BIGINT NOT NULL,
         transports NVARCHAR(MAX) NULL, device_type NVARCHAR(32) NOT NULL,
         backed_up BIT NOT NULL DEFAULT 0, label NVARCHAR(100) NOT NULL,
         aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL)""",
+    # BACKLOG #3423: widen a hash column created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128)
+    # to hold the "wc1:" scheme tag. A table created before this change carries a SYSTEM-NAMED
+    # primary key, which SQL Server will not let a column under it be altered, so the key is looked
+    # up, dropped and rebuilt under a fixed name. EXEC defers each parse, as for processed_files.
+    """IF COL_LENGTH('webauthn_credentials','credential_id_hash') = 128
+    BEGIN
+        DECLARE @pk sysname = (SELECT name FROM sys.key_constraints
+            WHERE parent_object_id = OBJECT_ID('webauthn_credentials') AND type = 'PK');
+        DECLARE @drop nvarchar(400) =
+            N'ALTER TABLE webauthn_credentials DROP CONSTRAINT ' + QUOTENAME(@pk);
+        EXEC(@drop);
+        EXEC(N'ALTER TABLE webauthn_credentials
+               ALTER COLUMN credential_id_hash NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE webauthn_credentials ADD CONSTRAINT pk_webauthn_credentials
+               PRIMARY KEY (credential_id_hash)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ix_webauthn_credentials_user','IndexID') IS NULL
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
@@ -2579,12 +2601,24 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (NOT ciphered). file_key = sha256 of the file identity — a DERIVED id, NEVER a cleartext
+    # body/PHI (NOT ciphered). file_key = a scheme tag + ":" + sha256 of the file identity (BACKLOG
+    # #3424: NVARCHAR(128) holds the tag; a bare pre-tag digest still reads) — a DERIVED id, NEVER a cleartext
     # filename (which can embed an MRN) and never logged at INFO+; channel_id (the inbound connection
     # name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit success (file = unit).
     """IF OBJECT_ID('processed_files','U') IS NULL CREATE TABLE processed_files (
-        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(64) NOT NULL, processed_at FLOAT NOT NULL,
+        channel_id NVARCHAR(256) NOT NULL, file_key NVARCHAR(128) NOT NULL, processed_at FLOAT NOT NULL,
         CONSTRAINT pk_processed_files PRIMARY KEY (channel_id, file_key))""",
+    # BACKLOG #3424: widen a table created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128) to hold
+    # the "fk1:" tag. The guarded CREATE above never reaches an existing table, and SQL Server will
+    # not ALTER a primary-key column in place, so the key is dropped and rebuilt around it. EXEC
+    # defers each parse, the same way as the users backfills, so the batch compiles on any shape.
+    """IF COL_LENGTH('processed_files','file_key') = 128
+    BEGIN
+        EXEC(N'ALTER TABLE processed_files DROP CONSTRAINT pk_processed_files');
+        EXEC(N'ALTER TABLE processed_files ALTER COLUMN file_key NVARCHAR(128) NOT NULL');
+        EXEC(N'ALTER TABLE processed_files ADD CONSTRAINT pk_processed_files
+               PRIMARY KEY (channel_id, file_key)');
+    END""",
     """IF INDEXPROPERTY(OBJECT_ID('processed_files'),'ix_processed_files_channel','IndexID') IS NULL
         CREATE INDEX ix_processed_files_channel ON processed_files(channel_id, processed_at)""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
@@ -2813,9 +2847,10 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
 
     WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
-    ``add_cipher_invocations`` needs FOUR sequential executor dispatches -- ``cursor()``, ``execute()``,
-    ``fetchone()``, ``commit()`` -- and the pool is opened ``autocommit=False``, so the row locks taken by
-    the MERGE in dispatch 2 are released only by the commit in dispatch 4. Once as many tasks as there
+    ``add_cipher_invocations`` needs SIX sequential executor dispatches -- ``cursor()``, then
+    ``execute()`` and ``fetchone()`` for the pre-tag fold's DELETE and again for the MERGE (BACKLOG
+    #3421), then ``commit()`` -- and the pool is opened ``autocommit=False``, so the row locks taken
+    from dispatch 2 on are released only by the commit in dispatch 6. Once as many tasks as there
     are threads are parked inside a blocked ``execute``, the lock holder's own ``commit`` sits behind
     them in the executor's FIFO queue with no worker left to run it. Nothing progresses until an ODBC
     query timeout or the pool acquire bound breaks the tie, which surfaces as HYT00 or StoreAcquireTimeout
@@ -7165,6 +7200,14 @@ class SqlServerStore:
         row = await self._fetchone(
             "SELECT 1 AS present FROM processed_files WHERE channel_id=? AND file_key=?",
             (channel_id, file_key),
+        )
+        return row is not None
+
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._fetchone(
+            "SELECT TOP 1 1 AS present FROM processed_files"
+            " WHERE channel_id=? AND file_key NOT LIKE '%:%'",
+            (channel_id,),
         )
         return row is not None
 
@@ -12289,13 +12332,25 @@ class SqlServerStore:
         contended server; both roll the statement back with NO committed effect, so we retry (bounded,
         with backoff). ``merged`` is the no-double-count guard: it is set the instant the MERGE returns
         its OUTPUT — after that a failure could be a completed-but-unacknowledged COMMIT, so we NEVER
-        retry then (a re-issue would double-count the security-critical GCM invocation bound)."""
+        retry then (a re-issue would double-count the security-critical GCM invocation bound).
+
+        The row is keyed on :func:`cipher_meta_key`. A pre-tag row, keyed on the bare ``key_id``, is
+        deleted in the same transaction and its count added to the MERGE (BACKLOG #3421). A
+        concurrent fold waits on the DELETE's row lock and then finds no row, so it is added once; a
+        rolled-back attempt restores the row for the retry."""
         now = time.time()
+        row_id = cipher_meta_key(key_id)
         for attempt in range(_CIPHER_MERGE_ATTEMPTS):
             merged = False
             retry = False
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
+                    await cur.execute(
+                        "DELETE FROM cipher_meta OUTPUT DELETED.invocations WHERE key_id = ?",
+                        (key_id,),
+                    )
+                    legacy = await cur.fetchone()
+                    folded = int(legacy[0]) if legacy is not None else 0
                     await cur.execute(
                         "MERGE cipher_meta WITH (HOLDLOCK) AS t"
                         " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
@@ -12306,11 +12361,11 @@ class SqlServerStore:
                         " INSERT (key_id, invocations, updated_at)"
                         " VALUES (s.key_id, s.invocations, s.updated_at)"
                         " OUTPUT INSERTED.invocations;",
-                        (key_id, int(count), now),
+                        (row_id, int(count) + folded, now),
                     )
                     row = await cur.fetchone()
                     merged = True  # MERGE ran + OUTPUT the total; past here a failure is a COMMIT
-                    total = int(row[0]) if row is not None else int(count)
+                    total = int(row[0]) if row is not None else int(count) + folded
                     await self._commit(conn)
                     return total
                 except Exception as exc:
@@ -12463,11 +12518,13 @@ class SqlServerStore:
         return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
         row = await self._fetchone(
-            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+            "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN (?, ?)",
+            (cipher_meta_key(key_id), key_id),
         )
-        return int(row["invocations"]) if row is not None else 0
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
@@ -13460,6 +13517,14 @@ class SqlServerStore:
         count is read from ``OUTPUT`` (BACKLOG #2283)."""
         count = await self._write_passkeys_txn(
             user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+        )
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423); store.py's
+        ``MessageStore.rehash_webauthn_credential`` states the contract. Counted from ``OUTPUT``."""
+        count = await self._write_passkeys_txn(
+            user_id, _MSSQL_WEBAUTHN_REHASH, (new_hash, user_id, old_hash), counted=True
         )
         return count > 0
 

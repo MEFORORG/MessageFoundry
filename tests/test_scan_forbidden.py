@@ -17,6 +17,8 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import re
 from pathlib import Path
 
@@ -625,3 +627,259 @@ def test_no_token_source_reports_mode_none_rather_than_a_clean_zero(sf, monkeypa
     """ "loaded nothing" and "loaded a real list that happens to be small" must not render alike."""
     monkeypatch.setattr(sf, "TOKENS_PRESENT", False)
     assert "mode=none" in sf._detector_count_report({"names": 0})
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #3364 -- the same record content in a PULL REQUEST BODY, where it is written as prose.
+#
+# THE SAME TWO CONTROLS AS #1337 ABOVE, AND THE SAME RULE THAT NEITHER GOES WITHOUT THE OTHER: each
+# owner-ruled kind (verdict, gap, code map) has fixtures that must fire, and ordinary PR text must pass.
+#
+# THE IDENTIFIERS ARE DELIBERATELY ONES NO REQUIREMENT CARRIES. A fixture reading "<id> stays <verdict>"
+# with a real identifier would itself publish a verdict-shaped sentence, so these use a real chapter and
+# the section number nine with a requirement number in the nineties: the detector's shape, and nobody's
+# assessment. The paths are invented for the same reason. The identifier and the verdict also stay
+# separate literals joined at runtime, as above, so this source carries no pair for the tree scan.
+# --------------------------------------------------------------------------------------------------
+
+_REQ = "16.9.97"
+_REQ_B = "9.9.98"
+_PARTIAL, _PASS, _FAIL, _NA = "partial", "pass", "fail", "na"
+
+_PR_VERDICT_MUST_FIRE = [
+    f"After this merges, {_REQ} stays {_PARTIAL} until the follow-up lands.",
+    f"ASVS {_REQ} stays **`{_FAIL}`** -- none of this changes the ceiling.",
+    f"The vault re-score held {_REQ} at {_PARTIAL} on one ground.",
+    f"The re-read of {_REQ} held the cell at {_PARTIAL} on four sentences.",
+    f"It does not move the ASVS {_REQ} cell to {_PASS}, and nothing here claims it does.",
+    f"A single-limb requirement gets `{_NA}` ({_REQ}), while a multi-limb one cannot.",
+    f"| #1 | {_REQ} | Stay **{_PARTIAL}**. The row's basis is replaced. |",
+    f"| {_REQ} | the outbound limb | {_PASS} |",
+    f"{_REQ}{': '}{_FAIL}",
+    f"Assessed as ASVS {_REQ} (`{_PARTIAL}`, the control covers only bound accounts).",
+    f"ASVS {_REQ} \u2192 {_PASS}",
+    f"ASVS {_REQ} remains at {_PARTIAL} for now.",
+    f"A vault re-read moved {_REQ} from {_PASS} to {_PARTIAL} on item 1.",
+    # The tree scan's tight pair, behind words the version filter would otherwise read as a lead.
+    f"Applies to {_REQ}{': '}{_PARTIAL}",
+    f"The follow-up {_REQ}{' = '}{_FAIL}",
+    # Markdown around the identifier or the verdict: emphasis, a link, a wrapped quote, an en dash.
+    f"ASVS _{_REQ}_ stays __{_PARTIAL}__.",
+    f"[ASVS {_REQ}](https://example.org/asvs/v16) stays {_PARTIAL}.",
+    f"> The vault re-read held ASVS {_REQ}\n> at {_PARTIAL} on review.",
+    f"> ASVS {_REQ} stays\n> {_PARTIAL} until the re-read.",
+    f"ASVS {_REQ} \u2013 {_PARTIAL}",
+    # A record verb binds even where the word before the identifier reads as a version lead.
+    f"Applies to {_REQ} which stays {_PARTIAL}.",
+    f"Cross-cutting {_REQ} stays {_PARTIAL}.",
+    f"Downgrades ASVS {_REQ} to {_PARTIAL}.",
+    f"ASVS {_REQ} now passes.",
+]
+_PR_GAP_MUST_FIRE = [
+    # Sentence-final: the identifier's own full stop must not hide it.
+    f"The shortfall is tracked under ASVS {_REQ}.",
+    f"BACKLOG #1, one limb: the unvalidated input residual (ASVS {_REQ}).",
+    f"It is the gap that keeps ASVS {_REQ} open on the record.",
+    f"## #1 (ASVS {_REQ}) -- verified, and deliberately not built",
+]
+_PR_MAP_MUST_FIRE = [
+    f"`pkg/example_module.py` states the ASVS {_REQ} guarantee for every caller.",
+    f"| `tests/test_example_widget.py` | {_REQ} | extracts one shared helper |",
+    f"Vault cell {_REQ} anchors on the `pkg/example.py:12` citation.",
+    f"ASVS {_REQ} is enforced at https://github.com/example/repo/blob/main/pkg/example_guard.py#L40",
+]
+
+#: Ordinary pull request text with NO requirement number at all -- the Lander's negative control. It
+#: carries every word the detector keys on (verdict words, gap words, code paths, versions) so a pass
+#: here means the binding held, not that the words were absent.
+_PR_CLEAN_BODY = "\n".join(
+    [
+        "## What this changes",
+        "",
+        "Adds a bounded retry to the outbound sender in `pkg/example_sender.py`, so a refused",
+        "connection is retried before the row dead-letters. The gap between attempts doubles.",
+        "",
+        "- Tests: 412 passed, 3 skipped; the new case would fail without the fix.",
+        "- Python 3.14.6, OpenSSL 3.5.7; bumps lxml from 6.1.1 to 6.1.2 in passing.",
+        "- `ruff==0.15.22`, js-yaml 4.3.1 in `ide/package-lock.json`, ldap3 2.9.1 in core/connection.py.",
+        "- It requires 3.14.6 to pass the collection step; no residual risk is introduced.",
+        "",
+        "| check | result |",
+        "| --- | --- |",
+        "| pytest | pass |",
+        "| mypy | fail before, pass after |",
+    ]
+)
+#: Text where a dotted triple is a version or an HL7 field, beside the words a record line would use.
+_PR_VERSION_MUST_STAY_QUIET = [
+    "Bumps lxml from 6.1.1 to 6.1.2 in `requirements.lock`.",
+    "Local CPython 3.14.6, OpenSSL 3.5.7: `tests/test_example_tls.py` gave 8 passed and 1 skipped.",
+    # A bump whose OLD side follows punctuation, so only the "<version> to <version>" tail marks it.
+    "One lockfile entry, 1.2.1 to 1.2.2, read by `pkg/example_client.py`.",
+    "| `gitleaks` | `v8.1.4` | `security.yml` `VER=8.1.4` | same |",
+    "E    MSH|^~\\&|SAPP|FAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1  at pkg/example_parser.py:40",
+    "the suite will pass; see 1.2.2 later for the rationale",
+    "requires 3.14.6 to pass the collection step",
+    # An id-SHAPED version before a bare "to <verdict>": only the move-verb guard keeps this quiet.
+    "requires 6.1.1 to pass the collection step",
+    "Parses a 2.5.1 ADT^A01 in tests/test_example_parse.py without the strict validator.",
+    "This uncovered a bug in 1.2.3 handling, now fixed.",
+    "Parses HL7 V2.5.1 ADT messages in pkg/example_peek.py.",
+    "Adds HL7 V2.3.1 support; the gap in segment handling is closed.",
+    f"- Python 3.14.6{': '}{_PASS}",
+    "Per RFC 6455 section 5.5.1, ping handling lives in pkg/example_ws.py.",
+    "<p>Changes in 7.1.2: fix</p><p>the residual leak in pkg/example_linux.py</p>",
+    # A heading is its own unit, so the next paragraph's identifier is not beside the heading's path.
+    f"## Changes to pkg/example_app.py\nContext: ASVS {_REQ} is cited in the brief.",
+    # The failure MODE of a control is not a verdict.
+    f"ASVS {_REQ} is now fail closed on a bad input.",
+]
+
+
+def _pr_kinds(sf, body: str) -> set[str]:
+    hits = sf.scan_pr_body(body)
+    return {kind for kind, reason in sf.PR_BODY_REASONS.items() if any(reason in h for h in hits)}
+
+
+@pytest.mark.parametrize("line", _PR_VERDICT_MUST_FIRE)
+def test_a_pr_body_stating_a_requirement_verdict_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, verdicts: prose binding ("stays", "held at", "cell to") as well as punctuation."""
+    assert "verdict" in _pr_kinds(sf, f"Context above.\n\n{line}\n\nContext below."), line
+
+
+@pytest.mark.parametrize("line", _PR_GAP_MUST_FIRE)
+def test_a_pr_body_stating_a_requirement_gap_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, gaps: a requirement beside a gap, residual or not-built claim."""
+    assert "gap" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize("line", _PR_MAP_MUST_FIRE)
+def test_a_pr_body_mapping_a_requirement_to_code_is_flagged(sf, line: str) -> None:
+    """CONTROL 1, code maps: a requirement beside the source path that implements it."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+def test_a_clean_pr_body_with_no_requirement_number_passes(sf) -> None:
+    """CONTROL 2. Without it, a detector that flags every body looks identical to a correct one."""
+    assert sf.scan_pr_body(_PR_CLEAN_BODY) == []
+
+
+@pytest.mark.parametrize("line", _PR_VERSION_MUST_STAY_QUIET)
+def test_a_version_beside_verdict_or_path_words_is_not_record_content(sf, line: str) -> None:
+    """Versions next to test counts and code paths were the dominant false positive when measured."""
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_bare_requirement_number_is_not_flagged_while_that_is_unruled(sf) -> None:
+    """Whether a bare number with no verdict, gap or code path beside it should pass is an OPEN owner
+    decision. Until it is ruled the detector must not decide it, so this pins the pass. If the owner
+    rules the other way, this test is the one to change, deliberately."""
+    body = (
+        f"BACKLOG #1 (ASVS {_REQ}). Adds an input bound to the intake path.\n\nSee also {_REQ_B}."
+    )
+    assert sf.scan_pr_body(body) == []
+
+
+def test_a_hard_wrapped_sentence_is_read_whole_and_reported_at_the_identifier_line(sf) -> None:
+    body = f"Intro line.\n\nThe control for ASVS {_REQ} is the one\nthat `pkg/example_module.py` enforces."
+    hits = sf.scan_pr_body(body)
+    assert hits == [f"pr-body:3: {sf.PR_BODY_REASONS['map']}"], hits
+
+
+def test_one_line_restating_a_verdict_reports_it_once(sf) -> None:
+    body = (
+        f"{_REQ} stays {_PARTIAL}. It stays {_PARTIAL}: {_REQ} again. Again {_REQ} is {_PARTIAL}."
+    )
+    assert sf.scan_pr_body(body) == [f"pr-body:1: {sf.PR_BODY_REASONS['verdict']}"]
+
+
+def test_the_pr_body_detector_reports_no_value(sf) -> None:
+    """The identifier beside its verdict IS the disclosure; a public CI log must not repeat it."""
+    body = "\n".join(_PR_VERDICT_MUST_FIRE + _PR_GAP_MUST_FIRE + _PR_MAP_MUST_FIRE)
+    hits = sf.scan_pr_body(body)
+    assert hits, "the fixtures must fire, or this asserts nothing"
+    for h in hits:
+        for leaked in (_REQ, "example_module", "example.py", f" {_PARTIAL} "):
+            assert leaked not in h, f"the reason echoed {leaked!r}: {h!r}"
+
+
+def test_the_pr_body_mode_exit_codes(sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 on a hit, 0 on a clean body, 2 when the instrument cannot read -- never 0 for "could not look"."""
+    dirty = tmp_path / "dirty.md"
+    dirty.write_text(_PR_VERDICT_MUST_FIRE[0], encoding="utf-8")
+    clean = tmp_path / "clean.md"
+    clean.write_text(_PR_CLEAN_BODY, encoding="utf-8")
+    assert sf.main(["--pr-body", str(dirty)]) == 1
+    assert sf.main(["--pr-body", str(clean)]) == 0
+    assert sf.main(["--pr-body"]) == 2
+    assert sf.main(["--pr-body", str(tmp_path / "absent.md")]) == 2
+    monkeypatch.setattr("sys.stdin", io.StringIO(_PR_GAP_MUST_FIRE[0]))
+    assert sf.main(["--pr-body", "-"]) == 1
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert sf.main(["--pr-body", "-"]) == 0
+    # The flag form a typo produces must refuse, not scan nothing and pass.
+    assert sf.main([f"--pr-body={dirty}"]) == 2
+
+
+def test_the_pr_body_event_mode_reads_the_webhook_payload(sf, tmp_path: Path) -> None:
+    """CI's form. A payload with no pull request is a misrouted run and refuses; a null body is empty."""
+
+    def event(name: str, payload: object) -> str:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    assert (
+        sf.main(["--pr-body-event", event("a", {"pull_request": {"body": _PR_MAP_MUST_FIRE[0]}})])
+        == 1
+    )
+    assert sf.main(["--pr-body-event", event("b", {"pull_request": {"body": _PR_CLEAN_BODY}})]) == 0
+    assert sf.main(["--pr-body-event", event("c", {"pull_request": {"body": None}})]) == 0
+    assert sf.main(["--pr-body-event", event("d", {"push": {}})]) == 2
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert sf.main(["--pr-body-event", str(bad)]) == 2
+
+
+def test_a_staged_file_named_like_the_flag_does_not_switch_the_commit_gate(
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """pre-commit passes ``--require-tokens`` and then the staged names, so the body modes only count as
+    the WHOLE command line. Anywhere else the TREE scan's own argument handling owns the flag and refuses
+    it as an unknown option. Both paths exit 2, so the assertion is on which one spoke."""
+    monkeypatch.setattr(sf, "LOCAL_TOKEN_FILE", tmp_path / "absent-tokens.txt")
+    monkeypatch.delenv("MEFOR_FORBIDDEN_TOKENS", raising=False)
+    assert sf.main(["--require-tokens", "--pr-body", str(tmp_path / "x.md")]) == 2
+    err = capsys.readouterr().err
+    assert "unknown option" in err, err
+    assert "usage" not in err and "pull request body" not in err, err
+
+
+def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> None:
+    """The body is attacker-controlled. The scanner must read it from the event payload file, so no
+    Actions expression carries it anywhere in the workflow, and the job must run on an edit as well as
+    a push. The job is not a required context: making it one is a separate branch-protection decision."""
+    # Imported here, not at module scope: the helper skips its importer when PyYAML is absent, and that
+    # must skip this one test rather than every scanner test in the file.
+    from tests._workflow_contexts import (
+        WORKFLOWS,
+        context_of,
+        jobs_of,
+        required_contexts,
+        step_script,
+        triggers_of,
+    )
+
+    workflow = "pr-body-leak-scan.yml"
+    types = triggers_of(workflow)["pull_request"]["types"]
+    assert set(types) == {"opened", "edited", "reopened", "synchronize"}
+    ((key, job),) = jobs_of(workflow).items()
+    for step in job["steps"]:
+        assert "${{" not in step.get("run", ""), (
+            "no Actions expression may sit inside a run: script"
+        )
+    text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+    assert "pull_request.body" not in text, "the body must not pass through an Actions expression"
+    _, script = step_script(workflow, key, "Scan the pull request body")
+    assert '--pr-body-event "$GITHUB_EVENT_PATH"' in script
+    assert context_of(key, job) not in required_contexts()

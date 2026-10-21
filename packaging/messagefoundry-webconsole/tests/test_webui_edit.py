@@ -289,8 +289,17 @@ async def test_console_edit_resend_audits_keyed_digests_and_origin(tmp_path: Pat
         digest = detail["body_digest"]
         cipher = store.cipher()
         kid = digest["key_id"]
-        assert verify_audit_body_digest(cipher, ADT, key_id=kid, digest=digest["original"])
-        assert verify_audit_body_digest(cipher, EDITED, key_id=kid, digest=digest["edited"])
+        assert verify_audit_body_digest(
+            cipher, ADT, key_id=kid, digest=digest["original"], alg=digest["alg"], kdf=digest["kdf"]
+        )
+        assert verify_audit_body_digest(
+            cipher,
+            EDITED,
+            key_id=kid,
+            digest=digest["edited"],
+            alg=digest["alg"],
+            kdf=digest["kdf"],
+        )
         assert "DOE^JOHN" not in str(rec["detail"])
         child = await store.get_message(detail["new_message_id"])
         assert child is not None and (child["origin"], child["origin_actor"]) == (

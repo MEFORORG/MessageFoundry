@@ -22,7 +22,7 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
-from messagefoundry.auth.totp import DEFAULT_DIGITS as TOTP_DIGITS
+from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
@@ -64,7 +64,7 @@ class LoginRequest(RequestModel):
     supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
     # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
     # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
-    # TOTP digit count; the engine treats a blank one as absent. No response gains a field.
+    # longest code any compiled-in enrolment gives (#3422); the engine treats a blank one as absent.
     totp_code: str | None = Field(default=None, max_length=TOTP_DIGITS, pattern=r"^[0-9]*$")
 
 
@@ -464,13 +464,17 @@ class MfaStatusResponse(BaseModel):
 
     ``enabled`` stays == TOTP-enabled (the desktop console's boolean view is untouched);
     ``webauthn_enrolled`` is the ADR 0068 additive field (defaulted, so an older client's decode
-    is unaffected). ``required`` accounts for either factor being enrolled."""
+    is unaffected). ``required`` accounts for either factor being enrolled.
+    ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) says the TOTP
+    enrolment was made with parameters other than this release's default, so the holder should be
+    offered a fresh one."""
 
     enabled: bool
     enrolled_at: float | None = None
     recovery_codes_remaining: int = 0
     required: bool = False
     webauthn_enrolled: bool = False
+    totp_reenrolment_recommended: bool = False
 
 
 class RoleInfo(BaseModel):

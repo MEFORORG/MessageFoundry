@@ -133,6 +133,7 @@ from messagefoundry.store.crypto import (
     allows_unmarked,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
@@ -665,7 +666,8 @@ _SCHEMA: list[str] = [
     # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
     # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
     # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
-    # body/PHI (not part of the cipher seam). file_key = sha256 of the file identity — a DERIVED id,
+    # body/PHI (not part of the cipher seam). file_key = a scheme tag + ":" + sha256 of the file
+    # identity (BACKLOG #3424; a bare pre-tag digest still reads) — a DERIVED id,
     # NEVER a cleartext filename (which can embed an MRN) and never logged at INFO+; channel_id (the
     # inbound connection name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit.
     """CREATE TABLE IF NOT EXISTS processed_files (
@@ -960,7 +962,7 @@ _SCHEMA: list[str] = [
     # BIGINT (a WebAuthn uint32 overflows signed INT); label is column-capped so ux_webauthn_label
     # stays bounded; public_key is COSE verification material, plaintext by design (not a secret).
     """CREATE TABLE IF NOT EXISTS webauthn_credentials (
-        credential_id_hash VARCHAR(64) PRIMARY KEY,
+        credential_id_hash VARCHAR(128) PRIMARY KEY,
         credential_id      TEXT NOT NULL,
         user_id            TEXT NOT NULL REFERENCES users(id),
         rp_id              VARCHAR(256) NOT NULL,
@@ -974,6 +976,14 @@ _SCHEMA: list[str] = [
         created_at         DOUBLE PRECISION NOT NULL,
         last_used_at       DOUBLE PRECISION
     )""",
+    # BACKLOG #3423: the hash now carries a scheme tag ("wc1:" + 64 hex), wider than VARCHAR(64).
+    # Widening a varchar is metadata-only here, and the primary key comes along unchanged. Guarded,
+    # so a column already at 128 takes no ACCESS EXCLUSIVE lock when the batch runs again.
+    "DO $$ BEGIN IF (SELECT character_maximum_length FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'webauthn_credentials'"
+    " AND column_name = 'credential_id_hash') < 128 THEN"
+    " ALTER TABLE webauthn_credentials ALTER COLUMN credential_id_hash TYPE VARCHAR(128);"
+    " END IF; END $$",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
@@ -1265,6 +1275,7 @@ _PG_USER_RESEAL: Final = (
 _PG_USER_ROLE_INSERT: Final = (
     "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES ($1,$2,$3,$4)"
 )
+_PG_WEBAUTHN_REHASH: Final = "UPDATE webauthn_credentials SET credential_id_hash=$1 WHERE user_id=$2 AND credential_id_hash=$3"
 _PG_WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
@@ -5670,6 +5681,13 @@ class PostgresStore:
         )
         return row is not None
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        row = await self._fetchval(
+            "SELECT 1 FROM processed_files WHERE channel_id=$1 AND file_key NOT LIKE '%:%' LIMIT 1",
+            channel_id,
+        )
+        return row is not None
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:
@@ -8565,16 +8583,23 @@ class PostgresStore:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
         NEGATIVE ``count`` refunds an unspent reserve at settlement). See the SQLite twin — one row per
         key_id, reserve-then-spend, aggregating every process on this one unified store (engine shards
-        and `[cluster]` HA nodes alike)."""
+        and `[cluster]` HA nodes alike).
+
+        The CTE folds a pre-tag row, keyed on the bare ``key_id``, into the :func:`cipher_meta_key`
+        row in the same statement (BACKLOG #3421). A concurrent fold waits on the DELETE's row lock
+        and then finds no row, so the old count is added once."""
         row = await self._fetchone(
-            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES ($1,$2,$3)"
+            "WITH legacy AS (DELETE FROM cipher_meta WHERE key_id = $4 RETURNING invocations)"
+            " INSERT INTO cipher_meta (key_id, invocations, updated_at)"
+            " VALUES ($1, $2::bigint + COALESCE((SELECT invocations FROM legacy), 0), $3)"
             " ON CONFLICT (key_id) DO UPDATE SET"
             " invocations = cipher_meta.invocations + EXCLUDED.invocations,"
             " updated_at = EXCLUDED.updated_at"
             " RETURNING invocations",
-            key_id,
+            cipher_meta_key(key_id),
             int(count),
             time.time(),
+            key_id,
         )
         return int(row["invocations"]) if row is not None else int(count)
 
@@ -8656,9 +8681,14 @@ class PostgresStore:
         return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
-        row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
-        return int(row["invocations"]) if row is not None else 0
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
+        row = await self._fetchone(
+            "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN ($1, $2)",
+            cipher_meta_key(key_id),
+            key_id,
+        )
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
@@ -9198,6 +9228,15 @@ class PostgresStore:
                 "DELETE FROM webauthn_credentials WHERE user_id=$1 AND credential_id_hash=$2",
                 user_id,
                 credential_id_hash,
+            )
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423); store.py's
+        ``MessageStore.rehash_webauthn_credential`` states the contract."""
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            count = await self._write_passkeys(
+                conn, user_id, _PG_WEBAUTHN_REHASH, new_hash, user_id, old_hash
             )
         return count > 0
 

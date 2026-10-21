@@ -533,3 +533,29 @@ seal Transit-mode archives under a salted sub-key, or seal them through Transit.
 Per engine `CLAUDE.md` section 0 there are no deployments. Take a first site on `vault_transit`
 that configures a key for the backup. It would seal every archive under that DEK in process. No
 enforced ceiling would cover that key's archive use.
+
+## Amendment (2026-10-20): the stored row id names the fingerprint scheme (BACKLOG #3421)
+
+Context item 4 still holds for `key_id` in memory. What `cipher_meta` stores is that id behind a
+scheme tag, `sha256-16:<key_id>` (`cipher_meta_key` and `KEY_ID_SCHEME` in `store/crypto.py`). The
+tag names the function, not the key.
+
+The tag does not by itself keep a count across a change to `_fingerprint`. A row is found by an id
+computed from the key, so a release that changes the function must keep the old one compiled in,
+compute the old id, and read the row under it. What the tag adds is that each stored row says which
+function made it, so that release can tell an old-scheme row from a new key's. A release that does
+not know a tag finds no row for it, so it never reads one under the wrong function. A release that
+adds a scheme should therefore keep the old-scheme row rather than fold it away, or a rollback
+counts the key from zero.
+
+A row keyed on the bare id, written before the tag, is read as today's scheme. `cipher_invocations`
+sums both forms, and `add_cipher_invocations` folds the bare row into the tagged one within one
+write transaction on all three backends. That fold does not keep the bare row, so a store moved back
+to a release from before the tag would count that key from zero.
+
+The DEK row of `secret_rotation_meta` carries the same tag, and its non-DEK rows carry
+`hmac-sha256-32`. There the stored value is parsed. An unknown tag is refused: it is not read under
+any scheme, its dates are kept, and the row is re-stamped under this release's scheme, so the next
+rotation is detected. An untagged value that compares equal is re-stamped in its tagged form, dates
+kept. The `mfenc:` markers and DR archives are unchanged, because their format
+version can name a new function.

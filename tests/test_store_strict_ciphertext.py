@@ -372,7 +372,8 @@ async def test_the_one_transaction_seal_never_outruns_its_reservation(
         # A separate connection sees only what is COMMITTED -- what a crash would leave behind.
         with sqlite3.connect(db) as conn:
             row = conn.execute(
-                "SELECT invocations FROM cipher_meta WHERE key_id=?", (cipher.active_key_id,)
+                "SELECT invocations FROM cipher_meta WHERE key_id=?",
+                (crypto_mod.cipher_meta_key(cipher.active_key_id),),
             ).fetchone()
         persisted = int(row[0]) if row else 0
         spent = cipher.cumulative_invocations()

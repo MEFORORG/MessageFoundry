@@ -297,7 +297,7 @@ async def test_a_forged_range_row_does_not_route_live_appends(
     import logging
 
     from messagefoundry.store.crypto import audit_key_id
-    from messagefoundry.store.store import audit_epoch_detail, audit_handover_tag
+    from messagefoundry.store.store import audit_epoch_detail
 
     path, a, b = await _rotated_and_dropped(tmp_path)
     x = generate_key()
@@ -320,7 +320,7 @@ async def test_a_forged_range_row_does_not_route_live_appends(
             "digest": "",
             "prev_hash": "",
         }
-        detail = audit_epoch_detail(x_id, closes, audit_handover_tag(x_id, closes, (x_mac, None)))
+        detail = audit_epoch_detail(x_id, closes, (x_mac, None))
         forged = audit_row_hash(
             head["row_hash"],
             seq=forged_seq,
@@ -468,7 +468,6 @@ def _rows_across_a_rotation(
     from messagefoundry.store.crypto import audit_key_id
     from messagefoundry.store.store import (
         audit_epoch_detail,
-        audit_handover_tag,
         audit_range_closing,
     )
 
@@ -513,10 +512,9 @@ def _rows_across_a_rotation(
             )
         )
         closes.update(closes_edit or {})
-        tag = audit_handover_tag(audit_key_id(incoming), closes, (signer, None))
         add(
             AUDIT_KEY_EPOCH_ACTION,
-            audit_epoch_detail(audit_key_id(incoming), closes, tag),
+            audit_epoch_detail(audit_key_id(incoming), closes, (signer, None)),
             incoming,
         )
 

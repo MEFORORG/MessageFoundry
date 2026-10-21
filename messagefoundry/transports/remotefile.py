@@ -120,8 +120,10 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    file_key_forms,
     float_setting,
     intake_open,
+    ledger_holds,
     poll_interval,
     positive_cap,
     register_destination,
@@ -2609,10 +2611,11 @@ class RemoteFileSource(SourceConnector):
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
             # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
             # server gives one, BACKLOG #2758) — never a cleartext filename.
-            file_key = self._file_key(name, size, mtime) if self._after_read == "leave" else None
-            if file_key is not None and await self._leave_already_ingested(file_key):
+            forms = self._file_key_forms(name, size, mtime) if self._after_read == "leave" else None
+            file_key = None if forms is None else forms[0]
+            if forms is not None and await self._leave_already_ingested(forms):
                 if mtime is None:
-                    self._log_undetectable_skip(name, size, file_key)
+                    self._log_undetectable_skip(name, size, forms[0])
                 continue
             if not self._settled(name, size, mtime):
                 # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
@@ -2881,6 +2884,10 @@ class RemoteFileSource(SourceConnector):
                 self._settle_seen[name] = (sighting, missed + 1)
 
     def _file_key(self, name: str, size: int, mtime: str | None) -> str:
+        """The key this release writes for ``name``: the first of :meth:`_file_key_forms`."""
+        return self._file_key_forms(name, size, mtime)[0]
+
+    def _file_key_forms(self, name: str, size: int, mtime: str | None) -> tuple[str, ...]:
         """A stable, HASHED identity for a remote source file, for the leave-in-place dedup ledger
         (#142). SHA-256 over the file's FULL REMOTE PATH (``remote_dir``/``name``) + size + the listed
         modification time where the server gives one — folding the full path, not just the basename,
@@ -2908,10 +2915,13 @@ class RemoteFileSource(SourceConnector):
         at-least-once already allows, never a loss.
 
         The path — which, like a filename, can embed an MRN — is never stored or logged in the clear
-        (the ledger holds this derived id only; never log the path)."""
+        (the ledger holds this derived id only; never log the path).
+
+        Returns every form the ledger may hold the key under, today's scheme-tagged one first
+        (:func:`~messagefoundry.transports.base.file_key_forms`, BACKLOG #3424)."""
         full = posixpath.join(self._remote_dir, name)
         identity = f"{full}\x00{size}" if mtime is None else f"{full}\x00{size}\x00{mtime}"
-        return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
+        return file_key_forms(hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest())
 
     def _reads(self, name: str) -> bool:
         """Whether ``pattern``, a file-name glob, matches ``name``: the one test the poll loop
@@ -2993,15 +3003,15 @@ class RemoteFileSource(SourceConnector):
         while len(self._processed_seen) > LEAVE_SEEN_CACHE_MAX:
             self._processed_seen.popitem(last=False)
 
-    async def _leave_already_ingested(self, file_key: str) -> bool:
+    async def _leave_already_ingested(self, forms: tuple[str, ...]) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
         I/O), then, on a miss, the AUTHORITATIVE durable ledger (covers a restart / a fresh process / a
-        cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest."""
-        if self._seen_touch(file_key):
+        cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest.
+        ``forms`` is :meth:`_file_key_forms`, so a row written under an older scheme still counts."""
+        if self._seen_touch(forms[0]):
             return True
-        ledger = self.processed_ledger
-        if ledger is not None and await ledger.is_processed(file_key):
-            self._seen_add(file_key)
+        if await ledger_holds(self.processed_ledger, forms):
+            self._seen_add(forms[0])
             return True
         return False
 

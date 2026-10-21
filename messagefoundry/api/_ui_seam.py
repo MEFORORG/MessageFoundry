@@ -652,12 +652,17 @@ from typing import Any
 #: ``count_other_sessions`` return ``int | None``, None for a count the store refused, which the
 #: account page reads to keep its mark, so the digest moved again, from ``108e906e98fd66f0``.
 #:
+#: Merging main into the #3401 / #3393 stack joined two digests: this stack's ``35b9f58cdc447306``
+#: and main's ``6d8b36eb7bb94bf0``, where BACKLOG #3422 gave ``MfaStatus`` and
+#: ``MfaStatusResponse`` a ``totp_reenrolment_recommended`` field. The digest below covers both
+#: surfaces. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "35b9f58cdc447306"
+ENGINE_UI_SEAM: str = "bcdc6665f3b8a958"
 
 
 @dataclass(frozen=True, slots=True)

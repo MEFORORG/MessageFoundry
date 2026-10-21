@@ -40,7 +40,7 @@ from messagefoundry.config.settings import (
     load_settings,
 )
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin, login_admin
+from tests._admin_account import PROVISION_EMAIL, create_admin, login_admin
 
 #: The shipped-list clause, and the site-term clause. They differ on purpose: the published list holds
 #: only the shipped terms, so a refused user must be told when the word is one of the site's.
@@ -275,7 +275,10 @@ async def test_the_first_administrator_is_screened_for_site_terms() -> None:
         await service.initialize()
         with pytest.raises(FirstAdministratorRefused, match="this site's additions"):
             await service.provision_first_administrator(
-                username="firstadmin", password=_TEMPLATE.format("globex"), actor="test"
+                username="firstadmin",
+                password=_TEMPLATE.format("globex"),
+                notify_email=PROVISION_EMAIL,
+                actor="test",
             )
     finally:
         await store.close()

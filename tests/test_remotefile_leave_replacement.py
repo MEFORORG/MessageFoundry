@@ -138,7 +138,7 @@ def test_the_key_folds_the_mtime_and_keeps_the_size_only_shape_without_one(
 ) -> None:
     src = _src(monkeypatch, _FakeClient(), after_read="leave")
     plain = src._file_key(_NAME, 13, None)
-    assert plain == hashlib.sha256(f"/in/{_NAME}\x0013".encode()).hexdigest()
+    assert plain == "fk1:" + hashlib.sha256(f"/in/{_NAME}\x0013".encode()).hexdigest()
     assert src._file_key(_NAME, 13, "1") != plain
     assert src._file_key(_NAME, 13, "1") != src._file_key(_NAME, 13, "2")
 
