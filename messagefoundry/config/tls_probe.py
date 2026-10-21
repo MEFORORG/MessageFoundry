@@ -109,6 +109,13 @@ def _offer_context(version: ssl.TLSVersion | None) -> ssl.SSLContext:
     # by design, because the probe must be able to ASK. Asserting forward secrecy would empty the
     # offer and turn a floor probe that can fail into one that cannot. This context carries no
     # application data and never leaves this module. Do not "fix" it.
+    #
+    # Nor are its signature schemes narrowed (tls_policy.narrow_signature_algorithms, BACKLOG #3414),
+    # on purpose, for three reasons. The offer verifies no certificate (CERT_NONE above), so the
+    # handshake signature it would bound authenticates nothing. The two legacy offers are TLS 1.0
+    # and 1.1, whose ClientHello carries no signature_algorithms extension, so there is no list to
+    # narrow. And the third offer is a default-capability client by design (the module docstring,
+    # question 3), so it stays the interpreter's stock offer.
     return ctx
 
 
