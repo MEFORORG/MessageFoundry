@@ -389,6 +389,12 @@ ENROL_FIRST_UI_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/ui/account/mfa/enroll"),
         ("GET", "/ui/account/mfa/confirm"),
         ("POST", "/ui/account/mfa/verify"),
+        # ADR 0197 Amendment A, wave 2: a discoverable passkey is a way past the sign-in lock, so
+        # it may be the first factor, and its registration is open to such a session too. Both legs
+        # keep their own step-up gate; the finish refuses a passkey its client reports is not
+        # discoverable.
+        ("POST", "/ui/account/webauthn/enroll"),
+        ("POST", "/ui/account/webauthn/verify"),
     }
 )
 

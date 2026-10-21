@@ -4584,7 +4584,9 @@ class AuthService:
         # Wave 2: the discoverable passkeys an assertion could answer for, under this request's
         # relying party, from the set the account's seal covers. None read without an assertion.
         passkey_creds: list[WebAuthnCredential] = []
-        if passkey is not None:
+        # Without the [webauthn] extra no assertion can be checked, so it changes nothing and the
+        # request is the password sign-in, refused under a live lock like any other.
+        if passkey is not None and webauthn.available():
             held = await self._verified_passkeys(user)
             passkey_creds = [c for c in held or () if c.discoverable and c.rp_id == passkey.rp_id]
         with_passkey = passkey is not None and bool(passkey_creds)
@@ -5015,7 +5017,8 @@ class AuthService:
         ``"passkey"`` on a combined passkey sign-in, ``"first_step"`` on ``verify_mfa``), so the
         notice can tell the owner which one to replace;
         only the owner receives it. A sign-in lock on a local account with TOTP enrolled tells the
-        owner the combined sign-in gets them in now."""
+        owner the combined sign-in gets them in now; one on a local account with a discoverable
+        passkey tells it the combined passkey sign-in does."""
         if not failure.just_locked:
             return
         notice: dict[str, Any] = {
@@ -5030,6 +5033,13 @@ class AuthService:
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
         elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
             notice["combined_sign_in"] = True
+        elif (
+            user.auth_provider == AuthProvider.LOCAL.value
+            and isinstance(user, VerifiedUser)
+            and await self._holds_discoverable_passkey(user)
+        ):
+            # ADR 0197 Amendment A, wave 2: the way past is the combined passkey sign-in.
+            notice["combined_passkey_sign_in"] = True
         await self._record_suspicious_login(
             ACCOUNT_LOCKED, user, client=client, audit_detail=audit_detail, notice_detail=notice
         )
@@ -13696,6 +13706,12 @@ class AuthService:
             and self._covered_by_requirement(user, identity.roles)
             and not await self._has_way_past(user)
         ):
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=identity.username,
+                detail=_json({"phase": "enroll", "reason": "not_discoverable"}),
+                client=client,
+            )
             raise ValueError(PASSKEY_NOT_DISCOVERABLE)
         credential_id_hash = hash_bytes(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
@@ -13984,6 +14000,15 @@ class AuthService:
             await self._mark_login_address_known(user.id, client)
         return elevation
 
+    async def _passkey_still_held(self, user_id: str, cred: WebAuthnCredential) -> bool:
+        """Whether the account still holds ``cred`` after a conditional delete wrote nothing, which
+        tells the way-past refusal from a concurrent delete of the same passkey. A record or set that
+        no longer verifies reads as held, so the refusal is what the caller gets."""
+        user = await self._load_user(user_id)
+        if user is None:
+            return False
+        return await self._passkey_held(user, cred) != "removed"
+
     async def _passkey_held(self, user: VerifiedUser, cred: WebAuthnCredential) -> _PasskeyHeld:
         """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
         #2592). :meth:`finish_webauthn_assertion` asks it after the sign-count write (BACKLOG
@@ -14076,12 +14101,6 @@ class AuthService:
         # passkey that is not discoverable is no way past, so its removal is never refused on this
         # ground. ``admin_reset_mfa`` stays the recovery for a lost or stolen one, as ADR 0068 says.
         keep_way_past = target.discoverable and self._covered_by_requirement(user, identity.roles)
-        if (
-            keep_way_past
-            and not user.totp_enabled
-            and not any(c is not target and c.discoverable for c in creds)
-        ):
-            raise ValueError(PASSKEY_REMOVAL_REFUSED)
         last_second_factor = len(creds) == 1 and not user.totp_enabled
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False
@@ -14090,14 +14109,15 @@ class AuthService:
                 "this is your last second factor and MFA is required for your account — "
                 "enroll another factor first"
             )
-        # The store asks the way-past question again in its own write, with the account row held,
-        # so two concurrent removals cannot both pass the check above (ADR 0197 Amendment A).
+        # The store asks the way-past question in its own write, with the account row held, so two
+        # concurrent removals cannot both pass a check made before either wrote (ADR 0197 Amendment
+        # A, AC-A3a): one place states the rule, store.removal_keeps_way_past.
         if not await self._store.delete_webauthn_credential(
             identity.user_id, credential_id_hash, require_way_past=keep_way_past
         ):
-            if keep_way_past:
+            if keep_way_past and await self._passkey_still_held(identity.user_id, target):
                 raise ValueError(PASSKEY_REMOVAL_REFUSED)
-            return False  # pragma: no cover - raced with a concurrent delete of the same row
+            return False  # raced with a concurrent delete of the same row
         await self._audit(
             "auth.webauthn_removed",
             actor=identity.username,

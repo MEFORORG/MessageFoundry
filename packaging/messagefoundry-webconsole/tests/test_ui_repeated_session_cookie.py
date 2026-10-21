@@ -158,13 +158,18 @@ async def test_the_socket_cookie_refusal_is_audited(engine: Engine) -> None:
 
 #: A read of a request's cookie dict, the spelling that would skip the copy count.
 _COOKIE_READ = re.compile(r"\.cookies(?:\.get\(|\[)")
-#: The two reads allowed: ``session_token`` itself, and the OIDC flow cookie, which is a one-leg
-#: correlation value and not a session credential.
+#: The reads allowed: ``session_token`` itself, the OIDC flow cookie, which is a one-leg
+#: correlation value and not a session credential, and the passkey sign-in handle (ADR 0197
+#: Amendment A wave 2), which names a staged challenge and carries no authority of its own.
 _ALLOWED = {
     ("messagefoundry_webconsole/_auth.py", "conn.cookies.get(session_cookie_name(conn))"),
     (
         "messagefoundry_webconsole/routes/oidc.py",
         "request.cookies.get(oidc_flow_cookie_name(request))",
+    ),
+    (
+        "messagefoundry_webconsole/routes/core.py",
+        "handle = request.cookies.get(passkey_sign_in_cookie_name(request))",
     ),
 }
 

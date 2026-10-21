@@ -3234,7 +3234,21 @@ always checked. A right password with an invalid assertion is counted and audite
 wrong password with an invalid assertion, on the sign-in counter, so no record shows which password
 was right; a wrong password with a valid assertion counts on the second-step counter. A passkey
 registered before wave 2 is not discoverable and gets no such path. The JSON API has no passkey
-sign-in. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
+sign-in. A covered must-change account may register its first passkey from the enrol-first
+confinement (`ENROL_FIRST_UI_ROUTES`), and a sign-in lock notice on such an account names the
+combined passkey sign-in. The two removal guards and the rotation write ask the way-past question
+again inside their own store write, with the account row held, so two concurrent removals cannot
+both pass.
+
+**Two limits of the passkey way past, stated.** At least these:
+
+- The rotation gate, the removal guards and the census count a discoverable passkey under **any**
+  `rp_id`, while the sign-in accepts only one minted under the request's. After an origin change
+  ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
+  visibly unusable) an account whose only way past is such a passkey is lockable with no way past
+  until it registers a passkey again or enrols TOTP; the census does not name it.
+- One passkey sign-in charges the sign-in window twice, at the begin leg and at the sign-in, so the
+  owner's way past gets half the per-address budget a password sign-in gets. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
 always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable
 knowledge secrets that would undercut the phishing-resistant tier). A covered local account that has TOTP
 keeps it beside its passkeys, since it cannot remove it, so TOTP is its fallback. On any other

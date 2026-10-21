@@ -39,7 +39,11 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 async def _service(engine: Engine) -> AuthService:
     service = AuthService(
         engine.store,
-        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            login_rate_limit_enabled=False,
+            admin_write_min_interval_seconds=0,
+        ),
     )
     await service.initialize()
     return service
@@ -149,3 +153,37 @@ async def test_a_passkey_only_owner_signs_in_past_a_live_sign_in_lock(engine: En
         assert cleared and "max-age=0" in cleared[0].lower(), "the spent handle was not cleared"
     user = await service.store.get_user(user_id)
     assert user is not None and user.locked_until is None and user.failed_attempts == 0
+
+
+async def test_a_must_change_account_may_register_a_passkey_as_its_first_factor(
+    engine: Engine,
+) -> None:
+    """ADR 0197 Amendment A wave 2, AC-A3 on the console plane: a covered must-change account with
+    no factor enrols one before it rotates, and from wave 2 a discoverable passkey qualifies, so the
+    enrol-first confinement admits the passkey registration. RED when: ``ENROL_FIRST_UI_ROUTES``
+    drops the passkey legs, which sends the first POST to the enrolment page instead."""
+    service = await _service(engine)
+    await create_local_user_chosen(
+        service,
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+        assert r.status_code == 303
+        r = await c.post("/ui/account/webauthn/enroll", headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"].startswith("/ui/reauth?next="), (
+            r.headers
+        )
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": "/ui/account/webauthn/enroll", "password": PW},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
+        r = await c.post("/ui/account/webauthn/enroll", headers=SAME_ORIGIN)
+        assert r.status_code == 200 and "data-mf-webauthn-create" in r.text

@@ -133,6 +133,72 @@ async def test_a_covered_first_factor_the_client_says_is_not_discoverable_is_ref
             )
         assert str(refused.value) == PASSKEY_NOT_DISCOVERABLE
         assert await store.list_webauthn_credentials(identity.user_id) == []
+        failed = [
+            json.loads(r["detail"])
+            for r in await store.list_audit(limit=100, action="auth.webauthn_failed")
+        ]
+        assert {"phase": "enroll", "reason": "not_discoverable"} in failed, (
+            "the refusal is unaudited"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refusal() -> None:
+    """A conditional delete that matched no row because the same passkey was already removed (two
+    tabs, a double click) answers "not removed", never the last-way-past refusal."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _register(service, identity, token, label="one")
+        _, token = await _register(service, identity, token, label="two")
+        target = (await store.list_webauthn_credentials(identity.user_id))[0]
+        real_delete = store.delete_webauthn_credential
+
+        async def already_gone(
+            user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+        ) -> bool:
+            assert await real_delete(user_id, credential_id_hash)  # the other tab wins first
+            return await real_delete(user_id, credential_id_hash, require_way_past=require_way_past)
+
+        store.delete_webauthn_credential = already_gone  # type: ignore[method-assign]
+        assert (
+            await service.delete_webauthn_credential(identity, target.credential_id_hash) is False
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_lock_notice_tells_a_passkey_owner_the_way_past() -> None:
+    """The ``ACCOUNT_LOCKED`` notice of a sign-in lock on an account whose way past is a
+    discoverable passkey names the combined passkey sign-in, as a TOTP account's names the code."""
+    from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
+
+    events: list[SecurityEvent] = []
+
+    class _Notifier:
+        async def notify(self, event: SecurityEvent) -> bool:
+            events.append(event)
+            return True
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0,
+                login_rate_limit_enabled=False,
+                lockout_threshold=3,
+            ),
+            security_notifier=_Notifier(),
+        )
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        for i in range(3):
+            assert not (await service.login(identity.username, f"wrong-{i}")).ok
+        locks = [e for e in events if e.event_type == ACCOUNT_LOCKED]
+        assert locks and locks[-1].detail.get("combined_passkey_sign_in") is True, locks
     finally:
         await store.close()
 

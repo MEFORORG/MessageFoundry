@@ -480,7 +480,9 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         Status.FAIL,
         "; ".join(parts)
         + ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
-        "factors (POST /users/{id}/reset-mfa), which issues a generated credential" + passkey_note,
+        "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
+        + passkey_note
+        + ".",
     )
 
 

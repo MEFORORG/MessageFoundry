@@ -699,7 +699,8 @@ decisions of this ADR change; the rest stand.
    `required`, the legacy `requireResidentKey`, and the `credProps` extension. Each stored passkey
    records `discoverable`: the `credProps.rk` the client reports, or the requirement when it reports
    none, so on a client that does not conform the record can overstate. The column rides the passkey
-   digest, so the account's seal covers it. **Stated rather than hidden:** an authenticator that
+   digest when it is set, so the account's seal covers a flip to discoverable, and a passkey stored
+   before the column keeps the digest it was sealed under. **Stated rather than hidden:** an authenticator that
    cannot store a discoverable credential, such as an older U2F key, can no longer register; its
    holder keeps TOTP. A passkey registered before this amendment records `discoverable` false and is
    left as it is.

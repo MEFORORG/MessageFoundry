@@ -2393,6 +2393,11 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
             if f.name in PASSKEY_DIGEST_EXCLUDED:
                 continue
             value = getattr(cred, f.name)
+            # ADR 0197 Amendment A, wave 2: ``discoverable`` enters the digest only when set. A row
+            # flipped to discoverable outside the store still fails its digest, and a passkey
+            # written before the column, which reads False, keeps the digest it was sealed under.
+            if f.name == "discoverable" and not value:
+                continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
