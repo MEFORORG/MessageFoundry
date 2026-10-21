@@ -666,13 +666,27 @@ async def test_a_loop_task_cancelled_elsewhere_does_not_cancel_the_stop(
     assert task.cancelled()
 
 
+def _changelog_entry(title: str) -> str:
+    """The CHANGELOG.md bullet whose bold title starts with ``title``, up to the next bullet or
+    heading. A fragment is deleted when a release folds it in, so a test reads the folded entry."""
+    lines = (_REPO / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(f"- **{title}")]
+    assert len(starts) == 1, f"CHANGELOG.md holds {len(starts)} entries titled {title!r}"
+    end = starts[0] + 1
+    while end < len(lines) and lines[end].startswith("  "):
+        end += 1
+    return " ".join(line.strip() for line in lines[starts[0] : end])
+
+
 def test_the_interval_is_the_one_the_documents_state() -> None:
     """One row a pass, so the interval is the bound on rows, and the operator documents state
     it. A shorter one would let the injecting process add rows faster than they say."""
     seconds = f"{CHECK_INTERVAL_SECONDS:g} seconds"
     assert seconds == "30 seconds"
-    for doc in ("docs/SECURITY-LOOSENING.md", "changelog.d/2742.added.md"):
-        assert f"every {seconds}" in (_REPO / doc).read_text(encoding="utf-8"), doc
+    loosening = (_REPO / "docs/SECURITY-LOOSENING.md").read_text(encoding="utf-8")
+    assert f"every {seconds}" in loosening, "docs/SECURITY-LOOSENING.md"
+    entry = _changelog_entry("A script the remote-debugging guard refuses is now audited")
+    assert f"every {seconds}" in entry, "the vault BACKLOG #2742 entry in CHANGELOG.md"
 
 
 # --- the engine runs it, and only serve builds an engine -----------------------------------------
