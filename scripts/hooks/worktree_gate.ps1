@@ -2867,11 +2867,11 @@ What to do instead:
 # is a string ORDINALLY equal to "web-fetch" or "claude-code-guide". Ordinal, not -ceq/-cin: PowerShell's
 # culture comparison ignores zero-width, soft-hyphen and NUL characters, so "web-fetch" plus U+200B would
 # match. The key is matched ordinally too, because a PSCustomObject property read is case-insensitive.
-# Owner authorization 2026-10-21, for docs/AUTONOMY-PLAN.md section 6.1 (on branch autonomy-plan when
-# this was written). Those two built-in types carry no shell AND no write tool (WebFetch; Glob/Grep/Read/
+# Owner authorization 2026-10-21, for docs/AUTONOMY-PLAN.md section 6, item 1 (on branch autonomy-plan
+# when this was written; its brief called it 6.1). Those two built-in types carry no shell AND no write tool (WebFetch; Glob/Grep/Read/
 # WebFetch/WebSearch), so inheriting the primary's cwd cannot build or swap anything there, which is the
 # harm this rule exists for. "No shell" alone is not the criterion: statusline-setup has none but has Edit.
-# Everything else stays denied: Explore and Plan have Bash, and a shell redirect evades rules 1 and 3;
+# Everything else stays denied: Explore and Plan have Bash, and a shell write evades rule 1 outright;
 # general-purpose, fork, a missing or non-string type, any other spelling of the two names, and every
 # Workflow. RESIDUALS, at least: the match is on the NAME, not on the tool list, so an agent defined under
 # either name with a shell or a write tool passes too, from any source that can define one (project or
@@ -2887,7 +2887,8 @@ if ($tool -in @("Task", "Agent", "Workflow")) {
         $subagentType = $null
         if ($typeProps.Count -eq 1) { $subagentType = $typeProps[0].Value }
         if ($subagentType -is [string] -and
-            [Array]::IndexOf([string[]]@("web-fetch", "claude-code-guide"), $subagentType) -ge 0) {
+            ([string]::Equals($subagentType, "web-fetch", [StringComparison]::Ordinal) -or
+             [string]::Equals($subagentType, "claude-code-guide", [StringComparison]::Ordinal))) {
             exit 0
         }
     }
@@ -2895,8 +2896,8 @@ if ($tool -in @("Task", "Agent", "Workflow")) {
     if ($root) {
         $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
-BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
-this subagent. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
+BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not make
+this dispatch. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
 not reliably surface back to you -- the fan-out would appear to succeed while writing nothing.
 
 Create a worktree first, then dispatch from it:
