@@ -12,15 +12,21 @@ unit test that did the same would be a network flake in the required leg.
 
 from __future__ import annotations
 
+import functools
 import json
+import ssl
 import urllib.error
+import urllib.request
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
 from scripts.security.new_dependency_check import (
     Finding,
+    RetryBudget,
+    _http_fetch,
     declared_distributions,
     main,
     normalize,
@@ -317,6 +323,179 @@ def test_main_exits_2_when_pypi_is_unreachable(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(mod, "_http_fetch", unreachable)
     assert main([]) == 2
+
+
+# --- transient retry (BACKLOG #3089): the link is retried, the answer never is ------------------
+#
+# These drive the SHIPPED _http_fetch -> _fetch_once path with only urllib.request.urlopen replaced, so
+# the 404 mapping and the transient classification under test are the real ones. Sleeps are recorded,
+# never slept.
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _script_urlopen(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[BaseException | bytes]
+) -> list[str]:
+    """Replace urlopen with one that plays ``outcomes`` in order (the last repeats). Returns the URLs
+    it was called with, so a test counts attempts by what reached the wire."""
+    calls: list[str] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> _FakeResponse:
+        calls.append(request.full_url)
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return _FakeResponse(outcome)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return calls
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://pypi.org/pypi/x/json", code, "x", Message(), None)
+
+
+_GOOD_BODY = json.dumps(_fetch_all_good("fastapi")).encode()
+# The exact shape the 2026-10-20 merge-group evictions logged.
+_HANDSHAKE_TIMEOUT = urllib.error.URLError(
+    TimeoutError("_ssl.c:1064: The handshake operation timed out")
+)
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        _HANDSHAKE_TIMEOUT,
+        TimeoutError("timed out"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        _http_error(429),
+        _http_error(503),
+    ],
+    ids=["tls-handshake-timeout", "read-timeout", "reset", "refused", "http-429", "http-503"],
+)
+def test_a_transient_failure_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, transient: BaseException
+) -> None:
+    calls = _script_urlopen(monkeypatch, [transient, _GOOD_BODY])
+    sleeps: list[float] = []
+
+    payload = _http_fetch("fastapi", sleep=sleeps.append)
+
+    assert payload is not None and payload["info"]["name"] == "fastapi"
+    assert len(calls) == 2, "a transient failure must be tried again, exactly once here"
+    assert len(sleeps) == 1 and 1.0 <= sleeps[0] < 1.5, f"backoff out of range: {sleeps}"
+
+
+def test_a_persistent_timeout_fails_after_the_attempts_are_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAIL CLOSED: retries delay the failure, they never replace it with a payload."""
+    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+    sleeps: list[float] = []
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("fastapi", sleep=sleeps.append)
+
+    assert len(calls) == 3
+    assert len(sleeps) == 2 and sleeps[0] < sleeps[1], f"backoff must grow: {sleeps}"
+
+
+def test_a_404_is_not_retried_and_still_means_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _script_urlopen(monkeypatch, [_http_error(404)])
+    sleeps: list[float] = []
+
+    assert _http_fetch("ghost-pkg", sleep=sleeps.append) is None
+    assert len(calls) == 1 and sleeps == [], "a 404 is a definitive answer and must not be retried"
+
+
+@pytest.mark.parametrize(
+    "definitive",
+    [
+        _http_error(403),
+        _http_error(400),
+        b"<html>not json</html>",
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+    ],
+    ids=["http-403", "http-400", "malformed-json", "cert-verify-failed"],
+)
+def test_a_definitive_failure_is_raised_at_once(
+    monkeypatch: pytest.MonkeyPatch, definitive: BaseException | bytes
+) -> None:
+    calls = _script_urlopen(monkeypatch, [definitive, _GOOD_BODY])
+    sleeps: list[float] = []
+
+    with pytest.raises((urllib.error.URLError, json.JSONDecodeError)):
+        _http_fetch("fastapi", sleep=sleeps.append)
+
+    assert len(calls) == 1 and sleeps == [], "a definitive answer must never be retried into a pass"
+
+
+def test_the_run_budget_caps_retries_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PyPI that is flaky on EVERY name must fail closed in minutes, not after 56 x 3 attempts."""
+    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+    budget = RetryBudget(remaining=1)
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("first", budget=budget, sleep=lambda _s: None)
+    assert len(calls) == 2 and budget.remaining == 0
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("second", budget=budget, sleep=lambda _s: None)
+    assert len(calls) == 3, "an exhausted budget must not retry"
+
+
+def test_main_exits_2_after_retrying_a_persistent_handshake_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI end of the contract: exit 2 (unreachable), each retry logged with attempt and host."""
+    import scripts.security.new_dependency_check as mod
+
+    monkeypatch.setattr(mod, "_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(mod, "_BACKOFF_JITTER_S", 0.0)
+    calls = _script_urlopen(monkeypatch, [_HANDSHAKE_TIMEOUT])
+
+    assert main([]) == 2
+    assert len(calls) == 3, "the sweep must stop at the first request whose retries are spent"
+    err = capsys.readouterr().err
+    assert "attempt 1 of 3 (URLError(TimeoutError))" in err
+    assert "attempt 2 of 3" in err and "pypi.org" in err
+    assert "could not reach PyPI" in err
+
+
+def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One handshake timeout mid-sweep -- the 2026-10-20 eviction -- now clears instead of exiting 2.
+
+    Patches _fetch_once rather than urlopen because each name needs its own canonical payload."""
+    import scripts.security.new_dependency_check as mod
+
+    monkeypatch.setattr(mod, "_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(mod, "_BACKOFF_JITTER_S", 0.0)
+    monkeypatch.setattr(
+        mod, "_fetch_once", functools.partial(_fail_once_then_good, state={"failed": False})
+    )
+
+    assert main([]) == 0
+
+
+def _fail_once_then_good(name: str, *, timeout: float, state: dict[str, bool]) -> dict:
+    if not state["failed"]:
+        state["failed"] = True
+        raise _HANDSHAKE_TIMEOUT
+    return _fetch_all_good(name)
 
 
 def test_main_exits_2_when_the_sweep_examines_nothing(
