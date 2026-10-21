@@ -680,6 +680,16 @@ never with mail. The evidence is probe PR
   into the PR body. Adding a dependency is not in
   this class: follow §7, edit `pyproject.toml` and re-lock. Parameterize SQL; catch exceptions
   specifically (§6).
+- **A command or script that would do harm on the wrong machine carries a circuit breaker (owner
+  ruling 2026-10-21),** including one handed to the owner or written into a file. Put its whole
+  body inside a host check that runs nothing anywhere else. A `hostname;` prefix does not count: it
+  shows the mistake only after the command has run. Use if/else. Never use `exit`: pasted, it closes
+  the owner's PowerShell window. Never use `return` either; it is easy to get wrong in a pasted line.
+
+      if ($env:COMPUTERNAME -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $env:COMPUTERNAME; nothing ran" } else { ... }
+
+  A machine-specific script also checks its own host at the top, right after any `param()` block,
+  so a copy run by hand is guarded too.
 
 ---
 
