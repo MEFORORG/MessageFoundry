@@ -304,6 +304,25 @@ _INVISIBLE_LOOKALIKES = [
 ]
 
 
+def test_the_host_collation_premise_holds() -> None:
+    """The lookalike tests below are only discriminating where PowerShell's culture StartsWith ignores
+    these characters and trips on a combining mark. Without ICU (invariant globalization) culture equals
+    ordinal, every one of them passes against a gate missing either half, and this says so."""
+    probe = (
+        "$z=('c:/r/.claude/worktrees'+[char]0x200b+'/x').StartsWith('c:/r/.claude/worktrees/'); "
+        "$m=('c:/r/'+[char]0x301+'a').StartsWith('c:/r/'); "
+        'Write-Output "$z $m"'
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+        capture_output=True,
+        text=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    if proc.stdout.strip() != "True False":
+        pytest.skip(f"culture comparison on this host is not ICU's ({proc.stdout.strip()!r})")
+
+
 @pytest.mark.parametrize("lookalike", _INVISIBLE_LOOKALIKES)
 def test_an_invisible_character_does_not_reach_the_nested_worktree_exemption(
     primary: Path, repos_file: Path, lookalike: str
@@ -927,9 +946,31 @@ def test_unparseable_input_is_denied(repos_file: Path, junk: str) -> None:
     assert "could not parse" in reason
 
 
-def test_unparseable_input_is_allowed_when_the_gate_is_off(empty_repos: Path) -> None:
-    """The allowlist is still the kill switch: with nothing governed, a parse failure denies nothing."""
-    assert run_gate(_UNPARSEABLE[0], empty_repos) is None
+@pytest.mark.parametrize("off", ["comments-only", "missing"])
+def test_unparseable_input_is_allowed_when_the_gate_is_off(
+    tmp_path: Path, empty_repos: Path, off: str
+) -> None:
+    """The allowlist is still the kill switch: with nothing governed, a parse failure denies nothing.
+    Both off-states, since "delete the allowlist" is the documented instant off."""
+    allowlist = empty_repos if off == "comments-only" else tmp_path / "nope.txt"
+    assert run_gate(_UNPARSEABLE[0], allowlist) is None
+
+
+def test_hook_input_is_decoded_as_utf8_not_the_console_code_page(tmp_path: Path) -> None:
+    """Claude Code writes raw UTF-8. Read through the console code page, a non-ASCII primary's path
+    arrived mangled, never matched its allowlist entry, and the write was allowed."""
+    primary = tmp_path / "Repo-\u00e9"
+    allowlist = tmp_path / "repos.txt"
+    allowlist.write_text(f"{primary}\n", encoding="utf-8")
+    raw = json.dumps(edit(primary / "x.py", primary), ensure_ascii=False).encode("utf-8")
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GATE), "-ReposFile", str(allowlist)],
+        input=raw,
+        capture_output=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    assert proc.stdout, f"expected a DENY, got allow (stderr: {proc.stderr!r})"
+    assert_denied(json.loads(proc.stdout))
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------

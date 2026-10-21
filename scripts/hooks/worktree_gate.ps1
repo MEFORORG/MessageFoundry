@@ -9,8 +9,8 @@
     it governs every session in every worktree the moment it lands -- a project-scoped hook would live on
     one branch and reach the other worktrees only once each merged it.
 
-    It denies two things, and only inside a governed primary checkout (hook input it cannot parse is
-    denied anywhere while the gate is on; see FAILS OPEN below):
+    It denies at least these two things, only inside a governed primary checkout; the rules below add
+    more, and hook input it cannot parse is denied anywhere while the gate is on (see FAILS OPEN):
 
       1. A Write/Edit/MultiEdit/NotebookEdit whose TARGET PATH is inside the primary checkout -- its working
          tree, AND the shared .git beside it. Those are two different things and the difference is
@@ -2324,10 +2324,26 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
 $hook = $null
 $hookText = ""
 $hookUnparseable = $false
+# UTF-8 BYTES, not [Console]::In, which decodes with the console code page. Once a parse failure denies,
+# that matters: on a double-byte code page (cp932, cp936, cp950) a lead byte swallows the next `\`, so
+# a valid payload with such a character beside a JSON escape stops parsing and every such call would be
+# denied. Same reader as Read-CcxHookInput in _hookinput.ps1, inlined because only this file is
+# installed.
+$hookParseError = ""
 try {
-    $hookText = [Console]::In.ReadToEnd()
+    $hookReader = [System.IO.StreamReader]::new(
+        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
+    $hookText = $hookReader.ReadToEnd()
     $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
-} catch { $hookUnparseable = $true }
+} catch {
+    $hookUnparseable = $true
+    # A fixed class for the receipt, never the message: the message can quote the payload.
+    $m = "$($_.Exception.Message)"
+    $hookParseError = if ($m -match 'different casing') { "case-duplicate-key" }
+                      elseif ($m -match 'empty string') { "empty-key" }
+                      elseif ($m -match '(?i)depth') { "depth" }
+                      else { "other" }
+}
 if (-not $hookUnparseable -and -not $hook) { exit 0 }
 
 # The allowlist doubles as the kill switch: no file, no entries => nothing is governed.
@@ -2346,15 +2362,17 @@ $roots = @(
 if ($roots.Count -eq 0) { exit 0 }
 
 if ($hookUnparseable) {
-    # No tool name, cwd or path is known here, so the message names none. The receipt carries only the
-    # input's length: enough to tell a burst of one payload shape from many, and nothing it says.
-    Write-Deny -Rule "parse" -Detail "unparseable-input length=$($hookText.Length)" -Reason @"
+    # No tool name, cwd or path is known here, so the message names none. The receipt carries the
+    # error's class and the input's length: enough to tell one payload shape from many, and nothing
+    # the payload says.
+    Write-Deny -Rule "parse" -Detail "unparseable-input class=$hookParseError length=$($hookText.Length)" -Reason @"
 BLOCKED: the worktree gate could not parse this tool call's hook input as JSON. It cannot tell
 whether the call is governed, so it does not allow it.
 
 PowerShell's JSON parser refuses at least these shapes in a tool input:
   * two keys that differ only by case, such as subagent_type and SUBAGENT_TYPE;
-  * a key that is an empty string.
+  * a key that is an empty string;
+  * nesting deeper than 1024 levels.
 If the input has one of them, retry with each key spelled once and none empty. Otherwise, or if the
 retry is blocked too, STOP and tell the user. Do not route around this.
 "@
@@ -2462,7 +2480,9 @@ $rehome
 #
 # THE EXEMPTION IS ORDINAL; "UNDER A ROOT" IS ORDINAL OR CULTURE. A culture comparison ignores zero-width
 # and soft-hyphen characters, so it read `.claude/worktrees<U+200B>/x`, a directory inside the primary, as
-# the exemption. Ordinal is what the filesystem means, so the exemption uses it alone. The governed test
+# the exemption. Ordinal on this lowercased form is the closest the comparison gets to what the filesystem
+# means (a case-sensitive filesystem still differs: `.claude/Worktrees/` folds onto the exemption), so the
+# exemption uses it alone. The governed test
 # keeps its culture match beside the ordinal one, because the two disagree in BOTH directions (measured:
 # a combining mark after the slash makes the culture StartsWith false and the ordinal one true), and
 # dropping either loses a deny. The culture half still matters: rule 3b's own culture `-eq` hands a
@@ -2472,8 +2492,8 @@ function Test-Governed([string]$Candidate) {
     $ord = [System.StringComparison]::Ordinal
     foreach ($root in $roots) {
         $c = $root.Compare
-        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or
-            [string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {
+        # No ordinal Equals: an ordinal match there is always a culture `-eq` match too.
+        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or $Candidate.StartsWith("$c/", $ord)) {
             if ($Candidate.StartsWith("$c/.claude/worktrees/", $ord)) { return $null }
             return $root
         }
