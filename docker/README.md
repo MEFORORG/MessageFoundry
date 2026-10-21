@@ -168,7 +168,10 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
   production.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
-  passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`).
+  passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`). Under the default `enforce` the engine
+  refuses a group-readable key file ([PHI.md](../docs/PHI.md) §2, *Key files*, which also says what
+  the Kubernetes manifests do about it). A Compose bind mount keeps the host's owner and mode, so own
+  the files by uid 10001 at mode `0600`; `compose.yaml` gives the commands.
 
 ## Healthcheck, signals, rotation
 
@@ -183,7 +186,9 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   serially), so raise it for many-listener graphs. A fully graceful shutdown exits **0**; **143**
   (128+SIGTERM) is also fine; **137** means it was SIGKILLed (grace exceeded = ungraceful).
 - **Cert rotation:** the **API** TLS context is built once at startup, so an API-cert renewal needs a
-  **container restart** (rolling restart across instances). **MLLP** certs reload on `POST /config/reload`.
+  **container restart** (rolling restart across instances). On the Kubernetes manifests it needs a new
+  **pod**, such as `kubectl rollout restart`: `copy-tls` copies the Secret only when a pod starts, so
+  a restart of the engine container alone reads the old copy. **MLLP** certs reload on `POST /config/reload`.
 
 ## Residuals / gotchas
 

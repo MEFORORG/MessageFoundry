@@ -152,7 +152,9 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
-        fsGroup: 10001                      # mounted TLS Secret files (mode 0440) become group-readable
+        # fsGroup lets copy-tls below read the Secret, whose files are root-owned at 0440. The engine
+        # never reads its key through this group.
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       # Spread the 3 replicas across nodes/zones so a single node/zone loss can't take the whole cluster.
@@ -163,6 +165,31 @@ spec:
           labelSelector:
             matchLabels:
               app: mefor-engine-ha
+      # Under enforce the engine refuses a group-readable TLS key, and a Secret volume serves one
+      # (docs/PHI.md section 2, *Key files*). copy-tls copies the pair into a memory emptyDir at 0600 as
+      # uid 10001, and the engine mounts that, never the Secret. A Secret update reaches the engine at
+      # the next pod start. Copy a connection's key file, such as an MLLP tls_key_file, the same way.
+      initContainers:
+        - name: copy-tls
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
+          command:
+            - install
+            - "-m"
+            - "0600"
+            - /etc/mefor/tls-secret/api.crt
+            - /etc/mefor/tls-secret/api.key
+            - /etc/mefor/tls/
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits: { cpu: "100m", memory: "64Mi" }
+          volumeMounts:
+            - { name: tls-secret, mountPath: /etc/mefor/tls-secret, readOnly: true }
+            - { name: tls, mountPath: /etc/mefor/tls }
       containers:
         - name: engine
           # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY config /config).
@@ -217,7 +244,7 @@ spec:
             - name: MEFOR_API_TLS_KEY_PASSWORD
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: api-tls-key-password, optional: true } }
           volumeMounts:
-            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }
+            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }   # copy-tls's 0600 copies
             - { name: tmp, mountPath: /tmp }               # writable tmpfs for the read-only root fs
             # NOTE: NO store PVC here — durability is in the external Postgres, the pods are stateless.
           # Liveness only. /health is tokenless + always 200 and answers BEFORE the engine finishes
@@ -234,10 +261,12 @@ spec:
             requests: { cpu: "250m", memory: "256Mi" }
             limits: { cpu: "1", memory: "512Mi" }
       volumes:
-        - name: tls
+        - name: tls                     # what the engine reads: copy-tls writes it, at 0600
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        - name: tls-secret              # mounted on copy-tls only, never on the engine
           secret:
             secretName: mefor-secrets
-            defaultMode: 0440           # group-readable (fsGroup 10001); keep the private key off 0644
+            defaultMode: 0440           # root-owned: copy-tls reads it through fsGroup 10001. Never 0644
             items:
               - { key: api.crt, path: api.crt }
               - { key: api.key, path: api.key }

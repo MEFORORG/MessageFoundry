@@ -380,8 +380,11 @@ than a path is not checked
   makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
   the first start mint a key and makes every later start refuse it. Supplying your own certificate
   does not avoid this under `"enforce"`: an `[api].tls_key_file` on such a volume is judged by the
-  same test. The shipped Kubernetes manifests mount the API key from a Secret at mode `0440` with
-  `fsGroup`, so as shipped they would not start under `"enforce"`. That gap is open.
+  same test. A Kubernetes Secret volume is one such volume. The shipped manifests
+  (`docker/k8s/statefulset.yaml`, `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on
+  a `copy-tls` initContainer, which copies the API pair into a memory-backed `emptyDir` at mode
+  `0600`, owned by the engine's account. The engine mounts that `emptyDir`, not the Secret. A key
+  you add for a connection has to be copied the same way.
 - The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds
