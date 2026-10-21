@@ -914,3 +914,44 @@ async def test_a_lock_notice_names_the_passkey_way_past_beside_a_refused_totp() 
         assert "combined_sign_in" not in lock.detail
     finally:
         await store.close()
+
+
+async def test_the_scheme_rehash_keeps_a_passkey_discoverable_and_sealed(tmp_path: Any) -> None:
+    """BACKLOG #3423 beside wave 2: moving a passkey stored under the bare digest to today's tagged
+    hash keeps its ``discoverable`` record, the moved set still verifies against the account's
+    seal, and it still opens the rotation gate; a flip after the move still fails the seal."""
+    import base64
+    import hashlib
+    import secrets as _secrets
+
+    from messagefoundry.auth.tokens import credential_id_hash
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from tests._webauthn_store_contract import _cred
+
+    store = await MessageStore.open(
+        tmp_path / "keyed.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        raw = _secrets.token_bytes(32)
+        raw_b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+        await store.add_webauthn_credential(
+            _cred(
+                identity.user_id,
+                "legacy",
+                id_hash=hashlib.sha256(raw).hexdigest(),
+                credential_id=raw_b64,
+                rp_id=RP,
+                discoverable=True,
+            )
+        )
+        assert await service.rehash_webauthn_credentials() == (1, 0)
+        (moved,) = await store.list_webauthn_credentials(identity.user_id)
+        assert moved.credential_id_hash == credential_id_hash(raw) and moved.discoverable
+        assert not await service.must_enrol_before_rotating(identity)
+        await store._db.execute("UPDATE webauthn_credentials SET discoverable = 0")
+        await store._db.commit()
+        assert await service.must_enrol_before_rotating(identity), "a flip passed the seal"
+    finally:
+        await store.close()
