@@ -423,6 +423,23 @@ def _action_bound_json_routes() -> set[str]:
     }
 
 
+def _conditionally_bound_json_routes() -> set[str]:
+    """The action-bound JSON routes whose handler decides in its body whether the bound proof is due.
+
+    BACKLOG #3401: each calls ``_prove_group_save``, which spends the ``save_ends_own_sessions``
+    grant only when the save would end the caller's own sessions and otherwise checks the session
+    window. A route that starts or stops calling it changes this answer."""
+    tree = ast.parse(_AUTH_ROUTES.read_text(encoding="utf-8"))
+    return {
+        route
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and calls_to(node.args, _ACTION_BOUND_GATES)
+        and calls_to(node, {"_prove_group_save"})
+        and (route := _route_of(node)) is not None
+    }
+
+
 def _route_of(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
     """``METHOD path`` from a ``@app.<verb>("<path>", ...)`` decorator, or ``None``."""
     for deco in func.decorator_list:
@@ -529,6 +546,15 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
     for route in sorted(_action_bound_json_routes()):
         if f"`{route}`" not in action:
             problems.append(f"require_action_step_up does not name the action-bound `{route}`")
+    # BACKLOG #3401: the group-wide saves are bound only when they would end the caller's own
+    # sessions, so the row must carry that condition, not list them as unconditionally bound.
+    if _conditionally_bound_json_routes() and (
+        "only when the save would end the caller's own sessions" not in action
+    ):
+        problems.append(
+            "require_action_step_up names the group-wide saves without their condition: they "
+            "are bound only when the save would end the caller's own sessions"
+        )
 
     kerberos = _row(section, "kerberos_enabled")
     if "0.2 target" in kerberos or "v0.1" in kerberos:
@@ -665,7 +691,31 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         "POST /users/{user_id}/reset-mfa",
         "PUT /users/{user_id}/federated-identity",
         "DELETE /users/{user_id}/federated-identity",
+        "PUT /ad-group-map",
+        "PUT /ad-group-scope-map",
+        "PUT /roles/custom/{role_id}",
+        "DELETE /roles/custom/{role_id}",
     }
+    # Of those, the group-wide saves are bound only when they would end the caller's own sessions:
+    # _prove_group_save spends the grant on that branch and checks the session window on the other
+    # (BACKLOG #3401).
+    assert _conditionally_bound_json_routes() == {
+        "PUT /ad-group-map",
+        "PUT /ad-group-scope-map",
+        "PUT /roles/custom/{role_id}",
+        "DELETE /roles/custom/{role_id}",
+    }
+    from messagefoundry.api import auth_routes
+
+    prove = ast.parse(textwrap.dedent(inspect.getsource(auth_routes._prove_group_save)))
+    branch = next(
+        st for st in named_func(prove, "_prove_group_save").body if isinstance(st, ast.If)
+    )
+    assert ast.unparse(branch.test) == "identity.user_id in ended"
+    assert calls_to(ast.Module(body=branch.body, type_ignores=[]), {"spend_step_up_action"})
+    assert calls_to(
+        ast.Module(body=branch.orelse, type_ignores=[]), {"refuse_unless_step_up_window_live"}
+    )
 
     # HTTP intake: an unlisted mTLS subject is an AUTHORIZATION failure, answered 403.
     from messagefoundry.transports.http_listener import HttpSource
