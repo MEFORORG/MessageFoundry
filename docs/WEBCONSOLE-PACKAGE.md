@@ -39,7 +39,8 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
   lockstep; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
   floor is raised at each console release, not as the engine moves.** Console 0.4.0 set the first
-  one, `messagefoundry>=0.5.0`; 0.3.0 and earlier declared a bare `messagefoundry` dependency. Step 2
+  one, `messagefoundry>=0.5.0`, and console 0.5.0 raised it to `messagefoundry>=0.5.2`; 0.3.0 and
+  earlier declared a bare `messagefoundry` dependency. Step 2
   of [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
   `release-webconsole` job refuses a console wheel whose engine requirement has no lower bound.
 - **Mounted same-origin, in-process.** `create_app` grafts the console onto its FastAPI app with a single
