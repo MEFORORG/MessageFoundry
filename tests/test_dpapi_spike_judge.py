@@ -436,9 +436,10 @@ def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:
 
 
 # Reads the rig's account wiring by the PowerShell AST, and runs the installer's Set-ServiceAccount
-# over stubs that store a run-as name the way the SCM did in CI run 39524776520: a local account
-# given as COMPUTERNAME\name reads back as .\name. The verbatim arm is the control. It is that run's
-# failure, so stubs that stopped modelling the SCM would show here as a verbatim arm that passes.
+# over stubs that model the rewrite measured in CI run 39524776520: a local account given as
+# COMPUTERNAME\name reads back as .\name. Any other name they store as given, which is assumed, not
+# measured. The verbatim arm is the control. It is that run's failure, so stubs that stopped
+# modelling the rewrite would show here as a verbatim arm that passes.
 _SPELLING_CHECK = r"""
 param([string]$RigPath, [string]$InstallerPath)
 $ErrorActionPreference = 'Stop'
@@ -481,13 +482,15 @@ $res = [ordered]@{
   reassigned = @($reg.Body.FindAll({ $args[0] -is $assign }, $true) | ForEach-Object { $_.Left.Extent.Text } |
     Where-Object { $_ -in '$RunAs', '$Account' })
   # The rig needs ".\name" NOT to translate on Windows, or Set-ServiceAccount turns it back into
-  # COMPUTERNAME\name. Read for a user that exists here; $null where no SAM is asked.
-  dotTranslates = $null
+  # COMPUTERNAME\name. Read for the current user; $null where no SAM is asked. hostTranslates is
+  # its positive control: a user not in the local SAM, such as a domain account, fails both.
+  dotTranslates = $null; hostTranslates = $null
 }
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
-  try { $null = ([Security.Principal.NTAccount](".\" + [Environment]::UserName)).Translate(
-      [Security.Principal.SecurityIdentifier]); $res.dotTranslates = $true }
-  catch { $res.dotTranslates = $false } }
+  foreach ($probe in @(@('dotTranslates', '.\'), @('hostTranslates', "$env:COMPUTERNAME\"))) {
+    try { $null = ([Security.Principal.NTAccount]($probe[1] + [Environment]::UserName)).Translate(
+        [Security.Principal.SecurityIdentifier]); $res[$probe[0]] = $true }
+    catch { $res[$probe[0]] = $false } } }
 # Stubs, defined after the lift so they win.
 $stored = ''; $startName = ''; $disabled = $false
 function Get-CimInstance { [pscustomobject]@{ Name = 'Svc' } }
@@ -518,6 +521,7 @@ def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Pa
     assert r["otherRunAs"] == f".\\{user}", r
     # Each registration hands Set-ServiceAccount its RunAs, and everything else its Account: the
     # second one the SCM spelling, the owner its virtual account both times.
+    assert len(r["registrations"]) == 2, r["registrations"]
     regs = {reg["Name"]: reg for reg in r["registrations"]}
     assert len(regs) == 2, r["registrations"]
     assert regs["$OtherService"]["Account"] == "$OtherAccount", regs
@@ -535,7 +539,8 @@ def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Pa
     verbatim = r["verbatim"]
     assert verbatim["stored"] == f".\\{user}", verbatim
     assert f"runs as '.\\{user}'" in verbatim["error"] and verbatim["disabled"], verbatim
-    # The rig's arm: sent as .\name, stored as .\name, and the installer's read-back accepts it.
+    # The rig's arm: sent as .\name, and the installer's read-back accepts it. That the SCM keeps
+    # .\name as given is the stubs' assumption, not a measurement; the spike leg's sc.exe qc reads it.
     rig = r["rig"]
     assert rig["startName"] == f".\\{user}" and rig["stored"] == f".\\{user}", rig
     assert rig["error"] == "" and rig["disabled"] is False, rig
@@ -544,9 +549,10 @@ def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Pa
         "'.\\name' translates here, so it would be canonicalised"
     )
     if sys.platform == "win32":
-        assert r["dotTranslates"] is False, (
-            "CONTROL FAILED: the translation was not tried on Windows"
-        )
+        assert r["hostTranslates"] is not None, "CONTROL FAILED: the translation was not tried"
+        if r["hostTranslates"]:
+            # Only then does a refusal of ".\name" say anything about the prefix.
+            assert r["dotTranslates"] is False, r
 
 
 def test_the_rig_names_exactly_the_files_the_judge_reads() -> None:

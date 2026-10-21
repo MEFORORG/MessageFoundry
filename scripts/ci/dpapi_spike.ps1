@@ -176,7 +176,9 @@ function Register-SpikeService {
     else { Set-ServiceAccount -ServiceName $Name -Account $RunAs }
     $choice = Get-ServiceSidTypeChoice -ServiceName $Name -ServiceAccount $Account
     Set-ServiceTokenHardening -ServiceName $Name -SidType $choice.SidType -Privileges $ServicePrivileges
-    "$Name registered as $Account (SCM: $RunAs), SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
+    "$Name registered as $Account (handed to the SCM as $RunAs), SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
+    # SERVICE_START_NAME is the run-as name the SCM actually stored.
+    "===== sc.exe qc $Name ====="; (& sc.exe qc $Name | Out-String).Trim()
     "===== sc.exe qsidtype $Name ====="; (& sc.exe qsidtype $Name | Out-String).Trim()
     "===== sc.exe qprivs $Name ====="; (& sc.exe qprivs $Name | Out-String).Trim()
 }
