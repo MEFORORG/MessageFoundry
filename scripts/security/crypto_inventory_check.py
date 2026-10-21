@@ -2652,10 +2652,14 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "scripts/hooks/worktree_gate.ps1": frozenset({"hash:SHA256"}),
     # A fixed-length cache file name for each querying worktree, from its root path.
     "scripts/coord/overlap.ps1": frozenset({"hash:SHA256"}),
+    # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
+    # session id or a notice key.
+    "scripts/hooks/_hookinput.ps1": frozenset({"hash:SHA256"}),
     # Three CSPRNG bytes as the suffix of a decision record id, after its millisecond UTC stamp, so
-    # two records written in the same millisecond are unlikely to collide (24 bits; not
-    # impossible, and the log's reader keys records by id, so a collision would drop one). An
-    # identifier, not a secret or a token: nothing is authorized by knowing an id.
+    # two records written in the same millisecond are unlikely to collide (24 bits, so not
+    # impossible). A collision costs at least a record: the log's reader keys records by id, and
+    # the spool's final move refuses to overwrite. An identifier, not a secret or a token: nothing
+    # is authorized by knowing an id.
     "scripts/coord/_decisionlog.ps1": frozenset({"csprng:RandomNumberGenerator"}),
     # --- The AFK digest (ADR 0211 section 5): an audit draw, not an identifier. No secret. ---
     # The CSPRNG orders the day's Class B decisions to draw the owner's blind-rating sample, which
@@ -2667,9 +2671,6 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # the digest's reader only; the decision record itself names the recommendation, and any
     # session can read the record.
     "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
-    # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
-    # session id or a notice key.
-    "scripts/hooks/_hookinput.ps1": frozenset({"hash:SHA256"}),
 }
 
 
