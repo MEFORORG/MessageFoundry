@@ -28,6 +28,7 @@ from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes.oidc import _step_up_return_key
 
 _SUB = "S-1-5-21-fed"
 _NEXT = "/ui/config/reload"
@@ -357,3 +358,130 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
         assert 'action="/ui/reauth/oidc"' in r.text
         assert "did not complete the confirmation" in r.text  # BACKLOG #3221: a step-up word
         assert await service.identity_for_token(token) is not None
+
+
+def _flow_id(c: httpx.AsyncClient) -> str:
+    """The flow cookie's value, under whichever of its prefixed names this origin uses."""
+    value = next((v for k, v in c.cookies.items() if k.endswith("mf_oidc_flow")), None)
+    assert value is not None, "the browser holds no flow cookie"
+    return value
+
+
+def _drain_sign_in_window(service: AuthService) -> None:
+    """Spend the sign-in window's GLOBAL budget from many addresses, as a flood would. The sign-in
+    before it already spent some, so the loop stops at the first refusal."""
+    for i in range(_settings().login_rate_limit_global):
+        if not service.allow_login_attempt(f"203.0.113.{i}"):
+            break
+    assert not service.allow_login_attempt("127.0.0.1"), "fixture: the window is not spent"
+
+
+def _forbid_sign_in_charge(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any charge of the sign-in window during the callback fail the test."""
+
+    def _charged(_client: str | None) -> bool:
+        raise AssertionError("a step-up return charged the sign-in window")
+
+    monkeypatch.setattr(service, "allow_login_attempt", _charged)
+
+
+def _ceremony_budget_left(service: AuthService, key: str) -> bool:
+    """Whether the ceremony limiter would admit ``key``, read WITHOUT recording an attempt."""
+    limiter = service._reauth_limiter
+    assert limiter is not None
+    return limiter.would_allow(key)
+
+
+async def test_a_spent_sign_in_window_does_not_refuse_an_idp_step_up_return(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3374. RED when: the callback charges the sign-in window before it tells a step-up
+    return from a sign-in. A flood that spends that window's global budget then refuses every IdP
+    step-up return, while a password step-up, on the per-actor budget, keeps working."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        old = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _NEXT)
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        _drain_sign_in_window(service)
+        _forbid_sign_in_charge(service, monkeypatch)
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 200, r.text
+        assert f'action="{_NEXT}"' in r.text
+        new = c.cookies.get("mf_session")
+        assert new and new != old
+        assert await service.has_recent_step_up(new)
+
+
+async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3374. RED when: the step-up return draws no budget at all once it left the sign-in
+    window. It draws a per-user key of the ceremony limiter, and a spent key refuses it with a 429
+    that writes no audit row and consumes nothing. That key is the return's own, so the user's
+    other ceremonies keep their budget."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        token = await _federated_sign_in(service, c, monkeypatch)
+        identity = await service.identity_for_token(token)
+        assert identity is not None
+        issue_continuation(c, _NEXT)
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        flow_id = _flow_id(c)
+        return_key = _step_up_return_key(identity.user_id)
+        for _ in range(_settings().login_rate_limit_per_ip):
+            assert service.allow_reauth_attempt(return_key), "fixture: refused before the cap"
+        assert not _ceremony_budget_left(service, return_key), "fixture: budget not spent"
+        assert _ceremony_budget_left(service, identity.user_id)
+        _forbid_sign_in_charge(service, monkeypatch)
+        rows_before = await service.store.count_audit(limit=None)
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 429, r.text
+        assert "Too many attempts" in r.text
+        assert "Reload the engine configuration" in r.text  # the action the operator started from
+        assert 'action="/ui/reauth/oidc"' in r.text and 'name="password"' not in r.text
+        assert "retry-after" not in r.headers
+        assert await service.store.count_audit(limit=None) == rows_before
+        assert await service.identity_for_token(token) is not None
+        assert not await service.has_recent_step_up(token)
+        assert _ceremony_budget_left(service, identity.user_id), "the user's own key was spent"
+        # Nothing was consumed: the flow and its cookie wait for a retry of the real return.
+        staged = service.oidc_step_up_flow(flow_id)
+        assert staged is not None and staged.user_id == identity.user_id
+        assert _flow_id(c) == flow_id
+        monkeypatch.setattr(service, "_reauth_limiter", None)  # the budget refilled
+        retry = await _callback(c, start.headers["location"])
+        assert retry.status_code == 200, retry.text
+        new = c.cookies.get("mf_session")
+        assert new and await service.has_recent_step_up(new)
+
+
+@pytest.mark.parametrize("flow_id", [b"not-a-live-flow", b"caf\xe9"])
+async def test_a_return_naming_no_live_step_up_flow_still_draws_the_sign_in_window(
+    engine: Engine, flow_id: bytes
+) -> None:
+    """BACKLOG #3374. RED when: a forged flow cookie reaches the ceremony budget, or a cookie the
+    flow cache cannot key raises before any limiter. The callback reads the flow before it charges
+    anything, so a non-ASCII id once answered an unthrottled 500 here."""
+    service = await _service(engine, _FakeLdap())
+    _drain_sign_in_window(service)
+    names = (b"mf_oidc_flow", b"__Secure-mf_oidc_flow", b"__Host-mf_oidc_flow")
+    cookie = b"; ".join(name + b"=" + flow_id for name in names)
+    async with _client(engine, service) as c:
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "authcode", "state": "s"},
+            headers=[
+                (b"cookie", cookie),
+                *((k.encode(), v.encode()) for k, v in _CROSS_SITE_NAV.items()),
+            ],
+            follow_redirects=False,
+        )
+    assert r.status_code == 303, r.text
+    assert r.headers["location"] == "/ui/login?e=rate_limited"

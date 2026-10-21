@@ -204,7 +204,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     passkey sign-in (ADR 0197 Amendment A, wave 2).
 
     BACKLOG #3401 added ``STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS``, the action the four group-wide
-    saves' console routes bind and their continuations mint."""
+    saves' console routes bind and their continuations mint.
+
+    BACKLOG #3374 added ``OidcStepUpFlow``, the live step-up flow the ``/ui/oidc`` callback reads
+    to charge a step-up return to the staged user's ceremony budget."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
@@ -214,6 +217,7 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "MfaStatus",
         "NotifyEmailAlreadySet",
         "OidcStepUp",
+        "OidcStepUpFlow",
         "PasskeyProof",
         "RolesGained",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",

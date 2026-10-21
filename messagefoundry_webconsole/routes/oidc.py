@@ -42,6 +42,8 @@ Two deliberate departures a reviewer will want to check rather than "fix":
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
+The callback picks its limiter from the flow its cookie names (BACKLOG #3374): see
+``ui_oidc_callback``.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ from messagefoundry.api.security import (
     public_route,
 )
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
-from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp
+from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp, OidcStepUpFlow
 
 from .. import pages
 from .._auth import (
@@ -123,6 +125,48 @@ def reauth_idp_response(
     )
 
 
+def _step_up_target(return_to: str) -> str:
+    """The staged continuation, re-validated although the start leg validated it before staging
+    it, else the console."""
+    return return_to if lookup_ui_action(return_to) is not None else "/ui"
+
+
+#: The refusal text of a spent ceremony budget, on the step-up start and on its return.
+_TOO_MANY_ATTEMPTS = "Too many attempts. Wait a moment."
+
+
+def _step_up_return_key(user_id: str) -> str:
+    """The ceremony-limiter key an IdP step-up's RETURN is charged under (BACKLOG #3374).
+
+    Its own key per user, apart from the one ``POST /ui/reauth/oidc`` and the other ceremonies
+    charge, for two reasons. One step-up then spends one attempt of the user's ceremony budget,
+    not two. And the flow cookie is SameSite=Lax, so a foreign page can send a browser holding a
+    live step-up flow to the callback: on this key those navigations can refuse that user's IdP
+    returns, never their other ceremonies. The limiter is ``glob=0``, so no other key shares it.
+    """
+    return f"oidc-step-up-return:{user_id}"
+
+
+def _step_up_refusal(
+    deps: UiDeps, auth: AuthService, return_to: str, *, error: str | None, status_code: int
+) -> HTMLResponse:
+    """The step-up page a refused IdP return renders. It offers the IdP leg again and never a
+    password field.
+
+    An auto-retry target was staged only because it was issued, and the start leg spent that issue
+    (#2764), so a fresh flow started from this page continues only to an unlock target; the page
+    says so. (After a state mismatch the original flow is still staged and its real return would
+    still continue -- the conservative wording errs toward "nothing will run".) An action-bound
+    unlock page arrives here as return_to only when the start leg found it issued, and that leg
+    leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the retry this page offers
+    still continues to it.
+    """
+    next_ = _step_up_target(return_to)
+    return reauth_idp_response(
+        deps, auth, next_, continues=is_unlock_action(next_), error=error, status_code=status_code
+    )
+
+
 def _step_up_landing(
     request: Request, deps: UiDeps, auth: AuthService, outcome: OidcStepUp
 ) -> Response:
@@ -130,38 +174,22 @@ def _step_up_landing(
 
     Every branch is a document served from this origin, never a 303 onward, for the reason
     :func:`pages.oidc_landing` gives: the session cookie is SameSite=Strict, and a redirect issued
-    in answer to the IdP's cross-site navigation would reach the next page without it. The
-    continuation is re-validated here although the start leg validated it before staging it.
+    in answer to the IdP's cross-site navigation would reach the next page without it.
     """
     if outcome.elevation.session_lost:
         resp: Response = login_redirect_response()
         clear_oidc_flow_cookie(resp, request)
         return resp
-    next_ = outcome.return_to if lookup_ui_action(outcome.return_to) is not None else "/ui"
     token = outcome.elevation.token
     if token is None:
-        # A refusal. The page it renders offers the IdP leg again and never a password field. An
-        # auto-retry target was staged only because it was issued, and the start leg spent that
-        # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
-        # the page says so. (After a state mismatch the original flow is still staged and its real
-        # return would still continue -- the conservative wording errs toward "nothing will run".)
-        # An action-bound unlock page arrives here as return_to only when the start leg found it
-        # issued, and that leg leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the
-        # retry this page offers still continues to it.
-        resp = reauth_idp_response(
-            deps,
-            auth,
-            next_,
-            continues=is_unlock_action(next_),
-            error=outcome.error,
-            status_code=403,
-        )
+        resp = _step_up_refusal(deps, auth, outcome.return_to, error=outcome.error, status_code=403)
         if outcome.flow_consumed:
             # The refusal ended the flow, so its cookie goes too. One that consumed nothing (a
             # state mismatch) skips this: the flow waits for the real IdP return, which needs the
             # cookie (BACKLOG #3198).
             clear_oidc_flow_cookie(resp, request)
         return resp
+    next_ = _step_up_target(outcome.return_to)
     if next_ == "/ui" or is_unlock_action(next_):
         # A GET admin form (or nothing to continue to): open it in the fresh step-up window.
         resp = HTMLResponse(pages.oidc_landing(next_), status_code=200)
@@ -399,7 +427,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 auth,
                 next_,
                 continues=continues,
-                error="Too many attempts. Wait a moment.",
+                error=_TOO_MANY_ATTEMPTS,
                 status_code=429,
             )
         public_origin = getattr(request.app.state, "public_origin", None)
@@ -460,7 +488,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if auth is None or not auth.oidc_enabled:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         client = client_ip(request)
-        if not auth.allow_login_attempt(client):
+        flow_id = request.cookies.get(oidc_flow_cookie_name(request))
+        # BACKLOG #3374: a STEP-UP return draws the per-ACTOR ceremony limiter, under the key
+        # _step_up_return_key gives the user the flow names (see oidc_step_up_flow), so a flood on
+        # the sign-in surface cannot refuse it. Every other caller, a forged or expired cookie
+        # included, still draws the sign-in window.
+        staged: OidcStepUpFlow | None = auth.oidc_step_up_flow(flow_id) if flow_id else None
+        if staged is not None:
+            if not auth.allow_reauth_attempt(_step_up_return_key(staged.user_id)):
+                # A _log.warning, never an audit, as on the sign-in branch below. The flow consumed
+                # nothing: a reload of this return retries it once the budget refills, if the IdP's
+                # code still redeems, and the page's own button starts a fresh flow.
+                _log.warning(
+                    "federated step-up return rate limit exceeded for %s", client or "<unknown>"
+                )
+                return _step_up_refusal(
+                    deps, auth, staged.return_to, error=_TOO_MANY_ATTEMPTS, status_code=429
+                )
+        elif not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.
             _log.warning("federated callback rate limit exceeded for %s", client or "<unknown>")
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
@@ -471,14 +516,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _fail(request, "oidc_failed", keep_flow=True)
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
 
-        flow_id = request.cookies.get(oidc_flow_cookie_name(request))
         if not flow_id:
             # AC-7: without the browser-binding cookie the request is refused even when state and
             # code are otherwise valid — server-side `state` alone would let whoever presents a valid
             # (state, code) pair have the session minted into THEIR browser.
             await auth.audit_oidc_reject("flow_binding_missing", client=client)
             return _fail(request, "flow_binding_missing")
-        if auth.oidc_flow_is_step_up(flow_id):
+        if staged is not None:
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
             # The service pops the flow and re-checks its kind, so this branch only picks the leg.
             step_up = (
