@@ -3268,10 +3268,11 @@ wrong password that sets a lock past the first of its cycle count, so a wrong pa
 threshold costs that path no cell open; the combined sign-in still opens the cell per attempt.
 Where that judgement is missing, the lock escalates by the plain enabled-TOTP rule, as it did
 before BACKLOG #3422, even beside a refused enrolment. At least these races: TOTP enabled,
-replaced or re-keyed between the read the judgement used and the failure's write; and a parallel
-burst whose crossing failure read a lower count, which needs only the username. So the
-fixed-length lock beside a refused enrolment holds only for serial failures that no such write
-races.
+replaced or re-keyed between the failure's pre-lock read and its write; a parallel burst whose
+crossing failure read a lower count, which needs only the username, or read a live lock that an
+unlock lifted before the write; and, at a `lockout_threshold` of 1, an unlock or a password
+rotation landing after a read that saw a live lock. So the fixed-length lock beside a refused enrolment holds only for serial failures that no
+write races.
 
 **Two limits of the passkey way past, stated.** At least these:
 
