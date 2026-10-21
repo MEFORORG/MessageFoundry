@@ -20,7 +20,9 @@
       2. A Task/Agent/Workflow dispatch made FROM the primary -- because a subagent inherits the parent's
          cwd, cannot create a worktree of its own, and its denied edits do not reliably surface to the
          parent (measured: the parent's result came back with an EMPTY permission_denials list). Blocking
-         the fan-out costs one second; letting it run costs the whole workflow.
+         the fan-out costs one second; letting it run costs the whole workflow. A Task/Agent call whose
+         subagent_type is exactly web-fetch or claude-code-guide is exempt; the comment above `Rule 2 --`
+         says why.
 
     KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
     made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
@@ -67,7 +69,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.18.1"
+$GateVersion = "2026.10.21.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
