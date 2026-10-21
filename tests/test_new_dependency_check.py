@@ -16,10 +16,12 @@ import errno
 import functools
 import http.client
 import json
+import re
 import socket
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
 from email.message import Message
@@ -554,7 +556,12 @@ def test_main_exits_2_after_retrying_a_persistent_handshake_timeout(
     assert len(calls) == 3, "the sweep must stop at the first request whose retries are spent"
     err = capsys.readouterr().err
     assert "attempt 1 of 3 (URLError(TimeoutError))" in err
-    assert "attempt 2 of 3" in err and "pypi.org" in err
+    hosts = re.findall(
+        r"^::warning::PyPI request for '[^']+' to (\S+) failed transiently ", err, re.M
+    )
+    assert hosts == ["pypi.org", "pypi.org"], f"one warning per retry, naming the host: {hosts}"
+    assert "attempt 2 of 3" in err
+    assert {urllib.parse.urlsplit(url).hostname for url in calls} == {"pypi.org"}
     assert "could not reach PyPI" in err
 
 
