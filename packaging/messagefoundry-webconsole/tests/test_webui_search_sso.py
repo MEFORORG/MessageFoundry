@@ -291,10 +291,10 @@ async def test_webauthn_enroll_requires_password_reproof(engine: Engine) -> None
             headers=_SFS,
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
-        # ADR 0197 Amendment A, AC-A3: the continuation still works, and then the service refuses a
-        # passkey as this covered account's FIRST factor -- it has no way past the sign-in lock.
+        # The continuation still works. From ADR 0197 Amendment A wave 2 a passkey may be this
+        # covered account's FIRST factor, because the options require a discoverable credential.
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
-        assert r.status_code == 400 and "enrol an authenticator app first" in r.text
+        assert r.status_code == 200 and "data-mf-webauthn-create" in r.text
 
 
 async def test_reauth_both_factors_enrolled_renders_code_and_passkey(engine: Engine) -> None:

@@ -620,6 +620,20 @@ from typing import Any
 #: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
 #: removed. The digest moved again; re-derived with ``--write``.
 #:
+#: Vault BACKLOG #3373 (ADR 0197 Amendment A, wave 2): ``AuthService`` gained
+#: ``begin_passkey_sign_in`` and ``login`` gained the ``passkey`` keyword, carrying the new
+#: ``PasskeyProof``, for the combined passkey sign-in. ``POST /ui/login/passkey`` calls the first and
+#: ``POST /ui/login`` passes the second. The console imports ``PasskeyProof`` at module scope, so a
+#: skew fails the console's import at mount, before any request; an engine that kept the name but
+#: lost a member would fail at sign-in instead. They force a bump. Re-derived with ``--write`` on
+#: this branch's tree (e45be008d9bd193a).
+#:
+#: Vault BACKLOG #3422 (engine PR 2453) added the additive ``totp_reenrolment_recommended`` field to
+#: ``MfaStatus`` and ``MfaStatusResponse`` and moved main's seam to 6d8b36eb7bb94bf0. Vault BACKLOG
+#: #3373 (at e45be008d9bd193a) then merged main; neither parent's value covered both, so the move
+#: comes from the merge. Re-derived with ``--write`` on the merged tree, so the value below covered
+#: both entries.
+#:
 #: BACKLOG #3401: the four group-wide saves take a step-up bound to ``save_ends_own_sessions``
 #: when they would end the caller's own sessions. ``AuthService`` gained
 #: ``sessions_ended_by_ad_map_save`` and ``sessions_ended_by_custom_role_save``, which the
@@ -657,12 +671,16 @@ from typing import Any
 #: ``totp_reenrolment_recommended`` field; the branch at ``35b9f58cdc447306``). Neither parent's
 #: value covered both surfaces, so the move comes from the merge.
 #:
+#: Vault BACKLOG #3373 merged main after BACKLOG #3401 / #3393 (engine PR 2466): this branch's seam
+#: was ``c52ca8f0200fbecf`` and main's ``bcdc6665f3b8a958``. Neither parent's value covered both
+#: surfaces, so the move comes from the merge. Re-derived with ``--write`` on the merged tree.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bcdc6665f3b8a958"
+ENGINE_UI_SEAM: str = "ea0b48d0bf69ec09"
 
 
 @dataclass(frozen=True, slots=True)

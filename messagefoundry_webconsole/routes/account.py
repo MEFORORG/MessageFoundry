@@ -218,12 +218,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         "passkey_added": "Passkey added.",
         "passkey_removed": "Passkey removed.",
     }
-    # ADR 0197 Amendment A: an account the requirement covers that has no TOTP may not register a
-    # passkey as its first factor (``begin_webauthn_registration`` refuses it), so its notice offers
-    # the authenticator app alone. ``must_enrol_before_rotating`` is that refusal's own predicate.
+    # ADR 0197 Amendment A: an account the requirement covers that holds no factor with a way past
+    # the sign-in lock enrols one first: TOTP, or from wave 2 a passkey the browser stores as
+    # discoverable. ``must_enrol_before_rotating`` is the rotation refusal's own predicate.
     _ENROL_TOTP_FIRST_NOTICE = (
-        "That action requires MFA: enroll an authenticator app (TOTP) to continue. "
-        "You can add a passkey after that."
+        "That action requires MFA: enroll an authenticator app (TOTP) or a passkey to continue."
     )
 
     async def _account_notice(
@@ -720,7 +719,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             options = await service.begin_webauthn_registration(
                 identity, token=token, rp_id=rp[0], rp_name=_RP_NAME
             )
-        except ValueError as exc:  # unknown account, or a first factor that must be TOTP
+        except ValueError as exc:  # unknown account
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
