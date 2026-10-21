@@ -2217,6 +2217,7 @@ class AuthStore(Protocol):
         password_generated: bool,
         must_change_password: bool = True,
         require_way_past: bool = False,
+        totp_usable: Callable[[str | None], bool] | None = None,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2377,8 +2378,16 @@ class AuthStore(Protocol):
     # ``require_way_past`` (ADR 0197 Amendment A, wave 2): delete only while the account keeps a way
     # past the sign-in lock after the delete (TOTP, or another discoverable passkey), judged in the
     # delete's own transaction with the account row held. False when refused or when no row matched.
+    # ``totp_usable`` (BACKLOG #3422) is the caller's rule for whether an OPENED TOTP secret is one
+    # the engine can compute with; the conditional writes count TOTP as a way past only then. The
+    # same keyword on ``set_password``.
     async def delete_webauthn_credential(
-        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: Callable[[str | None], bool] | None = None,
     ) -> bool: ...
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...

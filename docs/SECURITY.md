@@ -3243,7 +3243,12 @@ sign-in. A covered must-change account may register its first passkey from the e
 confinement (`ENROL_FIRST_UI_ROUTES`), and a sign-in lock notice on such an account names the
 combined passkey sign-in. The two removal guards and the rotation write ask the way-past question
 again inside their own store write, with the account row held, so two concurrent removals cannot
-both pass.
+both pass. **TOTP counts as a way past only while the engine can compute codes with it**: an
+enrolment whose marker this release refuses (BACKLOG #3422) matches no code, so its combined
+sign-in can never pass a lock. Every way-past gate (rotation, TOTP removal, passkey removal and the
+store's own re-check) and the census ask one rule for this. The census names an account holding
+such a TOTP beside a working discoverable passkey in both lists, and says that a factor reset would
+remove that passkey, so its holder enrols the authenticator app again instead.
 
 **Two limits of the passkey way past, stated.** At least these:
 

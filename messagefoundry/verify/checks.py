@@ -455,14 +455,22 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         if census.passkey_only
         else ""
     )
+    # BACKLOG #3422 beside wave 2: a factor reset would also remove these accounts' working passkey.
+    reset_note = (
+        ". These also hold a discoverable passkey that still gets them past a lock, which a factor "
+        "reset would remove, so re-enrol their authenticator app instead: "
+        + ", ".join(census.reset_would_remove_a_passkey)
+        if census.reset_would_remove_a_passkey
+        else ""
+    )
     if census.clean:
         return CheckResult(
             rid,
             title,
             Status.PASS,
             "every local account the MFA requirement covers holds a generated credential, an "
-            "authenticator app or a discoverable passkey, and every enabled TOTP secret decrypts"
-            + passkey_note,
+            "authenticator app or a discoverable passkey, and every enabled TOTP secret decrypts "
+            "and computes" + passkey_note,
         )
     parts: list[str] = []
     if census.no_way_past:
@@ -483,6 +491,7 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         + ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
         "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
         + passkey_note
+        + reset_note
         + ".",
     )
 

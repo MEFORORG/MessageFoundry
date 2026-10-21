@@ -245,6 +245,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    TotpUsable,
     UserAuthzRecord,
     UserChange,
     UserRecord,
@@ -321,6 +322,7 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
+    totp_counts_with,
     totp_enable,
     totp_removal,
     totp_replace,
@@ -13295,6 +13297,7 @@ class SqlServerStore:
         password_generated: bool,
         must_change_password: bool = True,
         require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -13315,6 +13318,7 @@ class SqlServerStore:
                     now=now,
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
+                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13503,7 +13507,12 @@ class SqlServerStore:
         return row is not None
 
     async def delete_webauthn_credential(
-        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
@@ -13523,6 +13532,7 @@ class SqlServerStore:
                     await self._account_passkeys(cur, user_id),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
+                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
                 ):
                     await conn.rollback()
                     return False

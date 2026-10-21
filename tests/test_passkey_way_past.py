@@ -30,6 +30,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     AuthService,
     FactorEnrolmentRequired,
     PasskeyProof,
+    _opened_totp_usable,
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
@@ -157,10 +158,19 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
         real_delete = store.delete_webauthn_credential
 
         async def already_gone(
-            user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+            user_id: str,
+            credential_id_hash: str,
+            *,
+            require_way_past: bool = False,
+            totp_usable: Any = None,
         ) -> bool:
             assert await real_delete(user_id, credential_id_hash)  # the other tab wins first
-            return await real_delete(user_id, credential_id_hash, require_way_past=require_way_past)
+            return await real_delete(
+                user_id,
+                credential_id_hash,
+                require_way_past=require_way_past,
+                totp_usable=totp_usable,
+            )
 
         store.delete_webauthn_credential = already_gone  # type: ignore[method-assign]
         assert (
@@ -728,5 +738,126 @@ async def test_every_refused_passkey_outcome_is_padded_into_the_first_slot(
         out = await service.login(identity.username, "wrong", passkey=_proof(service, stranger))
         assert not out.ok
         assert slots == [1] * (len(shapes) + 1), slots
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3422 beside wave 2: a TOTP enrolment this release refuses is no way past ------------
+
+_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+#: An enrolment whose marker this release does not compile in: no code ever matches it.
+_REFUSED_TOTP = f"totp1:SHA1:6:30:{_TOTP_SECRET}"
+#: A usable enrolment, the control arm.
+_USABLE_TOTP = f"totp1:SHA256:6:30:{_TOTP_SECRET}"
+
+
+async def _enable_totp(store: MessageStore, user_id: str, secret: str) -> None:
+    cell = await store.set_totp_secret(user_id, secret=secret)
+    assert await store.enable_totp(user_id, recovery_code_hashes=[], expected_secret_cell=cell)
+
+
+def test_the_way_past_rule_reads_an_opened_totp_as_the_census_does() -> None:
+    """One rule for the census and the gates: a refused marker, a non-base32 value and nothing at
+    all are no way past; a usable enrolment, marked or bare, is."""
+    assert not _opened_totp_usable(_REFUSED_TOTP)
+    assert not _opened_totp_usable("not base32 at all!")
+    assert not _opened_totp_usable(None) and not _opened_totp_usable("")
+    assert _opened_totp_usable(_USABLE_TOTP) and _opened_totp_usable(_TOTP_SECRET)
+
+
+@pytest.mark.parametrize(("secret", "removable"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
+async def test_a_refused_totp_does_not_free_the_last_discoverable_passkey(
+    secret: str, removable: bool
+) -> None:
+    """Passkey removal, in the service and in the store's own re-check: an account holding a
+    refused-marker TOTP and one discoverable passkey cannot delete the passkey, since the TOTP is
+    no way past. The control: a usable TOTP frees it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, secret)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        if removable:
+            assert await service.delete_webauthn_credential(identity, cred.credential_id_hash)
+            return
+        with pytest.raises(ValueError) as refused:
+            await service.delete_webauthn_credential(identity, cred.credential_id_hash)
+        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
+        # The in-store re-check on its own, with the service's rule.
+        assert not await store.delete_webauthn_credential(
+            identity.user_id,
+            cred.credential_id_hash,
+            require_way_past=True,
+            totp_usable=_opened_totp_usable,
+        )
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("secret", "rotates"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
+async def test_a_refused_totp_does_not_open_the_rotation_gate(secret: str, rotates: bool) -> None:
+    """Rotation, in the service and in the store's conditional write: an account whose only factor
+    is a refused-marker TOTP cannot rotate into a chosen password with no working way past. The
+    control: a usable TOTP opens the gate."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, secret)
+        assert await service.must_enrol_before_rotating(identity) is not rotates
+        if rotates:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert not await store.set_password(
+            identity.user_id,
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=True,
+            totp_usable=_opened_totp_usable,
+        )
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_hash != "h-chosen"
+    finally:
+        await store.close()
+
+
+async def test_a_refused_totp_may_go_while_a_discoverable_passkey_remains() -> None:
+    """``disable_mfa``: removing a refused TOTP is allowed while a discoverable passkey stays as
+    the account's working way past, the same rule as a usable TOTP."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        await service.disable_mfa(identity)
+        row = await store.get_user(identity.user_id)
+        assert row is not None and not row.totp_enabled
+    finally:
+        await store.close()
+
+
+async def test_the_census_warns_that_a_reset_would_remove_a_working_passkey() -> None:
+    """An account with a refused TOTP and a working discoverable passkey: the TOTP is named as
+    unusable, the account as relying on its passkey, and the census says a factor reset would
+    remove that passkey. It is not named as having no way past."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await service.change_password(identity, _NEW_PASSWORD)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        census = await lockable_account_census(store, AuthSettings())
+        assert census.undecryptable_totp == (identity.username,)
+        assert census.passkey_only == (identity.username,)
+        assert census.reset_would_remove_a_passkey == (identity.username,)
+        assert census.no_way_past == ()
     finally:
         await store.close()

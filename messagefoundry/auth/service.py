@@ -2224,13 +2224,16 @@ class LockableAccountCensus:
     ``no_way_past`` names every local account ``[security].require_mfa`` covers that holds a chosen
     credential (``password_generated`` unset) and no factor with a way past the sign-in lock: no TOTP,
     and no passkey recorded as discoverable (wave 2). ``undecryptable_totp`` names every account
-    whose ENABLED TOTP secret the engine cannot decrypt, which turns the owner's combined sign-in into
-    "right password, wrong code". All are usernames only, sorted; none carries a secret.
+    whose ENABLED TOTP secret the engine cannot decrypt or compute with (BACKLOG #3422), which turns
+    the owner's combined sign-in into "right password, wrong code". All are usernames only, sorted;
+    none carries a secret.
 
-    ``passkey_only`` is informational and not a finding: the covered accounts whose only way past is
-    a passkey recorded as discoverable. The record is what the client reported, or the requirement
-    the registration sent when it reported nothing, so on a client that does not conform it can
-    overstate, and ADR 0197 Amendment A (N-G) has the census name these accounts for that reason."""
+    ``passkey_only`` is informational and not a finding: the covered accounts whose only working way
+    past is a passkey recorded as discoverable, an account whose TOTP is unusable included. The record
+    is what the client reported, or the requirement the registration sent when it reported nothing,
+    so on a client that does not conform it can overstate, and ADR 0197 Amendment A (N-G) has the
+    census name these accounts for that reason. An account in both lists keeps a working passkey that
+    an administrator's factor reset would remove: :attr:`reset_would_remove_a_passkey`."""
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
@@ -2239,6 +2242,12 @@ class LockableAccountCensus:
     @property
     def clean(self) -> bool:
         return not self.no_way_past and not self.undecryptable_totp
+
+    @property
+    def reset_would_remove_a_passkey(self) -> tuple[str, ...]:
+        """The accounts with an unusable TOTP whose working way past is a discoverable passkey: for
+        them the cure is a fresh TOTP enrolment, since ``reset-mfa`` also removes every passkey."""
+        return tuple(sorted(set(self.undecryptable_totp) & set(self.passkey_only)))
 
 
 @dataclass(frozen=True)
@@ -2355,14 +2364,36 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
             "a TOTP secret is still ciphertext: this shell opened the store without the key it was "
             "written under. Set the service's store key here and run again."
         )
+    reason = _totp_unusable_reason(secret)
+    if reason == "refused":
+        _log_totp_refused(user.username)
+    return reason is None
+
+
+def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
+    """Why an OPENED TOTP secret is no key the engine can compute codes with, or ``None`` when it
+    is one. ``"refused"``: its enrolment marker names parameters this release refuses
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"malformed"``: not base32, so no key. The one
+    statement of the rule: :func:`_totp_secret_usable` (the census) and :func:`_opened_totp_usable`
+    (every way-past gate) both ask it, so they cannot disagree about one account."""
     try:
         totp.totp(secret)
     except totp.RefusedEnrolment:
-        _log_totp_refused(user.username)
-        return False
+        return "refused"
     except ValueError:  # binascii.Error is a ValueError: not base32, so no key
+        return "malformed"
+    return None
+
+
+def _opened_totp_usable(secret: str | None) -> bool:
+    """Whether an opened TOTP secret counts as a way past the sign-in lock (ADR 0197 Amendment A):
+    present, not ciphertext a keyless open passed through, and one the engine can compute codes
+    with (:func:`_totp_unusable_reason`). The way-past gates ask it in the service and pass it to
+    the store's conditional writes (``totp_usable``), so an enrolment this release refuses is no
+    way past anywhere."""
+    if not secret:
         return False
-    return True
+    return not secret.startswith(MARKER_PREFIX) and _totp_unusable_reason(secret) is None
 
 
 async def lockable_account_census(
@@ -2398,9 +2429,11 @@ async def lockable_account_census(
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
         if user.totp_enabled:
-            if not await _totp_secret_usable(store, user):
-                undecryptable.append(user.username)
-            continue
+            if await _totp_secret_usable(store, user):
+                continue
+            # An unusable TOTP is named, and the account still falls through: a discoverable passkey
+            # may be its working way past, which reset-mfa would remove (named in passkey_only).
+            undecryptable.append(user.username)
         if (
             user.password_generated
             or user.password_hash is None
@@ -2423,7 +2456,7 @@ async def lockable_account_census(
         digest = user.row.cred_digest if user.row is not None else ""
         if discoverable_way_past(creds, digest, sealed=sealed):
             passkey_only.append(user.username)
-        else:
+        elif not user.totp_enabled:
             no_way_past.append(user.username)
     return LockableAccountCensus(
         no_way_past=tuple(sorted(no_way_past)),
@@ -12049,6 +12082,7 @@ class AuthService:
             must_change_password=must_change,
             password_generated=False,
             require_way_past=covered,
+            totp_usable=_opened_totp_usable,
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
@@ -12076,13 +12110,27 @@ class AuthService:
 
     async def _has_way_past(self, user: VerifiedUser) -> bool:
         """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A):
-        TOTP, which has option E's combined sign-in, or (wave 2) a passkey recorded as
-        discoverable, which has the usernameless passkey sign-in (option N-G).
+        a usable TOTP (:meth:`_totp_way_past`), which has option E's combined sign-in, or (wave 2) a
+        passkey recorded as discoverable, which has the usernameless passkey sign-in (option N-G).
 
         A passkey registered before wave 2, or one whose client reported it was not made
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11)."""
-        return user.totp_enabled or await self._holds_discoverable_passkey(user)
+        return self._totp_way_past(user) or await self._holds_discoverable_passkey(user)
+
+    def _totp_way_past(self, user: VerifiedUser) -> bool:
+        """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its sealed cell opens,
+        and the engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
+        enrolment whose marker this release refuses matches no code, so its combined sign-in can
+        never pass a lock, and it is no way past (BACKLOG #3422)."""
+        if not user.totp_enabled:
+            return False
+        try:
+            secret = self._totp_secret(user)
+        except CipherError:
+            _log_totp_undecryptable(user.username)
+            return False
+        return _opened_totp_usable(secret)
 
     async def _holds_discoverable_passkey(self, user: VerifiedUser) -> bool:
         """Whether ``user`` holds a passkey recorded as discoverable, asked of the set its seal
@@ -12212,6 +12260,14 @@ class AuthService:
                 "account's factors (POST /users/{id}/reset-mfa) for an enrolment this release refuses.",
                 len(census.undecryptable_totp),
                 ", ".join(census.undecryptable_totp),
+            )
+        if census.reset_would_remove_a_passkey:
+            _log.warning(
+                "ADR 0197: %d of those also hold a discoverable passkey that still gets them past a "
+                "lock: %s. Ask each to enrol the authenticator app again from the account page; a "
+                "factor reset (POST /users/{id}/reset-mfa) would also remove that passkey.",
+                len(census.reset_would_remove_a_passkey),
+                ", ".join(census.reset_would_remove_a_passkey),
             )
         await self._audit(
             "auth.lockable_account_census",
@@ -14181,7 +14237,10 @@ class AuthService:
         # concurrent removals cannot both pass a check made before either wrote (ADR 0197 Amendment
         # A, AC-A3a): one place states the rule, store.removal_keeps_way_past.
         if not await self._store.delete_webauthn_credential(
-            identity.user_id, credential_id_hash, require_way_past=keep_way_past
+            identity.user_id,
+            credential_id_hash,
+            require_way_past=keep_way_past,
+            totp_usable=_opened_totp_usable,
         ):
             if keep_way_past and await self._passkey_still_held(identity.user_id, target):
                 raise ValueError(PASSKEY_REMOVAL_REFUSED)

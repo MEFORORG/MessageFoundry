@@ -2654,18 +2654,61 @@ def discoverable_way_past(
     return any(c.discoverable for c in passkeys)
 
 
+#: The caller's rule for whether an OPENED TOTP secret is one the engine can compute codes with
+#: (BACKLOG #3422): the auth service's census rule. The store holds no TOTP logic, so the service
+#: passes it to the conditional writes that ask the way-past question.
+TotpUsable = Callable[[str | None], bool]
+
+#: Whether a record's TOTP counts as a way past, evaluated on the record a write read.
+TotpCounts = Callable[[UserAuthzRecord], bool]
+
+
+def totp_counts_with(
+    opener: Callable[[str, str | None], str | None], usable: TotpUsable | None
+) -> TotpCounts | None:
+    """The :data:`TotpCounts` a backend passes to :func:`holds_way_past` and
+    :func:`removal_keeps_way_past`: open the record's TOTP cell with ``opener`` (the backend's
+    ``open_totp_secret``) and ask ``usable``. A cell that does not open counts for nothing. ``None``
+    for no ``usable``, which leaves the stored-secret test alone."""
+    if usable is None:
+        return None
+    rule = usable
+
+    def counts(record: UserAuthzRecord) -> bool:
+        row = record.row
+        if not row.totp_enabled or row.totp_secret is None:
+            return False
+        try:
+            return rule(opener(row.id, row.totp_secret))
+        except CipherError:
+            return False
+
+    return counts
+
+
+def _totp_is_way_past(record: UserAuthzRecord, totp_counts: TotpCounts | None) -> bool:
+    """TOTP on with a secret, and, given ``totp_counts``, a secret the engine can compute with:
+    an enrolment whose marker this release refuses is no way past (BACKLOG #3422)."""
+    row = record.row
+    if totp_counts is not None:
+        return totp_counts(record)
+    return row.totp_enabled and row.totp_secret is not None
+
+
 def holds_way_past(
-    record: UserAuthzRecord, passkeys: Sequence[WebAuthnCredential], *, sealed: bool
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+    *,
+    sealed: bool,
+    totp_counts: TotpCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
-    TOTP on with a secret, or a passkey recorded as discoverable (wave 2). ``passkeys`` is the
-    account's set, read in the same transaction as the write that asks
-    (:func:`discoverable_way_past` says how it is trusted). TOTP with no secret is no way past,
-    hence its second test."""
-    row = record.row
-    if row.totp_enabled and row.totp_secret is not None:
+    a usable TOTP (:func:`_totp_is_way_past`), or a passkey recorded as discoverable (wave 2).
+    ``passkeys`` is the account's set, read in the same transaction as the write that asks
+    (:func:`discoverable_way_past` says how it is trusted)."""
+    if _totp_is_way_past(record, totp_counts):
         return True
-    return discoverable_way_past(passkeys, row.cred_digest, sealed=sealed)
+    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
 
 
 def removal_keeps_way_past(
@@ -2675,13 +2718,15 @@ def removal_keeps_way_past(
     sealed: bool,
     drop_totp: bool = False,
     drop_passkey: str | None = None,
+    totp_counts: TotpCounts | None = None,
 ) -> bool:
     """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
     passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
     ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
-    trusts it, so a set that fails its digest leaves nothing."""
+    trusts it, so a set that fails its digest leaves nothing. TOTP counts as
+    :func:`_totp_is_way_past` says."""
     row = record.row
-    if not drop_totp and row.totp_enabled and row.totp_secret is not None:
+    if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
@@ -2717,6 +2762,7 @@ def password_change(
     now: float,
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
+    totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2740,7 +2786,9 @@ def password_change(
     when = float(now)
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if require_way_past and not holds_way_past(r, passkeys, sealed=sealed):
+        if require_way_past and not holds_way_past(
+            r, passkeys, sealed=sealed, totp_counts=totp_counts
+        ):
             return None
         claimed = r.row.password_claimed_at
         if not must_change_password and claimed is None:
@@ -15334,6 +15382,7 @@ class MessageStore:
         password_generated: bool,
         must_change_password: bool = True,
         require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -15347,6 +15396,7 @@ class MessageStore:
                 now=now,
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
+                totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15607,13 +15657,18 @@ class MessageStore:
             return (await cur.fetchone()) is not None
 
     async def delete_webauthn_credential(
-        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
         With ``require_way_past``, only while a way past remains after it, judged under the same
-        writer lock (:func:`removal_keeps_way_past`)."""
+        writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
         async with _writer_guard(self._db, self._lock):
             if require_way_past:
                 current = await self._read_user_record(user_id)
@@ -15622,6 +15677,7 @@ class MessageStore:
                     await self._account_passkeys(user_id),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
+                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
                 ):
                     return False
             count = await self._write_passkeys(
