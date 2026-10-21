@@ -838,14 +838,14 @@ were not measured.
 `-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out, needs a
 push and error apart. It prints one line per state change, and for `merged` and `closed` that line
 carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
-in the table above. **With `-Until merged` that state is acted on:** a PR read `behind` or `dirty`
-on two checks of one head and base ends the wait with its own exit code instead of running to the
-timeout. That adds the went-stale arm described just above, not the failing arm: a red required
-check reads `blocked` and still runs to the timeout. The exit line names which state it read, and
-the two need different fixes, so read it before you act: `behind` is an update from `main`,
-`dirty` is a conflict to resolve (see the table above). With `closed` the state is only printed,
-and the `checks-complete` line does not carry it. `checks-complete` waits for every context the
-base branch requires, not only the checks that already exist.
+in the table above. **With `-Until merged`, `dirty` is acted on:** a PR read `dirty` on repeated
+checks of one head and base ends the wait with its own exit code instead of running to the timeout,
+and the fix is a conflict to resolve, not an update from `main` (see the table above). **`behind` is
+only printed**, so the went-stale arm described just above is a line to read, not an exit (the
+script's header says why). Nor is the failing arm an exit: a red required check reads
+`blocked` and still runs to the timeout. With `closed` the state is only printed, and the
+`checks-complete` line does not carry it. `checks-complete` waits for every context the base branch
+requires, not only the checks that already exist.
 
 Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
 options: the two test seams that replace the sleep and the timeout are refused unless
