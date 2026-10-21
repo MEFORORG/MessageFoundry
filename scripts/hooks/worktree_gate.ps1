@@ -30,8 +30,10 @@
     matters. That 29% is a share of those primary-seated sessions' own calls, NOT of every call in
     the repo; the counts and the population are in docs/WORKTREE-GATE.md.
 
-    FAILS OPEN on every error path (bad JSON, missing fields, unreadable allowlist). A guardrail that
-    wedges all work gets uninstalled, and then it protects nothing.
+    FAILS OPEN on error paths such as missing fields and an unreadable allowlist. A guardrail that
+    wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT DOES NOT PARSE IS
+    THE EXCEPTION: while the allowlist governs anything, it is DENIED, because the gate cannot tell
+    whether such a call is governed (see the comment above the ConvertFrom-Json call).
 
     This is a guardrail against the ACCIDENTAL primary edit -- the "I forgot to spin up a worktree" case.
     It is NOT a security boundary: it inspects tool arguments, so a file written from a shell command is
@@ -69,9 +71,10 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.1"
+$GateVersion = "2026.10.21.2"
 
-# Fail OPEN: any unhandled error must let the tool call through, never block it.
+# Fail OPEN: any unhandled error must let the tool call through, never block it. The one exception is
+# hook input that does not parse, which is denied once the allowlist is read.
 $ErrorActionPreference = "SilentlyContinue"
 
 function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") {
@@ -2309,8 +2312,17 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     }
 }
 
-try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { exit 0 }
-if (-not $hook) { exit 0 }
+# A PARSE FAILURE IS RECORDED, NOT ALLOWED. It used to exit 0, which let through any payload
+# ConvertFrom-Json refuses -- for one, PowerShell 7 throws on keys that differ only by case, so a
+# tool_input carrying both `subagent_type` and `SUBAGENT_TYPE` reached no rule at all. The deny waits
+# for the allowlist below, so the kill switch still turns the gate off. Not -AsHashtable: it accepts
+# such keys, but its lookups are case-sensitive where every read in this file relies on a
+# PSCustomObject's case-insensitive ones. Empty stdin and a bare `null` parse to nothing without an
+# error and still exit 0 here: they carry no tool call to judge.
+$hook = $null
+$hookUnparseable = $false
+try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } catch { $hookUnparseable = $true }
+if (-not $hookUnparseable -and -not $hook) { exit 0 }
 
 # The allowlist doubles as the kill switch: no file, no entries => nothing is governed.
 # Each root keeps BOTH forms: a casefolded/slash-normalized one to compare against (Windows paths are
@@ -2326,6 +2338,16 @@ $roots = @(
         }
 )
 if ($roots.Count -eq 0) { exit 0 }
+
+if ($hookUnparseable) {
+    # No tool name, cwd or path is known here, so the message names none.
+    Write-Deny -Rule "parse" -Detail "unparseable-input" -Reason @"
+BLOCKED: the worktree gate could not parse this tool call's hook input as JSON, so it cannot tell
+whether the call is governed, and it does not allow a call it cannot judge. One cause is a tool input
+carrying two keys that differ only by case (for example both subagent_type and SUBAGENT_TYPE), which
+PowerShell's JSON parser refuses. Retry the call with each key spelled once.
+"@
+}
 
 # WHICH governed root does the SESSION belong to? Every other rule judges a PATH and takes its root from
 # whatever matched. Rule 4 fires on the TOOL NAME alone and has no path to match, so it named $roots[0] --
@@ -2377,8 +2399,8 @@ $cwdRaw = [string]$hook.cwd                        # original case: for `git -C`
 #
 # Keys on the TOOL, not the cwd: relocation loses the chat wherever you start it, so once the gate is
 # on (roots non-empty, guarded above) EnterWorktree is denied unconditionally. ExitWorktree is a safe
-# keep and must NOT be caught. Fail-open is preserved: any earlier parse error already exited 0, and
-# only an exact tool match reaches Write-Deny.
+# keep and must NOT be caught. An earlier parse error was already denied (or exited 0 with the gate off),
+# and only an exact tool match reaches Write-Deny.
 #
 # Expressed as `$tool -in @("EnterWorktree")` so tests/test_install_gate_wiring.py SEES this tool as
 # handled -- rule 3 shipped dead once by implementing a rule with no matcher, and that tripwire exists to
@@ -2426,12 +2448,17 @@ $rehome
 
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
+#
+# ORDINAL, like every other prefix check in this file. Both sides are already Get-ComparablePath's
+# lowercased form, so case needs no help; a culture comparison instead ignores zero-width and soft-hyphen
+# characters, and read `.claude/worktrees<U+200B>/x`, a directory inside the primary, as the exemption.
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
+    $ord = [System.StringComparison]::Ordinal
     foreach ($root in $roots) {
         $c = $root.Compare
-        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/")) {
-            if ($Candidate.StartsWith("$c/.claude/worktrees/")) { return $null }
+        if ([string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {
+            if ($Candidate.StartsWith("$c/.claude/worktrees/", $ord)) { return $null }
             return $root
         }
     }
