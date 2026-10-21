@@ -4466,6 +4466,21 @@ jobs:
           cmd /c "openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter $iter -in ""$key"" -passin pass:smoke-key-pass -out ""$wrapped"" -passout pass:smoke-key-pass 2>nul"
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wrapped)) { throw "openssl failed to re-wrap the smoke client key" }
           Move-Item -Force -Path $wrapped -Destination $key
+          # BACKLOG #3402: under enforce the engine refuses a connection key file that a broad group
+          # can read or change. This key inherits BUILTIN\Users read from RUNNER_TEMP. So strip its
+          # inherited entries, which are all it has, as openssl wrote it. Then grant SYSTEM and
+          # Administrators full, and the service account read. LocalSystem's account is SYSTEM, so
+          # it gets no second entry. Last, run the engine's own check on this key, as this account.
+          # It shows no broad group can reach the key. Whether the service account can read it is
+          # shown only when the service starts. tests/test_service_token_hardening.py ties this key
+          # to the key files the engine's preflight judges in the samples graph, so a second one
+          # fails on the pull request.
+          $clientKeyGrants = @("*S-1-5-18:F", "*S-1-5-32-544:F")
+          if ($env:SMOKE_ACCOUNT -ne "localsystem") { $clientKeyGrants += "${grantee}:R" }
+          & icacls $key /inheritance:r /grant:r $clientKeyGrants | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "could not lock the smoke client key (icacls exit $LASTEXITCODE)" }
+          python -c "import sys; from messagefoundry.config.key_file_access import key_file_problem as check; p = check(sys.argv[1], what='the smoke client key', remedy='Lock it'); print(p or 'restricted'); sys.exit(1 if p else 0)" $key
+          if ($LASTEXITCODE -ne 0) { throw "the engine's key-file check refuses the smoke client key '$key' (exit $LASTEXITCODE)" }
           # `prod` is a PHI environment, so the engine FAIL-CLOSES at startup unless a store encryption
           # key is set (PHI-at-rest must never be plaintext). Without one, `serve` refuses to start, NSSM
           # throttles the crash-loop to SERVICE_PAUSED, and /health never comes up. Mint a throwaway AES

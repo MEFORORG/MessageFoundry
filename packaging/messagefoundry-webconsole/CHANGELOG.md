@@ -20,6 +20,15 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Added
+
+- **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
+  button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
+  window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with
+  the username and password. A local account with a discoverable passkey uses it to get past a
+  sign-in lock that someone else's wrong passwords set. Needs the engine seam that carries
+  `AuthService.begin_passkey_sign_in`. (BACKLOG #3373, ADR 0197 Amendment A wave 2)
+
 ### Security
 
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the

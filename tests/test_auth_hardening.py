@@ -36,7 +36,7 @@ from messagefoundry.api.app import _session_reaper
 from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService, LastAdministratorRefused
+from messagefoundry.auth.service import AuthService, LastAdministratorRefused, _opened_totp_state
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
@@ -465,6 +465,7 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
                 lockout_seconds=900.0,
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
+                totp_usable=_opened_totp_state,
             )
 
     async with _client(engine, service, serve_ui=True) as c:

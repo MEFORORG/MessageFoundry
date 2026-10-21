@@ -2151,11 +2151,15 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     local_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))
     doubling = (
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
-        "account, and the sign-in lock does so only on a local account with TOTP enrolled; every "
-        "other lock keeps `lockout_minutes`"
+        "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
+        "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
+        "or whose value will not compute, still escalates. Every other lock keeps "
+        "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
+        "serial failures only: a race listed under [WebAuthn passkeys]"
     )
     assert doubling in " ".join(local_row[2].split()), (
-        "the Local row's brute-force cell must state which locks double, as lockout_escalates does."
+        "the Local row's brute-force cell must state which locks double, as lockout_escalates "
+        "and lockout_increment's refused-TOTP rule do."
     )
     for token in (
         "**Set this to `administrators`**, which frees only a **local** account that does not "
@@ -2349,16 +2353,15 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             # Items 1-3: a covered account with no TOTP enrols before it rotates.
             with pytest.raises(FactorEnrolmentRequired):
                 await service.change_password(identity, "a-brand-new-chosen-passphrase")
-            # Items 2 and 5: its first factor may not be a passkey.
-            with pytest.raises(FactorEnrolmentRequired):
-                await service.begin_webauthn_registration(
-                    identity, token=out.token, rp_id="localhost", rp_name="t"
-                )
+            # Items 2 and 5 moved in wave 2 (ADR 0197 Amendment A): its first factor may be a
+            # passkey, because the registration requires a discoverable one. The twelfth sweep's
+            # probe pins that order.
             off = AuthService(store, AuthSettings(require_mfa=False))
             assert not await off.must_enrol_before_rotating(identity), (
                 "with require_mfa off the account should rotate first"
             )
-            # Item 6: once TOTP is on, a covered account cannot remove it, passkey or not ...
+            # Item 6: once TOTP is on, a covered account cannot remove it while no DISCOVERABLE
+            # passkey remains; this one is not discoverable ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
             staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
             assert await store.enable_totp(
@@ -2418,21 +2421,24 @@ def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
     assert "ends its own sessions and changes its password from a password-only session" not in (
         binding
     ), "item 2: the factor-binding row says a no-factor account changes its password pending"
-    assert "first factor must be TOTP" in binding
+    assert "first factor must be TOTP or a discoverable passkey" in binding
 
     # 3. A pending no-factor session cannot rotate, in any configuration.
     assert "An account with no factor still changes its password from a pending session" not in doc
     assert "it cannot rotate from a pending session either" in doc
 
-    # 4. A reset passkey-only account also enrols TOTP before it rotates.
+    # 4. A reset passkey-only account rotates only once it holds a way past; from wave 2 a
+    #    discoverable passkey is one (ADR 0197 Amendment A).
     assert "A passkey-only account has to do this on the console" not in doc
-    assert "must also enrol TOTP before it rotates" in doc and "`_has_way_past` counts TOTP" in doc
+    assert "must also enrol TOTP before it rotates" not in doc
+    assert "`_has_way_past` counts TOTP or a passkey recorded as discoverable" in doc
 
-    # 5. CONFIGURATION.md's require_mfa row: TOTP first for a covered local account.
+    # 5. CONFIGURATION.md's require_mfa row: a factor with a way past first for a covered local
+    #    account, TOTP or (wave 2) a discoverable passkey.
     assert "to enrol TOTP or a passkey." not in config, (
         "item 5: the require_mfa row offers a passkey as a covered local account's first factor"
     )
-    assert "enrols **TOTP first**" in _config_row("require_mfa", "bool")
+    assert "enrols **TOTP or a discoverable passkey first**" in _config_row("require_mfa", "bool")
 
     # 6. TOTP removal refuses on its own condition, and the MFA section says so.
     assert "the same refusal, on the same condition, as the passkey removal path" not in doc
@@ -2822,9 +2828,11 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
         "api.security.require no longer asks mfa_satisfied; the docs say the factor is an access gate."
     )
 
-    # 2. The first factor of an account the requirement covers is TOTP. The ninth sweep pins the
-    #    covered local refusal end to end; this adds the arms the docs now also state: a directory
-    #    account and a local account outside the requirement may register a passkey first. A real
+    # 2. Wave 2 (ADR 0197 Amendment A): the first factor of an account the requirement covers is
+    #    TOTP or a passkey, since a registration requires a discoverable credential, so every arm
+    #    passes the begin gate; a covered local account is refused only a passkey its client reports
+    #    is not discoverable, at the finish. A directory account and a local account outside the
+    #    requirement may register a passkey first, as before. A real
     #    service and store, with the account row swapped and the first store read past the gate
     #    raising a sentinel, so "passed the gate" is told from "refused at it" with no WebAuthn extra.
     from messagefoundry.store.store import MessageStore
@@ -2881,14 +2889,14 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
             await store.close()
 
     assert asyncio.run(probe()) == {
-        "covered local, no TOTP": "refused",
+        "covered local, no TOTP": "passed",
         "covered local, TOTP": "passed",
         "local, requirement off": "passed",
         "directory, no TOTP": "passed",
     }, (
         "the first-passkey order changed. docs/REMOTE-CONSOLE.md and docs/BROWSER-SUPPORT.md say a "
-        "covered local account enrols TOTP first and a directory account or a local account outside "
-        "the requirement may register a passkey first."
+        "covered local account enrols TOTP or a discoverable passkey first, and a directory account "
+        "or a local account outside the requirement may register a passkey first."
     )
     # ...and a covered account cannot then drop the TOTP that came first.
     disable = ast.parse(textwrap.dedent(inspect.getsource(AuthService.disable_mfa)))
@@ -3104,7 +3112,8 @@ def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
 
 def test_the_twelfth_sweep_remote_console_sends_a_covered_account_to_totp_first() -> None:
     """docs/REMOTE-CONSOLE.md's X-MFA-Required row said "Enrol TOTP or a passkey". A covered local
-    account's first passkey is refused until it holds TOTP."""
+    account's first factor must be one with a way past the sign-in lock: TOTP, or from ADR 0197
+    Amendment A wave 2 a passkey the browser stores as discoverable, which the row now names."""
     row = _flat(
         next(
             line

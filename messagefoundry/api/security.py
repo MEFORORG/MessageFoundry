@@ -146,8 +146,9 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset(
 # shipped require_mfa that is every new account. The rotation ends every session, so rotating first
 # would pass through "a chosen password, no factor, no session", which anyone who knows the username
 # can lock. So the order is enrol, then rotate, and these paths are open to such a session only; for
-# every other must-change session the set above stands. Passkey registration is deliberately absent:
-# in wave 1 a passkey is not a way past, and the service refuses it as a first factor anyway. Keyed
+# every other must-change session the set above stands. Passkey registration is absent because the
+# JSON plane has no passkey routes; the console's twin (ENROL_FIRST_UI_ROUTES) admits it, since from
+# wave 2 a discoverable passkey is a way past. Keyed
 # on (METHOD, path) for the reason _MFA_EXEMPT_ROUTES gives: GET /me/mfa reads the factor status,
 # and DELETE /me/mfa removes a factor, which a path-only entry would open too.
 _ENROL_FIRST_ROUTES: frozenset[tuple[str, str]] = frozenset(

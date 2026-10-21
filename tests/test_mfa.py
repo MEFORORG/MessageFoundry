@@ -46,6 +46,7 @@ from messagefoundry.auth.service import (
     AuthService,
     _credential_lock_key,
     _directory_login_refusal,
+    _opened_totp_state,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -661,6 +662,7 @@ async def test_parallel_store_increments_each_land_and_lock_once() -> None:
                         lockout_seconds=900.0,
                         max_lockout_seconds=86_400.0,
                         now=now,
+                        totp_usable=_opened_totp_state,
                     )
                     for _ in range(burst)
                 )
@@ -1221,6 +1223,7 @@ async def _set_second_step_lock(store: MessageStore, user_id: str) -> None:
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=time.time(),
+            totp_usable=_opened_totp_state,
         )
 
 
@@ -2225,6 +2228,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=clock.now,
+            totp_usable=_opened_totp_state,
         )
         assert result.just_locked
         await service._record_lock(user, "second_step", result, client=None, factor="password")
@@ -2330,6 +2334,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=clock.now,
+            totp_usable=_opened_totp_state,
         )
         await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
         notice = (await _lock_notices(service, notifier))[-1]
@@ -2397,6 +2402,7 @@ async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failu
                 lockout_seconds=900.0,
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
+                totp_usable=_opened_totp_state,
             )
         assert (await service.reauth(out.identity, password, token=out.token)).ok
         flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
@@ -3017,7 +3023,8 @@ async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_hold
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC-A3, the whole first sign-in. At every step the account holds a way past, and each step
-    that would break that is refused: the rotation before TOTP, and a passkey as the first factor."""
+    that would break that is refused: the rotation before a factor with a way past. From wave 2 a
+    passkey registration may start, because it requires a discoverable credential."""
     from messagefoundry.auth.service import FactorEnrolmentRequired
 
     store = await _store()
@@ -3039,11 +3046,14 @@ async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_hold
         assert row is not None and row.password_generated and _way_past(row)
         assert await service.must_enrol_before_rotating(identity)
 
-        # A passkey cannot be the first factor: it has no way past the lock in wave 1.
-        with pytest.raises(FactorEnrolmentRequired):
+        # Wave 2: a passkey may be the first factor, because the registration REQUIRES a
+        # discoverable credential, which the usernameless sign-in can find.
+        options = json.loads(
             await service.begin_webauthn_registration(
                 identity, token=token, rp_id="localhost", rp_name="MessageFoundry"
             )
+        )
+        assert options["authenticatorSelection"]["residentKey"] == "required"
 
         # Enrolment is allowed, and it is TOTP.
         enroll = await service.begin_mfa_enrollment(identity)
@@ -3406,7 +3416,8 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
                 password_hash=await asyncio.to_thread(hash_password_for_test, "a-chosen-one-99x"),
                 password_generated=False,
                 must_change_password=False,
-                require_totp=True,
+                require_way_past=True,
+                totp_usable=_opened_totp_state,
             ), "the holder's conditional write must match here, TOTP is still on"
             await real_disable(user_id, **k)
 

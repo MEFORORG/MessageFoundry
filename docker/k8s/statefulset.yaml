@@ -17,7 +17,7 @@
 # adopter image (COPY writes root-owned files; run chmod -R a+rX,go-w on it in the build context first):
 #     FROM messagefoundry:<version>
 #     COPY config /config
-# and set image: below to it.
+# and set both image: fields below (copy-tls and engine) to it.
 #
 # Single replica: the default SQLite store is single-writer. For multi-node HA use the Postgres/SQL Server
 # store backend + the built leader election (docs/CLUSTERING.md) — out of scope for this baseline manifest.
@@ -75,9 +75,36 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
-        fsGroup: 10001                      # so the mounted TLS Secret files (mode 0440) are group-readable
+        # fsGroup makes the store PVC writable by the engine, and lets copy-tls below read the Secret,
+        # whose files are root-owned at 0440. The engine never reads its key through this group.
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # Under enforce the engine refuses a group-readable TLS key, and a Secret volume serves one
+      # (docs/PHI.md section 2, *Key files*). copy-tls copies the pair into a memory emptyDir at 0600 as
+      # uid 10001, and the engine mounts that, never the Secret. A Secret update reaches the engine at
+      # the next pod start. Copy a connection's key file, such as an MLLP tls_key_file, the same way.
+      initContainers:
+        - name: copy-tls
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
+          command:
+            - install
+            - "-m"
+            - "0600"
+            - /etc/mefor/tls-secret/api.crt
+            - /etc/mefor/tls-secret/api.key
+            - /etc/mefor/tls/
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits: { cpu: "100m", memory: "64Mi" }
+          volumeMounts:
+            - { name: tls-secret, mountPath: /etc/mefor/tls-secret, readOnly: true }
+            - { name: tls, mountPath: /etc/mefor/tls }
       containers:
         - name: engine
           # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY config /config).
@@ -113,7 +140,7 @@ spec:
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: api-tls-key-password, optional: true } }
           volumeMounts:
             - { name: store, mountPath: /var/lib/mefor }   # PHI store (PVC); WAL writes -wal/-shm siblings here
-            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }
+            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }   # copy-tls's 0600 copies
             - { name: tmp, mountPath: /tmp }               # writable tmpfs for the read-only root fs
           # Liveness only. /health is tokenless + always 200 and answers BEFORE the engine finishes
           # starting — a pure liveness signal, not readiness. There is no unauthenticated readiness
@@ -123,10 +150,12 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 30
       volumes:
-        - name: tls
+        - name: tls                     # what the engine reads: copy-tls writes it, at 0600
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        - name: tls-secret              # mounted on copy-tls only, never on the engine
           secret:
             secretName: mefor-secrets
-            defaultMode: 0440           # group-readable (fsGroup 10001); keep the private key off 0644
+            defaultMode: 0440           # root-owned: copy-tls reads it through fsGroup 10001. Never 0644
             items:
               - { key: api.crt, path: api.crt }
               - { key: api.key, path: api.key }

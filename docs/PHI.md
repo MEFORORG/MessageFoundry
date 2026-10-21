@@ -345,11 +345,28 @@ account that created it, plus read for the one account `protect-key --grant-acco
 does not inherit from the directory. If the file cannot be created that way, the command fails and writes no file
 ([restricted_file.py](../messagefoundry/restricted_file.py)).
 
-`serve` and `supervise` also check two of these files before they use them: the store key file,
-when `[store].key_provider` loads it, and the TLS key the engine minted. If a broad group can read
-or change the file, or its access cannot be read, the engine refuses to start under
-`[security].enforcement = "enforce"` and warns under `"warn"`. Every other command that reads the
-store key file, such as `provision-admin` and `rotate-key`, logs a warning and goes on.
+`serve` and `supervise` also check key files before they use them: the store key file, when
+`[store].key_provider` loads it, the TLS key the engine minted, and an `[api].tls_key_file` you
+supply. With no `[api].tls_key_file` the key is in the certificate PEM, so `[api].tls_cert_file`
+is checked instead. If a broad group can read or change the file, or its access cannot be read, the
+engine refuses to start under `[security].enforcement = "enforce"` and warns under `"warn"`. Every
+other command that reads the store key file, such as `provision-admin` and `rotate-key`, logs a
+warning and goes on.
+
+A connection's key file is checked each time the engine is about to run a graph: at the start, on
+every reload that applies one, and on a DR activation, which re-applies the running graph. The
+check resolves `env()` against the values that load uses, and reads the files off the event loop.
+That is at least `tls_key_file` on MLLP, the HTTP listener,
+DICOM and FTPS, and `Soap(client_key_file=...)`. Where a TLS connection leaves `tls_key_file`
+unset, or its `env()` value blank, the key is in its certificate PEM, so `tls_cert_file` is
+checked instead. A connection that loads no TLS identity has neither file checked.
+Under `"enforce"` a file a broad group can read would refuse the start, or the reload or activation,
+which keeps the running graph, and `supervise` would refuse such a graph, judged whole, before it
+starts an engine shard. Under `"warn"` each engine shard logs it, and `supervise` refuses nothing.
+Each engine shard checks its own inbound connections and every outbound one. A connection with
+`deployed = false` is not checked until a reload deploys it. A value that holds PEM text rather
+than a path is not checked
+([key_file_access.py](../messagefoundry/config/key_file_access.py), BACKLOG #3402).
 
 **What this does not cover.** Know these before you rely on it:
 
@@ -361,14 +378,30 @@ store key file, such as `provision-admin` and `rotate-key`, logs a warning and g
   SERVICE are accounts that many services share, and the check does not report them.
 - On POSIX the test is a group or other read or write bit, whoever is in the group. A volume that
   makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
-  the first start mint a key and makes every later start refuse it. Supply your own certificate
-  there, as the shipped manifest does.
+  the first start mint a key and makes every later start refuse it. Supplying your own certificate
+  does not avoid this under `"enforce"`: an `[api].tls_key_file` on such a volume is judged by the
+  same test. A Kubernetes Secret volume is one such volume. The shipped manifests
+  (`docker/k8s/statefulset.yaml`, `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on
+  a `copy-tls` initContainer, which copies the API pair into a memory-backed `emptyDir` at mode
+  `0600`, owned by the engine's account. The engine mounts that `emptyDir`, not the Secret. A key
+  you add for a connection has to be copied the same way.
 - The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds
   permissions, or supply your own certificate.
-- It does not look at an operator-supplied `[api].tls_key_file` or a connection's key file.
-  Restrict those yourself.
+- It does not look at, at least: the syslog forwarder's client key, a `Database` connection's
+  `odbc_params` `sslkey`, a `smart_private_key` on a connection or a `FhirLookup`, a signing key
+  such as `sign_private_key` or `Direct(signing_key=...)`, and a path in
+  `[auth].oidc_client_private_key`. Restrict those yourself. `Sftp(private_key=...)` holds key
+  text, not a path, so it has no file to check.
+- A connection's key file is checked when a graph is about to run, not each time a connection
+  starts. A key file that was missing then passes, for the connection's own build to refuse, so an
+  operator start of that connection after the file appears would not check it. Nor would a
+  clustered standby that takes leadership and starts the graph it loaded earlier. A dry-run reload
+  checks nothing, because it starts no connection.
+- The check judges every connection in the graph, including one a DR activation's priority
+  threshold would park, so under `"enforce"` such a connection's key file would refuse the whole
+  activation.
 - A key file is created for the account that creates it. `cert import` and `cert self-signed` have
   no grant option, so run them as the account that will read the key, or grant that account
   yourself. If an administrator runs `serve` by hand before the service first starts, the minted

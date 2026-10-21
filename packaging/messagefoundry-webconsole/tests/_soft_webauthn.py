@@ -62,6 +62,10 @@ class SoftAuthenticator:
     rp_id: str = "t"
     origin: str = "http://t"
     sign_count: int = 0
+    #: The ``userHandle`` every assertion returns: the account id the credential was registered
+    #: for, as a discoverable credential returns it (ADR 0197 Amendment A, wave 2). ``None`` sends
+    #: none, the shape of a credential that is not discoverable.
+    user_handle: bytes | None = None
     credential_id: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     _key: ec.EllipticCurvePrivateKey = field(
         default_factory=lambda: ec.generate_private_key(ec.SECP256R1())
@@ -74,9 +78,16 @@ class SoftAuthenticator:
     def _rp_hash(self) -> bytes:
         return hashlib.sha256(self.rp_id.encode("utf-8")).digest()
 
-    def create_response(self, challenge: bytes, *, transports: list[str] | None = None) -> str:
+    def create_response(
+        self,
+        challenge: bytes,
+        *,
+        transports: list[str] | None = None,
+        resident_key: bool | None = None,
+    ) -> str:
         """A ``navigator.credentials.create`` response JSON (fmt="none" — time-stable, no
-        attestation cert chain; the passkey norm and this repo's requested policy)."""
+        attestation cert chain; the passkey norm and this repo's requested policy).
+        ``resident_key`` reports ``credProps.rk``; ``None`` reports no ``credProps`` at all."""
         attested = (
             _AAGUID
             + struct.pack(">H", len(self.credential_id))
@@ -98,13 +109,16 @@ class SoftAuthenticator:
         }
         if transports is not None:
             response["transports"] = transports
+        extensions: dict[str, object] = {}
+        if resident_key is not None:
+            extensions["credProps"] = {"rk": resident_key}
         return json.dumps(
             {
                 "id": self.credential_id_b64,
                 "rawId": self.credential_id_b64,
                 "response": response,
                 "type": "public-key",
-                "clientExtensionResults": {},
+                "clientExtensionResults": extensions,
             }
         )
 
@@ -129,7 +143,9 @@ class SoftAuthenticator:
                     "clientDataJSON": bytes_to_base64url(client_data),
                     "authenticatorData": bytes_to_base64url(auth_data),
                     "signature": bytes_to_base64url(signature),
-                    "userHandle": None,
+                    "userHandle": (
+                        None if self.user_handle is None else bytes_to_base64url(self.user_handle)
+                    ),
                 },
                 "type": "public-key",
                 "clientExtensionResults": {},
