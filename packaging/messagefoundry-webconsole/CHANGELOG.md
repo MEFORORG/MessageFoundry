@@ -82,6 +82,9 @@ this line.**
   takes that base class (`BACKLOG #2289`); it took `Request | WebSocket`. The console still
   passes a `Request` or a `WebSocket`, and both fit, so no console call changed. The signature
   is on the seam the console pins, so the supported digest moved.
+- **Seam only: the MFA status names a TOTP re-enrolment.** `MfaStatus` and `MfaStatusResponse`
+  gain `totp_reenrolment_recommended` (vault `BACKLOG #3422`). The console does not show it yet,
+  but the field is on the seam it pins, so the supported digest moved.
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.

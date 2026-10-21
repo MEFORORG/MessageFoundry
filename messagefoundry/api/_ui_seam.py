@@ -652,10 +652,10 @@ from typing import Any
 #: ``count_other_sessions`` return ``int | None``, None for a count the store refused, which the
 #: account page reads to keep its mark, so the digest moved again, from ``108e906e98fd66f0``.
 #:
-#: Merging main into the #3401 / #3393 stack joined two digests: this stack's ``35b9f58cdc447306``
-#: and main's ``6d8b36eb7bb94bf0``, where BACKLOG #3422 gave ``MfaStatus`` and
-#: ``MfaStatusResponse`` a ``totp_reenrolment_recommended`` field. The digest below covers both
-#: surfaces. Re-derived with ``--write``.
+#: Re-derived with ``--write`` on the #3401 / #3393 branch's merge of main at 4b0aa7ec9 (seam
+#: digest ``6d8b36eb7bb94bf0``, where BACKLOG #3422 gave ``MfaStatus`` and ``MfaStatusResponse`` a
+#: ``totp_reenrolment_recommended`` field; the branch at ``35b9f58cdc447306``). Neither parent's
+#: value covered both surfaces, so the move comes from the merge.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
