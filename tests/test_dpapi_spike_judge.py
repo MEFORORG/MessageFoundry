@@ -428,6 +428,95 @@ def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:
     assert any("calls Get-FilePinProblem" in gap for gap in gaps), gaps
 
 
+# Lifts the installer's Set-ServiceAccount and the rig's ConvertTo-ScmAccountName, and runs them
+# over stubs that store a run-as name the way the SCM did in CI run 39524776520: a local account given
+# as COMPUTERNAME\name reads back as .\name. The verbatim arm is the control. It is that run's failure,
+# so a stub that stopped modelling the SCM would show here as a verbatim arm that passes.
+_SPELLING_CHECK = r"""
+param([string]$RigPath, [string]$InstallerPath)
+$ErrorActionPreference = 'Stop'
+# Linux pwsh sets no COMPUTERNAME, and the rewrite the stubs model is keyed on it.
+if (-not $env:COMPUTERNAME) { $env:COMPUTERNAME = 'SPIKEHOST' }
+$L = [System.Management.Automation.Language.Parser]
+$fnType = [System.Management.Automation.Language.FunctionDefinitionAst]
+$assign = [System.Management.Automation.Language.AssignmentStatementAst]
+$rig = $L::ParseFile($RigPath, [ref]$null, [ref]$null)
+$installer = $L::ParseFile($InstallerPath, [ref]$null, [ref]$null)
+foreach ($pair in @(@($installer, 'Set-ServiceAccount'), @($rig, 'ConvertTo-ScmAccountName'))) {
+  $f = @($pair[0].EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq $pair[1] })
+  if ($f.Count -ne 1) { throw "$($pair[1]) is defined $($f.Count) times at top level" }
+  . ([scriptblock]::Create($f[0].Extent.Text))
+}
+# The account the rig hands Register-SpikeService for the second service, from its own assignments.
+$top = @($rig.EndBlock.Statements | Where-Object { $_ -is $assign })
+$rhs = { param($n) @($top | Where-Object { $_.Left.Extent.Text -eq $n })[0].Right.Extent.Text }
+$OtherUser = & ([scriptblock]::Create((& $rhs '$OtherUser')))
+$OwnerService = & ([scriptblock]::Create((& $rhs '$OwnerService')))
+$other = & ([scriptblock]::Create((& $rhs '$OtherAccount')))
+$owner = & ([scriptblock]::Create((& $rhs '$OwnerAccount')))
+# Every Set-ServiceAccount call in the rig, by the text of its -Account argument.
+$sent = @($rig.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+    $args[0].GetCommandName() -eq 'Set-ServiceAccount' }, $true) | ForEach-Object {
+  $e = @($_.CommandElements); $text = ''
+  for ($i = 0; $i -lt $e.Count - 1; $i++) {
+    if ($e[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+        $e[$i].ParameterName -eq 'Account') { $text = $e[$i + 1].Extent.Text } }
+  $text })
+# Stubs, defined after the lift so they win.
+$stored = ''; $startName = ''; $disabled = $false
+function Get-CimInstance { [pscustomobject]@{ Name = 'Svc' } }
+function Invoke-CimMethod {
+  param($InputObject, $MethodName, $Arguments, $ErrorAction)
+  $script:startName = $Arguments['StartName']
+  $script:stored = $Arguments['StartName'] -replace "^$([regex]::Escape($env:COMPUTERNAME))\\", '.\'
+  [pscustomobject]@{ ReturnValue = 0 }
+}
+function Get-ItemProperty { param($LiteralPath, $Name, $ErrorAction) [pscustomobject]@{ ObjectName = $script:stored } }
+function Set-Service { param($Name, $StartupType, $ErrorAction) $script:disabled = $true }
+$pw = ConvertTo-SecureString 'synthetic-pw-3411' -AsPlainText -Force
+$res = @{ other = $other; owner = $owner; ownerService = $OwnerService; sent = $sent
+  ownerRunAs = (ConvertTo-ScmAccountName $owner); host = $env:COMPUTERNAME }
+foreach ($arm in @(@('rig', (ConvertTo-ScmAccountName $other)), @('verbatim', $other))) {
+  $stored = ''; $startName = ''; $disabled = $false; $err = ''
+  try { Set-ServiceAccount -ServiceName 'Svc' -Account $arm[1] -Password $pw } catch { $err = "$_" }
+  $res[$arm[0]] = @{ startName = $startName; stored = $stored; disabled = $disabled; error = $err }
+}
+$res | ConvertTo-Json -Compress -Depth 4
+"""
+
+
+def _spelling(tmp_path: Path) -> dict[str, Any]:
+    if shutil.which("pwsh") is None:
+        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+    script = tmp_path / "spelling_check.ps1"
+    script.write_text(_SPELLING_CHECK, encoding="utf-8")
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+    argv += ["-RigPath", str(_RIG), "-InstallerPath", str(_INSTALLER)]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
+    assert done.returncode == 0, done.stderr
+    result: dict[str, Any] = json.loads(done.stdout.strip().splitlines()[-1])
+    return result
+
+
+def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Path) -> None:
+    r = _spelling(tmp_path)
+    user = "mefor-dpapi-b"
+    # What the rig passes for the second service: a local account, under this computer's name.
+    assert r["other"] == f"{r['host']}\\{user}", r
+    # Both of the rig's Set-ServiceAccount calls take the converted name, never $Account itself.
+    assert r["sent"] == ["$runAs", "$runAs"], r["sent"]
+    # The control arm: CI run 39524776520's failure, so the stubs model the SCM's rewrite.
+    verbatim = r["verbatim"]
+    assert verbatim["stored"] == f".\\{user}", verbatim
+    assert f"runs as '.\\{user}'" in verbatim["error"] and verbatim["disabled"], verbatim
+    # The rig's arm: sent as .\name, stored as .\name, and the installer's read-back accepts it.
+    rig = r["rig"]
+    assert rig["startName"] == f".\\{user}" and rig["stored"] == f".\\{user}", rig
+    assert rig["error"] == "" and rig["disabled"] is False, rig
+    # The owner's virtual account is not a local account and passes through unchanged.
+    assert r["owner"] == f"NT SERVICE\\{r['ownerService']}" and r["ownerRunAs"] == r["owner"], r
+
+
 def test_the_rig_waits_on_and_copies_the_names_the_worker_writes() -> None:
     # The rig is PowerShell and cannot import the worker's constants, so they are pinned here.
     rig = _RIG.read_text(encoding="utf-8")

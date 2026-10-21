@@ -25,8 +25,10 @@
   virtual account with a restricted service SID and the installer's privilege list, and the judge
   checks the running token by service_token_probe.py's token_problems, the windows-service-smoke
   leg's own rule. The other service runs as a local user with SID type none, which is what the
-  installer gives such an account. Only the registration is the installer's: the two work folders
-  are plain folders with one grant each, not the engine's data directory.
+  installer gives such an account. Set-ServiceAccount is handed that user as ".\name", the spelling
+  the SCM stores (ConvertTo-ScmAccountName says why); the owner's name is passed unchanged. Only
+  the registration is the installer's: the two work folders are plain folders with one grant each,
+  not the engine's data directory.
 
   THE LIFT IS BY NAME. If a lifted function starts calling another of the installer's helpers, this
   rig fails at that call with "not recognized", on its next run. Add the helper to $lifted.
@@ -138,6 +140,21 @@ function Stop-SpikeService([string]$Name) {
     if (-not (Stop-ServiceAndConfirm -ServiceName $Name)) { Write-Warning "$Name did not stop within 30 seconds" }
 }
 
+function ConvertTo-ScmAccountName([string]$Account) {
+    # The spelling the SCM stores for a run-as account: ".\name" for a local account given as
+    # COMPUTERNAME\name, and anything else as it is. Measured in CI run 39524776520 on both legs:
+    # given COMPUTERNAME\mefor-dpapi-b, the service's ObjectName read back as .\mefor-dpapi-b, and
+    # the lifted Set-ServiceAccount, which compares the two after dropping only a ".\" prefix,
+    # refused it. Given ".\name" it sends the name as is, because ".\" does not translate to a SID,
+    # and the read-back matches. The logon right, the SID type, the folder grants and the judge keep
+    # the COMPUTERNAME\name spelling, which does translate.
+    $prefix = "$env:COMPUTERNAME\"
+    if ($env:COMPUTERNAME -and $Account.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return ".\" + $Account.Substring($prefix.Length)
+    }
+    return $Account
+}
+
 function Register-SpikeService {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -160,11 +177,12 @@ function Register-SpikeService {
     Invoke-Nssm set $Name Start SERVICE_DEMAND_START
     # As install-service.ps1 does for every named account: the right first, then the account.
     Set-ServiceLogonRight -Account $Account
-    if ($Password) { Set-ServiceAccount -ServiceName $Name -Account $Account -Password $Password }
-    else { Set-ServiceAccount -ServiceName $Name -Account $Account }
+    $runAs = ConvertTo-ScmAccountName $Account
+    if ($Password) { Set-ServiceAccount -ServiceName $Name -Account $runAs -Password $Password }
+    else { Set-ServiceAccount -ServiceName $Name -Account $runAs }
     $choice = Get-ServiceSidTypeChoice -ServiceName $Name -ServiceAccount $Account
     Set-ServiceTokenHardening -ServiceName $Name -SidType $choice.SidType -Privileges $ServicePrivileges
-    "$Name registered as $Account, SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
+    "$Name registered as $Account (SCM: $runAs), SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
     "===== sc.exe qsidtype $Name ====="; (& sc.exe qsidtype $Name | Out-String).Trim()
     "===== sc.exe qprivs $Name ====="; (& sc.exe qprivs $Name | Out-String).Trim()
 }
