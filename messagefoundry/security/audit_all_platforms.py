@@ -48,10 +48,11 @@ that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a relea
 say) fail the audit instead of being skipped.
 
 WHAT IT REFUSES, exit 2: a lock with no requirement lines at all, so an empty input cannot read as
-a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv export
-never writes and which would resolve against the temporary copy's directory, or escape the strip,
-rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
-write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
+a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which would resolve
+against the temporary copy's directory, or escape the strip, rather than audit what it names. The
+DEP-1 exports write none: a uv export writes ``-e`` for a path source such as the in-tree web
+console, which ``--no-emit-package`` keeps out (security.yml says why), and a lock tool can write at
+least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to; and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
 would stay in place. It does not judge whether a non-empty lock is complete; released-line-audit
 carries its own floor for that.

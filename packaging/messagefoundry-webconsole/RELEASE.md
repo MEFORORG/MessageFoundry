@@ -77,7 +77,6 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       — no known-CVE pins. The console's only dependency is the engine, whose closure that lock
       holds. Not a bare `pip-audit -r requirements.lock`;
       `messagefoundry/security/audit_all_platforms.py` says why.
-- [ ] Verify the cyclic optional dep resolves under **both** `uv lock` and plain `pip`.
 
 ## 4. SBOM + publish/mirror wiring
 
@@ -110,9 +109,10 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] **When the same pull request released engine X, tag `vX` first, and tag the console only once
       engine X is on PyPI.** A console published first requires an engine nobody can install, and a
-      PyPI version cannot be uploaded again if the engine release then fails. In the gap, engine X's
-      `[webconsole]` extra fails at resolve, because console A is not published yet; a plain
-      `pip install messagefoundry` is unaffected.
+      PyPI version cannot be uploaded again if the engine release then fails. In the gap, an install
+      of `messagefoundry==X` with the `[webconsole]` extra fails at resolve, because console A is not
+      published yet. Unpinned, pip backtracks to an earlier engine instead, with no console if that
+      engine has no such extra. A plain `pip install messagefoundry` is unaffected.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
       `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`

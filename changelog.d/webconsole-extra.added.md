@@ -1,5 +1,5 @@
 - **The engine declares a `webconsole` extra.** `pip install "messagefoundry[webconsole]"` installs
-  the web console, `messagefoundry-webconsole>=0.5.0`, as a floor with no ceiling
+  the web console, `messagefoundry-webconsole` at a floor with no ceiling
   ([WEBCONSOLE-PACKAGE.md](../docs/WEBCONSOLE-PACKAGE.md)); the startup handshake still refuses a
   console built for another engine seam. uv resolves the extra to the in-tree console, so
   `uv sync --extra webconsole` installs the console that matches the tree. The two `--all-extras`

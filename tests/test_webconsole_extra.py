@@ -24,12 +24,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 _CONSOLE = "messagefoundry-webconsole"
 
 
-def _pinned_names(lock: Path) -> set[str]:
+def _pinned_names(text: str) -> set[str]:
     """The distribution names a uv requirements export pins, read as the DEP-1 audit reads it."""
-    return {
-        canonicalize_name(line.split("==", 1)[0].strip())
-        for line in requirement_lines(read_lock(lock))
-    }
+    return {canonicalize_name(line.split("==", 1)[0].strip()) for line in requirement_lines(text)}
 
 
 def test_the_webconsole_extra_is_a_floor_with_no_ceiling() -> None:
@@ -86,13 +83,15 @@ def test_the_all_extras_exports_leave_the_console_out() -> None:
     assert any(p["name"] == _CONSOLE for p in packages), "uv.lock resolves no console package"
     for name in ("requirements.lock", "constraints.lock"):
         text = read_lock(_ROOT / name)
-        names = _pinned_names(_ROOT / name)
-        assert "fastapi" in names, f"{name} parsed to no pins; the parser no longer reads it"
-        # An export without the flag writes the in-tree console as `-e ./packaging/...`, which the
-        # parser files under option lines, not requirements; so both kinds are checked.
-        carried = [ln for ln in option_lines(text) if _CONSOLE in ln] + (
-            [_CONSOLE] if _CONSOLE in names else []
-        )
+        assert "fastapi" in _pinned_names(text), f"{name} parsed to no pins; the parser misreads it"
+        # Whatever form the console takes -- a `name==` pin, the `-e ./packaging/...` option line an
+        # export without the flag writes, or a `name @ file:` line -- it names the console's
+        # distribution or its directory, so every requirement and option line is searched for both.
+        carried = [
+            ln
+            for ln in requirement_lines(text) + option_lines(text)
+            if _CONSOLE in ln.lower() or "messagefoundry_webconsole" in ln.lower()
+        ]
         assert not carried, (
             f"{name} carries the first-party console: {carried}; security.yml says why not"
         )

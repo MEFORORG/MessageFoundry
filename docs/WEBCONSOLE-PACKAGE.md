@@ -90,7 +90,9 @@ current, so choosing X stays a release step.
 `pyproject.toml`'s `[tool.uv.sources]` points uv at the in-tree console, so `uv lock` resolves the
 floor before console A is on PyPI, and `uv sync` installs the console that matches the tree's seam.
 uv alone reads that table. The published wheel's metadata names only `messagefoundry-webconsole>=A`,
-so pip resolves it from the index and refuses at resolve until A is published. uv does not compare
+so pip resolves it from the index; RELEASE.md step 6 says what an install does before A is
+published. A checkout installs the console by path, never through the extra, since pip would fetch
+the published console rather than the tree's. uv does not compare
 the floor with the in-tree version, so `tests/test_webconsole_extra.py` holds the two equal.
 
 ### Before it imports the console, `serve` checks whose package it is
