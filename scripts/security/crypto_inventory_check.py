@@ -2652,6 +2652,18 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "scripts/hooks/worktree_gate.ps1": frozenset({"hash:SHA256"}),
     # A fixed-length cache file name for each querying worktree, from its root path.
     "scripts/coord/overlap.ps1": frozenset({"hash:SHA256"}),
+    # Three CSPRNG bytes as the suffix of a decision record id, after its millisecond UTC stamp, so
+    # two records written in the same millisecond do not collide. An identifier, not a secret or a
+    # token: nothing is authorized by knowing an id, and Get-Random would serve as well.
+    "scripts/coord/_decisionlog.ps1": frozenset({"csprng:RandomNumberGenerator"}),
+    # Two uses in the AFK digest (ADR 0211 section 5), neither a secret. The CSPRNG orders the day's
+    # Class B decisions to draw the owner's blind-rating sample. That draw feeds a calibration audit
+    # of the seats' judgment, so it should not be predictable in advance, but the draw is then saved
+    # to a local file any session on the machine can read, and the ADR says who rates is a rule, not
+    # a control. The SHA-256 of "<id>|<option>" fixes the order a sampled decision's options are
+    # shown in, so the number the owner rates maps back to an option; it hides which option is the
+    # recommendation from the reader only, since anyone holding the id can recompute it.
+    "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
     # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
     # session id or a notice key.
     "scripts/hooks/_hookinput.ps1": frozenset({"hash:SHA256"}),
