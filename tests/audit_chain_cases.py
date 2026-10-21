@@ -34,12 +34,21 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
-from messagefoundry.store.crypto import audit_key_id, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    AUDIT_KEYLESS_MAC,
+    AUDIT_SCHEME_IN_HEAP,
+    AuditScheme,
+    audit_key_id,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     audit_genesis_detail,
+    audit_handover_tag,
+    audit_range_closing,
     audit_row_hash,
     parse_audit_genesis,
 )
@@ -565,6 +574,206 @@ async def a_rotation_reports_rows_that_went_missing_under_its_open_handle(
         await store.close()
 
 
+# --- BACKLOG #3420: each range record names its scheme -------------------------------------------
+
+
+def _mac_key(key: str) -> bytes:
+    mac = make_cipher(key).audit_mac_key()
+    assert mac is not None
+    return mac
+
+
+def _scheme_fields(scheme: AuditScheme | None) -> dict[str, str]:
+    return {} if scheme is None else {"mac": scheme.mac, "kdf": scheme.kdf}
+
+
+def genesis_record(key_id: str, scheme: AuditScheme | None) -> str:
+    """A genesis row's detail naming ``scheme``, or none: the shape written before BACKLOG #3420.
+    The store writes only the scheme it holds, so a test that needs another builds it here."""
+    return json.dumps({"genesis": 1, "key_id": key_id, **_scheme_fields(scheme)}, sort_keys=True)
+
+
+def epoch_record(
+    key_id: str, closes: Mapping[str, Any], handover: str, scheme: AuditScheme | None
+) -> str:
+    """A range row's detail naming ``scheme``, or none, as :func:`genesis_record` builds one."""
+    record = {"key_id": key_id, "closes": dict(closes), "handover": handover}
+    return json.dumps({**record, **_scheme_fields(scheme)}, sort_keys=True)
+
+
+async def _write_chain(
+    b: ChainBackend,
+    entries: Sequence[tuple[str, str | Callable[[list[dict[str, Any]]], str], bytes]],
+) -> list[dict[str, Any]]:
+    """Write ``entries`` as a whole chain from seq 1, as a holder of each row's key would seal it.
+
+    Each entry is ``(action, detail, mac key)``. ``detail`` may be a function of the rows so far, so
+    a range row can digest the rows before it. The rows go in through the keyless writer, so the
+    stores under test read rows they did not write themselves."""
+    rows: list[dict[str, Any]] = []
+    prev = ""
+    for seq, (action, detail_of, key) in enumerate(entries, start=1):
+        detail = detail_of(rows) if callable(detail_of) else detail_of
+        assert "'" not in detail  # it is embedded in a SQL string literal below
+        row: dict[str, Any] = {
+            "seq": seq,
+            "ts": float(seq),
+            "actor": "u",
+            "action": action,
+            "channel_id": None,
+            "detail": detail,
+            "client": None,
+        }
+        row["row_hash"] = prev = audit_row_hash(prev, **row, key=key)
+        rows.append(row)
+        await b.execute(
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            f" VALUES ({seq}, {float(seq)!r}, 'u', '{action}', NULL, '{detail}', NULL, '{prev}')"
+        )
+    return rows
+
+
+async def records_that_name_no_scheme_still_verify(b: ChainBackend) -> None:
+    """A chain whose genesis and range rows were written before records named a scheme still
+    verifies, routes appends to its current range, and rolls no-op. Every such record was sealed
+    under the in-heap scheme, which is how it is read. The control is that the records under test
+    really name no scheme, and that a chain this release writes does name one."""
+    await b.reset()
+    a, bk = generate_key(), generate_key()
+    a_mac, b_mac = _mac_key(a), _mac_key(bk)
+    a_id, b_id = audit_key_id(a_mac), audit_key_id(b_mac)
+
+    def range_row(rows: list[dict[str, Any]]) -> str:
+        closes = audit_range_closing(rows, key_id=a_id, from_seq=1, prev_hash="")
+        tag = audit_handover_tag(b_id, closes, (a_mac, None), scheme=None)
+        return epoch_record(b_id, closes, tag, None)
+
+    rows = await _write_chain(
+        b,
+        [
+            (AUDIT_KEY_EPOCH_ACTION, genesis_record(a_id, None), a_mac),
+            ("act", json.dumps({"n": 1}), a_mac),
+            (AUDIT_KEY_EPOCH_ACTION, range_row, b_mac),
+            ("act", json.dumps({"n": 2}), b_mac),
+        ],
+    )
+    assert not {"mac", "kdf"} & json.loads(rows[0]["detail"]).keys()
+    assert not {"mac", "kdf"} & json.loads(rows[2]["detail"]).keys()
+    store = await b.open_keyed(bk, (a,))
+    try:
+        assert store._audit_ranges_trusted and store._audit_range_key_id == b_id, b.name
+        ok, message = await store.verify_audit_chain()
+        assert ok, f"{b.name}: {message}"
+        await _seed(store, "after", 1)
+        ok, message = await store.verify_audit_chain()
+        assert ok, f"{b.name}: {message}"
+        ok, message = await store.roll_audit_key_epoch()
+        assert ok and "already" in message, f"{b.name}: {message}"
+    finally:
+        await store.close()
+    await b.reset()
+    store = await b.open_keyed(a, ())
+    try:
+        await _seed(store, "act", 1)
+    finally:
+        await store.close()
+    named = json.loads((await _chain(b))[0]["detail"])
+    assert (named["mac"], named["kdf"]) == (AUDIT_SCHEME_IN_HEAP.mac, AUDIT_SCHEME_IN_HEAP.kdf)
+
+
+#: A scheme no release compiles, and the keyless store mode's plain SHA-256, which no record may name.
+_REFUSED_SCHEMES: Final = (
+    (AuditScheme(mac="hmac-sha3-256", kdf="hkdf-sha256:mefor/audit-chain/v2"), "does not seal"),
+    (AuditScheme(mac=AUDIT_KEYLESS_MAC, kdf="none"), "keyless store mode"),
+)
+
+
+async def a_record_naming_a_scheme_this_release_does_not_hold_is_refused(b: ChainBackend) -> None:
+    """A genesis row naming an unknown scheme, or the keyless mode, is refused even when a holder of
+    its key sealed it, so every MAC on it verifies: the open routes no append by it and the roll
+    refuses, the walk reports it, and a handle with no key still reads the chain as keyed. The
+    control is the same chain naming the scheme this release holds, which verifies."""
+    for scheme, reason in ((AUDIT_SCHEME_IN_HEAP, None), *_REFUSED_SCHEMES):
+        await b.reset()
+        key = generate_key()
+        mac = _mac_key(key)
+        key_id = audit_key_id(mac)
+        await _write_chain(
+            b,
+            [
+                (
+                    AUDIT_KEY_EPOCH_ACTION,
+                    genesis_record(key_id, scheme),
+                    mac,
+                ),
+                ("act", json.dumps({"n": 1}), mac),
+            ],
+        )
+        store = await b.open_keyed(key, ())
+        try:
+            ok, message = await store.verify_audit_chain()
+            if reason is None:
+                assert ok and store._audit_ranges_trusted, f"{b.name}: {message}"
+                continue
+            assert not ok and reason in (message or ""), f"{b.name}: {message}"
+            assert store._audit_ranges_trusted is False, b.name
+            ok, message = await store.roll_audit_key_epoch()
+            assert not ok, f"{b.name}: {message}"
+        finally:
+            await store.close()
+        keyless = await b.open_keyless()
+        try:
+            assert keyless.audit_append_refusal() is not None, b.name
+            verdict = await keyless.verify_audit_chain()
+            assert not verdict[0] and not verdict.keyless_walk, f"{b.name}: {verdict[1]}"
+            assert reason in (verdict[1] or ""), f"{b.name}: {verdict[1]}"
+        finally:
+            await keyless.close()
+
+
+async def a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless(b: ChainBackend) -> None:
+    """The attack the keyless exclusion exists for: a writer with no key renames the genesis row to
+    the keyless mode and recomputes every row as plain SHA-256. A handle with a key reports it; one
+    without still reads the chain as keyed, refuses to append, and does not pass it as a keyless
+    walk. The control is the recomputation itself, which the keyless walk would accept were the
+    genesis row not there: the same rows with that row's action changed verify as keyless."""
+    await b.reset()
+    key = generate_key()
+    store = await b.open_keyed(key, ())
+    try:
+        await _seed(store, "act", 2)
+    finally:
+        await store.close()
+    detail = genesis_record(
+        audit_key_id(_mac_key(key)), AuditScheme(mac=AUDIT_KEYLESS_MAC, kdf="none")
+    )
+    await b.execute(f"UPDATE audit_log SET detail = '{detail}' WHERE seq = 1")
+    await _recompute_without_a_key(b)
+    store = await b.open_keyed(key, ())
+    try:
+        ok, message = await store.verify_audit_chain()
+        assert not ok, f"{b.name}: {message}"
+    finally:
+        await store.close()
+    keyless = await b.open_keyless()
+    try:
+        assert keyless.audit_append_refusal() is not None, b.name
+        verdict = await keyless.verify_audit_chain()
+        assert not verdict[0] and "keyless store mode" in (verdict[1] or ""), (
+            f"{b.name}: {verdict[1]}"
+        )
+    finally:
+        await keyless.close()
+    await b.execute("UPDATE audit_log SET action = 'renamed' WHERE seq = 1")
+    await _recompute_without_a_key(b)
+    keyless = await b.open_keyless()
+    try:
+        verdict = await keyless.verify_audit_chain()
+        assert verdict[0] and verdict.keyless_walk, f"{b.name}: {verdict[1]}"
+    finally:
+        await keyless.close()
+
+
 #: Every case, for a backend's test module to parametrise over.
 CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     an_untouched_keyed_chain_verifies,
@@ -579,4 +788,7 @@ CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is,
     a_genesis_row_rewritten_to_name_another_held_key_routes_no_append_to_it,
     a_rotation_reports_rows_that_went_missing_under_its_open_handle,
+    records_that_name_no_scheme_still_verify,
+    a_record_naming_a_scheme_this_release_does_not_hold_is_refused,
+    a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless,
 )

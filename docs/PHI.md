@@ -1185,11 +1185,14 @@ data. The agility the requirement asks for would be bought by creating a downgra
 this trade the project takes the refusal.
 
 **THE HONEST LIMIT, and it is the part a reader should take away:** the seam covers the **at-rest
-value core**. It does **not** cover the **audit MAC or its KDF**, which carry *no version
-discriminator at all* — measured: zero `mfenc`-style markers anywhere on the audit-chain path. So
-changing the audit MAC is not a swap along this seam; it means versioning the tamper-evidence chain
-itself, which is undesigned. Any future claim that this project "has crypto agility" must exclude the
-audit chain or be false.
+value core**. It does **not** cover the **audit MAC or its KDF**, which have *no version
+discriminator in this seam's sense*: no `mfenc`-style marker sits on the audit-chain path. Since
+BACKLOG #3420 each genesis and range record of the chain, and each edit-resend body digest, names its
+MAC and its HKDF labels. A name other than the one this release compiles is refused (ADR 0193,
+amendment 2026-10-20). That is a label, not a swap. The release compiles one audit scheme per key
+kind, so the stored name selects nothing, and the downgrade surface above does not open there.
+Changing the audit MAC still needs a release that compiles a second scheme, which is undesigned. Any
+future claim that this project "has crypto agility" must exclude the audit chain or be false.
 
 ---
 
@@ -1447,7 +1450,7 @@ sent, not only that something was. Two pieces of evidence outlive the bodies:
 
 | Evidence | Where | What it holds |
 |---|---|---|
-| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's body as the store holds it, so after any document detach or prune; it is `null` when retention had already blanked it. `edited` is the edited body as the engine admitted and stored it, after the inbound's own normalization such as line endings |
+| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `kdf` (the two HKDF labels the key came through, BACKLOG #3420), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's body as the store holds it, so after any document detach or prune; it is `null` when retention had already blanked it. `edited` is the edited body as the engine admitted and stored it, after the inbound's own normalization such as line endings |
 | Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Anything an inbound connection takes in reads `partner`, a timer's configured body included. Upload injects read `operator_upload`, and the engine's own loopback and pass-through hops read `reingress` |
 
 Both modes write the same row: a re-route names the new message in `new_message_id`, and so does a
@@ -1469,7 +1472,9 @@ configured. **Remove a retired key and its digests can no longer be checked.** T
 keyed ranges depend on the same key, so keep a retired key for as long as its rows must verify.
 
 **To prove a body afterwards,** hold the candidate body and the store key, and call
-`verify_audit_body_digest` in `store/crypto.py` with the row's `key_id` and digest. A match shows
+`verify_audit_body_digest` in `store/crypto.py` with the row's `key_id`, digest, `alg` and `kdf`.
+A row written before `kdf` was recorded carries none, and is read as the labels it was taken under.
+A row naming any other `alg` or `kdf` does not verify. A match shows
 that body is the one the row describes. A reader without the key can neither recover a body nor
 test a guess. The digest is deterministic under one key, so that reader can still see that two
 digests are equal, for example that an edit changed nothing.

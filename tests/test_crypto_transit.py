@@ -64,6 +64,8 @@ class _FakeTransit:
         # the type a correctly provisioned store key has.
         self.key_types: dict[str, str] = {}
         self.read_calls: list[str] = []
+        #: The ``algorithm`` of every ``generate_hmac`` call, so a test can check what was asked for.
+        self.hmac_algorithms: list[str] = []
 
     def read_key(self, *, name: str) -> dict[str, Any]:
         self.read_calls.append(name)
@@ -75,6 +77,7 @@ class _FakeTransit:
         # Deterministic keyed MAC over the raw input, keyed by the module-held per-key secret — mirrors
         # Transit `generate_hmac`: same input+key ⇒ same MAC (round-trips at verify), different input or
         # a wrong key ⇒ a different MAC (tamper/forgery detected). The secret NEVER appears in the output.
+        self.hmac_algorithms.append(algorithm)
         secret = self._hmac_secret[name]
         digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
         return {"data": {"hmac": "vault:v1:" + base64.b64encode(digest).decode("ascii")}}
@@ -174,6 +177,22 @@ def test_audit_hmac_is_deterministic_and_tamper_sensitive(monkeypatch: pytest.Mo
     assert (
         cipher.audit_hmac(b"row-canonical-bytez") != a
     )  # one-byte edit → different MAC (tamper caught)
+
+
+def test_audit_hmac_asks_transit_for_the_hash_its_records_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3420: a Transit genesis or range record names ``AUDIT_SCHEME_TRANSIT``, so the hash
+    Transit is asked for must be the one that scheme names. This pins the cipher to the shared
+    constant, so a literal written back into ``crypto_transit`` fails here. An in-place change of the
+    constant itself is caught by the fixed pre-#3420 name, in ``test_audit_chain_scheme.py``. The
+    fake records each call's ``algorithm``; the control is that it saw a call at all."""
+    from messagefoundry.store.crypto import AUDIT_SCHEME_TRANSIT, AUDIT_TRANSIT_HASH_ALGO
+
+    transit = _use_fake(monkeypatch)
+    build_transit_cipher(StoreSettings()).audit_hmac(b"row-canonical-bytes")
+    assert transit.hmac_algorithms and set(transit.hmac_algorithms) == {AUDIT_TRANSIT_HASH_ALGO}
+    assert AUDIT_SCHEME_TRANSIT.mac == "vault-transit:hmac-" + AUDIT_TRANSIT_HASH_ALGO
 
 
 def test_audit_hmac_uses_dedicated_key_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
