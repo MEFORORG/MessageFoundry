@@ -290,7 +290,7 @@ So: **server TLS required** (the gate enforces it), **mTLS opt-in per partner**,
 
 | Item | Type | How into the container | Notes |
 |---|---|---|---|
-| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`, and a k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
+| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`. A Swarm secret or config surfaces at `0444` unless its long syntax sets `uid: "10001"` and `mode: 0400`. A k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
 | `tls_key_password` (API + MLLP) | secret | API: env `MEFOR_API_TLS_KEY_PASSWORD`. MLLP: per-connection `tls_key_password=env(...)` | Decrypts an encrypted private key. The API key uses the env var; an encrypted **MLLP** key uses the per-connection `tls_key_password` (env-sourced) — see §7. |
 | Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either ([PHI.md](PHI.md) §3). Mint with `messagefoundry gen-key`. |
 | DB password / `tls_client_ca_file` etc. | secret / file | env (`MEFOR_STORE_PASSWORD`) / mounted file | Prefer the orchestrator's secret store over plain `-e` where possible. |
@@ -301,10 +301,13 @@ mounts; the **private keys** should be treated like secrets (read-only, tight pe
 
 **Rotation.**
 - **MLLP cert/key:** rebuilt in the connector `__init__`, so a **config reload** (`POST
-  /config/reload`) re-instantiates the connector and picks up a swapped PEM — no restart.
+  /config/reload`) re-instantiates the connector and picks up a swapped PEM — no restart. On the
+  shipped Kubernetes manifests the engine reads a copy made when the pod started, so a key copied
+  that way needs a new pod ([`docker/README.md`](../docker/README.md), *Cert rotation*).
 - **API cert/key:** the uvicorn TLS context is built **once** at `uvicorn.run` (a fixed
   `ssl_context_factory`); a config reload does **not** rebuild it. **API cert rotation requires a
-  process/container restart.** With the byte-identical multi-instance + active-passive HA model, do a
+  process/container restart**, and on the shipped Kubernetes manifests a new pod, since a container
+  restart there reads the old copy. With the byte-identical multi-instance + active-passive HA model, do a
   **rolling restart** (drain one instance, swap its mounted cert, restart). Worth stating in the
   runbook; consider an `ssl_context_factory` that re-reads on each handshake as a future enhancement.
 
@@ -387,8 +390,9 @@ The console stays a **host-side process**; only its target URL changes.
    wired via `env()` are **unmonitored**. Use literal paths for any cert you want alarmed, or accept
    that only the `[api]` cert is covered. Worth a one-line note in the container runbook.
 
-4. **API cert rotation needs a container restart** (§4) — the uvicorn TLS context is built once. Plan a
-   rolling restart; MLLP certs rotate on config reload, the API cert does not.
+4. **API cert rotation needs a container restart** (§4), and a new pod on the shipped Kubernetes
+   manifests — the uvicorn TLS context is built once. Plan a rolling restart; MLLP certs rotate on
+   config reload, the API cert does not.
 
 5. **Raw TCP / X12 inbound have *no* transport guard.** Unlike MLLP/DICOM, a non-loopback raw-TCP or
    X12 listener is **not refused** — it would publish plaintext PHI with no startup error (operator

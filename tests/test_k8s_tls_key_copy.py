@@ -145,14 +145,27 @@ def _refused(modes: dict[str, int]) -> dict[str, str]:
     }
 
 
+def _serves_a_secret(volume: dict[str, Any]) -> bool:
+    """A Secret volume, or a projected volume with a Secret among its sources."""
+    sources = volume.get("projected", {}).get("sources", [])
+    return "secret" in volume or any("secret" in source for source in sources)
+
+
 def _engine_secret_mounts(pod: dict[str, Any]) -> list[str]:
     # A mount with no pod volume is a StatefulSet's volumeClaimTemplates PVC, never a Secret.
     volumes = _volumes(pod)
     return [
         m["mountPath"]
         for m in _container(pod, "engine").get("volumeMounts", [])
-        if "secret" in volumes.get(m["name"], {})
+        if _serves_a_secret(volumes.get(m["name"], {}))
     ]
+
+
+def test_a_projected_secret_counts_as_a_secret_mount() -> None:
+    """The control for the projected branch, which no shipped manifest exercises."""
+    assert _serves_a_secret({"projected": {"sources": [{"secret": {"name": "mefor-secrets"}}]}})
+    assert not _serves_a_secret({"projected": {"sources": [{"configMap": {"name": "x"}}]}})
+    assert not _serves_a_secret({"emptyDir": {"medium": "Memory"}})
 
 
 def test_the_pre_fix_pod_is_refused_by_the_same_resolver_and_rule() -> None:
@@ -206,6 +219,19 @@ def test_copy_tls_runs_as_the_engine_with_the_engine_s_hardening(
     assert engine["securityContext"]["readOnlyRootFilesystem"] is True, name
     assert engine["securityContext"]["capabilities"] == {"drop": ["ALL"]}, name
     assert init["image"] == engine["image"], name
+
+
+@pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
+def test_copy_tls_can_read_the_root_owned_secret(name: str, pod: dict[str, Any]) -> None:
+    """The kubelet writes Secret files root-owned, so copy-tls (uid 10001) reads them only through
+    fsGroup and a group-read bit. Tightening the Secret to 0400, or dropping fsGroup, would leave
+    the pod stuck in Init."""
+    pod_ctx = pod["securityContext"]
+    assert pod_ctx["fsGroup"] == pod_ctx["runAsGroup"] == 10001, name
+    secret = _volumes(pod)["tls-secret"]["secret"]
+    modes = [item.get("mode", secret["defaultMode"]) for item in secret["items"]]
+    assert all(mode & 0o040 for mode in modes), name
+    assert not any(mode & 0o007 for mode in modes), name
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)

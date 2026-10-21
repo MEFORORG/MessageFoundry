@@ -126,8 +126,10 @@ services:
       # a group-readable key file (docs/PHI.md section 2, *Key files*). So own every file here, a
       # certificate PEM that holds its key included, by uid 10001 at mode 0600, and again after each
       # rotation. The `ha` engines below mount the same directory. On Linux:
-      #   sudo chown -R 10001:10001 ./tls && sudo chmod 0700 ./tls && sudo chmod 0600 ./tls/*
-      # A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be refused, as config is.
+      #   sudo chown -R 10001:10001 ./tls && sudo find ./tls -type f -exec chmod 0600 {} + && sudo chmod 0700 ./tls
+      # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 10001
+      # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be
+      # refused, as config is.
       - ./tls:/etc/mefor/tls:ro
 
     # Hardening: non-root is the image default (uid 10001); lock the rest down.

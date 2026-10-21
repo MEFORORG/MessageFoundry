@@ -17,7 +17,7 @@
 # adopter image (COPY writes root-owned files; run chmod -R a+rX,go-w on it in the build context first):
 #     FROM messagefoundry:<version>
 #     COPY config /config
-# and set image: below to it.
+# and set both image: fields below (copy-tls and engine) to it.
 #
 # Single replica: the default SQLite store is single-writer. For multi-node HA use the Postgres/SQL Server
 # store backend + the built leader election (docs/CLUSTERING.md) — out of scope for this baseline manifest.

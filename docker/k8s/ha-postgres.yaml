@@ -26,7 +26,7 @@
 #
 # CONFIG IS BAKED INTO THE IMAGE (same rule as statefulset.yaml): the engine (uid 10001) trusts a config
 # owner that is root or itself, and root-owned is the safer of the two. Build an adopter image (COPY
-# writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set image: below:
+# writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set both image: fields below (copy-tls and engine) to it:
 #     FROM messagefoundry:<version>
 #     COPY config /config
 # The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).

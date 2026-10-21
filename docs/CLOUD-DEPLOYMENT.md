@@ -353,8 +353,8 @@ TLS-terminating collector).
    and push it to your private registry.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, and the API TLS cert/key (and optional `api-tls-key-password`).
-4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with `image:` set to your baked
-   image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
+4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with both `image:` fields
+   (`copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
 5. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
    interval, deregistration delay ~60s) per [§3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover).
 6. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and

@@ -131,7 +131,7 @@ against one case that matters, described under
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set `image:` to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set both `image:` fields (`copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -178,7 +178,9 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 - **Healthcheck:** `GET /health` is tokenless and always 200 — a **liveness** signal (it answers before
   the engine finishes starting; there is no unauthenticated readiness endpoint). The image probe uses
   `curl -k https://127.0.0.1:8443/health` (the container presents its own, often self-signed, cert on
-  loopback, so `-k`/`--cacert` is **mandatory**) then falls back to `http://127.0.0.1:8765/health`.
+  loopback, so `-k`/`--cacert` is **mandatory**). It has no cleartext fallback, so a container whose
+  TLS is broken reports unhealthy (BACKLOG #1179; the port follows `MEFOR_API_PORT`).
+  **CORRECTED 2026-10-20:** this said the probe then fell back to `http://127.0.0.1:8765/health`.
 - **Graceful shutdown:** PID 1 is `tini`, which forwards `SIGTERM` → uvicorn lifespan → `engine.stop()`
   (drains MLLP clients within the `_CLIENT_SHUTDOWN_GRACE` bound). Give the orchestrator a stop grace of
   **≥30s** (`stop_grace_period` / `terminationGracePeriodSeconds`) to cover the ordered teardown — the
@@ -188,7 +190,9 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 - **Cert rotation:** the **API** TLS context is built once at startup, so an API-cert renewal needs a
   **container restart** (rolling restart across instances). On the Kubernetes manifests it needs a new
   **pod**, such as `kubectl rollout restart`: `copy-tls` copies the Secret only when a pod starts, so
-  a restart of the engine container alone reads the old copy. **MLLP** certs reload on `POST /config/reload`.
+  a restart of the engine container alone reads the old copy. **MLLP** certs reload on `POST /config/reload`,
+  but on the Kubernetes manifests a reload re-reads the old copy too, so a rotated connection key
+  copied through `copy-tls` also needs a new pod.
 
 ## Residuals / gotchas
 
