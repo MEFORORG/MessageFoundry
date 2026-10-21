@@ -107,6 +107,7 @@ tests/test_coord_overlap_signals.py
 tests/test_coord_overlap_work_signal.py
 tests/test_coord_presence.py
 tests/test_coord_recoverable.py
+tests/test_coord_wait_pr.py
 tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
 tests/test_import_db_ca_console_text.py
