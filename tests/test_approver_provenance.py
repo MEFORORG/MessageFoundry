@@ -20,6 +20,7 @@ refuses that; it cannot be told apart from a real second person in software. Wha
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -48,7 +49,16 @@ from tests._admin_account import create_local_user_chosen
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
 from tests.test_approval_requester_recheck import _Sink as _RecheckSink
-from tests.test_approvals import ON, PW, _add, _interrupt, _service, _StaleRead, _token
+from tests.test_approvals import (
+    ON,
+    PW,
+    _add,
+    _AuditRefuses,
+    _interrupt,
+    _service,
+    _StaleRead,
+    _token,
+)
 from tests.test_auth_service import _FakeNotifier
 
 _FLAG = "approval.approver_provenance"
@@ -335,20 +345,14 @@ async def test_a_lost_resolver_flag_pages_and_the_resolution_stands(engine: Engi
         def audit_write_failed(self, name: str, *, action: str) -> None:
             self.events.append(("audit_write_failed", name, {"action": action}))
 
-    class _FlagRefused:
-        def __getattr__(self, name: str) -> Any:
-            return getattr(engine.store, name)
-
-        async def record_audit(self, action: str, **kw: Any) -> Any:
-            if action == _FLAG:
-                raise OSError("audit log unreachable")
-            return await engine.store.record_audit(action, **kw)
-
     service = await _service(engine)
     maker = await _add(service, "maker", Role.OPERATOR)
     sink = _PagingSink()
     gate = ApprovalGate(
-        _FlagRefused(), ON, resolve_identity=service.identity_for_user_id, alert_sink=sink
+        _AuditRefuses(engine.store, _FLAG),
+        ON,
+        resolve_identity=service.identity_for_user_id,
+        alert_sink=sink,
     )
     gate.register("dead_letter_replay", "replay", _noop, permission=Permission.MESSAGES_REPLAY)
     approval_id = await _request(gate, maker)
@@ -358,8 +362,52 @@ async def test_a_lost_resolver_flag_pages_and_the_resolution_stands(engine: Engi
     await _resolve_it(gate, approval_id, resolver)
 
     assert await _flags(engine) == []
-    assert ("audit_write_failed", f"approval:{approval_id}", {"action": _FLAG}) in sink.events
+    # vault BACKLOG #3438: the resolve's own key, as its provenance alert uses.
+    assert (
+        "audit_write_failed",
+        f"approval:{approval_id}:resolve",
+        {"action": _FLAG},
+    ) in sink.events
     assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+
+
+async def test_a_lost_release_flag_and_a_lost_resolver_flag_page_twice(engine: Engine) -> None:
+    """vault BACKLOG #3438: one request whose release flag and resolver flag both fail to write
+    raises two audit_write_failed alerts. RED when the resolver's page goes back to the release's
+    key: the notifier then folds the second into the first's instance and its re-alert window."""
+
+    async def _cut_off(_params: Mapping[str, Any]) -> dict[str, Any]:
+        raise asyncio.CancelledError  # what a request timeout does mid-run: the row is interrupted
+
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    transport = _RecordingTransport("t")
+    sink = NotifierAlertSink([transport])
+    gate = ApprovalGate(
+        _AuditRefuses(engine.store, _FLAG),
+        ON,
+        resolve_identity=service.identity_for_user_id,
+        alert_sink=sink,
+    )
+    gate.register("dead_letter_replay", "replay", _cut_off, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, maker)
+    checker = await _add(service, "checker", Role.ADMINISTRATOR)  # minted after the request
+    resolver = await _add(service, "resolver", Role.ADMINISTRATOR)  # minted after the request
+    with pytest.raises(asyncio.CancelledError):
+        await gate.approve(approval_id, approver="checker", approver_user_id=checker)
+    await _resolve_it(gate, approval_id, resolver)
+    await _drain(sink)
+
+    assert await _flags(engine) == []
+    lost = [
+        (e["connection"], e["action"])
+        for e in transport.events
+        if e["type"] == "audit_write_failed"
+    ]
+    assert lost == [
+        (f"approval:{approval_id}", _FLAG),
+        (f"approval:{approval_id}:resolve", _FLAG),
+    ]
 
 
 async def test_a_resolver_older_than_the_request_is_not_flagged(engine: Engine) -> None:

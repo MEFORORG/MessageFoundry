@@ -2393,7 +2393,9 @@ its audit row answers **503**. The request does not move, except where a COMMIT 
 error, as stated for the claim above.
 
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
-least these paths. The alert is keyed `approval:<id>` and carries the row's action name.
+least these paths. The alert is keyed `approval:<id>` and carries the row's action name. A
+resolution's lost `approval.approver_provenance` row is keyed `approval:<id>:resolve` instead, so it
+cannot fold into a lost release flag on the same request (vault BACKLOG #3438).
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;

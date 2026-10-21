@@ -536,7 +536,8 @@ class AlertSink(Protocol):
         the engine log, which nobody pages on.
 
         ``name`` keys the subject the lost row was about. The approval gate uses ``approval:<approval
-        id>``, the key :meth:`approval_too_early` uses. ``POST /config/reload`` uses
+        id>``, the key :meth:`approval_too_early` uses, and ``approval:<approval id>:resolve`` for a
+        resolution's lost provenance row (vault BACKLOG #3438). ``POST /config/reload`` uses
         ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT

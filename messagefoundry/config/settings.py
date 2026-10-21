@@ -5109,10 +5109,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #287 (ASVS 2.4.2): a dual-control release refused for arriving before the
         # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, which no connection can be named.
         "approval_too_early",
-        # BACKLOG #315: a release by an approver account changed after the request, and an
-        # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
-        # sign-in's role sync, and since vault BACKLOG #3141 by a directory reconcile pass (both
-        # granted_by `<directory>`).
+        # BACKLOG #315: a release by an approver account changed after the request (keyed
+        # `approval:<id>`), or since BACKLOG #2125 the resolution of an interrupted release by such
+        # an account (keyed `approval:<id>:resolve`), and an Administrator grant through the console
+        # API or, since vault BACKLOG #2610, by a directory sign-in's role sync, and since vault
+        # BACKLOG #3141 by a directory reconcile pass (both granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
         # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed

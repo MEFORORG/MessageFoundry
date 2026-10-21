@@ -1676,6 +1676,7 @@ class ApprovalGate:
         detail: str,
         client: str | None,
         context: str,
+        alert_key: str | None = None,
     ) -> None:
         """Write one of the gate's audit rows without letting a failed write raise.
 
@@ -1684,7 +1685,8 @@ class ApprovalGate:
         BACKLOG #2255 a failed write at the refusals turned a documented 409 into a raw 500. The
         loss is logged at ERROR with ``context`` and the detail, and paged. ``defects=()``: some
         callers run after the operation executed, and a defect raised there would skip the page
-        and report an executed release as a 500 (vault BACKLOG #2260)."""
+        and report an executed release as a 500 (vault BACKLOG #2260). ``alert_key`` overrides the
+        page's key, as :meth:`_alert_lost_audit` says."""
         if not await write_audit_soft(
             lambda: self._store.record_audit(action, actor=actor, detail=detail, client=client),
             log=log,
@@ -1694,7 +1696,7 @@ class ApprovalGate:
             args=lambda: (approval_id, context, action, scrub_log_argument(detail)),
             defects=(),
         ):
-            self._alert_lost_audit(approval_id, action)
+            self._alert_lost_audit(approval_id, action, key=alert_key)
 
     async def _requester_standing(
         self, requester_user_id: str, op: _Operation, params: Mapping[str, Any]
@@ -1820,13 +1822,15 @@ class ApprovalGate:
             "is still needed, run it again: it now runs without a second approver",
         )
 
-    def _alert_lost_audit(self, approval_id: str, action: str) -> None:
+    def _alert_lost_audit(self, approval_id: str, action: str, *, key: str | None = None) -> None:
         """Page on an audit row the gate could not write (vault BACKLOG #2255).
 
         The caller logs the loss itself, with whatever detail it holds. This only raises the
-        ``audit_write_failed`` alert, and is best effort by the sink's own contract."""
+        ``audit_write_failed`` alert, and is best effort by the sink's own contract. The key is
+        ``approval:<id>`` unless ``key`` names another. A lost resolver flag passes
+        ``approval:<id>:resolve``, so it cannot fold into a lost release flag (vault BACKLOG #3438)."""
         try:
-            self._alert_sink.audit_write_failed(f"approval:{approval_id}", action=action)
+            self._alert_sink.audit_write_failed(key or f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
             log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
 
@@ -1888,7 +1892,9 @@ class ApprovalGate:
         (BACKLOG #2125). Both write the same audit action and raise the same alert type. One
         request can carry one of each, so the row's ``act`` field says which account it flags, and
         a resolve's alert is keyed ``approval:<id>:resolve``. Under the release's key it would fold
-        into the release's open instance and fall inside its re-alert window, and page nobody."""
+        into the release's open instance and fall inside its re-alert window, and page nobody. The
+        page for a lost flag row uses the same key, for the same reason (vault BACKLOG #3438)."""
+        key = f"approval:{approval_id}" if act == "release" else f"approval:{approval_id}:resolve"
         await self._record_audit_soft(
             approval_id,
             "approval.approver_provenance",
@@ -1906,11 +1912,9 @@ class ApprovalGate:
             context=(
                 "the release went ahead" if act == "release" else "the resolution was recorded"
             ),
+            alert_key=key,
         )
         try:
-            key = (
-                f"approval:{approval_id}" if act == "release" else f"approval:{approval_id}:resolve"
-            )
             self._alert_sink.approval_approver_provenance(
                 key, operation=operation, changed=tuple(changed)
             )
@@ -2082,6 +2086,8 @@ class ApprovalGate:
         async def _resolve_then_flag() -> None:
             # One shielded unit: a resolution that raised (409, 503) is not flagged, and a cancel
             # cannot skip the flag of one that moved the row, as approve's `finally` cannot.
+            # Accepted (vault BACKLOG #3438): a slow flag write can outlast a request timeout, and a
+            # retry of the moved row then answers 409; the flag landing outranks a clean retry.
             await self._record_resolution(
                 approval_id,
                 status=status,
