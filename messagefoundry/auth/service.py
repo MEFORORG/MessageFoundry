@@ -4952,6 +4952,8 @@ class AuthService:
         cheaper way to reach the same answer."""
         return await self._store.increment_login_failure(
             user.id,
+            # BACKLOG #3422: the sign-in lock escalates only where the TOTP is a way past.
+            totp_way_past=counter != "sign_in" or await self._totp_way_past(user),
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
@@ -5192,9 +5194,7 @@ class AuthService:
             # account is its directory sign-in, not a password this engine can reset.
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
-        elif user.auth_provider == AuthProvider.LOCAL.value and (
-            self._totp_way_past(user) if isinstance(user, VerifiedUser) else user.totp_enabled
-        ):
+        elif user.auth_provider == AuthProvider.LOCAL.value and await self._totp_way_past(user):
             notice["combined_sign_in"] = True
         elif (
             user.auth_provider == AuthProvider.LOCAL.value
@@ -10091,11 +10091,12 @@ class AuthService:
         so this line is what names the cause."""
         secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
         # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
-        if secret is not None and not secret.startswith(MARKER_PREFIX):
-            try:
-                totp.parse_enrolment(secret)
-            except totp.RefusedEnrolment:
-                _log_totp_refused(user.username)
+        if (
+            secret is not None
+            and not secret.startswith(MARKER_PREFIX)
+            and _totp_unusable_reason(secret) == "refused"
+        ):
+            _log_totp_refused(user.username)
         return secret
 
     def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
@@ -12212,20 +12213,24 @@ class AuthService:
         A passkey registered before wave 2, or one whose client reported it was not made
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11)."""
-        return self._totp_way_past(user) or await self._holds_discoverable_passkey(user)
+        return await self._totp_way_past(user) or await self._holds_discoverable_passkey(user)
 
-    def _totp_way_past(self, user: VerifiedUser) -> bool:
-        """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its sealed cell opens,
-        and the engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
+    async def _totp_way_past(self, user: UserRecord) -> bool:
+        """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its cell opens, and the
+        engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422)."""
-        if not user.totp_enabled:
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one on the record
+        read (the sealed one for a :class:`VerifiedUser`), opened OFF THE EVENT LOOP, since a
+        Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). A record built with
+        no row reads as no way past. Every way-past decision asks this: the rotation and removal
+        gates, the last-factor rule, the lock escalation and the lock notice."""
+        cell = None if user.row is None else user.row.totp_secret
+        if not user.totp_enabled or cell is None:
             return False
-        # Opened directly, not through _totp_secret: a gate asks this on every confined request, and
-        # the cause is logged where a code is checked and by the census, not once per request here.
         try:
-            secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
+            secret = await asyncio.to_thread(self._store.open_totp_secret, user.id, cell)
         except CipherError:
+            _log_totp_undecryptable(user.username)
             return False
         return _opened_totp_usable(secret)
 
@@ -13543,8 +13548,8 @@ class AuthService:
         # removing it takes nothing away, and it is the first step of enrolling again.
         keep_way_past = (
             user is not None
-            and self._totp_way_past(user)
             and self._covered_by_requirement(user, identity.roles)
+            and await self._totp_way_past(user)
         )
         if user is not None and keep_way_past and not await self._holds_discoverable_passkey(user):
             raise ValueError(TOTP_REMOVAL_REFUSED)
@@ -14328,7 +14333,9 @@ class AuthService:
         # passkey that is not discoverable is no way past, so its removal is never refused on this
         # ground. ``admin_reset_mfa`` stays the recovery for a lost or stolen one, as ADR 0068 says.
         keep_way_past = target.discoverable and self._covered_by_requirement(user, identity.roles)
-        last_second_factor = len(creds) == 1 and not user.totp_enabled
+        # A TOTP this release refuses is no factor the holder can use (BACKLOG #3422), so the
+        # last-factor rule (ADR 0068 decision 5) does not count it either.
+        last_second_factor = len(creds) == 1 and not await self._totp_way_past(user)
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False
         ):

@@ -2458,6 +2458,9 @@ class AuthStore(Protocol):
         lockout_seconds: float,
         max_lockout_seconds: float,
         now: float | None = None,
+        # BACKLOG #3422: the caller's verdict that the account's TOTP is usable. The sign-in lock
+        # escalates only where TOTP is on in the locked row AND this holds.
+        totp_way_past: bool = True,
     ) -> LockoutIncrement: ...
 
     # --- roles / AD-group maps -----------------------------------------------

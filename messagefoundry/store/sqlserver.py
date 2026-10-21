@@ -280,6 +280,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
+    judge_totp,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -323,7 +324,6 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_counts_with,
     totp_enable,
     totp_removal,
     totp_replace,
@@ -13350,9 +13350,8 @@ class SqlServerStore:
         # the record's seal, so the write's compare loses.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                if require_way_past:
-                    # The account row first, under UPDLOCK, so a concurrent removal waits.
-                    await self._read_user_record(cur, user_id)
+                # The account row first, under UPDLOCK, so a concurrent removal waits.
+                held = await self._read_user_record(cur, user_id) if require_way_past else None
                 change = password_change(
                     password_hash=password_hash,
                     password_generated=password_generated,
@@ -13361,7 +13360,7 @@ class SqlServerStore:
                     now=now,
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
-                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
+                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13473,16 +13472,17 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 passkeys: list[WebAuthnCredential] = []
+                held = None
                 if require_way_past:
                     # The account row first, under UPDLOCK, so a concurrent removal waits.
-                    await self._read_user_record(cur, user_id)
+                    held = await self._read_user_record(cur, user_id)
                     passkeys = await self._account_passkeys(cur, user_id)
                 change = totp_removal(
                     now,
                     require_way_past=require_way_past,
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
-                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
+                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13583,7 +13583,7 @@ class SqlServerStore:
                     await self._account_passkeys(cur, user_id),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
-                    totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
+                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, current),
                 ):
                     await conn.rollback()
                     return False
@@ -13906,6 +13906,7 @@ class SqlServerStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         now: float | None = None,
+        totp_way_past: bool = True,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
         atomic step.
@@ -13924,6 +13925,7 @@ class SqlServerStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
+            totp_way_past=totp_way_past,
         )
         written = await self._write_user_txn(user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)

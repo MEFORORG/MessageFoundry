@@ -783,10 +783,11 @@ async def test_a_refused_totp_does_not_free_the_last_discoverable_passkey(
         if removable:
             assert await service.delete_webauthn_credential(identity, cred.credential_id_hash)
             return
-        with pytest.raises(ValueError) as refused:
+        # Refused by the service: the last-factor rule answers first, since a refused TOTP is no
+        # factor the holder can use either (ADR 0068 decision 5).
+        with pytest.raises(ValueError, match="last second factor"):
             await service.delete_webauthn_credential(identity, cred.credential_id_hash)
-        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
-        # The in-store re-check on its own, with the service's rule.
+        # The in-store way-past re-check on its own, with the service's rule.
         assert not await store.delete_webauthn_credential(
             identity.user_id,
             cred.credential_id_hash,
@@ -983,5 +984,119 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
         )
         census = await lockable_account_census(store, AuthSettings())
         assert census.no_way_past == (identity.username,) and census.passkey_only == ()
+    finally:
+        await store.close()
+
+
+# --- the refused-TOTP rule at the remaining sites, and off the event loop ---------------------------
+
+
+def test_a_keyless_open_ciphertext_cell_is_no_way_past() -> None:
+    """A keyless open hands the stored ciphertext through unchanged; that is no usable TOTP."""
+    from messagefoundry.store.crypto import MARKER_PREFIX
+
+    assert not _opened_totp_usable(MARKER_PREFIX + "v2:opaque-ciphertext")
+
+
+@pytest.mark.parametrize(("secret", "escalates"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
+async def test_the_sign_in_lock_escalates_only_beside_a_usable_totp(
+    secret: str, escalates: bool
+) -> None:
+    """ADR 0197 escalates the sign-in lock only where the owner has a way past it. A refused TOTP
+    is none, so its account keeps the fixed length on the second cycle; the usable control
+    doubles."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _lock_service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, secret)
+        user = await service._load_user(identity.user_id)
+        assert user is not None
+        start = 1_000_000.0
+        for cycle in range(2):
+            at = start + cycle * 10_000.0
+            for i in range(_LOCK_THRESHOLD):
+                await service._register_failure(user, at + i, counter="sign_in")
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.locked_until is not None
+        length = row.locked_until - (start + 10_000.0 + _LOCK_THRESHOLD - 1)
+        assert length == (1800.0 if escalates else 900.0), length
+    finally:
+        await store.close()
+
+
+async def test_a_refused_totp_as_the_only_factor_is_no_way_out_but_the_admin_reset() -> None:
+    """The refused TOTP as the account's only factor: no way past, so the rotation waits; and the
+    last-factor rule keeps it, so the holder cannot remove it either. An administrator's factor
+    reset is the documented way out."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        assert await service.must_enrol_before_rotating(identity)
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        with pytest.raises(ValueError, match="last second factor"):
+            await service.disable_mfa(identity)
+        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        assert issued is not None
+        row = await store.get_user(identity.user_id)
+        assert row is not None and not row.totp_enabled and row.password_generated
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("secret", "removable"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])
+async def test_the_last_passkey_beside_a_refused_totp_is_the_last_factor(
+    secret: str, removable: bool
+) -> None:
+    """ADR 0068 decision 5 under ``require_mfa``: a TOTP this release refuses is no factor the
+    holder can use, so the passkey beside it is the last one and its removal is refused, as for a
+    sole usable factor. The control: beside a usable TOTP it may go."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store, require_mfa=False)
+        identity, token, _ = await login_admin(setup)
+        await _register(setup, identity, token, resident_key=False)
+        await _enable_totp(store, identity.user_id, secret)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        service = _service(store)
+        if removable:
+            assert await service.delete_webauthn_credential(identity, cred.credential_id_hash)
+            return
+        with pytest.raises(ValueError, match="last second factor"):
+            await service.delete_webauthn_credential(identity, cred.credential_id_hash)
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+    finally:
+        await store.close()
+
+
+async def test_the_way_past_gates_open_the_totp_cell_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAUDE.md section 6: a Transit cipher's decrypt is a blocking HTTP call, so the service gate
+    and the store's in-transaction re-check open the TOTP cell in a worker thread, never on the
+    thread that runs the event loop."""
+    import threading
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        loop_thread = threading.current_thread()
+        threads: list[threading.Thread] = []
+        real_open = store.open_totp_secret
+
+        def spy(user_id: str, cell: str | None) -> str | None:
+            threads.append(threading.current_thread())
+            return real_open(user_id, cell)
+
+        monkeypatch.setattr(store, "open_totp_secret", spy)
+        assert not await service.must_enrol_before_rotating(identity)
+        assert await service.change_password(identity, _NEW_PASSWORD) == []
+        assert len(threads) >= 2, "the gate and the store re-check should each open the cell"
+        assert loop_thread not in threads, "a TOTP cell was opened on the event loop"
     finally:
         await store.close()
