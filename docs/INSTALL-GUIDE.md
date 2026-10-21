@@ -139,7 +139,7 @@ usually is.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1                 # development only, on Linux/macOS: . .venv/bin/activate
-pip install "messagefoundry==0.5.1"          # pin the exact version (core runtime only)
+pip install "messagefoundry==0.5.2"          # pin the exact version (core runtime only)
 ```
 
 > **CAUTION: early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
@@ -172,7 +172,7 @@ the **GitHub CLI** (`gh` 2.68.0 or later is required, and 2.102.0 or later is re
 optionally `sigstore` (`pip install sigstore`); install **only** the file that passes.
 
 ```powershell
-$V = "0.5.1"   # the exact version you intend to install, as its wheel spells it
+$V = "0.5.2"   # the exact version you intend to install, as its wheel spells it
 # Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
 $TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 
@@ -219,7 +219,7 @@ re-resolve the package name against the folder at install time, or `pip` could s
 different file than the one you just checked:
 
 ```powershell
-$V = "0.5.1"
+$V = "0.5.2"
 # Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
 $TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 pip download "messagefoundry==$V" --no-deps -d .\verify
@@ -273,7 +273,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.5.1
+├─ requirements.txt                # pins the engine:  messagefoundry==0.5.2
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches
