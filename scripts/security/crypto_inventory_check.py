@@ -2653,16 +2653,19 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # A fixed-length cache file name for each querying worktree, from its root path.
     "scripts/coord/overlap.ps1": frozenset({"hash:SHA256"}),
     # Three CSPRNG bytes as the suffix of a decision record id, after its millisecond UTC stamp, so
-    # two records written in the same millisecond do not collide. An identifier, not a secret or a
-    # token: nothing is authorized by knowing an id, and Get-Random would serve as well.
+    # two records written in the same millisecond are unlikely to collide (24 bits; not
+    # impossible, and the log's reader keys records by id, so a collision would drop one). An
+    # identifier, not a secret or a token: nothing is authorized by knowing an id.
     "scripts/coord/_decisionlog.ps1": frozenset({"csprng:RandomNumberGenerator"}),
-    # Two uses in the AFK digest (ADR 0211 section 5), neither a secret. The CSPRNG orders the day's
-    # Class B decisions to draw the owner's blind-rating sample. That draw feeds a calibration audit
-    # of the seats' judgment, so it should not be predictable in advance, but the draw is then saved
-    # to a local file any session on the machine can read, and the ADR says who rates is a rule, not
-    # a control. The SHA-256 of "<id>|<option>" fixes the order a sampled decision's options are
-    # shown in, so the number the owner rates maps back to an option; it hides which option is the
-    # recommendation from the reader only, since anyone holding the id can recompute it.
+    # --- The AFK digest (ADR 0211 section 5): an audit draw, not an identifier. No secret. ---
+    # The CSPRNG orders the day's Class B decisions to draw the owner's blind-rating sample, which
+    # feeds a calibration audit of the seats' judgment, so the draw should not be predictable in
+    # advance. It is not a control against a session: the draw is saved to a local file any session
+    # on the machine can read, delete or rewrite, and the ADR says who rates is a rule, not a
+    # control. The SHA-256 of "<id>|<option>" fixes the order a sampled decision's options are shown
+    # in, so the number the owner rates maps back to an option. It hides the recommendation from
+    # the digest's reader only; the decision record itself names the recommendation, and any
+    # session can read the record.
     "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
     # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
     # session id or a notice key.
