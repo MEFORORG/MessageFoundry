@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.2"
+$GateVersion = "2026.10.21.3"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2324,15 +2324,29 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
 $hook = $null
 $hookText = ""
 $hookUnparseable = $false
-# [Console]::In, NOT the UTF-8 byte reader other hooks use. shell-guard-dispatch.ps1 runs this gate
-# in-process and hands it the payload through [Console]::SetIn, so a byte read of the real stdin
-# would find it already consumed, read nothing, and allow every Bash and PowerShell call
-# (measured: tests/test_shell_guard_dispatch.py goes red). The cost, unfixed here: on a double-byte
-# console code page (cp932, cp936, cp950) a lead byte can swallow the next `\`, and a valid payload
-# that stops parsing is now denied rather than allowed.
+# UTF-8 BYTES FIRST, [Console]::In ONLY WHEN THEY ARE EMPTY. Claude Code writes UTF-8, and
+# [Console]::In decodes with the console code page, which a hook child does not choose: one started
+# from this box's Bash tool reads cp437 and decodes U+00E9 as two characters (measured 2026-10-21), so
+# a non-ASCII primary never matched its allowlist entry. On a double-byte page (cp932, cp936, cp950) a
+# lead byte also swallows the next `\`, so a valid payload stops parsing, and the parse deny below
+# would refuse every such call in every session.
+# The fallback is for shell-guard-dispatch.ps1, which runs this gate in-process: it has already read
+# stdin to the end and hands the payload over through [Console]::SetIn, so the byte read finds EOF
+# and returns nothing. Reading only the bytes there allowed every Bash and PowerShell call (measured:
+# tests/test_shell_guard_dispatch.py went red). A byte read that throws also falls back. On that
+# path the text is only as good as the dispatcher's own read of stdin.
 $hookParseError = ""
 try {
-    $hookText = [Console]::In.ReadToEnd()
+    if ([Console]::IsInputRedirected) {
+        try {
+            $hookText = [System.IO.StreamReader]::new(
+                [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
+        } catch {
+            # Left empty, so the [Console]::In read below runs as it always did.
+            $null = $_
+        }
+    }
+    if (-not $hookText) { $hookText = [Console]::In.ReadToEnd() }
     $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
 } catch {
     $hookUnparseable = $true
