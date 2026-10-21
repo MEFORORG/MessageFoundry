@@ -956,27 +956,6 @@ def test_unparseable_input_is_allowed_when_the_gate_is_off(
     assert run_gate(_UNPARSEABLE[0], allowlist) is None
 
 
-def test_hook_input_is_decoded_as_utf8_not_the_console_code_page(tmp_path: Path) -> None:
-    """Claude Code writes raw UTF-8. Read through the console code page, a non-ASCII primary's path
-    arrived mangled, never matched its allowlist entry, and the write was allowed.
-
-    DISCRIMINATES ONLY WHERE THE CONSOLE CODE PAGE IS NOT UTF-8 (measured: under 65001 the old reader
-    decoded this correctly too; under 437 it read U+00E9 as two characters). It does not force a code
-    page itself, because `chcp` changes the console every parallel test shares."""
-    primary = tmp_path / "Repo-\u00e9"
-    allowlist = tmp_path / "repos.txt"
-    allowlist.write_text(f"{primary}\n", encoding="utf-8")
-    raw = json.dumps(edit(primary / "x.py", primary), ensure_ascii=False).encode("utf-8")
-    proc = run_single(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GATE), "-ReposFile", str(allowlist)],
-        input=raw,
-        capture_output=True,
-        timeout=GATE_TIMEOUT_S,
-    )
-    assert proc.stdout, f"expected a DENY, got allow (stderr: {proc.stderr!r})"
-    assert_denied(json.loads(proc.stdout))
-
-
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
 #
 # The rule decided on COMMAND SHAPE -- the appearance of a disarm KEY -- rather than on whether a

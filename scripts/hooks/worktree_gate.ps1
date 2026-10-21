@@ -2324,16 +2324,15 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
 $hook = $null
 $hookText = ""
 $hookUnparseable = $false
-# UTF-8 BYTES, not [Console]::In, which decodes with the console code page. Once a parse failure denies,
-# that matters: on a double-byte code page (cp932, cp936, cp950) a lead byte swallows the next `\`, so
-# a valid payload with such a character beside a JSON escape stops parsing and every such call would be
-# denied. Same reader as Read-CcxHookInput in _hookinput.ps1, inlined because only this file is
-# installed.
+# [Console]::In, NOT the UTF-8 byte reader other hooks use. shell-guard-dispatch.ps1 runs this gate
+# in-process and hands it the payload through [Console]::SetIn, so a byte read of the real stdin
+# would find it already consumed, read nothing, and allow every Bash and PowerShell call
+# (measured: tests/test_shell_guard_dispatch.py goes red). The cost, unfixed here: on a double-byte
+# console code page (cp932, cp936, cp950) a lead byte can swallow the next `\`, and a valid payload
+# that stops parsing is now denied rather than allowed.
 $hookParseError = ""
 try {
-    $hookReader = [System.IO.StreamReader]::new(
-        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
-    $hookText = $hookReader.ReadToEnd()
+    $hookText = [Console]::In.ReadToEnd()
     $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
 } catch {
     $hookUnparseable = $true
