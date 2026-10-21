@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``scripts/coord/wait-pr.ps1``, the bounded background wait on a pull request (AUTONOMY-PLAN 6.2).
+"""``scripts/coord/wait-pr.ps1``, the bounded background wait on a pull request.
+
+The AFK-autonomy plan's section 6.2 asked for it (docs/AUTONOMY-PLAN.md, on branch
+``autonomy-plan`` and not yet on main when this was written).
 
 Every test drives the script against a stub ``gh`` that answers ``gh api -i`` the way gh 2.102.0
 was measured to: a status line and headers on stdout, a blank line, the body, and exit 1 for a 304
@@ -14,6 +17,7 @@ Nothing reaches GitHub.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,7 +34,8 @@ SHA = "a" * 40
 RUNS_PATH = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1"
 STATUS_PATH = f"repos/{REPO}/commits/{SHA}/status?per_page=100"
 BRANCH_PATH = f"repos/{REPO}/branches/main"
-RULES_PATH = f"repos/{REPO}/rules/branches/main"
+RULES_PATH = f"repos/{REPO}/rules/branches/main?per_page=100&page=1"
+SEAMS = {**os.environ, "MEFOR_WAIT_PR_TEST_SEAMS": "1"}
 TIMEOUT = 120
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="the script runs under pwsh")
@@ -104,7 +109,13 @@ class Run:
         return [c[-1] for c in self.calls]
 
 
-def wait_pr(tmp_path: Path, until: str, plan: dict[str, list[Any]], *args: str) -> Run:
+def wait_pr(
+    tmp_path: Path,
+    until: str,
+    plan: dict[str, list[Any]],
+    *args: str,
+    env: dict[str, str] = SEAMS,
+) -> Run:
     """Run the script with ``-Until until``; ``plan`` maps a REST path to its answers in order."""
     plan.setdefault("rate_limit", [rate(4000)])
     log, counts, sleeps = tmp_path / "gh.log", tmp_path / "counts.json", tmp_path / "sleeps.log"
@@ -140,6 +151,7 @@ def wait_pr(tmp_path: Path, until: str, plan: dict[str, list[Any]], *args: str) 
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
+        env=env,
     )
     return Run(proc, log, sleeps)
 
@@ -219,11 +231,49 @@ def test_a_304_reuses_the_cached_body_and_is_not_counted(tmp_path: Path) -> None
     assert "3 requests, 1 of them 304 and not counted" in run.out
 
 
-def test_a_pr_closed_without_merging_cannot_meet_merged(tmp_path: Path) -> None:
+def test_a_pr_closed_without_merging_on_two_checks_cannot_meet_merged(tmp_path: Path) -> None:
     run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr("closed", merged=False))]})
     assert run.code == 1
-    assert "closed without merging" in run.err
-    assert run.sleeps == []
+    assert "closed without merging on two checks in a row" in run.err
+    assert run.sleeps == [120]
+
+
+def test_a_pr_closed_and_reopened_to_rerun_ci_is_still_waited_on(tmp_path: Path) -> None:
+    run = wait_pr(
+        tmp_path,
+        "merged",
+        {PR_PATH: [ok(pr("closed")), ok(pr()), ok(pr("closed")), ok(pr("closed", merged=True))]},
+    )
+    assert run.code == 0, run.err
+    assert run.sleeps == [120, 120, 120]
+
+
+def test_closed_is_met_by_a_pr_closed_without_merging(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "closed", {PR_PATH: [ok(pr()), ok(pr("closed"))]})
+    assert run.code == 0, run.err
+    assert "met: closed" in run.out
+    assert run.sleeps == [120]
+
+
+def test_a_transient_5xx_is_read_again_next_interval(tmp_path: Path) -> None:
+    run = wait_pr(
+        tmp_path,
+        "merged",
+        {PR_PATH: [ok(pr()), {"status": 502}, ok(pr("closed", merged=True))]},
+    )
+    assert run.code == 0, run.err
+    assert "transient, reading again next interval" in run.out
+    assert "HTTP 502" in run.out
+    assert run.sleeps == [120, 120]
+
+
+def test_the_sleep_seam_is_refused_outside_tests(tmp_path: Path) -> None:
+    """A no-op sleeper would remove the 120 s floor, so it needs the test-only switch."""
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_WAIT_PR_TEST_SEAMS"}
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr("closed", True))]}, env=env)
+    assert run.code == 1
+    assert "-SleepCommand is a test seam" in run.err
+    assert run.calls == []
 
 
 def test_checks_complete_waits_for_a_required_context_that_has_not_started(
@@ -240,7 +290,14 @@ def test_checks_complete_waits_for_a_required_context_that_has_not_started(
         "checks-complete",
         {
             PR_PATH: [ok(pr())],
-            BRANCH_PATH: [ok({"protection": {"required_status_checks": {"contexts": ["lint"]}}})],
+            BRANCH_PATH: [
+                ok(
+                    {
+                        "protected": True,
+                        "protection": {"required_status_checks": {"contexts": ["lint"]}},
+                    }
+                )
+            ],
             RULES_PATH: [
                 ok(
                     [
@@ -285,7 +342,52 @@ def test_an_unprotected_base_is_said_out_loud_and_no_check_is_not_complete(
     )
     # No check at all is not "complete": the wait times out rather than meeting the condition.
     assert run.code == 2, run.err
-    assert "no required contexts found on main" in run.out
+    assert "no required contexts on unprotected main" in run.out
+
+
+def test_a_protected_base_with_no_contexts_list_is_an_error_not_an_empty_set(
+    tmp_path: Path,
+) -> None:
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {PR_PATH: [ok(pr())], BRANCH_PATH: [ok({"protected": True, "protection": {}})]},
+    )
+    assert run.code == 1
+    assert "is protected but its branch payload names no" in run.err
+
+
+def test_checks_complete_reads_every_page_and_waits_on_a_pending_status(tmp_path: Path) -> None:
+    done = [
+        {"name": f"leg {i}", "status": "completed", "conclusion": "success"} for i in range(100)
+    ]
+    late = {"name": "late", "status": "in_progress", "conclusion": None}
+    late_done = {"name": "late", "status": "completed", "conclusion": "success"}
+    page2 = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=2"
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok({"protected": False})],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [ok({"total_count": 101, "check_runs": done})],
+            page2: [
+                ok({"total_count": 101, "check_runs": [late]}),
+                ok({"total_count": 101, "check_runs": [late_done]}),
+            ],
+            STATUS_PATH: [
+                ok({"statuses": [{"context": "ext", "state": "pending"}]}),
+                ok({"statuses": [{"context": "ext", "state": "pending"}]}),
+                ok({"statuses": [{"context": "ext", "state": "success"}]}),
+            ],
+        },
+    )
+    assert run.code == 0, run.err
+    assert "runs=100/101 completed, statuses pending=1/1" in run.out
+    assert "runs=101/101 completed, statuses pending=1/1" in run.out
+    assert "102 success" in run.out
+    assert run.sleeps == [120, 120]
 
 
 def test_a_refused_required_context_read_is_an_error_not_an_empty_set(tmp_path: Path) -> None:
