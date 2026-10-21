@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any, Literal, get_args
 
 from fastapi import (
     Depends,
@@ -2080,12 +2080,39 @@ async def recheck_standing(
 
     Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
     one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
-    differs from the scope the export started with."""
+    differs from the scope the export started with. A caller whose stop record names why asks
+    :func:`check_standing`, which runs the same checks and returns the reason in place of ``None``."""
+    outcome = await check_standing(auth, token, *permissions, activity=activity)
+    return None if isinstance(outcome, str) else outcome
+
+
+#: Why :func:`check_standing` refused, as an audit row's ``reason`` names it (BACKLOG #3404).
+StandingRefusal = Literal[
+    "session_ended",
+    "password_change_required",
+    "notify_email_required",
+    "permission_withdrawn",
+    "second_factor_unmet",
+]
+
+
+async def check_standing(
+    auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
+) -> Identity | StandingRefusal:
+    """:func:`recheck_standing`, returning the reason for a refusal rather than ``None``.
+
+    The same checks in the same order, so the two always agree on whether to refuse. It writes no
+    audit row either. ``session_ended`` covers a revoked, expired, idled or disabled session alike,
+    because :meth:`AuthService.identity_for_token` returns ``None`` for each of them."""
     identity = await auth.identity_for_token(token, activity=activity)
-    if identity is None or identity.must_change_password or identity.must_set_notify_email:
-        return None
+    if identity is None:
+        return "session_ended"
+    if identity.must_change_password:
+        return "password_change_required"
+    if identity.must_set_notify_email:
+        return "notify_email_required"
     if not all(identity.has(permission) for permission in permissions):
-        return None
+        return "permission_withdrawn"
     if not await auth.mfa_satisfied(token):
-        return None
+        return "second_factor_unmet"
     return identity

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -352,3 +353,93 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    # BACKLOG #3404: and a feed that was never refused records no stop.
+    assert await _stopped_rows(engine) == []
+
+
+# --- BACKLOG #3404: a stopped feed leaves one audit row naming why ---------------------------------
+
+
+async def _stopped_rows(engine: Engine) -> list[dict[str, object]]:
+    return [dict(a) for a in await engine.store.list_audit() if a["action"] == "ws_stats.stopped"]
+
+
+def _flip_inside_first_frame(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """A flag that turns True inside the first frame's ``store.stats()``. That call comes after
+    the frame's re-check and before its send, as in :func:`test_no_frame_follows_a_revocation`, so
+    the second frame's re-check is the first to see what the test binds to the flag."""
+    flipped = [False]
+    real_stats = engine.store.stats
+
+    async def stats_then_flip() -> dict[str, int]:
+        flipped[0] = True
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", stats_then_flip)
+    return flipped
+
+
+async def test_a_revocation_stop_records_the_session_ended_reason(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await _wait_for_first_frame(harness, task)
+    await service.revoke_sessions_for_user(uid, actor="admin")
+    await task
+    assert harness.close_code == 1008
+    rows = await _stopped_rows(engine)
+    assert len(rows) == 1, rows
+    assert rows[0]["actor"] == "op" and rows[0]["client"] == "127.0.0.1"
+    detail = json.loads(str(rows[0]["detail"]))
+    assert detail == {"reason": "session_ended", "frames": len(harness.frames)}
+    assert detail["frames"] >= 1
+
+
+async def test_an_unmet_second_factor_stops_the_feed_and_records_why(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factor check is the re-check's last step. The seam is ``mfa_satisfied`` itself, which
+    every gate asks, so the session stays live and only the factor answer changes."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    flipped = _flip_inside_first_frame(engine, monkeypatch)
+    real_mfa = service.mfa_satisfied
+
+    async def mfa_until_flipped(tok: str | None) -> bool:
+        return not flipped[0] and await real_mfa(tok)
+
+    monkeypatch.setattr(service, "mfa_satisfied", mfa_until_flipped)
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+    rows = await _stopped_rows(engine)
+    assert len(rows) == 1, rows
+    assert json.loads(str(rows[0]["detail"])) == {"reason": "second_factor_unmet", "frames": 1}
+
+
+async def test_a_missing_notification_address_stops_the_feed_and_records_why(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store cannot clear an address (``set_user_notify_email`` takes ``str``), so the seam is
+    ``notify_email_required``, which the service asks on every resolve."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    flipped = _flip_inside_first_frame(engine, monkeypatch)
+    monkeypatch.setattr(service, "notify_email_required", lambda _user: flipped[0])
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+    rows = await _stopped_rows(engine)
+    assert len(rows) == 1, rows
+    assert json.loads(str(rows[0]["detail"])) == {"reason": "notify_email_required", "frames": 1}

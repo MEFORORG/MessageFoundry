@@ -232,11 +232,13 @@ from messagefoundry.api.security import (
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
+    StandingRefusal,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
     bearer_token,
+    check_standing,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -9806,13 +9808,14 @@ def create_app(
 
         # A nested function rather than an inline call: scripts/security/route_gates.py reads a
         # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
-        async def _reauthorize() -> Identity | None:
-            """The caller as it stands now, or ``None`` to close. With no auth enforced
+        async def _reauthorize() -> Identity | StandingRefusal:
+            """The caller as it stands now, or why the feed must close. With no auth enforced
             (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
-            return await recheck_standing(auth, token, Permission.MONITORING_READ)
+            return await check_standing(auth, token, Permission.MONITORING_READ)
 
+        frames_sent = 0
         try:
             await websocket.accept()
             while True:
@@ -9823,7 +9826,17 @@ def create_app(
                 # feed too; a scope change that reached the session without a revoke shapes this
                 # frame.
                 current = await _reauthorize()
-                if current is None:
+                if isinstance(current, str):
+                    # One row per stopped feed, naming why (BACKLOG #3404), as the export records
+                    # messages_export.stopped. Written before the close, as the export writes its
+                    # row before it raises; the close itself is unchanged. Not per frame: only the
+                    # stop is recorded, so a feed that streams for hours adds one row at its end.
+                    await engine_obj.store.record_audit(
+                        "ws_stats.stopped",
+                        actor=handshake_identity.username,
+                        detail=json.dumps({"reason": current, "frames": frames_sent}),
+                        client=client_ip(websocket),
+                    )
                     await websocket.close(code=1008)
                     return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
@@ -9850,6 +9863,7 @@ def create_app(
                     rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
+                frames_sent += 1
                 await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return

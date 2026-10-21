@@ -4561,7 +4561,10 @@ those ran at the gate. Each resolves the token it started with, so a session rot
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
-  with 1008 before the next frame. An administrator's scope change revokes the session, as the
+  with 1008 before the next frame. It first records `ws_stats.stopped`, one row per stopped feed,
+  with the frames sent and the reason: `session_ended`, `password_change_required`,
+  `notify_email_required`, `permission_withdrawn` or `second_factor_unmet` (BACKLOG #3404). A
+  revoked, expired, idled or disabled session all read `session_ended`. An administrator's scope change revokes the session, as the
   export bullet below says, so the feed closes. Each frame's connections table uses the identity
   resolved for that frame. So a scope change that reaches a live session without a revoke shapes
   the next frame. A direct store write does that. So can a frame resolved in the export bullet's
