@@ -6,21 +6,30 @@
     docs/AUTONOMY-PLAN.md section 4.4).
 
 .DESCRIPTION
-    IT DOES NOT BLOCK. Permission rules in .claude/settings.json and the other guards already deny
-    most of these acts; this hook's job is the record and the reminder. When a Bash or PowerShell
-    command carries one of the acts below, it appends a `tripwire` record through
-    scripts/coord/decision.ps1 -NoPost (spooled locally, posted to the vault by the next flush) and
-    returns additionalContext telling the session that the act is Class C: stop, and bring it to the
-    owner in the Class C bundle. A command an earlier guard denied never reaches this one, so it
-    leaves no record; it did not run.
+    IT DOES NOT BLOCK, AND SO IT DOES NOT MEET PLAN SECTION 4.4, which says a tripwire "stops the
+    act". Blocking was left out of this slice by its brief. Most of these acts are not denied by
+    anything else either: the deny rules in .claude/settings.json cover only the plain prefixes
+    `git push --force`, `git push -f` and `git reset --hard`, so `--force-with-lease`, `--delete`,
+    `--no-verify`, `cd x && git reset --hard` and `remove.ps1 -Force` all run. The context this hook
+    returns reaches the session with the call, not before it: the act has already run when the
+    session reads "stop". What this hook gives is the RECORD and the reminder.
+
+    When a Bash or PowerShell command carries one of the acts below, it appends a `tripwire` record
+    through scripts/coord/decision.ps1 -NoPost (spooled locally, posted to the vault by the next
+    flush) and returns additionalContext telling the session the act is Class C. A record means the
+    act was ATTEMPTED: this hook runs before the permission rules, so a command they then refuse is
+    recorded too. A command an earlier guard in the dispatcher denied never reaches this one.
 
     WHAT IT DETECTS, at least:
       * `--no-verify` on any git subcommand, and `-n` on `git commit`;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
+      * a long option git accepts abbreviated (`--forc`, `--no-veri`), or one written in quotes;
       * `-Force` on scripts/worktree/remove.ps1 or scripts/coord/claim.ps1;
-      * `-AllowOrphanedAllocations` on any command.
+      * `-AllowOrphanedAllocations` on any command;
+      * a write to the kill switch: `gh variable set|delete MEFOR_AFK_KILL`, or a non-GET
+        `gh api` call on its path. The owner sets it; nothing else stops a seat from doing so.
 
     HOW IT READS A COMMAND. It splits the text into segments at shell separators, honouring quotes,
     so a flag inside a quoted message (`git commit -m "never --no-verify"`) is a mention, not a use.
@@ -40,8 +49,10 @@
     become one shared helper; each copy has its own blind spots until then.
 
     FAST AND OFFLINE: no network, no git call of its own (decision.ps1 runs one `git rev-parse` on a
-    hit), and a command naming none of the words a hit needs is not tokenised at all. It runs under scripts/hooks/shell-guard-dispatch.ps1, which passes a context-only answer
-    through. Fail-open on any error.
+    hit), and a command naming none of the words a hit needs is not tokenised at all. It runs under
+    scripts/hooks/shell-guard-dispatch.ps1, after block-blanket-git-stage.ps1, whose length cap
+    bounds what reaches it, and the dispatcher passes its context-only answer through. Fail-open on
+    any error.
 
     WIRING IS NOT ASSERTED HERE ON PURPOSE. Which guards run is a property of settings.json.
 #>
@@ -105,6 +116,29 @@ function Test-ShortCluster([string]$T, [char]$Letter, [string]$ValueLetters) {
     return $false
 }
 
+function Test-LongOption([string]$T, [string]$Full, [int]$Min) {
+    # git accepts an unambiguous abbreviation of a long option; $Min is the shortest one that is
+    # not also the start of another option of the same subcommand.
+    $name = $T.Split('=')[0]
+    return ($name -ceq $Full -or ($name.Length -ge $Min -and $Full.StartsWith($name, [StringComparison]::Ordinal)))
+}
+
+function Test-KillSwitchWrite($Argv) {
+    # `gh variable set|delete MEFOR_AFK_KILL`, or `gh api` on its path with a method other than GET:
+    # -X/--method, or a field or input, which makes gh send a POST.
+    $words = @($Argv | ForEach-Object { $_.T })
+    if (-not @($words | Where-Object { $_ -match 'MEFOR_AFK_KILL' }).Count) { return $false }
+    if ($words.Count -ge 2 -and $words[0] -eq 'variable' -and $words[1] -in @('set', 'delete', 'remove')) { return $true }
+    if (-not $words.Count -or $words[0] -ne 'api') { return $false }
+    for ($p = 1; $p -lt $words.Count; $p++) {
+        $w = $words[$p]
+        if ($w -cin @('-X', '--method') -and $p + 1 -lt $words.Count) { if ($words[$p + 1] -ne 'GET') { return $true } }
+        elseif ($w -cmatch '^(-X|--method=)(.+)$') { if ($Matches[2] -ne 'GET') { return $true } }
+        elseif ($w -cin @('-f', '-F', '--field', '--raw-field', '--input')) { return $true }
+    }
+    return $false
+}
+
 function Find-GitTripwires($Argv, $Hits) {
     $k = 0
     # Global options before the subcommand; -C, -c and the bare long forms take a value.
@@ -116,19 +150,29 @@ function Find-GitTripwires($Argv, $Hits) {
     if ($k -ge $Argv.Count) { return }
     $sub = $Argv[$k].T
     $rest = @(if ($k + 1 -lt $Argv.Count) { $Argv[($k + 1)..($Argv.Count - 1)] })
-    $flags = @($rest | Where-Object { -not $_.Q } | ForEach-Object { $_.T })
-    if ($flags -ccontains '--no-verify') { $Hits.Add("git $sub --no-verify") }
+    # A flag is an unquoted token, or a quoted one that is a single flag-shaped word: the shell
+    # hands git `--force` either way. A quoted word right after an option that takes a value is
+    # that value (`-m "--no-verify"`), not a flag.
+    $valued = @('-m', '--message', '-F', '--file', '-C', '-c', '-t', '--template', '-o', '--push-option')
+    $flags = @(for ($p = 0; $p -lt $rest.Count; $p++) {
+            $t = $rest[$p]
+            $after = $p -gt 0 -and $rest[$p - 1].T -cin $valued
+            if (-not $t.Q -or ($t.T -cmatch '^--?[A-Za-z][\w-]*(=\S*)?$' -and -not $after)) { $t.T }
+        })
+    if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $sub --no-verify") }
     switch -CaseSensitive ($sub) {
         'commit' {
             if (@($flags | Where-Object { Test-ShortCluster $_ ([char]'n') 'mFCct' }).Count) { $Hits.Add('git commit -n (no-verify)') }
         }
         'reset' {
-            if ($flags -ccontains '--hard') { $Hits.Add('git reset --hard') }
+            if (@($flags | Where-Object { Test-LongOption $_ '--hard' 4 }).Count) { $Hits.Add('git reset --hard') }
         }
         'push' {
             foreach ($f in $flags) {
-                if ($f -ceq '--force' -or $f.StartsWith('--force-with-lease') -or $f -ceq '--mirror' -or (Test-ShortCluster $f ([char]'f') 'o')) { $Hits.Add('git push --force') }
-                if ($f -ceq '--delete' -or $f -ceq '--prune' -or (Test-ShortCluster $f ([char]'d') 'o')) { $Hits.Add('git push ref deletion') }
+                if ((Test-LongOption $f '--force' 6) -or $f.StartsWith('--force-w') -or (Test-LongOption $f '--mirror' 4) -or
+                    (Test-ShortCluster $f ([char]'f') 'o')) { $Hits.Add('git push --force') }
+                if ((Test-LongOption $f '--delete' 4) -or (Test-LongOption $f '--prune' 5) -or
+                    (Test-ShortCluster $f ([char]'d') 'o')) { $Hits.Add('git push ref deletion') }
             }
             $positional = [System.Collections.Generic.List[string]]::new()
             for ($p = 0; $p -lt $rest.Count; $p++) {
@@ -161,7 +205,11 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
             $Hits.Add('-AllowOrphanedAllocations')
         }
         $k = 0
-        while ($k -lt $seg.Count -and -not $seg[$k].Q -and ($seg[$k].T -match '^[A-Za-z_][A-Za-z0-9_]*=' -or $skip -contains $seg[$k].T)) { $k++ }
+        # Skip an environment assignment (X=1), a PowerShell assignment ($r = ... , $null = ...)
+        # and the keywords that can stand in front of a command.
+        while ($k -lt $seg.Count -and -not $seg[$k].Q -and (
+                $seg[$k].T -match '^[A-Za-z_][A-Za-z0-9_]*=' -or $seg[$k].T -match '^\$[\w:]+$' -or
+                $seg[$k].T -in @('=', '+=') -or $skip -contains $seg[$k].T)) { $k++ }
         if ($k -ge $seg.Count) { continue }
         $prog = Get-ProgramLeaf $seg[$k].T
         $argv = @(if ($k + 1 -lt $seg.Count) { $seg[($k + 1)..($seg.Count - 1)] })
@@ -185,6 +233,8 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
         }
         if ($prog -eq 'git') {
             Find-GitTripwires $argv $Hits
+        } elseif ($prog -eq 'gh') {
+            if (Test-KillSwitchWrite $argv) { $Hits.Add('a write to the MEFOR_AFK_KILL kill switch') }
         } elseif ($prog -in @('remove.ps1', 'claim.ps1')) {
             if (@($argv | Where-Object { -not $_.Q -and $_.T -match '^-Force(:\$?true)?$' }).Count) { $Hits.Add("$prog -Force") }
         }
@@ -200,7 +250,7 @@ try {
     $cmdProp = $input_.Value.PSObject.Properties['command']
     if (-not $cmdProp) { exit 0 }
     # Every hit needs one of these words, so most shell calls stop here without being tokenised.
-    if ([string]$cmdProp.Value -notmatch 'git|remove\.ps1|claim\.ps1|AllowOrphanedAllocations') { exit 0 }
+    if ([string]$cmdProp.Value -notmatch '\bgit\b|remove\.ps1|claim\.ps1|AllowOrphanedAllocations|MEFOR_AFK_KILL') { exit 0 }
     $hits = [System.Collections.Generic.List[string]]::new()
     Find-Tripwires ([string]$cmdProp.Value) 0 $hits
     if (-not $hits.Count) { exit 0 }

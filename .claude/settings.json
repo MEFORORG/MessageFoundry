@@ -141,7 +141,7 @@
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/afk-tripwire.ps1"
             ],
-            "timeout": 60,
+            "timeout": 75,
             "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling, filesystem scans and AFK tripwires"
           }
         ]

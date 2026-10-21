@@ -60,6 +60,22 @@ MUST_HIT = [
     pytest.param("git push -f origin b", "git push --force", id="push-f"),
     pytest.param("git -C D:/x push -uf origin b", "git push --force", id="push-cluster"),
     pytest.param("git --super-prefix x/ push --force", "git push --force", id="super-prefix"),
+    pytest.param("$null = git push --force origin b", "git push --force", id="ps-assignment"),
+    pytest.param("$r = git reset --hard", "git reset --hard", id="ps-assignment-reset"),
+    pytest.param('git push "--force" origin b', "git push --force", id="quoted-flag"),
+    pytest.param("git push --forc origin b", "git push --force", id="abbreviated-long"),
+    pytest.param("git reset --ha", "git reset --hard", id="abbreviated-hard"),
+    pytest.param(
+        "gh variable set MEFOR_AFK_KILL --repo MEFORORG/MessageFoundry --body off",
+        "kill switch",
+        id="kill-switch-set",
+    ),
+    pytest.param(
+        "gh api -X PATCH repos/MEFORORG/MessageFoundry/actions/variables/MEFOR_AFK_KILL"
+        " -f value=off",
+        "kill switch",
+        id="kill-switch-patch",
+    ),
     pytest.param("git push --force-with-lease origin b", "git push --force", id="lease"),
     pytest.param("git push origin +main:main", "git push --force", id="plus-refspec"),
     pytest.param("git push origin :old-branch", "git push ref deletion", id="colon-refspec"),
@@ -102,6 +118,13 @@ MUST_PASS = [
     pytest.param(r"pwsh -File scripts\worktree\remove.ps1 -Path x", id="remove-no-force"),
     pytest.param("Remove-Item -Force x.txt", id="remove-item-force"),
     pytest.param("git log --format=%H -n 3", id="log-n"),
+    pytest.param("git push --progress origin b", id="push-progress"),
+    pytest.param("git commit -m '--no-verify'", id="quoted-flag-as-message"),
+    pytest.param(
+        "gh api repos/MEFORORG/MessageFoundry/actions/variables/MEFOR_AFK_KILL",
+        id="kill-switch-read",
+    ),
+    pytest.param("gh api repos/MEFORORG/MessageFoundry/pulls/1 -X PATCH -f x=y", id="other-gh"),
 ]
 
 
@@ -184,3 +207,11 @@ def test_the_dispatcher_joins_the_context_onto_a_kept_decision(sb: Sandbox, tmp_
     assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert out["hookSpecificOutput"]["permissionDecisionReason"] == "because"
     assert "AFK TRIPWIRE" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_a_failed_guard_is_named_in_the_context_it_would_hide_behind(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """Writing a context exits 0, so a guard that failed open on the same call must be said."""
+    out = _dispatch(sb, [tmp_path / "missing-guard.ps1", HOOK], "git reset --hard")
+    assert "FAILED OPEN" in out["hookSpecificOutput"]["additionalContext"]

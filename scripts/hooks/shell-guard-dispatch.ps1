@@ -83,7 +83,8 @@
     read stops at its cap, but THIS file reads all of stdin first, so on the wired path the read
     itself is not bounded; only the parse is. The timeout in settings.json is the guards' former
     per-guard timeouts summed, so a run in which every guard finishes inside its old budget still
-    finishes inside this one.
+    finishes inside this one. afk-tripwire.ps1 never had its own handler, so its 15 seconds were
+    added when it joined (ADR 0211).
 
     WIRING IS NOT ASSERTED HERE ON PURPOSE. Which guards run is a property of settings.json.
     ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -256,6 +257,10 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
     if ($ShellGuardContext) { $ShellGuardContexts.Add($ShellGuardContext) }
 }
 if ($ShellGuardContexts.Count) {
+    # Writing a context exits 0, which would hide a failed guard behind it; say so in the context.
+    if ($ShellGuardFailed) {
+        $ShellGuardContexts.Add('shell-guard-dispatch: at least one shell guard FAILED OPEN on this call, so it checked nothing; the hook stderr names it.')
+    }
     try {
         $ShellGuardAnswer = if ($null -ne $ShellGuardKept) { $ShellGuardKept | ConvertFrom-Json } else {
             [pscustomobject]@{ hookSpecificOutput = [pscustomobject]@{ hookEventName = 'PreToolUse' } }
