@@ -840,19 +840,20 @@ push and error apart. It prints one line per state change, and for `merged` and 
 carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
 in the table above. **With `-Until merged`, `dirty` is acted on:** a PR read `dirty` on repeated
 checks of one head and base ends the wait with its own exit code instead of running to the timeout,
-and the fix is a conflict to resolve, not an update from `main` (see the table above). **`behind` is
-only printed**, so the went-stale arm described just above is a line to read, not an exit (the
-script's header says why). Nor is the failing arm an exit: a red required check reads
-`blocked` and still runs to the timeout. With `closed` the state is only printed, and the
-`checks-complete` line does not carry it. `checks-complete` waits for every context the base branch
-requires, not only the checks that already exist.
+and the fix is a conflict to resolve by hand, not a mechanical rebase (see the table above).
+**`behind` is only printed and does not end the wait** (the script's header says why), so a
+background wait on a PR that went stale wakes you at its timeout, and the went-stale arm described
+just above is the last state line to read then, not an exit code. Nor is the failing arm an exit: a
+red required check reads `blocked` and still runs to the timeout. With `closed` the state is only
+printed, and the `checks-complete` line does not carry it. `checks-complete` waits for every context
+the base branch requires, not only the checks that already exist.
 
 Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
 options: the two test seams that replace the sleep and the timeout are refused unless
 `MEFOR_WAIT_PR_TEST_SEAMS=1` is set, so never leave that variable set outside a test run. Every
 read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on the last ETag, so an unchanged answer does not count against the shared rate
 limit. The script's header is the one place that states the numbers, the exit codes, how many
-stale reads end a wait, and why it does not trip
+`dirty` reads end a wait, and why it does not trip
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
 
 ### Resolving a conflict: never take a side wholesale
