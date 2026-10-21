@@ -56,7 +56,7 @@ there is no defence in depth between them.
 | Rule | Fires on | Keyed on |
 |---|---|---|
 | 1 | `Write`/`Edit`/`MultiEdit`/`NotebookEdit` targeting the primary's tree | **target path** |
-| 2 | `Task`/`Agent`/`Workflow` dispatch from the primary, except a `Task`/`Agent` call whose `subagent_type` is exactly `web-fetch` or `claude-code-guide` | **session cwd** |
+| 2 | `Task`/`Agent`/`Workflow` dispatch from the primary, except a `Task`/`Agent` call whose `subagent_type` is exactly `web-fetch` or `claude-code-guide` | **session cwd**; the exemption also reads `tool_input.subagent_type` |
 | 3 | 11 git verbs that swap or discard the primary's tree | target path parsed out of the command string |
 | 3b | `checkout`/`switch` moving a *linked worktree* onto an existing branch | ditto |
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
@@ -228,7 +228,7 @@ reading the emitted decision — not by reading source alone.
 | Rule 1a — write to the gate's own script or allowlist | user | **NEW** — the kill switch sat outside every governed root, so rule 1 allowed an `Edit` to it |
 | Rule 3c — `git config` that disarms the shared repo | user | **NEW** — `core.hooksPath` / `core.worktree` / `alias.*` / `include.path`; asks git for the common dir, so a *linked worktree* is covered too |
 | Rule 3d — `git worktree remove` / `move` on another session's checkout | user | **NEW** — every other rule protects a tree from being *swapped*; this protects it from being *deleted* |
-| Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY, measured before the exemption in the rule table above; the exemption itself is read from source and not probed) |
+| Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY, measured before the exemption in the rule table above; the exemption is tested against the repo copy, not probed against the installed hook, and is live only once `install-gate.ps1` installs it) |
 | Rule 3 — git verbs vs primary | user | **LIVE, partial** — the `-c` and relative-`cd` holes are fixed in source (G2/G3); enumerated-verb gaps remain (G9) |
 | Rule 3b — worktree hijack | user | **LIVE but narrow** — 2 of 11 verbs, existing-local-branch destinations only |
 | Rule 4 — `EnterWorktree` | — | **INERT BY DESIGN** — now opt-in behind `-EnterWorktreeGate`; was inert by accident (absent from the installed script *and* unmatched in all 5 config dirs) |
@@ -293,10 +293,10 @@ A row in this table that has not been re-established that way is a claim about t
 closed and probe-verified. So is the literal-spelling tree swap: `git checkout main` at cwd = primary,
 `git -C <abs primary> checkout main`, `git -C ../../.. checkout zzz`, and `cd <abs primary> && git checkout main`
 all DENY. Fan-out from the primary is closed for the three named dispatch tools, bar rule 2's exemption
-for two built-in subagent types with neither a shell nor a write tool (rule table above; the comment above
-`Rule 2 --` in the gate names the residuals). Duplicate-branch checkout
-across worktrees is closed — though git enforces that one for free, so rule 3b fills a narrower gap than
-its 73 lines suggest.
+for two subagent types (rule table above). That exemption matches the type NAME only, so an agent defined
+under either name passes whatever tools it has; the `# Rule 2 --` comment block in the gate lists that and
+the other residuals. Duplicate-branch checkout across worktrees is closed — though git enforces that one
+for free, so rule 3b fills a narrower gap than its 73 lines suggest.
 
 **Only nominally closed.**
 
@@ -529,9 +529,11 @@ for ranking the rest.
 recorded as, and the correct response is not to weaken it.**
 
 **The mechanics.** Rule 2 denies `Task`/`Agent`/`Workflow` **only when the session's cwd is a governed
-primary**, and even there it passes the two exempt subagent types in the rule table above. `Test-Governed` exempts `<primary>/.claude/worktrees/…`, and sibling worktrees fall outside
-the root entirely — so **dispatch works from every worktree, nested or sibling**. What is blocked is a
-Workflow launched from a session hand-started in the primary. Because the owner runs many VS Code windows
+primary**, and even there it passes the two exempt subagent types in the rule table above.
+`Test-Governed` exempts `<primary>/.claude/worktrees/…`, and sibling worktrees fall outside the root
+entirely — so **dispatch works from every worktree, nested or sibling**. What is blocked is a Workflow,
+or a `Task`/`Agent` call of any other subagent type, launched from a session hand-started in the
+primary. Because the owner runs many VS Code windows
 and opens the primary himself, that collision is frequent enough to *feel* like a general prohibition,
 which is how it got recorded as "an ultracode Workflow CANNOT launch there". That reading is too broad.
 
@@ -577,9 +579,9 @@ wants fan-out can get it under another name; the rule mostly stops the *sanction
 **Recommendation on rule 4 (`EnterWorktree`) — do not install it. Retire it.**
 
 The compounding argument in [WORKTREES.md](WORKTREES.md) is correct and is the decisive one: with rules 2
-and 4 both live, a primary-resident session has **no in-session path to isolation at all**. It can
-dispatch no subagent that can build, and it cannot relocate. It must be re-started elsewhere by a human. That is a hard stop on
-workflow-by-default from the directory sessions naturally open in.
+and 4 both live, a primary-resident session has **no in-session path to isolation at all**. It has
+no sanctioned path to a subagent that can build, and it cannot relocate. It must be re-started elsewhere
+by a human. That is a hard stop on workflow-by-default from the directory sessions naturally open in.
 
 Three further facts, all first-party:
 
