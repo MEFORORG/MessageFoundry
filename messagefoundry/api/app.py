@@ -9830,14 +9830,18 @@ def create_app(
                     # One row per stopped feed, naming the rule and the frames sent (BACKLOG
                     # #3404). The gate audits its own refusals; without this a feed ended by an
                     # unmet second factor or a missing notification address left no trail. Written
-                    # before the close, as the export writes its stop before it raises.
-                    await engine_obj.store.record_audit(
-                        "ws_stats.stopped",
-                        actor=handshake_identity.username,
-                        detail=json.dumps({"reason": current, "frames": frames}),
-                        client=client_ip(websocket),
-                    )
-                    await websocket.close(code=1008)
+                    # before the close, as the export writes its stop before it raises. The close
+                    # is in a finally so a failed write still ends the feed with 1008, and the
+                    # write's error still propagates to be logged.
+                    try:
+                        await engine_obj.store.record_audit(
+                            "ws_stats.stopped",
+                            actor=handshake_identity.username,
+                            detail=json.dumps({"reason": current, "frames": frames}),
+                            client=client_ip(websocket),
+                        )
+                    finally:
+                        await websocket.close(code=1008)
                     return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
                 # counts PLUS the SERVER-RENDERED, already-escaped connections fragment, so the /ui table

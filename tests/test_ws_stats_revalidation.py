@@ -15,6 +15,7 @@ import contextlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from starlette.websockets import WebSocket
@@ -95,8 +96,6 @@ class _WSHarness:
         if kind == "websocket.accept":
             return
         if kind == "websocket.send":
-            import json
-
             self.frames.append(json.loads(message["text"]))  # type: ignore[arg-type]
             return
         if kind == "websocket.close":
@@ -383,7 +382,7 @@ class _Notifier:
 
 
 async def _wire_a_notifier(service: AuthService, uid: str) -> None:
-    service._security_notifier = _Notifier()
+    service.attach_security_notifier(_Notifier())
 
 
 async def _unmeet_the_second_factor(service: AuthService, uid: str) -> None:
@@ -432,7 +431,7 @@ async def test_a_refused_recheck_records_one_stop_row_naming_why(
     ``act`` runs inside the first frame's ``store.stats()``, as in
     :func:`test_no_frame_follows_a_revocation`, so exactly one frame goes out and the second
     frame's re-check refuses. The feed then writes exactly one row, naming the reason and the frames
-    sent, and never the token."""
+    sent. The exact match is what keeps the token, or anything else, out of the row."""
     monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
@@ -443,9 +442,9 @@ async def test_a_refused_recheck_records_one_stop_row_naming_why(
     await harness.run(timeout=_HARNESS_TIMEOUT)
     assert harness.close_code == 1008
     assert len(harness.frames) == 1, harness.frames
-    stops = await _stop_rows(engine)
-    assert stops == [{"actor": "op", "client": "127.0.0.1", "reason": reason, "frames": 1}]
-    assert token not in json.dumps(stops)
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": reason, "frames": 1}
+    ]
 
 
 async def test_a_refusal_before_the_first_frame_records_a_stop_with_no_frames(
@@ -489,3 +488,66 @@ async def test_the_refusal_names_a_permission_the_caller_does_not_hold(engine: E
     current = await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
     assert isinstance(current, Identity) and current.username == "op"
     assert await recheck_standing(service, token, Permission.MONITORING_READ) == current
+
+
+async def test_a_lapsed_factor_is_named_before_a_missing_address(engine: Engine) -> None:
+    """BACKLOG #3404: the re-check runs in the gates' order, the factor first, so a session that
+    fails both is named ``mfa_unmet``, as ``authorize_ws`` would audit it ``auth.mfa_denied``. The
+    first assertion is the control: the missing address alone is named."""
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    await _wire_a_notifier(service, uid)
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+        == "notify_email_due"
+    )
+    await _unmeet_the_second_factor(service, uid)
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ) == "mfa_unmet"
+    )
+
+
+async def test_a_session_that_ends_during_the_factor_check_is_named_ended(engine: Engine) -> None:
+    """BACKLOG #3404: the factor check reads the session again. A session that ends between the
+    first resolve and that read fails the factor check, and must still be named ``session_ended``,
+    not a lapsed factor on an account that may just have proved one."""
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    real_mfa_satisfied = service.mfa_satisfied
+
+    async def revoke_then_check(token: str | None) -> bool:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+        return await real_mfa_satisfied(token)
+
+    service.mfa_satisfied = revoke_then_check  # type: ignore[method-assign]
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+        == "session_ended"
+    )
+
+
+async def test_a_failed_stop_row_write_still_closes_the_feed_with_1008(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404: the close runs whether or not the stop row is written. A store that refuses
+    the write still ends the feed with the policy close, and the write's error still surfaces."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    real_record_audit = engine.store.record_audit
+
+    async def refuse_the_stop_row(action: str, **kwargs: Any) -> Any:
+        if action == "ws_stats.stopped":
+            raise RuntimeError("store refused the write")
+        return await real_record_audit(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", refuse_the_stop_row)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    with pytest.raises(RuntimeError, match="store refused the write"):
+        await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames

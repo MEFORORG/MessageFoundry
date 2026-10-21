@@ -2062,9 +2062,9 @@ def quiet_deliberate_export_stops() -> None:
 StandingRefusal = Literal[
     "session_ended",
     "password_change_due",
+    "mfa_unmet",
     "notify_email_due",
     "permission_withdrawn",
-    "mfa_unmet",
 ]
 
 
@@ -2074,20 +2074,28 @@ async def recheck_standing_or_refusal(
     """:func:`recheck_standing`, returning the refusal's reason where that returns ``None``.
 
     For a caller whose stop row names the rule that refused (BACKLOG #3404): the ``/ws/stats`` feed.
-    ``session_ended`` covers every way the token stops resolving, a revoke, an expiry, an idle
-    timeout, a disabled or deleted account among them, since the lookup does not say which.
-    The standing rules live here; :func:`recheck_standing` is this with the reason dropped."""
+    The standing rules live here, so a new one goes here; :func:`recheck_standing` is this with
+    the reason dropped. They run in the gates' order, the factor before the notification address
+    and the permissions, so a session failing several is named as the gate would name it.
+
+    ``session_ended`` covers every way the token stops resolving, since the lookup does not say
+    which: at least a revoke, a sign-out, an expiry, an idle timeout, a disabled or deleted
+    account, and a session rotation such as a step-up on that session."""
     identity = await auth.identity_for_token(token, activity=activity)
     if identity is None:
         return "session_ended"
     if identity.must_change_password:
         return "password_change_due"
+    if not await auth.mfa_satisfied(token):
+        # The factor check loads the session again, and finds none if it ended between the two
+        # reads. Ask once more on this refusal-only path, so that end is not named a lapsed factor.
+        if await auth.identity_for_token(token, activity=False) is None:
+            return "session_ended"
+        return "mfa_unmet"
     if identity.must_set_notify_email:
         return "notify_email_due"
     if not all(identity.has(permission) for permission in permissions):
         return "permission_withdrawn"
-    if not await auth.mfa_satisfied(token):
-        return "mfa_unmet"
     return identity
 
 
@@ -2108,10 +2116,10 @@ async def recheck_standing(
     act has started. It moves no idle clock unless ``activity`` is True: a live feed is passive,
     but a download the caller asked for is that caller's act, and the export passes True now and
     then so a long download does not idle its own session out. It writes no audit row; the caller
-    records the stop, and :func:`recheck_standing_or_refusal` gives one that names the rule the
-    reason. :func:`require`, :func:`authorize_ws` and the
-    console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
-    standing rule goes in all four.
+    records the stop, and a caller whose row names the rule that refused calls
+    :func:`recheck_standing_or_refusal`, which holds the rules. :func:`require`,
+    :func:`authorize_ws` and the console's ``authorize_ui_ws`` ask the same list with audit rows
+    between the steps, so a new standing rule goes in that function and in all three.
 
     Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
     one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
