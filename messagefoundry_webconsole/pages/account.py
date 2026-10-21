@@ -588,8 +588,8 @@ def _session_offer(others: int) -> Markup:
     """The offer to end the caller's other sessions after a factor change (BACKLOG #1147, ASVS 7.4.3).
 
     ``others`` is how many sessions the revoke would end: every other session of the caller not yet
-    signed out, one that has gone idle included (BACKLOG #3393), so the number on the button is the
-    number that ends. The form posts to the same route as the sessions page's *Sign out everywhere
+    signed out, one that has gone idle included (BACKLOG #3393), as read after the factor change. A
+    sign-in or the reaper before the click can still move it. The form posts to the same route as the sessions page's *Sign out everywhere
     else*, which keeps the current session. That route asks for a fresh re-proof, bound to the
     action, and then runs (ASVS 7.5.2). Declining is doing nothing: no session ends unless the
     caller asks."""

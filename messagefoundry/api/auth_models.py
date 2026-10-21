@@ -428,7 +428,7 @@ class MfaConfirmResponse(CredentialReply):
 
     ``other_sessions`` is the offer to end the caller's other sessions after this factor change
     (ASVS 7.4.3, BACKLOG #1147, #3393): how many of them ``DELETE /me/sessions`` would end, read
-    before the confirm. Nothing ends unless the client asks; the console shows the same offer."""
+    after the confirm. Nothing ends unless the client asks; the console shows the same offer."""
 
     recovery_codes: list[str]
     token: str
@@ -438,7 +438,7 @@ class MfaConfirmResponse(CredentialReply):
 class MfaDisableResponse(BaseModel):
     """``DELETE /me/mfa``'s reply. ``other_sessions`` is the offer to end the caller's other
     sessions after the factor change (ASVS 7.4.3, BACKLOG #1147, #3393): how many of them
-    ``DELETE /me/sessions`` would end, read before the disable. It is 0 when TOTP was never on,
+    ``DELETE /me/sessions`` would end, read after the disable. It is 0 when TOTP was never on,
     since that disable changed no factor. Nothing ends unless the client asks."""
 
     detail: str

@@ -85,7 +85,7 @@ def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> 
         client.login("jdoe", "a-strong-test-passphrase")
         client.reauth("a-strong-test-passphrase")
         client.verify_mfa("123456")
-        assert client.confirm_mfa("123456").recovery_codes == ["code-one"]
+        assert client.confirm_mfa("123456").recovery_codes == ("code-one",)
         client.me()
     finally:
         client.close()

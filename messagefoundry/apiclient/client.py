@@ -156,7 +156,7 @@ class MfaConfirmed:
     ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end.
     The rotated session token is not here: the client has already adopted it."""
 
-    recovery_codes: list[str]
+    recovery_codes: tuple[str, ...]
     other_sessions: int
 
 
@@ -1208,7 +1208,7 @@ class EngineClient:
         self._adopt_rotated(response)
         confirmed = _decode(response, MfaConfirmResponse)
         return MfaConfirmed(
-            recovery_codes=confirmed.recovery_codes, other_sessions=confirmed.other_sessions
+            recovery_codes=tuple(confirmed.recovery_codes), other_sessions=confirmed.other_sessions
         )
 
     def verify_mfa(self, code: str) -> None:

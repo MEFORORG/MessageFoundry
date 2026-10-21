@@ -117,6 +117,14 @@ async def test_enroll_confirm_shows_the_codes_and_the_offer_for_the_new_session(
         user_id = await provision(service, "op", ["operator"])
         assert (await service.login("op", PW)).ok
         await cookie_login(c, "op")
+        # BACKLOG #3393: a lapsed row nobody revoked. The confirm's own session-cap run ends it, so
+        # the count, read after that run, still offers 1; read before it, the page offered 2.
+        await service.store.create_session(
+            token_hash=hash_token("lapsed-session-token-3393"),
+            user_id=user_id,
+            expires_at=1.0,
+            auth_mechanism="password",
+        )
         before = _cookie(c)
         r = await _enroll_totp(c, service, user_id)
         assert "shown once" in r.text and "<code>" in r.text  # the codes still render
@@ -320,3 +328,22 @@ def test_the_offer_with_no_other_session_has_no_button() -> None:
     assert OFFER in pages.account_page(me, mfa, session_offer=2)
     assert OFFER not in pages.account_page(me, mfa)
     assert OFFER not in pages.mfa_recovery_page(["a", "b"], other_sessions=0)
+
+
+def test_spending_a_mark_keeps_one_set_again_meanwhile() -> None:
+    """BACKLOG #3393: the account page reads the mark, renders, then spends it. A factor change in
+    another tab can mark the session again in between; that mark belongs to its own page, so the
+    spend must leave it. RED when ``spend`` drops whatever mark the session holds."""
+    from messagefoundry_webconsole.routes.account import _SessionOffers
+
+    offers = _SessionOffers()
+    offers.mark("tok")
+    first = offers.pending("tok")
+    assert first is not None
+    offers.mark("tok")  # the other tab's change, before this page spends
+    offers.spend("tok", first)
+    assert offers.pending("tok") is not None
+    again = offers.pending("tok")
+    assert again is not None
+    offers.spend("tok", again)
+    assert offers.pending("tok") is None

@@ -982,11 +982,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         token = bearer_token(request)
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
-        # BACKLOG #1147, #3393: the offer's count, read BEFORE the confirm commits, as the console's
-        # confirm reads it. Read after, a store fault would answer 500 once TOTP is on and the token
-        # rotated, losing the one-time codes and the caller's session. The confirm ends no other
-        # session and re-keys this one in place, so the count holds across the rotation.
-        others = await service.count_other_sessions(identity.user_id, hash_token(token))
         try:
             elevation = await service.confirm_mfa_enrollment(
                 identity, body.code, token=token, client=client_ip(request)
@@ -1010,6 +1005,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
+        # BACKLOG #1147, #3393: the offer's count, read after the confirm's own session-cap run and
+        # against the rotated token. count_other_sessions answers 0 rather than raise, so a store
+        # fault here cannot cost the recovery codes.
+        others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         return MfaConfirmResponse(
             recovery_codes=list(elevation.recovery_codes),
             token=elevation.token,
@@ -1033,7 +1032,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
         token = bearer_token(request)
-        if token is None:
+        if token is None:  # pragma: no cover - require_step_up_action authenticated this bearer
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         return await _disable_my_mfa_core(
             service=service, identity=identity, token=token, client=client_ip(request)
@@ -1046,15 +1045,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         the JSON route, the cookie session on the console's ``/ui/account/mfa/disable``, which takes
         the same step-up in its own gate (BACKLOG #3393).
 
-        ``other_sessions`` is the offer to end the caller's other sessions (BACKLOG #1147). It is
-        read before the disable, so a store fault cannot answer 500 for a disable that committed,
-        and it is 0 when TOTP was never on, since that disable changed no factor."""
-        others = await service.count_other_sessions(identity.user_id, hash_token(token))
+        ``other_sessions`` is the offer to end the caller's other sessions (BACKLOG #1147), read
+        after the disable committed. It is 0 when TOTP was never on, since that disable changed no
+        factor, and on a store fault, which ``count_other_sessions`` logs rather than raises."""
         try:
             was_on = await service.disable_mfa(identity, client=client)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        return MfaDisableResponse(detail="MFA disabled", other_sessions=others if was_on else 0)
+        others = (
+            await service.count_other_sessions(identity.user_id, hash_token(token)) if was_on else 0
+        )
+        return MfaDisableResponse(detail="MFA disabled", other_sessions=others)
 
     # --- self-service session inventory (WP-10, ASVS 7.5.2/7.4.5) -------------
 

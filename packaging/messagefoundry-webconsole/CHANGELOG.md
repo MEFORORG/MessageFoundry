@@ -166,8 +166,10 @@ this line.**
   `PUT /users/{id}/channel-scope` still answers a malformed body 422 first, with no row. Seam
   change: `AdminHandlers` gains `refuse_own_channel_scope`. (BACKLOG #3393)
 - **The sign-out offer after a factor change counts what it ends, and survives a failed page.**
-  The number on the offer is now the number the sign-out ends: every other session not yet signed
-  out, one gone idle included, where it used to count only the sessions the sessions page lists.
+  The number on the offer is now counted with the sign-out's own rule: every other session not yet
+  signed out, one gone idle included, where it used to count only the sessions the sessions page
+  lists. The TOTP confirm reads it after its own session-cap run, so it no longer offers sessions
+  the confirm has just ended.
   The account page spends the offer's single-use mark only once it has rendered, so a page that
   fails keeps the offer for the next load. Turning TOTP off now marks the session only when there
   is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and

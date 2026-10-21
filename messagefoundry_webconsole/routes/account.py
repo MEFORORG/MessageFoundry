@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
 from collections import OrderedDict
@@ -165,31 +166,39 @@ class _SessionOffers:
     table holds, and a mark there would sit one lookup away from an action that runs."""
 
     def __init__(self) -> None:
-        self._marks: OrderedDict[str, float] = OrderedDict()
+        #: Each mark's deadline and its serial. The serial tells two marks apart: a monotonic
+        #: clock can read the same value twice, as Windows' coarse one does.
+        self._marks: OrderedDict[str, tuple[float, int]] = OrderedDict()
+        self._serial = itertools.count()
 
     def mark(self, token: str | None) -> None:
         if not token:
             return
         key = hash_token(token)
         self._marks.pop(key, None)  # a re-mark refreshes the deadline and moves to the back
-        self._marks[key] = time.monotonic() + _SESSION_OFFER_TTL_SECONDS
+        self._marks[key] = (time.monotonic() + _SESSION_OFFER_TTL_SECONDS, next(self._serial))
         while len(self._marks) > _SESSION_OFFER_SESSIONS_MAX:
             self._marks.popitem(last=False)
 
-    def pending(self, token: str) -> bool:
-        """Whether this session holds a live mark. Reads it and leaves it in place."""
+    def pending(self, token: str) -> int | None:
+        """This session's live mark, as its serial, or None. Reads it and leaves it in place."""
         key = hash_token(token)
-        deadline = self._marks.get(key)
-        if deadline is None:
-            return False
-        if deadline > time.monotonic():
-            return True
-        del self._marks[key]  # lapsed: nothing to offer, so drop it now
-        return False
+        entry = self._marks.get(key)
+        if entry is None:
+            return None
+        if entry[0] <= time.monotonic():
+            del self._marks[key]  # lapsed: nothing to offer, so drop it now
+            return None
+        return entry[1]
 
-    def spend(self, token: str) -> None:
-        """Drop this session's mark, once the page that showed the offer has rendered."""
-        self._marks.pop(hash_token(token), None)
+    def spend(self, token: str, serial: int) -> None:
+        """Drop the mark :meth:`pending` returned, once the page that showed it has rendered. A mark
+        set again meanwhile, by a factor change in another tab, has a new serial and is kept for
+        that change's own page. Two loads at once can both show the offer; that is harmless."""
+        key = hash_token(token)
+        entry = self._marks.get(key)
+        if entry is not None and entry[1] == serial:
+            del self._marks[key]
 
 
 _SESSION_OFFERS = _SessionOffers()
@@ -283,9 +292,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # revoke's own (AuthService.count_other_sessions), and the mark is spent only after the page
         # rendered, so a failed render keeps the offer for the next load (BACKLOG #3393).
         token = session_token(request)
-        marked = token is not None and _SESSION_OFFERS.pending(token)
+        serial = _SESSION_OFFERS.pending(token) if token else None
         offer = None
-        if token is not None and marked:
+        if token and serial is not None:
             offer = await service.count_other_sessions(identity.user_id, hash_token(token))
         response = await _account_response(
             service,
@@ -294,8 +303,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             notice=await _account_notice(service, identity, m),
             session_offer=offer,
         )
-        if token is not None and marked:
-            _SESSION_OFFERS.spend(token)
+        if token and serial is not None:
+            _SESSION_OFFERS.spend(token, serial)
         return response
 
     async def _factor_first(
@@ -516,11 +525,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
         code = form.get("code", "").strip()
-        # BACKLOG #1147: the offer's count, read BEFORE the confirm commits. Read after it, a store
-        # fault would answer 500 once TOTP is on and the token rotated, losing the one-time codes and
-        # this browser's session. The confirm ends no other session and rotates this one in place,
-        # so counting against this token counts against the session the new token continues.
-        others = await service.count_other_sessions(identity.user_id, hash_token(token))
         try:
             elevation = await service.confirm_mfa_enrollment(
                 identity, code, token=token, client=client
@@ -551,6 +555,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
         # BACKLOG #1147: the offer rides this response; accepting it acts as the new cookie below.
+        # Its count is read after the confirm's own session-cap run, against the rotated token, and
+        # answers 0 rather than raise, so a store fault cannot cost the codes (BACKLOG #3393).
+        others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         resp = HTMLResponse(
             pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others)
         )

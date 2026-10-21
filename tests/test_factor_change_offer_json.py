@@ -137,6 +137,43 @@ async def test_confirm_and_disable_carry_the_offer(engine: Engine) -> None:
         assert (await c.get("/auth/me", headers=_auth(other))).status_code == 200
 
 
+async def test_the_confirm_offers_only_what_the_revoke_then_ends(engine: Engine) -> None:
+    """RED when the confirm counts before its own session-cap run: that run ends the lapsed row
+    planted here (``max_sessions_per_user`` defaults on), so a count read first offers 2 while the
+    revoke that follows ends 1."""
+    service = await _service(engine)
+    user_id = await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        token = await _login(c, "op")
+        await service.store.create_session(
+            token_hash=hash_token(mint_token()),
+            user_id=user_id,
+            expires_at=time.time() - 60,
+            auth_mechanism="password",
+        )
+        r, token = await _enroll(c, token)
+        assert r.json()["other_sessions"] == 1
+        token = await _proof(c, token, "session_terminate")
+        r = await c.delete("/me/sessions", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json() == {"detail": "signed out 1 other session(s)"}
+
+
+async def test_a_store_fault_while_counting_costs_the_offer_and_nothing_else(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The count is read after the change committed, so a fault there answers 0 rather than raise:
+    a raise on the confirm would lose the recovery codes in its reply. RED when it propagates."""
+    service = await _service(engine)
+
+    async def _fault(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("synthetic store fault")
+
+    monkeypatch.setattr(service.store, "count_user_sessions", _fault)
+    assert await service.count_other_sessions("u", hash_token(mint_token())) == 0
+
+
 def _mock_client(replies: dict[str, object]) -> EngineClient:
     client = EngineClient("http://127.0.0.1:8765")
     client._http.close()
@@ -156,7 +193,9 @@ def test_the_client_surfaces_the_offer_on_both_calls() -> None:
         }
     )
     try:
-        assert client.confirm_mfa("123456") == MfaConfirmed(recovery_codes=["c1"], other_sessions=2)
+        assert client.confirm_mfa("123456") == MfaConfirmed(
+            recovery_codes=("c1",), other_sessions=2
+        )
         assert client.disable_mfa().other_sessions == 3
     finally:
         client.close()

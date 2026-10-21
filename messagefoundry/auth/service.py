@@ -10351,12 +10351,29 @@ class AuthService:
         return revoked
 
     async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int:
-        """How many sessions :meth:`revoke_other_sessions` would end for this caller: the number
-        the offer after a factor change shows (BACKLOG #1147, #3393). It is the store's count with
-        the revoke's own predicate, so it includes a session that has gone idle or expired but was
-        never revoked, which :meth:`list_sessions` hides. Pass the hash of the token the caller
-        holds NOW, so a ceremony that rotated it counts against the new one."""
-        return await self._store.count_user_sessions(user_id, except_token_hash=current_token_hash)
+        """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
+        of the read: the number the offer after a factor change shows (BACKLOG #1147, #3393). It is
+        the store's count with the revoke's own predicate, so it includes a session that has gone
+        idle or expired but was never revoked, which :meth:`list_sessions` hides. A sign-in, the
+        reaper or a cap run before the revoke can still move it.
+
+        Read it AFTER the factor change has committed, against the token the caller holds NOW: a
+        confirm re-keys the session and then runs the session cap, which can end rows itself, so a
+        count read before it would offer sessions that are already gone.
+
+        **A store fault answers 0 and is logged, never raised.** Every caller reads this after the
+        change committed, and a confirm's reply carries recovery codes shown once, so a raise would
+        lose them for a number. 0 costs the offer and nothing else, the failure docs/SECURITY.md
+        already accepts for a lost mark. The catch is broad for the reason
+        :meth:`_enforce_session_cap_after_elevation` gives: each backend raises its own driver's
+        errors. A cancellation is not an ``Exception``, so it still propagates."""
+        try:
+            return await self._store.count_user_sessions(
+                user_id, except_token_hash=current_token_hash
+            )
+        except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
+            _log.exception("counting the other sessions for the sign-out offer failed; no offer")
+            return 0
 
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
