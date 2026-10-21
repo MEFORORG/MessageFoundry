@@ -327,7 +327,7 @@ async def _refuse_own_channel_scope(
     user_id: str,
     target: UserRecord | None = None,
 ) -> None:
-    """The channel-scope write's self-target refusal (BACKLOG #1149), one copy for both planes.
+    """The channel-scope write's self-target refusal (BACKLOG #1149), one definition for both planes.
 
     The console calls it through the seam before its own form checks (BACKLOG #3393), so a
     self-target post with a malformed form is still refused and audited, not answered first by a
@@ -1865,7 +1865,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         why.
 
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2): the write revokes the
-        target's sessions, as the role write does."""
+        target's sessions, as the role write does. As on the role write, a body that fails
+        ``ChannelScope`` is answered 422 by FastAPI before the guard runs, with no audit row; the
+        console route runs the guard before its own checks (BACKLOG #3393)."""
         await _refuse_own_channel_scope(request, service, identity, user_id)
         try:
             await service.set_channel_scope(

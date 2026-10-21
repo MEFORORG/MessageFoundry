@@ -455,7 +455,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # is the guard's target, and the directory-scope check below reuses it.
         user = await service.store.get_user(user_id)
         try:
-            await admin.refuse_own_channel_scope(request, service, identity, user_id, user)
+            # By keyword: the seam digest records the field's name, not its parameters.
+            await admin.refuse_own_channel_scope(
+                request=request, service=service, identity=identity, user_id=user_id, target=user
+            )
         except HTTPException as exc:
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=exc.status_code

@@ -378,14 +378,18 @@ def user_new_page(
     )
 
 
-def _self_note(what: str) -> Markup:
+def _self_note(what: str, holds: str) -> Markup:
     """What the caller's own user page shows in place of a form whose route refuses the caller's
-    own account because the write ends the target's sessions (BACKLOG #3393, #1149)."""
-    return el(
-        "p",
-        f"You cannot change your own {what} here. Another administrator must, because the change "
-        "signs the account out of every session.",
-        class_="muted",
+    own account because the write ends the target's sessions (BACKLOG #3393, #1149): what the
+    account holds, read-only, and why it cannot be changed here."""
+    return Markup(
+        el("p", f"Current {what}: {holds}")
+        + el(
+            "p",
+            f"You cannot change your own {what} here. Another administrator must, because the "
+            "change signs the account out of every session.",
+            class_="muted",
+        )
     )
 
 
@@ -405,8 +409,10 @@ def user_detail_page(
 
     ``is_self`` marks the caller's own account (BACKLOG #3393). Save roles, Save channel scope and
     Sign out all sessions are replaced by notes there: each write ends the target's sessions, so
-    its route refuses the caller's own account (BACKLOG #1149), and the routes still do. The other
-    account actions are not changed here, although their routes refuse the caller's account too.
+    its route refuses the caller's own account (BACKLOG #1149), and the routes still do. The roles
+    and scope the account holds are still shown, read-only. The other account actions are not
+    changed here: Reset password, Reset MFA and Delete user refuse the caller's own account too,
+    and Save profile refuses only a disable of it.
 
     ``scope_draft`` fills the channel-scope form with the channels a refused save submitted,
     instead of the stored scope (BACKLOG #2099).
@@ -454,7 +460,7 @@ def user_detail_page(
     if is_ad:
         roles_section: Markup = el("p", "AD users get roles from the AD-group map.", class_="muted")
     elif is_self:
-        roles_section = _self_note("roles")
+        roles_section = _self_note("roles", ", ".join(user.roles) or "(none)")
     else:
         roles_section = el(
             "form",
@@ -520,7 +526,7 @@ def user_detail_page(
             ),
         ]
     scope = (
-        _self_note("channel scope")
+        _self_note("channel scope", _scope_cell(user))
         if is_self
         else el(
             "form",
@@ -573,8 +579,8 @@ def user_detail_page(
         sign_out: Markup = el(
             "p",
             "You cannot sign yourself out of every session here. ",
-            el("a", "Your account page", href="/ui/account"),
-            " manages your other sessions, and Sign out ends this one.",
+            el("a", "Your active sessions page", href="/ui/account/sessions"),
+            " ends your other sessions, and Sign out ends this one.",
             class_="muted",
         )
     else:

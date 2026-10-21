@@ -195,21 +195,31 @@ _SCOPE_WORDS = next(words for op, *_rest, words in ROUTES if op == "channel_scop
 
 #: BACKLOG #3393: self-target channel-scope posts that a form check would refuse. The guard now
 #: runs before every one of them.
+#: Each carries the form error it meets on another account.
 _MALFORMED_SCOPE_FORMS = [
-    pytest.param({"scope_mode": "bogus"}, id="unknown-mode"),
-    pytest.param({"scope_mode": "list", "channels": ""}, id="empty-list"),
-    pytest.param({"scope_mode": "list", "channels": "*"}, id="all-channels-token-in-list"),
-    pytest.param({"scope_mode": "list", "channels": "not a connection!"}, id="bad-name"),
+    pytest.param({"scope_mode": "bogus"}, "unknown scope mode", id="unknown-mode"),
+    pytest.param(
+        {"scope_mode": "list", "channels": ""}, "list at least one connection", id="empty-list"
+    ),
+    pytest.param(
+        {"scope_mode": "list", "channels": "*"},
+        "is the all-channels grant",
+        id="all-channels-token-in-list",
+    ),
+    pytest.param(
+        {"scope_mode": "list", "channels": "not a connection!"}, "invalid input", id="bad-name"
+    ),
 ]
 
 
 @pytest.mark.parametrize("spelling", ["exact", "upper"])
-@pytest.mark.parametrize("form", _MALFORMED_SCOPE_FORMS)
+@pytest.mark.parametrize(("form", "_form_error"), _MALFORMED_SCOPE_FORMS)
 async def test_a_malformed_self_target_scope_post_is_still_refused_and_audited(
     engine: Engine,
     root: tuple[httpx.AsyncClient, AuthService, str],
     spelling: str,
     form: dict[str, str],
+    _form_error: str,
 ) -> None:
     """RED when: ``/ui/users/{id}/channel-scope`` answers a malformed post aimed at the caller's
     own account with its form error, before the self-target guard runs, so no
@@ -233,9 +243,12 @@ async def test_a_malformed_self_target_scope_post_is_still_refused_and_audited(
     )
 
 
-@pytest.mark.parametrize("form", _MALFORMED_SCOPE_FORMS)
+@pytest.mark.parametrize(("form", "form_error"), _MALFORMED_SCOPE_FORMS)
 async def test_a_malformed_scope_post_on_another_account_gets_its_form_error(
-    engine: Engine, root: tuple[httpx.AsyncClient, AuthService, str], form: dict[str, str]
+    engine: Engine,
+    root: tuple[httpx.AsyncClient, AuthService, str],
+    form: dict[str, str],
+    form_error: str,
 ) -> None:
     """The control: the same posts aimed at another account still meet the form checks, and
     write no refusal row."""
@@ -243,6 +256,7 @@ async def test_a_malformed_scope_post_on_another_account_gets_its_form_error(
     other = await provision(service, "viewer1", [Role.VIEWER.value])
     r = await c.post(f"/ui/users/{other}/channel-scope", data=form, headers=SAME_ORIGIN)
     assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert form_error in r.text
     assert _SCOPE_WORDS not in r.text
     assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
 
@@ -256,9 +270,9 @@ _BUTTONS = {
 #: (form action suffix, button) for the forms the caller's own user page no longer offers: every
 #: route of ``SESSION_REVOKING``, so a route that joins it must have its form hidden too.
 _SELF_HIDDEN_FORMS = [(suffix, _BUTTONS[suffix]) for suffix, _form in SESSION_REVOKING]
-#: Forms the caller's own page still offers. Their routes refuse the caller's account too, so each
-#: can only fail there; hiding them is outside BACKLOG #3393's scope, not a decision that they work.
-_SELF_KEPT_FORMS = ["/update", "/reset-password", "/reset-mfa", "/delete"]
+#: The sign-out note and its link, which the top nav's own /ui/account link cannot stand in for.
+_SIGN_OUT_NOTE = "You cannot sign yourself out of every session here"
+_SESSIONS_LINK = '<a href="/ui/account/sessions">Your active sessions page</a>'
 
 
 @pytest.mark.parametrize("spelling", ["exact", "upper"])
@@ -275,11 +289,15 @@ async def test_the_own_user_page_offers_no_roles_scope_or_sign_out_form(
     for suffix, button in _SELF_HIDDEN_FORMS:
         assert f'action="/ui/users/{me}{suffix}"' not in r.text, suffix
         assert button not in r.text, button
-    for suffix in _SELF_KEPT_FORMS:
-        assert f'action="/ui/users/{me}{suffix}"' in r.text, suffix
+    # Save profile works on the caller's own account, so the page is not simply blank.
+    assert f'action="/ui/users/{me}/update"' in r.text
     assert "You cannot change your own roles here" in r.text
     assert "You cannot change your own channel scope here" in r.text
-    assert 'href="/ui/account"' in r.text
+    # What the account holds is still shown, read-only.
+    assert "Current roles: administrator" in r.text
+    assert "Current channel scope: all (administrator)" in r.text
+    assert _SIGN_OUT_NOTE in r.text
+    assert _SESSIONS_LINK in r.text
 
 
 async def test_another_users_page_still_offers_the_three_forms(
@@ -294,3 +312,5 @@ async def test_another_users_page_still_offers_the_three_forms(
         assert f'action="/ui/users/{other}{suffix}"' in r.text, suffix
         assert button in r.text, button
     assert "You cannot change your own" not in r.text
+    assert _SIGN_OUT_NOTE not in r.text
+    assert _SESSIONS_LINK not in r.text
