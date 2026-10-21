@@ -201,6 +201,34 @@ async def test_the_last_discoverable_passkey_cannot_be_removed_while_covered() -
         await store.close()
 
 
+async def test_two_concurrent_removals_cannot_take_the_last_way_past() -> None:
+    """AC-A3a under a race: both removals of an account's only two discoverable passkeys pass the
+    service's check made before either wrote, so the store asks again in each write. Exactly one
+    lands; the other is refused and the account keeps a way past."""
+    import asyncio
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _register(service, identity, token, label="one")
+        _, token = await _register(service, identity, token, label="two")
+        hashes = [
+            c.credential_id_hash for c in await store.list_webauthn_credentials(identity.user_id)
+        ]
+        results = await asyncio.gather(
+            *(service.delete_webauthn_credential(identity, h) for h in hashes),
+            return_exceptions=True,
+        )
+        assert sum(r is True for r in results) == 1, results
+        refused = [r for r in results if isinstance(r, ValueError)]
+        assert len(refused) == 1 and str(refused[0]) == PASSKEY_REMOVAL_REFUSED, results
+        (left,) = await store.list_webauthn_credentials(identity.user_id)
+        assert left.discoverable
+    finally:
+        await store.close()
+
+
 async def test_totp_can_be_removed_while_a_discoverable_passkey_remains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2345,7 +2345,13 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> int | None: ...
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
+    # ``require_way_past`` (ADR 0197 Amendment A, wave 2) makes the removal CONDITIONAL, in the
+    # write's own transaction, on a passkey recorded as discoverable remaining in the set the
+    # account's seal covers, so two concurrent removals cannot both pass a check made before either
+    # wrote. Returns whether a row was written; a conditional caller refuses on False.
+    async def disable_totp(
+        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+    ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
 
@@ -2368,7 +2374,12 @@ class AuthStore(Protocol):
 
     async def any_webauthn_credentials(self) -> bool: ...
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool: ...
+    # ``require_way_past`` (ADR 0197 Amendment A, wave 2): delete only while the account keeps a way
+    # past the sign-in lock after the delete (TOTP, or another discoverable passkey), judged in the
+    # delete's own transaction with the account row held. False when refused or when no row matched.
+    async def delete_webauthn_credential(
+        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+    ) -> bool: ...
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 

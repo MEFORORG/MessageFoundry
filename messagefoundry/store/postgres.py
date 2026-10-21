@@ -293,6 +293,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
@@ -318,8 +319,8 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_disable,
     totp_enable,
+    totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
@@ -8993,8 +8994,10 @@ class PostgresStore:
     ) -> bool:
         now = time.time() if now is None else now
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            # The passkeys the condition reads are read in the write's own transaction; a removal
-            # that commits before the write moves the record's seal, so the write's compare loses.
+            # The passkeys the condition reads are read in the write's own transaction, after the
+            # account row is locked, so a concurrent removal waits for this write.
+            if require_way_past:
+                await self._read_user_record(conn, user_id)
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
@@ -9077,10 +9080,24 @@ class PostgresStore:
         tee_audits((audit,), appended, ts=now)
         return _rowcount(revoked)
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
+    async def disable_totp(
+        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+    ) -> bool:
         now = time.time() if now is None else now
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
-        await self._write_user_txn(user_id, lambda r: totp_disable(r, now))
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            passkeys: list[WebAuthnCredential] = []
+            if require_way_past:
+                # The account row first, locked, so a concurrent passkey removal waits for this.
+                await self._read_user_record(conn, user_id)
+                passkeys = await self._account_passkeys(conn, user_id)
+            change = totp_removal(
+                now,
+                require_way_past=require_way_past,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+            )
+            return await self._write_user(conn, user_id, change) is not None
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=$1", user_id)
@@ -9193,11 +9210,23 @@ class PostgresStore:
         row = await self._fetchone("SELECT 1 AS present FROM webauthn_credentials LIMIT 1")
         return row is not None
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
+    async def delete_webauthn_credential(
+        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+    ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if require_way_past:
+                # ADR 0197 Amendment A: the account row locked first, so two removals serialize.
+                current = await self._read_user_record(conn, user_id)
+                if current is None or not removal_keeps_way_past(
+                    current,
+                    await self._account_passkeys(conn, user_id),
+                    sealed=self._row_sealer is not None,
+                    drop_passkey=credential_id_hash,
+                ):
+                    return False
             count = await self._write_passkeys(
                 conn,
                 user_id,

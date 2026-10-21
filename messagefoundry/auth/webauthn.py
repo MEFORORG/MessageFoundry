@@ -30,6 +30,7 @@ import json
 import logging
 import secrets
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -406,7 +407,7 @@ class PreAuthChallengePool:
     fast enough flood can, which ADR 0197 names as a residual.
 
     Every entry has the same TTL, so insertion order is deadline order: the first entry is the
-    oldest, and expiry and eviction both work from the front.
+    oldest, and expiry and eviction both work from the front, in O(1) each (an ``OrderedDict``).
     """
 
     def __init__(
@@ -419,15 +420,15 @@ class PreAuthChallengePool:
         self._ttl = ttl_seconds
         self._cap = cap
         self._clock = clock
-        self._entries: dict[str, tuple[bytes, float]] = {}
+        self._entries: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def _prune(self, now: float) -> None:
         while self._entries:
-            key = next(iter(self._entries))
-            if self._entries[key][1] > now:
+            key, (_challenge, deadline) = next(iter(self._entries.items()))
+            if deadline > now:
                 return
             del self._entries[key]
 
@@ -437,7 +438,7 @@ class PreAuthChallengePool:
         self._prune(now)
         self._entries.pop(key, None)
         while len(self._entries) >= self._cap:
-            del self._entries[next(iter(self._entries))]
+            self._entries.popitem(last=False)
         self._entries[key] = (challenge, now + self._ttl)
 
     def pop(self, key: str) -> bytes | None:

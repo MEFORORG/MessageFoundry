@@ -50,6 +50,7 @@ from messagefoundry.auth.service import (
     PasskeyProof,
 )
 from messagefoundry.auth.tokens import hash_bytes, hash_token
+from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.parsing import HL7PeekError, parse_tree
 from messagefoundry.parsing.tree import ParseTreeTooLargeError
@@ -113,15 +114,15 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
-#: The passkey sign-in cookie's lifetime: the engine's pre-auth challenge TTL, so the browser drops
-#: the handle when the challenge it names expires (ADR 0197 Amendment A, wave 2).
-PASSKEY_SIGN_IN_COOKIE_SECONDS = 120
+#: The passkey sign-in cookie's lifetime: the engine's pre-auth challenge TTL, read from the engine,
+#: so the browser drops the handle when the challenge it names expires (ADR 0197 Amendment A).
+_PASSKEY_SIGN_IN_COOKIE_SECONDS = int(CHALLENGE_TTL_SECONDS)
 
 #: The longest passkey assertion the sign-in form passes on. A real one is a few hundred characters;
 #: a longer value is clamped, which makes it an invalid assertion rather than a large parse.
 _PASSKEY_ASSERTION_MAX_CHARS = 16_384
 
+#: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
 #: ``/ui/reauth/webauthn``: a constant, not the bucket's exact wait (BACKLOG #3293). The reason is
 #: stated once, in docs/SECURITY.md, under the PHI-read ``Retry-After`` paragraph.
 _CEREMONY_RETRY_AFTER = "30"
@@ -704,7 +705,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         handle, options = begun
         resp = JSONResponse({"options": json.loads(options)})
         set_passkey_sign_in_cookie(
-            resp, handle, request=request, max_age=int(PASSKEY_SIGN_IN_COOKIE_SECONDS)
+            resp, handle, request=request, max_age=_PASSKEY_SIGN_IN_COOKIE_SECONDS
         )
         resp.headers["Cache-Control"] = "no-store"
         return resp

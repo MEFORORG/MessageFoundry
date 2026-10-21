@@ -443,6 +443,32 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     assert await rotate(), "a discoverable passkey did not open the rotation"
     user = await store.get_user("rot-pk1")
     assert user is not None and user.password_hash == "h-chosen" and not user.password_generated
+
+    # The conditional removals (AC-A3a): the last discoverable passkey goes only while TOTP stands,
+    # and TOTP goes only while a discoverable passkey stands, each judged in its own write.
+    assert not await store.delete_webauthn_credential(
+        "rot-pk1", "rot-pk-resident", require_way_past=True
+    ), "the last way past was deleted"
+    assert await store.get_webauthn_credential("rot-pk-resident") is not None
+    assert await store.delete_webauthn_credential("rot-pk1", "rot-pk-plain", require_way_past=True)
+    staged_cell = await store.set_totp_secret("rot-pk1", secret="JBSWY3DPEHPK3PXP", now=5.0)
+    assert await store.enable_totp(
+        "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
+    )
+    assert await store.delete_webauthn_credential(
+        "rot-pk1", "rot-pk-resident", require_way_past=True
+    ), "TOTP stands, so the passkey may go"
+    assert not await store.disable_totp("rot-pk1", now=6.0, require_way_past=True), (
+        "TOTP went with no discoverable passkey left"
+    )
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.totp_enabled
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "again", id_hash="rot-pk-again", created_at=7.0, discoverable=True)
+    )
+    assert await store.disable_totp("rot-pk1", now=8.0, require_way_past=True)
+    user = await store.get_user("rot-pk1")
+    assert user is not None and not user.totp_enabled
     await store.delete_all_webauthn_credentials("rot-pk1")
     await store.delete_user("rot-pk1")
 

@@ -871,9 +871,11 @@ async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_rem
 
         real_delete = store.delete_webauthn_credential
 
-        async def racing_delete(user_id: str, credential_id_hash: str) -> bool:
+        async def racing_delete(
+            user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+        ) -> bool:
             await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
-            return await real_delete(user_id, credential_id_hash)
+            return await real_delete(user_id, credential_id_hash, require_way_past=require_way_past)
 
         store.delete_webauthn_credential = racing_delete  # type: ignore[method-assign]
         assert (

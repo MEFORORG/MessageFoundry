@@ -294,6 +294,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
@@ -319,8 +320,8 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_disable,
     totp_enable,
+    totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
@@ -13287,6 +13288,9 @@ class SqlServerStore:
         # the record's seal, so the write's compare loses.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                if require_way_past:
+                    # The account row first, under UPDLOCK, so a concurrent removal waits.
+                    await self._read_user_record(cur, user_id)
                 change = password_change(
                     password_hash=password_hash,
                     password_generated=password_generated,
@@ -13392,10 +13396,30 @@ class SqlServerStore:
         tee_audits((audit,), appended, ts=now)
         return revoked
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
+    async def disable_totp(
+        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+    ) -> bool:
         now = time.time() if now is None else now
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
-        await self._write_user_txn(user_id, lambda r: totp_disable(r, now))
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                passkeys: list[WebAuthnCredential] = []
+                if require_way_past:
+                    # The account row first, under UPDLOCK, so a concurrent removal waits.
+                    await self._read_user_record(cur, user_id)
+                    passkeys = await self._account_passkeys(cur, user_id)
+                change = totp_removal(
+                    now,
+                    require_way_past=require_way_past,
+                    passkeys=passkeys,
+                    sealed=self._row_sealer is not None,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written is not None
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
@@ -13462,14 +13486,41 @@ class SqlServerStore:
         row = await self._fetchone("SELECT TOP (1) 1 AS present FROM webauthn_credentials")
         return row is not None
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
+    async def delete_webauthn_credential(
+        self, user_id: str, credential_id_hash: str, *, require_way_past: bool = False
+    ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
         is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592), and the
-        count is read from ``OUTPUT`` (BACKLOG #2283)."""
-        count = await self._write_passkeys_txn(
-            user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
-        )
+        count is read from ``OUTPUT`` (BACKLOG #2283). With ``require_way_past``, only while a way
+        past remains after it, judged with the account row held (ADR 0197 Amendment A)."""
+        if not require_way_past:
+            count = await self._write_passkeys_txn(
+                user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+            )
+            return count > 0
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._read_user_record(cur, user_id)
+                if current is None or not removal_keeps_way_past(
+                    current,
+                    await self._account_passkeys(cur, user_id),
+                    sealed=self._row_sealer is not None,
+                    drop_passkey=credential_id_hash,
+                ):
+                    await conn.rollback()
+                    return False
+                count = await self._write_passkeys(
+                    cur,
+                    user_id,
+                    _MSSQL_WEBAUTHN_DELETE_ONE,
+                    (user_id, credential_id_hash),
+                    counted=True,
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
         return count > 0
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int:

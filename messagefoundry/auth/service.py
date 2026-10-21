@@ -173,6 +173,7 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
+    discoverable_way_past,
     passkey_digest,
     require_notify_email,
     role_seal_ok,
@@ -1775,6 +1776,11 @@ def _live_lock(user: UserRecord, now: float) -> bool:
 _LOCAL_REFUSAL_REASON = "bad_credentials"
 
 
+async def _write_now(write: Callable[[], Awaitable[None]]) -> None:
+    """Run one audit write at once: the ``write`` a caller passes where nothing defers its rows."""
+    await write()
+
+
 async def _run_in_order(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
     """Run deferred audit writes one after another, in the order they were queued."""
     for write in writes:
@@ -2366,6 +2372,8 @@ async def lockable_account_census(
     undecryptable: list[str] = []
     passkey_only: list[str] = []
     sealed = store.row_sealer() is not None
+    # One probe, so a site with no passkey anywhere reads no account's set below.
+    any_passkeys = await store.any_webauthn_credentials()
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
@@ -2391,10 +2399,9 @@ async def lockable_account_census(
             continue
         # Wave 2: a passkey recorded as discoverable is a way past, read from the set the account's
         # seal covers. A set that fails its digest counts for nothing, so the account is named.
-        creds = await store.list_webauthn_credentials(user.id)
+        creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
         digest = user.row.cred_digest if user.row is not None else ""
-        trusted = not sealed or passkey_digest(creds) == digest
-        if trusted and any(c.discoverable for c in creds):
+        if discoverable_way_past(creds, digest, sealed=sealed):
             passkey_only.append(user.username)
         else:
             no_way_past.append(user.username)
@@ -4906,48 +4913,20 @@ class AuthService:
         handle = webauthn.user_handle_from_response(passkey.response_json)
         if cred is None or handle is None or not constant_time_equal(handle, user.id.encode()):
             return False
-        try:
-            new_count = webauthn.verify_assertion(
-                response_json=passkey.response_json,
-                challenge=challenge,
-                rp_id=passkey.rp_id,
-                origin=passkey.origin,
-                public_key=self._b64url_decode(cred.public_key),
-                current_sign_count=cred.sign_count,
-            )
-        except webauthn.StoredKeyRefusedError:
-            # BACKLOG #1963, as on finish_webauthn_assertion: this passkey will never sign in again.
-            _log.warning(
-                "passkey sign-in refused for %s: stored credential %r fails the registration key "
-                "check and must be registered again",
-                user.username,
-                cred.label,
-            )
-            label = cred.label
-
-            async def stored_key_row() -> None:
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=_json({"reason": "stored_key_refused", "label": label}),
-                    client=client,
-                )
-
-            await later(stored_key_row)
-            return False
-        except webauthn.WebAuthnVerificationError as exc:
-            if "sign count" in str(exc).lower():  # py_webauthn's own regression check (ADR 0068)
-                suspect = cred
-
-                async def clone_row() -> None:
-                    await self._audit(
-                        "auth.webauthn_clone_suspected",
-                        actor=user.username,
-                        detail=_json({"label": suspect.label}),
-                        client=client,
-                    )
-
-                await later(clone_row)
+        # A bad signature writes no row here (see _check_password_and_passkey); the clone signal
+        # and a refused stored key do, deferred with the other refused rows.
+        new_count = await self._verify_passkey_signature(
+            user,
+            cred,
+            response_json=passkey.response_json,
+            challenge=challenge,
+            rp_id=passkey.rp_id,
+            origin=passkey.origin,
+            client=client,
+            write=later,
+            audit_bad_signature=False,
+        )
+        if new_count is None:
             return False
         answer = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
@@ -4961,6 +4940,62 @@ class AuthService:
             await later(cas_row)
             return False
         return True
+
+    async def _verify_passkey_signature(
+        self,
+        user: UserRecord,
+        cred: WebAuthnCredential,
+        *,
+        response_json: str,
+        challenge: bytes,
+        rp_id: str,
+        origin: str,
+        client: str | None,
+        write: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
+        audit_bad_signature: bool,
+    ) -> int | None:
+        """Verify an assertion's signature against stored passkey ``cred``: the new sign count, or
+        ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
+        :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
+        row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
+
+        * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
+          is logged and audited with a fixed slug, never the refusal text, which can quote the key.
+        * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
+        * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
+        try:
+            return webauthn.verify_assertion(
+                response_json=response_json,
+                challenge=challenge,
+                rp_id=rp_id,
+                origin=origin,
+                public_key=self._b64url_decode(cred.public_key),
+                current_sign_count=cred.sign_count,
+            )
+        except webauthn.StoredKeyRefusedError:
+            _log.warning(
+                "passkey sign-in refused for %s: stored credential %r fails the registration key "
+                "check and must be registered again",
+                user.username,
+                cred.label,
+            )
+            action, detail = (
+                "auth.webauthn_failed",
+                _json({"reason": "stored_key_refused", "label": cred.label}),
+            )
+        except webauthn.WebAuthnVerificationError as exc:
+            if "sign count" in str(exc).lower():
+                action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
+            elif audit_bad_signature:
+                action, detail = "auth.webauthn_failed", None
+            else:
+                return None
+
+        async def refused_row() -> None:
+            await self._audit(action, actor=user.username, detail=detail, client=client)
+
+        await write(refused_row)
+        return None
 
     async def _record_lock(
         self,
@@ -11999,7 +12034,11 @@ class AuthService:
     async def _holds_discoverable_passkey(self, user: VerifiedUser) -> bool:
         """Whether ``user`` holds a passkey recorded as discoverable, asked of the set its seal
         covers (BACKLOG #2592): a set that fails its digest counts for nothing, so a passkey row
-        written or flipped outside the store cannot open a gate (ADR 0197 Amendment A, wave 2)."""
+        written or flipped outside the store cannot open a gate (ADR 0197 Amendment A, wave 2).
+        An account whose sealed record names no passkey reads none: a row added outside the store
+        could only fail the digest anyway."""
+        if not user.has_passkeys:
+            return False
         held = await self._verified_passkeys(user)
         return any(c.discoverable for c in held or ())
 
@@ -13303,7 +13342,18 @@ class AuthService:
                 "this is your last second factor and MFA is required for your account — "
                 "enroll another factor first"
             )
-        await self._store.disable_totp(identity.user_id)
+        # The store asks the way-past question again in its own write (ADR 0197 Amendment A), so a
+        # passkey removal racing this one cannot leave the account with neither.
+        keep_way_past = (
+            user is not None
+            and user.totp_enabled
+            and self._covered_by_requirement(user, identity.roles)
+        )
+        if (
+            not await self._store.disable_totp(identity.user_id, require_way_past=keep_way_past)
+            and keep_way_past
+        ):
+            raise ValueError(TOTP_REMOVAL_REFUSED)
         await self._audit(
             "auth.mfa_disabled",
             actor=identity.username,
@@ -13637,7 +13687,7 @@ class AuthService:
         # ADR 0197 Amendment A, wave 2: what the client reported it made, or the requirement the
         # options sent (``residentKey`` required) when it reported nothing. Under that requirement a
         # conforming browser makes a discoverable credential or fails the ceremony.
-        discoverable = True if result.resident_key is None else result.resident_key
+        discoverable = result.resident_key is not False
         # AC-A3: a covered account with no way past may take only a factor that is one as its first.
         # A passkey the client says is not discoverable is not, so it is refused before it is
         # stored. Asked after the verify, since only the response says what was made.
@@ -13849,43 +13899,22 @@ class AuthService:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
             return await self._assertion_refused(user, client, "unknown_credential")
-        try:
-            new_count = webauthn.verify_assertion(
-                response_json=response_json,
-                challenge=pending.challenge,
-                rp_id=rp_id,
-                origin=origin,
-                public_key=self._b64url_decode(cred.public_key),
-                current_sign_count=cred.sign_count,
-            )
-        except webauthn.StoredKeyRefusedError:
-            # BACKLOG #1963. The STORED key breaks the registration rule (ADR 0068, 2026-09-24
-            # amendment), so this passkey will never sign in again. Audited as a bad signature, an
-            # admin could not see why a passkey-only user is stuck. The reason goes to the audit
-            # row and the log only; the caller gets the same refusal as any failed assertion. The
-            # detail carries a fixed slug and never the refusal text, which can quote the key.
-            _log.warning(
-                "passkey sign-in refused for %s: stored credential %r fails the registration key "
-                "check and must be registered again",
-                user.username,
-                cred.label,
-            )
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "stored_key_refused", "label": cred.label}),
-                client=client,
-            )
-            return Elevation()
-        except webauthn.WebAuthnVerificationError as exc:
-            # py_webauthn's own counter-regression rejection IS a clone signal (ADR 0068 §4).
-            clone = "sign count" in str(exc).lower()
-            await self._audit(
-                "auth.webauthn_clone_suspected" if clone else "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"label": cred.label}) if clone else None,
-                client=client,
-            )
+        # BACKLOG #1963: a STORED key that breaks the registration rule (ADR 0068, 2026-09-24
+        # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
+        # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
+        # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
+        new_count = await self._verify_passkey_signature(
+            user,
+            cred,
+            response_json=response_json,
+            challenge=pending.challenge,
+            rp_id=rp_id,
+            origin=origin,
+            client=client,
+            write=_write_now,
+            audit_bad_signature=True,
+        )
+        if new_count is None:
             return Elevation()
         answer = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
@@ -14046,12 +14075,11 @@ class AuthService:
         # one, so removing it is refused unless TOTP or another discoverable passkey remains. A
         # passkey that is not discoverable is no way past, so its removal is never refused on this
         # ground. ``admin_reset_mfa`` stays the recovery for a lost or stolen one, as ADR 0068 says.
-        others_discoverable = [c for c in creds if c is not target and c.discoverable]
+        keep_way_past = target.discoverable and self._covered_by_requirement(user, identity.roles)
         if (
-            target.discoverable
+            keep_way_past
             and not user.totp_enabled
-            and not others_discoverable
-            and self._covered_by_requirement(user, identity.roles)
+            and not any(c is not target and c.discoverable for c in creds)
         ):
             raise ValueError(PASSKEY_REMOVAL_REFUSED)
         last_second_factor = len(creds) == 1 and not user.totp_enabled
@@ -14062,7 +14090,13 @@ class AuthService:
                 "this is your last second factor and MFA is required for your account — "
                 "enroll another factor first"
             )
-        if not await self._store.delete_webauthn_credential(identity.user_id, credential_id_hash):
+        # The store asks the way-past question again in its own write, with the account row held,
+        # so two concurrent removals cannot both pass the check above (ADR 0197 Amendment A).
+        if not await self._store.delete_webauthn_credential(
+            identity.user_id, credential_id_hash, require_way_past=keep_way_past
+        ):
+            if keep_way_past:
+                raise ValueError(PASSKEY_REMOVAL_REFUSED)
             return False  # pragma: no cover - raced with a concurrent delete of the same row
         await self._audit(
             "auth.webauthn_removed",
