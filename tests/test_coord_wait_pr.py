@@ -8,7 +8,9 @@ The AFK-autonomy plan's section 6.2 asked for it (docs/AUTONOMY-PLAN.md, on bran
 Every test drives the script against a stub ``gh`` that answers ``gh api -i`` the way gh 2.102.0
 was measured to: a status line and headers on stdout, a blank line, the body, and exit 1 for a 304
 or a 4xx. The stub logs each call's arguments, so a test can assert what was SENT (the
-``If-None-Match`` header) and not only what came back. A recording sleeper stands in for
+``If-None-Match`` header) and not only what came back. The script runs the stub as its own pwsh
+child process, the same path a real gh takes, so the per-call timeout and its kill are exercised
+by the stub too. A recording sleeper stands in for
 ``Start-Sleep``, so a 60-minute wait runs in seconds and the clamped interval is observable.
 
 Nothing reaches GitHub.
@@ -55,6 +57,11 @@ $counts[$path] = $n + 1
 Set-Content -LiteralPath '__COUNTS__' -Value (ConvertTo-Json -Compress -InputObject $counts)
 $list = @($plan[$path])
 $resp = $list[[math]::Min($n, $list.Count - 1)]
+if ($resp.ContainsKey('hang')) {
+    Add-Content -LiteralPath '__PIDS__' -Value $PID
+    Start-Sleep -Seconds 600
+    exit 0
+}
 "HTTP/2.0 $($resp['status']) Stub"
 if ($resp.ContainsKey('etag')) { "Etag: $($resp['etag'])" }
 if ($resp.ContainsKey('headers')) { $resp['headers'] }
@@ -79,12 +86,14 @@ def rate(remaining: int) -> dict[str, Any]:
     return ok({"resources": {"core": {"remaining": remaining}}})
 
 
-def pr(state: str = "open", merged: bool = False) -> dict[str, Any]:
+def pr(
+    state: str = "open", merged: bool = False, mergeable: str | None = "blocked", sha: str = SHA
+) -> dict[str, Any]:
     return {
         "state": state,
         "merged": merged,
-        "mergeable_state": "blocked",
-        "head": {"sha": SHA},
+        "mergeable_state": mergeable,
+        "head": {"sha": sha},
         "base": {"ref": "main"},
     }
 
@@ -92,8 +101,14 @@ def pr(state: str = "open", merged: bool = False) -> dict[str, Any]:
 NO_STATUSES = [ok({"state": "pending", "statuses": []})]
 
 
+def ints(path: Path) -> list[int]:
+    return [int(s) for s in path.read_text(encoding="utf-8").split()] if path.exists() else []
+
+
 class Run:
-    def __init__(self, proc: subprocess.CompletedProcess[str], log: Path, sleeps: Path) -> None:
+    def __init__(
+        self, proc: subprocess.CompletedProcess[str], log: Path, sleeps: Path, pids: Path
+    ) -> None:
         self.code = proc.returncode
         self.out = proc.stdout
         self.err = proc.stderr
@@ -102,9 +117,9 @@ class Run:
             if log.exists()
             else []
         )
-        self.sleeps = (
-            [int(s) for s in sleeps.read_text(encoding="utf-8").split()] if sleeps.exists() else []
-        )
+        self.sleeps = ints(sleeps)
+        # The process ids of the stub calls that hung on purpose.
+        self.hung = ints(pids)
 
     def paths(self) -> list[str]:
         return [c[-1] for c in self.calls]
@@ -120,13 +135,15 @@ def wait_pr(
     """Run the script with ``-Until until``; ``plan`` maps a REST path to its answers in order."""
     plan.setdefault("rate_limit", [rate(4000)])
     log, counts, sleeps = tmp_path / "gh.log", tmp_path / "counts.json", tmp_path / "sleeps.log"
+    pids = tmp_path / "hung.log"
     plan_file = tmp_path / "plan.json"
     plan_file.write_text(json.dumps(plan), encoding="utf-8")
     stub = tmp_path / "gh-stub.ps1"
     stub.write_text(
         STUB.replace("__LOG__", str(log))
         .replace("__PLAN__", str(plan_file))
-        .replace("__COUNTS__", str(counts)),
+        .replace("__COUNTS__", str(counts))
+        .replace("__PIDS__", str(pids)),
         encoding="utf-8",
     )
     sleeper = tmp_path / "sleeper.ps1"
@@ -154,7 +171,7 @@ def wait_pr(
         timeout=TIMEOUT,
         env=env,
     )
-    return Run(proc, log, sleeps)
+    return Run(proc, log, sleeps, pids)
 
 
 def test_an_already_merged_pr_exits_0_after_one_read_and_no_sleep(tmp_path: Path) -> None:
@@ -489,3 +506,104 @@ def test_a_refused_required_context_read_is_an_error_not_an_empty_set(tmp_path: 
     )
     assert run.code == 1
     assert "answered HTTP 404" in run.err
+
+
+@pytest.mark.parametrize("stale", ["dirty", "behind"])
+def test_two_reads_that_need_a_push_on_one_head_exit_3(tmp_path: Path, stale: str) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr(mergeable=stale))]})
+    assert run.code == 3, run.err
+    assert f"needs a push: mergeable_state={stale} on two checks in a row of head {SHA}" in run.out
+    assert run.sleeps == [120]
+
+
+MERGED = pr("closed", merged=True)
+HEAD_B = "b" * 40
+
+
+@pytest.mark.parametrize(
+    ("reads", "code", "sleeps"),
+    [
+        # A clean read between two dirty ones resets the count, so the merge is waited for.
+        ([pr(mergeable="dirty"), pr(mergeable="clean"), pr(mergeable="dirty"), MERGED], 0, 3),
+        # Dirty on head A, then on head B: B has been read dirty once, not twice.
+        ([pr(mergeable="dirty"), pr(mergeable="dirty", sha=HEAD_B), MERGED], 0, 2),
+        # Still computing neither counts nor resets: exit 3 on the third read, not the second.
+        ([pr(mergeable="dirty"), pr(mergeable="unknown"), pr(mergeable="dirty"), MERGED], 3, 2),
+        ([pr(mergeable="dirty"), pr(mergeable=None), pr(mergeable="dirty"), MERGED], 3, 2),
+    ],
+    ids=["clean-resets", "new-head-resets", "unknown-is-nothing", "null-is-nothing"],
+)
+def test_what_resets_the_needs_a_push_count(
+    tmp_path: Path, reads: list[dict[str, Any]], code: int, sleeps: int
+) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(r) for r in reads]})
+    assert run.code == code, run.err
+    assert ("needs a push" in run.out) == (code == 3)
+    assert run.sleeps == [120] * sleeps
+
+
+@pytest.mark.parametrize("until", ["checks-complete", "closed"])
+def test_only_until_merged_acts_on_a_pr_that_needs_a_push(tmp_path: Path, until: str) -> None:
+    dirty = pr(mergeable="dirty")
+    queued = {"name": "a", "status": "queued", "conclusion": None}
+    done = {"name": "a", "status": "completed", "conclusion": "success"}
+    run = wait_pr(
+        tmp_path,
+        until,
+        {
+            PR_PATH: [ok(dirty), ok(dirty), ok(pr("closed", mergeable="dirty"))],
+            BRANCH_PATH: [ok({"protected": False})],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [
+                ok({"total_count": 1, "check_runs": [queued]}),
+                ok({"total_count": 1, "check_runs": [queued]}),
+                ok({"total_count": 1, "check_runs": [done]}),
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert "needs a push" not in run.out
+    assert run.sleeps == [120, 120]
+
+
+def test_a_gh_call_that_hangs_is_killed_and_counted_as_transient(tmp_path: Path) -> None:
+    """Two hung reads keep the wait going; the third in a row is exit 1, and none survives."""
+    psutil = pytest.importorskip("psutil")
+    run = wait_pr(
+        tmp_path,
+        "merged",
+        {PR_PATH: [ok(pr()), {"hang": True}]},
+        "-GhTimeoutSeconds",
+        "5",
+    )
+    assert run.code == 1, run.out
+    assert f"gh api {PR_PATH} did not finish within 5 s and was killed" in run.out
+    assert "three transient failures in a row" in run.err
+    assert run.sleeps == [120, 120, 120]
+    assert len(run.hung) == 3
+    assert not [pid for pid in run.hung if psutil.pid_exists(pid)]
+
+
+def test_the_timeout_seam_is_refused_outside_tests(tmp_path: Path) -> None:
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_WAIT_PR_TEST_SEAMS"}
+    run = wait_pr(
+        tmp_path,
+        "merged",
+        {PR_PATH: [ok(pr("closed", True))]},
+        "-GhTimeoutSeconds",
+        "5",
+        env=env,
+    )
+    assert run.code == 1
+    assert "-GhTimeoutSeconds is a test seam" in run.err
+    assert run.calls == []
+
+
+def test_a_weak_etag_keeps_its_quotes_on_the_way_to_gh(tmp_path: Path) -> None:
+    """The ETag goes to gh through ArgumentList, so its embedded quotes and space survive."""
+    etag = 'W/"e 1"'
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr(), etag), ok(pr("closed", True))]})
+    assert run.code == 0, run.err
+    pr_calls = [c for c in run.calls if c[-1] == PR_PATH]
+    assert f"If-None-Match: {etag}" in pr_calls[1]
