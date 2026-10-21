@@ -61,9 +61,13 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
 
 
 def test_the_shipped_pyproject_declares_the_fastapi_floor() -> None:
-    """The control for the parser: the real file yields the floor the route walk rests on."""
+    """The control for the parser: the real file yields the floor the route walk rests on.
+
+    0.143.1 is the first release with the ``RouteContext`` shape the route walk reads, and the
+    required legs run only the locked release, so a floor below it would allow a shape no required
+    leg runs (vault BACKLOG #3916)."""
     floor = declared_floors(_ROOT / "pyproject.toml")["fastapi"]
-    assert floor is not None and floor >= Version("0.140.0")
+    assert floor is not None and floor >= Version("0.143.1")
 
 
 def _installed(versions: dict[str, str | None]) -> Callable[[str], Version | None]:
