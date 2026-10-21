@@ -28,11 +28,6 @@ tests/test_afk_decision_log.py
 tests/test_afk_digest.py
 tests/test_afk_kill_switch.py
 tests/test_afk_tripwire.py
-# Not a test: the fake gh and sandbox the four AFK tests above share, and nothing else imports it.
-# Listed so a pull request that edits only this helper still summons the tooling job through
-# ci.yml's `grep -qxFf` arm; without it that pull request runs the four tests on no leg. The
-# marker is applied by basename, so this line marks no test.
-tests/_fake_gh.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_attribution_trailer_check.py
