@@ -2001,15 +2001,42 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
 
 
 class ExportStopped(RuntimeError):
-    """A running export lost its caller's standing, so the stream aborts (BACKLOG #1154). The
-    bulk message export and the audit export raise it.
+    """A running export stopped: its caller lost standing, or its scope changed (BACKLOG #1154,
+    #3381). The bulk message export and the audit export raise it.
 
-    The response has already started, so no status code can say so. Raising aborts the transfer,
-    and the client sees an incomplete download rather than a short file that looks complete. The
-    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
-    and uvicorn writes a traceback. Returning without the final body message would avoid
-    that, but the ``@app.middleware("http")`` layers would then finish the response cleanly,
-    which is the short file this exists to prevent."""
+    The response has already started, so no status code can say so. The raise was meant to abort
+    the transfer, so the client would see an incomplete download rather than a short file that
+    looks complete. **It does not, on the engine as shipped (found under BACKLOG #3381, unfixed).**
+    Starlette's ``BaseHTTPMiddleware``, which each ``@app.middleware("http")`` layer is, ends the
+    response with its final body message when the inner app raises, and re-raises only after
+    that. So the client receives a cleanly ended 200 holding the rows streamed before the stop.
+    Returning without the final body message would fare no better behind those layers.
+
+    A stop is a decision, not a crash. The raising stream writes a WARNING with the counts and the
+    stop's audit row before it raises (BACKLOG #3381), so ``_unhandled_exception`` writes no ERROR
+    line for this type, and :class:`ExportStopLogFilter` drops the traceback uvicorn would log for
+    it."""
+
+
+class ExportStopLogFilter(logging.Filter):
+    """Drop uvicorn's ``Exception in ASGI application`` record for an :class:`ExportStopped`
+    (BACKLOG #3381); see that class for why. Every other record passes, so a real crash keeps its
+    traceback."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Truthiness, not ``is not None``: a call with ``exc_info=False`` leaves False there.
+        return not (record.exc_info and isinstance(record.exc_info[1], ExportStopped))
+
+
+_EXPORT_STOP_FILTER = ExportStopLogFilter()
+
+
+def quiet_deliberate_export_stops() -> None:
+    """Install :class:`ExportStopLogFilter` on ``uvicorn.error``, the logger uvicorn writes an
+    exception that leaves the ASGI app to. One shared instance, which ``addFilter`` adds only once,
+    however many apps are built. A logger filter, not a handler one, so it holds whatever handlers
+    ``configure_logging`` or a test attaches."""
+    logging.getLogger("uvicorn.error").addFilter(_EXPORT_STOP_FILTER)
 
 
 async def recheck_standing(
@@ -2035,7 +2062,7 @@ async def recheck_standing(
 
     Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
     one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
-    no longer covers the scope the export started with."""
+    differs from the scope the export started with."""
     identity = await auth.identity_for_token(token, activity=activity)
     if identity is None or identity.must_change_password or identity.must_set_notify_email:
         return None
