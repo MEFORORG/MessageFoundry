@@ -8,6 +8,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
+This engine pairs with web console 0.5.0, which is published after it under its own
+`webconsole-v0.5.0` tag. Its UI seam is `6d8b36eb7bb94bf0`, so with the console on it refuses to
+start beside console 0.4.0. Upgrade the two together, or set
+`[security].serve_web_console = false`. A `BACKLOG #N` number cites the project's private planning
+ledger, so it has no public page.
+
 ### Added
 - **Federated sign-in can authenticate to the token endpoint with `private_key_jwt`.** Set
   `[auth].oidc_token_endpoint_auth_method = "private_key_jwt"` and supply
@@ -3536,7 +3542,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   routes and lack `iter_route_contexts`. The walk now imports that call directly, so a FastAPI
   without it fails at import. On 0.137.2 to 0.139.x the walk is complete, but the guard against
   sync route dependencies cannot run. The engine still refused an undeclared route at request time
-  on 0.137.0 and 0.137.1. The lock already pins 0.141.1. (`vault BACKLOG #2845`)
+  on 0.137.0 and 0.137.1. The lock already pins 0.141.1. (`vault BACKLOG #2845`) Superseded in
+  this release: the floor is `fastapi>=0.143.1`.
 - **The engine now counts every refusal of a route that declares no authorization.** It used to
   log only the first refusal of such a route, so a later burst wrote nothing. The ERROR line now
   repeats at most once a minute for each route. Each line says how many refusals came since the
@@ -4866,7 +4873,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   carry unhandled-exception messages and stack traces, either of which can hold PHI. `create_app` now passes a
   telemetry config with every switch off, so no environment variable can start that export. The
   engine's own optional OTLP metrics export is separate and unchanged. The FastAPI floor is now
-  0.142.0, the first release with the `telemetry` argument.
+  0.142.0, the first release with the `telemetry` argument. Superseded in this release: the floor
+  is `fastapi>=0.143.1`.
 - **The federated bind, rebind and unbind audit rows say whether the account holds engine
   factors.** `auth.federated_subject_bound`, `auth.federated_subject_rebound` and
   `auth.federated_subject_unbound` now carry `totp_enrolled` and `webauthn_enrolled`. A bind or
