@@ -38,7 +38,42 @@ this line.**
   that spent the shared sign-in budget would otherwise refuse every federated step-up while a
   password step-up kept working. A refused return answers 429 with the step-up page for the staged
   continuation, and consumes nothing. Every other callback still draws the sign-in budget. This console needs an
-  engine with `oidc_step_up_flow`, and refuses an older one at startup. (BACKLOG #3374)
+  engine with `oidc_step_up_flow`, and refuses an older one at startup. A flood can still refuse
+  a federated step-up at its start: `POST /ui/reauth/oidc` stages its flow in the same pending-flow
+  cache as a sign-in start (`[auth].oidc_flow_cache_max`, and a per-address cap), which refuses a
+  new flow when full rather than evict one, so a flood that fills it answers that start 429 with
+  the step-up page. (BACKLOG #3374)
+- **A group-wide save that would end your own sessions asks you to re-authenticate for it.**
+  Saving either AD group map (`POST /ui/ad-groups/map`, `POST /ui/ad-groups/scope-map`), and
+  updating or deleting a custom role (`POST /ui/roles/custom/{role_id}/update`,
+  `POST /ui/roles/custom/{role_id}/delete`), ends the sessions of every account the save reaches,
+  which can include yours. Those saves used to run on the step-up window alone. When the save
+  would end your own sessions, the route now takes a single-use re-authentication bound to
+  `save_ends_own_sessions`, and a re-proof from a session that has not passed its second factor
+  does not count. A save that ends none of your sessions keeps the window. The save still ends
+  your own sessions, so the console then sends you to the sign-in page, which says the change was
+  saved and to sign in again. Seam change: the console's new
+  `require_ui_step_up_when_own_sessions_end` gate calls `AuthService.sessions_ended_by_ad_map_save`
+  and `sessions_ended_by_custom_role_save`. (BACKLOG #3401)
+- **Your own user page no longer offers Save roles, Save channel scope or Sign out all
+  sessions.** Each of those writes ends the target account's sessions, so its route refuses your
+  own account (BACKLOG #1149), and the page offered a button that could only fail. The page now
+  shows the roles and scope you hold, read-only, with a note in place of each form, and points to
+  your active sessions page. A `/ui/users/{id}/channel-scope` post aimed at your own account is
+  now refused, and written to the audit log as `auth.self_target_refused`, before the form is
+  checked; before, a malformed one got the form error and no audit row. The JSON
+  `PUT /users/{id}/channel-scope` still answers a malformed body 422 first, with no row. Seam
+  change: `AdminHandlers` gains `refuse_own_channel_scope`. (BACKLOG #3393)
+- **The sign-out offer after a factor change counts what it ends, and survives a failed page.**
+  The number on the offer is now counted with the sign-out's own rule: every other session not yet
+  signed out, one gone idle included, where it used to count only the sessions the sessions page
+  lists. The TOTP confirm reads it after its own session-cap run, so it no longer offers sessions
+  the confirm has just ended.
+  The account page spends the offer's single-use mark only once it has rendered, so a page that
+  fails keeps the offer for the next load. Turning TOTP off now marks the session only when there
+  is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and
+  `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
+  `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 
@@ -191,25 +226,6 @@ digest moved.
 
 ### Security
 
-- **Your own user page no longer offers Save roles, Save channel scope or Sign out all
-  sessions.** Each of those writes ends the target account's sessions, so its route refuses your
-  own account (BACKLOG #1149), and the page offered a button that could only fail. The page now
-  shows the roles and scope you hold, read-only, with a note in place of each form, and points to
-  your active sessions page. A `/ui/users/{id}/channel-scope` post aimed at your own account is
-  now refused, and written to the audit log as `auth.self_target_refused`, before the form is
-  checked; before, a malformed one got the form error and no audit row. The JSON
-  `PUT /users/{id}/channel-scope` still answers a malformed body 422 first, with no row. Seam
-  change: `AdminHandlers` gains `refuse_own_channel_scope`. (BACKLOG #3393)
-- **The sign-out offer after a factor change counts what it ends, and survives a failed page.**
-  The number on the offer is now counted with the sign-out's own rule: every other session not yet
-  signed out, one gone idle included, where it used to count only the sessions the sessions page
-  lists. The TOTP confirm reads it after its own session-cap run, so it no longer offers sessions
-  the confirm has just ended.
-  The account page spends the offer's single-use mark only once it has rendered, so a page that
-  fails keeps the offer for the next load. Turning TOTP off now marks the session only when there
-  is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and
-  `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
-  `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".
