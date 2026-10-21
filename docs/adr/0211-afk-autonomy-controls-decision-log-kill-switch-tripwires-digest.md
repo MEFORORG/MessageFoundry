@@ -47,8 +47,8 @@ where they live, not from the cwd, so a run from inside another checkout cannot 
 
 A reader merges the vault's records with the spool's and drops duplicates by id, so a record
 posted twice reads once. Two machines that create the same day's issue leave two issues with one
-title, and a reader reads both. The listing returns the 100 most recently created log issues; a
-requested day older than a full listing reaches makes the read INCOMPLETE rather than empty.
+title, and a reader reads both. A reader pages through the whole issue listing, one request per
+100 issues, so a day missing from it has no issue rather than an unread one.
 
 ### 2. The record schema (version 1)
 
@@ -84,7 +84,14 @@ its timeout (10 seconds by default) is ON. `scripts/coord/afk-kill.ps1 -Status` 
 `-Banner` runs at every SessionStart from `.claude/settings.json` and prints a loud banner, as a
 `systemMessage` the owner sees and `additionalContext` the session reads, only when the switch is
 ON. The read runs in its own runspace with its own timeout, so a hung gh cannot outlast the hook's
-timeout and leave no banner.
+timeout and leave no banner, and a fault anywhere in the script prints the ON banner. A hook that
+cannot start at all prints nothing: in a fresh cloud VM, pwsh does not exist until cloud-setup.sh
+installs it, so the first session start there shows no banner whatever the switch says.
+
+**The owner sets it, and nothing enforces that.** Every seat acts as the one shared GitHub
+identity, which can write repository variables. The tripwire hook records a `gh variable
+set|delete MEFOR_AFK_KILL` or a non-GET `gh api` call on its path; that is a record, not a block,
+and a write by any other route leaves none.
 
 **The variable does not exist when this merges, so every session reads ON until the owner sets
 it to `off`.** That is the fail-safe reading, not a fault. Setting it is the one owner or Lander
@@ -96,19 +103,30 @@ start"* is wave 2's driver rule, which calls `-Status`.
 ### 4. Tripwires: what a hook enforces, and what is a rule only
 
 `scripts/hooks/afk-tripwire.ps1` runs under `shell-guard-dispatch.ps1` on every Bash and PowerShell
-tool call. **It does not block.** On a hit it spools a `tripwire` record through `decision.ps1
--NoPost` and returns `additionalContext` telling the session the act is Class C. It makes no
-network call. The dispatcher now passes every non-deny guard's `additionalContext` through,
-joined in guard order onto the kept `ask` or `allow` decision, or alone when nothing decided. A deny still ends the run, and the command it refuses does not
-run, so it leaves no tripwire record.
+tool call. **It does not block, so this slice does not meet plan section 4.4, which says each
+tripwire "stops the act".** The brief for this slice left blocking out. Most of these acts are not
+denied by anything else either: the deny rules in `.claude/settings.json` cover only the plain
+prefixes `git push --force`, `git push -f` and `git reset --hard`. The context reaches the session
+with the call, so by the time it reads "stop" the act has run. What the hook gives is the record
+and the reminder. Making it block is the change that would meet section 4.4; it is not built.
+
+On a hit it spools a `tripwire` record through `decision.ps1 -NoPost` and returns
+`additionalContext` telling the session the act is Class C. It makes no network call. A record
+means the act was **attempted**: the hook runs before the permission rules, so a command they
+then refuse is recorded too, with outcome `detected`. A command an earlier guard in the dispatcher
+denied never reaches the hook and leaves no record. The dispatcher now passes every non-deny
+guard's `additionalContext` through, joined in guard order onto the kept `ask` or `allow`
+decision, or alone when nothing decided, and says in it when a guard failed open on the same call.
+Its timeout rises from 60 to 75 seconds, the tripwire's 15-second share.
 
 | Section 4.4 tripwire | In this slice |
 |---|---|
 | `--no-verify` (and `git commit -n`) | **Hook**: recorded and flagged, not blocked. |
-| `--force`, `-f`, `--force-with-lease`, `--mirror`, a `+` refspec on push | **Hook**, not blocked. Plain `git push --force` and `-f` are also refused by the deny rules in `.claude/settings.json`. |
+| `--force`, `-f`, `--force-with-lease`, `--mirror`, a `+` refspec on push | **Hook**, not blocked. A command that starts with plain `git push --force` or `git push -f` is also refused by the deny rules in `.claude/settings.json`. |
 | A ref deletion by push: `--delete`, `-d`, `--prune`, a `:<branch>` refspec | **Hook**, not blocked. |
-| `reset --hard` | **Hook**, not blocked. The settings deny rules refuse the plain forms. |
+| `reset --hard` | **Hook**, not blocked. A command that starts with `git reset --hard` is also refused by the settings deny rules. |
 | `-Force` on `remove.ps1` or `claim.ps1`; `-AllowOrphanedAllocations` | **Hook**, not blocked. |
+| A write to `MEFOR_AFK_KILL` (not in section 4.4; added because any seat can write it) | **Hook**, not blocked. |
 | A diff touching Class C paths | **Rule only.** No hook reads a diff. |
 | The same permission denial twice | **Rule only.** No hook sees a denial. |
 | `main` red for more than two hours | **Rule only.** |
@@ -128,18 +146,27 @@ reversals and tripwire hits; the bundled open Class C questions; spend (not in t
 section says so and points at `scripts/coord/usage.ps1`: designed, not built); collisions; Class D
 commands; and a calibration table.
 
-**The blind sample.** Class B decisions from the day that have no rating yet, drawn at random:
-`-Sample N` draws N, and a default draw takes 5 or 10 percent of the day's Class B decisions,
-whichever is more, and is saved so a rerun shows the same sample. Each sampled decision shows its
-options in an order fixed by a hash of its id, with no mark on the recommendation, and without the
-confidence, the undo path or the outcome. The day's decision list omits a sampled decision's
-recommendation too. `-Rate <id> <agree|disagree|N>` records the owner's verdict as a `rating`
-record; N is the option number the digest showed, compared with the hidden recommendation.
+**The blind sample.** Class B decisions from the day, drawn at random and saved locally, so a
+rerun shows the same sample. The target is 5 or 10 percent of the day's Class B decisions,
+whichever is more, or N with `-Sample N`; each run keeps the saved draw and tops it up from
+decisions logged since, so an early run does not freeze the day's sample. Each sampled decision
+shows its options in an order fixed by a hash of its id, with no mark on the recommendation, and
+without the confidence, the undo path, the review or the outcome. The day's decision list and the
+reversals section leave the same things off a sampled decision until it is rated. `-Rate <id>
+<agree|disagree|N>` records the owner's verdict as a `rating` record, and refuses a decision that
+was not in the day's saved sample on that machine, whose recommendation was visible. N is the
+option number the digest showed, compared with the hidden recommendation.
+
+**Who rates is a rule, not a control.** Every seat writes as the one GitHub identity, so a rating a
+session writes (`decision.ps1 -Log -Kind rating`, or `-Rate` on its own judgment) cannot be told
+from the owner's. Plan R5 is what keeps ratings the owner's, and calibration is only as good as
+that rule. Enforcing it needs an identity the sessions do not hold; it is not built.
 
 **Calibration**, per seat and class, over the records `-Window` days back (60 by default): the
 owner's disagreements on the trailing 60 rated decisions, calibrated at 60 samples with 3 or
-fewer; and the 14-day reversal rate, a breach above 5 percent. A rating older than the window is
-not read.
+fewer. After a breach, any trailing 60 with more than 3, the class stays on the review path until
+60 ratings newer than the breach pass, as plan section 4.2 says. And the 14-day reversal rate, a
+breach above 5 percent. A rating older than the window is not read.
 
 **An unread vault is said aloud.** The digest is marked INCOMPLETE and exits 4, and `decision.ps1
 -List` does the same, because an empty answer from an unread log looks like a quiet day.
@@ -209,11 +236,12 @@ trips nothing, because it runs inside the dispatcher's process.
 - The trailing 60 is read within a 60-day window. At fewer than one rated decision a day per seat
   and class, older ratings fall out of it.
 - Spend is not in the digest; it says so.
-- Tripwires for Class C paths, repeated denials and a red `main` are rules only (section 4).
+- No tripwire blocks, so section 4.4's "stops the act" is not met. Tripwires for Class C paths,
+  repeated denials and a red `main` are rules only (section 4).
+- Rating authorship and kill-switch authorship are rules only: every seat holds the same identity.
 - A cloud session reads the kill switch only if its GitHub proxy grants the variables read. If
   not, it reads ON, which is the safe side.
-- A day's issue is found among the 100 most recently created log issues, about three months of
-  days. An older day reads as INCOMPLETE, not as empty.
+- The issue listing grows by a page every 100 days of log; a reader reads every page.
 - The digest reads each day's issue in turn: about one request per day of `-Window`, once a day.
   A local cache of past days' comments would cut that; it is not built.
 - On a kill-switch read that times out, the hung `gh` child is left to finish on its own.
@@ -225,4 +253,9 @@ trips nothing, because it runs inside the dispatcher's process.
   session prints the ON banner. Setting it is a live repository settings change, so this build
   does not make it.
 - After the merge, sessions pick up the new SessionStart and PreToolUse wiring from the primary
-  checkout's `.claude/settings.json` on their next start; no installer needs to run.
+  checkout's `.claude/settings.json` on their next start.
+- **Lander: re-run the gate installer on each account**, from an up-to-date `main`:
+  `pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -ConfigDir <account config root>`.
+  This change edits `shell-guard-dispatch.ps1`, and an account's own shell entry stands down only
+  for the dispatcher copy the installer pinned, so until the re-install the worktree gate runs
+  twice on every shell call (`install-gate.ps1 -Status` reports it as NOT CURRENT).
