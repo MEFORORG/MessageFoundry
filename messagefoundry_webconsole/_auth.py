@@ -317,7 +317,8 @@ async def rotation_comes_first(auth: AuthService, must_change: bool, token: str 
     """Whether a session is confined to the password page (L4b) right now.
 
     A must-change session with no factor, or with its factor proven, can only rotate, unless its
-    account must enrol TOTP first (ADR 0197 Amendment A, :func:`_enrols_first`). One that still
+    account must enrol a factor with a way past first, TOTP or a discoverable passkey (ADR 0197
+    Amendment A, :func:`_enrols_first`). One that still
     owes a factor it has enrolled proves it first, since the password page refuses it until then
     (``AuthService.password_change_owes_factor``, BACKLOG #1954); an administrator reset is at least
     one shipped way in, because it keeps factors. Where the routing is a redirect,
@@ -365,7 +366,8 @@ async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
 
 async def must_change_target(auth: AuthService, token: str | None) -> str:
     """Where a must-change session is sent: the factor page while it owes an enrolled factor, then
-    the enrolment page while its account must enrol TOTP first (ADR 0197 Amendment A), otherwise
+    the enrolment page while its account must enrol a factor with a way past first (ADR 0197
+    Amendment A), otherwise
     the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
     state is confined on both paths and never audited as an MFA refusal."""
     if await _owes_known_factor(auth, token):
@@ -376,13 +378,14 @@ async def must_change_target(auth: AuthService, token: str | None) -> str:
 
 
 #: Where a session that must enrol before it rotates is sent (ADR 0197 Amendment A): the account
-#: page, which offers the TOTP enrolment, with the notice that says why.
+#: page, which offers the TOTP and passkey enrolments, with the notice that says why.
 ENROL_FIRST_PAGE = "/ui/account?m=enroll_first"
 
 #: The /ui routes a must-change session that must enrol first may reach (ADR 0197 Amendment A):
-#: the account page and the TOTP enrolment ceremony. ``/ui/reauth`` makes the same decision by hand.
-#: Session termination and passkey registration are NOT here, matching the JSON plane. Keyed on
-#: (METHOD, path) as the JSON twin is, so a later handler on one of these paths is not opened too.
+#: the account page, the TOTP enrolment ceremony and, from wave 2, the passkey registration, which
+#: the JSON plane has no route for. ``/ui/reauth`` makes the same decision by hand. Session
+#: termination is NOT here, matching the JSON plane. Keyed on (METHOD, path) as the JSON twin is,
+#: so a later handler on one of these paths is not opened too.
 ENROL_FIRST_UI_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/ui/account"),

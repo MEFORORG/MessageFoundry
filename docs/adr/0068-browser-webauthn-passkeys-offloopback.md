@@ -710,16 +710,19 @@ decisions of this ADR change; the rest stand.
    the hash of an opaque per-begin handle the console sets as an HttpOnly cookie, never by client
    address, and a full pool evicts its oldest entry rather than refusing. Its begin leg charges the
    sign-in limiter first and takes no username; its options carry an empty `allowCredentials`. The
-   sign-in pops the challenge on arrival, whatever the outcome. The assertion's `userHandle` must be
-   the named account's id.
+   sign-in pops the challenge on arrival, whatever the outcome. The assertion must come from one of
+   the named account's own passkeys and verify under its stored key, which is what binds it to that
+   account; its `userHandle` must also be the account's id, a consistency check only, since the
+   client chooses it and the signature does not cover it.
 3. **One assertion failure is now counted.** Decision 1(d) and the docstring of
    `finish_webauthn_assertion` say assertion failures never feed the lockout, because a signature is
    not a guessable secret and a flaky authenticator must not lock the account. That stays true of
    the second-factor leg. On the combined passkey sign-in, an invalid assertion is counted on the
    sign-in counter, beside the password, whatever the password was. Left uncounted, "right password,
    invalid assertion" was a silent password oracle (ADR 0197 Amendment A, adversarial review round
-   1). A flaky authenticator there costs the owner only the fixed sign-in lock, which this path
-   passes anyway. A valid assertion beside a wrong password counts on the second-step counter.
+   1). On an account without TOTP a flaky authenticator there costs the owner only the fixed
+   sign-in lock, which this path passes anyway; on one with TOTP the sign-in lock escalates, and the
+   owner's TOTP combined sign-in passes it. A valid assertion beside a wrong password counts on the second-step counter.
 
 **Who decided.** The design is ADR 0197 Amendment A, option N-G, accepted by the batch 121 Manager
 on 2026-09-28 under the owner's "No, fix it" ruling; it is not itself an owner ruling. This

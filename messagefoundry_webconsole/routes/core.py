@@ -1769,7 +1769,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
             # still owes an enrolled factor stays here to answer it (BACKLOG #1954), and one that
-            # must enrol TOTP first never reaches this branch (rotation_comes_first is False).
+            # must enrol a factor with a way past first never reaches this branch
+            # (rotation_comes_first is False).
             return RedirectResponse("/ui/account/password", status_code=303)
         if await auth.mfa_satisfied(token):
             return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed

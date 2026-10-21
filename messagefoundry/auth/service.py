@@ -2372,8 +2372,9 @@ async def lockable_account_census(
     undecryptable: list[str] = []
     passkey_only: list[str] = []
     sealed = store.row_sealer() is not None
-    # One probe, so a site with no passkey anywhere reads no account's set below.
-    any_passkeys = await store.any_webauthn_credentials()
+    # One probe, so a site with no passkey anywhere reads no account's set below. Without the
+    # [webauthn] extra no passkey can sign in, so none is a way past and none is read.
+    any_passkeys = webauthn.available() and await store.any_webauthn_credentials()
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
@@ -4583,13 +4584,16 @@ class AuthService:
         now = time.time()
         # Wave 2: the discoverable passkeys an assertion could answer for, under this request's
         # relying party, from the set the account's seal covers. None read without an assertion.
+        # The path exists only where one of them is discoverable; the assertion may then come
+        # from any of the account's passkeys under this relying party, since a browser can offer
+        # one registered before wave 2 that is in fact discoverable.
         passkey_creds: list[WebAuthnCredential] = []
         # Without the [webauthn] extra no assertion can be checked, so it changes nothing and the
         # request is the password sign-in, refused under a live lock like any other.
         if passkey is not None and webauthn.available():
             held = await self._verified_passkeys(user)
-            passkey_creds = [c for c in held or () if c.discoverable and c.rp_id == passkey.rp_id]
-        with_passkey = passkey is not None and bool(passkey_creds)
+            passkey_creds = [c for c in held or () if c.rp_id == passkey.rp_id]
+        with_passkey = passkey is not None and any(c.discoverable for c in passkey_creds)
         combined = with_passkey or (bool(code) and user.totp_enabled)
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
@@ -4868,10 +4872,13 @@ class AuthService:
         checked (ADR 0197 Amendment A, N-G), for the reason :meth:`_check_both_factors` gives.
 
         The assertion is invalid when the challenge was not staged or expired, the response is
-        malformed, its credential is not one of ``creds`` (the account's discoverable passkeys under
-        this relying party), its ``userHandle`` is not this account's id, its signature or origin
-        fails, or the sign-count compare-and-set misses. The ``userHandle`` test is what binds the
-        usernameless assertion to the account the form named. A valid signature moves the sign
+        malformed, its credential is not one of ``creds`` (the account's own passkeys under this
+        relying party), its ``userHandle`` is not this account's id, its signature or origin fails,
+        or the sign-count compare-and-set misses. **What binds the usernameless assertion to the
+        account the form named is the lookup in ``creds`` and the signature under that passkey's
+        stored key**, never the ``userHandle``: the signature does not cover it and the client
+        chooses it, so its test is a consistency check only. Never widen the lookup beyond the named
+        account's own set on the strength of it. A valid signature moves the sign
         count whatever the password was, as a matching TOTP code is consumed whatever the password
         was; the challenge is single use, so the assertion cannot be replayed.
 
@@ -11376,7 +11383,7 @@ class AuthService:
         an account that holds a factor, unless it is a directory (AD) account, and when the session
         or its user cannot be found. An account with no factor has nothing to prove here; whether
         it may rotate is :meth:`change_password`'s call, which refuses a covered local account
-        until it has TOTP (ADR 0197 Amendment A). A directory account is left to the route's 400,
+        until it has TOTP or a discoverable passkey (ADR 0197 Amendment A). A directory account is left to the route's 400,
         which changes nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
         the web console's password and factor pages all ask it, so the planes cannot drift."""
         return await self._owes_enrolled_factor(token, local_only=True)
@@ -12046,8 +12053,9 @@ class AuthService:
         covers (BACKLOG #2592): a set that fails its digest counts for nothing, so a passkey row
         written or flipped outside the store cannot open a gate (ADR 0197 Amendment A, wave 2).
         An account whose sealed record names no passkey reads none: a row added outside the store
-        could only fail the digest anyway."""
-        if not user.has_passkeys:
+        could only fail the digest anyway. Without the ``[webauthn]`` extra no passkey can sign
+        in, so none is a way past."""
+        if not user.has_passkeys or not webauthn.available():
             return False
         held = await self._verified_passkeys(user)
         return any(c.discoverable for c in held or ())
@@ -13556,7 +13564,12 @@ class AuthService:
             user_id=user.id,
             user_name=user.username,
             challenge=challenge,
-            exclude_credential_ids=[self._b64url_decode(c.credential_id) for c in existing],
+            # Only discoverable passkeys are excluded (ADR 0197 Amendment A, wave 2): a holder may
+            # register an authenticator again as a discoverable credential, which is the remedy for
+            # a passkey registered before wave 2.
+            exclude_credential_ids=[
+                self._b64url_decode(c.credential_id) for c in existing if c.discoverable
+            ],
         )
         self._webauthn_challenges.put((hash_token(token), "register"), user.id, challenge)
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)

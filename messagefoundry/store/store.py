@@ -6534,9 +6534,12 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with TOTP enrolled, because only that owner can use the
+    * the SIGN-IN lock on a local account with TOTP enrolled, because that owner can use the
       combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
-      account with TOTP enrolled included: it has no combined sign-in to get past its lock.
+      account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
+      account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
+      too, and still keeps the fixed length: escalating would need the passkey set inside this
+      atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
 
     Read by every backend inside its atomic increment, from ``auth_provider`` and ``totp_enabled``
     on the row it locked, so the decision and the count come from one read."""

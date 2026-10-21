@@ -615,6 +615,31 @@ async def test_an_assertion_on_an_account_with_no_discoverable_passkey_is_refuse
         await store.close()
 
 
+async def test_an_older_passkey_answers_where_the_account_also_holds_a_discoverable_one() -> None:
+    """The path exists because the account holds a discoverable passkey, and then any of its own
+    passkeys under the relying party may answer: a browser can offer one recorded as not
+    discoverable. And a new registration excludes only discoverable passkeys, so such an
+    authenticator can be registered again as discoverable."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _lock_service(store)
+        identity, token, password = await login_admin(service)
+        _, token = await _register(service, identity, token, label="resident")
+        older, _ = await _register(service, identity, token, resident_key=False, label="older")
+        options = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token="unused-token", rp_id=RP, rp_name="MF"
+            )
+        )
+        excluded = {c["id"] for c in options["excludeCredentials"]}
+        assert older.credential_id_b64 not in excluded and len(excluded) == 1
+        await _set_sign_in_lock(store, identity.user_id)
+        out = await service.login(identity.username, password, passkey=_proof(service, older))
+        assert out.ok, "an assertion from the account's older passkey was refused"
+    finally:
+        await store.close()
+
+
 async def test_a_challenge_is_single_use() -> None:
     store = await MessageStore.open(":memory:")
     try:
