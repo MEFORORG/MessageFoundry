@@ -40,9 +40,11 @@ this line.**
   continuation, and consumes nothing. Every other callback still draws the sign-in budget. This console needs an
   engine with `oidc_step_up_flow`, and refuses an older one at startup. A flood can still refuse
   a federated step-up at its start: `POST /ui/reauth/oidc` stages its flow in the same pending-flow
-  cache as a sign-in start (`[auth].oidc_flow_cache_max`, and a per-address cap), which refuses a
-  new flow when full rather than evict one, so a flood that fills it answers that start 429 with
-  the step-up page. (BACKLOG #3374)
+  cache as a sign-in start, which refuses a new flow when full rather than evict one. The cache
+  has a per-address cap (16) and an engine-wide one (`[auth].oidc_flow_cache_max`), so a flood
+  from an address the operator shares, such as a NAT, fills it soonest. That start then answers
+  429 with the step-up page, and unlike a refused return it has already spent one of the
+  operator's ceremony attempts. (BACKLOG #3374)
 - **A group-wide save that would end your own sessions asks you to re-authenticate for it.**
   Saving either AD group map (`POST /ui/ad-groups/map`, `POST /ui/ad-groups/scope-map`), and
   updating or deleting a custom role (`POST /ui/roles/custom/{role_id}/update`,
@@ -50,7 +52,8 @@ this line.**
   which can include yours. Those saves used to run on the step-up window alone. When the save
   would end your own sessions, the route now takes a single-use re-authentication bound to
   `save_ends_own_sessions`, and a re-proof from a session that has not passed its second factor
-  does not count. A save that ends none of your sessions keeps the window. The save still ends
+  does not count. With `[auth].require_action_step_up = false` it takes the window instead, as
+  every action-bound step-up does. A save that ends none of your sessions keeps the window. The save still ends
   your own sessions, so the console then sends you to the sign-in page, which says the change was
   saved and to sign in again. Seam change: the console's new
   `require_ui_step_up_when_own_sessions_end` gate calls `AuthService.sessions_ended_by_ad_map_save`
