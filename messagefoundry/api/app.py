@@ -246,6 +246,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    quiet_deliberate_export_stops,
     recheck_standing,
     refuse_from_new_address,
     refuse_undeclared_route,
@@ -3941,15 +3942,22 @@ def create_app(
     # its returned bundle's type lives in the engine leaf api._ui_seam (never the console package).
     admin = add_auth_routes(app)
 
+    quiet_deliberate_export_stops()  # BACKLOG #3381; see ExportStopped
+
     @app.exception_handler(Exception)
     async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         # Catch-all so an unexpected error returns a generic 500 — never a stack trace or internal
         # detail to the client (ASVS 16.5.1). The real cause is logged server-side only; we log the
         # exception TYPE + route, not str(exc), to avoid a stray PHI fragment reaching the general
         # log (the "never log bodies" rule; centralized redaction is the WP-6c follow-up).
-        _log.error(
-            "unhandled error on %s %s: %s", request.method, request.url.path, type(exc).__name__
-        )
+        # Not for ExportStopped, a decision rather than a crash (BACKLOG #3381; see its docstring).
+        if not isinstance(exc, ExportStopped):
+            _log.error(
+                "unhandled error on %s %s: %s",
+                request.method,
+                request.url.path,
+                type(exc).__name__,
+            )
         # The baseline security headers are set HERE, not left to the middleware that sets them on
         # every other response. Starlette routes a handler registered for Exception/500 to
         # ServerErrorMiddleware, which build_middleware_stack places OUTSIDE user_middleware by
@@ -6702,11 +6710,13 @@ def create_app(
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
         it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
-        caller is re-resolved before each row. Once its standing fails, or its channel scope no longer
-        covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
-        (BACKLOG #1154). Each streamed body is re-checked against that row's per-channel scope, which
-        covers at least the starting one (load-bearing for the attacker-suppliable ``ids`` path); an
-        out-of-scope id is skipped + audited (``auth.channel_denied``).
+        caller is re-resolved before each row. Once its standing fails, or its channel scope differs
+        from the one it started with, wider or narrower, the stream records
+        ``messages_export.stopped`` and raises :class:`ExportStopped` (BACKLOG #1154, #3381), which
+        does not reach the client as a failed download; see that class. Each streamed body is re-checked
+        against that row's per-channel scope, which is therefore the starting one (load-bearing for the
+        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
+        (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
@@ -6771,18 +6781,6 @@ def create_app(
         token = bearer_token(request) if auth is not None else None
         touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
 
-        def _still_covers(current: Identity) -> bool:
-            """Whether ``current``'s channel scope still covers the scope the export started with
-            (None = every channel). This is the check for a scope change that reached the session
-            without a revoke: a widened scope covers it, and a narrowed one stops the export. An
-            administrator's change of either direction revokes the session, and once the revoke
-            lands the standing re-check stops the export. Until then the session is still live.
-            In that window, after ``set_channel_scope`` writes the scope, this is the only check."""
-            if current.allowed_channels is None:
-                return True
-            start = identity.allowed_channels
-            return start is not None and start <= current.allowed_channels
-
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             streamed = 0
             # -inf, so the first row touches. It cannot rescue a selection that ran longer than the
@@ -6811,10 +6809,15 @@ def create_app(
                         activity=touch,
                     )
                 )
-                # A narrowed channel scope stops the export too, rather than skipping and auditing
-                # every later out-of-scope row: one stop row, not a denial per row that would trip
-                # the access-denied burst signal against an operator who did nothing.
-                if current is None or not _still_covers(current):
+                # A changed channel scope stops the export too, in either direction (BACKLOG
+                # #3381). This catches a change that reached the session without a revoke: a direct
+                # store write, or a row checked after an engine path wrote a scope or a role set but
+                # before its revoke landed (docs/SECURITY.md names the paths). A narrowing stops rather than
+                # skipping and auditing every later out-of-scope row, which would trip the
+                # access-denied burst signal against an operator who did nothing. A widening stops
+                # rather than streaming rows from a scope the caller did not hold when it proved
+                # the export, which no audit row would name.
+                if current is None or current.allowed_channels != identity.allowed_channels:
                     reason = "standing_changed" if current is None else "scope_changed"
                     # Counts only, never an id or a body.
                     _log.warning(
@@ -6835,11 +6838,8 @@ def create_app(
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                # Read with THIS row's identity, which covers the starting scope. A channel that
-                # reached this session without a revoke is then readable on the ``ids`` path only:
-                # a search-mode save-all chose its rows with the starting scope. After a direct
-                # store write that lasts to the end of the export. After an administrator's write
-                # it lasts only until the revoke lands, when the next row's re-check stops it.
+                # Read with THIS row's identity, whose scope the check above held to the starting
+                # one, so a row streams only on the scope the export was proved and audited for.
                 row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue

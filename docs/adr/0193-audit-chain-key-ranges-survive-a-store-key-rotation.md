@@ -3,7 +3,8 @@
 - **Status:** Accepted (2026-09-23) -- built with the change. **Amended 2026-10-01** by owner
   ruling: see *Amendment 2026-10-01* at the end. Decision items 2 and 8, the field names in item
   3's closing record, and the first sentence of *Negative / risks* are superseded there. The text
-  below is kept as it was decided.
+  below is kept as it was decided. **Amended 2026-10-20** (BACKLOG #3420): see *Amendment
+  2026-10-20*, which adds a scheme to each range record and supersedes nothing.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -306,3 +307,105 @@ have one and are skipped elsewhere.
 - **It does not remove the keyless store mode.** A store opened with no key, under the audited
   opt-outs, still has a wholly keyless chain, and its posture says so. The owner has ruled that
   mode is to be removed; that is a separate, later change.
+
+---
+
+## Amendment 2026-10-20 -- each range record names its scheme
+
+- **Status:** Accepted -- built with the change (BACKLOG #3420). It builds part of the algorithm
+  epoch that *Out of scope* above left to vault row #1165. The census re-grade stays #1165's.
+- **Supersedes:** nothing. It adds fields to the genesis record (amendment 2026-10-01, item 3), to
+  the range record (Decision item 3), and to the edit-resend body-digest record.
+
+### Why
+
+The genesis row and each range row named the key their range is MAC'd under, and nothing else. The
+row MAC is HMAC-SHA256 (`audit_row_hash`), and the key is HKDF-SHA256 over the DEK under the label
+`mefor/audit-chain/v1` (`_derive_audit_mac_key`). A Transit range is Transit's HMAC with the hash
+`sha2-256`. A release that changed any of these would have made `audit-verify` report every existing
+row broken, because no row said which scheme sealed it. The edit-resend body digests named their
+MAC but not the two labels their key came through, so a change to either label would have made
+every stored digest stop verifying. Zero deployments (CLAUDE.md section 0): this is what such a
+release would have done to a first deployment's rows.
+
+### What changes
+
+1. **The genesis record and the range record carry `mac` and `kdf`.** In-heap ranges name
+   `hmac-sha256` and `hkdf-sha256:mefor/audit-chain/v1`. The Transit range names
+   `vault-transit:hmac-sha2-256` and `vault-transit`. The names are `AUDIT_SCHEME_IN_HEAP` and
+   `AUDIT_SCHEME_TRANSIT` in `store/crypto.py`. The in-heap `kdf` is built from the label HKDF
+   uses, and `crypto_transit` reads its hash from `AUDIT_TRANSIT_HASH_ALGO`, so a record names what
+   the release computes.
+2. **A record without them is read as the scheme every such record was sealed under**, a fixed name
+   per key kind (`AUDIT_SCHEME_UNNAMED_IN_HEAP`, `AUDIT_SCHEME_UNNAMED_TRANSIT`). It is written out,
+   not taken from what the release writes, so a later release that changes the written scheme still
+   reads an older record as what sealed it. Its handover tag was taken without the fields, and is
+   checked that way.
+3. **A record may name only the scheme this release seals its key with** (`audit_scheme_refusal`).
+   Each key kind has one compiled scheme today, so "verify each range under the scheme its record
+   names" is: refuse every other name, then verify under that one. A release that adds a scheme adds
+   an entry there and looks keys up by scheme. Anything else is refused: an unknown name, the other
+   key kind's scheme, or a malformed pair. A record that holds all its own fields but is otherwise
+   malformed still reads as a record. That covers half a pair, a name that is not text, and a field
+   beyond the pair. It names a scheme no release holds, so it is refused. Before this amendment the
+   range parser ignored an extra field.
+4. **No record may name the keyless store mode.** Its `mac` is `sha256` (`AUDIT_KEYLESS_MAC`), and a
+   record naming it is refused whatever its `kdf` says, by a handle with or without a key. So a row
+   cannot declare its chain keyless. A record naming an unknown scheme or the keyless mode still
+   parses as a genesis record. So a handle with no key still reads the chain as keyed, refuses to
+   append, and reports the refusal as a break, never as a keyless pass. It does not stop every
+   rewrite. A writer can still remove the genesis row,
+   drop one of its required fields, or rename its action. A handle with no key then reads the chain
+   as keyless, as it did before. The control there is the `keyless_walk` verdict. A caller whose
+   settings require a key never reports it as a pass (vault BACKLOG #3054).
+5. **Where a refusal applies.** At open, a refused genesis or range record makes the ranges untrusted:
+   new rows go under the active key, or the last range that authenticated, as for any range row that
+   fails, and `rotate-key` refuses. The walk reports a break at the record's position, even where every
+   MAC on the row is valid. A one-row MAC check returns nothing for a row whose range names a
+   refused scheme. That check backs `newest_keyed_audit_row` and the Transit attestation check.
+6. **The handover tag covers the scheme a range row names.** The incoming key MACs the range row, and
+   the outgoing key's tag authorises its key and its scheme. A holder of the incoming key alone cannot
+   change either while the outgoing key is held. `audit_epoch_detail` takes the outgoing secret and
+   computes the tag from the same scheme it writes, so the two cannot disagree.
+7. **The body-digest record carries `kdf`** beside `alg`: `BODY_DIGEST_KDF` names the audit-chain
+   label, then `mefor/audit-body-digest/v1`. `verify_audit_body_digest` takes the record's `alg` and
+   `kdf` as `record.get(...)`. It reads a missing one as the fixed pre-#3420 name
+   (`BODY_DIGEST_UNNAMED_ALG`, `BODY_DIGEST_UNNAMED_KDF`), and returns false unless the pair is the
+   one this release digests with, so a plain hash is refused.
+8. **The anchor's hex width is defined once, beside the in-heap scheme** (`AUDIT_MAC_HEX_LEN`), not
+   written as 64 in the anchor parser. The keyless mode's plain SHA-256 has the same width, which a
+   test pins.
+
+### Acceptance criteria
+
+- **AC-13** -- WHEN a chain's genesis and range records name no scheme, THE SYSTEM SHALL verify it,
+  route appends to its current range, and roll it as a no-op.
+  → `tests/audit_chain_cases.py::records_that_name_no_scheme_still_verify`
+- **AC-14** -- IF a genesis or range record names a scheme this release does not seal its key with,
+  or the keyless mode, THEN THE SYSTEM SHALL report a break, route no append by it, and refuse to
+  roll, even when every MAC on the row verifies.
+  → `tests/audit_chain_cases.py::a_record_naming_a_scheme_this_release_does_not_hold_is_refused`
+  → `tests/test_audit_chain_scheme.py::test_a_range_row_naming_a_refused_scheme_is_a_break_though_its_holders_sealed_it`
+- **AC-15** -- IF a writer with no key renames the chain keyless and recomputes it, THEN a handle with
+  no key SHALL refuse to append and SHALL NOT pass the chain as a keyless walk.
+  → `tests/audit_chain_cases.py::a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless`
+- **AC-16** -- IF a range row's scheme differs from the one its handover tag was taken over, THEN THE
+  SYSTEM SHALL report the row as not authorised.
+  → `tests/test_audit_chain_scheme.py::test_the_handover_tag_covers_the_scheme_the_range_row_names`
+- **AC-17** -- IF a body-digest record names another `alg` or `kdf`, THEN `verify_audit_body_digest`
+  SHALL return false. A record that names no `kdf` SHALL verify.
+  → `tests/test_edit_resend_provenance.py::test_a_digest_record_naming_another_scheme_is_refused`
+  → `tests/test_edit_resend_provenance.py::test_the_digest_names_its_key_derivation_and_a_record_without_it_still_verifies`
+
+The AC-13 to AC-15 cases run on all three backends, as the 2026-10-01 cases do.
+
+### What this amendment does not do
+
+- **It compiles no second scheme.** It makes a later swap possible without stranding rows. The swap
+  itself, with a keyring per KDF label, is that later release's work.
+- **It does not name the range digest's or the handover tag's own hash.** The `closes` digest is
+  plain SHA-256. The tag is the outgoing range's MAC, HMAC-SHA256 in heap, over input that starts
+  with the domain label `mefor/audit-handover/v1`. Neither is named in a record, so a change to
+  either would still strand the range rows written before it.
+- **It does not name the scheme in the anchor.** An anchor stays `COUNT:HEAD`. Its hex width follows
+  the in-heap scheme, and a Transit head stays opaque.

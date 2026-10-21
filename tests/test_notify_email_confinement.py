@@ -40,7 +40,7 @@ from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyE
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
-from tests._admin_account import create_local_user_chosen, provision_totp
+from tests._admin_account import create_local_user_chosen, forget_addresses, provision_totp
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -103,8 +103,9 @@ async def _flag_after_login(service: AuthService, username: str, password: str =
 # There were four. The fourth, the first-run bootstrap administrator, was retired by ADR 0183
 # Amendment A, Wave 2 (BACKLOG #1136), and its test went with it. The first administrator of an
 # install now comes from `provision-admin`. That command requires `--email` since BACKLOG #1138,
-# so its no-address arm is gone; the service method below still accepts none, and an
-# Administrator with no address is still confined, which is what this pins.
+# and the service method below does too since #3391, so its no-address arm is gone. An
+# Administrator with no address is still reachable, from a directory account granted the role or a
+# store an earlier build wrote, and is still confined, which is what this pins.
 
 
 async def test_a_local_account_created_without_an_address_is_confined_and_one_with_is_not() -> None:
@@ -120,18 +121,22 @@ async def test_a_local_account_created_without_an_address_is_confined_and_one_wi
         await store.close()
 
 
-async def test_an_administrator_provisioned_without_an_address_is_confined() -> None:
-    for notify_email, expected in ((ADDRESS, False), (None, True)):
+async def test_a_provisioned_administrator_that_loses_its_address_is_confined() -> None:
+    """The control arm is the service's own output, which always carries an address now; the other
+    arm clears it, the state a store an earlier build wrote can hold."""
+    for forget, expected in ((False, False), (True, True)):
         store = await MessageStore.open(":memory:")
         try:
             service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
-            await service.provision_first_administrator(
+            outcome = await service.provision_first_administrator(
                 username="first",
                 password=PW,
-                notify_email=notify_email,
+                notify_email=ADDRESS,
                 actor="cli:test",
                 **provision_totp(),
             )
+            if forget:
+                await forget_addresses(store, outcome.user_id)
             assert await _flag_after_login(service, "first") is expected
         finally:
             await store.close()

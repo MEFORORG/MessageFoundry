@@ -629,12 +629,16 @@ from typing import Any
 #: A method the console calls, so it forces a bump; the pinned digest refuses either pair at
 #: mount. Re-derived with ``--write``.
 #:
+#: BACKLOG #3374 merged with main: each side moved the digest on its own (this branch to
+#: b6270406897ee7c6, main to 6d8b36eb7bb94bf0). The value below was re-derived with ``--write``
+#: on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b6270406897ee7c6"
+ENGINE_UI_SEAM: str = "3c209cdd46721b6c"
 
 
 @dataclass(frozen=True, slots=True)

@@ -30,7 +30,6 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_managed_app
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
@@ -41,7 +40,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import provision_totp
+from tests._admin_account import provision_admin
 
 # provision-admin's prompt stub and passphrase, imported rather than copied, as
 # tests/test_audit_keyless_chain_flagged.py does: that module is where the prompt is pinned.
@@ -68,8 +67,9 @@ def _seed(
     ``key`` is given.
 
     Built through ``provision_first_administrator`` rather than ``initialize()``, so no bootstrap
-    account is minted and the Administrator here is the only one. ``viewer`` adds a second, enabled,
-    non-Administrator account with no address.
+    account is minted and the Administrator here is the only one. With no ``admin_email`` it holds
+    no address, which the service will not write, so :func:`provision_admin` clears it after.
+    ``viewer`` adds a second, enabled, non-Administrator account with no address.
     """
 
     async def run() -> None:
@@ -79,13 +79,8 @@ def _seed(
             cipher = make_cipher(key)
             store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
-            service = AuthService(store, AuthSettings())
-            outcome = await service.provision_first_administrator(
-                username=_ADMIN,
-                password=_PASSWORD,
-                notify_email=admin_email,
-                actor="test",
-                **provision_totp(),
+            outcome = await provision_admin(
+                store, username=_ADMIN, password=_PASSWORD, notify_email=admin_email
             )
             if admin_disabled:
                 await store.set_user_disabled(outcome.user_id, disabled=True)
@@ -173,8 +168,9 @@ def test_the_setter_unstrands_an_administrator_with_no_address(
     consistent with an app that starts whatever the store holds.
 
     ``provision-admin`` can no longer leave this state, since BACKLOG #1138 made ``--email``
-    required, so the Administrator is written through the service, as a store an earlier build
-    wrote would hold it. The old no-address invocation is pinned as refused here too.
+    required, and since #3391 the service refuses it too. So the Administrator is written through
+    the service and its address cleared after, the state a store an earlier build wrote can hold.
+    The old no-address invocation is pinned as refused here too.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()
@@ -426,9 +422,7 @@ def test_a_keyed_store_opened_without_its_key_writes_nothing_unaudited(
         cipher = make_cipher(key)
         store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
-            await AuthService(store, AuthSettings()).provision_first_administrator(
-                username=_ADMIN, password=_PASSWORD, actor="test", **provision_totp()
-            )
+            await provision_admin(store, username=_ADMIN, password=_PASSWORD, notify_email=None)
         finally:
             await store.close()
 

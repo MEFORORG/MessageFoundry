@@ -116,11 +116,17 @@ from messagefoundry.store.cell_tag import (
     withhold_message_cells,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
-from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
+    AUDIT_KEYLESS_MAC,
+    AUDIT_MAC_HEX_LEN,
+    AUDIT_SCHEME_IN_HEAP,
+    AUDIT_SCHEME_TRANSIT,
+    AUDIT_SCHEME_UNNAMED_IN_HEAP,
+    AUDIT_SCHEME_UNNAMED_TRANSIT,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
+    AuditScheme,
     Cipher,
     CipherError,
     CipherInfo,
@@ -129,10 +135,12 @@ from messagefoundry.store.crypto import (
     audit_key_id,
     cell_aad,
     cipher_info,
+    cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
     rotation_fingerprint_key,
 )
+from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
@@ -2131,7 +2139,8 @@ SignCountAnswer = Literal["moved", "mismatch", "gone"]
 class WebAuthnCredential:
     """One enrolled WebAuthn passkey (WP-14b, ADR 0068 §4).
 
-    ``credential_id_hash`` — SHA-256 hex of the *raw* credential id (the ``sessions.token_hash``
+    ``credential_id_hash`` — the scheme tag ``wc1:`` and SHA-256 hex of the *raw* credential id
+    (BACKLOG #3423, :func:`messagefoundry.auth.tokens.credential_id_hash`; the ``sessions.token_hash``
     precedent) — is the primary key on all three backends: WebAuthn ids may legitimately be up to
     1023 raw bytes, unboundable as a SQL Server index key, so the fixed-width digest is the
     parity-safe key; the full base64url ``credential_id`` rides alongside as a body column.
@@ -2483,6 +2492,9 @@ _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
 )
 _WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+_WEBAUTHN_REHASH: Final = (
+    "UPDATE webauthn_credentials SET credential_id_hash=? WHERE user_id=? AND credential_id_hash=?"
+)
 _WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1"
 
 # The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
@@ -3693,8 +3705,9 @@ AUDIT_ANCHOR_FORM = (
 #: ticket must get a verify, not a tamper alarm.
 _AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
 #: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
-#: chain can produce, keyless or keyed (:func:`audit_row_hash`).
-AUDIT_ANCHOR_DIGEST_HEX_LEN = 64
+#: chain can produce, keyless or keyed (:func:`audit_row_hash`). Defined once, beside the in-heap
+#: scheme it belongs to (``AUDIT_MAC_HEX_LEN``, BACKLOG #3420), not written here as a literal.
+AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 #: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
 #: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
 #: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
@@ -3888,6 +3901,14 @@ def audit_mac_bytes(value: object) -> bytes:
 #   NEW key, and its detail names that key and carries a digest of the range it closes.
 # * Every row carries ``seq``, its position in the chain, inside its MAC. The walk requires ``seq`` to
 #   start at 1 and rise by one, so a renumbered, repeated or missing row is a reported break.
+# * The genesis row and every range row name the SCHEME their range is sealed with, its MAC algorithm
+#   and key derivation, beside the key (BACKLOG #3420, ADR 0193 amendment 2026-10-20). A record that
+#   names none is read as the fixed scheme every such record was sealed under. A record naming any
+#   other scheme is refused (:func:`audit_scheme_refusal`), and so is one naming the keyless store
+#   mode, by a handle with or without a key. That stops a row from declaring a chain keyless. It
+#   does not stop a writer from removing the genesis row or renaming its action: a handle with no key
+#   then reads the chain as keyless, and the control there is the ``keyless_walk`` verdict, which a
+#   caller whose settings require a key never reports as a pass.
 #
 # Three properties of the ranges follow, and the functions below are where each is enforced -- once,
 # for all three backends:
@@ -3922,6 +3943,73 @@ AUDIT_GENESIS_ACTOR: Final = "system"
 #: The key id a range keyed inside Vault/OpenBao Transit names (ADR 0138). Transit versions its own key,
 #: so from the engine's side a Transit-keyed chain is one range.
 AUDIT_TRANSIT_KEY_ID: Final = "vault-transit"
+
+
+def audit_scheme_for(key_id: str) -> AuditScheme:
+    """The scheme this release seals a range keyed under ``key_id`` with (BACKLOG #3420): Transit's
+    for the Transit range, the in-heap HKDF scheme for every other key."""
+    return AUDIT_SCHEME_TRANSIT if key_id == AUDIT_TRANSIT_KEY_ID else AUDIT_SCHEME_IN_HEAP
+
+
+def _audit_unnamed_scheme(key_id: str) -> AuditScheme:
+    """What a genesis or range record that names no scheme was sealed under. A fixed name per key
+    kind, never :func:`audit_scheme_for`, so changing what this release writes cannot change what
+    an older record is read as."""
+    if key_id == AUDIT_TRANSIT_KEY_ID:
+        return AUDIT_SCHEME_UNNAMED_TRANSIT
+    return AUDIT_SCHEME_UNNAMED_IN_HEAP
+
+
+def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
+    """Why a genesis or range record's named ``scheme`` is refused, or ``None`` when it is the one
+    this release seals ``key_id``'s range with (BACKLOG #3420). ``None`` for ``scheme`` is a record
+    that names none, read as :func:`_audit_unnamed_scheme`, which today is that same scheme.
+
+    A stored name only chooses among the schemes compiled into the release, and each key kind has
+    one today, so verifying a range under the scheme its record names is: refuse every other name,
+    then verify under that one. The keyless store mode is never among them, whatever ``kdf`` says,
+    so no record can declare its chain keyless."""
+    if scheme is None:
+        scheme = _audit_unnamed_scheme(key_id)
+    if scheme == audit_scheme_for(key_id):
+        return None
+    if scheme.mac == AUDIT_KEYLESS_MAC:
+        return "names the keyless store mode, which no audit record may name"
+    return (
+        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
+        f"release does not seal the range of audit key {key_id[:64]!r} with it"
+    )
+
+
+#: The fields a genesis or range record names its scheme in (BACKLOG #3420).
+_AUDIT_SCHEME_FIELDS: Final = frozenset({"mac", "kdf"})
+
+
+def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> AuditScheme | None:
+    """The scheme record ``obj`` names, or ``None`` when it holds exactly ``fields`` and names none
+    (a record written before BACKLOG #3420). Raises ``ValueError`` unless ``obj`` holds every one of
+    ``fields``.
+
+    Any other shape that still holds every one of ``fields`` names a scheme no release holds:
+    half a pair, a name that is not text, or a field beyond the pair. So
+    :func:`audit_scheme_refusal` refuses it. Read as no record instead, one added field would turn
+    a keyed chain's genesis row into none, and its chain into a keyless one for a handle with no
+    key. Removing a required field still does that, as renaming the row's action does."""
+    keys = set(obj)
+    if not fields <= keys:
+        raise ValueError("not an audit chain record")
+    if keys == fields:
+        return None
+    mac, kdf = obj.get("mac"), obj.get("kdf")
+    if keys != fields | _AUDIT_SCHEME_FIELDS or not (isinstance(mac, str) and isinstance(kdf, str)):
+        return AuditScheme(mac="", kdf="")  # a shape no release writes, refused as such
+    return AuditScheme(mac=mac, kdf=kdf)
+
+
+def _audit_scheme_fields(scheme: AuditScheme | None) -> dict[str, str]:
+    """The ``mac`` and ``kdf`` entries of a record naming ``scheme``. ``None`` gives none, the shape
+    of a record written before BACKLOG #3420."""
+    return {} if scheme is None else {"mac": scheme.mac, "kdf": scheme.kdf}
 
 
 class AppendedAuditRow(NamedTuple):
@@ -4096,15 +4184,23 @@ def audit_seal_next(
 
 def audit_genesis_detail(key_id: str) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
-    under. JSON, so a later field can be added beside ``key_id``."""
-    return json.dumps({"genesis": 1, "key_id": key_id}, sort_keys=True)
+    under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
+    beside them."""
+    scheme = _audit_scheme_fields(audit_scheme_for(key_id))
+    return json.dumps({"genesis": 1, "key_id": key_id, **scheme}, sort_keys=True)
 
 
-def parse_audit_genesis(detail: object) -> str | None:
-    """The key id a genesis row's ``detail`` names, or ``None`` when ``detail`` is not one.
+_AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
+
+
+def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
+    """``(key_id, scheme)`` from a genesis row's ``detail``, or ``None`` when ``detail`` is not one.
+    ``scheme`` is ``None`` for a record that names none. Whether a named one is held is
+    :func:`audit_scheme_refusal`'s question, not this parser's, so a record naming an unknown
+    scheme still reads as a genesis row, and its chain as keyed.
 
     Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
-    never an exception. Exactly the two fields a genesis record has, so a range row's detail (which
+    never an exception. Exactly the fields a genesis record has, so a range row's detail (which
     carries ``closes`` and ``handover``) is never read as one."""
     if not isinstance(detail, str):
         return None
@@ -4112,20 +4208,31 @@ def parse_audit_genesis(detail: object) -> str | None:
         obj = json.loads(detail)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(obj, dict) or set(obj) != {"genesis", "key_id"}:
+    if not isinstance(obj, dict):
+        return None
+    try:
+        scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
+    except ValueError:
         return None
     marker, key_id = obj["genesis"], obj["key_id"]
     if isinstance(marker, bool) or marker != 1:
         return None
-    return key_id if isinstance(key_id, str) and key_id else None
+    return (key_id, scheme) if isinstance(key_id, str) and key_id else None
 
 
-def _audit_genesis_key(row: Mapping[str, Any]) -> str | None:
-    """The key id ``row`` names when it is a genesis row, else ``None``. The action is matched
+def parse_audit_genesis(detail: object) -> str | None:
+    """The key id a genesis row's ``detail`` names, or ``None`` when ``detail`` is not one; see
+    :func:`parse_audit_genesis_record`."""
+    record = parse_audit_genesis_record(detail)
+    return None if record is None else record[0]
+
+
+def _audit_genesis(row: Mapping[str, Any]) -> tuple[str, AuditScheme | None] | None:
+    """``(key_id, scheme)`` when ``row`` is a genesis row, else ``None``. The action is matched
     EXACTLY, here in Python, so a padding or case-folding collation cannot widen it."""
     if row["action"] != AUDIT_KEY_EPOCH_ACTION:
         return None
-    return parse_audit_genesis(row["detail"])
+    return parse_audit_genesis_record(row["detail"])
 
 
 #: The columns of an ``audit_log`` row that its hash covers besides ``seq`` and the previous hash,
@@ -4197,7 +4304,11 @@ _AUDIT_CLOSES_FIELDS: Final = frozenset(
 
 
 def audit_handover_tag(
-    key_id: str, closes: Mapping[str, Any], secret: tuple[bytes | None, AuditMacFn | None]
+    key_id: str,
+    closes: Mapping[str, Any],
+    secret: tuple[bytes | None, AuditMacFn | None],
+    *,
+    scheme: AuditScheme | None,
 ) -> str:
     """The OUTGOING key's authorisation of a range handover (review round 1 of BACKLOG #1904).
 
@@ -4205,9 +4316,15 @@ def audit_handover_tag(
     key -- a leaked retired key that never keyed a range included -- open a range under it. So the
     range row also carries this tag: a MAC, under the key of the range being CLOSED, over the new key id
     and the ``closes`` record. A handover therefore needs the key the chain is currently under, which is
-    the active key, or the retired key during the window before ``rotate-key``."""
+    the active key, or the retired key during the window before ``rotate-key``.
+
+    The tag also covers ``scheme``, the scheme the range row names (BACKLOG #3420), so the outgoing
+    key authorises the new range's scheme as well as its key. ``None`` is a range row that names
+    none: it was tagged without one, and is checked that way."""
     data = _AUDIT_HANDOVER_INFO + json.dumps(
-        {"key_id": key_id, "closes": dict(closes)}, sort_keys=True, default=str
+        {"key_id": key_id, "closes": dict(closes), **_audit_scheme_fields(scheme)},
+        sort_keys=True,
+        default=str,
     ).encode("utf-8")
     key, mac = secret
     if mac is not None:
@@ -4216,16 +4333,42 @@ def audit_handover_tag(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
-def audit_epoch_detail(key_id: str, closes: Mapping[str, Any], handover: str) -> str:
-    """The ``detail`` of a range row: the key the new range is MAC'd under, what it closes, and the
-    outgoing key's :func:`audit_handover_tag`."""
+def audit_epoch_detail(
+    key_id: str, closes: Mapping[str, Any], outgoing: tuple[bytes | None, AuditMacFn | None]
+) -> str:
+    """The ``detail`` of a range row: the key the new range is MAC'd under, the scheme it is sealed
+    with (BACKLOG #3420), what it closes, and the :func:`audit_handover_tag` the ``outgoing``
+    secret takes over all three. One scheme feeds both, so the tag always covers what the row
+    names."""
+    scheme = audit_scheme_for(key_id)
+    handover = audit_handover_tag(key_id, closes, outgoing, scheme=scheme)
     return json.dumps(
-        {"key_id": key_id, "closes": dict(closes), "handover": handover}, sort_keys=True
+        {
+            "key_id": key_id,
+            "closes": dict(closes),
+            "handover": handover,
+            **_audit_scheme_fields(scheme),
+        },
+        sort_keys=True,
     )
 
 
-def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | None:
-    """``(key_id, closes, handover)`` from a range row's detail, or ``None`` when it is not one.
+class AuditEpoch(NamedTuple):
+    """A range row's record, as :func:`parse_audit_epoch` reads it."""
+
+    key_id: str
+    closes: dict[str, Any]
+    handover: str
+    #: The scheme the record names, or ``None`` when it names none (BACKLOG #3420).
+    scheme: AuditScheme | None
+
+
+_AUDIT_EPOCH_FIELDS: Final = frozenset({"key_id", "closes", "handover"})
+
+
+def parse_audit_epoch(detail: str | None) -> AuditEpoch | None:
+    """The record a range row's detail holds, or ``None`` when it is not one: exactly the fields a
+    range record has, with or without the scheme it names (BACKLOG #3420).
 
     Total over attacker-written input: ``detail`` is a writable column, and a deeply nested value makes
     ``json.loads`` raise ``RecursionError``, which must surface as a malformed row -- a reported break --
@@ -4238,7 +4381,11 @@ def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | N
         return None
     if not isinstance(obj, dict):
         return None
-    key_id, closes, handover = obj.get("key_id"), obj.get("closes"), obj.get("handover")
+    try:
+        scheme = _audit_record_scheme(obj, _AUDIT_EPOCH_FIELDS)
+    except ValueError:
+        return None
+    key_id, closes, handover = obj["key_id"], obj["closes"], obj["handover"]
     if not isinstance(key_id, str) or not key_id or not isinstance(closes, dict):
         return None
     # Exactly the fields a closing record has -- a record missing `prev_hash` or `digest` is malformed
@@ -4251,18 +4398,14 @@ def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | N
         return None
     if not isinstance(handover, str):
         return None
-    return key_id, closes, handover
+    return AuditEpoch(key_id, closes, handover, scheme)
 
 
-def _audit_tag_ok(
-    new_key: str,
-    closes: Mapping[str, Any],
-    handover: str,
-    secret: tuple[bytes | None, AuditMacFn | None],
-) -> bool:
-    """Constant-time check of a range row's handover tag under the outgoing key's ``secret``."""
-    expected = audit_handover_tag(new_key, closes, secret)
-    return hmac.compare_digest(audit_mac_bytes(handover), audit_mac_bytes(expected))
+def _audit_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | None]) -> bool:
+    """Constant-time check of a range row's handover tag under the outgoing key's ``secret``, over
+    the scheme the row names (none, for a row that names none)."""
+    expected = audit_handover_tag(epoch.key_id, epoch.closes, secret, scheme=epoch.scheme)
+    return hmac.compare_digest(audit_mac_bytes(epoch.handover), audit_mac_bytes(expected))
 
 
 #: Why a keyed process reports a chain with no genesis row at sequence number 1.
@@ -4349,7 +4492,8 @@ def verify_audit_rows(
     A range whose key is no longer held is proved instead by the digest in the range row that closes
     it; the NEWEST range's key must be held, since nothing later vouches for it. A range row must
     match the range it closes, carry the outgoing key's handover tag whenever that key is held, and
-    name a key that has not keyed a range before.
+    name a key that has not keyed a range before. The genesis row and every range row must name a
+    scheme this release holds for their key, or none (:func:`audit_scheme_refusal`, BACKLOG #3420).
 
     **What this cannot see.** A tail cut off the END leaves a shorter chain that still verifies, and so
     does a log emptied altogether. Only an anchor held OUTSIDE the database shows either: pass it as
@@ -4365,7 +4509,8 @@ def verify_audit_rows(
     # with a key in hand it would leave every row's MAC uncompared, and with none it would make a
     # keyed chain read as keyless.
     opening = next((r for r in rows if _strict_int(r["seq"]) == 1), None)
-    genesis_key = _audit_genesis_key(opening) if opening is not None else None
+    genesis = _audit_genesis(opening) if opening is not None else None
+    genesis_key = genesis[0] if genesis is not None else None
     # A keyed chain and no key/MAC in hand (opened without the DEK or the vault). No row MAC can be
     # recomputed, so the walk compares each stored hash with itself rather than mis-flag every keyed
     # row as tampered. It still runs, because a break that needs no key is still a break (#2725).
@@ -4389,8 +4534,8 @@ def verify_audit_rows(
     #: Stored ``row_hash`` of the row just before the range being walked: its link to the chain below.
     range_prev: Any = ""
     seen_keys: set[str] = set()
-    #: (position, row id, outgoing key, new key, claimed closes, handover tag, what the walk saw)
-    closings: list[tuple[int, Any, str | None, str, dict[str, Any], str, dict[str, Any]]] = []
+    #: (position, row id, outgoing key, the range row's record, what the walk saw)
+    closings: list[tuple[int, Any, str | None, AuditEpoch, dict[str, Any]]] = []
     for pos, r in enumerate(rows, start=1):
         rid = r["id"]
         seq_ok = _strict_int(r["seq"]) == pos
@@ -4405,27 +4550,33 @@ def verify_audit_rows(
             )
         if ranged and pos == 1:
             range_from_id = rid
-            if genesis_key is None:
+            if genesis is None:
                 breaks.append((pos, rid, _AUDIT_NO_GENESIS))
             else:
-                range_key = genesis_key
-                seen_keys.add(genesis_key)
+                range_key = genesis[0]
+                seen_keys.add(range_key)
+                # BACKLOG #3420: a scheme this release does not hold is refused, the keyless mode
+                # included; the rows are still walked under the one it does.
+                refusal = audit_scheme_refusal(*genesis)
+                if refusal is not None:
+                    breaks.append((pos, rid, f"the genesis row {refusal}"))
         elif ranged and r["action"] == AUDIT_KEY_EPOCH_ACTION:
             parsed = parse_audit_epoch(r["detail"])
             if parsed is None:
                 breaks.append((pos, rid, "malformed audit key-range row"))
             else:
-                new_key, claimed, handover = parsed
+                new_key = parsed.key_id
                 if new_key in seen_keys:
                     breaks.append((pos, rid, f"audit key {new_key!r} opens a second range"))
+                refusal = audit_scheme_refusal(new_key, parsed.scheme)
+                if refusal is not None:
+                    breaks.append((pos, rid, f"audit key-range row {refusal}"))
                 closings.append(
                     (
                         pos,
                         rid,
                         range_key,
-                        new_key,
-                        claimed,
-                        handover,
+                        parsed,
                         {
                             "key_id": range_key,
                             "from_seq": range_from,
@@ -4491,7 +4642,8 @@ def verify_audit_rows(
                 "configured",
             )
         )
-    for pos, rid, outgoing, new_key, claimed, handover, actual in closings:
+    for pos, rid, outgoing, epoch, actual in closings:
+        claimed = epoch.closes
         fields_ok = all(
             claimed.get(f) == actual[f] for f in ("key_id", "from_seq", "to_seq", "rows")
         )
@@ -4516,7 +4668,7 @@ def verify_audit_rows(
                 )
             )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
-        if out_secret is not None and not _audit_tag_ok(new_key, claimed, handover, out_secret):
+        if out_secret is not None and not _audit_tag_ok(epoch, out_secret):
             breaks.append(
                 (
                     pos,
@@ -4695,8 +4847,8 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
-    genesis_key = _audit_genesis_key(first) if first is not None else None
-    if first is None or genesis_key is None:
+    genesis = _audit_genesis(first) if first is not None else None
+    if first is None or genesis is None:
         # No genesis row at seq 1. On an empty log that is a chain nobody has started, and a
         # keyless handle may start a keyless one. With rows in the log, a handle that holds a key
         # reports them.
@@ -4707,11 +4859,15 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
         return
     host._audit_chain_keyed = True
     if active_id is not None:
-        await settle_audit_ranges(host, first, genesis_key, active_id)
+        await settle_audit_ranges(host, first, *genesis, active_id)
 
 
 async def settle_audit_ranges(
-    host: AuditRangeHost, genesis: Mapping[str, Any], genesis_key: str, active_id: str
+    host: AuditRangeHost,
+    genesis: Mapping[str, Any],
+    genesis_key: str,
+    genesis_scheme: AuditScheme | None,
+    active_id: str,
 ) -> None:
     """At open, on a keyed chain: find the CURRENT range -- the one new rows join.
 
@@ -4724,6 +4880,9 @@ async def settle_audit_ranges(
     the active key when it is not. Never a key the failing row names. Either way the store logs an
     ERROR and ``rotate-key`` refuses until ``audit-verify`` has been read. A full verify is not run
     here; it is the startup check's and ``audit-verify``'s job, and they report the break this finds.
+
+    A genesis or range row that names a scheme this release does not hold fails the same way, even
+    when every MAC on it verifies (:func:`audit_scheme_refusal`, BACKLOG #3420).
 
     Between a key change and ``rotate-key`` the current range is legitimately a RETIRED key's; the
     store says so, and says differently when that key is not configured at all."""
@@ -4743,6 +4902,8 @@ async def settle_audit_ranges(
             problem = (
                 f"the audit chain's genesis row does not verify under the key it names{refused}"
             )
+    if problem is None and (refusal := audit_scheme_refusal(genesis_key, genesis_scheme)):
+        problem = f"the audit chain's genesis row {refusal}"  # BACKLOG #3420
     genesis_ok = problem is None
     current, current_from = genesis_key, 1
     seen: list[str] = [genesis_key]
@@ -4753,14 +4914,18 @@ async def settle_audit_ranges(
             if parsed is None or seq is None:
                 problem = f"the audit key-range row at seq={e['seq']!r} is malformed"
                 break
-            new_key, closes, handover = parsed
-            if new_key in seen or closes.get("key_id") != current:
+            new_key = parsed.key_id
+            if new_key in seen or parsed.closes.get("key_id") != current:
                 problem = (
                     f"the audit key-range row at seq={seq} does not follow the range before it"
                 )
                 break
+            refusal = audit_scheme_refusal(new_key, parsed.scheme)
+            if refusal is not None:
+                problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
+                break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(new_key, closes, handover, out_secret):
+            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -4900,13 +5065,12 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
-    handover = audit_handover_tag(active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, handover),
+            detail=audit_epoch_detail(active_id, closes, out_secret),
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:
@@ -6195,7 +6359,8 @@ async def _audit_row_mac_check(
     row's hash and the opening row of ``seq``'s key range, so it walks no chain.
 
     With ``only_key_id`` a row in any other range is refused: a keyless one, which anyone who can
-    write the table can recompute, and one under a retired key still in the keyring."""
+    write the table can recompute, and one under a retired key still in the keyring. A row whose
+    range names a scheme this release does not hold is refused too (BACKLOG #3420)."""
     prev: object = ""
     if seq > 1:
         before = await fetch("SELECT row_hash FROM audit_log WHERE seq = ?", (seq - 1,))
@@ -6209,11 +6374,18 @@ async def _audit_row_mac_check(
         (AUDIT_KEY_EPOCH_ACTION, seq),
     )
     key_id: str | None = None
+    scheme: AuditScheme | None = None
     if opening is not None and _strict_int(opening["seq"]) == 1:
-        key_id = _audit_genesis_key(opening)
+        genesis = _audit_genesis(opening)
+        if genesis is not None:
+            key_id, scheme = genesis
     elif opening is not None and opening["action"] == AUDIT_KEY_EPOCH_ACTION:
         parsed = parse_audit_epoch(opening["detail"])
-        key_id = parsed[0] if parsed is not None else None
+        if parsed is not None:
+            key_id, scheme = parsed.key_id, parsed.scheme
+    if key_id is not None and audit_scheme_refusal(key_id, scheme) is not None:
+        # BACKLOG #3420: a range sealed under a scheme this release does not hold proves nothing.
+        return f"audit row {seq}'s key range names an audit scheme this release does not hold"
     if only_key_id is not None and key_id != only_key_id:
         return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
@@ -6906,7 +7078,8 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- (after_read='leave') File/RemoteFile poll source has ALREADY ingested, so a read-only share whose
 -- files another system owns can be polled without moving/deleting them and a left file is ingested
 -- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
--- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
+-- the clear (NOT part of the `_cipher` seam). `file_key` is a scheme tag, ":", and a SHA-256 of the
+-- file's identity (BACKLOG #3424: the tag names the derivation; a bare pre-tag digest still reads)
 -- (relative-path+mtime+size local / full-remote-path+size+the listed mtime remote, the mtime only where
 -- the server lists one, BACKLOG #2758 — the PATH is folded in, not just the basename, so two
 -- same-named files under different subdirs stay distinct and are BOTH ingested) — a
@@ -6916,7 +7089,7 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- FILE, not each split message, is the dedup unit). Additive: CREATE TABLE IF NOT EXISTS on every open.
 CREATE TABLE IF NOT EXISTS processed_files (
     channel_id   TEXT NOT NULL,   -- inbound connection name (config metadata, non-PHI)
-    file_key     TEXT NOT NULL,   -- sha256(rel-path || mtime || size) — a HASHED derived id, never a path
+    file_key     TEXT NOT NULL,   -- "fk1:" + sha256(identity) — a HASHED derived id, never a path
     processed_at REAL NOT NULL,   -- epoch ts recorded AFTER emit success; drives the age/count prune
     PRIMARY KEY (channel_id, file_key)
 );
@@ -7224,7 +7397,7 @@ CREATE TABLE IF NOT EXISTS session_lineage (
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
-    credential_id_hash TEXT PRIMARY KEY,       -- sha256 hex of the RAW credential id (sessions.token_hash
+    credential_id_hash TEXT PRIMARY KEY,       -- "wc1:" + sha256 hex of the RAW credential id (BACKLOG #3423) (sessions.token_hash
                                                -- precedent): WebAuthn ids may be up to 1023 raw bytes —
                                                -- unboundable as a SQL Server index key, so the digest is
                                                -- the parity-safe PK on all 3 backends (ADR 0068 §4)
@@ -14448,17 +14621,28 @@ class MessageStore:
         The rotation / at-rest-migration bursts hold the write lock across their whole batch loop and
         must still charge the bound per batch (otherwise a kill mid-burst permanently under-counts every
         value already re-encrypted). ``self._lock`` is a plain non-reentrant ``asyncio.Lock``, so they
-        charge through this variant; every other caller goes through the public method."""
+        charge through this variant; every other caller goes through the public method.
+
+        The row is keyed on :func:`cipher_meta_key`. A row written before scheme tags, keyed on the
+        bare ``key_id``, is folded into it here, so its count carries over (BACKLOG #3421)."""
         now = time.time()
+        row_id = cipher_meta_key(key_id)
+        # The pre-tag row is read inside the upsert, its first write, so the write lock is held from
+        # the read through the commit and no second writer can fold the same count. The DELETE
+        # follows it. If it fails, the writer guard rolls both back; on the lock-held burst path the
+        # caller may commit the upsert alone, and the next add folds the row again: an over-count,
+        # the direction this bound may drift in.
         await self._db.execute(
-            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?,?,?)"
-            " ON CONFLICT(key_id) DO UPDATE SET"
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at)"
+            " SELECT ?, ? + COALESCE((SELECT invocations FROM cipher_meta WHERE key_id = ?), 0), ?"
+            " WHERE true ON CONFLICT(key_id) DO UPDATE SET"
             " invocations = cipher_meta.invocations + excluded.invocations,"
             " updated_at = excluded.updated_at",
-            (key_id, int(count), now),
+            (row_id, int(count), key_id, now),
         )
+        await self._db.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
         cur = await self._db.execute(
-            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (row_id,)
         )
         row = await cur.fetchone()
         await self._commit()
@@ -14591,13 +14775,15 @@ class MessageStore:
         return withdrawn
 
     async def cipher_invocations(self, key_id: str) -> int:
-        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet). Sums
+        the tagged row and an unfolded pre-tag row (BACKLOG #3421)."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+                "SELECT COALESCE(SUM(invocations), 0) AS n FROM cipher_meta WHERE key_id IN (?, ?)",
+                (cipher_meta_key(key_id), key_id),
             )
             row = await cur.fetchone()
-        return int(row["invocations"]) if row is not None else 0
+        return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
@@ -15320,6 +15506,17 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             count = await self._write_passkeys(
                 user_id, _WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash)
+            )
+            await self._commit()
+        return count > 0
+
+    async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
+        """Move one passkey to a new ``credential_id_hash`` (BACKLOG #3423), re-sealing the account
+        over its new passkey digest in the same transaction. True iff a row moved. Raises
+        :class:`RowSealError` when the account's record or passkeys fail their seal."""
+        async with _writer_guard(self._db, self._lock):
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_REHASH, (new_hash, user_id, old_hash)
             )
             await self._commit()
         return count > 0
@@ -17314,6 +17511,15 @@ class MessageStore:
             cur = await conn.execute(
                 "SELECT 1 FROM processed_files WHERE channel_id=? AND file_key=? LIMIT 1",
                 (channel_id, file_key),
+            )
+            return await cur.fetchone() is not None
+
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        """True while this connection's ledger still holds a key with no scheme tag (BACKLOG #3424)."""
+        async with self._read() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM processed_files WHERE channel_id=? AND file_key NOT LIKE '%:%' LIMIT 1",
+                (channel_id,),
             )
             return await cur.fetchone() is not None
 

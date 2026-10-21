@@ -641,3 +641,31 @@ def test_the_verification_failure_is_found_through_the_httpx_wrapping() -> None:
     cyclic.__context__ = other
     other.__context__ = cyclic
     assert not client_module._is_cert_verification_failure(cyclic)
+
+
+def test_a_build_refusing_the_renewed_context_keeps_the_pin_and_says_so_once(
+    engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3414. ``_build_verify_context`` raises ApiError when the build refuses the
+    signature scheme list. A renewal that meets it keeps the current pin, logs the reason once, and
+    leaves the caller the ordinary verification error. Red before the fix: that ApiError escaped
+    the follow and replaced the verification error on every request, and nothing was logged."""
+    with _pinned(engine) as client:
+        transport = client._http
+
+        def refusing(
+            cacert: str | None, client_cert: str | None, client_key: str | None
+        ) -> ssl.SSLContext:
+            raise ApiError(
+                "this Python/OpenSSL build refused the client's TLS signature scheme list: synthetic"
+            )
+
+        monkeypatch.setattr(client_module, "_build_verify_context", refusing)
+        engine.serve(engine.renew_pin())
+        with caplog.at_level("INFO", logger=client_module.__name__):
+            for _ in range(3):
+                with pytest.raises(ApiError, match="CERTIFICATE_VERIFY_FAILED"):
+                    client.health()
+        assert client._http is transport
+        refused = [r for r in caplog.records if "signature scheme list" in r.getMessage()]
+        assert len(refused) == 1, [r.getMessage() for r in refused]

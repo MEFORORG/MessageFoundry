@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
+    AUDIT_TRANSIT_HASH_ALGO,
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -94,11 +95,6 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
-#: Transit HMAC hash algorithm (matches the SHA-256 the in-process chain used). Byte-length differs from
-#: SHA-256 hex, but the audit column is opaque TEXT — verify recomputes and string-compares, so any
-#: deterministic MAC round-trips. NEVER change on an existing keyed-in-Transit store (it re-breaks the
-#: suffix), same discipline as rotating the in-heap key.
-_AUDIT_HASH_ALGO = "sha2-256"
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
 #: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
 _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
@@ -229,7 +225,7 @@ class TransitCipher(_UnmarkedPolicy):
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
             "hash_input": inp,
-            "algorithm": _AUDIT_HASH_ALGO,
+            "algorithm": AUDIT_TRANSIT_HASH_ALGO,
         }
         if key_version is not None:
             kwargs["key_version"] = key_version
@@ -263,7 +259,9 @@ class TransitCipher(_UnmarkedPolicy):
             return False
         try:
             probe: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key, hash_input=_VERSION_PROBE_INPUT, algorithm=_AUDIT_HASH_ALGO
+                name=self._audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
             )
             answered = probe["data"]["hmac"]
         except Exception as probe_exc:  # the latest version fails too: not a version refusal

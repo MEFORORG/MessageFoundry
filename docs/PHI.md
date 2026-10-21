@@ -190,7 +190,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `connection_event.reason` (#46 transport/lifecycle log, **default on**) | all three | **Possibly** — a free-text diagnostic fragment | **Yes, when a key is set** — store cipher; AAD `("connection_event","reason",connection,ts,kind)`; store DEK | **PL-2** | Defended twice: the emit site passes a `safe_exc()`-scrubbed string and the store re-applies `safe_text(reason, limit=200)`, the bound §3's PL-2 block states. IDENTITY `id`, so its own composite pass. Every other column is bounded engine/config metadata **except `peer_host`** (its own PL-4 row below) — the table carries no frame, body or HL7 field value. The route is read under `monitoring:read`, **not** a PHI permission, so `reason` alone is gated on `messages:view_summary` and masked until a per-event reveal (BACKLOG #2443; [§7](#7-logging--phi-redaction)) | `` `[retention].connection_event_retention_hours` `` |
 | `connection_event.peer_host` | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The connecting peer's IP, taken from the socket; `NULL` for outbound/unknown. Personal data, not PHI — the **same class and the same decision** as `audit_log.client` / `sessions.client`: plaintext so it stays greppable for incident response. Returned to operators by `GET /events` under `monitoring:read`. Purged with its row by `[retention].connection_event_retention_hours` | ``rides `[retention].connection_event_retention_hours` `` |
 | `alert_instance.reason` (ADR 0044 operator alerts) | all three | **Possibly** — the alert's `detail`/`reason` free text | **Yes, when a key is set** — store cipher; AAD `("alert_instance","reason",event_type,connection)`; store DEK | **PL-2** | `safe_text(reason, limit=200)` before the cipher, the bound §3's PL-2 block states. The AAD binds the de-dup grain, so the same AAD covers both the INSERT and the re-fire upsert UPDATE that never sees the `id`. The route is read under `monitoring:diagnose`; `reason` alone is gated on `messages:view_summary` and masked until a per-alert reveal (BACKLOG #2443; [§7](#7-logging--phi-redaction)) | ``rides `[retention].connection_event_retention_hours` `` |
-| `users.totp_secret` | all three | **No** — not PHI | **Yes, when a key is set** — store cipher; AAD `("users","totp_secret",id)`; store DEK | **PL-3** | The base32 TOTP MFA seed. It is returned **once**, when enrollment stages it. §3's PL-3 block says how. **This cell said "Never returned by any API response model" until BACKLOG #1185 corrected it.** Its siblings `users.password_hash` and `users.totp_recovery_codes` are **argon2id one-way hashes** and are deliberately **not** ciphered | `keep-forever by design` — it lives and dies with the user row |
+| `users.totp_secret` | all three | **No** — not PHI | **Yes, when a key is set** — store cipher; AAD `("users","totp_secret",id)`; store DEK | **PL-3** | The base32 TOTP MFA seed, prefixed by the parameters it was enrolled with (`totp1:<algorithm>:<digits>:<period>:`, BACKLOG #3422; a cell without the prefix is a bare seed). The seed is returned **once**, when enrollment stages it. §3's PL-3 block says how. **This cell said "Never returned by any API response model" until BACKLOG #1185 corrected it.** Its siblings `users.password_hash` and `users.totp_recovery_codes` are **argon2id one-way hashes** and are deliberately **not** ciphered | `keep-forever by design` — it lives and dies with the user row |
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
@@ -1185,11 +1185,14 @@ data. The agility the requirement asks for would be bought by creating a downgra
 this trade the project takes the refusal.
 
 **THE HONEST LIMIT, and it is the part a reader should take away:** the seam covers the **at-rest
-value core**. It does **not** cover the **audit MAC or its KDF**, which carry *no version
-discriminator at all* — measured: zero `mfenc`-style markers anywhere on the audit-chain path. So
-changing the audit MAC is not a swap along this seam; it means versioning the tamper-evidence chain
-itself, which is undesigned. Any future claim that this project "has crypto agility" must exclude the
-audit chain or be false.
+value core**. It does **not** cover the **audit MAC or its KDF**, which have *no version
+discriminator in this seam's sense*: no `mfenc`-style marker sits on the audit-chain path. Since
+BACKLOG #3420 each genesis and range record of the chain, and each edit-resend body digest, names its
+MAC and its HKDF labels. A name other than the one this release compiles is refused (ADR 0193,
+amendment 2026-10-20). That is a label, not a swap. The release compiles one audit scheme per key
+kind, so the stored name selects nothing, and the downgrade surface above does not open there.
+Changing the audit MAC still needs a release that compiles a second scheme, which is undesigned. Any
+future claim that this project "has crypto agility" must exclude the audit chain or be false.
 
 ---
 
@@ -1259,10 +1262,11 @@ once the API/MLLP binds off-loopback (when the engine terminates TLS).
 **Handshake signature schemes `[PARTIAL — the SHA-224 pin acts on Python 3.15 only]` (ASVS 11.4.1,
 BACKLOG #1171).** By owner ruling of 2026-09-29, every context the engine narrows drops the three
 SHA-224 signature schemes where the interpreter can: `narrow_signature_algorithms` in
-[config/tls_policy.py](../messagefoundry/config/tls_policy.py). On Python 3.14 it changes nothing,
+[tls_sigalgs.py](../messagefoundry/tls_sigalgs.py), which `config/tls_policy.py` re-exports. On Python 3.14 it changes nothing,
 so those contexts still offer and accept SHA-224. On 3.15 they stop, unless the linked OpenSSL is
-older than 3.4. The LDAPS hop is reached too, since BACKLOG #2494. That function's docstring is the one statement of
-what it does, what else it changes, and what it cannot reach.
+older than 3.4. The LDAPS hop is reached too, since BACKLOG #2494, and so are the apiclient's and
+the tray probe's client contexts, since BACKLOG #3414. That function's docstring is the one
+statement of what it does, what else it changes, and what it cannot reach.
 
 **Outbound destination allowlist `[BUILT]` (WP-11c).** The `[egress]` section
 ([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed** allowlist for where the engine
@@ -1447,7 +1451,7 @@ sent, not only that something was. Two pieces of evidence outlive the bodies:
 
 | Evidence | Where | What it holds |
 |---|---|---|
-| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's body as the store holds it, so after any document detach or prune; it is `null` when retention had already blanked it. `edited` is the edited body as the engine admitted and stored it, after the inbound's own normalization such as line endings |
+| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `kdf` (the two HKDF labels the key came through, BACKLOG #3420), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's body as the store holds it, so after any document detach or prune; it is `null` when retention had already blanked it. `edited` is the edited body as the engine admitted and stored it, after the inbound's own normalization such as line endings |
 | Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Anything an inbound connection takes in reads `partner`, a timer's configured body included. Upload injects read `operator_upload`, and the engine's own loopback and pass-through hops read `reingress` |
 
 Both modes write the same row: a re-route names the new message in `new_message_id`, and so does a
@@ -1469,7 +1473,9 @@ configured. **Remove a retired key and its digests can no longer be checked.** T
 keyed ranges depend on the same key, so keep a retired key for as long as its rows must verify.
 
 **To prove a body afterwards,** hold the candidate body and the store key, and call
-`verify_audit_body_digest` in `store/crypto.py` with the row's `key_id` and digest. A match shows
+`verify_audit_body_digest` in `store/crypto.py` with the row's `key_id`, digest, `alg` and `kdf`.
+A row written before `kdf` was recorded carries none, and is read as the labels it was taken under.
+A row naming any other `alg` or `kdf` does not verify. A match shows
 that body is the one the row describes. A reader without the key can neither recover a body nor
 test a guess. The digest is deterministic under one key, so that reader can still see that two
 digests are equal, for example that an edit changed nothing.

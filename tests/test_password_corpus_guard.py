@@ -31,7 +31,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin, provision_totp
+from tests._admin_account import PROVISION_EMAIL, create_admin, provision_totp
 from tests.test_provision_first_administrator import _tty
 
 #: A password the stand-in corpora below declare leaked. Holds no CONTEXT_WORDS entry and clears the
@@ -188,6 +188,7 @@ async def test_the_startup_error_names_what_an_unusable_corpus_blocks(
         await service.provision_first_administrator(
             username="opsadmin",
             password="an-operator-chosen-passphrase",
+            notify_email=PROVISION_EMAIL,
             actor="installer",
             **provision_totp(),
         )
@@ -287,6 +288,7 @@ async def test_an_operator_supplied_first_administrator_still_refuses_on_an_unus
         await service.provision_first_administrator(
             username="opsadmin",
             password="an-operator-chosen-passphrase",
+            notify_email=PROVISION_EMAIL,
             actor="installer",
             **provision_totp(),
         )

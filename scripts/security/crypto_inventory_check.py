@@ -298,6 +298,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # loop ran, and installs it as a server context's sslobject_class. It re-raises unchanged, and
     # builds no context, loads no key and chooses no algorithm, so section 4 gains no row.
     "messagefoundry/tls_handshake_failures.py": frozenset({"ssl"}),
+    # BACKLOG #3414: the SHA-224 signature-scheme narrowing (BACKLOG #1171) moved out of
+    # config/tls_policy.py into this stdlib-only leaf, so the apiclient and the tray, which may not
+    # import config/, call the same copy. It narrows a context it is handed with set_server_sigalgs
+    # (Python 3.15 only) and builds none. Section 4 rows that already name each context say so.
+    "messagefoundry/tls_sigalgs.py": frozenset({"ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
@@ -454,8 +459,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # in store/crypto.py, HKDF), never a salted hash — to auto-detect rotation without persisting or
     # logging any value. hashlib supplies the SHA-256 digestmod for that HMAC. The DEK-derived key is
     # obtained through the store cipher (store.crypto seam), delegated, so this module keeps only the
-    # keyed-MAC primitive.
-    "messagefoundry/pipeline/secret_rotation.py": frozenset({"hashlib", "hmac"}),
+    # keyed-MAC primitive. BACKLOG #3421: it imports the store.crypto seam for the stored
+    # fingerprints' scheme tags only (KEY_ID_SCHEME, scheme_tagged, read_scheme_tag): string
+    # tagging and parsing, no primitive.
+    "messagefoundry/pipeline/secret_rotation.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+    ),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
@@ -679,8 +688,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
     # with zero direct stdlib-crypto import in the module. rotate-key stamps a new DEK key-id only
     # when it CHANGED, and compares it to the stored fingerprint through
-    # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
-    # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
+    # pipeline.secret_rotation.fingerprint_changed (fingerprints_equal): constant-time over bytes, the
+    # same compare the rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`. A
+    # stored scheme tag it does not know is refused and re-stamped with its dates kept (#3421).
     # BACKLOG #296: provision-admin also imports SigningError, to give a refused OIDC
     # private_key_jwt key a fixed text; it signs nothing.
     "messagefoundry/__main__.py": frozenset(
@@ -1082,6 +1092,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
             "tls_context:via messagefoundry.keywrap",
+            "tls_context:via messagefoundry.tls_sigalgs",  # BACKLOG #3414
         }
     ),
     # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
@@ -1217,13 +1228,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
-            "tls_context:.set_server_sigalgs()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",
             "tls_context:ssl.create_default_context",
+            # BACKLOG #3414: narrow_signature_algorithms calls the shared leaf.
+            "tls_context:via messagefoundry.tls_sigalgs",
         }
     ),
     "messagefoundry/config/tls_probe.py": frozenset(
@@ -1715,6 +1727,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"tls_context:.load_verify_locations()"}
     ),
+    # BACKLOG #3414: the SHA-224 narrowing, moved here from config/tls_policy.py (BACKLOG #1171).
+    "messagefoundry/tls_sigalgs.py": frozenset({"tls_context:.set_server_sigalgs()"}),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
     "messagefoundry/tray/probe.py": frozenset(
@@ -1723,6 +1737,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.set_ciphersuites()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
+            "tls_context:via messagefoundry.tls_sigalgs",  # BACKLOG #3414
         }
     ),
     "messagefoundry/uploads.py": frozenset(

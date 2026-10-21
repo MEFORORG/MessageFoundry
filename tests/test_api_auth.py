@@ -1472,8 +1472,8 @@ async def test_audit_export_stops_after_the_page_a_revoke_lands_in(
 async def test_audit_export_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The stop leaves the app as a raise, so the client sees a failed download and not a short
-    file that looks complete."""
+    """The stop leaves the app as a raise. This pins the raise, NOT what the client receives: the
+    client still gets a short file that looks complete (BACKLOG #3381; see ``ExportStopped``)."""
     with pytest.raises(ExportStopped):
         await _export_with_mid_stream_act(
             engine, monkeypatch, Role.AUDITOR, _revoke, raise_app_exceptions=True

@@ -887,6 +887,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             recovery_codes_remaining=st.recovery_codes_remaining,
             required=st.required,
             webauthn_enrolled=st.webauthn_enrolled,
+            totp_reenrolment_recommended=st.totp_reenrolment_recommended,
         )
 
     @app.post(
@@ -2085,7 +2086,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
         failed standing stops the stream. So does a caller who may now read fewer rows than the
-        export started with. A stop records ``audit.export.stopped`` and aborts. The JSON route
+        export started with. A stop records ``audit.export.stopped`` and raises :class:`ExportStopped`, which does not
+        reach the client as a failed download; see that class. The JSON route
         reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
         session."""
         # A direct caller that passed no token hands on the Depends marker. Refuse it here, before
