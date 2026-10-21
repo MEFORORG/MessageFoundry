@@ -111,7 +111,7 @@ pip install -e ".[webauthn]"     # browser WebAuthn passkeys for the /ui console
 pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
-(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.5.2"`, and the web console installs as its own wheel on its own version line: `pip install "messagefoundry-webconsole==0.4.0"`, the console built for engine 0.5.1.) SQLite is the zero-dependency default — you need no extra to run the sample config.
+(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.5.2"`, and the web console installs as its own wheel on its own version line: `pip install "messagefoundry-webconsole==0.5.0"`, the console built for engine 0.5.2.) SQLite is the zero-dependency default — you need no extra to run the sample config.
 
 ### 3. Run the engine headless (dev)
 
