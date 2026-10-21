@@ -20,6 +20,14 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+## [0.5.0] — 2026-10-20 — Early Access
+
+**Requires engine 0.5.2. Supported engine UI seam: `6d8b36eb7bb94bf0`**, the value engine 0.5.2
+ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
+to start. Console 0.4.0 does not work with engine 0.5.2, and this console does not work with engines
+0.5.0 or 0.5.1, so upgrade the two together. The entries marked as seam changes below say why the
+digest moved.
+
 ### Added
 
 - **The status page shows the four per-tier retention acknowledgements.** The security posture
@@ -72,6 +80,10 @@ this line.**
 
 ### Changed
 
+- **The package requires `messagefoundry>=0.5.2`.** Console 0.4.0 required `messagefoundry>=0.5.0`.
+  The floor still has no ceiling (`RELEASE.md` step 2), so beside an older engine pip upgrades the
+  engine, and an unpinned upgrade takes the newest release, whose seam may differ. Pin both:
+  `messagefoundry==0.5.2` with `messagefoundry-webconsole==0.5.0`.
 - **Linux is not a supported v1 deployment target.** The package drops the
   `Operating System :: POSIX :: Linux` classifier, matching the engine
   ([why](../../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
@@ -736,7 +748,8 @@ two items sat under Unreleased.
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It was not wired
   when this entry was written; the `release-webconsole` job published this wheel on 2026-07-29.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.4.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.5.0...HEAD
+[0.5.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.4.0
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0
 [0.2.15]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.2.15

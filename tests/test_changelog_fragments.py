@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - fixed argv, no shell
 import sys
@@ -457,6 +458,47 @@ def test_the_live_fragments_assemble_into_the_live_changelog_without_moving_a_li
     assert _is_subsequence(before.split("\n"), after.split("\n"))
     for fragment in fragments:
         assert "\n".join(cf.rendered(fragment)) in after
+
+
+#: A path to one fragment: a slash or backslash path, or a join such as ``"changelog.d" / "<name>"``,
+#: ``Path("changelog.d") / "<name>"`` or ``os.path.join("changelog.d", "<name>")``. README.md is the
+#: one file that stays; ``assemble`` deletes every other name when a release folds it in.
+_FRAGMENT_PATH = re.compile(
+    r"""changelog\.d[\\/]+(?!README\.md)[\w.-]+\.md"""
+    r"""|["']changelog\.d["']\)?\s*[/,]\s*["'](?!README\.md)[\w.-]+\.md"""
+)
+#: Files that name fragment paths without reading the live directory: this module builds its own
+#: under tmp_path, and the doc-guards lane test classifies a path string.
+_FRAGMENT_PATH_ALLOWED = ("tests/test_changelog_fragments.py", "tests/test_doc_guards_lane.py")
+
+
+def test_no_tracked_file_names_a_fragment_the_release_fold_deletes() -> None:
+    """The engine 0.5.2 fold deleted ``changelog.d/2742.added.md`` while a test still read it, and
+    the release pull request went red on the required test leg. Point at a durable document, or at
+    the folded CHANGELOG.md entry, instead."""
+    for planted in (
+        "changelog.d/2742.added.md",
+        "changelog.d\\2742.added.md",
+        '"changelog.d" / "2742.added.md"',
+        'Path("changelog.d") / "2742.added.md"',
+        'os.path.join("changelog.d", "2742.added.md")',
+    ):
+        assert _FRAGMENT_PATH.search(planted), planted
+    assert not _FRAGMENT_PATH.search('changelog.d/README.md "changelog.d" / "README.md"')
+    # One git grep for candidate lines, then this pattern on them: git's ERE has no lookahead.
+    excluded = [f":!{name}" for name in ("changelog.d", *_FRAGMENT_PATH_ALLOWED)]
+    found = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        ["git", "grep", "-n", "-I", "-F", "changelog.d", "--", ".", *excluded],
+        cwd=_REPO,
+        capture_output=True,
+        check=False,
+    )
+    assert found.returncode == 0, found.stderr.decode("utf-8", "replace")  # 1 would mean no line
+    lines = found.stdout.decode("utf-8", "replace").splitlines()
+    assert lines, "git grep printed no line"
+    assert any("changelog.d/README.md" in line for line in lines), "git grep read nothing usable"
+    offenders = [line for line in lines if _FRAGMENT_PATH.search(line)]
+    assert not offenders, f"tracked files name changelog fragments: {offenders}"
 
 
 def test_ci_checks_every_pull_request_and_release_refuses_leftovers() -> None:
