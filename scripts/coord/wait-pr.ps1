@@ -30,7 +30,9 @@
     gh call that failed, a PR that can no longer meet the condition). Exit 2 is not exit 1 on
     purpose: a timeout means "still waiting, decide whether to wait again", an error means "this
     instrument did not work". Exit 3 is neither: the instrument worked and waiting longer will not
-    help, because someone has to update or rebase the branch first.
+    help. Its line names the state, and the two need different fixes: `behind` needs the branch
+    updated with its base, `dirty` needs a conflict resolved (docs/WORKTREES.md warns that treating
+    one as the other is destructive).
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints a start line,
@@ -44,8 +46,12 @@
     head SHA ends the wait with exit 3 and one line naming the state and the SHA. Two reads, because
     GitHub computes mergeability lazily and a transient value is common. An `unknown` or missing
     value, or a transient failure, counts for nothing and resets nothing; any other value, a closed
-    read, or a new head SHA resets the count. For closed and checks-complete the state is printed
-    and never acted on.
+    read, or a new head SHA resets the count. For closed the state is printed and never acted on;
+    the checks-complete line does not carry it. A red required check is not acted on either: it
+    reads `blocked` or `unstable`, and the wait runs to its timeout. UNMEASURED: whether REST reads
+    `behind` for a PR already in a merge queue on a strict base. If it does, exit 3 fires on a PR
+    the queue would merge, so a seat watching a queued PR reads the line before it pushes, and
+    dequeues first (CLAUDE.md section 5, "Dequeue before pushing").
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -62,8 +68,10 @@
     move.
 
     EVERY gh CALL HAS A 60 s TIMEOUT. gh sets none of its own, so each call runs as a child process
-    that is killed, with its process tree, if it has not finished within 60 s. A killed call is a
-    transient failure under the three-in-a-row rule below. The ceiling is on time SLEPT: intervals
+    that is killed, with its process tree, if it has not finished within 60 s. Inside the loop a
+    killed call is a transient failure under the three-in-a-row rule below; the starting
+    rate_limit read runs before the loop, so a killed call there is exit 1 at once. The timeout is
+    fixed for every caller that does not set MEFOR_WAIT_PR_TEST_SEAMS=1 (see TEST SEAMS). The ceiling is on time SLEPT: intervals
     slept never exceed it, and the wall clock ends the wait at the first check that finishes past
     it. So a wait can run past its ceiling by at most one interval plus the reads of one check, and
     with the timeout each of those reads is bounded too.
@@ -232,19 +240,28 @@ function Invoke-Gh([string[]]$GhArgs) {
         $err = $proc.StandardError.ReadToEndAsync()
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         $ms = $GhTimeoutSeconds * 1000
-        # EOF on both pipes is waited for under the same deadline: a grandchild holding a pipe open
-        # would otherwise hang the read after gh itself exited.
-        $finished = $proc.WaitForExit($ms) -and
-            [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($out, $err),
-                [int][math]::Max(0, $ms - $clock.ElapsedMilliseconds))
-        if (-not $finished) {
+        $exited = $proc.WaitForExit($ms)
+        $drained = $false
+        if ($exited) {
+            # EOF on both pipes is waited for too, under what is left of the deadline but never
+            # less than a second, so a gh that exits just before it still has its output read. A
+            # grandchild holding a pipe open would otherwise hang the read after gh itself exited.
+            try {
+                $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($out, $err),
+                    [int][math]::Max(1000, $ms - $clock.ElapsedMilliseconds))
+            } catch [System.AggregateException] {
+                throw [TransientReadException]::new("gh api $($GhArgs[-1]) exited but its output could not be read: $($_.Exception.InnerException.Message)")
+            }
+        }
+        if (-not $drained) {
             try {
                 $proc.Kill($true)
                 [void]$proc.WaitForExit(5000)
             } catch [System.InvalidOperationException], [System.ComponentModel.Win32Exception], [System.AggregateException] {
                 [Console]::Error.WriteLine("wait-pr $Repo#${Pr}: could not kill gh process $($proc.Id): $($_.Exception.Message)")
             }
-            throw [TransientReadException]::new("gh api $($GhArgs[-1]) did not finish within $GhTimeoutSeconds s and was killed")
+            $what = if ($exited) { 'exited, but its output pipes stayed open past' } else { 'did not finish within' }
+            throw [TransientReadException]::new("gh api $($GhArgs[-1]) $what $GhTimeoutSeconds s and was killed")
         }
         [pscustomobject]@{ Out = $out.Result; Err = $err.Result; Code = $proc.ExitCode }
     } finally {
