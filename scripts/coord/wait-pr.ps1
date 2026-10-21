@@ -29,8 +29,8 @@
     merge (-Until merged only), 1 anything else (bad arguments, too little rate budget to start, a
     gh call that failed, a PR that can no longer meet the condition). Exit 2 is not exit 1 on
     purpose: a timeout means "still waiting, decide whether to wait again", an error means "this
-    instrument did not work". Exit 3 is neither: the instrument worked and waiting longer will not
-    help. Its line names the state, and the two need different fixes: `behind` needs the branch
+    instrument did not work". Exit 3 is neither: the instrument worked and, outside a merge queue
+    (see UNMEASURED below), waiting longer will not help. Its line names the state, and the two need different fixes: `behind` needs the branch
     updated with its base, `dirty` needs a conflict resolved (docs/WORKTREES.md warns that treating
     one as the other is destructive).
 
@@ -42,16 +42,18 @@
 
     NEEDS A PUSH IS EXIT 3, FOR -Until merged ONLY. docs/WORKTREES.md ("watch for three outcomes,
     not two") says a merge watcher must not sit out its whole budget on a PR that cannot merge
-    without a push. So an open PR read as `dirty` or `behind` on two checks in a row of the SAME
-    head SHA ends the wait with exit 3 and one line naming the state and the SHA. Two reads, because
-    GitHub computes mergeability lazily and a transient value is common. An `unknown` or missing
-    value, or a transient failure, counts for nothing and resets nothing; any other value, a closed
-    read, or a new head SHA resets the count. For closed the state is printed and never acted on;
-    the checks-complete line does not carry it. A red required check is not acted on either: it
-    reads `blocked` or `unstable`, and the wait runs to its timeout. UNMEASURED: whether REST reads
-    `behind` for a PR already in a merge queue on a strict base. If it does, exit 3 fires on a PR
-    the queue would merge, so a seat watching a queued PR reads the line before it pushes, and
-    dequeues first (CLAUDE.md section 5, "Dequeue before pushing").
+    without a push. So an open PR read as `dirty` or `behind` on two checks of the SAME head SHA and
+    base, with nothing but `unknown`, a missing value or a transient failure between them, ends the
+    wait with exit 3 and one line naming the state and the SHA. Two reads, because GitHub computes
+    mergeability lazily and a transient value is common. Those in-between reads count for nothing
+    and reset nothing; any other value, a closed read, a new head SHA or a new base resets the
+    count. For closed the state is printed and never acted on; the checks-complete line does not
+    carry it. A red required check is not acted on either: it reads `blocked`, and the wait runs to
+    its timeout. UNMEASURED: how REST reads a PR that a merge queue could still merge while it is
+    behind, on a base that requires the queue, queued or not yet queued. The queue builds its own
+    merge group on the base, so on such a base `behind` may not need a push at all. A seat that
+    gets exit 3 for `behind` there reads the line before it pushes, and dequeues first (CLAUDE.md
+    section 5, "Dequeue before pushing").
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -71,8 +73,11 @@
     that is killed, with its process tree, if it has not finished within 60 s. Inside the loop a
     killed call is a transient failure under the three-in-a-row rule below; the starting
     rate_limit read runs before the loop, so a killed call there is exit 1 at once. The timeout is
-    fixed for every caller that does not set MEFOR_WAIT_PR_TEST_SEAMS=1 (see TEST SEAMS). The ceiling is on time SLEPT: intervals
-    slept never exceed it, and the wall clock ends the wait at the first check that finishes past
+    fixed for every caller that does not set MEFOR_WAIT_PR_TEST_SEAMS=1 (see TEST SEAMS). One case
+    the kill cannot reach: on Linux, once gh itself has exited, a grandchild still holding its pipe
+    has been reparented out of gh's tree, so it is left running and the call is still counted as
+    transient. The kill of a gh that has not exited, the case the timeout is for, was measured on
+    Windows only. The ceiling is on time SLEPT: intervals slept never exceed it, and the wall clock ends the wait at the first check that finishes past
     it. So a wait can run past its ceiling by at most one interval plus the reads of one check, and
     with the timeout each of those reads is bounded too.
 
@@ -172,7 +177,7 @@ $script:Bodies = @{}
 $script:Requests = 0
 $script:NotModified = 0
 $script:ClosedUnmerged = 0
-$script:StaleSha = $null
+$script:StaleKey = $null
 $script:StaleReads = 0
 $script:Utf8 = [System.Text.UTF8Encoding]::new($false)
 
@@ -213,7 +218,9 @@ function Resolve-Gh {
         Select-Object -First 1
     if (-not $cmd) { Fail "cannot find gh as '$GhCommand'; is the GitHub CLI installed and on PATH?" }
     if ($cmd.CommandType -eq 'ExternalScript') {
-        return @{ File = [Environment]::ProcessPath; Args = @('-NoProfile', '-NonInteractive', '-File', $cmd.Source) }
+        # $PSHOME, not the process path: under a host other than pwsh that path is not pwsh.
+        $pwsh = Join-Path $PSHOME ($IsWindows ? 'pwsh.exe' : 'pwsh')
+        return @{ File = $pwsh; Args = @('-NoProfile', '-NonInteractive', '-File', $cmd.Source) }
     }
     @{ File = $cmd.Source; Args = @() }
 }
@@ -337,18 +344,19 @@ function Test-Merged($p) {
             Say $state
             Fail 'the PR was read as closed without merging on two checks in a row, so -Until merged will not be met.'
         }
-        if ((Measure-NeedsPush $p.state $ms $sha) -ge 2) {
-            $needsPush = "mergeable_state=$ms on two checks in a row of head $sha"
+        if ((Measure-NeedsPush $p.state $ms "$sha $([string]$p.base.ref)") -ge 2) {
+            $needsPush = "mergeable_state=$ms on two checks of head $sha"
         }
     }
     @{ Met = $met; NeedsPush = $needsPush; State = $state; Summary = "head=$sha" }
 }
 
-# Counts reads of an open PR that cannot merge without a push, per head SHA, and returns the
-# count. `unknown` and a missing value are GitHub still computing, so they neither count nor reset.
-function Measure-NeedsPush([string]$State, [string]$Mergeable, [string]$Sha) {
-    if ($Sha -cne $script:StaleSha) {
-        $script:StaleSha = $Sha
+# Counts reads of an open PR that cannot merge without a push, per head SHA and base, and returns
+# the count. `unknown` and a missing value are GitHub still computing, so they neither count nor
+# reset.
+function Measure-NeedsPush([string]$State, [string]$Mergeable, [string]$Key) {
+    if ($Key -cne $script:StaleKey) {
+        $script:StaleKey = $Key
         $script:StaleReads = 0
     }
     if ($State -ne 'open') {
@@ -401,7 +409,7 @@ function Test-Checks($p) {
     $conclusions = @($runs | ForEach-Object { [string]$_.conclusion }) +
         @($statuses | ForEach-Object { [string]$_.state })
     $tally = ($conclusions | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', '
-    @{ Met = $met; State = $state; Summary = "head=$sha $tally" }
+    @{ Met = $met; NeedsPush = $null; State = $state; Summary = "head=$sha $tally" }
 }
 
 # The required set, from the same two endpoints scripts/ci/required_contexts.py reads: classic
@@ -492,7 +500,7 @@ try {
         } catch [TransientReadException] {
             $transients++
             if ($transients -ge 3) { Fail "three transient failures in a row, the last: $($_.Exception.Message)" }
-            $r = @{ Met = $false; State = "transient, reading again next interval: $($_.Exception.Message)" }
+            $r = @{ Met = $false; NeedsPush = $null; State = "transient, reading again next interval: $($_.Exception.Message)" }
         }
         if ($r.State -ne $last) {
             Say $r.State
@@ -503,9 +511,8 @@ try {
             Say "met: $Until. $($r.Summary). $accounting"
             exit 0
         }
-        # Indexed, not dotted: only Test-Merged sets the key, and StrictMode throws on a missing one.
-        if ($r['NeedsPush']) {
-            Say "needs a push: $($r['NeedsPush']), so -Until merged will not be met without one. $accounting"
+        if ($r.NeedsPush) {
+            Say "needs a push: $($r.NeedsPush), so -Until merged will not be met without one. $accounting"
             exit 3
         }
         # Counted in intervals slept, so the last interval is waited too; the wall clock also ends
