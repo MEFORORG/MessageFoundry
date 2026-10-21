@@ -433,5 +433,6 @@ def test_the_rig_waits_on_and_copies_the_names_the_worker_writes() -> None:
     rig = _RIG.read_text(encoding="utf-8")
     names = [W.owner_report(1), W.owner_report(2), W.OTHER_REPORT, W.USER_BLOB, W.MACHINE_BLOB]
     names += [W.FOREIGN_USER_BLOB, W.FOREIGN_MACHINE_BLOB]
+    assert len(names) >= 7, "CONTROL FAILED: the worker's file names were not collected"
     missing = [name for name in names if f'"{name}"' not in rig]
     assert not missing, f"scripts/ci/dpapi_spike.ps1 no longer names {missing}"
