@@ -30,8 +30,11 @@
     gh call that failed, a PR that can no longer meet the condition). Exit 2 is not exit 1 on
     purpose: a timeout means "still waiting, decide whether to wait again", an error means "this
     instrument did not work". Exit 3 is neither: the instrument worked, the PR has a real conflict,
-    and waiting longer will not help. It needs the conflict resolved, not an update from the base
-    (docs/WORKTREES.md warns that treating one as the other is destructive).
+    and waiting longer will not help. It needs the conflict resolved by hand, not a mechanical
+    rebase-and-push (docs/WORKTREES.md warns that treating one as the other is destructive), and a
+    dequeue or disarm before the push (CLAUDE.md section 5, "Dequeue before pushing"). After exit
+    2, read the last state line before waiting again: a `behind` PR on a base with no merge queue
+    also times out (see below), and no further wait merges it.
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints a start line,
@@ -39,20 +42,23 @@
     GitHub's REST `mergeable_state`, in lower case (`behind`, `dirty`, `blocked`, `clean`), so a
     branch that went stale while you waited is in the output.
 
-    NEEDS A PUSH IS EXIT 3, FOR -Until merged ONLY, AND ONLY FOR `dirty`. docs/WORKTREES.md ("watch
+    A CONFLICT IS EXIT 3, FOR -Until merged ONLY: `dirty`, never `behind`. docs/WORKTREES.md ("watch
     for three outcomes, not two") says a merge watcher must not sit out its whole budget on a PR
     that cannot merge without a push. So an open PR read as `dirty` on two checks of the SAME head
     SHA and base, with nothing but `unknown`, a missing value or a transient failure between them,
     ends the wait with exit 3 and one line naming the state and the SHA. Two reads, because GitHub
     computes mergeability lazily and a transient value is common. Those in-between reads count for
     nothing and reset nothing; any other value, `behind` included, a closed read, a new head SHA or
-    a new base resets the count. `behind` is printed and never ends the wait: the engine's `main`
-    requires the merge queue, the queue merges a behind branch without an update, and REST exposes
-    no merge-queue field that would tell a behind PR the queue will merge from one it will not. So
-    a `behind` wait runs to its timeout, and the state line shows it; on a base with no queue, such
-    as the vault's `main`, that line is the cue to update the branch. For closed the state is
-    printed and never acted on; the checks-complete line does not carry it. A red required check is
-    not acted on either: it reads `blocked`, and the wait runs to its timeout.
+    a new base resets the count. `behind` is printed and never ends the wait, by Manager ruling of
+    2026-10-21: the engine's `main` requires the merge queue, the queue merges a behind branch
+    without an update, and the REST PR object has no merge-queue field that would tell a behind PR
+    the queue will merge from one it will not. UNMEASURED: how REST reads a behind PR the queue
+    could still merge, queued or not yet queued; the ruling rests on the queue building its own
+    merge group on the base, not on a reading taken here. So a `behind` wait runs to its timeout,
+    and the state line shows it; on a base with no queue, such as the vault's `main`, that line is
+    the cue to update the branch. For closed the state is printed and never acted on; the
+    checks-complete line does not carry it. A red required check is not acted on either: it reads
+    `blocked`, and the wait runs to its timeout.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -343,7 +349,7 @@ function Test-Merged($p) {
             Say $state
             Fail 'the PR was read as closed without merging on two checks in a row, so -Until merged will not be met.'
         }
-        if ((Measure-NeedsPush $p.state $ms "$sha $([string]$p.base.ref)") -ge 2) {
+        if ((Measure-DirtyReads $p.state $ms "$sha $([string]$p.base.ref)") -ge 2) {
             $needsPush = "mergeable_state=$ms on two checks of head $sha"
         }
     }
@@ -353,7 +359,7 @@ function Test-Merged($p) {
 # Counts `dirty` reads of an open PR, per head SHA and base, and returns the count. `unknown` and a
 # missing value are GitHub still computing, so they neither count nor reset. The header says why
 # `behind` resets rather than counts.
-function Measure-NeedsPush([string]$State, [string]$Mergeable, [string]$Key) {
+function Measure-DirtyReads([string]$State, [string]$Mergeable, [string]$Key) {
     if ($Key -cne $script:DirtyKey) {
         $script:DirtyKey = $Key
         $script:DirtyReads = 0
