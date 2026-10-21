@@ -277,7 +277,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+from messagefoundry.audit_write import write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -456,7 +456,7 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
-from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.base import ResendError, Store, build_store_cipher, store_call_errors
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
@@ -470,7 +470,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import audit_body_digests
+from messagefoundry.store.crypto import CipherError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
@@ -3479,7 +3479,9 @@ async def _audit_alert_rules_withheld(
     denial count, so routine alerts-page loads could raise a denial-burst alert.
 
     Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
-    refusal is logged rather than turning the answered read into a 500. The row goes through the
+    refusal is logged rather than turning the answered read into a 500. Only a store refusal is
+    caught; any other fault is a bug and escapes. ``defects=()`` because a defect class such as
+    ``sqlite3.ProgrammingError`` is not in ``errors`` and escapes anyway. The row goes through the
     auth service's store, the one its own audit rows use: only a channel-scoped caller withholds a
     rule, such a caller exists only when that service is attached, and the engine may not be."""
     auth = get_auth(request)
@@ -3502,7 +3504,8 @@ async def _audit_alert_rules_withheld(
         log=_log,
         message="GET /alerts/rules withheld %d rules from %s, but its audit row failed",
         args=lambda: (withheld, scrub_log_argument(actor)),
-        defects=AUDIT_WRITE_DEFECTS,
+        defects=(),
+        errors=(CipherError, *store_call_errors()),
     )
 
 
@@ -8858,11 +8861,8 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
-        withheld = len(alerts.rules) - len(rules)
-        if withheld:
-            await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
 
-        return AlertsConfig(
+        config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
             webhook_timeout=alerts.webhook_timeout,
             webhook_allowed_hosts=list(alerts.webhook_allowed_hosts),
@@ -8898,6 +8898,11 @@ def create_app(
                 for r in rules
             ],
         )
+        # After the answer is built, so the row never counts as shown a rule a failed read did not.
+        withheld = len(alerts.rules) - len(rules)
+        if withheld:
+            await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
+        return config
 
     # --- config provenance ---------------------------------------------------
 
