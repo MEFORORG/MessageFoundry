@@ -92,7 +92,10 @@ dependencies = [
     # pydantic floor 2.12.0: the lowest release whose pydantic-core has a cp314 wheel (BACKLOG #3177).
     "pydantic>=2.12.0",     # channel config models / validation
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
-    # FastAPI floor: the first release where every route-walk test passes (vault BACKLOG #2845).
+    # FastAPI floor 0.143.1: the locked release (vault BACKLOG #3916). Its RouteContext answers from
+    # the rebuilt route, the shape route_gates.py and api/security.py read. The required legs run
+    # only the lock, so a lower floor would allow an older shape that no required leg runs.
+    # Releases below 0.142.0 also fail outright (vault BACKLOG #2845):
     # 0.137.0 and 0.137.1 hide included routes and have no iter_route_contexts.
     # scripts/security/route_gates.py imports that call, so it fails to import there.
     # 0.137.2 to 0.139.x lack fastapi.dependencies.models._is_async_gen_callable.
