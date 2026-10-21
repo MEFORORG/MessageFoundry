@@ -32,7 +32,7 @@ PR = 7
 PR_PATH = f"repos/{REPO}/pulls/{PR}"
 SHA = "a" * 40
 RUNS_PATH = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1"
-STATUS_PATH = f"repos/{REPO}/commits/{SHA}/status?per_page=100"
+STATUS_PATH = f"repos/{REPO}/commits/{SHA}/status?per_page=100&page=1"
 BRANCH_PATH = f"repos/{REPO}/branches/main"
 RULES_PATH = f"repos/{REPO}/rules/branches/main?per_page=100&page=1"
 SEAMS = {**os.environ, "MEFOR_WAIT_PR_TEST_SEAMS": "1"}
@@ -57,6 +57,7 @@ $list = @($plan[$path])
 $resp = $list[[math]::Min($n, $list.Count - 1)]
 "HTTP/2.0 $($resp['status']) Stub"
 if ($resp.ContainsKey('etag')) { "Etag: $($resp['etag'])" }
+if ($resp.ContainsKey('headers')) { $resp['headers'] }
 'X-Ratelimit-Resource: core'
 ''
 if ($resp.ContainsKey('body')) { ConvertTo-Json -Compress -Depth 20 -InputObject $resp['body'] }
@@ -342,7 +343,66 @@ def test_an_unprotected_base_is_said_out_loud_and_no_check_is_not_complete(
     )
     # No check at all is not "complete": the wait times out rather than meeting the condition.
     assert run.code == 2, run.err
-    assert "no required contexts on unprotected main" in run.out
+    assert "no required contexts on main" in run.out
+
+
+def test_a_transient_failure_reading_the_required_set_reads_it_again(tmp_path: Path) -> None:
+    """A 502 part-way through must not leave the base marked read with an empty required set."""
+    lint = {"name": "lint", "status": "completed", "conclusion": "success"}
+    gate = {"name": "CI gate", "status": "completed", "conclusion": "success"}
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [
+                {"status": 502},
+                ok({"protected": True, "protection": {"required_status_checks": {"contexts": []}}}),
+            ],
+            RULES_PATH: [
+                ok(
+                    [
+                        {
+                            "type": "required_status_checks",
+                            "parameters": {"required_status_checks": [{"context": "CI gate"}]},
+                        }
+                    ]
+                )
+            ],
+            RUNS_PATH: [
+                ok({"total_count": 1, "check_runs": [lint]}),
+                ok({"total_count": 2, "check_runs": [lint, gate]}),
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    # An empty classic list is a real answer; the ruleset still supplies the one required context.
+    assert "required contexts on main: 1" in run.out
+    assert "required not reported=1" in run.out
+    assert run.sleeps == [120, 120]
+
+
+def test_three_transient_failures_in_a_row_are_an_error(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr()), {"status": 503}]})
+    assert run.code == 1
+    assert "three transient failures in a row" in run.err
+    assert run.sleeps == [120, 120, 120]
+
+
+def test_a_spent_rate_budget_mid_wait_stops_the_wait(tmp_path: Path) -> None:
+    spent = {"status": 403, "headers": ["X-Ratelimit-Remaining: 0"], "body": {"message": "x"}}
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr()), spent]})
+    assert run.code == 1
+    assert "X-Ratelimit-Remaining 0" in run.err
+    assert run.sleeps == [120]
+
+
+def test_a_total_shorter_than_one_interval_still_waits_one_interval(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr())]}, "-MaxMinutes", "1")
+    assert run.code == 2, run.err
+    assert "total wait raised from 1 min to one interval, 120 s" in run.out
+    assert run.sleeps == [120]
 
 
 def test_a_protected_base_with_no_contexts_list_is_an_error_not_an_empty_set(
@@ -364,6 +424,12 @@ def test_checks_complete_reads_every_page_and_waits_on_a_pending_status(tmp_path
     late = {"name": "late", "status": "in_progress", "conclusion": None}
     late_done = {"name": "late", "status": "completed", "conclusion": "success"}
     page2 = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=2"
+    green = [{"context": f"ctx {i}", "state": "success"} for i in range(100)]
+    status2 = f"repos/{REPO}/commits/{SHA}/status?per_page=100&page=2"
+
+    def ext(state: str) -> dict[str, Any]:
+        return ok({"total_count": 101, "statuses": [{"context": "ext", "state": state}]})
+
     run = wait_pr(
         tmp_path,
         "checks-complete",
@@ -376,18 +442,43 @@ def test_checks_complete_reads_every_page_and_waits_on_a_pending_status(tmp_path
                 ok({"total_count": 101, "check_runs": [late]}),
                 ok({"total_count": 101, "check_runs": [late_done]}),
             ],
-            STATUS_PATH: [
-                ok({"statuses": [{"context": "ext", "state": "pending"}]}),
-                ok({"statuses": [{"context": "ext", "state": "pending"}]}),
-                ok({"statuses": [{"context": "ext", "state": "success"}]}),
-            ],
+            STATUS_PATH: [ok({"total_count": 101, "statuses": green})],
+            status2: [ext("pending"), ext("pending"), ext("success")],
         },
     )
     assert run.code == 0, run.err
-    assert "runs=100/101 completed, statuses pending=1/1" in run.out
-    assert "runs=101/101 completed, statuses pending=1/1" in run.out
-    assert "102 success" in run.out
+    assert "runs=100/101 completed, statuses pending=1/101" in run.out
+    assert "runs=101/101 completed, statuses pending=1/101" in run.out
+    assert "202 success" in run.out
     assert run.sleeps == [120, 120]
+
+
+def test_a_base_name_with_a_hash_is_escaped_in_the_path(tmp_path: Path) -> None:
+    """`#` is legal in a branch name and would otherwise cut the path at a fragment."""
+    body = pr()
+    body["base"] = {"ref": "release/1#2"}
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(body)],
+            f"repos/{REPO}/branches/release/1%232": [ok({"protected": False})],
+            f"repos/{REPO}/rules/branches/release/1%232?per_page=100&page=1": [ok([])],
+            RUNS_PATH: [
+                ok(
+                    {
+                        "total_count": 1,
+                        "check_runs": [
+                            {"name": "a", "status": "completed", "conclusion": "success"}
+                        ],
+                    }
+                )
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert "no required contexts on release/1#2" in run.out
 
 
 def test_a_refused_required_context_read_is_an_error_not_an_empty_set(tmp_path: Path) -> None:
