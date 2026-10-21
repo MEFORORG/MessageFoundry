@@ -1,0 +1,203 @@
+# Sharing fleet coordination state across two PCs
+
+**Status: PROPOSED, 2026-10-21. Nothing in `scripts/` has changed.** Moving where every session
+reads and writes coordination state is the owner's call. This note is the design that call is made
+on.
+
+## The recommendation: one shared root on a dedicated SMB share, named by UNC path, split by class
+
+Put the SHARED part of `mefor-coord/` on an SMB share on Nucbox01, named by its UNC path in one
+setting every script reads. Keep the LOCAL part where it is. Exclusive operations fail closed when
+the share is down; advisory reads fail open fast. Confidence: about 80 percent that this is the
+right shape, and lower on the details that need the owner's answers below.
+
+The owner asked for "the Z drive". Z: is the right **server**, but the drive letter is the wrong
+**name** for it, and moving the whole directory is the wrong **scope**. The sections below say why.
+
+## What Z: actually is (measured 2026-10-21 on ALIENWARE)
+
+| Fact | Reading | Instrument |
+|---|---|---|
+| Backing | SMB share `\\192.168.4.21\Shared`, NTFS on a Windows host | `Get-PSDrive Z`, `Win32_LogicalDisk` |
+| Host | `192.168.4.21` reverse-resolves to `Nucbox01`, a third box, not MEFORDEV01 | `Dns.GetHostEntry` |
+| Kind | A real share, not a sync folder (no OneDrive or Offline Files layer found) | `net use`, `Win32_OfflineFilesCache` empty |
+| Round trip | ping under 1 ms; 20 x (exists + listing) took 76 ms, the same as 20 local listings of `seats/` | `Measure-Command` |
+| Client caches | directory cache 10 s, file-info cache 10 s, not-found cache 5 s, session timeout 60 s | `Get-SmbClientConfiguration` |
+| Mapping | `net use` shows Z: in this logon; `HKCU:\Network\Z` returned nothing | `Get-ItemProperty` |
+| Neighbours | The share already holds unrelated files, at least one whose name suggests exported keys | `Get-ChildItem Z:\` |
+
+Not measured, and left open on purpose: whether an elevated shell or a service sees Z:, and atomic
+create and rename on the share. No probe file was written to Z:, because writing outside the
+worktree needs the owner. Migration step 2 below measures both before anything moves.
+
+## Why not the drive letter
+
+- **A drive letter belongs to one logon session.** An elevated shell does not see a non-elevated
+  mapping unless `EnableLinkedConnections` is set. A service under NSSM or LocalSystem sees none. A
+  scheduled task sees one only if it runs as the user with the mapping live.
+- **The second PC may map a different letter**, or none.
+- The UNC path names the same thing in every one of those contexts. Scripts read the UNC path; Z:
+  stays the owner's convenience.
+
+## Why not move the whole directory
+
+At least five things under `mefor-coord/` are local by nature. Moving them adds network latency,
+cross-PC false sharing, or both.
+
+| Path | Class | Why |
+|---|---|---|
+| `seats/` | SHARED | The only way to find a peer across accounts (CLAUDE.md section 5). The point of the change. |
+| `mail/` | SHARED | Cross-account, and now cross-PC, messages. |
+| `claims/` (+ `.history`) | SHARED, exclusive | One item, one holder, fleet-wide. Two PCs claiming one item is the failure to prevent. |
+| `alloc/` | SHARED, exclusive | ADR numbers. The allocator has collided before; a per-PC copy would collide by design. |
+| `locks/` | FOLLOWS ITS RESOURCE | A lock lives on the same root as the thing it guards. `lock.ps1` callers must be sorted one by one. |
+| `handoffs/` | SHARED | A seat can be resumed from either PC. |
+| `wiki/` (inbox) | SHARED | Korus `scripts/wiki/*.ps1` take `-StateRoot`; point it at the shared root. |
+| `announce/` | LOCAL | Per-session delivery receipts for the `list_sessions` lane, which is itself per-PC. |
+| `wiki-prompt/` | LOCAL | Per-session Stop-hook state. |
+| `overlap-cache/`, `overlap-terms.json` | LOCAL | A cache, about 190 MB measured. Rebuildable; never worth a network hop. |
+| `pwsh-burst/` | LOCAL | Measures this machine's CPU. |
+| `test-slots/` | LOCAL | Leases on this machine's test capacity. |
+
+## The bug a plain path change would ship
+
+**Liveness checks judge a record by looking at this machine's disk.** `claim.ps1` marks a claim
+`HOLDER GONE` when `Test-Path` cannot find the holder's worktree (around its `HeldPath` check), and
+`seat.ps1` probes a seat's worktree the same way. A claim taken on MEFORDEV01 names a path that does
+not exist on ALIENWARE. After a plain move, every live claim from the other PC would read as
+`HOLDER GONE` and invite a `-Force` release. That is the duplicate-work failure the claim registry
+exists to stop.
+
+The fix is part of the change, not a follow-up:
+
+1. Every shared record carries `host` (`$env:COMPUTERNAME`). `seat.ps1` already writes it into its
+   stage log, not into the record.
+2. A liveness check judges only records whose `host` is this machine. A record from another host
+   reads `ON <HOST>, NOT CHECKABLE HERE`, never `GONE`.
+3. A record with no `host` is treated as this machine's, which is true of every record written
+   before the change.
+
+## The worktree gate must follow the root
+
+`worktree_gate.ps1` denies writes outside the worktree, with **one** exemption:
+`<primary>/.git/mefor-coord/`. Moving the shared root without moving that exemption makes every
+seat declare, mail send and claim a denied write. Widen the exemption to the configured shared root
+and nothing else, the way it was narrowed to `mefor-coord/` alone. This is a control change, so it
+needs its own code review.
+
+## Offline behaviour: fail closed for exclusive ops, fail open fast for reads
+
+A dead SMB server does not answer "no". It hangs a file call for up to the 60 s session timeout. A
+PreToolUse hook that waits on it would stall every tool call in every session on both PCs.
+
+| Operation | If the shared root does not answer |
+|---|---|
+| `claim.ps1`, `alloc.ps1`, ledger and claim git hooks | **Refuse, and say the root is down.** Never fall back to a local copy: a fallback splits the fleet into two registries that each think they are the only one. |
+| Seat declare, mail send, handoff write | Refuse with a clear message. The caller retries later. |
+| Hooks that read (announce, mail drain, roster, collision gate) | Skip with a one-line note. Never block the tool call. |
+
+One shared resolver does the probe: a TCP connect to port 445 with a 1.5 s timeout, then the file
+call. It caches a "down" verdict per process for 60 s, so a dead share costs one timeout, not one
+per hook.
+
+## Atomicity over SMB
+
+The scripts rely on three primitives. On a Windows NTFS server all three are decided by the
+server, so they hold across clients:
+
+- **Create-new fails if the file exists** (`FileMode.CreateNew`). Claims, allocations and locks use
+  this, and the server makes it exclusive.
+- **Rename over an existing file** is atomic on the server.
+- **An open with no sharing** is enforced by the server.
+
+What the client caches do break is **reads**: a new file can stay invisible for up to 10 s, and a
+deleted one can still look present. So:
+
+- Never decide "free" from a listing or `Test-Path`. Decide by attempting the exclusive create.
+  The scripts already do this for claims and allocations; the migration audit confirms each caller.
+- Accept that a roster or inbox read may be up to 10 s stale. Nothing in the fleet acts faster.
+- A disconnected client can leave a durable handle open for up to about 60 s. A lock taken just
+  before a network drop may block that long. Locks keep their staleness timeouts.
+
+## PHI and secrets
+
+Coordination records are seat goals, item numbers, paths and message text. None may carry PHI or a
+secret, and the engine's rules (CLAUDE.md section 9) already forbid both. Two extra safeguards,
+because the share is reachable from more than one machine:
+
+- **Use a dedicated share,** for example `\\Nucbox01\mefor-coord`, readable and writable by the
+  owner's account alone. Not the general `Shared` share, which already holds unrelated and possibly
+  sensitive files and whose access list is unknown.
+- Mail bodies are free text. `mail.ps1` should refuse a body that matches the leak gate's secret
+  patterns, the same patterns the pre-commit gate uses. That is a follow-up, not a precondition.
+
+## The contract every script reads
+
+One resolver, `scripts/coord/coord-root.ps1` (dot-sourced) plus a Python twin for the git hooks and
+`read_batch.py`. Two functions:
+
+| Function | Returns |
+|---|---|
+| `Get-CoordSharedRoot` | `$env:MEFOR_COORD_ROOT` if set, else the `shared_root` value in `<git-common-dir>/mefor-coord/root.toml`, else `<git-common-dir>/mefor-coord` (today's behaviour). Probes reachability as above. |
+| `Get-CoordLocalRoot` | Always `<git-common-dir>/mefor-coord`. |
+
+Rules:
+
+1. Each state path calls exactly one of the two, per the class table. No script builds
+   `git-common-dir/mefor-coord` by hand any more; about 36 files do today.
+2. The env var wins so that a test, a single session or a rollback can override without touching a
+   file.
+3. `root.toml` is per-clone and untracked, so each PC sets its own UNC path.
+4. A cloud session (`CLAUDE_CODE_REMOTE=true`) still refuses, unchanged.
+5. A test pins both roots to temp directories through the env var.
+6. Korus wiki scripts get `-StateRoot (Get-CoordSharedRoot)`. The batch skill's `seats_dir()` calls
+   the Python twin.
+
+## Alternatives weighed
+
+| Option | Verdict |
+|---|---|
+| Z: as a drive letter, whole directory | Rejected. Invisible to elevated shells and services; ships the liveness bug; drags local caches over the network. |
+| Private GitHub repo or ref as the store | Rejected for seats and mail: a push per heartbeat is seconds of latency and spends the fleet's shared GitHub budget. Strongest compare-and-swap of any option, and works from cloud sessions too, so **a good later home for `alloc/` alone** if the SMB allocator ever collides. |
+| A small coordination service on one PC | Rejected for now: a new process to run, secure and keep alive, for a beta. Revisit if a third PC or cloud sessions need to join. |
+| Per-PC state plus a sync (robocopy, Syncthing) | Rejected for claims and allocations: sync cannot give exclusion, so both PCs win the same item. Fine only for read-mostly data, which does not need it. |
+| Shared root by setting, local fallback | **Chosen**, with one change: no fallback for exclusive operations. |
+
+Single point of failure: Nucbox01. If it is down, nobody can claim or allocate on either PC, by
+design. Reads and builds keep working.
+
+## Migration
+
+1. Owner creates the dedicated share and gives this account read and write.
+2. On each PC, in a desktop shell, an elevated shell and a scheduled task, a probe script measures:
+   UNC reachability, exclusive create (two processes race 100 times, exactly one wins each time),
+   rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
+3. Land the resolver, the `host` field, the host-aware liveness checks and the gate exemption, with
+   tests. Behaviour is unchanged, because no root is configured yet.
+4. Pick a quiet window. Announce it on the old mail lane.
+5. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
+   `robocopy /E /COPY:DT`. Leave the originals in place.
+6. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
+7. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
+   back from a second account.
+8. Rename the old local copies to `*.pre-share` so nothing reads them by accident.
+9. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE.
+
+## Rollback
+
+1. Delete `root.toml`, or set `MEFOR_COORD_ROOT` to the local path. The next hook call is local.
+2. Copy back anything written to the share since step 6 that the fleet still needs, at least open
+   claims and unread mail.
+3. Rename the `*.pre-share` copies back.
+
+The resolver keeps today's behaviour when nothing is configured, so rollback never needs a code
+revert.
+
+## Not in scope
+
+- `session-registry.ps1`, `presence.ps1` and the `list_sessions` lane read the desktop app's own
+  per-PC session store. They stay per-PC. The seat registry is the cross-PC view.
+- Two PCs signed in to one Claude account share one usage pool. The Steward reads usage per
+  account, so it still works, but its pacing must count both PCs. Unmeasured.
+- The zero-model cron that reads the seat registry (owner AFK plan, section 8) should read
+  `Get-CoordSharedRoot` and run on one PC only.
