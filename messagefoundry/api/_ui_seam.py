@@ -640,12 +640,22 @@ from typing import Any
 #: engine is refused at mount; a newer console on an older engine would raise AttributeError at the
 #: save, and the pinned digest refuses that pair at mount first. Re-derived with ``--write``.
 #:
+#: BACKLOG #3393, the factor-change offer: ``AuthService`` gained ``count_other_sessions``, which
+#: the console's account page and TOTP confirm call for the offer's count.
+#: ``AdminHandlers.disable_my_mfa`` is now ``_disable_my_mfa_core``, the disable past the JSON
+#: route's gate, which takes ``token`` (the session the offer is counted against, the console's
+#: cookie session) and ``client``, and returns ``MfaDisableResponse``, whose ``other_sessions`` the
+#: console reads to decide the mark. The snapshot records none of that, because ``AdminHandlers``
+#: fields are typed ``Callable[..., Awaitable[Any]]``; the new ``AuthService`` method moved the
+#: digest from ``382cd35a6af61f7b``, so a skew in either direction is refused at mount, before a
+#: call with the wrong keywords. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "382cd35a6af61f7b"
+ENGINE_UI_SEAM: str = "108e906e98fd66f0"
 
 
 @dataclass(frozen=True, slots=True)

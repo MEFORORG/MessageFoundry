@@ -82,6 +82,26 @@ async def _enroll_totp(c: httpx.AsyncClient, service: AuthService, user_id: str)
     return r
 
 
+async def _synthetic_passkey(service: AuthService, user_id: str, id_hash: str) -> None:
+    """A passkey written straight to the store, so the delete lane runs without the extra."""
+    await service.store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash=id_hash,
+            credential_id="c3ludGhldGlj",
+            user_id=user_id,
+            rp_id="t",
+            public_key="c3ludGhldGlj",
+            sign_count=0,
+            transports=None,
+            device_type="single_device",
+            backed_up=False,
+            label="synthetic key",
+            aaguid=None,
+            created_at=1.0,
+        )
+    )
+
+
 async def _live_hashes(service: AuthService, user_id: str) -> set[str]:
     return {s.token_hash for s in await service.list_sessions(user_id)}
 
@@ -206,22 +226,7 @@ async def test_passkey_delete_offers_without_the_webauthn_extra(engine: Engine) 
         user_id = await provision(service, "op", ["operator"])
         assert (await service.login("op", PW)).ok
         await cookie_login(c, "op")
-        await service.store.add_webauthn_credential(
-            WebAuthnCredential(
-                credential_id_hash="synthetic-hash-1147",
-                credential_id="c3ludGhldGlj",
-                user_id=user_id,
-                rp_id="t",
-                public_key="c3ludGhldGlj",
-                sign_count=0,
-                transports=None,
-                device_type="single_device",
-                backed_up=False,
-                label="synthetic key",
-                aaguid=None,
-                created_at=1.0,
-            )
-        )
+        await _synthetic_passkey(service, user_id, "synthetic-hash-1147")
         creds = await service.store.list_webauthn_credentials(user_id)
         path = f"/ui/account/webauthn/{creds[0].credential_id_hash}/delete"
         await mint_bound_proof(c, path)
@@ -229,6 +234,38 @@ async def test_passkey_delete_offers_without_the_webauthn_extra(engine: Engine) 
         assert r.status_code == 303 and r.headers["location"] == "/ui/account?m=passkey_removed"
         page = await c.get(r.headers["location"])
         assert OFFER in page.text and "Sign out my other sessions (1)" in page.text
+
+
+async def test_a_render_that_fails_keeps_the_offer_for_the_next_load(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3393: the mark is spent only once the account page has rendered. RED when the
+    route spends it before the render, as it once did: the failed load would then cost the offer,
+    and the retry below would render none."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        user_id = await provision(service, "op", ["operator"])
+        assert (await service.login("op", PW)).ok
+        await cookie_login(c, "op")
+        await _synthetic_passkey(service, user_id, "synthetic-hash-3393")
+        path = "/ui/account/webauthn/synthetic-hash-3393/delete"
+        await mint_bound_proof(c, path)
+        r = await c.post(path, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+
+        class _RenderFault(RuntimeError):
+            pass
+
+        def _fail(*_args: object, **_kwargs: object) -> str:
+            raise _RenderFault("synthetic render fault")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(pages, "account_page", _fail)
+            with pytest.raises(_RenderFault):
+                await c.get(r.headers["location"])
+        page = await c.get(r.headers["location"])
+        assert OFFER in page.text and "Sign out my other sessions (1)" in page.text
+        assert OFFER not in (await c.get(r.headers["location"])).text  # then spent
 
 
 async def test_a_forged_notice_code_renders_no_offer(engine: Engine) -> None:

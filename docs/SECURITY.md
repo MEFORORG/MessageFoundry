@@ -4915,14 +4915,20 @@ account and keep this one. The enrolment confirm shows the offer in its own resp
 recovery codes. The other three set a single-use mark on the session. The next account page that
 session loads shows the offer and spends the mark. So a typed `/ui/account?m=mfa_off` shows the
 notice and no offer, and so does a failed attempt or a disable of TOTP that was never on. With no
-other session live, there is no offer. The confirm and the passkey add rotate the session. The
+other session to end, there is no offer. The count is the one the revoke would end: every other
+session not yet signed out, one gone idle included, so the number on the button is the number that
+ends (BACKLOG #3393). The confirm and the passkey add rotate the session. The
 confirm's count excludes this session across the rotation, and the passkey add marks the new token.
 Accepting posts to `POST /ui/account/sessions/revoke-others`.
 It asks for the same `session_terminate` re-proof as any terminate, then runs. Declining means doing
 nothing, and no session ends unasked. The mark is process-local, like the re-auth continuations. A
-lost mark costs the offer, and the **Active sessions…** view still has the control. The JSON twins,
-`POST /me/mfa/confirm` and `DELETE /me/mfa`, do not carry the offer yet. A password change is
-unchanged: it ends every session, the caller's included.
+lost mark costs the offer, and the **Active sessions…** view still has the control. The page spends
+the mark only once it has rendered, so a page that fails to render keeps the offer for the next
+load. The JSON twins carry the offer as `other_sessions`, on `POST /me/mfa/confirm` and
+`DELETE /me/mfa` (BACKLOG #3393): the same count, read before the change, and 0 for a disable of
+TOTP that was never on. A client would offer `DELETE /me/sessions` when it is not 0, and nothing ends
+unless it calls that. Passkey add and removal have no JSON route. A password change is unchanged: it
+ends every session, the caller's included.
 
 The offer covers factors the engine holds, on local and directory accounts alike. A password or
 factor changed in Active Directory, or at an OpenID Connect provider, never reaches the engine. The

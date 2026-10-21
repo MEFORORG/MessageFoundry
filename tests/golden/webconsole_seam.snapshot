@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-382cd35a6af61f7b
+108e906e98fd66f0
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -176,6 +176,7 @@ begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 complete_oidc_step_up: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'OidcStepUp'
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
+count_other_sessions: (self, user_id: 'str', current_token_hash: 'str') -> 'int'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
 factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
 fill_own_notify_email: (self, identity: 'Identity', email: 'str', *, client: 'str | None' = None) -> 'bool'

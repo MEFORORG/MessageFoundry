@@ -1800,6 +1800,15 @@ async def admin_guard_counts(
 _REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
 )
+#: The rows that sweep ends, counted, with its WHERE clause (BACKLOG #3393). Each is a plain literal
+#: rather than a concatenation of one shared clause, because the transaction-verb guard in
+#: ``tests/test_writer_txn_is_the_only_begin.py`` reads module strings only as literals. Keep the two
+#: clauses in step; the session-seal contract checks the count against the sweep on every backend.
+_COUNT_USER_SESSIONS_SQL: Final = (
+    "SELECT COUNT(*) FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+)
+#: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
+_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
 
 
 @dataclass(frozen=True)
@@ -16265,7 +16274,7 @@ class MessageStore:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
                 cur = await self._db.execute(
-                    _REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                    _REVOKE_USER_SESSIONS_SQL + _EXCEPT_TOKEN_HASH_SQL,
                     (now, user_id, except_token_hash),
                 )
             revoked = int(cur.rowcount)
@@ -16277,6 +16286,21 @@ class MessageStore:
                 )
             await self._commit()
         return revoked
+
+    async def count_user_sessions(
+        self, user_id: str, *, except_token_hash: str | None = None
+    ) -> int:
+        """How many sessions :meth:`revoke_user_sessions` would end with the same arguments, read
+        from the same clause (BACKLOG #3393). See :meth:`AuthStore.count_user_sessions`."""
+        async with self._read() as db:
+            if except_token_hash is None:
+                cur = await db.execute(_COUNT_USER_SESSIONS_SQL, (user_id,))
+            else:
+                cur = await db.execute(
+                    _COUNT_USER_SESSIONS_SQL + _EXCEPT_TOKEN_HASH_SQL, (user_id, except_token_hash)
+                )
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     async def _session_epoch(self, user_id: str) -> int:
         """The account's session epoch, read on the writer connection inside the caller's

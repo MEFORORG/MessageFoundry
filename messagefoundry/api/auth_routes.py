@@ -50,6 +50,7 @@ from messagefoundry.api.auth_models import (
     LoginResponse,
     MfaConfirmRequest,
     MfaConfirmResponse,
+    MfaDisableResponse,
     MfaEnrollResponse,
     MfaResetResponse,
     MfaStatusResponse,
@@ -981,6 +982,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         token = bearer_token(request)
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+        # BACKLOG #1147, #3393: the offer's count, read BEFORE the confirm commits, as the console's
+        # confirm reads it. Read after, a store fault would answer 500 once TOTP is on and the token
+        # rotated, losing the one-time codes and the caller's session. The confirm ends no other
+        # session and re-keys this one in place, so the count holds across the rotation.
+        others = await service.count_other_sessions(identity.user_id, hash_token(token))
         try:
             elevation = await service.confirm_mfa_enrollment(
                 identity, body.code, token=token, client=client_ip(request)
@@ -1005,15 +1011,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
         return MfaConfirmResponse(
-            recovery_codes=list(elevation.recovery_codes), token=elevation.token
+            recovery_codes=list(elevation.recovery_codes),
+            token=elevation.token,
+            other_sessions=others,
         )
 
-    @app.delete("/me/mfa", response_model=SimpleMessage)
+    @app.delete("/me/mfa", response_model=MfaDisableResponse)
     async def disable_my_mfa(
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
-    ) -> SimpleMessage:
+    ) -> MfaDisableResponse:
         """Self-service: turn off the caller's TOTP MFA. Step-up gated — you prove your current factor
         (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
         action (ADR 0077): a hijacked session inside the login window can't silently strip MFA.
@@ -1024,11 +1032,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         must enroll another factor first. Both are CLIENT conditions, not faults, so they must
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
+        token = bearer_token(request)
+        if token is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+        return await _disable_my_mfa_core(
+            service=service, identity=identity, token=token, client=client_ip(request)
+        )
+
+    async def _disable_my_mfa_core(
+        *, service: AuthService, identity: Identity, token: str, client: str | None
+    ) -> MfaDisableResponse:
+        """The disable past :func:`disable_my_mfa`'s gate, counted against ``token``: the bearer on
+        the JSON route, the cookie session on the console's ``/ui/account/mfa/disable``, which takes
+        the same step-up in its own gate (BACKLOG #3393).
+
+        ``other_sessions`` is the offer to end the caller's other sessions (BACKLOG #1147). It is
+        read before the disable, so a store fault cannot answer 500 for a disable that committed,
+        and it is 0 when TOTP was never on, since that disable changed no factor."""
+        others = await service.count_other_sessions(identity.user_id, hash_token(token))
         try:
-            await service.disable_mfa(identity, client=client_ip(request))
+            was_on = await service.disable_mfa(identity, client=client)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        return SimpleMessage(detail="MFA disabled")
+        return MfaDisableResponse(detail="MFA disabled", other_sessions=others if was_on else 0)
 
     # --- self-service session inventory (WP-10, ASVS 7.5.2/7.4.5) -------------
 
@@ -2390,7 +2416,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         my_mfa=my_mfa,
         change_password=change_password,
         enroll_mfa=enroll_mfa,
-        disable_my_mfa=disable_my_mfa,
+        # BACKLOG #3393: the core past the JSON route's gate, given the console's cookie session.
+        disable_my_mfa=_disable_my_mfa_core,
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,

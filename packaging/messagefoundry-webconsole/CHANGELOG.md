@@ -165,6 +165,14 @@ this line.**
   checked; before, a malformed one got the form error and no audit row. The JSON
   `PUT /users/{id}/channel-scope` still answers a malformed body 422 first, with no row. Seam
   change: `AdminHandlers` gains `refuse_own_channel_scope`. (BACKLOG #3393)
+- **The sign-out offer after a factor change counts what it ends, and survives a failed page.**
+  The number on the offer is now the number the sign-out ends: every other session not yet signed
+  out, one gone idle included, where it used to count only the sessions the sessions page lists.
+  The account page spends the offer's single-use mark only once it has rendered, so a page that
+  fails keeps the offer for the next load. Turning TOTP off now marks the session only when there
+  is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and
+  `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
+  `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".

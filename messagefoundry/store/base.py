@@ -2950,6 +2950,20 @@ class AuthStore(Protocol):
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int: ...
 
+    async def count_user_sessions(
+        self, user_id: str, *, except_token_hash: str | None = None
+    ) -> int:
+        """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
+        ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
+        but for the excepted one (BACKLOG #3393).
+
+        Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
+        to sign out the other sessions shows is the number the revoke then ends. Each backend
+        writes the count beside its sweep with the same clause, and the session-seal contract
+        checks the pair on every backend. Changes nothing, takes no lock and raises no epoch,
+        so a concurrent sign-in can still move the number before the revoke runs."""
+        ...
+
     async def enforce_session_cap(
         self,
         user_id: str,

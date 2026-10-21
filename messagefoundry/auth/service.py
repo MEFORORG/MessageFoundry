@@ -10350,6 +10350,14 @@ class AuthService:
             )
         return revoked
 
+    async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int:
+        """How many sessions :meth:`revoke_other_sessions` would end for this caller: the number
+        the offer after a factor change shows (BACKLOG #1147, #3393). It is the store's count with
+        the revoke's own predicate, so it includes a session that has gone idle or expired but was
+        never revoked, which :meth:`list_sessions` hides. Pass the hash of the token the caller
+        holds NOW, so a ceremony that rotated it counts against the new one."""
+        return await self._store.count_user_sessions(user_id, except_token_hash=current_token_hash)
+
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
         Audited."""
@@ -13005,9 +13013,13 @@ class AuthService:
         )
         return True
 
-    async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
+    async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> bool:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
         the user is notified out-of-band (ASVS 6.3.7).
+
+        Returns whether TOTP was on, read before the disable. A disable of TOTP that was never on
+        still succeeds, audited and notified, but it changed no factor, so both planes offer no
+        sign-out of the other sessions for it (BACKLOG #1147, #3393).
 
         Raises :class:`ValueError` (:data:`TOTP_REMOVAL_REFUSED`) whenever ``[security].require_mfa``
         covers the caller as a local account and TOTP is on, passkeys or not: in wave 1 TOTP is the
@@ -13056,6 +13068,7 @@ class AuthService:
             email=user.notify_email if user is not None else None,
             client=client,
         )
+        return user is not None and user.totp_enabled
 
     async def admin_reset_mfa(self, user_id: str, *, actor: str) -> IssuedCredential | None:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no

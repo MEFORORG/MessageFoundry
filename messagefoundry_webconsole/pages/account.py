@@ -587,10 +587,12 @@ def _revoke_others_form(label: str) -> Markup:
 def _session_offer(others: int) -> Markup:
     """The offer to end the caller's other sessions after a factor change (BACKLOG #1147, ASVS 7.4.3).
 
-    ``others`` is the count of the caller's live sessions besides this one. The form posts to the
-    same route as the sessions page's *Sign out everywhere else*, which keeps the current session.
-    That route asks for a fresh re-proof, bound to the action, and then runs (ASVS 7.5.2). Declining
-    is doing nothing: no session ends unless the caller asks."""
+    ``others`` is how many sessions the revoke would end: every other session of the caller not yet
+    signed out, one that has gone idle included (BACKLOG #3393), so the number on the button is the
+    number that ends. The form posts to the same route as the sessions page's *Sign out everywhere
+    else*, which keeps the current session. That route asks for a fresh re-proof, bound to the
+    action, and then runs (ASVS 7.5.2). Declining is doing nothing: no session ends unless the
+    caller asks."""
     if not others:
         return Markup("")  # nothing to end, as on the sessions page
     return el(
@@ -598,9 +600,9 @@ def _session_offer(others: int) -> Markup:
         el("h2", "Your other sessions"),
         el(
             "p",
-            f"You changed how you sign in. You have {others} other active session(s). If you made "
-            "this change because a device or a code may be in the wrong hands, sign them out now. "
-            "This session stays signed in.",
+            f"You changed how you sign in. You have {others} other session(s) not yet signed "
+            "out. If you made this change because a device or a code may be in the wrong hands, "
+            "sign them out now. This session stays signed in.",
         ),
         _revoke_others_form(f"Sign out my other sessions ({others})"),
         el(

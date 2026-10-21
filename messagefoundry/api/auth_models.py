@@ -424,10 +424,25 @@ class MfaConfirmResponse(CredentialReply):
 
     ``token`` is the caller's NEW bearer token: confirming an enrolment elevates the session, and
     ASVS 7.2.4 re-keys it on every elevation, so the token the client authenticated this very call
-    with has stopped working. A client that ignores this field has locked itself out."""
+    with has stopped working. A client that ignores this field has locked itself out.
+
+    ``other_sessions`` is the offer to end the caller's other sessions after this factor change
+    (ASVS 7.4.3, BACKLOG #1147, #3393): how many of them ``DELETE /me/sessions`` would end, read
+    before the confirm. Nothing ends unless the client asks; the console shows the same offer."""
 
     recovery_codes: list[str]
     token: str
+    other_sessions: int
+
+
+class MfaDisableResponse(BaseModel):
+    """``DELETE /me/mfa``'s reply. ``other_sessions`` is the offer to end the caller's other
+    sessions after the factor change (ASVS 7.4.3, BACKLOG #1147, #3393): how many of them
+    ``DELETE /me/sessions`` would end, read before the disable. It is 0 when TOTP was never on,
+    since that disable changed no factor. Nothing ends unless the client asks."""
+
+    detail: str
+    other_sessions: int
 
 
 class ElevatedResponse(CredentialReply):
