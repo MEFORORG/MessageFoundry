@@ -3536,14 +3536,14 @@ ledger, so it has no public page.
   now refused. The `[security]` lists still accept a dotted-quad IPv4 address such as
   `10.20.30.40`. An identity provider can be reached by address. The console now matches such an
   entry exactly. Domain matching is unchanged. (`vault BACKLOG #2843`)
-- **The FastAPI floor is now 0.140.0.** On 0.137.0 and 0.137.1 the route-gate walk in
+- **The FastAPI floor is now 0.140.0, superseded in this release by `fastapi>=0.143.1`.** On 0.137.0 and 0.137.1 the route-gate walk in
   `scripts/security/route_gates.py` left every route added through `include_router` out of its
   gated view. It showed each include as one bare `MOUNT` row instead. Those releases hide included
   routes and lack `iter_route_contexts`. The walk now imports that call directly, so a FastAPI
   without it fails at import. On 0.137.2 to 0.139.x the walk is complete, but the guard against
   sync route dependencies cannot run. The engine still refused an undeclared route at request time
-  on 0.137.0 and 0.137.1. The lock already pins 0.141.1. (`vault BACKLOG #2845`) Superseded in
-  this release: the floor is `fastapi>=0.143.1`, and the lock pins 0.143.1.
+  on 0.137.0 and 0.137.1. The lock already pins 0.141.1. (`vault BACKLOG #2845`) In this
+  release the lock pins 0.143.1.
 - **The engine now counts every refusal of a route that declares no authorization.** It used to
   log only the first refusal of such a route, so a later burst wrote nothing. The ERROR line now
   repeats at most once a minute for each route. Each line says how many refusals came since the
