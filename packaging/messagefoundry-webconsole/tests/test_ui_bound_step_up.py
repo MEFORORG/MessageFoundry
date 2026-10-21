@@ -605,7 +605,7 @@ def test_a_window_only_unlock_page_is_never_issued() -> None:
     records nothing: an entry would only fill the per-session cap and evict a pending auto-retry
     issue. CONTROL: the same refusal toward an action-bound unlock page is recorded."""
     token = "t" * 43
-    window_only, bound = "/ui/ad-groups", "/ui/connections/purge-confirm"
+    window_only, bound = "/ui/roles/new", "/ui/connections/purge-confirm"
     wo_action, bound_action = lookup_ui_action(window_only), lookup_ui_action(bound)
     assert wo_action is not None and wo_action.unlock and wo_action.action is None
     assert bound_action is not None and bound_action.unlock and bound_action.action is not None

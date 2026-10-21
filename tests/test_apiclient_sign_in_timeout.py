@@ -44,7 +44,7 @@ def _reply(request: httpx.Request) -> httpx.Response:
     elif path in ("/me/reauth", "/auth/mfa-verify"):
         body = {"detail": "re-verified", "token": _ROTATED}
     elif path == "/me/mfa/confirm":
-        body = {"recovery_codes": ["code-one"], "token": _ROTATED}
+        body = {"recovery_codes": ["code-one"], "token": _ROTATED, "other_sessions": 0}
     else:
         body = _USER
     return httpx.Response(200, json=body)
@@ -85,7 +85,7 @@ def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> 
         client.login("jdoe", "a-strong-test-passphrase")
         client.reauth("a-strong-test-passphrase")
         client.verify_mfa("123456")
-        assert client.confirm_mfa("123456") == ["code-one"]
+        assert client.confirm_mfa("123456").recovery_codes == ("code-one",)
         client.me()
     finally:
         client.close()

@@ -814,6 +814,12 @@ STEP_UP_ACTION_UPLOAD_RESEND = "upload_resend"
 STEP_UP_ACTION_MESSAGE_EXPORT = "message_export"
 STEP_UP_ACTION_CONNECTION_PURGE = "connection_purge"
 STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
+# BACKLOG #3401 (ASVS 7.5.2, a #1149 follow-up). The four group-wide saves -- both AD group maps,
+# custom-role edit and custom-role delete -- end the sessions of every account they reach, and that
+# can include the caller's own. Only then do they take this proof, single-use and bound here; a save
+# that ends nobody's session of the caller's keeps the session window. Its own id and not
+# `session_terminate`, so a grant minted for DELETE /me/sessions cannot be spent on a map save.
+STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS = "save_ends_own_sessions"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -10867,6 +10873,34 @@ class AuthService:
             )
         return revoked
 
+    async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
+        """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
+        of the read: the number the offer after a factor change shows (BACKLOG #1147, #3393). It is
+        the store's count with the revoke's own predicate, so it includes a session that has gone
+        idle or expired but was never revoked, which :meth:`list_sessions` hides. At least a sign-in,
+        the reaper, a cap run or another revoke before the revoke runs can still move it.
+
+        Read it AFTER the factor change has committed, against the token the caller holds NOW: a
+        confirm re-keys the session and then runs the session cap, which can end rows itself, so a
+        count read before it would offer sessions that are already gone.
+
+        **A refused store call answers None, "could not count", and is logged, never raised.** The
+        confirm reads this after the change committed, and its reply carries recovery codes shown
+        once, so a raise would lose them for a number. None is not 0: the console keeps its mark
+        for the next load, and a JSON client can tell "unknown" from "none". What counts as refused
+        is :func:`~messagefoundry.store.base.store_call_errors`; a defect in
+        :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` still raises, so a bug is not read as
+        a store fault."""
+        try:
+            return await self._store.count_user_sessions(
+                user_id, except_token_hash=current_token_hash
+            )
+        except AUDIT_WRITE_DEFECTS:
+            raise
+        except store_call_errors():
+            _log.exception("counting the other sessions for the sign-out offer failed; no offer")
+            return None
+
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
         Audited."""
@@ -11530,12 +11564,18 @@ class AuthService:
     #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014), and
     #: both enrolment legs, that one and ``confirm_mfa_enrollment`` (``mfa_confirm``), ask it again
     #: after their directory lookup (BACKLOG #3061).
+    #:
+    #: ``save_ends_own_sessions`` (BACKLOG #3401) rides an MFA-gated gate instead, so a pending
+    #: session never reaches its routes. It is listed anyway, for the owner's #1149 Reading B: a
+    #: password re-proof from an MFA-pending session does not count as authenticating again, so
+    #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
             STEP_UP_ACTION_MFA_CONFIRM,
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
             STEP_UP_ACTION_SESSION_TERMINATE,
+            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
         }
     )
 
@@ -13604,9 +13644,13 @@ class AuthService:
         )
         return True
 
-    async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
+    async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> bool:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
         the user is notified out-of-band (ASVS 6.3.7).
+
+        Returns whether TOTP was on, read before the disable. A disable of TOTP that was never on
+        still succeeds, audited and notified, but it changed no factor, so both planes offer no
+        sign-out of the other sessions for it (BACKLOG #1147, #3393).
 
         Raises :class:`ValueError` (:data:`TOTP_REMOVAL_REFUSED`) whenever ``[security].require_mfa``
         covers the caller as a local account, its TOTP is a way past the sign-in lock
@@ -13670,6 +13714,7 @@ class AuthService:
             email=user.notify_email if user is not None else None,
             client=client,
         )
+        return user is not None and user.totp_enabled
 
     async def admin_reset_mfa(self, user_id: str, *, actor: str) -> IssuedCredential | None:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
@@ -14964,12 +15009,31 @@ class AuthService:
         await self._store.delete_custom_role(role_id)
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
+    async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:
+        """The account ids whose sessions an edit or a delete of custom role ``role_id`` would end.
+
+        BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
+        :meth:`_revoke_sessions_for_role` revokes exactly this set, so a route asking whether the
+        save ends the caller's own sessions gets the answer the revoke acts on. Empty for a role
+        nobody holds, including one that does not exist.
+
+        Compared without case. A store whose id columns compare case-insensitively (SQL Server)
+        finds the role from another spelling, and the console passes its path to these routes as
+        a plain str, so an exact match would let a save under ``CUSTOM:...`` change the role and
+        end nobody's sessions, the caller's included (the vault BACKLOG #3259 class)."""
+        wanted = role_id.casefold()
+        return frozenset(
+            user.id
+            for user in await self._load_users()
+            if any(held.casefold() == wanted for held in user.role_ids)
+        )
+
     async def _revoke_sessions_for_role(self, role_id: str) -> None:
         """Revoke the live sessions of every user currently holding ``role_id`` so a permission
         reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
-        for user in await self._load_users():
-            if role_id in user.role_ids:
-                await self._store.revoke_user_sessions(user.id)
+        # Sorted, so a revoke a store fault interrupts stops at a repeatable point.
+        for user_id in sorted(await self.sessions_ended_by_custom_role_save(role_id)):
+            await self._store.revoke_user_sessions(user_id)
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
@@ -15814,16 +15878,28 @@ class AuthService:
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
         revoked = 0
-        for user in await self._load_users():
-            if user.auth_provider != AuthProvider.AD.value or user.disabled:
-                continue
+        for user_id in sorted(await self.sessions_ended_by_ad_map_save()):
             # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
             # row, and that read filters on the wall clock: after a forward clock step past the
             # absolute lifetime it found none, and those rows would come back on the old mapping
             # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
             # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += await self._store.revoke_user_sessions(user.id)
+            revoked += await self._store.revoke_user_sessions(user_id)
         return revoked
+
+    async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
+        """The account ids whose sessions a save of either AD group map would end: every enabled
+        directory account.
+
+        BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
+        :meth:`_revoke_ad_sessions` revokes exactly this set, so a route asking whether the save
+        ends the caller's own sessions gets the answer the revoke acts on. The entries being saved
+        do not narrow it, for the reason that method's docstring gives."""
+        return frozenset(
+            user.id
+            for user in await self._load_users()
+            if user.auth_provider == AuthProvider.AD.value and not user.disabled
+        )
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""

@@ -22,7 +22,7 @@ from pathlib import Path
 
 #: Independent version root (NOT lockstep with the engine — that is the departure from
 #: ``messagefoundry-harness``); its own tag / changelog / PyPI cadence. Starts matched to the engine.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 #: The engine seam this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). Any other engine is
 #: refused at startup — the runtime backstop behind the PEP 508 compat range.
@@ -44,7 +44,7 @@ __version__ = "0.4.0"
 # If cross-seam support is ever genuinely wanted, re-widen this set AND add the CI matrix that
 # installs the MIN and MAX supported engine builds — the claim and its test land together, or not
 # at all.
-SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"c52ca8f0200fbecf"})
+SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"ea0b48d0bf69ec09"})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"

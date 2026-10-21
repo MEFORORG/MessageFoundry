@@ -13,6 +13,6 @@ into the process. It is the sole engine-client entrypoint since the PySide6 desk
 
 from __future__ import annotations
 
-from messagefoundry.apiclient.client import ApiError, EngineClient, IdpStepUpRequired
+from messagefoundry.apiclient.client import ApiError, EngineClient, IdpStepUpRequired, MfaConfirmed
 
-__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired"]
+__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed"]

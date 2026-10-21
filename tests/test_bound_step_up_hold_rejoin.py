@@ -299,7 +299,8 @@ async def test_a_proof_free_repeat_from_a_new_address_is_refused(
 def _proof_in_route_routes() -> dict[str, ast.AsyncFunctionDef]:
     """Every function in ``api/app.py`` with a parameter default that calls
     ``require_step_up_action(..., proof_in_route=True)``, by name. It reads parameter defaults in
-    that one module, which is where every JSON route declares its gate today."""
+    that one module only. The four group-wide saves in ``api/auth_routes.py`` take the same gate
+    and spend only on one branch; ``tests/test_group_save_step_up.py`` pins them (BACKLOG #3401)."""
     app_py = Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
     found: dict[str, ast.AsyncFunctionDef] = {}
     for node in ast.walk(ast.parse(app_py.read_text(encoding="utf-8"))):

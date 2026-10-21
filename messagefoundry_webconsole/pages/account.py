@@ -76,6 +76,9 @@ def login(
         # gets a reason instead of an unexplained login form.
         "expired": "Your session ended — sign in again.",
         "pwchanged": "Password changed — sign in with the new password.",
+        # BACKLOG #3401: an AD map or custom-role save that reached the caller's own account ended
+        # its sessions, this one included, so the change applies to the caller at once too.
+        "own_sessions_ended": "Saved. The change ended your own sessions, so sign in again.",
         # L5c (ADR 0068 §9) — allow-listed SSO outcome codes, never reflected text.
         # No remedy is named beyond "another way": a directory account has no password form, and
         # one bound to a federated identity signs in through its identity provider.
@@ -603,10 +606,13 @@ def _revoke_others_form(label: str) -> Markup:
 def _session_offer(others: int) -> Markup:
     """The offer to end the caller's other sessions after a factor change (BACKLOG #1147, ASVS 7.4.3).
 
-    ``others`` is the count of the caller's live sessions besides this one. The form posts to the
-    same route as the sessions page's *Sign out everywhere else*, which keeps the current session.
-    That route asks for a fresh re-proof, bound to the action, and then runs (ASVS 7.5.2). Declining
-    is doing nothing: no session ends unless the caller asks."""
+    ``others`` is how many sessions the revoke would end: every other session of the caller not yet
+    signed out, one that has gone idle included (BACKLOG #3393), as read after the factor change.
+    At least a sign-in, the reaper or another revoke before the click can still move it. The form
+    posts to the same route as the sessions page's *Sign out everywhere
+    else*, which keeps the current session. That route asks for a fresh re-proof, bound to the
+    action, and then runs (ASVS 7.5.2). Declining is doing nothing: no session ends unless the
+    caller asks."""
     if not others:
         return Markup("")  # nothing to end, as on the sessions page
     return el(
@@ -614,9 +620,9 @@ def _session_offer(others: int) -> Markup:
         el("h2", "Your other sessions"),
         el(
             "p",
-            f"You changed how you sign in. You have {others} other active session(s). If you made "
-            "this change because a device or a code may be in the wrong hands, sign them out now. "
-            "This session stays signed in.",
+            f"You changed how you sign in. You have {others} other session(s) not yet signed "
+            "out. If you made this change because a device or a code may be in the wrong hands, "
+            "sign them out now. This session stays signed in.",
         ),
         _revoke_others_form(f"Sign out my other sessions ({others})"),
         el(

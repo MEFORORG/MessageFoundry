@@ -1756,6 +1756,7 @@ async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
         "event": "restart_required",
         "fingerprint": hashlib.sha256(rotated).hexdigest(),
         "in_use": hashlib.sha256(good).hexdigest(),
+        "algorithm": "sha256",  # BACKLOG #3425: the row names the digest of both
     }
     assert restart == [want, want]
     warned = [r.getMessage() for r in caplog.records if "Restart the engine" in r.getMessage()]

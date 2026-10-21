@@ -50,6 +50,7 @@ from messagefoundry.api.auth_models import (
     LoginResponse,
     MfaConfirmRequest,
     MfaConfirmResponse,
+    MfaDisableResponse,
     MfaEnrollResponse,
     MfaResetResponse,
     MfaStatusResponse,
@@ -92,11 +93,13 @@ from messagefoundry.api.security import (
     public_route,
     recheck_standing,
     record_repeated_credential,
+    refuse_unless_step_up_window_live,
     require,
     require_paced,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
+    spend_step_up_action,
 )
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
@@ -134,6 +137,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
     AuthService,
@@ -315,6 +319,54 @@ async def _refuse_if_self(
         defects=(),
     )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+
+
+async def _refuse_own_channel_scope(
+    request: Request,
+    service: AuthService,
+    identity: Identity,
+    user_id: str,
+    target: UserRecord | None = None,
+) -> None:
+    """The channel-scope write's self-target refusal (BACKLOG #1149), one definition for both planes.
+
+    The console calls it through the seam before its own form checks (BACKLOG #3393), so a
+    self-target post with a malformed form is still refused and audited, not answered first by a
+    form error. ``set_channel_scope`` runs it again before the write, so the console's call adds
+    the order and takes nothing away."""
+    await _refuse_if_self(
+        request,
+        service,
+        identity,
+        user_id,
+        target,
+        op="channel_scope",
+        detail="another administrator must change your own channel scope",
+    )
+
+
+async def _prove_group_save(request: Request, identity: Identity, ended: frozenset[str]) -> None:
+    """The step-up of a group-wide save whose revoke would end the sessions of ``ended``.
+
+    The route's gate is ``require_step_up_action(save_ends_own_sessions, USERS_MANAGE,
+    proof_in_route=True)``: the permission, pacing, the MFA gate, the new-address check and the
+    factor-binding refusal run there, and this takes the step-up.
+
+    BACKLOG #3401 (ASVS 7.5.2, a #1149 follow-up). Each of these saves ends the sessions of every
+    account it reaches, and that can be the caller's own. On the login window alone that was a mass
+    terminate with no fresh proof. So a save that would end the caller's own sessions spends the
+    single-use ``save_ends_own_sessions`` grant, which only a re-proof after sign-in mints, and an
+    MFA-pending one never (owner ruling 2026-10-10, #1149 Reading B). Any other save keeps the
+    session window it always took, checked here because ``proof_in_route`` drops it from the gate.
+
+    ``ended`` comes from the service's own enumeration of the stored accounts, the one its revoke
+    runs, never from the identity. Not a refusal: an Administrator whose only account is a directory
+    one would then be locked out of the maps. Not a revoke that spares the caller: the edit must
+    still apply to the caller's session at once (BACKLOG #1154, ASVS 8.3.2)."""
+    if identity.user_id in ended:
+        await spend_step_up_action(request, STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS)
+    else:
+        await refuse_unless_step_up_window_live(request)
 
 
 def _login_response(
@@ -954,16 +1006,22 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
+        # BACKLOG #1147, #3393: the offer's count, read after the confirm's own session-cap run and
+        # against the rotated token. count_other_sessions answers None rather than raise, so a store
+        # fault here cannot cost the recovery codes.
+        others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         return MfaConfirmResponse(
-            recovery_codes=list(elevation.recovery_codes), token=elevation.token
+            recovery_codes=list(elevation.recovery_codes),
+            token=elevation.token,
+            other_sessions=others,
         )
 
-    @app.delete("/me/mfa", response_model=SimpleMessage)
+    @app.delete("/me/mfa", response_model=MfaDisableResponse)
     async def disable_my_mfa(
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
-    ) -> SimpleMessage:
+    ) -> MfaDisableResponse:
         """Self-service: turn off the caller's TOTP MFA. Step-up gated — you prove your current factor
         (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
         action (ADR 0077): a hijacked session inside the login window can't silently strip MFA.
@@ -974,11 +1032,31 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         must enroll another factor first. Both are CLIENT conditions, not faults, so they must
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
+        token = bearer_token(request)
+        if token is None:  # pragma: no cover - require_step_up_action authenticated this bearer
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+        return await _disable_my_mfa_core(
+            service=service, identity=identity, token=token, client=client_ip(request)
+        )
+
+    async def _disable_my_mfa_core(
+        *, service: AuthService, identity: Identity, token: str, client: str | None
+    ) -> MfaDisableResponse:
+        """The disable past :func:`disable_my_mfa`'s gate, counted against ``token``: the bearer on
+        the JSON route, the cookie session on the console's ``/ui/account/mfa/disable``, which takes
+        the same step-up in its own gate (BACKLOG #3393).
+
+        ``other_sessions`` is the offer to end the caller's other sessions (BACKLOG #1147), read
+        after the disable committed. It is 0 when TOTP was never on, since that disable changed no
+        factor, and None on a store fault, which ``count_other_sessions`` logs rather than raises."""
         try:
-            await service.disable_mfa(identity, client=client_ip(request))
+            was_on = await service.disable_mfa(identity, client=client)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        return SimpleMessage(detail="MFA disabled")
+        others = (
+            await service.count_other_sessions(identity.user_id, hash_token(token)) if was_on else 0
+        )
+        return MfaDisableResponse(detail="MFA disabled", other_sessions=others)
 
     # --- self-service session inventory (WP-10, ASVS 7.5.2/7.4.5) -------------
 
@@ -1140,9 +1218,27 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def update_custom_role(
         role_id: CustomRoleId,
         body: CustomRoleRequest,
+        request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> CustomRoleInfo:
+        """Edit a custom role. Ends the sessions of every holder, so a caller who holds it takes
+        the bound proof (BACKLOG #3401, :func:`_prove_group_save`)."""
+        ended = await service.sessions_ended_by_custom_role_save(role_id)
+        await _prove_group_save(request, identity, ended)
+        return await _update_custom_role_core(
+            role_id, body=body, service=service, identity=identity
+        )
+
+    async def _update_custom_role_core(
+        role_id: str, *, body: CustomRoleRequest, service: AuthService, identity: Identity
+    ) -> CustomRoleInfo:
+        """The edit past :func:`update_custom_role`'s step-up. The console's route takes the same
+        proof in its own gate, so the seam hands it this."""
         try:
             role = await service.update_custom_role(
                 role_id,
@@ -1165,9 +1261,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/roles/custom/{role_id}", response_model=SimpleMessage)
     async def delete_custom_role(
         role_id: CustomRoleId,
+        request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
+        """Delete a custom role. Ends the sessions of every holder, so a caller who holds it takes
+        the bound proof (BACKLOG #3401, :func:`_prove_group_save`)."""
+        ended = await service.sessions_ended_by_custom_role_save(role_id)
+        await _prove_group_save(request, identity, ended)
+        return await _delete_custom_role_core(role_id, service=service, identity=identity)
+
+    async def _delete_custom_role_core(
+        role_id: str, *, service: AuthService, identity: Identity
+    ) -> SimpleMessage:
+        """The delete past :func:`delete_custom_role`'s step-up, for the seam."""
         try:
             await service.delete_custom_role(role_id, actor=identity.username)
         except ValueError as exc:
@@ -1782,15 +1893,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         why.
 
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2): the write revokes the
-        target's sessions, as the role write does."""
-        await _refuse_if_self(
-            request,
-            service,
-            identity,
-            user_id,
-            op="channel_scope",
-            detail="another administrator must change your own channel scope",
-        )
+        target's sessions, as the role write does. As on the role write, a body that fails
+        ``ChannelScope`` is answered 422 by FastAPI before the guard runs, with no audit row; the
+        console route runs the guard before its own checks (BACKLOG #3393)."""
+        await _refuse_own_channel_scope(request, service, identity, user_id)
         try:
             await service.set_channel_scope(
                 user_id,
@@ -1820,9 +1926,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.put("/ad-group-map", response_model=SimpleMessage)
     async def set_ad_group_map(
         body: AdGroupMap,
+        request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
+        """Replace the AD-group to role map. Ends every directory account's sessions, so a caller
+        signed in through the directory takes the bound proof (BACKLOG #3401,
+        :func:`_prove_group_save`)."""
+        await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
+        return await _set_ad_group_map_core(body, service=service, identity=identity)
+
+    async def _set_ad_group_map_core(
+        body: AdGroupMap, *, service: AuthService, identity: Identity
+    ) -> SimpleMessage:
+        """The save past :func:`set_ad_group_map`'s step-up, for the seam."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await _validate_roles(service, [e.role for e in body.entries])
 
@@ -1860,9 +1981,23 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.put("/ad-group-scope-map", response_model=SimpleMessage)
     async def set_ad_group_scope_map(
         body: AdGroupScopeMap,
+        request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS, Permission.USERS_MANAGE, proof_in_route=True
+            )
+        ),
     ) -> SimpleMessage:
+        """Replace the AD-group to channel-scope map. Ends every directory account's sessions, as
+        the role map does, and takes the same step-up (BACKLOG #3401)."""
+        await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
+        return await _set_ad_group_scope_map_core(body, service=service, identity=identity)
+
+    async def _set_ad_group_scope_map_core(
+        body: AdGroupScopeMap, *, service: AuthService, identity: Identity
+    ) -> SimpleMessage:
+        """The save past :func:`set_ad_group_scope_map`'s step-up, for the seam."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await service.set_ad_group_scope_map(
             [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
@@ -2265,6 +2400,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         update_user=update_user,
         set_user_roles=set_user_roles,
         set_channel_scope=set_channel_scope,
+        refuse_own_channel_scope=_refuse_own_channel_scope,
         reset_user_password=reset_user_password,
         reset_user_mfa=reset_user_mfa,
         bind_user_federated_identity=bind_user_federated_identity,
@@ -2272,16 +2408,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         admin_revoke_user_sessions=admin_revoke_user_sessions,
         delete_user=delete_user,
         create_custom_role=create_custom_role,
-        update_custom_role=update_custom_role,
-        delete_custom_role=delete_custom_role,
+        # BACKLOG #3401: the cores past the JSON routes' step-up. Each /ui route in front of one
+        # takes the same conditional proof in its own gate.
+        update_custom_role=_update_custom_role_core,
+        delete_custom_role=_delete_custom_role_core,
         get_ad_group_map=get_ad_group_map,
         get_ad_group_scope_map=get_ad_group_scope_map,
-        set_ad_group_map=set_ad_group_map,
-        set_ad_group_scope_map=set_ad_group_scope_map,
+        set_ad_group_map=_set_ad_group_map_core,
+        set_ad_group_scope_map=_set_ad_group_scope_map_core,
         my_mfa=my_mfa,
         change_password=change_password,
         enroll_mfa=enroll_mfa,
-        disable_my_mfa=disable_my_mfa,
+        # BACKLOG #3393: the core past the JSON route's gate, given the console's cookie session.
+        disable_my_mfa=_disable_my_mfa_core,
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,

@@ -39,7 +39,14 @@ from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import lockout_escalates
-from tests._ast_sites import call_sites, callee_name, calls_to, named_func, source_has_literal
+from tests._ast_sites import (
+    call_sites,
+    callee_name,
+    calls_to,
+    named_func,
+    parse_source,
+    source_has_literal,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -407,19 +414,50 @@ def _row(text: str, key: str) -> str:
     )
 
 
-def _action_bound_json_routes() -> set[str]:
-    """Every ``METHOD path`` on the JSON auth routes whose handler takes an action-bound step-up.
-
-    Derived from the decorators and the ``Depends`` defaults, so a route that joins or leaves the set
-    changes this answer and the ``require_action_step_up`` row has to follow it.
-    """
-    tree = ast.parse(_AUTH_ROUTES.read_text(encoding="utf-8"))
-    return {
-        route
+def _action_bound_json_handlers() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """``(METHOD path, handler)`` for every JSON auth route whose handler takes an action-bound
+    step-up. Derived from the decorators and the ``Depends`` defaults."""
+    tree = parse_source(_AUTH_ROUTES.read_text(encoding="utf-8"))
+    return [
+        (route, node)
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and calls_to(node.args, _ACTION_BOUND_GATES)
         and (route := _route_of(node)) is not None
+    ]
+
+
+def _action_bound_json_routes() -> set[str]:
+    """Every ``METHOD path`` on the JSON auth routes whose handler takes an action-bound step-up,
+    so a route that joins or leaves the set changes this answer and the ``require_action_step_up``
+    row has to follow it."""
+    return {route for route, _ in _action_bound_json_handlers()}
+
+
+def _gate_moves_proof_into_route(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether the handler's action-bound gate is called with ``proof_in_route=True``, which is
+    what takes the spend out of the dependency and leaves the route to decide it."""
+    return any(
+        keyword.arg == "proof_in_route"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for gate in _ACTION_BOUND_GATES
+        for call in call_sites(func.args, gate)
+        for keyword in call.keywords
+    )
+
+
+def _conditionally_bound_json_routes() -> set[str]:
+    """The action-bound JSON routes whose handler decides in its body whether the bound proof is due.
+
+    BACKLOG #3401: each moves the proof into the route and calls ``_prove_group_save``, which
+    spends the ``save_ends_own_sessions`` grant only when the save would end the caller's own
+    sessions and otherwise checks the session window. A route that starts or stops doing both
+    changes this answer."""
+    return {
+        route
+        for route, node in _action_bound_json_handlers()
+        if _gate_moves_proof_into_route(node) and calls_to(node, {"_prove_group_save"})
     }
 
 
@@ -529,6 +567,20 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
     for route in sorted(_action_bound_json_routes()):
         if f"`{route}`" not in action:
             problems.append(f"require_action_step_up does not name the action-bound `{route}`")
+    # BACKLOG #3401: the group-wide saves are bound only when they would end the caller's own
+    # sessions. So every sentence of the row that names one must state that condition, which
+    # keeps each out of the sentences listing the unconditionally bound set.
+    condition = "only when the save would end the caller's own sessions"
+    sentences = re.split(r"\.\s+(?=[A-Z*`])", action)
+    for route in sorted(_conditionally_bound_json_routes()):
+        naming = [s for s in sentences if f"`{route}`" in s]
+        if any(condition not in s for s in naming):
+            problems.append(
+                f"require_action_step_up names `{route}` in a sentence that does not say it is "
+                f"bound {condition}"
+            )
+        elif not naming:
+            problems.append(f"require_action_step_up does not name `{route}` with its condition")
 
     kerberos = _row(section, "kerberos_enabled")
     if "0.2 target" in kerberos or "v0.1" in kerberos:
@@ -665,7 +717,29 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         "POST /users/{user_id}/reset-mfa",
         "PUT /users/{user_id}/federated-identity",
         "DELETE /users/{user_id}/federated-identity",
+        "PUT /ad-group-map",
+        "PUT /ad-group-scope-map",
+        "PUT /roles/custom/{role_id}",
+        "DELETE /roles/custom/{role_id}",
     }
+    # Of those, the group-wide saves are bound only when they would end the caller's own sessions:
+    # _prove_group_save spends the grant on that branch and checks the session window on the other
+    # (BACKLOG #3401).
+    assert _conditionally_bound_json_routes() == {
+        "PUT /ad-group-map",
+        "PUT /ad-group-scope-map",
+        "PUT /roles/custom/{role_id}",
+        "DELETE /roles/custom/{role_id}",
+    }
+    # The whole body past the docstring is that one fork, each branch a single awaited call.
+    prove = named_func(parse_source(_AUTH_ROUTES.read_text(encoding="utf-8")), "_prove_group_save")
+    body = prove.body[1:] if ast.get_docstring(prove) is not None else prove.body
+    assert [ast.unparse(st) for st in body] == [
+        "if identity.user_id in ended:\n"
+        "    await spend_step_up_action(request, STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS)\n"
+        "else:\n"
+        "    await refuse_unless_step_up_window_live(request)"
+    ]
 
     # HTTP intake: an unlisted mTLS subject is an AUTHORIZATION failure, answered 403.
     from messagefoundry.transports.http_listener import HttpSource

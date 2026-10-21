@@ -1251,6 +1251,12 @@ _PG_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
 )
+#: The rows ``revoke_user_sessions`` ends, counted (BACKLOG #3393): the sweep's clause and its
+#: ``except_token_hash`` clause, renumbered from ``$1``. Keep the two in step.
+_PG_COUNT_USER_SESSIONS_SQL: Final = (
+    "SELECT COUNT(*) FROM sessions WHERE user_id=$1 AND revoked_at IS NULL"
+    " AND ($2::text IS NULL OR token_hash != $2)"
+)
 #: Whether the account holds at least one passkey.
 _PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
@@ -10099,6 +10105,15 @@ class PostgresStore:
                     lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
                 )
         return _rowcount(status)
+
+    async def count_user_sessions(
+        self, user_id: str, *, except_token_hash: str | None = None
+    ) -> int:
+        """How many sessions :meth:`revoke_user_sessions` would end with the same arguments
+        (BACKLOG #3393). See :meth:`AuthStore.count_user_sessions`."""
+        return int(
+            await self._fetchval(_PG_COUNT_USER_SESSIONS_SQL, user_id, except_token_hash) or 0
+        )
 
     async def enforce_session_cap(
         self,

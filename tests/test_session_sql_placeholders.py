@@ -65,6 +65,9 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(
         "u", except_token_hash=_HASH, now=_NOW
     ),
+    # BACKLOG #3393: the revoke's clause, counted. Postgres renumbers it rather than sharing it.
+    "count_user_sessions": lambda s: s.count_user_sessions("u"),
+    "count_user_sessions_except": lambda s: s.count_user_sessions("u", except_token_hash=_HASH),
     "enforce_session_cap": lambda s: s.enforce_session_cap(
         "u", keep=2, idle_seconds=1800, split_mfa_pending=False, now=_NOW
     ),

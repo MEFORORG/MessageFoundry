@@ -1218,11 +1218,13 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         service_module.STEP_UP_ACTION_MFA_CONFIRM,
         service_module.STEP_UP_ACTION_WEBAUTHN_ENROLL,
         service_module.STEP_UP_ACTION_SESSION_TERMINATE,
+        service_module.STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     } == AuthService._PENDING_REFUSED_ACTIONS and _called(
         _service_func("complete_oidc_step_up"), "_factor_binding_is_blocked_hash"
     ), (
         "the IdP leg's grant refusal changed; the OIDC row and the Federated section say it covers "
-        "a factor-binding or session-terminate action."
+        "a factor-binding or session-terminate action, or a save that ends the caller's own "
+        "sessions."
     )
     reauth = _service_func("reauth")
     body = [
