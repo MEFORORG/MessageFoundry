@@ -20,7 +20,7 @@ import pytest
 
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
-from messagefoundry.auth.service import _opened_totp_usable
+from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.config.settings import AuthSettings, _env_overrides, load_settings
 from messagefoundry.pipeline.secret_rotation import dek_fingerprint
 from tests._phi_gate_provisions import (
@@ -3406,7 +3406,7 @@ def _seed_both_locks(db: Path) -> None:
                             max_lockout_seconds=86_400.0,
                             # The first cycle is set well in the past so it has lapsed by the second.
                             now=now - 5_000.0 if cycle == 0 and cycles > 1 else now,
-                            totp_usable=_opened_totp_usable,
+                            totp_usable=_opened_totp_state,
                         )
         finally:
             await s.close()

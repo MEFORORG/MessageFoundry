@@ -268,6 +268,11 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
                 "You can sign in now by entering your password and your authenticator code "
                 "together on the sign-in form."
             )
+        if event.detail.get("totp_state") == "unknown":
+            lines.append(
+                "The engine could not check your authenticator app just now, so it cannot say "
+                "whether your code will be accepted; if it is refused, ask your administrator."
+            )
         if event.detail.get("combined_passkey_sign_in"):
             lines.append(
                 "You can sign in now by entering your password and choosing 'Sign in with password "

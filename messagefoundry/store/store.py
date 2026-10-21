@@ -2682,10 +2682,16 @@ def discoverable_way_past(
     return any(passkey_is_way_past(c) for c in passkeys)
 
 
-#: The caller's rule for whether an OPENED TOTP secret is one the engine can compute codes with
-#: (BACKLOG #3422): the auth service's census rule. The store holds no TOTP logic, so the service
-#: passes it to the conditional writes that ask the way-past question.
-TotpUsable = Callable[[str | None], bool]
+#: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
+#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
+#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
+#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+TotpState = Literal["usable", "refused", "unknown"]
+
+#: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
+#: census rule. The store holds no TOTP logic, so the service passes it to the writes that ask.
+TotpUsable = Callable[[str | None], TotpState]
 
 #: Whether a record's TOTP counts as a way past, evaluated on the record a write read.
 TotpCounts = Callable[[UserAuthzRecord], bool]
@@ -2717,7 +2723,8 @@ def log_unopened_totp(user_id: str) -> None:
     _UNOPENED_TOTP_LOGGED[user_id] = now
     log.warning(
         "a TOTP cell did not open while judging a way past the sign-in lock (account %s): a store "
-        "key or cipher service fault; until it opens the TOTP counts as no way past",
+        "key or cipher service fault; until it opens the TOTP is judged unknown and every gate "
+        "applies the plain enabled-TOTP rule to it",
         user_id,
     )
 
@@ -2734,29 +2741,28 @@ async def judge_totp(
     ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
     with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
     holding SQLite's writer lock or a row lock across it would stall every other write. Under the
-    lock the verdict holds only for that exact cell: a write that finds another cell counts the
-    TOTP for nothing, which is the closed direction for every gate that needs a way past to proceed,
-    and :meth:`TotpJudgement.moved` lets :func:`totp_removal`, for which counting nothing would be
-    the OPEN direction, decline instead. A cell that does not open counts for nothing
-    (:func:`log_unopened_totp`). ``None`` for no ``usable``."""
+    lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each caller says
+    what a moved cell means for it. A cell that does not open is ``"unknown"``
+    (:func:`log_unopened_totp`), never a refusal. ``None`` for no ``usable``."""
     if usable is None:
         return None
     rule = usable
     cell = (
         None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
     )
-    verdict = False
+    state: TotpState = "refused"  # no cell: no TOTP to count
     if user is not None and cell is not None:
 
-        def judge(user_id: str, stored: str) -> bool:
+        def judge(user_id: str, stored: str) -> TotpState:
             return rule(opener(user_id, stored))
 
         try:
-            verdict = await asyncio.to_thread(judge, user.id, cell)
+            state = await asyncio.to_thread(judge, user.id, cell)
         except CipherError:
             log_unopened_totp(user.id)
+            state = "unknown"
 
-    return TotpJudgement(cell=cell, verdict=verdict)
+    return TotpJudgement(cell=cell, state=state)
 
 
 async def escalation_verdict(
@@ -2772,7 +2778,9 @@ async def escalation_verdict(
     held (:func:`judge_totp`) on a local account with TOTP on whose sign-in lock is not already
     live and can arm. It is judged on every such failure, not only near the threshold: a pre-lock
     read of the count cannot tell which of a parallel burst sets the lock. Everywhere else ``None``,
-    which escalates nothing, and no cell is opened. The one copy every backend calls."""
+    and no cell is opened; :func:`lockout_increment` then applies the plain ``totp_enabled`` rule to
+    the locked row, so a pre-read that a racing write made stale never skips an escalation. The one
+    copy every backend calls."""
     if totp_usable is None:  # typed never None; refused loudly for a caller typed ``Any``
         raise TypeError("increment_login_failure needs totp_usable, never None")
     if counter != "sign_in":
@@ -2791,14 +2799,21 @@ async def escalation_verdict(
 
 @dataclass(frozen=True)
 class TotpJudgement:
-    """A :data:`TotpCounts` from :func:`judge_totp`: the cell it judged and the verdict. Called on
-    the record a write locked, it answers for that exact cell only."""
+    """A :data:`TotpCounts` from :func:`judge_totp`: the cell it judged and what it found. Called
+    on the record a write locked, it says whether that row's TOTP counts as a way past: a usable or
+    an UNKNOWN one does, as the plain ``totp_enabled`` rule would count it, and only a KNOWN
+    refusal does not. A cell that moved since the judgement counts for nothing, the closed
+    direction for a gate that needs a way past to proceed."""
 
     cell: str | None
-    verdict: bool
+    state: TotpState
 
     def __call__(self, current: UserAuthzRecord) -> bool:
-        return self.verdict and current.row.totp_enabled and not self.moved(current)
+        return self.state != "refused" and current.row.totp_enabled and not self.moved(current)
+
+    def refuses(self, current: UserAuthzRecord) -> bool:
+        """Whether this is a KNOWN refusal of the TOTP the locked row still holds."""
+        return self.state == "refused" and current.row.totp_enabled and not self.moved(current)
 
     def moved(self, current: UserAuthzRecord) -> bool:
         """Whether the locked row's TOTP is not the one judged: enabled or replaced meanwhile."""
@@ -2860,9 +2875,10 @@ def totp_removal(
     totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
-    when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``) and no discoverable passkey
-    would remain (:func:`removal_keeps_way_past`). A TOTP that is no way past may go, and one swapped
-    for a usable enrolment between the caller's read and this write is judged as it now stands."""
+    when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
+    plain ``totp_enabled`` rule counts it) and no discoverable passkey would remain
+    (:func:`removal_keeps_way_past`). Only a KNOWN refusal may go, and a TOTP enabled or replaced
+    between the judgement and this write is declined."""
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if require_way_past:
@@ -2947,10 +2963,11 @@ def lockout_increment(
     totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
-    (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates
-    only where the locked row's TOTP is a way past by ``totp_counts`` (BACKLOG #3422): one the engine
-    can compute codes with, judged on that exact cell. With no verdict it does not escalate, the
-    closed direction for an owner who may have no way past."""
+    (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates as
+    the plain ``totp_enabled`` rule says on the locked row, EXCEPT where ``totp_counts`` holds a
+    KNOWN refusal of that exact cell (BACKLOG #3422): an enrolment this release refuses gives the
+    owner no way past, so its lock keeps the fixed length. An unknown verdict, a cell that moved,
+    and no verdict at all leave the plain rule standing."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
@@ -2965,10 +2982,11 @@ def lockout_increment(
             escalate=lockout_escalates(
                 counter,
                 auth_provider=r.row.auth_provider,
-                totp_enabled=(
-                    _totp_is_way_past(r, totp_counts)
-                    if counter == "sign_in"
-                    else r.row.totp_enabled
+                totp_enabled=r.row.totp_enabled
+                and not (
+                    counter == "sign_in"
+                    and isinstance(totp_counts, TotpJudgement)
+                    and totp_counts.refuses(r)
                 ),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),

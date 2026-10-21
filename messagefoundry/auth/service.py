@@ -175,6 +175,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     RoleRow,
     SessionRecord,
+    TotpState,
     UserAuthzRecord,
     UserRecord,
     UserRow,
@@ -2268,6 +2269,10 @@ class LockableAccountCensus:
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
+    #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
+    #: or the value would not compute), as opposed to a KNOWN refusal. Every gate counts such a TOTP
+    #: as the plain enabled-TOTP rule does; this names them as unknown (BACKLOG #3422).
+    unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
 
     @property
@@ -2376,7 +2381,16 @@ class CensusNeedsTheStoreKey(RuntimeError):
 
 
 async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
-    """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with.
+    """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with:
+    :func:`_totp_secret_state` is ``"usable"``."""
+    return await _totp_secret_state(store, user) == "usable"
+
+
+async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
+    """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
+    ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
+    refuses, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
+    open, or the value could not be computed with).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
     the account and never the value. A keyless open hands the stored ciphertext through unchanged,
@@ -2389,9 +2403,9 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
         secret = await store.get_totp_secret(user.id)
     except CipherError:
         _log_totp_undecryptable(user.username)
-        return False
+        return "unknown"
     if not secret:
-        return False
+        return "refused"
     if secret.startswith(MARKER_PREFIX):
         raise CensusNeedsTheStoreKey(
             "a TOTP secret is still ciphertext: this shell opened the store without the key it was "
@@ -2400,7 +2414,8 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
     reason = _totp_unusable_reason(secret)
     if reason == "refused":
         _log_totp_refused(user.username)
-    return reason is None
+        return "refused"
+    return "usable" if reason is None else "unknown"
 
 
 def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
@@ -2418,15 +2433,27 @@ def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None
     return None
 
 
-def _opened_totp_usable(secret: str | None) -> bool:
-    """Whether an opened TOTP secret counts as a way past the sign-in lock (ADR 0197 Amendment A):
-    present, not ciphertext a keyless open passed through, and one the engine can compute codes
-    with (:func:`_totp_unusable_reason`). The way-past gates ask it in the service and pass it to
-    the store's conditional writes (``totp_usable``), so an enrolment this release refuses is no
-    way past anywhere."""
+def _opened_totp_state(secret: str | None) -> TotpState:
+    """What an OPENED TOTP secret is (BACKLOG #3422): ``"usable"`` when the engine can compute
+    codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
+    enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
+    tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
+    gates ask it, and pass it to the store's writes as ``totp_usable``. Only ``"refused"`` moves any
+    decision away from the plain ``totp_enabled`` rule."""
     if not secret:
-        return False
-    return not secret.startswith(MARKER_PREFIX) and _totp_unusable_reason(secret) is None
+        return "refused"
+    if secret.startswith(MARKER_PREFIX):
+        return "unknown"
+    reason = _totp_unusable_reason(secret)
+    if reason == "refused":
+        return "refused"
+    return "usable" if reason is None else "unknown"
+
+
+def _opened_totp_usable(secret: str | None) -> bool:
+    """Whether an opened TOTP secret is one the engine can compute codes with
+    (:func:`_opened_totp_state` is ``"usable"``)."""
+    return _opened_totp_state(secret) == "usable"
 
 
 async def lockable_account_census(
@@ -2453,6 +2480,7 @@ async def lockable_account_census(
     site-wide veto."""
     no_way_past: list[str] = []
     undecryptable: list[str] = []
+    unknown: list[str] = []
     passkey_only: list[str] = []
     sealed = store.row_sealer() is not None
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
@@ -2462,11 +2490,17 @@ async def lockable_account_census(
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
         if user.totp_enabled:
-            if await _totp_secret_usable(store, user):
+            state = await _totp_secret_state(store, user)
+            if state == "usable":
                 continue
-            # An unusable TOTP is named, and the account still falls through: a discoverable passkey
-            # may be its working way past, which reset-mfa would remove (named in passkey_only).
             undecryptable.append(user.username)
+            if state == "unknown":
+                # Named as unknown, never as refused or as usable. The gates count it as the plain
+                # enabled-TOTP rule does, so it is not read as an account with no way past.
+                unknown.append(user.username)
+                continue
+            # A KNOWN refusal: the account still falls through, since a discoverable passkey may be
+            # its working way past, which reset-mfa would remove (named in passkey_only).
         if (
             user.password_generated
             or user.password_hash is None
@@ -2494,6 +2528,7 @@ async def lockable_account_census(
     return LockableAccountCensus(
         no_way_past=tuple(sorted(no_way_past)),
         undecryptable_totp=tuple(sorted(undecryptable)),
+        unknown_totp=tuple(sorted(unknown)),
         passkey_only=tuple(sorted(passkey_only)),
     )
 
@@ -4955,7 +4990,7 @@ class AuthService:
             user.id,
             # BACKLOG #3422: the sign-in lock escalates only where the TOTP is a way past, judged
             # by the store on the locked row's cell, and only where the failure may set the lock.
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
@@ -5200,9 +5235,12 @@ class AuthService:
         elif (
             user.auth_provider == AuthProvider.LOCAL.value
             and isinstance(user, VerifiedUser)
-            and await self._totp_way_past(user)
+            and (totp_state := await self._totp_state(user)) in ("usable", "unknown")
         ):
             notice["combined_sign_in"] = True
+            if totp_state == "unknown":
+                # Reported as unknown, never as usable or as refused (BACKLOG #3422).
+                notice["totp_state"] = "unknown"
         elif (
             user.auth_provider == AuthProvider.LOCAL.value
             and isinstance(user, VerifiedUser)
@@ -12186,7 +12224,7 @@ class AuthService:
             must_change_password=must_change,
             password_generated=False,
             require_way_past=covered,
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
@@ -12223,8 +12261,15 @@ class AuthService:
         return await self._totp_way_past(user) or await self._holds_discoverable_passkey(user)
 
     async def _totp_way_past(self, user: VerifiedUser) -> bool:
-        """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its cell opens, and the
-        engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
+        """Whether ``user``'s TOTP counts as a way past the sign-in lock: it is enabled and not a
+        KNOWN refusal (:meth:`_totp_state`). An UNKNOWN one counts, exactly as the plain
+        ``totp_enabled`` rule counts it, so a cell that cannot be opened during a cipher outage
+        never lifts a control the plain rule enforces."""
+        return await self._totp_state(user) in ("usable", "unknown")
+
+    async def _totp_state(self, user: VerifiedUser) -> TotpState | None:
+        """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
+        it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
         never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one this checked
         record's seal covered (BACKLOG #3510), opened OFF THE EVENT LOOP, since a Transit cipher's
@@ -12233,14 +12278,16 @@ class AuthService:
         notice; the store's conditional writes and the lock escalation ask the same rule
         (``totp_usable``) on the cell they lock."""
         cell = user.totp_secret_cell
-        if not user.totp_enabled or cell is None:
-            return False
+        if not user.totp_enabled:
+            return None
+        if cell is None:
+            return "refused"
         try:
             secret = await asyncio.to_thread(self._store.open_totp_secret, user.id, cell)
         except CipherError:
             log_unopened_totp(user.id)
-            return False
-        return _opened_totp_usable(secret)
+            return "unknown"
+        return _opened_totp_state(secret)
 
     async def _holds_discoverable_passkey(self, user: VerifiedUser) -> bool:
         """Whether ``user`` holds a passkey recorded as discoverable, asked of the set its seal
@@ -12373,6 +12420,14 @@ class AuthService:
                 len(census.undecryptable_totp),
                 ", ".join(census.undecryptable_totp),
             )
+        if census.unknown_totp:
+            _log.warning(
+                "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
+                "value would not compute): %s. Until they can be, every gate treats each as an "
+                "enabled TOTP. Check the store key and the cipher service before anything else.",
+                len(census.unknown_totp),
+                ", ".join(census.unknown_totp),
+            )
         keep_passkey = census.reset_would_remove_a_passkey
         if keep_passkey:
             _log.warning(
@@ -12391,6 +12446,7 @@ class AuthService:
                     "no_way_past": list(census.no_way_past),
                     "undecryptable_totp": list(census.undecryptable_totp),
                     "reset_would_remove_a_passkey": list(keep_passkey),
+                    "unknown_totp": list(census.unknown_totp),
                 }
             ),
         )
@@ -13581,7 +13637,7 @@ class AuthService:
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
         if (
             not await self._store.disable_totp(
-                identity.user_id, require_way_past=covered, totp_usable=_opened_totp_usable
+                identity.user_id, require_way_past=covered, totp_usable=_opened_totp_state
             )
             and covered
         ):
@@ -14360,7 +14416,7 @@ class AuthService:
             identity.user_id,
             credential_id_hash,
             require_way_past=keep_way_past,
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
         ):
             if keep_way_past and await self._passkey_still_held(identity.user_id, target):
                 raise ValueError(PASSKEY_REMOVAL_REFUSED)

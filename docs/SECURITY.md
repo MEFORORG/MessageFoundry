@@ -3256,7 +3256,12 @@ the enrol-first confinement does not reach the TOTP removal. Nor does the last-f
 such a TOTP as a factor beside the last passkey, and the sign-in lock escalates only where the TOTP
 is usable. The census names an account holding one beside a working
 discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
-cure is the holder removing the authenticator app and enrolling it again.
+cure is the holder removing the authenticator app and enrolling it again. **Only a KNOWN refusal
+changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a store-key
+fault, or a cipher service such as Transit that does not answer) or its value will not compute, is
+**unknown**: every gate then applies the plain enabled-TOTP rule, so it still counts as a way past
+and as a factor, its removal is refused as before, and the sign-in lock still escalates. The census
+names such an account as unknown, never as refused.
 
 **Two limits of the passkey way past, stated.** At least these:
 

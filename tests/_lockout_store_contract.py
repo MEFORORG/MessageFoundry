@@ -52,7 +52,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.service import _opened_totp_usable
+from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.auth.tokens import credential_id_hash
 
 #: Discoverable passkeys stored under today's credential-id hash scheme (BACKLOG #3423): only such a
@@ -98,7 +98,7 @@ async def _fail(
         max_lockout_seconds=MAX_LOCKOUT_SECONDS,
         now=now,
         # The service's rule (BACKLOG #3422), a required argument.
-        totp_usable=_opened_totp_usable,
+        totp_usable=_opened_totp_state,
     )
     return (result.attempts, result.just_locked, result.cycles)
 
@@ -124,6 +124,8 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_conditional_rotation_on_a_passkey(store)
     await _assert_refused_totp_is_no_way_past(store)
     await _assert_refused_totp_keeps_the_fixed_sign_in_lock(store)
+    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store)
+    await _assert_a_stale_pre_read_still_escalates(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -441,7 +443,7 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
                 password_generated=False,
                 must_change_password=False,
                 require_way_past=True,
-                totp_usable=_opened_totp_usable,
+                totp_usable=_opened_totp_state,
             )
         )
 
@@ -465,21 +467,21 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     # The conditional removals (AC-A3a): the last discoverable passkey goes only while TOTP stands,
     # and TOTP goes only while a discoverable passkey stands, each judged in its own write.
     assert not await store.delete_webauthn_credential(
-        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
     ), "the last way past was deleted"
     assert await store.get_webauthn_credential(_PK_RESIDENT) is not None
     assert await store.delete_webauthn_credential(
-        "rot-pk1", "rot-pk-plain", require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", "rot-pk-plain", require_way_past=True, totp_usable=_opened_totp_state
     )
     staged_cell = await store.set_totp_secret("rot-pk1", secret="JBSWY3DPEHPK3PXP", now=5.0)
     assert await store.enable_totp(
         "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
     )
     assert await store.delete_webauthn_credential(
-        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
     ), "TOTP stands, so the passkey may go"
     assert not await store.disable_totp(
-        "rot-pk1", now=6.0, require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", now=6.0, require_way_past=True, totp_usable=_opened_totp_state
     ), "TOTP went with no discoverable passkey left"
     user = await store.get_user("rot-pk1")
     assert user is not None and user.totp_enabled
@@ -487,12 +489,102 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
         _cred("rot-pk1", "again", id_hash=_PK_AGAIN, created_at=7.0, discoverable=True)
     )
     assert await store.disable_totp(
-        "rot-pk1", now=8.0, require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", now=8.0, require_way_past=True, totp_usable=_opened_totp_state
     )
     user = await store.get_user("rot-pk1")
     assert user is not None and not user.totp_enabled
     await store.delete_all_webauthn_credentials("rot-pk1")
     await store.delete_user("rot-pk1")
+
+
+async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any) -> None:
+    """BACKLOG #3422, on every backend: a TOTP cell that does not open (a stub cipher raising
+    ``CipherError``, as a Transit outage does) is UNKNOWN, and every store decision then follows
+    the plain ``totp_enabled`` rule, never the refused-TOTP one. The sign-in lock still escalates;
+    the TOTP cannot be removed while only a passkey that is not discoverable would remain; and that
+    passkey may go, because the TOTP still counts."""
+    from messagefoundry.store.crypto import CipherError
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="lock-uk1",
+        username="lock-uk-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret("lock-uk1", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(
+        "lock-uk1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+    )
+    plain = credential_id_hash(b"lock-uk-plain")
+    await store.add_webauthn_credential(_cred("lock-uk1", "plain", id_hash=plain))
+
+    def outage(_user_id: str, _cell: str | None) -> str | None:
+        raise CipherError("the cipher service did not answer")
+
+    store.open_totp_secret = outage
+    try:
+        first = await _lock_cycle(store, "lock-uk1", start=10_000.0, counter="sign_in")
+        second = await _lock_cycle(store, "lock-uk1", start=first + 1.0, counter="sign_in")
+        assert second - (first + 1.0 + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+            "an unknown TOTP lost the sign-in lock's escalation"
+        )
+        assert not await store.disable_totp(
+            "lock-uk1", now=50_000.0, require_way_past=True, totp_usable=_opened_totp_state
+        ), "an unknown TOTP was removed beside a passkey that is not discoverable"
+        user = await store.get_user("lock-uk1")
+        assert user is not None and user.totp_enabled
+        assert await store.delete_webauthn_credential(
+            "lock-uk1", plain, require_way_past=True, totp_usable=_opened_totp_state
+        ), "an unknown TOTP did not count as the account's way past"
+    finally:
+        del store.open_totp_secret
+    await store.disable_totp("lock-uk1", now=60_000.0)
+    await store.delete_user("lock-uk1")
+
+
+async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
+    """The escalation verdict is judged on a read taken before the write's lock. When that read is
+    stale (here it shows a live lock that a racing ``clear_lockout`` already lifted), no verdict is
+    judged, and the locked write falls back to the plain ``totp_enabled`` rule on the row it holds:
+    it escalates, as before BACKLOG #3422, rather than skipping the escalation."""
+    import dataclasses
+
+    await store.create_user(
+        user_id="lock-st1",
+        username="lock-st-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret("lock-st1", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(
+        "lock-st1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+    )
+    first = await _lock_cycle(store, "lock-st1", start=10_000.0, counter="sign_in")
+    real_get_user = store.get_user
+
+    async def stale(user_id: str) -> Any:
+        user = await real_get_user(user_id)
+        return None if user is None else dataclasses.replace(user, locked_until=1e12)
+
+    store.get_user = stale
+    try:
+        for i in range(THRESHOLD):
+            await _fail(store, "lock-st1", now=first + 1.0 + i, counter="sign_in")
+    finally:
+        del store.get_user
+    user = await store.get_user("lock-st1")
+    assert user is not None and user.locked_until is not None
+    second = float(user.locked_until)
+    assert second - (first + 1.0 + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+        "a stale pre-read skipped the sign-in lock's escalation"
+    )
+    await store.disable_totp("lock-st1", now=60_000.0)
+    await store.delete_user("lock-st1")
 
 
 async def _assert_refused_totp_keeps_the_fixed_sign_in_lock(store: Any) -> None:
@@ -550,7 +642,7 @@ async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
     with pytest.raises(ValueError):
         await store.delete_webauthn_credential("rot-rf1", _RF_RESIDENT, require_way_past=True)
     assert not await store.delete_webauthn_credential(
-        "rot-rf1", _RF_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-rf1", _RF_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
     ), "a refused TOTP freed the last discoverable passkey"
     assert await store.get_webauthn_credential(_RF_RESIDENT) is not None
     await store.delete_all_webauthn_credentials("rot-rf1")
@@ -568,7 +660,7 @@ async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
-        totp_usable=_opened_totp_usable,
+        totp_usable=_opened_totp_state,
     ), "a refused TOTP opened the rotation"
     user = await store.get_user("rot-rf1")
     assert user is not None and user.password_hash == "h-issued"
@@ -596,7 +688,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
-        totp_usable=_opened_totp_usable,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None
@@ -621,7 +713,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
-        totp_usable=_opened_totp_usable,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
@@ -636,7 +728,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
-        totp_usable=_opened_totp_usable,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None

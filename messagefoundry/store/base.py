@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mappi
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -2223,7 +2223,7 @@ class AuthStore(Protocol):
         password_generated: bool,
         must_change_password: bool = True,
         require_way_past: bool = False,
-        totp_usable: Callable[[str | None], bool] | None = None,
+        totp_usable: Callable[[str | None], Literal["usable", "refused", "unknown"]] | None = None,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2362,7 +2362,7 @@ class AuthStore(Protocol):
         *,
         now: float | None = None,
         require_way_past: bool = False,
-        totp_usable: Callable[[str | None], bool] | None = None,
+        totp_usable: Callable[[str | None], Literal["usable", "refused", "unknown"]] | None = None,
     ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
@@ -2398,7 +2398,7 @@ class AuthStore(Protocol):
         credential_id_hash: str,
         *,
         require_way_past: bool = False,
-        totp_usable: Callable[[str | None], bool] | None = None,
+        totp_usable: Callable[[str | None], Literal["usable", "refused", "unknown"]] | None = None,
     ) -> bool: ...
 
     async def rehash_webauthn_credential(
@@ -2462,7 +2462,7 @@ class AuthStore(Protocol):
         # BACKLOG #3422: the caller's rule for whether an opened TOTP secret is usable. REQUIRED and
         # never None, so no caller can omit it and silently turn the sign-in lock's escalation off:
         # the sign-in lock escalates only where the account's TOTP is a way past by it.
-        totp_usable: Callable[[str | None], bool],
+        totp_usable: Callable[[str | None], Literal["usable", "refused", "unknown"]],
         now: float | None = None,
     ) -> LockoutIncrement: ...
 

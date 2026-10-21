@@ -46,7 +46,7 @@ from messagefoundry.auth.service import (
     AuthService,
     _credential_lock_key,
     _directory_login_refusal,
-    _opened_totp_usable,
+    _opened_totp_state,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -662,7 +662,7 @@ async def test_parallel_store_increments_each_land_and_lock_once() -> None:
                         lockout_seconds=900.0,
                         max_lockout_seconds=86_400.0,
                         now=now,
-                        totp_usable=_opened_totp_usable,
+                        totp_usable=_opened_totp_state,
                     )
                     for _ in range(burst)
                 )
@@ -1223,7 +1223,7 @@ async def _set_second_step_lock(store: MessageStore, user_id: str) -> None:
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=time.time(),
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
         )
 
 
@@ -2228,7 +2228,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=clock.now,
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
         )
         assert result.just_locked
         await service._record_lock(user, "second_step", result, client=None, factor="password")
@@ -2334,7 +2334,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=clock.now,
-            totp_usable=_opened_totp_usable,
+            totp_usable=_opened_totp_state,
         )
         await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
         notice = (await _lock_notices(service, notifier))[-1]
@@ -2402,7 +2402,7 @@ async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failu
                 lockout_seconds=900.0,
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
-                totp_usable=_opened_totp_usable,
+                totp_usable=_opened_totp_state,
             )
         assert (await service.reauth(out.identity, password, token=out.token)).ok
         flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
@@ -3417,7 +3417,7 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
                 password_generated=False,
                 must_change_password=False,
                 require_way_past=True,
-                totp_usable=_opened_totp_usable,
+                totp_usable=_opened_totp_state,
             ), "the holder's conditional write must match here, TOTP is still on"
             await real_disable(user_id, **k)
 
