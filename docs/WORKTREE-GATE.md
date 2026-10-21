@@ -58,7 +58,9 @@ for the checkouts named in its allowlist:
    cwd, cannot create a worktree for itself, and — measured — its blocked edits do **not** reliably surface
    back to the parent: the parent's result came back with an empty `permission_denials` list. A fan-out
    from the primary would therefore appear to succeed while writing nothing. Stopping the dispatch costs
-   one second; letting it run costs the whole workflow.
+   one second; letting it run costs the whole workflow. Only an `Agent`/`Task` call whose `subagent_type`
+   is exactly `web-fetch` or `claude-code-guide`, the two built-in types with no shell, passes; the
+   gate's rule 2 header comment says why and names the residual.
 
 3. **A git command that swaps the primary's working tree** — `checkout`, `switch`, `reset`, `restore`,
    `stash`, `clean`, `rebase`, `merge`, `cherry-pick`, `revert`, `am`, `apply`.

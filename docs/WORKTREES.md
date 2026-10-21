@@ -1510,7 +1510,9 @@ registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.js
 1. a **`Write`/`Edit`/`MultiEdit`/`NotebookEdit` whose target path is inside the primary's working tree**;
 2. a **`Task`/`Agent`/`Workflow` dispatch made from the primary** — a subagent inherits the parent's cwd,
    can't create a worktree for itself, and its blocked edits don't reliably surface back to the parent, so
-   a fan-out from the primary would *appear* to succeed while writing nothing.
+   a fan-out from the primary would *appear* to succeed while writing nothing. Only an `Agent`/`Task` call
+   whose `subagent_type` is exactly `web-fetch` or `claude-code-guide`, the two built-in types with no
+   shell, passes; the gate's rule 2 header comment says why and names the residual.
 3. an **`EnterWorktree` tool call**, which relocates a **live** session into a worktree — that re-files the
    session's chat transcript under the worktree's slug, so the conversation drops out of the session list of
    the window it was born in (nothing is deleted; the window just stops looking there). Open a **fresh**
