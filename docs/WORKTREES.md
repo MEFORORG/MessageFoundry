@@ -830,19 +830,18 @@ To carry a PR to completion without a hand-written poll loop, run
 pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr <N> -Until merged
 ```
 
-`-Until` is `merged`, `closed` or `checks-complete`. It exits 0 when the condition is met, 2 on a
-timeout, and 1 on anything else, including a PR closed without merging under `-Until merged`. It
-prints one line per state change, and for `merged` and `closed` that line carries `mergeable_state`,
-so a branch that went `BEHIND` while you waited is visible. `checks-complete` reads branch
-protection's required contexts once and waits until each has reported; it says so in its output
-when it cannot read them.
+`-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out and error
+apart. It prints one line per state change, and for `merged` and `closed` that line carries REST's
+lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values in the table
+above. **That state is printed, not acted on:** a branch that went `behind` while you waited still
+runs to the timeout, which is the two-armed watcher described just above. `checks-complete` waits
+for every context the base branch requires, not only the checks that already exist.
 
-The bounds are not options. The interval is raised to at least 120 s and the total lowered to at
-most 60 minutes. Every read is REST through `gh api`, never `gh pr`, so it also runs in a cloud
-session, and is conditional on the last ETag, so an unchanged answer is a 304 that does not count
-against the shared rate limit. It refuses to start when `gh api rate_limit` shows fewer than 500 core
-requests left. Why each bound exists, and why it does not trip
-[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1), is in the script's header.
+Its interval floor, total ceiling and starting rate-budget floor are fixed, not options. Every read
+is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on
+the last ETag, so an unchanged answer does not count against the shared rate limit. The script's
+header is the one place that states the numbers, the exit codes, and why it does not trip
+[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
 
 ### Resolving a conflict: never take a side wholesale
 
