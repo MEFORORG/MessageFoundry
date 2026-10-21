@@ -2098,12 +2098,15 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     local_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))
     doubling = (
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
-        "account, and the sign-in lock does so only on a local account with a TOTP enrolled "
-        "that is usable or that the engine could not check; every other lock keeps "
-        "`lockout_minutes`"
+        "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
+        "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
+        "or whose value will not compute, still escalates. Every other lock keeps "
+        "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
+        "serial failures only: a race listed under [WebAuthn passkeys]"
     )
     assert doubling in " ".join(local_row[2].split()), (
-        "the Local row's brute-force cell must state which locks double, as lockout_escalates does."
+        "the Local row's brute-force cell must state which locks double, as lockout_escalates "
+        "and lockout_increment's refused-TOTP rule do."
     )
     for token in (
         "**Set this to `administrators`**, which frees only a **local** account that does not "
