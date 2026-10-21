@@ -160,7 +160,7 @@ def test_pin_outcome_is_unchanged(tmp_path: Path) -> None:
 
 
 def test_pin_compare_is_constant_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """RED when: `evaluate_anchor` goes back to `fingerprint == _normalize_pin(spec.pin)`."""
+    """RED when: `evaluate_anchor` goes back to `fingerprint == parse_anchor_pin(spec.pin).digest`."""
     path, digest = _anchor(tmp_path)
     calls = _spy(monkeypatch, trust_anchors)
 
