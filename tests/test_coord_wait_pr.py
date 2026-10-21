@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -131,8 +132,12 @@ def wait_pr(
     plan: dict[str, list[Any]],
     *args: str,
     env: dict[str, str] = SEAMS,
+    gh: str | None = None,
 ) -> Run:
-    """Run the script with ``-Until until``; ``plan`` maps a REST path to its answers in order."""
+    """Run the script with ``-Until until``; ``plan`` maps a REST path to its answers in order.
+
+    ``gh`` replaces the stub as ``-GhCommand``, so the plan is not read.
+    """
     plan.setdefault("rate_limit", [rate(4000)])
     log, counts, sleeps = tmp_path / "gh.log", tmp_path / "counts.json", tmp_path / "sleeps.log"
     pids = tmp_path / "hung.log"
@@ -159,7 +164,7 @@ def wait_pr(
             "-Pr",
             str(PR),
             "-GhCommand",
-            str(stub),
+            gh or str(stub),
             "-SleepCommand",
             str(sleeper),
             "-Until",
@@ -516,27 +521,38 @@ def test_two_reads_that_need_a_push_on_one_head_exit_3(tmp_path: Path, stale: st
     assert run.sleeps == [120]
 
 
-MERGED = pr("closed", merged=True)
-HEAD_B = "b" * 40
+DIRTY = ok(pr(mergeable="dirty"))
+MERGED = ok(pr("closed", merged=True))
 
 
 @pytest.mark.parametrize(
     ("reads", "code", "sleeps"),
     [
         # A clean read between two dirty ones resets the count, so the merge is waited for.
-        ([pr(mergeable="dirty"), pr(mergeable="clean"), pr(mergeable="dirty"), MERGED], 0, 3),
+        ([DIRTY, ok(pr(mergeable="clean")), DIRTY, MERGED], 0, 3),
         # Dirty on head A, then on head B: B has been read dirty once, not twice.
-        ([pr(mergeable="dirty"), pr(mergeable="dirty", sha=HEAD_B), MERGED], 0, 2),
-        # Still computing neither counts nor resets: exit 3 on the third read, not the second.
-        ([pr(mergeable="dirty"), pr(mergeable="unknown"), pr(mergeable="dirty"), MERGED], 3, 2),
-        ([pr(mergeable="dirty"), pr(mergeable=None), pr(mergeable="dirty"), MERGED], 3, 2),
+        ([DIRTY, ok(pr(mergeable="dirty", sha="b" * 40)), MERGED], 0, 2),
+        # A closed read resets too: closed and reopened is a fresh start.
+        ([DIRTY, ok(pr("closed", mergeable="dirty")), DIRTY, MERGED], 0, 3),
+        # Still computing, or no answer at all, neither counts nor resets: exit 3 on the third
+        # read, not the second.
+        ([DIRTY, ok(pr(mergeable="unknown")), DIRTY, MERGED], 3, 2),
+        ([DIRTY, ok(pr(mergeable=None)), DIRTY, MERGED], 3, 2),
+        ([DIRTY, {"status": 502}, DIRTY, MERGED], 3, 2),
     ],
-    ids=["clean-resets", "new-head-resets", "unknown-is-nothing", "null-is-nothing"],
+    ids=[
+        "clean-resets",
+        "new-head-resets",
+        "closed-resets",
+        "unknown-is-nothing",
+        "null-is-nothing",
+        "transient-is-nothing",
+    ],
 )
 def test_what_resets_the_needs_a_push_count(
     tmp_path: Path, reads: list[dict[str, Any]], code: int, sleeps: int
 ) -> None:
-    run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(r) for r in reads]})
+    run = wait_pr(tmp_path, "merged", {PR_PATH: reads})
     assert run.code == code, run.err
     assert ("needs a push" in run.out) == (code == 3)
     assert run.sleeps == [120] * sleeps
@@ -568,17 +584,21 @@ def test_only_until_merged_acts_on_a_pr_that_needs_a_push(tmp_path: Path, until:
 
 
 def test_a_gh_call_that_hangs_is_killed_and_counted_as_transient(tmp_path: Path) -> None:
-    """Two hung reads keep the wait going; the third in a row is exit 1, and none survives."""
+    """Two hung reads keep the wait going; the third in a row is exit 1, and none survives.
+
+    The timeout covers every call, so it is long enough for a cold pwsh start of the stub on a
+    loaded runner, and short enough that three of them fit the per-test cap.
+    """
     psutil = pytest.importorskip("psutil")
     run = wait_pr(
         tmp_path,
         "merged",
         {PR_PATH: [ok(pr()), {"hang": True}]},
         "-GhTimeoutSeconds",
-        "5",
+        "8",
     )
     assert run.code == 1, run.out
-    assert f"gh api {PR_PATH} did not finish within 5 s and was killed" in run.out
+    assert f"gh api {PR_PATH} did not finish within 8 s and was killed" in run.out
     assert "three transient failures in a row" in run.err
     assert run.sleeps == [120, 120, 120]
     assert len(run.hung) == 3
@@ -598,6 +618,23 @@ def test_the_timeout_seam_is_refused_outside_tests(tmp_path: Path) -> None:
     assert run.code == 1
     assert "-GhTimeoutSeconds is a test seam" in run.err
     assert run.calls == []
+
+
+def test_a_gh_that_is_not_found_is_an_error_before_any_call(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {}, gh=str(tmp_path / "no-such-gh.exe"))
+    assert run.code == 1
+    assert "cannot find gh as" in run.err
+
+
+def test_a_program_gh_runs_as_itself_and_its_exit_code_is_read(tmp_path: Path) -> None:
+    """The path a real gh takes: a program, not a .ps1 stand-in, run with the gh arguments.
+
+    Python stands in for it: `python api ...` cannot open a file named `api`, prints no status
+    line and exits 2, so the starting read fails with that exit code in the message.
+    """
+    run = wait_pr(tmp_path, "merged", {}, gh=sys.executable)
+    assert run.code == 1
+    assert "gh api rate_limit printed no HTTP status line (exit 2)" in run.err
 
 
 def test_a_weak_etag_keeps_its_quotes_on_the_way_to_gh(tmp_path: Path) -> None:
