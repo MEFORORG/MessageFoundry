@@ -4470,10 +4470,11 @@ jobs:
           # can read or change. This key inherits BUILTIN\Users read from RUNNER_TEMP. So strip its
           # inherited entries, which are all it has, as openssl wrote it. Then grant SYSTEM and
           # Administrators full, and the service account read. LocalSystem's account is SYSTEM, so
-          # it gets no second entry. Last, run the engine's own check on this key. A key it refuses
-          # then fails this step by name, and the service is never started with it.
-          # tests/test_service_token_hardening.py ties this key to every key file the samples graph
-          # names, so a second one fails on the pull request.
+          # it gets no second entry. Last, run the engine's own check on this key, as this account.
+          # It shows no broad group can reach the key. Whether the service account can read it is
+          # shown only when the service starts. tests/test_service_token_hardening.py ties this key
+          # to the key files the engine's preflight judges in the samples graph, so a second one
+          # fails on the pull request.
           $clientKeyGrants = @("*S-1-5-18:F", "*S-1-5-32-544:F")
           if ($env:SMOKE_ACCOUNT -ne "localsystem") { $clientKeyGrants += "${grantee}:R" }
           & icacls $key /inheritance:r /grant:r $clientKeyGrants | Out-Null
