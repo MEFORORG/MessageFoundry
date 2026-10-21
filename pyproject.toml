@@ -343,13 +343,16 @@ vault = ["hvac>=2.3.0,<3", "requests>=2.32.2"]
 fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The browser ops console ([security].serve_web_console, ADR 0065/0143) is a separately-versioned
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
-# in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
-# 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step
-# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a floor, no ceiling, and a re-lock). Until
-# then it installs as its own distribution; CI and a checkout use
-# `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
-# serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
+# in-process via mount_ui. The extra is a floor with no ceiling (docs/WEBCONSOLE-PACKAGE.md says why),
+# raised at each console release (packaging/messagefoundry-webconsole/RELEASE.md step 1). The cycle
+# back to this engine (the console requires messagefoundry>=X) resolves under uv and pip. The floor can
+# only name a console already on PyPI, or `uv lock` fails. The two --all-extras lock exports leave the
+# console out; security.yml's DEP-1 step says why. CI and a checkout still install the console
+# editable, `-e packaging/messagefoundry-webconsole`. With the
+# package absent, serve refuses an explicit serve_web_console=true and degrades a default-on console
+# to JSON-only with a warning (__main__).
 # The legacy [api].serve_ui key is rejected at load (ADR 0118, settings._RELOCATED_TO_SECURITY).
+webconsole = ["messagefoundry-webconsole>=0.5.0"]
 dev = [
     "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     # >=1.3.0: 0.26 added asyncio_default_test_loop_scope (BACKLOG #17), but 0.26 requires pytest<9.

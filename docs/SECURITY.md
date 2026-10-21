@@ -6728,7 +6728,7 @@ with per-package hashes), both committed. CI verifies they're in sync (`uv lock 
 
 ```
 uv lock                                                              # update uv.lock from pyproject
-uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
+uv export --all-extras --no-emit-project --no-emit-package messagefoundry-webconsole --format requirements.txt -o requirements.lock
 ```
 
 For a fully reproducible, tamper-resistant install, `pip install --require-hashes -r requirements.lock`

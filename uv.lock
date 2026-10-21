@@ -1396,6 +1396,9 @@ vault = [
 webauthn = [
     { name = "webauthn" },
 ]
+webconsole = [
+    { name = "messagefoundry-webconsole" },
+]
 x12 = [
     { name = "pyx12" },
 ]
@@ -1442,6 +1445,7 @@ requires-dist = [
     { name = "hvac", marker = "extra == 'vault'", specifier = ">=2.3.0,<3" },
     { name = "ldap3", specifier = ">=2.9" },
     { name = "lxml", marker = "extra == 'xml'", specifier = ">=6.0.0" },
+    { name = "messagefoundry-webconsole", marker = "extra == 'webconsole'", specifier = ">=0.5.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.20" },
@@ -1474,7 +1478,7 @@ requires-dist = [
     { name = "websockets", specifier = "==17.2" },
     { name = "xmlschema", marker = "extra == 'xml'", specifier = ">=4.0.0" },
 ]
-provides-extras = ["dev", "dicom", "fhir", "fuzz", "harness", "otel", "postgres", "sftp", "sqlserver", "vault", "webauthn", "x12", "xml"]
+provides-extras = ["dev", "dicom", "fhir", "fuzz", "harness", "otel", "postgres", "sftp", "sqlserver", "vault", "webauthn", "webconsole", "x12", "xml"]
 
 [package.metadata.requires-dev]
 ci-quality = [
@@ -1492,6 +1496,17 @@ release-tools = [
     { name = "build", specifier = "==1.6.1" },
     { name = "cyclonedx-bom", specifier = "~=7.3.1" },
     { name = "sigstore", specifier = "==4.4.0" },
+]
+
+[[package]]
+name = "messagefoundry-webconsole"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "messagefoundry" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/d7/b78dd5a12d34ab610ae37ff2b0769aaf138e1bd56441a2e4a027c4cde9d8/messagefoundry_webconsole-0.5.0-py3-none-any.whl", hash = "sha256:6edaa382db665bd09db8c1d3d1f0b4b250976e37b53ab059767a53f2aca3496e", size = 345574, upload-time = "2026-10-21T19:12:01.248Z" },
 ]
 
 [[package]]
