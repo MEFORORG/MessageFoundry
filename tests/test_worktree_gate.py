@@ -958,7 +958,11 @@ def test_unparseable_input_is_allowed_when_the_gate_is_off(
 
 def test_hook_input_is_decoded_as_utf8_not_the_console_code_page(tmp_path: Path) -> None:
     """Claude Code writes raw UTF-8. Read through the console code page, a non-ASCII primary's path
-    arrived mangled, never matched its allowlist entry, and the write was allowed."""
+    arrived mangled, never matched its allowlist entry, and the write was allowed.
+
+    DISCRIMINATES ONLY WHERE THE CONSOLE CODE PAGE IS NOT UTF-8 (measured: under 65001 the old reader
+    decoded this correctly too; under 437 it read U+00E9 as two characters). It does not force a code
+    page itself, because `chcp` changes the console every parallel test shares."""
     primary = tmp_path / "Repo-\u00e9"
     allowlist = tmp_path / "repos.txt"
     allowlist.write_text(f"{primary}\n", encoding="utf-8")
