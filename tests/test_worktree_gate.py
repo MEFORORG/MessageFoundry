@@ -321,6 +321,24 @@ def test_an_invisible_character_does_not_exempt_a_dispatch_cwd(
     assert_denied(run_gate(dispatch(cwd, "Agent", "general-purpose"), repos_file))
 
 
+def test_a_combining_mark_after_the_root_does_not_hide_a_write_into_the_primary(
+    primary: Path, repos_file: Path
+) -> None:
+    """The culture StartsWith is FALSE here and the ordinal one true, so the governed test needs both.
+    The directory is inside the primary, so the write must be denied."""
+    target = primary / "\u0301a" / "app.py"
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+def test_a_lookalike_of_the_primary_itself_stays_governed(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The culture half of the governed test, kept on purpose: rule 3b's culture -eq reads a linked
+    worktree at this path as the primary and leaves it to rule 3, so rule 3 must still govern it."""
+    lookalike = tmp_path / (primary.name + "\u200b") / "src" / "app.py"
+    assert_denied(run_gate(edit(lookalike, cwd=primary), repos_file))
+
+
 def test_relative_path_is_resolved_against_cwd_then_denied(primary: Path, repos_file: Path) -> None:
     assert_denied(run_gate(edit("src/app.py", cwd=primary), repos_file))
 
@@ -890,11 +908,16 @@ def test_input_that_parses_but_names_nothing_governed_fails_open(
 ) -> None:
     """A guardrail that wedges every tool call on a bad payload gets uninstalled, and then it guards
     nothing. Input that parses, or is empty, but carries no governed field is allowed. Input that does
-    not parse is the one exception, below."""
+    not parse is an exception, below."""
     assert run_gate(junk, repos_file) is None
 
 
-_UNPARSEABLE = ["not json", '{"tool_name": "Edit", ', '{"tool_name": "Edit"} trailing']
+_UNPARSEABLE = [
+    "not json",
+    '{"tool_name": "Edit", ',
+    '{"tool_name": "Edit"} trailing',
+    '{"tool_name": "Edit", "tool_input": {"": 1}}',  # ConvertFrom-Json refuses an empty key
+]
 
 
 @pytest.mark.parametrize("junk", _UNPARSEABLE)

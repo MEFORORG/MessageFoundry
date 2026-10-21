@@ -9,7 +9,8 @@
     it governs every session in every worktree the moment it lands -- a project-scoped hook would live on
     one branch and reach the other worktrees only once each merged it.
 
-    It denies two things, and only inside a governed primary checkout:
+    It denies two things, and only inside a governed primary checkout (hook input it cannot parse is
+    denied anywhere while the gate is on; see FAILS OPEN below):
 
       1. A Write/Edit/MultiEdit/NotebookEdit whose TARGET PATH is inside the primary checkout -- its working
          tree, AND the shared .git beside it. Those are two different things and the difference is
@@ -32,8 +33,9 @@
 
     FAILS OPEN on error paths such as missing fields and an unreadable allowlist. A guardrail that
     wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT DOES NOT PARSE IS
-    THE EXCEPTION: while the allowlist governs anything, it is DENIED, because the gate cannot tell
-    whether such a call is governed (see the comment above the ConvertFrom-Json call).
+    ONE EXCEPTION: while the allowlist governs anything, it is DENIED in every session, governed or
+    not, because the gate cannot tell whether such a call is governed (see the comment above the
+    ConvertFrom-Json call).
 
     This is a guardrail against the ACCIDENTAL primary edit -- the "I forgot to spin up a worktree" case.
     It is NOT a security boundary: it inspects tool arguments, so a file written from a shell command is
@@ -2314,13 +2316,18 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
 # A PARSE FAILURE IS RECORDED, NOT ALLOWED. It used to exit 0, which let through any payload
 # ConvertFrom-Json refuses -- for one, PowerShell 7 throws on keys that differ only by case, so a
 # tool_input carrying both `subagent_type` and `SUBAGENT_TYPE` reached no rule at all. The deny waits
-# for the allowlist below, so the kill switch still turns the gate off. Not -AsHashtable: it accepts
-# such keys, but its lookups are case-sensitive where every read in this file relies on a
-# PSCustomObject's case-insensitive ones. Empty stdin and a bare `null` parse to nothing without an
-# error and still exit 0 here: they carry no tool call to judge.
+# for the allowlist below, so the kill switch still turns the gate off. It also comes before any cwd
+# or path is known, so it fires in every session while anything is governed. Not -AsHashtable: it
+# accepts such keys, but every read in this file is written for a PSCustomObject (member access,
+# `.PSObject.Properties` in rule 2), and a hashtable answers both differently. Empty stdin and a bare
+# `null` parse to nothing without an error and still exit 0 here: they carry no tool call to judge.
 $hook = $null
+$hookText = ""
 $hookUnparseable = $false
-try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } catch { $hookUnparseable = $true }
+try {
+    $hookText = [Console]::In.ReadToEnd()
+    $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
+} catch { $hookUnparseable = $true }
 if (-not $hookUnparseable -and -not $hook) { exit 0 }
 
 # The allowlist doubles as the kill switch: no file, no entries => nothing is governed.
@@ -2339,12 +2346,17 @@ $roots = @(
 if ($roots.Count -eq 0) { exit 0 }
 
 if ($hookUnparseable) {
-    # No tool name, cwd or path is known here, so the message names none.
-    Write-Deny -Rule "parse" -Detail "unparseable-input" -Reason @"
-BLOCKED: the worktree gate could not parse this tool call's hook input as JSON, so it cannot tell
-whether the call is governed, and it does not allow a call it cannot judge. One cause is a tool input
-carrying two keys that differ only by case (for example both subagent_type and SUBAGENT_TYPE), which
-PowerShell's JSON parser refuses. Retry the call with each key spelled once.
+    # No tool name, cwd or path is known here, so the message names none. The receipt carries only the
+    # input's length: enough to tell a burst of one payload shape from many, and nothing it says.
+    Write-Deny -Rule "parse" -Detail "unparseable-input length=$($hookText.Length)" -Reason @"
+BLOCKED: the worktree gate could not parse this tool call's hook input as JSON. It cannot tell
+whether the call is governed, so it does not allow it.
+
+PowerShell's JSON parser refuses at least these shapes in a tool input:
+  * two keys that differ only by case, such as subagent_type and SUBAGENT_TYPE;
+  * a key that is an empty string.
+If the input has one of them, retry with each key spelled once and none empty. Otherwise, or if the
+retry is blocked too, STOP and tell the user. Do not route around this.
 "@
 }
 
@@ -2448,15 +2460,20 @@ $rehome
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
 #
-# ORDINAL, as most prefix checks in this file already were. Both sides are already Get-ComparablePath's
-# lowercased form, so case needs no help; a culture comparison instead ignores zero-width and soft-hyphen
-# characters, and read `.claude/worktrees<U+200B>/x`, a directory inside the primary, as the exemption.
+# THE EXEMPTION IS ORDINAL; "UNDER A ROOT" IS ORDINAL OR CULTURE. A culture comparison ignores zero-width
+# and soft-hyphen characters, so it read `.claude/worktrees<U+200B>/x`, a directory inside the primary, as
+# the exemption. Ordinal is what the filesystem means, so the exemption uses it alone. The governed test
+# keeps its culture match beside the ordinal one, because the two disagree in BOTH directions (measured:
+# a combining mark after the slash makes the culture StartsWith false and the ordinal one true), and
+# dropping either loses a deny. The culture half still matters: rule 3b's own culture `-eq` hands a
+# linked worktree at `<primary><U+200B>` back to rule 3 as the primary, so rule 3 must govern it.
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
     $ord = [System.StringComparison]::Ordinal
     foreach ($root in $roots) {
         $c = $root.Compare
-        if ([string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {
+        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or
+            [string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {
             if ($Candidate.StartsWith("$c/.claude/worktrees/", $ord)) { return $null }
             return $root
         }
