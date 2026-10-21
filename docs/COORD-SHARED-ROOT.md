@@ -24,6 +24,24 @@ right shape, and lower on the details that need the owner's answers below.
 The owner asked for "the Z drive". Z: is the right **server**, but the drive letter is the wrong
 **name** for it, and moving the whole directory is the wrong **scope**. The sections below say why.
 
+## The failure this fixes is already happening
+
+On 2026-10-21 a Manager seat on the other PC posted on engine PR 2471 (comment of
+2026-10-21T22:51:29Z) that its worktree is `D:\Code\MessageFoundry\.claude\worktrees\autonomy-plan`,
+seat record `autonomy-plan-62022e2c`, reachable with `mail.ps1 -To` at that path. Checked from
+ALIENWARE the same day:
+
+- `D:\` exists here, but that worktree path does not.
+- `seats\` in this PC's `mefor-coord` holds no `autonomy-plan-*` record.
+
+So its seat cannot be found and its mail address cannot be reached from this PC. The only channel
+that worked was a PR comment. Two lessons for the design:
+
+1. **A mail address that is a worktree path is per-PC.** On a shared root, `mail.ps1 -To` must
+   accept a seat id, or a path qualified by host, and the seat record must name its host.
+2. **The other PC's clone lives at `D:\Code\MessageFoundry`, not under the user profile as on ALIENWARE.**
+   Nothing may assume the two PCs share clone paths. The shared root is the one path they share.
+
 ## What Z: actually is (measured 2026-10-21 on ALIENWARE)
 
 | Fact | Reading | Instrument |
