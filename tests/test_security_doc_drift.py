@@ -97,12 +97,14 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
 # BACKLOG #2446 added one /ui route and no JSON route: GET /ui/audit/export, audit:export, the
 # engine's audit export streamed from the console session.
+# Vault BACKLOG #3373 added one /ui route and no JSON route: POST /ui/login/passkey, the passkey
+# sign-in's begin leg (ADR 0197 Amendment A wave 2), un-gated like the sign-in it serves.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
-_ROUTES_WITH_UI = 243
+_ROUTES_WITH_UI = 244
 
-#: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
-#: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
+#: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
+#: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
 #: demanding a fresh step-up to perform a step-up would deadlock. ``/ui/mfa`` (ASVS 6.3.3) is the
 #: same shape: require_ui 303s every MFA-pending session THERE, so gating it would redirect it to
 #: itself. It re-implements the gate's checks by hand, in the gate's order.
@@ -110,6 +112,7 @@ _UI_NO_GATE_ROUTES = frozenset(
     {
         ("GET", "/ui/login"),
         ("POST", "/ui/login"),
+        ("POST", "/ui/login/passkey"),
         ("POST", "/ui/logout"),
         ("GET", "/ui/sso"),
         ("POST", "/ui/csp-report"),

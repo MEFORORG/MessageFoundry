@@ -2364,21 +2364,24 @@ def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
     assert "ends its own sessions and changes its password from a password-only session" not in (
         binding
     ), "item 2: the factor-binding row says a no-factor account changes its password pending"
-    assert "first factor must be TOTP" in binding
+    assert "first factor must be TOTP or a discoverable passkey" in binding
 
     # 3. A pending no-factor session cannot rotate, in any configuration.
     assert "An account with no factor still changes its password from a pending session" not in doc
     assert "it cannot rotate from a pending session either" in doc
 
-    # 4. A reset passkey-only account also enrols TOTP before it rotates.
+    # 4. A reset passkey-only account rotates only once it holds a way past; from wave 2 a
+    #    discoverable passkey is one (ADR 0197 Amendment A).
     assert "A passkey-only account has to do this on the console" not in doc
-    assert "must also enrol TOTP before it rotates" in doc and "`_has_way_past` counts TOTP" in doc
+    assert "must also enrol TOTP before it rotates" not in doc
+    assert "`_has_way_past` counts TOTP or a passkey recorded as discoverable" in doc
 
-    # 5. CONFIGURATION.md's require_mfa row: TOTP first for a covered local account.
+    # 5. CONFIGURATION.md's require_mfa row: a factor with a way past first for a covered local
+    #    account, TOTP or (wave 2) a discoverable passkey.
     assert "to enrol TOTP or a passkey." not in config, (
         "item 5: the require_mfa row offers a passkey as a covered local account's first factor"
     )
-    assert "enrols **TOTP first**" in _config_row("require_mfa", "bool")
+    assert "enrols **TOTP or a discoverable passkey first**" in _config_row("require_mfa", "bool")
 
     # 6. TOTP removal refuses on its own condition, and the MFA section says so.
     assert "the same refusal, on the same condition, as the passkey removal path" not in doc
@@ -3052,7 +3055,8 @@ def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
 
 def test_the_twelfth_sweep_remote_console_sends_a_covered_account_to_totp_first() -> None:
     """docs/REMOTE-CONSOLE.md's X-MFA-Required row said "Enrol TOTP or a passkey". A covered local
-    account's first passkey is refused until it holds TOTP."""
+    account's first factor must be one with a way past the sign-in lock: TOTP, or from ADR 0197
+    Amendment A wave 2 a passkey the browser stores as discoverable, which the row now names."""
     row = _flat(
         next(
             line
