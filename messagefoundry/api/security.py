@@ -1761,7 +1761,9 @@ def require_step_up_action(
     factor-binding refusal. At least purge, reload (vault BACKLOG #2625), export and edit-resend
     use it; export and edit-resend spend after their own input checks (owner ruling 2026-10-13,
     #3241 R1 and R2). ``_proof_in_route_routes`` in ``tests/test_bound_step_up_hold_rejoin.py``
-    pins the live set. A repeat that only
+    pins the live set in ``api/app.py``. The four group-wide saves in ``api/auth_routes.py`` use
+    it too, and spend only when the save ends the caller's own sessions; otherwise they call
+    :func:`refuse_unless_step_up_window_live` (BACKLOG #3401). A repeat that only
     rejoins the requester's open dual-control hold then needs a live session window
     (:func:`step_up_window_live`), and no new proof. ``tests/test_bound_step_up_hold_rejoin.py``
     pins what each such route may do before its spend."""
@@ -1837,6 +1839,21 @@ async def step_up_window_live(request: Request) -> bool:
     if auth is None:
         return True
     return await auth.has_recent_step_up(bearer_token(request))
+
+
+async def refuse_unless_step_up_window_live(request: Request) -> None:
+    """Refuse, as :func:`require_step_up` does, a request whose session window has lapsed.
+
+    For a ``proof_in_route`` route whose request turns out to need only the session window, such
+    as the four group-wide saves when they end none of the caller's own sessions (BACKLOG #3401).
+    Moving a route to ``proof_in_route=True`` drops its dependency's window check, so without this
+    call that branch would take no step-up at all. The 403 carries ``X-Step-Up-Required`` and no
+    ``X-Step-Up-Action``, so a client refreshes the window with a plain ``POST /me/reauth``. Does
+    nothing with no auth service attached, as the dependency then checks nothing."""
+    auth = get_auth(request)
+    if auth is None or await step_up_window_live(request):
+        return
+    raise await _step_up_refusal(auth, bearer_token(request))
 
 
 def require_reauth_only_action(

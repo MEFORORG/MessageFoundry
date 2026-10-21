@@ -94,6 +94,9 @@ digest moved.
   takes that base class (`BACKLOG #2289`); it took `Request | WebSocket`. The console still
   passes a `Request` or a `WebSocket`, and both fit, so no console call changed. The signature
   is on the seam the console pins, so the supported digest moved.
+- **Seam only: the MFA status names a TOTP re-enrolment.** `MfaStatus` and `MfaStatusResponse`
+  gain `totp_reenrolment_recommended` (vault `BACKLOG #3422`). The console does not show it yet,
+  but the field is on the seam it pins, so the supported digest moved.
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
@@ -168,6 +171,25 @@ digest moved.
 
 ### Security
 
+- **Your own user page no longer offers Save roles, Save channel scope or Sign out all
+  sessions.** Each of those writes ends the target account's sessions, so its route refuses your
+  own account (BACKLOG #1149), and the page offered a button that could only fail. The page now
+  shows the roles and scope you hold, read-only, with a note in place of each form, and points to
+  your active sessions page. A `/ui/users/{id}/channel-scope` post aimed at your own account is
+  now refused, and written to the audit log as `auth.self_target_refused`, before the form is
+  checked; before, a malformed one got the form error and no audit row. The JSON
+  `PUT /users/{id}/channel-scope` still answers a malformed body 422 first, with no row. Seam
+  change: `AdminHandlers` gains `refuse_own_channel_scope`. (BACKLOG #3393)
+- **The sign-out offer after a factor change counts what it ends, and survives a failed page.**
+  The number on the offer is now counted with the sign-out's own rule: every other session not yet
+  signed out, one gone idle included, where it used to count only the sessions the sessions page
+  lists. The TOTP confirm reads it after its own session-cap run, so it no longer offers sessions
+  the confirm has just ended.
+  The account page spends the offer's single-use mark only once it has rendered, so a page that
+  fails keeps the offer for the next load. Turning TOTP off now marks the session only when there
+  is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and
+  `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
+  `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".

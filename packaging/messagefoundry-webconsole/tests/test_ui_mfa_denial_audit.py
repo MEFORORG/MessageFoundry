@@ -310,6 +310,14 @@ _SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
             "/ui/reauth?next=/ui/dead-letters/replay-all",
             id="step_up-post-no-reauth_next",
         ),
+        # BACKLOG #3401: the conditional factory of the four group-wide saves.
+        pytest.param(
+            "POST",
+            "/ui/ad-groups/map",
+            Role.ADMINISTRATOR,
+            "/ui/reauth?next=/ui/ad-groups",
+            id="step_up_when_own_sessions_end",
+        ),
     ],
 )
 async def test_a_step_up_route_refusal_writes_an_mfa_denial_row(

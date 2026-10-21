@@ -197,7 +197,25 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     other = await _mint(store)
     copy = await store.get_session(hash_token(other))
     assert copy is not None
-    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine)) >= 1
+    # BACKLOG #3393: the count the factor-change offer shows is the number this revoke ends, over
+    # every kind of row the contract has left on the account. That includes an expired row nobody
+    # revoked, which the inventory hides and the revoke still ends.
+    lapsed = mint_token()
+    await raw(
+        "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
+        " auth_mechanism) VALUES (?,?,?,?,?,?)",
+        (hash_token(lapsed), "seal-u1", now - 7200, now - 3600, now - 7200, "password"),
+    )
+    listed = {s.token_hash for s in await store.list_sessions("seal-u1")}
+    assert hash_token(lapsed) not in listed and hash_token(other) in listed  # control
+    others = await store.count_user_sessions("seal-u1", except_token_hash=hash_token(mine))
+    assert others >= 2
+    assert await store.count_user_sessions("seal-u1") == others + 1  # mine is unrevoked too
+    absent = hash_token(mint_token())  # a hash that names no row excepts nothing
+    assert await store.count_user_sessions("seal-u1", except_token_hash=absent) == others + 1
+    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == others
+    assert await store.count_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == 0
+    assert await store.count_user_sessions("seal-u1") == 1
     assert await service.identity_for_token(mine) is not None  # the kept session, re-sealed
     assert await service.identity_for_token(other) is None
     await raw(

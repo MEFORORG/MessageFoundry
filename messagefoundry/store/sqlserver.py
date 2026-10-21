@@ -770,10 +770,18 @@ _MSSQL_SESSION_RESEAL: Final = (
 )
 #: The whole-account session sweep, counted from ``OUTPUT``: revoke and blank the seal (BACKLOG
 #: #2592). Each caller raises the account's session epoch in the same transaction.
+#: The rows it ends are :data:`_MSSQL_USER_SESSIONS_UNREVOKED_WHERE`, which ``count_user_sessions``
+#: counts (BACKLOG #3393).
+_MSSQL_USER_SESSIONS_UNREVOKED_WHERE: Final = " WHERE user_id=? AND revoked_at IS NULL"
 _MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
-    " WHERE user_id=? AND revoked_at IS NULL"
+    + _MSSQL_USER_SESSIONS_UNREVOKED_WHERE
 )
+_MSSQL_COUNT_USER_SESSIONS_SQL: Final = (
+    "SELECT COUNT(*) AS n FROM sessions" + _MSSQL_USER_SESSIONS_UNREVOKED_WHERE
+)
+#: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
+_MSSQL_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
 #: Whether the account holds at least one passkey.
 _MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
     "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
@@ -14537,7 +14545,7 @@ class SqlServerStore:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                 else:
                     await cur.execute(
-                        _MSSQL_REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                        _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, user_id, except_token_hash),
                     )
                 revoked = len(await cur.fetchall())
@@ -14555,6 +14563,20 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return revoked
+
+    async def count_user_sessions(
+        self, user_id: str, *, except_token_hash: str | None = None
+    ) -> int:
+        """How many sessions :meth:`revoke_user_sessions` would end with the same arguments, read
+        from the same clause (BACKLOG #3393). See :meth:`AuthStore.count_user_sessions`."""
+        if except_token_hash is None:
+            row = await self._fetchone(_MSSQL_COUNT_USER_SESSIONS_SQL, (user_id,))
+        else:
+            row = await self._fetchone(
+                _MSSQL_COUNT_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
+                (user_id, except_token_hash),
+            )
+        return int(row["n"]) if row else 0
 
     async def enforce_session_cap(
         self,
