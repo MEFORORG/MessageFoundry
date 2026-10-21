@@ -7703,7 +7703,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     Since vault BACKLOG #2711 step 1 that answer means a local Administrator with a usable password,
     so a store run only by directory Administrators is offered provisioning too.
     Answering that opens an EXISTING store the way ``serve`` does; an absent SQLite store is not
-    created by asking. ``provision_first_administrator`` repeats the blank-name, Administrator and
+    created by asking. ``provision_first_administrator`` repeats at least the blank-name, address
+    (:func:`~messagefoundry.auth.service.provision_notify_email`, BACKLOG #3391), Administrator and
     policy checks itself, so for those this ordering is a courtesy and not the control. The length
     limits are this command's alone: the service method does not apply them.
     """
@@ -7712,14 +7713,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
+        _BLANK_USERNAME_REFUSAL,
         HOLDER_NOTICE_DISPATCHED,
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
         FirstAdministratorRefused,
-        InvalidNotifyEmail,
         ProvisionedAdministrator,
         _is_integrity_refusal,
-        _require_single_mailbox,
+        provision_notify_email,
     )
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
@@ -7741,20 +7742,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # and the address limit is the one `admin-set-notify-email` applies.
     username = args.username.strip()
     if not username:
-        return _emit_error("a username is required and must not be blank", as_json=args.json)
+        return _emit_error(_BLANK_USERNAME_REFUSAL, as_json=args.json)
     if len(username) > _NAME_MAX:
         return _emit_error(f"the username is longer than {_NAME_MAX} characters", as_json=args.json)
+    # Read before the strip, as the console's bound reads the raw request body: stripped first, a
+    # padded address the console refuses would pass here.
     if len(args.email) > _NAME_MAX:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
     # A blank address is refused rather than read as none (BACKLOG #1138). The one-mailbox rule
     # admin-set-notify-email and the API apply (vault BACKLOG #2870) refuses it, and an address the
-    # alert sender could never put on RCPT TO. The service checks it again; this is the early copy.
+    # alert sender could never put on RCPT TO. The service checks it again with the same helper;
+    # this is the early copy.
     try:
-        email = _require_single_mailbox(args.email)
-    except InvalidNotifyEmail as exc:
-        return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
+        email = provision_notify_email(args.email)
+    except FirstAdministratorRefused as exc:
+        return _emit_error(str(exc), as_json=args.json)
     if args.display_name is not None and len(args.display_name) > _NAME_MAX:
         return _emit_error(
             f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
@@ -7835,7 +7839,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
             # and before an authenticator key is shown for an account that would then be refused.
-            # BACKLOG #2288: with the address, so this pre-check agrees with the write.
+            # With the address, so this pre-check agrees with the write (BACKLOG #1138).
             return False, await service.provision_refusal(username, notify_email=email)
         finally:
             store_slot.current = None

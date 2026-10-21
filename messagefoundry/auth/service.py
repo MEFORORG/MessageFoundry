@@ -122,7 +122,15 @@ from messagefoundry.auth.policy import (
     _operator_corpus,
 )
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
-from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
+from messagefoundry.auth.tokens import (
+    CREDENTIAL_ID_HASH_SCHEME,
+    credential_id_hash_scheme,
+    hash_token,
+    mint_token,
+)
+from messagefoundry.auth.tokens import (
+    credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
+)
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -1461,6 +1469,27 @@ def _require_account_email(value: str, *, blank: str) -> str:
     if not value.strip():
         raise InvalidNotifyEmail(blank)
     return _require_single_mailbox(value)
+
+
+def provision_notify_email(value: str | None) -> str:
+    """``value`` stripped, when it may be the first Administrator's notification address; else
+    :class:`FirstAdministratorRefused`, whose text is what ``provision-admin`` shows.
+
+    The one check behind ``provision-admin --email``, :meth:`AuthService.provision_refusal` and
+    :meth:`AuthService.provision_first_administrator`, so the three cannot word it differently.
+    The address is REQUIRED (BACKLOG #1138, ADR 0183 Amendment D), and since BACKLOG #3391 the
+    service refuses ``None`` as well, rather than only the command. ``None`` is typed in here, not
+    on the callers, so a caller that ignores the type is still refused at run time.
+    """
+    if value is None:
+        raise FirstAdministratorRefused(
+            "a notification address is required (--email), so no Administrator starts without "
+            "one; nothing was written"
+        )
+    try:
+        return _require_single_mailbox(value)
+    except InvalidNotifyEmail as exc:
+        raise FirstAdministratorRefused(f"the notification address was refused: {exc}") from exc
 
 
 class NotifyEmailAlreadySet(RuntimeError):
@@ -2867,6 +2896,9 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " is nothing to provision -- create further accounts from the web console, and use"
     " `admin-unlock` if that administrator is locked out"
 )
+#: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
+#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391).
+_BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3538,8 +3570,75 @@ class AuthService:
         :meth:`create_local_user` behind ``USERS_MANAGE``, and a directory sign-in, which assigns no
         role. The first-run account this used to mint went in Wave 2, and the WP-3 lifecycle that
         retired it went with it.
+
+        It then runs :meth:`rehash_webauthn_credentials`, so a passkey stored under an older
+        credential-id hash scheme can sign in before the first request arrives (BACKLOG #3423).
         """
         await self._seed_roles()
+        await self.rehash_webauthn_credentials()
+
+    async def rehash_webauthn_credentials(self) -> tuple[int, int]:
+        """Move every passkey whose ``credential_id_hash`` names another scheme to today's
+        (:data:`~messagefoundry.auth.tokens.CREDENTIAL_ID_HASH_SCHEME`, BACKLOG #3423), recomputing
+        it from the raw ``credential_id`` stored beside it, so a hash change does not lose a
+        registered passkey. No secret is needed: the raw id is not one.
+
+        Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
+        in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
+        value whose tag this release does not compile in is REFUSED: left as it is, never matched,
+        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
+        id does not give, and a move the store refuses: the account's seal failed between the read
+        and the write, or the new hash is already held. An account or passkey set already failing
+        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
+        a refusal never stops start-up."""
+        rehashed = refused = 0
+        if not await self._store.any_webauthn_credentials():
+            return 0, 0
+        # The checked loaders: an account or passkey set that fails its seal is reported there and
+        # skipped here, since it signs in with no passkey whatever its hash says.
+        for user in await self._load_users():
+            for cred in await self._verified_passkeys(user) or ():
+                try:
+                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
+                    # binascii.Error, a ValueError, for a credential_id that is not base64url.
+                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
+                except ValueError:  # CredentialHashSchemeError is one too
+                    refused += 1
+                    continue
+                if cred.credential_id_hash == new_hash:
+                    continue
+                if scheme == CREDENTIAL_ID_HASH_SCHEME:
+                    # Today's tag over a digest its own raw id does not give: not a row this
+                    # release wrote, so it is not rewritten into one that signs in.
+                    refused += 1
+                    continue
+                try:
+                    moved = await self._store.rehash_webauthn_credential(
+                        user.id, cred.credential_id_hash, new_hash
+                    )
+                except Exception as exc:
+                    # The seal failed between the read and the write, or the new hash is already
+                    # held (the same credential id enrolled again under today's scheme). Either
+                    # way the row stays as it is, and start-up goes on.
+                    if not isinstance(exc, RowSealError) and not _is_integrity_refusal(exc):
+                        raise
+                    refused += 1
+                    continue
+                rehashed += int(moved)
+        if rehashed:
+            _log.info(
+                "moved %d passkey(s) to credential-id hash scheme %s",
+                rehashed,
+                CREDENTIAL_ID_HASH_SCHEME,
+            )
+        if refused:
+            _log.warning(
+                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
+                " scheme, a hash its own credential id does not give, or a move the store refused);"
+                " they cannot sign in",
+                refused,
+            )
+        return rehashed, refused
 
     async def _seed_roles(self) -> None:
         for role in Role:
@@ -3618,7 +3717,7 @@ class AuthService:
         username: str,
         password: str,
         display_name: str | None = None,
-        notify_email: str | None = None,
+        notify_email: str,
         actor: str,
         totp_secret: str | None = None,
         totp_code: str | None = None,
@@ -3699,9 +3798,9 @@ class AuthService:
         host gate is unchanged, and the audit row's ``administrators_at_check`` names who held the
         role. A tighter rule for that case is not built here. Safe is
         not silent, though: a roleless account can still be somebody's, so a repair tells the
-        address it held before (BACKLOG #2019). And a row that holds an address is completed only
-        when ``notify_email`` is given (BACKLOG #2288), so the sole Administrator's notices never
-        go to an address nobody chose.
+        address it held before (BACKLOG #2019). And every run writes ``notify_email``, which is
+        required (BACKLOG #1138, #3391), so the sole Administrator's notices never go to an address
+        nobody chose.
 
         Not reused from :meth:`create_local_user`, which does the same four writes: that method
         creates WITH a hash and forces a rotation, and the ordering above is a durability property
@@ -3711,17 +3810,12 @@ class AuthService:
         """
         username = username.strip()
         if not username:
-            raise FirstAdministratorRefused("a username is required and must not be blank")
-        # BACKLOG #1138: a given address is checked as `create_local_user` checks one, so a blank or
-        # malformed address is refused rather than read as none. Checked ONCE, so the three later
-        # readers (`users.email`, `notify_email` and the audit's `notified`) cannot disagree.
-        if notify_email is not None:
-            try:
-                notify_email = _require_single_mailbox(notify_email)
-            except InvalidNotifyEmail as exc:
-                raise FirstAdministratorRefused(
-                    f"the notification address was refused: {exc}"
-                ) from exc
+            raise FirstAdministratorRefused(_BLANK_USERNAME_REFUSAL)
+        # Checked ONCE, so every later write of it carries the same value: `create_user` seeds both
+        # `users.email` and `notify_email` on a fresh create, and `set_user_notify_email` writes
+        # `notify_email` alone. A REPAIR writes no `users.email`, so that column keeps what the row
+        # held, which may be the earlier holder's, and can differ from `notify_email` afterwards.
+        notify_email = provision_notify_email(notify_email)
         usable, standing_admins = await self._administrator_standing()
         if usable:
             raise FirstAdministratorRefused(_ADMINISTRATOR_EXISTS_REFUSAL)
@@ -3768,9 +3862,7 @@ class AuthService:
         # "" and the notifier drops it, so "dispatched" would be a false record.
         prior_notify_email = ((existing.notify_email if existing else None) or "").strip() or None
         if existing is not None:
-            refusal = await self._existing_row_refusal(
-                existing, username, notify_email=notify_email
-            )
+            refusal = self._existing_row_refusal(existing, username)
             if refusal is not None:
                 raise FirstAdministratorRefused(refusal)
             user_id = existing.id
@@ -3804,7 +3896,7 @@ class AuthService:
                     raise
                 # BACKLOG #2697: another run, or a directory sign-in, took the name after the read
                 # above. Refused rather than repaired in place: a re-run reads the row and takes the
-                # repair branch, so `_existing_row_refusal`'s rules (#2288) stay in one place. This
+                # repair branch, so `_existing_row_refusal`'s rules stay in one place. This
                 # INSERT was the run's first account write, so no account row was written. A
                 # refusal with no row holding the name is some other fault and re-raises untouched.
                 if not await self._username_held(username):
@@ -3875,11 +3967,11 @@ class AuthService:
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
         # created with no roles, say -- so its earlier holder is told, at the address they held.
         # The repair is not refused outright, because an address is no sign of a second holder: a
-        # run given --email that crashed after `create_user` leaves its own address on the roleless
-        # row, and a flat refusal would strand exactly the half-written provision this branch
-        # exists to complete. BACKLOG #2288 asks for the address instead: `_existing_row_refusal`
-        # declines such a row until --email is given, and the crashed run's own command already
-        # carries it, so the same command run again completes the row.
+        # run that crashed after `create_user` leaves its own address on the roleless row, and a
+        # flat refusal would strand exactly the half-written provision this branch exists to
+        # complete. Every run carries the address the account is to keep (BACKLOG #1138), so the
+        # stored one is never kept unchosen; BACKLOG #2288's refusal of a run without one is
+        # therefore gone (#3391).
         #
         # BACKLOG #2915: the notice goes out HERE, after the last refusal above and BEFORE the address
         # write below. After the address write, a crash before the role left the operator's address
@@ -3900,12 +3992,7 @@ class AuthService:
         # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
         # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
         # claim a hand-off that never happened.
-        moved = (
-            repaired
-            and prior_notify_email is not None
-            and notify_email is not None
-            and notify_email != prior_notify_email
-        )
+        moved = repaired and prior_notify_email is not None and notify_email != prior_notify_email
         holder_notice: str | None = None
         if repaired:
             if prior_notify_email is None:
@@ -3919,12 +4006,11 @@ class AuthService:
                 holder_notice = HOLDER_NOTICE_DISPATCHED
             else:
                 holder_notice = HOLDER_NOTICE_NO_CHANNEL
-        if notify_email is not None:
-            # Unconditional rather than fresh-path-only, because the invariant "the supplied address
-            # always lands" is simpler than the case analysis. On the fresh path `create_user` already
-            # seeded the same value; on a REPAIRED row an earlier run created the account, so this
-            # write is the only one that carries it.
-            await self._store.set_user_notify_email(user_id, email=notify_email)
+        # Unconditional rather than repair-only, because the invariant "the supplied address always
+        # lands" is simpler than the case analysis. On the fresh path `create_user` already seeded the
+        # same value; on a REPAIRED row an earlier run created the account, so this write is the only
+        # one that carries it.
+        await self._store.set_user_notify_email(user_id, email=notify_email)
         # BACKLOG #3078: the refusal at the top is a read, and the account writes came in later
         # awaits, so two runs with different usernames could each pass it and each grant. The grant
         # re-checks under the last-administrator guard's lock, in the transaction that writes it,
@@ -4000,9 +4086,10 @@ class AuthService:
                 {
                     "username": username,
                     "repaired": repaired,
-                    # UNCHANGED MEANING: an address was supplied with --email. It says nothing about
-                    # the notice to an earlier holder, which is `holder_notice`.
-                    "notified": bool(notify_email),
+                    # UNCHANGED MEANING: an address was supplied with --email, which every run now
+                    # does (BACKLOG #1138, #3391), so it is always true. It says nothing about the
+                    # notice to an earlier holder, which is `holder_notice`.
+                    "notified": True,
                     "holder_notice": holder_notice,
                     # The earlier address itself is not recorded here; the notice went to it.
                     "notify_email_moved": moved,
@@ -4079,9 +4166,8 @@ class AuthService:
             f"showed, then run the command again. {again}"
         )
 
-    async def _existing_row_refusal(
-        self, existing: VerifiedUser, username: str, *, notify_email: str | None
-    ) -> str | None:
+    @staticmethod
+    def _existing_row_refusal(existing: VerifiedUser, username: str) -> str | None:
         """Why ``provision_first_administrator`` would refuse to complete ``existing``, or ``None``.
 
         A directory identity draws its authority from the directory, so it is never promoted here
@@ -4090,13 +4176,13 @@ class AuthService:
         reviving it under a new credential is not a recovery. An account holding roles is somebody's
         in use.
 
-        BACKLOG #2288: a row that already holds a notification address is completed only when
-        ``notify_email`` (``--email``) is given. Kept silently, that address would receive every
-        security notice for the sole Administrator, and it may be an earlier holder's. Giving the
-        same address again is allowed: it is then the operator's stated choice. Both callers refuse
-        a blank ``notify_email`` before this runs (BACKLOG #1138); a blank stored address counts as
-        none. The text never prints
-        the stored address, which may be somebody else's."""
+        BACKLOG #2288 once refused here a row holding a notification address when no address was
+        given, so an address nobody chose was never kept. Every caller now gives one, checked by
+        :func:`provision_notify_email` before this runs (BACKLOG #1138, #3391), so that refusal
+        could not fire and is gone. A repair replaces the stored ``notify_email``, and a takeover
+        notice goes to the old one where a notice channel is wired (``holder_notice`` records whether
+        one did). The profile ``users.email`` is not written on a repair, so it keeps what the row
+        held, which may be the earlier holder's."""
         if existing.auth_provider != AuthProvider.LOCAL.value:
             return (
                 f"{username!r} is a {existing.auth_provider} account -- provision a separate "
@@ -4112,36 +4198,41 @@ class AuthService:
                 f"an account named {username!r} already exists and holds roles -- choose "
                 "another username"
             )
-        if (existing.notify_email or "").strip() and not (notify_email or "").strip():
-            return (
-                f"the account named {username!r} already holds a notification address, and "
-                "this Administrator's security notices would go there -- run the command again "
-                "with --email <address> to say where they go"
-            )
         return None
 
-    async def provision_refusal(self, username: str, *, notify_email: str | None) -> str | None:
+    async def provision_refusal(self, username: str, *, notify_email: str) -> str | None:
         """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
-        prompt (ADR 0197 Amendment A): an enabled local Administrator with a usable password exists
-        (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711), or the named row is one this
-        command will not complete. ``provision-admin`` asks it first, so an operator is never shown
+        prompt (ADR 0197 Amendment A). It checks these, in this order, and returns the first that
+        holds as the write words it, or ``None``:
+
+        1. the username is blank (BACKLOG #3391);
+        2. ``notify_email``, the ``--email`` value, is missing, blank or not one plain mailbox, by
+           :func:`provision_notify_email` (BACKLOG #1138, #3391);
+        3. an enabled local Administrator with a usable password exists
+           (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711);
+        4. the account with that name fails its integrity seal;
+        5. the named row is one this command will not complete: a directory account, a disabled
+           one, or one that holds roles (:meth:`_existing_row_refusal`).
+
+        The write can still refuse for reasons asked only later, at least the password policy and
+        the authenticator code. ``provision-admin`` asks this first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
-        own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
-        required here so the pre-check cannot disagree with the write about BACKLOG #2288, and
-        checked here as the write checks it (BACKLOG #1138)."""
+        own; this is the courtesy, that is the control."""
         name = username.strip()
-        if notify_email is not None:
-            try:
-                notify_email = _require_single_mailbox(notify_email)
-            except InvalidNotifyEmail as exc:
-                return f"the notification address was refused: {exc}"
+        # In the write's order: the name first, then the address.
+        if not name:
+            return _BLANK_USERNAME_REFUSAL
+        try:
+            provision_notify_email(notify_email)
+        except FirstAdministratorRefused as exc:
+            return str(exc)
         if await self.has_self_sufficient_administrator():
             return _ADMINISTRATOR_EXISTS_REFUSAL
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
             return _UNSEALED_NAME_REFUSAL.format(username=name) if lookup.refused else None
-        return await self._existing_row_refusal(existing, name, notify_email=notify_email)
+        return self._existing_row_refusal(existing, name)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when
@@ -4976,7 +5067,7 @@ class AuthService:
         except webauthn.WebAuthnVerificationError:
             return False
         # ASVS 11.2.4: every candidate compared, each in constant time, as the delete path does.
-        wanted = hash_bytes(raw_id)
+        wanted = _credential_id_hash(raw_id)
         cred: WebAuthnCredential | None = None
         for candidate in creds:
             if constant_time_equal(candidate.credential_id_hash, wanted) and cred is None:
@@ -13848,7 +13939,7 @@ class AuthService:
                 client=client,
             )
             raise ValueError(PASSKEY_NOT_DISCOVERABLE)
-        credential_id_hash = hash_bytes(result.credential_id)
+        credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
         now = time.time()
@@ -14044,7 +14135,7 @@ class AuthService:
         # The account's passkeys, checked against the digest its seal covers (BACKLOG #2592): a
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
-        wanted = hash_bytes(raw_id)
+        wanted = _credential_id_hash(raw_id)
         cred = next((c for c in held or () if c.credential_id_hash == wanted), None)
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same

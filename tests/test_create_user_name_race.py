@@ -39,7 +39,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import provision_totp
+from tests._admin_account import PROVISION_EMAIL, provision_totp
 
 _OBJECT_ID = "0b6f2c1e-4d7a-4c55-9a1e-2f3d4c5b6a70"
 _OTHER_OBJECT_ID = "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4"
@@ -341,7 +341,11 @@ async def test_a_lost_provisioning_race_is_refused_and_a_re_run_completes_the_ro
         _rival_takes_the_name(store, monkeypatch, auth_provider=AuthProvider.LOCAL.value)
         with pytest.raises(FirstAdministratorRefused, match="let it finish") as raised:
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
         assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
         # This run wrote nothing: the rival is as it was, roleless and with no credential.
@@ -352,7 +356,11 @@ async def test_a_lost_provisioning_race_is_refused_and_a_re_run_completes_the_ro
 
         # The message's own instruction, followed: the re-run takes the repair branch.
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is True and outcome.user_id == "rival"
         assert Role.ADMINISTRATOR.value in await store.get_user_role_ids("rival")
@@ -373,7 +381,11 @@ async def test_a_provisioning_integrity_refusal_with_no_holder_re_raises(
         monkeypatch.setattr(store, "create_user", refused)
         with pytest.raises(sqlite3.IntegrityError, match="some other constraint"):
             await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
             )
     finally:
         await store.close()

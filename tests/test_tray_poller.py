@@ -1203,3 +1203,51 @@ def test_a_pin_on_a_plain_http_url_is_not_followed(tmp_path: Path) -> None:
         assert poller._client is first
     finally:
         poller.stop()
+
+
+def test_a_build_refusing_the_tls_lists_at_start_reads_unknown_instead_of_ending_the_tray(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3414. A build that refuses the probe's signature-scheme list raises RuntimeError
+    from building the first client, which is the probe module's contract. ``start()`` must absorb
+    it as a failed tick would: the thread runs, every tick reads UNKNOWN, and the failure is logged.
+    The build is not retried, because the refusal belongs to the process's linked OpenSSL. Red
+    before the fix: ``start()`` raises and the tray never shows an icon."""
+    from messagefoundry import pki, tls_sigalgs
+
+    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
+    pin = tmp_path / "api-generated-cert.pem"
+    pin.write_bytes(pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)[0])
+    builds: list[ssl.SSLContext] = []
+
+    def narrow(ctx: ssl.SSLContext) -> bool:
+        builds.append(ctx)
+        raise tls_sigalgs.NarrowerRefused("synthetic refusal of the list without SHA-224")
+
+    monkeypatch.setattr("messagefoundry.tray.probe.narrow_signature_algorithms", narrow)
+    published: queue.Queue[PollResult] = queue.Queue()
+    poller = StatusPoller(
+        TrayConfig(engine_url="https://127.0.0.1:8765", engine_cacert=str(pin)),
+        on_update=published.put,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller.start()  # must not raise
+    try:
+        first = published.get(timeout=10.0)
+        second = published.get(timeout=10.0)
+        thread = poller._thread
+        assert thread is not None and thread.is_alive()
+    finally:
+        poller.stop()
+
+    assert first.snapshot.state is TrayState.UNKNOWN
+    assert second.snapshot.state is TrayState.UNKNOWN
+    assert len(builds) == 1, "the refused build was retried"
+    assert poller._client is None
+    failures = _faults(caplog)
+    assert failures, "the refusal at start was not logged"
+    assert "could not be built" in failures[0].getMessage()
+    assert any("publishing UNKNOWN for this tick" in r.getMessage() for r in failures[1:])

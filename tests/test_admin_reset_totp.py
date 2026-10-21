@@ -29,10 +29,9 @@ from messagefoundry.__main__ import main
 from messagefoundry.auth import totp
 from messagefoundry.auth.passwords import verify_password
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import PROVISION_TOTP_SECRET, provision_totp
+from tests._admin_account import PROVISION_TOTP_SECRET, provision_admin
 from tests.test_provision_first_administrator import _PASSWORD
 
 _CMD = "admin-reset-totp"
@@ -56,18 +55,18 @@ def _seed(
     email: str | None = None,
 ) -> list[str]:
     """A keyless store holding one Administrator with TOTP, as ``provision-admin`` leaves it, plus a
-    live session. Returns the Administrator's recovery codes."""
+    live session. Returns the Administrator's recovery codes. With no ``email`` the Administrator
+    holds no address: the service will not write that (BACKLOG #3391), so it is cleared after."""
 
     async def run() -> list[str]:
         store = await MessageStore.open(db)
         try:
-            settings = AuthSettings(require_mfa=not no_totp)
-            outcome = await AuthService(store, settings).provision_first_administrator(
+            outcome = await provision_admin(
+                store,
                 username=_ADMIN,
                 password=_PASSWORD,
                 notify_email=email,
-                actor="test",
-                **({} if no_totp else provision_totp()),
+                settings=AuthSettings(require_mfa=not no_totp),
             )
             await store.create_session(
                 token_hash="synthetic-session-hash",

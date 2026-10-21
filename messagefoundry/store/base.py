@@ -990,6 +990,12 @@ class QueueStore(StoreLifecycle, Protocol):
         logged at INFO+). Implemented on SQLite, Postgres, and SQL Server at parity."""
         ...
 
+    async def has_untagged_processed_file(self, *, channel_id: str) -> bool:
+        """True iff ``channel_id``'s ledger still holds a ``file_key`` with no scheme tag: a row
+        written before BACKLOG #3424, which no release now writes. The runner asks so it can stop
+        looking a file up under its bare digest once the age prune has removed the last such row."""
+        ...
+
     async def record_processed_file(
         self, *, channel_id: str, file_key: str, now: float | None = None
     ) -> None:
@@ -2393,6 +2399,10 @@ class AuthStore(Protocol):
         *,
         require_way_past: bool = False,
         totp_usable: Callable[[str | None], bool] | None = None,
+    ) -> bool: ...
+
+    async def rehash_webauthn_credential(
+        self, user_id: str, old_hash: str, new_hash: str
     ) -> bool: ...
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...

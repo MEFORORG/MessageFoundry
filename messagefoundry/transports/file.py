@@ -62,8 +62,10 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    file_key_forms,
     float_setting,
     intake_open,
+    ledger_holds,
     poll_interval,
     positive_cap,
     register_destination,
@@ -1009,9 +1011,10 @@ class FileSource(SourceConnector):
             # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
             file_key: str | None = None
             if self.after_read == "leave":
-                file_key = self._file_key(path, before)
+                forms = self._file_key_forms(path, before)
+                file_key = forms[0]
                 with self._store_call():
-                    already = await self._leave_already_ingested(file_key)
+                    already = await self._leave_already_ingested(forms)
                 if already:
                     continue
             if not self._settled(path, before):
@@ -1261,6 +1264,10 @@ class FileSource(SourceConnector):
         return True
 
     def _file_key(self, path: Path, sig: _FileSig | None = None) -> str:
+        """The key this release writes for ``path``: the first of :meth:`_file_key_forms`."""
+        return self._file_key_forms(path, sig)[0]
+
+    def _file_key_forms(self, path: Path, sig: _FileSig | None = None) -> tuple[str, ...]:
         """A stable, HASHED identity for a source file, for the leave-in-place dedup ledger (#142).
 
         The identity folds the file's path **relative to the watch root** (not just the basename) +
@@ -1272,11 +1279,14 @@ class FileSource(SourceConnector):
         (the ledger holds this derived id only; never log the relative path). Folding mtime+size in means
         an UPDATED file (new mtime/size → new key) is re-ingested, while an unchanged file is skipped.
         ``sig`` is a stat the caller already holds; without one this stats the file, and may raise
-        ``OSError`` if it vanished mid-scan (the caller treats that as transient)."""
+        ``OSError`` if it vanished mid-scan (the caller treats that as transient).
+
+        Returns every form the ledger may hold the key under, today's scheme-tagged one first
+        (:func:`~messagefoundry.transports.base.file_key_forms`, BACKLOG #3424)."""
         size, mtime_ns = _file_sig(path) if sig is None else sig
         rel = path.relative_to(self.directory).as_posix()
         ident = f"{rel}\x00{mtime_ns}\x00{size}"
-        return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()
+        return file_key_forms(hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest())
 
     def _seen_touch(self, file_key: str) -> bool:
         """True if ``file_key`` is in the bounded in-memory fast-path (and refresh its LRU recency)."""
@@ -1374,15 +1384,16 @@ class FileSource(SourceConnector):
             else:
                 self._settle_seen[key] = (sig, missed + 1)
 
-    async def _leave_already_ingested(self, file_key: str) -> bool:
+    async def _leave_already_ingested(self, forms: tuple[str, ...]) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
         I/O), then, on a miss, the AUTHORITATIVE durable ledger (covers a restart / a fresh process /
-        a cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest."""
-        if self._seen_touch(file_key):
+        a cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest.
+        ``forms`` is :meth:`_file_key_forms`; the ledger is asked for each, so a row written under an
+        older scheme still marks the file read (BACKLOG #3424)."""
+        if self._seen_touch(forms[0]):
             return True
-        ledger = self.processed_ledger
-        if ledger is not None and await ledger.is_processed(file_key):
-            self._seen_add(file_key)
+        if await ledger_holds(self.processed_ledger, forms):
+            self._seen_add(forms[0])
             return True
         return False
 

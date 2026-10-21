@@ -246,6 +246,8 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/tls_handshake_failures.py": "observes a failed inbound handshake on a server "
     "context another module builds and re-raises it (vault BACKLOG #3302); it loads, mints and "
     "holds no key",
+    "messagefoundry/tls_sigalgs.py": "narrows the signature schemes of a context another module "
+    "builds, with set_server_sigalgs (BACKLOG #3414); it loads, mints and holds no key",
     "messagefoundry/parsing/xml/signature.py": _VERIFY_ONLY,
     "messagefoundry/parsing/xml/_deps.py": _VERIFY_ONLY,
     "messagefoundry/pipeline/cert_expiry.py": "reads PUBLIC certificate facts to alarm on expiry; "

@@ -393,7 +393,8 @@ account held **before** the repair (BACKLOG #2019).
   the earlier holder learns where later notices go. The comparison is case-sensitive, so the same
   mailbox typed in a different case counts as a change. From BACKLOG #2288 until ADR 0183 Amendment
   D (2026-10-10), only a repair of an account that held an address needed `--email` (ADR 0183
-  Amendment C). Amendment D says where that refusal still applies. It cannot fire from this command.
+  Amendment C). Since BACKLOG #3391 the service behind the command also refuses a run with no
+  address, so that narrower refusal is gone.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
@@ -4539,20 +4540,32 @@ on that session, for example) ends it as a revocation would.
   narrower, revokes the session. At least two such changes do. One is a user's channel scope set,
   from the list above. The other is an edit to the AD group-to-scope map, which revokes the
   sessions of every enabled directory account. So the next row's check refuses it, and the export
-  stops with the reason `standing_changed`. The reconcile pass also revokes when the directory
+  stops with the reason `standing_changed`. A row checked before that revoke lands stops it with
+  `scope_changed` instead, as the next paragraph says. The reconcile pass also revokes when the directory
   narrows or withdraws a scope. Its audit row, `auth.ad_session_revoked`, carries the reason
   `scope_changed`, or `roles_changed` with a `scope_changed` key when the roles changed too. The
   export it ends still records `standing_changed`.
 
   A second check catches a scope change that reaches a live session without a revoke. At least
-  two cases do. One is a direct store write. The other is a row checked after `set_channel_scope`
-  writes the scope but before its revoke lands. The AD map edit writes no user's scope, so it has
-  no such window. In both cases the export stops, with the reason `scope_changed`, when the
-  caller's channel scope no longer covers the scope it started with. A widened scope still covers
-  it. After a direct store write the export goes on. In the write-to-revoke window it goes on only
-  until the revoke lands, and the next row's check stops it with `standing_changed`. A stop
-  records `messages_export.stopped` with the selected and streamed counts and the reason. Then it
-  aborts the transfer, so the client sees a failed download rather than a short file.
+  two cases do. One is a direct store write. The other is a row checked after an engine path
+  writes a scope or a role set but before its revoke lands. At least these paths revoke after
+  their write, so each has that window: `set_channel_scope`, a role change, and the directory's
+  sign-in and reconcile writes. The AD map edit writes no user's scope, so it has no such window.
+  In both cases the export stops, with the reason `scope_changed`, when the caller's channel
+  scope differs from the one it started with, wider or narrower (BACKLOG #3381). So no row
+  streams from a channel the caller did not hold when it proved the export, and a grant then a
+  withdrawal stops at the grant rather than skipping later rows one by one. A stop
+  records `messages_export.stopped` with the selected and streamed counts and the reason. The
+  server log carries a WARNING with the counts beside that audit row, not an error with a
+  traceback.
+
+  **The stop does not reach the client as a failed download, in the shipped code.** The export
+  raises to abort the transfer, but the engine's `@app.middleware("http")` layers end the
+  response cleanly before that raise leaves them. So a client receives a 200 that ends normally
+  and holds only the rows streamed before the stop, and it cannot tell that file from a complete
+  export. The `messages_export.stopped` row and the server's WARNING record that it is short;
+  the file itself does not. This was
+  found under BACKLOG #3381 and is not fixed there. The same holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
@@ -4566,7 +4579,8 @@ on that session, for example) ends it as a revocation would.
   identity the export started with. A caller that may now read fewer rows, as after losing
   `users:manage`, would still receive the lock rows. So that stops it too, with the reason
   `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
-  the reason, then aborts the transfer. The idle clock moves as the bulk export's does, at most
+  the reason, then raises to abort the transfer, which reaches the client as a cleanly ended short
+  file, as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
   every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
