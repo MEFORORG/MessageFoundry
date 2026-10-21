@@ -472,7 +472,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         )
     if census.undecryptable_totp:
         parts.append(
-            "TOTP secret this engine cannot decrypt: " + ", ".join(census.undecryptable_totp)
+            "TOTP secret this engine cannot decrypt or compute with: "
+            + ", ".join(census.undecryptable_totp)
         )
     return CheckResult(
         rid,

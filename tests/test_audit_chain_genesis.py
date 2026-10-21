@@ -530,7 +530,8 @@ def test_a_genesis_record_round_trips_and_is_not_a_range_record() -> None:
         '{"genesis": true, "key_id": "k"}',
         '{"genesis": 1, "key_id": ""}',
         '{"genesis": 1, "key_id": 5}',
-        '{"genesis": 1, "key_id": "k", "closes": {}}',
+        # Since BACKLOG #3420 a genesis record with a field beyond its own still reads as one, and
+        # names a scheme no release holds: tests/test_audit_chain_scheme.py pins that refusal.
         # A short id: pytest puts the parameter in an environment variable, which has a size limit.
         pytest.param("[" * 100_000, id="deeply-nested"),
         5,

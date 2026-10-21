@@ -6763,7 +6763,8 @@ def _enrol_totp_at_terminal(
     label: str | None = None,
 ) -> tuple[str, str, float]:
     """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
-    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``. ``heading`` is the
+    Amendment A, N-A). Returns ``(enrolment, code, instant the code was read)``, the enrolment in
+    its stored form (:func:`totp.new_enrolment`, BACKLOG #3422). ``heading`` is the
     first sentence shown above the key and ``no_terminal`` opens the no-terminal refusal, so
     ``admin-reset-totp`` (ADR 0171 Amendment B) can name what it is doing. ``label`` is the account
     name the URI gives the app, ``username`` when unset; a replacement passes its own, so the app
@@ -6787,13 +6788,16 @@ def _enrol_totp_at_terminal(
             "interactively. Run this from a console."
         )
     secret = totp.generate_secret()
+    # What the store records and every check computes with; the URI advertises its parameters, so
+    # the app and the engine compute alike (BACKLOG #3422). The key line shows the bare secret.
+    enrolment = totp.new_enrolment(secret)
     _show_during_enrolment(
         f"\n{heading} Add this account "
         "to the app by its URI, which names the algorithm, then type the 6-digit code it shows. "
         "The codes use SHA-256: an app that takes only the key must be set to SHA-256, or its "
         "codes will never match.\n"
         f"  key: {secret}\n"
-        f"  URI: {totp.otpauth_uri(secret, username if label is None else label)}\n",
+        f"  URI: {totp.otpauth_uri(enrolment, username if label is None else label)}\n",
         refusal="could not open the console to show the authenticator key. Run this from a console",
     )
     went_away = "the console went away during enrolment"
@@ -6803,8 +6807,8 @@ def _enrol_totp_at_terminal(
         read_at = _time.time()
         if not code:
             raise _PasswordEntryRefused("empty authenticator code; nothing was written")
-        if totp.verify_totp_step(secret, code, now=read_at, window=skew_steps) is not None:
-            return secret, code, read_at
+        if totp.verify_totp_step(enrolment, code, now=read_at, window=skew_steps) is not None:
+            return enrolment, code, read_at
         if attempt < _PROVISION_TOTP_ATTEMPTS:  # never "try again" when no attempt is left
             _show_during_enrolment(
                 "That code did not match. Try the current one.\n", refusal=went_away
@@ -9266,7 +9270,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     topped up after **every committed batch** (so an interrupted rotation still accounts for
     everything it already re-encrypted — it cannot silently under-count the new key), and
     ``store.close()`` settles the remainder exactly. The key-age stamp below stays keyed on the DEK's
-    own fingerprint (``active_key_id``), never the sub-key (ADR 0196 AC-7).
+    own fingerprint (``active_key_id``, stored scheme-tagged, BACKLOG #3421), never the sub-key (ADR
+    0196 AC-7).
     """
     from pathlib import Path
 
@@ -9352,7 +9357,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
-        from messagefoundry.pipeline.secret_rotation import fingerprints_equal
+        from messagefoundry.pipeline.secret_rotation import dek_fingerprint, fingerprint_changed
         from messagefoundry.store.store import SecretRotationMetaStore
 
         # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
@@ -9400,10 +9405,32 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     # would reset the key-age clock for a key that was never rotated.
                     # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
                     # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
-                    if prior is None or not fingerprints_equal(prior.fingerprint, key_id):
+                    fingerprint = dek_fingerprint(key_id)
+                    changed = (
+                        True
+                        if prior is None
+                        else fingerprint_changed(prior.fingerprint, fingerprint)
+                    )
+                    if changed is None and prior is not None:
+                        # BACKLOG #3421: refused. Nothing says whether this run changed the key, so
+                        # it is re-stamped with its dates kept, as the watcher does: never a reset.
                         await store.upsert_secret_rotation_meta(
                             "MEFOR_STORE_ENCRYPTION_KEY",
-                            fingerprint=key_id,
+                            fingerprint=fingerprint,
+                            tracked_since=prior.tracked_since,
+                            last_rotated=prior.last_rotated,
+                        )
+                        print(
+                            "warning: the stored store-key fingerprint names a scheme this release"
+                            " does not know, so this run could not tell whether the key changed."
+                            " Its rotation dates were kept. If this run rotated the key, set"
+                            " [secret_rotation].store_key_last_rotated to today's date.",
+                            file=sys.stderr,
+                        )
+                    elif changed:
+                        await store.upsert_secret_rotation_meta(
+                            "MEFOR_STORE_ENCRYPTION_KEY",
+                            fingerprint=fingerprint,
                             tracked_since=prior.tracked_since if prior is not None else today,
                             last_rotated=today,
                         )

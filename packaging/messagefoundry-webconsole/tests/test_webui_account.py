@@ -21,7 +21,7 @@ from _webui_support import (
 )
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -185,7 +185,9 @@ async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
         assert 'action="/ui/account/mfa/verify"' in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
-        assert secret and secret in r.text  # the staged secret is what the page shows
+        # The staged secret is what the page shows: the bare key, without the parameters the cell
+        # also records (BACKLOG #3422).
+        assert secret and totp.parse_enrolment(secret)[0] in r.text
         # Confirm with a live code → recovery codes shown once; MFA active. Needs the MFA_CONFIRM grant.
         await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(

@@ -626,12 +626,18 @@ from typing import Any
 #: ``POST /ui/login`` passes the second, so a skew is an AttributeError or a TypeError at sign-in;
 #: they force a bump. Re-derived with ``--write``.
 #:
+#: Vault BACKLOG #3422 (engine PR 2453) added the additive ``totp_reenrolment_recommended`` field to
+#: ``MfaStatus`` and ``MfaStatusResponse`` and moved main's seam to 6d8b36eb7bb94bf0, with no note
+#: here. Vault BACKLOG #3373 then merged main; neither parent's value covered both, so the move
+#: comes from the merge. Re-derived with ``--write`` on the merged tree, so the value below covers
+#: both entries.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "e45be008d9bd193a"
+ENGINE_UI_SEAM: str = "c52ca8f0200fbecf"
 
 
 @dataclass(frozen=True, slots=True)

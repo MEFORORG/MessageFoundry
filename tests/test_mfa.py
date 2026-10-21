@@ -2772,7 +2772,7 @@ async def test_a_begin_inside_the_confirm_window_cannot_choose_the_enabled_secre
         assert user is not None and user.totp_enabled is False, (
             "the enable turned on a secret the confirm never verified"
         )
-        assert await store.get_totp_secret(identity.user_id) == second[0].secret
+        assert await store.get_totp_secret(identity.user_id) == totp.new_enrolment(second[0].secret)
         assert await store.get_recovery_code_hashes(identity.user_id) == []
         assert await store.list_sessions(identity.user_id) == []
         assert not any(e.event_type == MFA_ENABLED for e in notifier.events)
@@ -2794,7 +2794,7 @@ async def test_a_begin_inside_the_confirm_window_cannot_choose_the_enabled_secre
         )
         assert confirmed.ok
         assert (await service.mfa_status(identity)).enabled is True
-        assert await store.get_totp_secret(identity.user_id) == second[0].secret
+        assert await store.get_totp_secret(identity.user_id) == totp.new_enrolment(second[0].secret)
     finally:
         await store.close()
 
@@ -2883,7 +2883,7 @@ async def test_an_unrelated_write_inside_the_confirm_window_still_confirms(
         )
         assert confirmed.ok and len(confirmed.recovery_codes) == 10
         assert (await service.mfa_status(identity)).enabled is True
-        assert await store.get_totp_secret(identity.user_id) == enroll.secret
+        assert await store.get_totp_secret(identity.user_id) == totp.new_enrolment(enroll.secret)
     finally:
         await store.close()
 
@@ -2911,7 +2911,7 @@ async def test_a_begin_whose_stage_lands_after_an_enable_is_refused(
         monkeypatch.setattr(service, "_load_user", stale_read)
         with pytest.raises(ValueError, match="already enabled"):
             await service.begin_mfa_enrollment(identity)
-        assert await store.get_totp_secret(identity.user_id) == enroll.secret
+        assert await store.get_totp_secret(identity.user_id) == totp.new_enrolment(enroll.secret)
     finally:
         await store.close()
 
@@ -2948,9 +2948,9 @@ async def test_a_live_begin_racing_a_confirm_never_enables_an_unverified_secret(
         user = await store.get_user(identity.user_id)
         assert user is not None
         if user.totp_enabled:
-            assert await store.get_totp_secret(identity.user_id) == first.secret, (
-                "an enabled factor is not the secret the confirm verified"
-            )
+            assert await store.get_totp_secret(identity.user_id) == totp.new_enrolment(
+                first.secret
+            ), "an enabled factor is not the secret the confirm verified"
         if outcome.ok:
             assert user.totp_enabled and outcome.recovery_codes
         else:

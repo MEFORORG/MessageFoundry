@@ -175,6 +175,44 @@ _AUDIT_MAC_INFO = b"mefor/audit-chain/v1"
 _AUDIT_KEY_ID_INFO = b"mefor/audit-key-id/v1\x00"
 _AUDIT_MAC_LEN = 32  # bytes — HMAC-SHA256 key
 
+
+@dataclass(frozen=True)
+class AuditScheme:
+    """How one keyed range of the audit chain is sealed (BACKLOG #3420): the row MAC algorithm, and
+    how the range's key is obtained. A genesis or range record names it in ``mac`` and ``kdf``."""
+
+    mac: str
+    kdf: str
+
+
+#: An in-heap range: HMAC-SHA256 under a key HKDF-SHA256 derives from a store DEK under
+#: ``_AUDIT_MAC_INFO`` (:func:`_derive_audit_mac_key`).
+AUDIT_SCHEME_IN_HEAP = AuditScheme(
+    mac="hmac-sha256", kdf="hkdf-sha256:" + _AUDIT_MAC_INFO.decode("ascii")
+)
+#: The hash Vault/OpenBao Transit's ``generate_hmac`` is asked for (ADR 0138); it matches the SHA-256
+#: the in-heap chain uses. ``crypto_transit`` reads it from here, so the algorithm a Transit record
+#: names is the one this release computes. NEVER change it in place on a keyed-in-Transit store: verify
+#: recomputes every row with it, so every row written before the change would break. A new hash is a
+#: new scheme (BACKLOG #3420).
+AUDIT_TRANSIT_HASH_ALGO = "sha2-256"
+#: A Transit-keyed range: Transit's HMAC under its own named key, which never enters the engine.
+AUDIT_SCHEME_TRANSIT = AuditScheme(
+    mac="vault-transit:hmac-" + AUDIT_TRANSIT_HASH_ALGO, kdf="vault-transit"
+)
+#: What a genesis or range record that names no scheme was sealed under, by key kind: every such
+#: record predates BACKLOG #3420. Written out, not derived from the two schemes above, so a later
+#: release that changes those still reads these records as what they are.
+AUDIT_SCHEME_UNNAMED_IN_HEAP = AuditScheme(
+    mac="hmac-sha256", kdf="hkdf-sha256:mefor/audit-chain/v1"
+)
+AUDIT_SCHEME_UNNAMED_TRANSIT = AuditScheme(mac="vault-transit:hmac-sha2-256", kdf="vault-transit")
+#: The hex width of an in-heap row MAC. The keyless store mode's plain SHA-256 has the same width.
+AUDIT_MAC_HEX_LEN = 2 * hashlib.sha256().digest_size
+#: The ``mac`` name of the keyless store mode's plain SHA-256. No genesis or range record may name it,
+#: so no row can declare its chain keyless; whether a store runs keyless is its configuration.
+AUDIT_KEYLESS_MAC = "sha256"
+
 # HKDF info label for the secret-rotation fingerprint MAC key (ASVS 13.3.4, BACKLOG #282). A DEDICATED,
 # domain-separated subkey off the DEK: the rotation watcher fingerprints each tracked secret with a KEYED
 # MAC (never a salted hash — a salted hash of a low-entropy SMTP/AD password is offline-guessable), and
@@ -193,6 +231,14 @@ _BODY_DIGEST_INFO = b"mefor/audit-body-digest/v1"
 _BODY_DIGEST_LEN = 32  # bytes — HMAC-SHA256 key
 #: The algorithm name an audit row records beside each body digest.
 BODY_DIGEST_ALG = "hmac-sha256"
+#: The two HKDF-SHA256 steps a body-digest key takes from the DEK, as the record names them (BACKLOG
+#: #3420): the audit-chain label, then the body-digest label. A record without it is read as this.
+BODY_DIGEST_KDF = AUDIT_SCHEME_IN_HEAP.kdf + ",hkdf-sha256:" + _BODY_DIGEST_INFO.decode("ascii")
+#: What a body-digest record that names no ``alg`` or no ``kdf`` was taken under: every such record
+#: predates BACKLOG #3420. Written out, not derived from the names above, so a later release that
+#: changes those still reads these records as what they are.
+BODY_DIGEST_UNNAMED_ALG = "hmac-sha256"
+BODY_DIGEST_UNNAMED_KDF = "hkdf-sha256:mefor/audit-chain/v1,hkdf-sha256:mefor/audit-body-digest/v1"
 
 # Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
 # `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
@@ -682,8 +728,54 @@ def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
     (preimage-resistant), so embedding it in the stored prefix reveals nothing about the key. Accepts a
     ``bytearray`` so it can fingerprint an owned DEK buffer *before* it is zeroized, without forcing an
-    immutable copy."""
+    immutable copy.
+
+    Its output is persisted in at least the ``mfenc:`` marker of every sealed value, the DR archive
+    key check, a ``cipher_meta`` row and the DEK row of ``secret_rotation_meta``. The last two carry
+    :data:`KEY_ID_SCHEME` (BACKLOG #3421), so a change here needs a new scheme tag read beside this
+    one, or their counts and age clocks would restart at zero, as well as a new marker version."""
     return hashlib.sha256(key).hexdigest()[:_KEY_ID_LEN]
+
+
+#: The scheme tag a STORED :func:`_fingerprint` output carries (BACKLOG #3421): SHA-256, the first 16
+#: hex. It names the function, not the key, so a release that changes the function can tell a value
+#: the old one wrote. The ``mfenc:`` markers and DR archives do not carry it: their format version
+#: can name a new function.
+KEY_ID_SCHEME = "sha256-16"
+
+
+class UnknownSchemeError(ValueError):
+    """A stored value names a scheme this release does not compile in (BACKLOG #3421). A stored tag
+    may only choose among the release's own schemes, so it is refused, never resolved at run time."""
+
+
+def scheme_tagged(scheme: str, value: str) -> str:
+    """``value`` as it is stored, prefixed ``<scheme>:`` (BACKLOG #3421)."""
+    return f"{scheme}:{value}"
+
+
+def read_scheme_tag(stored: str, scheme: str) -> str:
+    """The value ``stored`` holds under ``scheme``, the one scheme its caller compiles in.
+
+    A tag is the text before the first ``:`` when it is not lowercase hex. Every value written
+    before tags existed starts with a hex key id or MAC, so an untagged value reads as written under
+    ``scheme`` and is returned as it is. That holds while ``scheme`` is the one each value was
+    written under before tags; a release that adds a scheme must map an untagged value to the old
+    one, not the new. A tag other than ``scheme`` raises
+    :class:`UnknownSchemeError`. Every tag therefore holds a character that is not lowercase hex."""
+    head, sep, rest = stored.partition(":")
+    if not sep or (head and not head.strip("0123456789abcdef")):
+        return stored
+    if head != scheme:
+        raise UnknownSchemeError(f"stored value names an unknown scheme {head[:32]!r}")
+    return rest
+
+
+def cipher_meta_key(key_id: str) -> str:
+    """The ``cipher_meta`` row id for the key whose :func:`_fingerprint` is ``key_id``: the id
+    tagged :data:`KEY_ID_SCHEME` (BACKLOG #3421). A row written before tags existed is keyed on the
+    bare id; each backend reads it as this row and folds it in on its next add."""
+    return scheme_tagged(KEY_ID_SCHEME, key_id)
 
 
 def _derive_audit_mac_key(dek: bytes | bytearray) -> bytes:
@@ -815,10 +907,12 @@ def _body_mac(key: bytes, body: str) -> HMAC:
 def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None] | None:
     """Keyed digests of message bodies for an audit row (vault BACKLOG #2615).
 
-    Returns ``{"alg", "key_id", <name>: <hex or None>, ...}``, one entry per keyword. An empty body,
-    such as one retention has already blanked, digests to ``None`` rather than to the digest of
+    Returns ``{"alg", "kdf", "key_id", <name>: <hex or None>, ...}``, one entry per keyword. An empty
+    body, such as one retention has already blanked, digests to ``None`` rather than to the digest of
     nothing. ``key_id`` is :func:`audit_key_id` of the audit key the digest key was derived from, so
-    :func:`verify_audit_body_digest` can still find that key after a rotation.
+    :func:`verify_audit_body_digest` can still find that key after a rotation. ``alg`` and ``kdf``
+    name the MAC and the two HKDF labels the key came through (BACKLOG #3420), so a later release
+    that changes either can still tell which scheme a stored digest was taken under.
 
     The key is HKDF-SHA256 over the in-heap audit-chain key under ``mefor/audit-body-digest/v1``. So
     a reader of the audit log who lacks the store key cannot recover or test a body from its digest,
@@ -830,26 +924,52 @@ def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None
     The digest outlives a key rotation only while the retired key stays configured: the audit chain's
     keyed ranges have the same dependency, so keep a retired key for as long as its rows must
     verify."""
-    reserved = {"alg", "key_id"} & bodies.keys()
+    reserved = {"alg", "kdf", "key_id"} & bodies.keys()
     if reserved:
         raise ValueError(f"body names {sorted(reserved)} collide with the digest's own fields")
     audit_key = cipher.audit_mac_key()
     if audit_key is None:
         return None
     key = _derive_body_digest_key(audit_key)
-    out: dict[str, str | None] = {"alg": BODY_DIGEST_ALG, "key_id": audit_key_id(audit_key)}
+    out: dict[str, str | None] = {
+        "alg": BODY_DIGEST_ALG,
+        "kdf": BODY_DIGEST_KDF,
+        "key_id": audit_key_id(audit_key),
+    }
     for name, body in bodies.items():
         out[name] = _body_mac(key, body).finalize().hex() if body else None
     return out
 
 
-def verify_audit_body_digest(cipher: Cipher, body: str, *, key_id: str, digest: str | None) -> bool:
+def verify_audit_body_digest(
+    cipher: Cipher,
+    body: str,
+    *,
+    key_id: str,
+    digest: str | None,
+    alg: object,
+    kdf: object,
+) -> bool:
     """Whether ``body`` is the body an audit row's ``digest`` was taken of (vault BACKLOG #2615).
 
     Looks the audit key up by ``key_id`` in the cipher's keyring, so a digest taken before a key
     rotation still verifies while the retired key is configured. ``False`` for an unknown key id, a
     keyless cipher, a ``None`` digest (a body retention had already blanked), or a mismatch. The
-    comparison is constant-time."""
+    comparison is constant-time.
+
+    ``alg`` and ``kdf`` are what the record names (BACKLOG #3420), and are required so no caller
+    skips the check: pass ``record.get("alg")`` and ``record.get("kdf")``. ``None`` is a field the
+    record does not carry, or carries as JSON ``null``, read as
+    :data:`BODY_DIGEST_UNNAMED_ALG` or :data:`BODY_DIGEST_UNNAMED_KDF`, what every such record was
+    taken under. The pair must then be the one this release digests with, or the answer is
+    ``False``, a plain hash included: a stored name only chooses among the schemes this release
+    compiles, and today that is one."""
+    named = (
+        BODY_DIGEST_UNNAMED_ALG if alg is None else alg,
+        BODY_DIGEST_UNNAMED_KDF if kdf is None else kdf,
+    )
+    if named != (BODY_DIGEST_ALG, BODY_DIGEST_KDF):
+        return False
     audit_key = cipher.audit_mac_keyring().get(key_id)
     if audit_key is None or not body or not isinstance(digest, str):
         return False

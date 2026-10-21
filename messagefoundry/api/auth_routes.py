@@ -887,6 +887,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             recovery_codes_remaining=st.recovery_codes_remaining,
             required=st.required,
             webauthn_enrolled=st.webauthn_enrolled,
+            totp_reenrolment_recommended=st.totp_reenrolment_recommended,
         )
 
     @app.post(
