@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-ea0b48d0bf69ec09
+abc94c8c0254d1ff
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -137,6 +137,7 @@ LoginOutcome: constructor (ok: 'bool', token: 'str | None' = None, identity: 'Id
 MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False, totp_reenrolment_recommended: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, totp_reenrolment_recommended, webauthn_enrolled; properties: none
 NotifyEmailAlreadySet: exception (RuntimeError < Exception < BaseException)
 OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reason: 'str | None' = None, error: 'str | None' = None, flow_consumed: 'bool' = True) -> None; fields: elevation, error, flow_consumed, reason, return_to; properties: ok
+OidcStepUpFlow: constructor (user_id: 'str', return_to: 'str') -> None; fields: return_to, user_id; properties: none
 PasskeyProof: constructor (handle: 'str', response_json: 'str', rp_id: 'str', origin: 'str') -> None; fields: handle, origin, response_json, rp_id; properties: none
 RolesGained: constructor (username: 'str', roles: 'frozenset[str]') -> None; fields: roles, username; properties: none
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
@@ -198,8 +199,8 @@ mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
 must_enrol_before_rotating: (self, identity: 'Identity') -> 'bool'
 oidc_enabled: property -> 'bool'
-oidc_flow_is_step_up: (self, flow_id: 'str') -> 'bool'
 oidc_flow_ttl_seconds: property -> 'int'
+oidc_step_up_flow: (self, flow_id: 'str') -> 'OidcStepUpFlow | None'
 password_change_owes_factor: (self, token: 'str | None') -> 'bool'
 phi_read_retry_after: (self, actor: 'str') -> 'int'
 reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'Elevation'

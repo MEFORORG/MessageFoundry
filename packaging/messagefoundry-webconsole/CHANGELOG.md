@@ -29,6 +29,17 @@ this line.**
   sign-in lock that someone else's wrong passwords set. Needs the engine seam that carries
   `AuthService.begin_passkey_sign_in`. (BACKLOG #3373, ADR 0197 Amendment A wave 2)
 
+### Security
+
+- **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
+  sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
+  charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already
+  draws, so the return spends none of the user's other ceremony attempts. A flood
+  that spent the shared sign-in budget would otherwise refuse every federated step-up while a
+  password step-up kept working. A refused return answers 429 with the step-up page for the staged
+  continuation, and consumes nothing. Every other callback still draws the sign-in budget. This console needs an
+  engine with `oidc_step_up_flow`, and refuses an older one at startup. (BACKLOG #3374)
+
 ## [0.5.0] — 2026-10-20 — Early Access
 
 **Requires engine 0.5.2. Supported engine UI seam: `6d8b36eb7bb94bf0`**, the value engine 0.5.2

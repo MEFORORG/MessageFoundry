@@ -675,12 +675,33 @@ from typing import Any
 #: was ``c52ca8f0200fbecf`` and main's ``bcdc6665f3b8a958``. Neither parent's value covered both
 #: surfaces, so the move comes from the merge. Re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3374: ``AuthService.oidc_flow_is_step_up`` became ``oidc_step_up_flow``, which returns
+#: a live step-up flow's user id and continuation as the new ``OidcStepUpFlow``, or None, where it
+#: returned a bool. The route types its value so discovery sees the DTO. The
+#: ``/ui/oidc/callback`` route charges an IdP step-up's return to that user's ceremony budget
+#: rather than the sign-in window, so a newer console on an older engine would raise
+#: AttributeError on every callback, and an older console on this engine would on every one too.
+#: A method the console calls, so it forces a bump; the pinned digest refuses either pair at
+#: mount. Re-derived with ``--write``.
+#:
+#: BACKLOG #3374 merged with main: each side moved the digest on its own (this branch to
+#: b6270406897ee7c6, main to 6d8b36eb7bb94bf0). The value below was re-derived with ``--write``
+#: on the merged tree, so it covers both.
+#:
+#: BACKLOG #3374 merged again with main, after #3401 / #3393 landed there (digest
+#: bcdc6665f3b8a958; this branch at 3c209cdd46721b6c). The value below was re-derived with
+#: ``--write`` on the merged tree, so it covers both.
+#:
+#: BACKLOG #3374 merged a third time with main, after vault BACKLOG #3373 landed there (digest
+#: ea0b48d0bf69ec09; this branch at d3f76a351d8328bd). The value below was re-derived with
+#: ``--write`` on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "ea0b48d0bf69ec09"
+ENGINE_UI_SEAM: str = "abc94c8c0254d1ff"
 
 
 @dataclass(frozen=True, slots=True)
