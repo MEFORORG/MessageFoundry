@@ -1402,6 +1402,58 @@ def test_the_lockdown_keeps_what_the_service_actually_needs(tmp_path: Path) -> N
 
 
 @_windows_only
+def test_a_key_file_in_the_locked_data_dir_passes_the_key_file_check(tmp_path: Path) -> None:
+    """BACKLOG #3402: ``enforce`` refuses a connection's key file a broad group can read. A key an
+    operator puts in the data directory this script locks passes that check, and the same key
+    beside it, in a parent that grants BUILTIN\\Users read the way ProgramData does, is refused.
+    The windows-service-smoke leg mints its registry client key there for this reason
+    (``tests/test_windows_smoke_key_file.py``)."""
+    from messagefoundry.config.key_file_access import key_file_problem
+
+    assert _SCRIPT is not None
+    parent = tmp_path / f"kf-{uuid.uuid4().hex[:8]}"
+    data = parent / "MessageFoundry"
+    data.mkdir(parents=True)
+    locked_key = data / "registry-cert" / "client.key"
+    open_key = parent / "client.key"
+    # Created as openssl creates them: plain files that take their folder's inherited ACL.
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+  if ($LASTEXITCODE -ne 0) {{ throw "icacls could not grant Users on the parent" }}
+  Set-SecureDataDirAcl -Path {_psq(str(data))} -Account $me 3>$null
+  New-Item -ItemType Directory -Force -Path {_psq(str(locked_key.parent))} | Out-Null
+  [IO.File]::WriteAllText({_psq(str(locked_key))}, 'not a key')
+  [IO.File]::WriteAllText({_psq(str(open_key))}, 'not a key')
+"""
+    try:
+        _ok(_extract(_SCRIPT, _ACL_FNS, body), tmp_path)
+
+        def problem(path: Path) -> str | None:
+            return key_file_problem(str(path), what="the key", remedy="restrict it")
+
+        refused = problem(open_key)
+        assert refused is not None and "S-1-5-32-545" in refused, (
+            f"CONTROL FAILED: a key under a parent granting BUILTIN\\Users read was not refused "
+            f"as Users-readable, so a pass below proves nothing: {refused!r}"
+        )
+        locked = problem(locked_key)
+        assert locked is None, (
+            f"a key file in the data directory install-service.ps1 locks is refused: {locked}"
+        )
+    finally:
+        from messagefoundry.service_status import _system_exe
+
+        # Put the tree back in reach so pytest can clean it up, however the block above ended: the
+        # lockdown keeps this user's Modify, and inheritance brings back tmp_path's own grant.
+        subprocess.run(  # noqa: S603
+            [_system_exe("icacls.exe"), str(data), "/inheritance:e"],
+            capture_output=True,
+            check=False,
+        )
+
+
+@_windows_only
 def test_residue_outside_the_well_known_set_is_reported_not_hidden(tmp_path: Path) -> None:
     """The named removals cover the well-known broad principals. Anything else -- a local group, a
     stale SID -- is READ BACK and named, so the caller is never told a lockdown happened that did
