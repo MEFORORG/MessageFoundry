@@ -2863,27 +2863,40 @@ What to do instead:
 # Rule 2 -- dispatching a fan-out FROM the primary. Checked first: it is the cheapest place to stop a
 # workflow that would otherwise burn 40 minutes and then report success while having written nothing.
 #
-# EXEMPT: a Task/Agent call whose tool_input.subagent_type is EXACTLY "web-fetch" or "claude-code-guide"
-# (case-sensitive, and only when the value is a string). Owner authorization 2026-10-21, AFK-autonomy plan
-# section 6.1. Those two built-in types carry no shell and no write tool (WebFetch; Glob/Grep/Read/
+# EXEMPT: a Task/Agent call whose tool_input has one key spelled exactly "subagent_type" and whose value
+# is a string ORDINALLY equal to "web-fetch" or "claude-code-guide". Ordinal, not -ceq/-cin: PowerShell's
+# culture comparison ignores zero-width, soft-hyphen and NUL characters, so "web-fetch" plus U+200B would
+# match. The key is matched ordinally too, because a PSCustomObject property read is case-insensitive.
+# Owner authorization 2026-10-21, for docs/AUTONOMY-PLAN.md section 6.1 (on branch autonomy-plan when
+# this was written). Those two built-in types carry no shell AND no write tool (WebFetch; Glob/Grep/Read/
 # WebFetch/WebSearch), so inheriting the primary's cwd cannot build or swap anything there, which is the
-# harm this rule exists for. Everything else stays denied: Explore and Plan have Bash, and a shell redirect
-# evades rules 1 and 3; general-purpose, fork, a missing or non-string type, any other spelling of the two
-# names, and every Workflow. RESIDUAL: the match is on the NAME, not on the tool list, so a project- or
-# user-scope agent defined under one of these two names, with a shell, would pass this rule too.
+# harm this rule exists for. "No shell" alone is not the criterion: statusline-setup has none but has Edit.
+# Everything else stays denied: Explore and Plan have Bash, and a shell redirect evades rules 1 and 3;
+# general-purpose, fork, a missing or non-string type, any other spelling of the two names, and every
+# Workflow. RESIDUALS, at least: the match is on the NAME, not on the tool list, so an agent defined under
+# either name with a shell or a write tool passes too, from any source that can define one (project or
+# user agents, the --agents flag, an SDK host's agents option); and the premise rests on the vendor's
+# current tool lists for these two types, which no test here pins.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("Task", "Agent", "Workflow")) {
-    $shellLessTypes = @("web-fetch", "claude-code-guide")
-    $subagentType = $hook.tool_input.subagent_type
-    if ($tool -ne "Workflow" -and $subagentType -is [string] -and $subagentType -cin $shellLessTypes) {
-        exit 0
+    if ($tool -ne "Workflow") {
+        $typeProps = @($hook.tool_input.PSObject.Properties |
+            Where-Object { [string]::Equals($_.Name, "subagent_type", [StringComparison]::Ordinal) })
+        # Assigned, never `$x = if (...) { ... }`: that form's pipeline output unrolls a one-element JSON
+        # array into its bare string, which would then pass the type check below.
+        $subagentType = $null
+        if ($typeProps.Count -eq 1) { $subagentType = $typeProps[0].Value }
+        if ($subagentType -is [string] -and
+            [Array]::IndexOf([string[]]@("web-fetch", "claude-code-guide"), $subagentType) -ge 0) {
+            exit 0
+        }
     }
     $root = Test-Governed $cwd
     if ($root) {
         $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
 BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
-subagents. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
+this subagent. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
 not reliably surface back to you -- the fan-out would appear to succeed while writing nothing.
 
 Create a worktree first, then dispatch from it:
@@ -2891,8 +2904,7 @@ Create a worktree first, then dispatch from it:
     pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
 
 That prints a worktree path. Ask the user to start the session there (or continue there yourself), then
-re-dispatch. If you were only going to READ, do it directly -- reads are never blocked. The only
-subagent types this rule lets through from here are $($shellLessTypes -join ' and '), which have no shell.
+re-dispatch. If you were only going to READ, do it directly -- reads are never blocked.
 "@
     }
     exit 0
