@@ -52,23 +52,29 @@ named test rather than leaving it to be discovered, following the precedent in
 ``tests/test_gate_liveness.py``, which documents its own reconciliation sum's blindness instead of
 hiding it.
 
-FAIL-CLOSED. A network error, a rate limit or an unparsable response is a FAILURE, never a pass. A
-supply-chain gate that degrades to green when it cannot see is the failure mode this repo has already
-catalogued three times (docs/CI.md, "Gate liveness"): a check that reports success while measuring
-nothing. For the same reason the summary prints the number of distributions actually EXAMINED, and
-exits non-zero if that number is zero.
+FAIL-CLOSED. A network error, a rate limit or an unparsable response that is still failing once the
+transient retries below are spent is a FAILURE (exit 2), never a pass. A supply-chain gate that
+degrades to green when it cannot see is the failure mode this repo has already catalogued three times
+(docs/CI.md, "Gate liveness"): a check that reports success while measuring nothing. For the same
+reason the summary prints the number of distributions actually EXAMINED, and exits non-zero if that
+number is zero.
 
-TRANSIENT RETRY, STILL FAIL-CLOSED (BACKLOG #3089). The sweep makes one PyPI request per declared
-distribution, about 56 in sequence, inside a REQUIRED job, so a single TLS handshake timeout used to
-evict a clean pull request from the merge queue. A request that fails TRANSIENTLY -- a connect, TLS
-handshake or read timeout, a connection reset, refused or dropped, or an HTTP 429 or 5xx -- is tried
-again, up to ``_ATTEMPTS`` times per request with exponential backoff and a little jitter, and at most
-``_RUN_RETRY_BUDGET`` retries across the whole run. A DEFINITIVE answer is never retried: a 404 still
-means "no such project" on the first reply, any other 4xx and malformed JSON still fail at once. When
-the retries are spent the last error propagates and the run exits 2 exactly as before; a retry never
-turns an unreachable PyPI into a pass. Worst case added time: the budget caps it at 6 retries x (a
-20s socket timeout + at most 2.5s backoff), about 135 seconds, reached only when every retry itself
-times out.
+TRANSIENT RETRY (BACKLOG #3089). The sweep makes one PyPI request per declared distribution, about 56
+in sequence, inside a REQUIRED job, so a single TLS handshake timeout used to evict a clean pull
+request from the merge queue. A request that fails TRANSIENTLY -- a network-level OSError such as a
+connect, TLS handshake or read timeout, a reset, refused or unreachable connection or a DNS failure, a
+truncated body, or an HTTP 429 or 5xx -- gets up to ``_ATTEMPTS`` attempts in total (two retries),
+with exponential backoff of about 1s then 2s plus up to 0.5s of jitter. A DEFINITIVE answer is never
+retried: a 404 still means "no such project" on the first reply; a 4xx other than 429, a certificate
+verification failure and an unparsable or wrongly shaped body still fail at once. When the retries are
+spent the last error propagates and the run exits 2 exactly as before; a retry never turns an
+unreachable PyPI into a pass.
+
+Worst case added time. The whole run gets at most ``_RUN_RETRY_BUDGET`` (6) retries, and none starts
+once the sweep has been running ``_RETRY_WINDOW_S`` (120s). So retries add at most those 120s plus
+the duration of the last retried attempt and its backoff (at most 2.5s). One attempt has no hard
+ceiling of its own -- urlopen's 20s timeout applies per socket operation and per resolved address --
+which was equally true of every request before this change.
 
 USAGE
     python scripts/security/new_dependency_check.py                 # sweep pyproject.toml
@@ -91,7 +97,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -297,45 +303,59 @@ def vet(
 
 
 # Retry policy for TRANSIENT network failures only (BACKLOG #3089); the module docstring states the
-# worst case. Attempts are per request; the budget is per run, so a PyPI that is flaky on every name
-# cannot stretch the job past a couple of minutes before it fails closed.
+# worst case. Attempts are per request; the budget and the window are per run, so a PyPI that is flaky
+# on every name fails closed within about two minutes rather than retrying every request.
 _ATTEMPTS = 3
 _BACKOFF_BASE_S = 1.0
 _BACKOFF_JITTER_S = 0.5
 _RUN_RETRY_BUDGET = 6
-
-# A TLS handshake timeout arrives as URLError(TimeoutError(...)) -- the 2026-10-20 queue evictions --
-# and a read timeout as a bare TimeoutError. ConnectionError covers reset, refused, aborted and
-# http.client.RemoteDisconnected. Every ssl.SSLError is deliberately absent, a certificate
-# verification failure above all: that is an answer about who is on the other end, not a flaky link,
-# and retrying it would only delay the failure. (Naming ssl.SSLEOFError here would also put this file
-# in the crypto inventory for an exception class; a handshake that HANGS, the observed case, arrives
-# as TimeoutError anyway.)
-_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-    TimeoutError,
-    ConnectionError,
-    http.client.IncompleteRead,
-)
+_RETRY_WINDOW_S = 120.0
+_PYPI_HOST = urllib.parse.urlsplit(_PYPI_JSON).hostname
 
 
 @dataclass
 class RetryBudget:
-    """Retries left for the whole run, shared by every request ``main`` makes."""
+    """Retries left for the whole run, and the moment after which none may start.
 
-    remaining: int = _RUN_RETRY_BUDGET
+    Required by ``_http_fetch`` rather than defaulted, so a caller cannot silently get a fresh budget
+    per request and lose the per-run cap. The defaults are read when the budget is made, not when the
+    module loads.
+    """
+
+    remaining: int = field(default_factory=lambda: _RUN_RETRY_BUDGET)
+    window_ends: float = field(default_factory=lambda: time.monotonic() + _RETRY_WINDOW_S)
+
+    def spend(self) -> bool:
+        """Take one retry if any is left and the window is open; False means fail now."""
+        if self.remaining <= 0 or time.monotonic() >= self.window_ends:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _is_certificate_failure(reason: BaseException) -> bool:
+    # Matched by class name so this file need not import ssl, which would enrol it in the crypto
+    # inventory for an exception class. ssl.CertificateError is an alias of this class.
+    return any(cls.__name__ == "SSLCertVerificationError" for cls in type(reason).__mro__)
 
 
 def _is_transient(exc: BaseException) -> bool:
     """True only for a failure that says nothing about the package: the link, not the answer.
 
     HTTPError is checked first because it subclasses URLError. A 404 is the definitive "no such
-    project" and is handled before this is reached; any other 4xx except 429 is a definitive refusal.
+    project" and never reaches here; any other 4xx except 429 is a definitive refusal. Below HTTP, any
+    network-level OSError is the link -- a timeout (the 2026-10-20 evictions logged
+    URLError(TimeoutError) from a TLS handshake), a reset, refused or unreachable connection, a DNS
+    failure, a TLS session dropped mid-handshake -- EXCEPT a certificate verification failure, which is
+    an answer about who is on the other end and must not be retried. A truncated body
+    (IncompleteRead; RemoteDisconnected is a ConnectionError) is the link too.
     """
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
-    if isinstance(exc, urllib.error.URLError):
-        return isinstance(exc.reason, _TRANSIENT_ERRORS)
-    return isinstance(exc, _TRANSIENT_ERRORS)
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, http.client.IncompleteRead):
+        return True
+    return isinstance(reason, OSError) and not _is_certificate_failure(reason)
 
 
 def _describe(exc: BaseException) -> str:
@@ -350,36 +370,33 @@ def _describe(exc: BaseException) -> str:
 def _http_fetch(
     name: str,
     *,
+    budget: RetryBudget,
     timeout: float = 20.0,
-    attempts: int = _ATTEMPTS,
-    budget: RetryBudget | None = None,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict | None:
     """Fetch PyPI's JSON for ``name``, retrying TRANSIENT failures only.
 
-    None means 404. A definitive error raises at once; a transient one raises once ``attempts`` or the
+    None means 404. A definitive error raises at once; a transient one raises once ``_ATTEMPTS`` or the
     run's ``budget`` is spent. Either way the caller fails closed -- nothing here returns a payload it
     did not receive.
     """
-    budget = budget if budget is not None else RetryBudget()
     attempt = 1
     while True:
         try:
             return _fetch_once(name, timeout=timeout)
         except (OSError, http.client.HTTPException) as exc:
-            if attempt >= attempts or budget.remaining <= 0 or not _is_transient(exc):
+            if attempt >= _ATTEMPTS or not _is_transient(exc) or not budget.spend():
                 raise
-            budget.remaining -= 1
             # Jitter only de-synchronises retries; it guards nothing, so a non-crypto PRNG is right.
             jitter = random.uniform(0, _BACKOFF_JITTER_S)  # nosec B311
             delay = _BACKOFF_BASE_S * 2 ** (attempt - 1) + jitter
             print(
-                f"::warning::PyPI request for {name!r} to {urllib.parse.urlsplit(_PYPI_JSON).hostname} "
-                f"failed transiently on attempt {attempt} of {attempts} ({_describe(exc)}); retrying "
-                f"in {delay:.1f}s ({budget.remaining} retries left this run).",
+                f"::warning::PyPI request for {name!r} to {_PYPI_HOST} failed transiently on attempt "
+                f"{attempt} of {_ATTEMPTS} ({_describe(exc)}); retrying in {delay:.1f}s "
+                f"({budget.remaining} retries left this run).",
                 file=sys.stderr,
             )
-            sleep(delay)
+            (sleep or time.sleep)(delay)
             attempt += 1
 
 
@@ -400,11 +417,16 @@ def _fetch_once(name: str, *, timeout: float) -> dict | None:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
-            return json.loads(response.read().decode("utf-8"))
+            payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
         raise
+    if not isinstance(payload, dict):
+        # Valid JSON of the wrong shape is a definitive bad answer, not a flaky link; raised here as a
+        # ValueError so main reports it as unreadable (exit 2) rather than vet crashing on .get.
+        raise ValueError(f"PyPI returned a JSON {type(payload).__name__}, not an object")
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -424,12 +446,12 @@ def main(argv: list[str] | None = None) -> int:
             min_age_days=args.min_age_days,
         )
     except (
-        urllib.error.URLError,
-        TimeoutError,
-        json.JSONDecodeError,
+        # OSError covers URLError, HTTPError and every timeout; ValueError covers JSONDecodeError, a
+        # non-UTF-8 body and a wrongly shaped one; HTTPException covers IncompleteRead, which is not an
+        # OSError. Anything escaping here would exit 1, the code that means "a dependency failed
+        # vetting", rather than 2, "could not see".
         OSError,
-        # IncompleteRead and friends are not OSError; without this a truncated body would escape as a
-        # traceback and exit 1, the code that means "a dependency failed vetting".
+        ValueError,
         http.client.HTTPException,
     ) as exc:
         # FAIL CLOSED. Passing here would mean "PyPI was unreachable, so every dependency is fine".
