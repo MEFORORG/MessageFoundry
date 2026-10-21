@@ -269,7 +269,9 @@ version.
    version in the *Admin console* section of `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
-   [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order.
+   [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the
+   link definitions at the foot of the file: `[Unreleased]` compares from the new tag, and a new
+   `[<version>]` line compares the previous tag with it. No test holds them.
 
 What an engine bump does not move:
 

@@ -620,7 +620,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored with no `upload.create` audit row, while the client was told the upload failed. The save
   now removes the pair, and logs at ERROR if the filesystem refuses. A caller cancelled in its own
   audit write, after `save` returned, still keeps the file. (`BACKLOG #2262`)
-- **A cancelled upload save now pays its cross-shard quota slot back.** A save cancelled while its
+- **A cancelled upload save now pays its cross-engine-shard quota slot back.** A save cancelled while its
   quota reserve or release was running could leave the slot held. That narrowed the uploader's
   budget until the reservation went stale. The save now waits a bounded time for both calls to
   finish before the cancellation goes on. At least a few cancelled cases still leak a slot, such as
@@ -10086,7 +10086,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
