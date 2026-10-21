@@ -1,8 +1,18 @@
 # Sharing fleet coordination state across two PCs
 
-**Status: PROPOSED, 2026-10-21. Nothing in `scripts/` has changed.** Moving where every session
-reads and writes coordination state is the owner's call. This note is the design that call is made
-on.
+**Status: APPROVED by the owner, 2026-10-21. Nothing in `scripts/` has changed yet.**
+
+Owner answers, 2026-10-21:
+
+- Design approved as written.
+- Host: Nucbox01 is always on. **Use the existing `Shared` share**, so the root is
+  `\\Nucbox01\Shared\mefor-coord`, not a dedicated share. MEFORDEV01 and the MEFORHV01 server are
+  also always on, and stay the fallback hosts if Nucbox01 proves unreliable. The access-list caveat
+  under *PHI and secrets* still applies to a subfolder of `Shared`.
+- MEFORDEV01 signs in to all the accounts and has its own clones. Its details come from a probe
+  session there, which drops results under `Z:\mefor-coord-probe\`.
+- Services: left to the Builder. Only the AFK zero-model cron reads shared state. It runs as the
+  owner's user, on one PC, and reads the UNC path. No NSSM service needs it.
 
 ## The recommendation: one shared root on a dedicated SMB share, named by UNC path, split by class
 
@@ -125,9 +135,10 @@ Coordination records are seat goals, item numbers, paths and message text. None 
 secret, and the engine's rules (CLAUDE.md section 9) already forbid both. Two extra safeguards,
 because the share is reachable from more than one machine:
 
-- **Use a dedicated share,** for example `\\Nucbox01\mefor-coord`, readable and writable by the
-  owner's account alone. Not the general `Shared` share, which already holds unrelated and possibly
-  sensitive files and whose access list is unknown.
+- **Restrict the folder.** The owner chose the general `Shared` share, which already holds
+  unrelated and possibly sensitive files and whose access list is unknown. So set an NTFS access
+  list on `\\Nucbox01\Shared\mefor-coord` that grants the owner's account alone, with inheritance
+  off. A dedicated share remains the stronger option.
 - Mail bodies are free text. `mail.ps1` should refuse a body that matches the leak gate's secret
   patterns, the same patterns the pre-commit gate uses. That is a follow-up, not a precondition.
 
@@ -168,7 +179,7 @@ design. Reads and builds keep working.
 
 ## Migration
 
-1. Owner creates the dedicated share and gives this account read and write.
+1. Create `\\Nucbox01\Shared\mefor-coord` and restrict its access list as above.
 2. On each PC, in a desktop shell, an elevated shell and a scheduled task, a probe script measures:
    UNC reachability, exclusive create (two processes race 100 times, exactly one wins each time),
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
