@@ -690,9 +690,13 @@ never with mail. The evidence is probe PR
 
       if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { ... }
 
-  A machine-specific script checks its own host at the top, right after any `param()` block, and
-  uses `throw`, so a blocked run exits non-zero. Keep `param()` first. Wrapped inside a check, it is
-  not parsed as one, so the script runs with its defaults and drops the caller's arguments.
+  A machine-specific script checks its own host at the top, right after any `param()` block. Keep
+  `param()` first. Wrapped inside a check, it is not parsed as one, so the script runs with its
+  defaults and drops the caller's arguments. The ban on `exit` covers pasted input only; a script
+  ends its check with `exit 1`, which stops it even when the caller silences errors and `throw` is
+  skipped:
+
+      if ([Environment]::MachineName -ne '<HOST>') { throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran"; exit 1 }
 
 ---
 
