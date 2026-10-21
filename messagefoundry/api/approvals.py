@@ -1828,7 +1828,8 @@ class ApprovalGate:
         The caller logs the loss itself, with whatever detail it holds. This only raises the
         ``audit_write_failed`` alert, and is best effort by the sink's own contract. The key is
         ``approval:<id>`` unless ``key`` names another. A lost resolver flag passes
-        ``approval:<id>:resolve``, so it cannot fold into a lost release flag (vault BACKLOG #3438)."""
+        ``approval:<id>:resolve``, so it cannot fold into a lost release flag (vault BACKLOG
+        #3438)."""
         try:
             self._alert_sink.audit_write_failed(key or f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract

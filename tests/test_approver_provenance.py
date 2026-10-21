@@ -377,7 +377,9 @@ async def test_a_lost_release_flag_and_a_lost_resolver_flag_page_twice(engine: E
     key: the notifier then folds the second into the first's instance and its re-alert window."""
 
     async def _cut_off(_params: Mapping[str, Any]) -> dict[str, Any]:
-        raise asyncio.CancelledError  # what a request timeout does mid-run: the row is interrupted
+        # Only to reach 'interrupted' through approve()'s own path; this pins the alert keys, not
+        # how approve() handles a cancel from outside, which tests/test_approvals.py covers.
+        raise asyncio.CancelledError
 
     service = await _service(engine)
     maker = await _add(service, "maker", Role.OPERATOR)
