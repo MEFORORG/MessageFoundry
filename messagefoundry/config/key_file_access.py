@@ -19,16 +19,9 @@ re-applies the running graph. A refused reload or activation leaves the running 
 dry-run reload skips the preflight, and starts no connection. The file checks run in a worker
 thread, so they never block the event loop.
 
-**What the preflight judges, at least.** The TLS identity of a connection: ``tls_key_file`` (MLLP,
-the HTTP listener, DICOM, and the FTPS key :mod:`messagefoundry.transports.remotefile` reads) and
-``Soap(client_key_file=...)``. Where the key setting is unset, the private key is in the certificate
-PEM, so the certificate file is judged instead, as the loaders read it. A value holding PEM text is
-key material, not a path, and is never judged as one. Not judged, at least: a ``Database``
-connection's ``odbc_params`` ``sslkey``, ``smart_private_key`` (on a connection or a ``FhirLookup``),
-a signing key such as ``sign_private_key`` or ``Direct(signing_key=...)``, the syslog client PEM, and
-``[auth].oidc_client_private_key``. ``Sftp(private_key=...)`` is key text, not a file. A key file
-that was missing at the load passes, for the connection's build to refuse, and an operator start of
-that connection later does not judge it.
+**What the preflight judges.** A connection's TLS identity, as :func:`connection_key_files` reads
+it. Which key settings that covers and which it leaves out, and when a key file is not judged, is
+stated once, in ``docs/PHI.md`` section 2, *Key files*.
 """
 
 from __future__ import annotations
@@ -55,9 +48,10 @@ __all__ = [
 ]
 
 #: Each (certificate setting, key setting, TLS-gated) a connector loads as its own TLS identity. A
-#: TLS-gated pair is read only where the connection loads a TLS identity, and there an unset key is
-#: read from the certificate. A SOAP client certificate needs its key setting, so it never holds the
-#: key, and SOAP loads the pair whenever both are set.
+#: pair is read only where its certificate is set. A TLS-gated pair is read only where the
+#: connection loads a TLS identity, and there an unset key is read from the certificate. A SOAP
+#: client certificate needs its key setting, so it never holds the key, and SOAP loads the pair
+#: whenever both are set.
 _IDENTITY_SETTINGS: Final[tuple[tuple[str, str, bool], ...]] = (
     ("tls_cert_file", "tls_key_file", True),
     ("client_cert_file", "client_key_file", False),
@@ -114,7 +108,9 @@ def connection_key_files(
     ``env()`` references are resolved against ``env_values``. Every inbound and outbound connection
     is read, deployed or not, so a key is judged before a deploy can load it. A setting that does
     not resolve is skipped with its pair: the connection's own build refuses it and names the
-    missing value. So is a value that is not a path, or that holds PEM text. A ``tls_key_file`` or
+    missing value. So is a value that is not a path, or that holds PEM text. A key whose certificate
+    setting is unset is skipped too, because every loader loads an identity only from a certificate,
+    so it would never open that key. A ``tls_key_file`` or
     ``tls_cert_file`` is judged only where the connection loads a TLS identity, and the certificate
     stands in for a key that resolves unset or blank, as the loader then reads the key from it. The
     label names the connection and the setting, never the path."""
@@ -159,14 +155,16 @@ def connection_key_files(
             for cert_setting, key_setting, tls_identity in _IDENTITY_SETTINGS:
                 if tls_identity and not loads_tls_identity(settings):
                     continue  # the loader opens neither file
+                cert_path = as_path(resolved(settings, cert_setting))
+                if cert_path is None:
+                    continue  # every loader keys its identity on the certificate: no cert, no load
                 key = resolved(settings, key_setting)
                 if key is unresolved:
                     continue
                 setting, value = key_setting, as_path(key)
                 if value is None and not key and tls_identity:
                     # The key resolves unset or blank, so the loader reads it from the certificate.
-                    cert = resolved(settings, cert_setting)
-                    setting, value = cert_setting, None if cert is unresolved else as_path(cert)
+                    setting, value = cert_setting, cert_path
                 if value is not None:
                     found.append(
                         (f"{direction} connection {conn.name!r} setting {setting!r}", value)

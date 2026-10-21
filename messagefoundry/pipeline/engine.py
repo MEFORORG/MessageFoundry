@@ -586,7 +586,7 @@ class Engine:
         # managed app) and every real reload, after the shard filter, before the swap. Dry runs skip
         # it, because it writes audit rows. It gets the graph and this instance's env() values and
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
-        # (BACKLOG #1142, slice 3), followed by the connection key-file check (BACKLOG #3402); None =
+        # (BACKLOG #1142, slice 3), preceded by the connection key-file check (BACKLOG #3402); None =
         # no preflight. A DR activation runs it too, over the running graph (_dr_preflight).
         self._registry_preflight = registry_preflight
         # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner

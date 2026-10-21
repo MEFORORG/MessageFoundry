@@ -169,10 +169,13 @@ def test_a_path_typed_key_is_judged_and_files_without_a_tls_identity_are_not() -
             "OB_SFTP": ConnectionSpec(
                 ConnectorType.REMOTEFILE, {"protocol": "sftp", "tls_key_file": "s.key"}
             ),
+            "OB_KEY_ONLY": ConnectionSpec(
+                ConnectorType.MLLP, {"tls": True, "tls_key_file": "k.key"}
+            ),
         },
     )
     # A blank key is read from the certificate, so the certificate is judged. Without a TLS
-    # identity the loader opens neither file. The protocol is read case-blind, as the transport does.
+    # identity the loader opens neither file, and a key with no certificate loads no identity. The protocol is read case-blind, as the transport does.
     assert connection_key_files(registry, {"blank_key": ""}) == [
         ("inbound connection 'IB_BLANK' setting 'tls_cert_file'", "b.pem"),
         ("inbound connection 'IB_PATH' setting 'tls_key_file'", "p.key"),
@@ -382,12 +385,23 @@ async def test_a_dr_activation_judges_the_running_graphs_key_files(
 
 @pytest.mark.parametrize("broad", [False, True])
 async def test_the_managed_app_awaits_the_preflight_at_the_first_load(
-    broad: bool, tmp_path: Path
+    broad: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``create_managed_app`` chains the caller's preflight after the trust-anchor one, so the
-    start's own first load is judged as a reload is."""
+    """``create_managed_app`` chains the caller's preflight before the trust-anchor one, so the
+    start's own first load is judged as a reload is, and a graph it refuses writes no anchor
+    audit row: the anchor preflight never runs on it."""
+    from messagefoundry.api import app as app_module
     from messagefoundry.api import create_managed_app
 
+    anchor_runs: list[Registry] = []
+
+    def recording_anchor_preflight(store: object, *, enforcing: bool) -> Any:
+        async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
+            anchor_runs.append(registry)
+
+        return preflight
+
+    monkeypatch.setattr(app_module, "make_registry_anchor_preflight", recording_anchor_preflight)
     cert, key = _self_signed(tmp_path)
     if broad:
         _broaden(key)
@@ -402,14 +416,16 @@ async def test_the_managed_app_awaits_the_preflight_at_the_first_load(
         with pytest.raises(WiringError, match="'IB_FEED' setting 'tls_key_file'"):
             async with app.router.lifespan_context(app):
                 pass
+        assert anchor_runs == []
     else:
         async with app.router.lifespan_context(app):
             runner = app.state.engine.registry_runner
             assert runner is not None and runner.inbound_running("IB_FEED")
+        assert len(anchor_runs) == 1  # the control: the anchor preflight still runs, beside it
 
 
-async def test_the_chained_preflight_runs_the_anchor_one_first_and_keeps_it_alone() -> None:
-    from messagefoundry.api.app import _then_preflight
+async def test_the_chained_preflight_runs_each_in_order_and_keeps_a_lone_one() -> None:
+    from messagefoundry.api.app import _chain_registry_preflights
 
     calls: list[str] = []
 
@@ -419,8 +435,8 @@ async def test_the_chained_preflight_runs_the_anchor_one_first_and_keeps_it_alon
     async def then(registry: Registry, env_values: Mapping[str, Any]) -> None:
         calls.append("then")
 
-    assert _then_preflight(first, None) is first
-    await _then_preflight(first, then)(Registry(), {})
+    assert _chain_registry_preflights(None, first) is first
+    await _chain_registry_preflights(first, None, then)(Registry(), {})
     assert calls == ["first", "then"]
 
 

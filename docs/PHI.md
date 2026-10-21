@@ -389,8 +389,12 @@ connections and every outbound one. A value that holds PEM text rather than a pa
   text, not a path, so it has no file to check.
 - A connection's key file is checked when a graph is about to run, not each time a connection
   starts. A key file that was missing then passes, for the connection's own build to refuse, so an
-  operator start of that connection after the file appears would not check it. A dry-run reload
+  operator start of that connection after the file appears would not check it. Nor would a
+  clustered standby that takes leadership and starts the graph it loaded earlier. A dry-run reload
   checks nothing, because it starts no connection.
+- The check judges every connection in the graph, including one a DR activation's priority
+  threshold would park, so under `"enforce"` such a connection's key file would refuse the whole
+  activation.
 - A key file is created for the account that creates it. `cert import` and `cert self-signed` have
   no grant option, so run them as the account that will read the key, or grant that account
   yourself. If an administrator runs `serve` by hand before the service first starts, the minted
