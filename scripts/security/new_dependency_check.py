@@ -122,10 +122,9 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 # adding one shows up in a diff with its justification attached.
 ALLOWLIST: dict[str, str] = {
     "messagefoundry-webconsole": (
-        "reviewed 2026-10-21 -- this repository's own second distribution, built from "
-        "packaging/messagefoundry-webconsole by release.yml's release-webconsole job and first "
-        "published by it on 2026-07-29. The age floor guards against a name somebody else "
-        "registered; this one the project registered itself, so its age proves nothing either way."
+        "reviewed 2026-10-21 -- this repository's own distribution "
+        "(packaging/messagefoundry-webconsole). The age floor guards against a name somebody else "
+        "registered; the project registered this one itself, so its age proves nothing."
     ),
 }
 

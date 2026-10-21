@@ -48,9 +48,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       webconsole = ["messagefoundry-webconsole>=A"]
       ```
 
-      Do this in a pull request after console A is on PyPI, with step 3's re-lock. `uv lock` resolves
-      the floor from the index, so a floor naming a console PyPI does not have fails DEP-1. The engine
-      release already tagged carries the previous floor.
+      Do this in a pull request after console A is on PyPI, with step 3's re-lock.
+      [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md#the-engine-requirement-is-a-floor-with-no-ceiling)
+      says why it waits. The engine release already tagged carries the previous floor.
 
 ## 2. Set the package's engine dependency floor
 

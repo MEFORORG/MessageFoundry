@@ -140,7 +140,7 @@ jobs:
           # a genuinely-stale lock fails here loudly (the same red the gate would raise), rather than
           # silently re-locking. "uv export" then serializes the validated lock (runs no package code).
           uv lock --check
-          # Both all-extras exports leave out the first-party console; security.yml says why.
+          # Both all-extras exports leave out the first-party console; security.yml's DEP-1 step says why.
           uv export --all-extras --no-emit-project --no-emit-package messagefoundry-webconsole --format requirements.txt -o requirements.lock
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock

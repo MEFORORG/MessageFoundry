@@ -17,16 +17,17 @@ from pathlib import Path
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
+from messagefoundry.security.audit_all_platforms import read_lock, requirement_lines
+
 _ROOT = Path(__file__).resolve().parent.parent
 _CONSOLE = "messagefoundry-webconsole"
 
 
 def _pinned_names(lock: Path) -> set[str]:
-    """The distribution names a uv requirements export pins, one per unindented ``name==`` line."""
+    """The distribution names a uv requirements export pins, read as the DEP-1 audit reads it."""
     return {
         canonicalize_name(line.split("==", 1)[0].strip())
-        for line in lock.read_text(encoding="utf-8").splitlines()
-        if "==" in line and not line.startswith((" ", "#"))
+        for line in requirement_lines(read_lock(lock))
     }
 
 
@@ -46,7 +47,8 @@ def test_the_webconsole_extra_is_a_floor_with_no_ceiling() -> None:
 
 
 def test_the_all_extras_exports_leave_the_console_out() -> None:
-    """RED when: either all-extras export drops ``--no-emit-package messagefoundry-webconsole``."""
+    """RED when: a committed all-extras lock pins the console, as an export without
+    ``--no-emit-package messagefoundry-webconsole`` writes it."""
     # The positive control: uv.lock does carry the console, so its absence below is the export
     # flag's doing, not a lock that never resolved the extra.
     uv_lock = (_ROOT / "uv.lock").read_text(encoding="utf-8")
