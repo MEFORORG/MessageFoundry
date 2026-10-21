@@ -99,9 +99,12 @@ def _state(db: Path, username: str = _ADMIN) -> dict[str, Any]:
         try:
             user = await store.get_user_by_username(username)
             assert user is not None
+            stored = await store.get_totp_secret(user.id)
             return {
                 "enabled": user.totp_enabled,
-                "secret": await store.get_totp_secret(user.id),
+                # The bare seed; the cell also records the enrolment's parameters (BACKLOG #3422).
+                "secret": None if stored is None else totp.parse_enrolment(stored)[0],
+                "stored": stored,
                 "codes": await store.get_recovery_code_hashes(user.id),
                 "sessions": len(await store.list_sessions(user.id)),
             }
@@ -146,7 +149,8 @@ def console(monkeypatch: pytest.MonkeyPatch) -> _Console:
 
     def enrol(*, username: str, skew_steps: int, **_wording: str) -> tuple[str, str, float]:
         at = time.time()
-        return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
+        # What the real prompt returns: the enrolment in its stored form (BACKLOG #3422).
+        return totp.new_enrolment(_NEW_SECRET), totp.totp(_NEW_SECRET, now=at), at
 
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     monkeypatch.setattr(cli, "_show_on_terminal", recorded.show)
@@ -185,6 +189,7 @@ def test_it_replaces_the_seed_and_the_codes_and_ends_every_session(
     after = _state(db)
     assert after["enabled"] is True
     assert after["secret"] == _NEW_SECRET
+    assert after["stored"] == totp.new_enrolment(_NEW_SECRET)  # the parameters it enrolled under
     assert after["sessions"] == 0
     assert len(after["codes"]) == AuthSettings().mfa_recovery_code_count
     # Every stored hash is new. Then one argon2 sample each way, since a full cross-check is a
