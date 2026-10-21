@@ -19,6 +19,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
@@ -39,6 +40,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleInfo,
     LoginResponse,
     MfaConfirmResponse,
+    MfaDisableResponse,
     MfaEnrollResponse,
     MfaResetResponse,
     MfaStatusResponse,
@@ -84,7 +86,7 @@ from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.tls_sigalgs import NarrowerRefused, narrow_signature_algorithms
 
-__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired"]
+__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed"]
 
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -145,6 +147,19 @@ _HTTP_PENDING_APPROVAL = 202
 #: lost reply rarer than the 5 s default did, and does not rule one out. It raises the read phase
 #: only (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
 SIGN_IN_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class MfaConfirmed:
+    """What :meth:`EngineClient.confirm_mfa` hands back: the one-time recovery codes, and the offer
+    to end the caller's other sessions after the factor change (BACKLOG #1147, #3393).
+
+    ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end,
+    or None when the engine could not count them. The rotated session token is not here: the
+    client has already adopted it."""
+
+    recovery_codes: tuple[str, ...]
+    other_sessions: int | None
 
 
 class ApiError(RuntimeError):
@@ -1189,15 +1204,16 @@ class EngineClient:
         so the step-up handler may prompt for the password before this returns."""
         return _decode(self._request("POST", "/me/mfa/enroll"), MfaEnrollResponse)
 
-    def confirm_mfa(self, code: str) -> list[str]:
+    def confirm_mfa(self, code: str) -> MfaConfirmed:
         """Confirm enrollment with a live TOTP code; activates MFA and returns the one-time recovery
-        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code, and (403, with no
-        ``X-Step-Up-Required`` header) when the directory could not confirm a directory account
+        codes (shown **once**), with the count of other sessions the caller may now want to end.
+        Raises :class:`ApiError` (400) on a wrong code, and (403, with no ``X-Step-Up-Required``
+        header) when the directory could not confirm a directory account
         (BACKLOG #3061) or that account is under a second-step lock (BACKLOG #3810 finding 4); the
         code was then never checked, and the ``detail`` says which.
 
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
-        token is adopted here — the caller keeps getting just the codes.
+        token is adopted here — the caller gets the codes and the count, never the token.
 
         Through :meth:`_adopt_rotated` like the other two elevation calls, deliberately. Assigning
         ``self._token`` directly worked only by accident of an annotation elsewhere:
@@ -1210,7 +1226,10 @@ class EngineClient:
             "POST", "/me/mfa/confirm", json={"code": code}, timeout=self._sign_in_timeout()
         )
         self._adopt_rotated(response)
-        return _decode(response, MfaConfirmResponse).recovery_codes
+        confirmed = _decode(response, MfaConfirmResponse)
+        return MfaConfirmed(
+            recovery_codes=tuple(confirmed.recovery_codes), other_sessions=confirmed.other_sessions
+        )
 
     def verify_mfa(self, code: str) -> None:
         """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises
@@ -1231,9 +1250,11 @@ class EngineClient:
             )
         )
 
-    def disable_mfa(self) -> None:
-        """Turn off the signed-in user's TOTP MFA (step-up gated)."""
-        self._request("DELETE", "/me/mfa")
+    def disable_mfa(self) -> MfaDisableResponse:
+        """Turn off the signed-in user's TOTP MFA (step-up gated). ``other_sessions`` on the reply
+        is how many sessions :meth:`revoke_other_sessions` would end, 0 when TOTP was never on and
+        None when the engine could not count them (BACKLOG #1147, #3393)."""
+        return _decode(self._request("DELETE", "/me/mfa"), MfaDisableResponse)
 
     def reset_user_mfa(self, user_id: str) -> MfaResetResponse:
         """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated). On a local

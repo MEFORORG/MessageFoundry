@@ -378,6 +378,21 @@ def user_new_page(
     )
 
 
+def _self_note(what: str, holds: str) -> Markup:
+    """What the caller's own user page shows in place of a form whose route refuses the caller's
+    own account because the write ends the target's sessions (BACKLOG #3393, #1149): what the
+    account holds, read-only, and why it cannot be changed here."""
+    return Markup(
+        el("p", f"Current {what}: {holds}")
+        + el(
+            "p",
+            f"You cannot change your own {what} here. Another administrator must, because the "
+            "change signs the account out of every session.",
+            class_="muted",
+        )
+    )
+
+
 def user_detail_page(
     user: UserSummary,
     roles: Sequence[RoleInfo],
@@ -385,11 +400,19 @@ def user_detail_page(
     error: str | None = None,
     federated: FederatedIdentityView | None = None,
     scope_draft: Sequence[str] | None = None,
+    is_self: bool,
 ) -> Markup:
     """One user's admin page (an ``unlock`` page): profile, roles, channel scope, and account actions.
 
     AD accounts get their roles from the AD-group map and their password from the directory, so those
     forms are replaced by notes (the JSON handlers refuse them anyway — this just mirrors the contract).
+
+    ``is_self`` marks the caller's own account (BACKLOG #3393). Save roles, Save channel scope and
+    Sign out all sessions are replaced by notes there: each write ends the target's sessions, so
+    its route refuses the caller's own account (BACKLOG #1149), and the routes still do. The roles
+    and scope the account holds are still shown, read-only. The other account actions are not
+    changed here: Reset password, Reset MFA and Delete user refuse the caller's own account too,
+    and Save profile refuses only a disable of it.
 
     ``scope_draft`` fills the channel-scope form with the channels a refused save submitted,
     instead of the stored scope (BACKLOG #2099).
@@ -436,6 +459,8 @@ def user_detail_page(
     )
     if is_ad:
         roles_section: Markup = el("p", "AD users get roles from the AD-group map.", class_="muted")
+    elif is_self:
+        roles_section = _self_note("roles", ", ".join(user.roles) or "(none)")
     else:
         roles_section = el(
             "form",
@@ -500,26 +525,30 @@ def user_detail_page(
                 class_="check",
             ),
         ]
-    scope = el(
-        "form",
-        el("p", f"Source: {_scope_source_text(user)}", class_="muted"),
-        el("label", "Scope", el("select", *mode_options, name="scope_mode")),
-        el(
-            "label",
-            "Allowed connections (one per line)",
-            el("textarea", "\n".join(listed), name="channels", rows=4),
-        ),
-        el(
-            "p",
-            "A new account starts with no channels and sees an empty console until you grant "
-            "some. Administrators reach every channel regardless of this setting.",
-            class_="muted",
-        ),
-        *confirm_manual,
-        el("button", "Save channel scope", type="submit"),
-        method="post",
-        action=f"/ui/users/{user.id}/channel-scope",
-        class_="ctl",
+    scope = (
+        _self_note("channel scope", _scope_cell(user))
+        if is_self
+        else el(
+            "form",
+            el("p", f"Source: {_scope_source_text(user)}", class_="muted"),
+            el("label", "Scope", el("select", *mode_options, name="scope_mode")),
+            el(
+                "label",
+                "Allowed connections (one per line)",
+                el("textarea", "\n".join(listed), name="channels", rows=4),
+            ),
+            el(
+                "p",
+                "A new account starts with no channels and sees an empty console until you grant "
+                "some. Administrators reach every channel regardless of this setting.",
+                class_="muted",
+            ),
+            *confirm_manual,
+            el("button", "Save channel scope", type="submit"),
+            method="post",
+            action=f"/ui/users/{user.id}/channel-scope",
+            class_="ctl",
+        )
     )
     danger: list[object] = []
     if not is_ad:
@@ -546,15 +575,23 @@ def user_detail_page(
             class_="ctl",
         )
     )
-    danger.append(
-        el(
+    if is_self:
+        sign_out: Markup = el(
+            "p",
+            "You cannot sign yourself out of every session here. ",
+            el("a", "Your active sessions page", href="/ui/account/sessions"),
+            " ends your other sessions, and Sign out ends this one.",
+            class_="muted",
+        )
+    else:
+        sign_out = el(
             "form",
             el("button", "Sign out all sessions", type="submit"),
             method="post",
             action=f"/ui/users/{user.id}/revoke-sessions",
             class_="ctl",
         )
-    )
+    danger.append(sign_out)
     danger.append(
         el(
             "form",

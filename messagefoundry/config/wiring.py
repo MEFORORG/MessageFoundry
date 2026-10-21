@@ -478,7 +478,8 @@ def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
     """Refuse a ``tls_ca_pin`` that is malformed or that nothing would check (vault BACKLOG #2371).
 
     The pin is the SHA-256 of ``tls_ca_file``; ``auth/trust_anchors.py``, module item 9, says when
-    the engine checks it. A literal is refused here if it is blank or not a SHA-256 hex digest, so
+    the engine checks it. A literal is refused here if it is blank or ``parse_anchor_pin`` refuses
+    it (a malformed digest, or a digest prefix the release does not support, BACKLOG #3425), so
     ``messagefoundry check`` and a dry run catch it; an ``env()`` value is checked once it resolves.
     With no ``tls_ca_file`` there is nothing to check, so the config would read as pinned while
     nothing is. :meth:`Registry.dialling_pin_problems` refuses a pin whose hop never reads the CA,
@@ -487,12 +488,12 @@ def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
     if pin is None:
         return
     if isinstance(pin, str):
-        from messagefoundry.auth.trust_anchors import TrustAnchorError, _normalize_pin
+        from messagefoundry.auth.trust_anchors import TrustAnchorError, parse_anchor_pin
         from messagefoundry.config.settings import refuse_a_blank_anchor_pin
 
         refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
         try:
-            _normalize_pin(pin)
+            parse_anchor_pin(pin)
         except TrustAnchorError as exc:
             raise ValueError(f"{factory} tls_ca_pin: {exc}") from exc
     if ca is None or (isinstance(ca, str) and not ca.strip()):

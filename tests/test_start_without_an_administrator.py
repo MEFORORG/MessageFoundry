@@ -222,7 +222,7 @@ def test_a_posture_that_starts_logs_one_warning_naming_provision_admin(
     # One fact, said once: the prefix must not repeat the detail (BACKLOG #1133 review).
     assert lines[0].count("no enabled Administrator") == 1, lines[0]
     if "enforcement" not in posture:
-        # The skipped-gate line, whose prefix changelog.d/1133-first-sign-in.changed.md quotes.
+        # The skipped-gate line, whose prefix the CHANGELOG.md [0.5.2] BACKLOG #1133 entry quotes.
         assert lines[0].startswith("the engine is starting with the notice gate skipped: "), lines[
             0
         ]

@@ -620,6 +620,43 @@ from typing import Any
 #: ``/ui/reauth/webauthn``, so ``AuthService.reauth_retry_after`` lost its only caller and was
 #: removed. The digest moved again; re-derived with ``--write``.
 #:
+#: BACKLOG #3401: the four group-wide saves take a step-up bound to ``save_ends_own_sessions``
+#: when they would end the caller's own sessions. ``AuthService`` gained
+#: ``sessions_ended_by_ad_map_save`` and ``sessions_ended_by_custom_role_save``, which the
+#: console's new ``require_ui_step_up_when_own_sessions_end`` gate asks, and the four console
+#: routes moved to that gate. ``AdminHandlers.update_custom_role``, ``delete_custom_role``,
+#: ``set_ad_group_map`` and ``set_ad_group_scope_map`` are now the cores past the JSON routes'
+#: step-up, with the signatures the console already called, so no console call changed. The JSON
+#: routes themselves now take ``request``, which the seam does not carry. The digest moved from
+#: ``7f01058f7699dfe8`` because the discovered surface and the route gates did. An older console
+#: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
+#: two methods. Re-derived with ``--write``.
+#:
+#: BACKLOG #3393: ``AdminHandlers`` gained ``refuse_own_channel_scope``, the channel-scope write's
+#: self-target refusal, which ``set_channel_scope`` also runs. ``/ui/users/{id}/channel-scope``
+#: calls it before its form checks, so a malformed post aimed at the caller's own account writes
+#: ``auth.self_target_refused`` rather than being answered by a form error with no row. The digest
+#: moved from ``a75c587ccc09a85c`` because the discovered surface grew. An older console on this
+#: engine is refused at mount; a newer console on an older engine would raise AttributeError at the
+#: save, and the pinned digest refuses that pair at mount first. Re-derived with ``--write``.
+#:
+#: BACKLOG #3393, the factor-change offer: ``AuthService`` gained ``count_other_sessions``, which
+#: the console's account page and TOTP confirm call for the offer's count.
+#: ``AdminHandlers.disable_my_mfa`` is now ``_disable_my_mfa_core``, the disable past the JSON
+#: route's gate, which takes ``token`` (the session the offer is counted against, the console's
+#: cookie session) and ``client``, and returns ``MfaDisableResponse``, whose ``other_sessions`` the
+#: console reads to decide the mark. The snapshot records none of that, because ``AdminHandlers``
+#: fields are typed ``Callable[..., Awaitable[Any]]``; the new ``AuthService`` method moved the
+#: digest from ``382cd35a6af61f7b``, so a skew in either direction is refused at mount, before a
+#: call with the wrong keywords. Re-derived with ``--write``. Review round 2 made
+#: ``count_other_sessions`` return ``int | None``, None for a count the store refused, which the
+#: account page reads to keep its mark, so the digest moved again, from ``108e906e98fd66f0``.
+#:
+#: Re-derived with ``--write`` on the #3401 / #3393 branch's merge of main at 4b0aa7ec9 (seam
+#: digest ``6d8b36eb7bb94bf0``, where BACKLOG #3422 gave ``MfaStatus`` and ``MfaStatusResponse`` a
+#: ``totp_reenrolment_recommended`` field; the branch at ``35b9f58cdc447306``). Neither parent's
+#: value covered both surfaces, so the move comes from the merge.
+#:
 #: BACKLOG #3374: ``AuthService.oidc_flow_is_step_up`` became ``oidc_step_up_flow``, which returns
 #: a live step-up flow's user id and continuation as the new ``OidcStepUpFlow``, or None, where it
 #: returned a bool. The route types its value so discovery sees the DTO. The
@@ -633,12 +670,16 @@ from typing import Any
 #: b6270406897ee7c6, main to 6d8b36eb7bb94bf0). The value below was re-derived with ``--write``
 #: on the merged tree, so it covers both.
 #:
+#: BACKLOG #3374 merged again with main, after #3401 / #3393 landed there (digest
+#: bcdc6665f3b8a958; this branch at 3c209cdd46721b6c). The value below was re-derived with
+#: ``--write`` on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "3c209cdd46721b6c"
+ENGINE_UI_SEAM: str = "d3f76a351d8328bd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,6 +805,8 @@ class AdminHandlers:
     update_user: Callable[..., Awaitable[Any]]
     set_user_roles: Callable[..., Awaitable[Any]]
     set_channel_scope: Callable[..., Awaitable[Any]]
+    # BACKLOG #3393: ``auth_routes._refuse_own_channel_scope``; its docstring says why.
+    refuse_own_channel_scope: Callable[..., Awaitable[Any]]
     reset_user_password: Callable[..., Awaitable[Any]]
     reset_user_mfa: Callable[..., Awaitable[Any]]
     # BACKLOG #1143 / #295 (ADR 0184 slice B): PUT and DELETE /users/{id}/federated-identity. Their

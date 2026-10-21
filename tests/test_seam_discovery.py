@@ -200,6 +200,9 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     BACKLOG #3082 added ``DirectoryRefusal``, the type of ``Elevation.directory_refusal``, which the
     console imports to pick the text for each fix.
 
+    BACKLOG #3401 added ``STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS``, the action the four group-wide
+    saves' console routes bind and their continuations mint.
+
     BACKLOG #3374 added ``OidcStepUpFlow``, the live step-up flow the ``/ui/oidc`` callback reads
     to charge a step-up return to the staged user's ceremony budget."""
     assert surface.auth_service_symbols == (
@@ -224,6 +227,7 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "STEP_UP_ACTION_MFA_CONFIRM",
         "STEP_UP_ACTION_MFA_DISABLE",
         "STEP_UP_ACTION_MFA_ENROLL",
+        "STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS",
         "STEP_UP_ACTION_SESSION_TERMINATE",
         "STEP_UP_ACTION_UPLOAD_RESEND",
         "STEP_UP_ACTION_WEBAUTHN_DELETE",

@@ -1671,13 +1671,13 @@ def test_the_error_banner_escapes_hostile_text() -> None:
         channel_scope_withheld=False,
     )
     hostile = "<img src=x onerror=alert(1)>"
-    page = str(pages.user_detail_page(user, [], error=hostile))
+    page = str(pages.user_detail_page(user, [], error=hostile, is_self=False))
     assert hostile not in page
     assert "&lt;img src=x onerror=alert(1)&gt;" in page
     # The control: an ordinary message still renders, so the assertion above is escaping and not
     # the banner having been dropped.
     assert "something went wrong" in str(
-        pages.user_detail_page(user, [], error="something went wrong")
+        pages.user_detail_page(user, [], error="something went wrong", is_self=False)
     )
 
 

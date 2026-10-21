@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
 from collections import OrderedDict
@@ -152,39 +153,56 @@ class _SessionOffers:
     The TOTP disable, passkey delete and passkey add lanes answer with a redirect or a JSON reply,
     and the browser then GETs ``/ui/account``. A ``?m=`` code renders whether or not anything
     changed, so the offer cannot hang off it. The success marks the session instead, and the next
-    account page that session loads consumes the mark (single use).
+    account page that session renders spends the mark (single use). It is spent only once that
+    page has rendered, so a render that fails keeps it for the next load (BACKLOG #3393).
 
     Keyed by ``hash_token(session token)``, so the raw token is never held. Mark the token the
     browser will present next: after a rotation, that is the new one. Process-local, bounded and
-    TTL'd, with the same per-process caveat as the issued re-auth continuations. A lost mark costs
-    the offer and nothing else: the sessions page still carries the same control."""
+    TTL'd, with the same per-process caveat as the issued re-auth continuations, and that caveat is
+    ACCEPTED (BACKLOG #3393): at least a restart, a load another engine process answers, the TTL
+    lapsing, eviction from the bounded table and a rotation the mark did not follow lose it, and a
+    lost mark costs the offer and nothing else, since the sessions page still carries the same
+    control and docs/SECURITY.md says so. It is kept apart from ``_IssuedContinuations`` in
+    ``_auth.py`` on purpose, though the two are built alike: ``/ui/reauth`` auto-submits what that
+    table holds, and a mark there would sit one lookup away from an action that runs."""
 
     def __init__(self) -> None:
-        self._marks: OrderedDict[str, float] = OrderedDict()
+        #: Each mark's deadline and its serial. The serial tells two marks apart: a monotonic
+        #: clock can read the same value twice, as Windows' coarse one does.
+        self._marks: OrderedDict[str, tuple[float, int]] = OrderedDict()
+        self._serial = itertools.count()
 
     def mark(self, token: str | None) -> None:
         if not token:
             return
         key = hash_token(token)
         self._marks.pop(key, None)  # a re-mark refreshes the deadline and moves to the back
-        self._marks[key] = time.monotonic() + _SESSION_OFFER_TTL_SECONDS
+        self._marks[key] = (time.monotonic() + _SESSION_OFFER_TTL_SECONDS, next(self._serial))
         while len(self._marks) > _SESSION_OFFER_SESSIONS_MAX:
             self._marks.popitem(last=False)
 
-    def consume(self, token: str) -> bool:
-        """Pop this session's mark; whether it was live."""
-        deadline = self._marks.pop(hash_token(token), None)
-        return deadline is not None and deadline > time.monotonic()
+    def pending(self, token: str) -> int | None:
+        """This session's live mark, as its serial, or None. Reads it and leaves it in place."""
+        key = hash_token(token)
+        entry = self._marks.get(key)
+        if entry is None:
+            return None
+        if entry[0] <= time.monotonic():
+            del self._marks[key]  # lapsed: nothing to offer, so drop it now
+            return None
+        return entry[1]
+
+    def spend(self, token: str, serial: int) -> None:
+        """Drop the mark :meth:`pending` returned, once the page that showed it has rendered. A mark
+        set again meanwhile, by a factor change in another tab, has a new serial and is kept for
+        that change's own page. Two loads at once can both show the offer; that is harmless."""
+        key = hash_token(token)
+        entry = self._marks.get(key)
+        if entry is not None and entry[1] == serial:
+            del self._marks[key]
 
 
 _SESSION_OFFERS = _SessionOffers()
-
-
-async def _other_session_count(service: AuthService, user_id: str, token: str) -> int:
-    """How many of the user's live sessions are not the one ``token`` names (BACKLOG #1147).
-    Pass the token the browser holds NOW, so a lane that rotated counts against the new one."""
-    current = hash_token(token)
-    return sum(1 for s in await service.list_sessions(user_id) if s.token_hash != current)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -271,20 +289,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(allow_mfa_pending=True)),
         m: str | None = Query(None, max_length=32),
     ) -> HTMLResponse:
-        # BACKLOG #1147: only a marked session sees the offer; see _SessionOffers.
+        # BACKLOG #1147: only a marked session sees the offer; see _SessionOffers. The count is the
+        # revoke's own (AuthService.count_other_sessions), and the mark is spent only after the page
+        # rendered, so a failed render keeps the offer for the next load (BACKLOG #3393).
         token = session_token(request)
-        offer = (
-            await _other_session_count(service, identity.user_id, token)
-            if token and _SESSION_OFFERS.consume(token)
-            else None
-        )
-        return await _account_response(
+        serial = _SESSION_OFFERS.pending(token) if token else None
+        offer = None
+        if token and serial is not None:
+            offer = await service.count_other_sessions(identity.user_id, hash_token(token))
+            # None: the count failed, so this load shows no offer and keeps the mark for the next.
+        response = await _account_response(
             service,
             identity,
             request,
             notice=await _account_notice(service, identity, m),
             session_offer=offer,
         )
+        if token and serial is not None and offer is not None:
+            _SESSION_OFFERS.spend(token, serial)
+        return response
 
     async def _factor_first(
         request: Request, service: AuthService, _identity: Identity
@@ -504,11 +527,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
         code = form.get("code", "").strip()
-        # BACKLOG #1147: the offer's count, read BEFORE the confirm commits. Read after it, a store
-        # fault would answer 500 once TOTP is on and the token rotated, losing the one-time codes and
-        # this browser's session. The confirm ends no other session and rotates this one in place,
-        # so counting against this token counts against the session the new token continues.
-        others = await _other_session_count(service, identity.user_id, token)
         try:
             elevation = await service.confirm_mfa_enrollment(
                 identity, code, token=token, client=client
@@ -539,8 +557,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
         # BACKLOG #1147: the offer rides this response; accepting it acts as the new cookie below.
+        # Its count is read after the confirm's own session-cap run, against the rotated token, and
+        # answers 0 rather than raise, so a store fault cannot cost the codes (BACKLOG #3393).
+        others = await service.count_other_sessions(identity.user_id, hash_token(elevation.token))
         resp = HTMLResponse(
-            pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others)
+            pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others or 0)
         )
         rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
@@ -553,12 +574,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> Response:
         assert_same_origin(request)
-        # BACKLOG #1147: the service answers a disable of TOTP that was never on as a success, and
-        # that changes no factor, so it earns no offer.
-        before = await service.store.get_user(identity.user_id)
-        was_on = before is not None and before.totp_enabled
+        token = session_token(request)
+        if not token:  # pragma: no cover - require_ui_step_up_action authenticated this cookie
+            return RedirectResponse("/ui/login", status_code=303)
         try:
-            await admin.disable_my_mfa(request=request, service=service, identity=identity)
+            # The offer is counted against this plane's token, the cookie session (BACKLOG #3393).
+            disabled = await admin.disable_my_mfa(
+                service=service, identity=identity, token=token, client=client_ip(request)
+            )
         except HTTPException as exc:
             # #1022: the JSON handler refuses with a 400 when TOTP is the caller's LAST second factor
             # and MFA is still required. This route DELEGATES to it, so without this the refusal
@@ -571,8 +594,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _account_response(
                 service, identity, request, error=str(exc.detail), status_code=exc.status_code
             )
-        if was_on:
-            _SESSION_OFFERS.mark(session_token(request))  # BACKLOG #1147
+        # BACKLOG #1147: the handler answers 0 for a disable of TOTP that was never on, which changed
+        # no factor, and for one with no other session to end; neither earns an offer. None (could
+        # not count) marks, so the account page counts again.
+        if disabled.other_sessions != 0:
+            _SESSION_OFFERS.mark(token)
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---
