@@ -3247,8 +3247,9 @@ both pass. **TOTP counts as a way past only while the engine can compute codes w
 enrolment whose marker this release refuses (BACKLOG #3422) matches no code, so its combined
 sign-in can never pass a lock. At least the rotation gate, passkey removal, the store's own
 re-check of both, TOTP removal, the sign-in lock notice and the census ask one rule for this; the
-store refuses a conditional write that brings no rule. Such a TOTP may be removed, which is the
-first step of enrolling it again. The census names an account holding one beside a working
+store refuses a conditional write that brings no rule. The way-past refusal does not keep such a
+TOTP, so it may be removed where another factor remains; where it is the account's only factor the
+last-factor rule still refuses, and an administrator's factor reset is the way out. The census names an account holding one beside a working
 discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
 cure is the holder removing the authenticator app and enrolling it again.
 

@@ -12261,8 +12261,10 @@ class AuthService:
             _log.warning(
                 "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt or "
                 "compute with, so their combined sign-in cannot pass a lock: %s. Each is logged above "
-                "with its cause: check the store key for a cell that does not open, or reset the "
-                "account's factors (POST /users/{id}/reset-mfa) for an enrolment this release refuses.",
+                "with its cause: check the store key for a cell that does not open; for an "
+                "enrolment this release refuses, have the holder remove the authenticator app and "
+                "enrol it again, or reset the account's factors (POST /users/{id}/reset-mfa), which "
+                "also removes every passkey the account holds.",
                 len(census.undecryptable_totp),
                 ", ".join(census.undecryptable_totp),
             )
@@ -13468,11 +13470,15 @@ class AuthService:
                 "this is your last second factor and MFA is required for your account — "
                 "enroll another factor first"
             )
-        # The store asks the way-past question again in its own write (ADR 0197 Amendment A), so a
-        # passkey removal racing this one cannot leave the account with neither.
+        # The store asks the way-past question again in its own write (ADR 0197 Amendment A), on the
+        # TOTP as it stands then, so neither a passkey removal nor a TOTP enrolled afresh racing this
+        # one can leave the account with no way past.
+        covered = user is not None and self._covered_by_requirement(user, identity.roles)
         if (
-            not await self._store.disable_totp(identity.user_id, require_way_past=keep_way_past)
-            and keep_way_past
+            not await self._store.disable_totp(
+                identity.user_id, require_way_past=covered, totp_usable=_opened_totp_usable
+            )
+            and covered
         ):
             raise ValueError(TOTP_REMOVAL_REFUSED)
         await self._audit(

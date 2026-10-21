@@ -9100,9 +9100,15 @@ class PostgresStore:
         return _rowcount(revoked)
 
     async def disable_totp(
-        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
     ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             passkeys: list[WebAuthnCredential] = []
@@ -9115,6 +9121,7 @@ class PostgresStore:
                 require_way_past=require_way_past,
                 passkeys=passkeys,
                 sealed=self._row_sealer is not None,
+                totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
             )
             return await self._write_user(conn, user_id, change) is not None
 

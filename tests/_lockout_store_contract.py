@@ -466,15 +466,17 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     assert await store.delete_webauthn_credential(
         "rot-pk1", "rot-pk-resident", require_way_past=True, totp_usable=_opened_totp_usable
     ), "TOTP stands, so the passkey may go"
-    assert not await store.disable_totp("rot-pk1", now=6.0, require_way_past=True), (
-        "TOTP went with no discoverable passkey left"
-    )
+    assert not await store.disable_totp(
+        "rot-pk1", now=6.0, require_way_past=True, totp_usable=_opened_totp_usable
+    ), "TOTP went with no discoverable passkey left"
     user = await store.get_user("rot-pk1")
     assert user is not None and user.totp_enabled
     await store.add_webauthn_credential(
         _cred("rot-pk1", "again", id_hash="rot-pk-again", created_at=7.0, discoverable=True)
     )
-    assert await store.disable_totp("rot-pk1", now=8.0, require_way_past=True)
+    assert await store.disable_totp(
+        "rot-pk1", now=8.0, require_way_past=True, totp_usable=_opened_totp_usable
+    )
     user = await store.get_user("rot-pk1")
     assert user is not None and not user.totp_enabled
     await store.delete_all_webauthn_credentials("rot-pk1")

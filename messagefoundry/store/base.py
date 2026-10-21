@@ -2351,7 +2351,12 @@ class AuthStore(Protocol):
     # account's seal covers, so two concurrent removals cannot both pass a check made before either
     # wrote. Returns whether a row was written; a conditional caller refuses on False.
     async def disable_totp(
-        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: Callable[[str | None], bool] | None = None,
     ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...

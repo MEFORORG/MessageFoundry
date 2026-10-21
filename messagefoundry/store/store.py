@@ -2694,11 +2694,10 @@ def totp_counts_with(
 
 
 def _totp_is_way_past(record: UserAuthzRecord, totp_counts: TotpCounts | None) -> bool:
-    """TOTP on with a secret, and, given ``totp_counts``, a secret the engine can compute with:
-    an enrolment whose marker this release refuses is no way past (BACKLOG #3422)."""
-    if totp_counts is not None:
-        return totp_counts(record)
-    return record.row.totp_enabled and record.row.totp_secret is not None
+    """Whether ``record``'s TOTP is a way past: what ``totp_counts`` (the caller's rule, BACKLOG
+    #3422) says of it. With no rule it counts for nothing, so a caller that forgot one fails closed
+    rather than letting an enrolment the engine cannot compute with count."""
+    return totp_counts is not None and totp_counts(record)
 
 
 def holds_way_past(
@@ -2745,13 +2744,18 @@ def totp_removal(
     require_way_past: bool,
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
+    totp_counts: TotpCounts | None = None,
 ) -> UserChange:
-    """What ``disable_totp`` writes (:func:`totp_disable`), declined when ``require_way_past`` and no
-    discoverable passkey would remain (:func:`removal_keeps_way_past`)."""
+    """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
+    when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``) and no discoverable passkey
+    would remain (:func:`removal_keeps_way_past`). A TOTP that is no way past may go, and one swapped
+    for a usable enrolment between the caller's read and this write is judged as it now stands."""
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if require_way_past and not removal_keeps_way_past(
-            r, passkeys, sealed=sealed, drop_totp=True
+        if (
+            require_way_past
+            and _totp_is_way_past(r, totp_counts)
+            and not removal_keeps_way_past(r, passkeys, sealed=sealed, drop_totp=True)
         ):
             return None
         return totp_disable(r, now)
@@ -15561,12 +15565,19 @@ class MessageStore:
         return int(revoked.rowcount)
 
     async def disable_totp(
-        self, user_id: str, *, now: float | None = None, require_way_past: bool = False
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
-        ``require_way_past`` only while a discoverable passkey remains, read under the same writer
-        lock (:func:`totp_removal`). Returns whether a row was written."""
+        ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
+        discoverable passkey remains, read under the same writer lock (:func:`totp_removal`).
+        Returns whether a row was written."""
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
         async with _writer_guard(self._db, self._lock):
             # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
@@ -15576,6 +15587,7 @@ class MessageStore:
                 require_way_past=require_way_past,
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
+                totp_counts=totp_counts_with(self.open_totp_secret, totp_usable),
             )
             written = await self._write_user(user_id, change)
             await self._commit()
