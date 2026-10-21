@@ -721,8 +721,10 @@ decisions of this ADR change; the rest stand.
    sign-in counter, beside the password, whatever the password was. Left uncounted, "right password,
    invalid assertion" was a silent password oracle (ADR 0197 Amendment A, adversarial review round
    1). On an account without TOTP a flaky authenticator there costs the owner only the fixed
-   sign-in lock, which this path passes anyway; on one with a usable TOTP the sign-in lock
-   escalates, and the owner's TOTP combined sign-in passes it. A valid assertion beside a wrong password counts on the second-step counter.
+   sign-in lock, which this path passes anyway; on one with a TOTP enrolled the sign-in lock
+   escalates unless the engine knows this release refuses that enrolment
+   ([SECURITY.md, WebAuthn passkeys](../SECURITY.md#webauthn-passkeys-wp-14b-adr-0068) states the
+   rule and its races), and a usable TOTP's combined sign-in passes it. A valid assertion beside a wrong password counts on the second-step counter.
 
 **Who decided.** The design is ADR 0197 Amendment A, option N-G, accepted by the batch 121 Manager
 on 2026-09-28 under the owner's "No, fix it" ruling; it is not itself an owner ruling. This

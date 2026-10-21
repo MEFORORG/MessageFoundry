@@ -15,10 +15,13 @@ counter counts wrong passwords from a caller who has proved nothing. The second-
 failures from a caller who has already proved one factor. Each carries its own lock and its own cycle
 count, and each lock doubles per cycle up to a ceiling only where the ADR says the owner has a way
 past it: the second-step lock on a local account, and the sign-in lock on a local account with a
-usable TOTP enrolled. Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
-``auth_provider`` read in the same locked ``SELECT`` as the count and, for the sign-in lock, the
-TOTP's usability judged by the caller's ``totp_usable`` rule before the lock, on a cell the locked
-row must still hold (BACKLOG #3422). The rule is a required argument, so no call omits it.
+TOTP enrolled, unless the caller's ``totp_usable`` rule KNOWS the enrolment is refused. A TOTP it
+cannot judge escalates, and so does a refused one whose judgement is missing (the stale-read and
+race arms below). Every other lock keeps the fixed ``lockout_seconds``. The store decides which,
+from ``auth_provider`` read in the same locked ``SELECT`` as the count and, for the sign-in lock, a
+refusal judged by the caller's rule before the lock, only for a failure that would set a
+later-cycle lock, on a cell the locked row must still hold (BACKLOG #3422). The rule is a required
+argument, so no call omits it.
 
 **Three separate SQL bodies implement one security policy, which is what this module is for.** One
 shared body, invoked from all three suites, makes "the backends agree" an assertion rather than a
