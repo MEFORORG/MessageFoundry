@@ -821,6 +821,29 @@ started". Assert on the count of legs you *expect*, not on the absence of pendin
 Both are the same failure as taking `--ours` on a conflict: **the instrument was accurate about what it
 looked at and silent about what it did not.** `main` moved seven times during one pair of PRs.
 
+### Waiting for a PR in the background — `wait-pr.ps1`
+
+To carry a PR to completion without a hand-written poll loop, run
+[`wait-pr.ps1`](../scripts/coord/wait-pr.ps1) with `run_in_background` and let its exit wake you:
+
+```powershell
+pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr <N> -Until merged
+```
+
+`-Until` is `merged`, `closed` or `checks-complete`. It exits 0 when the condition is met, 2 on a
+timeout, and 1 on anything else, including a PR closed without merging under `-Until merged`. It
+prints one line per state change, and for `merged` and `closed` that line carries `mergeable_state`,
+so a branch that went `BEHIND` while you waited is visible. `checks-complete` reads branch
+protection's required contexts once and waits until each has reported; it says so in its output
+when it cannot read them.
+
+The bounds are not options. The interval is raised to at least 120 s and the total lowered to at
+most 60 minutes. Every read is REST through `gh api`, never `gh pr`, so it also runs in a cloud
+session, and is conditional on the last ETag, so an unchanged answer is a 304 that does not count
+against the shared rate limit. It refuses to start when `gh api rate_limit` shows fewer than 500 core
+requests left. Why each bound exists, and why it does not trip
+[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1), is in the script's header.
+
 ### Resolving a conflict: never take a side wholesale
 
 `docs/BACKLOG.md` and `CHANGELOG.md` were single large files every session appended to, so they
