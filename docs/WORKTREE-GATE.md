@@ -152,7 +152,7 @@ prompt to fall back on:
 |---|---|
 | Session in the primary edits a file **in the primary** | **Denied.** File unchanged; the session escalated to the user. |
 | Same session (still cwd = primary) edits a file **in a worktree**, absolute path | **Allowed.** Write landed. |
-| Session in the primary **dispatches a subagent** | **Denied.** |
+| Session in the primary **dispatches a subagent** | **Denied.** Measured before the rule 2 exemption in item 2 above; a `web-fetch` or `claude-code-guide` dispatch now passes, and that live run has not been repeated. |
 
 ## Rescuing work already in the primary
 

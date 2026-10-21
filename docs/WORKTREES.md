@@ -1529,7 +1529,8 @@ blocked.
 >
 > Weigh it with rules 2 and 3 together before you activate. Rule 2 denies a fan-out **from** the primary and
 > rule 3 denies relocating **into** a worktree, so with both live a primary-resident session has **no
-> in-session path to a subagent at all** — it must be *started* in a worktree. That is the safe pattern, but
+> in-session path to a subagent that can build** (rule 2 passes only `web-fetch` and `claude-code-guide`)
+> — it must be *started* in a worktree. That is the safe pattern, but
 > it is a hard stop rather than a nudge, and it makes workflow-by-default impossible from the directory
 > sessions naturally open in.
 >
