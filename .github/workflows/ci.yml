@@ -4455,8 +4455,9 @@ jobs:
           # BACKLOG #3402: under `enforce` the engine refuses a connection's key file that a broad
           # group can read, and RUNNER_TEMP grants BUILTIN\Users read to what is created in it. So
           # the pair goes in the service's data directory, which install-service.ps1 (run above)
-          # locked to SYSTEM, Administrators and the run-as account: the restricted place an operator
-          # can keep a connection's key file. The check after the mint fails here, by name.
+          # locked to SYSTEM, Administrators and the run-as account. A file CREATED there takes that
+          # access list; one MOVED in on the same volume keeps its own. The check after the mint
+          # fails here, by name.
           $certDir = "C:\ProgramData\MessageFoundry\registry-cert"
           New-Item -ItemType Directory -Force -Path $certDir | Out-Null
           $cert = Join-Path $certDir "client.pem"
@@ -4473,8 +4474,12 @@ jobs:
           Move-Item -Force -Path $wrapped -Destination $key
           # The check `serve` runs on this key at start, so a key a broad group can read fails this
           # step by name rather than as a service that never comes up. It prints only the reason.
-          python -c "import sys; from messagefoundry.config.key_file_access import key_file_problem as check; r = check(sys.argv[1], what='the smoke registry client key', remedy='Mint it under the locked data directory'); print(r or 'restricted'); sys.exit(1 if r else 0)" $key
-          if ($LASTEXITCODE -ne 0) { throw "serve would refuse the registry client key '$key' (exit $LASTEXITCODE)" }
+          # Exit 3 is a refusal; any other non-zero is the check itself failing, such as an import
+          # error. Through cmd with stderr merged THERE, for the PowerShell 5.1 reason above.
+          cmd /c "python -c ""import sys; from messagefoundry.config.key_file_access import key_file_problem as check; r = check(sys.argv[1], what='the smoke registry client key', remedy='Mint it under the locked data directory'); print(r or 'restricted'); sys.exit(3 if r else 0)"" ""$key"" 2>&1"
+          $keyChecked = $LASTEXITCODE
+          if ($keyChecked -eq 3) { throw "serve would refuse the registry client key '$key'" }
+          if ($keyChecked -ne 0) { throw "the key-file check on '$key' did not run (exit $keyChecked)" }
           # `prod` is a PHI environment, so the engine FAIL-CLOSES at startup unless a store encryption
           # key is set (PHI-at-rest must never be plaintext). Without one, `serve` refuses to start, NSSM
           # throttles the crash-loop to SERVICE_PAUSED, and /health never comes up. Mint a throwaway AES

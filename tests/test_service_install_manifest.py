@@ -1401,56 +1401,97 @@ def test_the_lockdown_keeps_what_the_service_actually_needs(tmp_path: Path) -> N
     assert got["warnings"] == [], f"a clean lockdown must report no residue; got {got['warnings']}"
 
 
+def _smoke_key_check(tmp_path: Path) -> Path:
+    """The program windows-service-smoke runs on its registry client key, written to a file.
+
+    Read from the step itself, so an engine change that renames or moves what it calls fails here,
+    on the engine legs, rather than as a service smoke the pull request never runs."""
+    pytest.importorskip("yaml")
+    from tests.test_windows_smoke_key_file import check_program, install_step
+
+    program = check_program(install_step())
+    assert program is not None, "the smoke's install step no longer runs a check on its key"
+    path = tmp_path / f"check-{uuid.uuid4().hex[:8]}.py"
+    path.write_text(program, encoding="utf-8")
+    return path
+
+
+def test_the_smokes_key_check_runs_against_the_engine(tmp_path: Path) -> None:
+    """BACKLOG #3402: the smoke's key check passes a key created restricted and refuses, with the
+    exit code the step reads, a key it cannot examine. On every platform, so an engine leg runs it."""
+    from messagefoundry.restricted_file import write_restricted_file
+    from tests.test_windows_smoke_key_file import REFUSED_EXIT
+
+    check = _smoke_key_check(tmp_path)
+    restricted = tmp_path / "restricted.key"
+    write_restricted_file(restricted, b"not a key")
+
+    def run(key: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            [sys.executable, str(check), str(key)], capture_output=True, text=True, timeout=120
+        )
+
+    passed = run(restricted)
+    assert passed.returncode == 0, f"a restricted key was refused: {passed.stdout}{passed.stderr}"
+    missing = run(tmp_path / "missing.key")
+    assert missing.returncode == REFUSED_EXIT, (
+        f"a key the check cannot examine did not exit {REFUSED_EXIT}: "
+        f"{missing.returncode} {missing.stdout}{missing.stderr}"
+    )
+
+
 @_windows_only
-def test_a_key_file_in_the_locked_data_dir_passes_the_key_file_check(tmp_path: Path) -> None:
-    """BACKLOG #3402: ``enforce`` refuses a connection's key file a broad group can read. A key an
-    operator puts in the data directory this script locks passes that check, and the same key
-    beside it, in a parent that grants BUILTIN\\Users read the way ProgramData does, is refused.
-    The windows-service-smoke leg mints its registry client key there for this reason
-    (``tests/test_windows_smoke_key_file.py``)."""
-    from messagefoundry.config.key_file_access import key_file_problem
+def test_a_key_file_in_the_locked_data_dir_passes_the_smokes_key_check(tmp_path: Path) -> None:
+    """BACKLOG #3402: ``enforce`` refuses a connection's key file a broad group can read. A key
+    CREATED in the data directory this script locks takes that directory's access list and passes
+    the check windows-service-smoke runs; the same key created in a parent that grants
+    BUILTIN\\Users read, the way ProgramData does, is refused. A key MOVED in on the same volume
+    keeps its own access list, so this says nothing about one."""
+    from tests.test_windows_smoke_key_file import REFUSED_EXIT
 
     assert _SCRIPT is not None
+    check = _smoke_key_check(tmp_path)
     parent = tmp_path / f"kf-{uuid.uuid4().hex[:8]}"
     data = parent / "MessageFoundry"
     data.mkdir(parents=True)
     locked_key = data / "registry-cert" / "client.key"
     open_key = parent / "client.key"
-    # Created as openssl creates them: plain files that take their folder's inherited ACL.
+    # Created as openssl creates them: plain files that take their folder's inherited ACL. The
+    # checks run before the `finally`, which hands the tree back to the test user.
     body = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  try {{
   & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw "icacls could not grant Users on the parent" }}
-  Set-SecureDataDirAcl -Path {_psq(str(data))} -Account $me 3>$null
+  $warnings = @(& {{ Set-SecureDataDirAcl -Path {_psq(str(data))} -Account $me }} 3>&1 |
+    Where-Object {{ $_ -is [System.Management.Automation.WarningRecord] }} | ForEach-Object {{ "$_" }})
   New-Item -ItemType Directory -Force -Path {_psq(str(locked_key.parent))} | Out-Null
   [IO.File]::WriteAllText({_psq(str(locked_key))}, 'not a key')
   [IO.File]::WriteAllText({_psq(str(open_key))}, 'not a key')
+  $lockedOut = (& {_psq(sys.executable)} {_psq(str(check))} {_psq(str(locked_key))} 2>&1 | Out-String)
+  $lockedExit = $LASTEXITCODE
+  $openOut = (& {_psq(sys.executable)} {_psq(str(check))} {_psq(str(open_key))} 2>&1 | Out-String)
+  $openExit = $LASTEXITCODE
+  [pscustomobject]@{{
+    warnings = $warnings; lockedOut = $lockedOut; lockedExit = $lockedExit
+    openOut = $openOut; openExit = $openExit
+  }} | ConvertTo-Json -Depth 3 -Compress
+  }} finally {{
+    # Put the tree back in reach so pytest can clean it up, however the block above ended.
+    & icacls {_psq(str(parent))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+    & icacls {_psq(str(data))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+  }}
 """
-    try:
-        _ok(_extract(_SCRIPT, _ACL_FNS, body), tmp_path)
-
-        def problem(path: Path) -> str | None:
-            return key_file_problem(str(path), what="the key", remedy="restrict it")
-
-        refused = problem(open_key)
-        assert refused is not None and "S-1-5-32-545" in refused, (
-            f"CONTROL FAILED: a key under a parent granting BUILTIN\\Users read was not refused "
-            f"as Users-readable, so a pass below proves nothing: {refused!r}"
-        )
-        locked = problem(locked_key)
-        assert locked is None, (
-            f"a key file in the data directory install-service.ps1 locks is refused: {locked}"
-        )
-    finally:
-        from messagefoundry.service_status import _system_exe
-
-        # Put the tree back in reach so pytest can clean it up, however the block above ended: the
-        # lockdown keeps this user's Modify, and inheritance brings back tmp_path's own grant.
-        subprocess.run(  # noqa: S603
-            [_system_exe("icacls.exe"), str(data), "/inheritance:e"],
-            capture_output=True,
-            check=False,
-        )
+    got = json.loads(_ok(_extract(_SCRIPT, _ACL_FNS, body), tmp_path).strip().splitlines()[-1])
+    assert not got["warnings"], f"fixture: the lockdown did not complete: {got['warnings']}"
+    assert got["openExit"] == REFUSED_EXIT and "S-1-5-32-545" in got["openOut"], (
+        "CONTROL FAILED: a key under a parent granting BUILTIN\\Users read was not refused as "
+        f"Users-readable, so a pass below proves nothing: {got['openExit']} {got['openOut']}"
+    )
+    assert got["lockedExit"] == 0, (
+        "a key file created in the data directory install-service.ps1 locks is refused: "
+        f"{got['lockedExit']} {got['lockedOut']}"
+    )
 
 
 @_windows_only
