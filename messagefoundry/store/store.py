@@ -2646,16 +2646,40 @@ def lockout_clear(r: UserAuthzRecord, *, reset_cycles: bool, now: float) -> User
     return out.changed(lock_cycles=0, second_step_lock_cycles=0) if reset_cycles else out
 
 
+def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
+    """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
+    under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
+    #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
+    statement of the per-passkey rule: the store's conditional writes, the census, the service's
+    gates, the sign-in path and the lock notice all ask it."""
+    if not cred.discoverable:
+        return False
+    # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
+    # the store module takes no import-time dependency on the auth package.
+    from messagefoundry.auth.tokens import (
+        CREDENTIAL_ID_HASH_SCHEME,
+        CredentialHashSchemeError,
+        credential_id_hash_scheme,
+    )
+
+    try:
+        return credential_id_hash_scheme(cred.credential_id_hash) == CREDENTIAL_ID_HASH_SCHEME
+    except CredentialHashSchemeError:
+        return False
+
+
 def discoverable_way_past(
     passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
 ) -> bool:
-    """Whether ``passkeys`` hold one recorded as discoverable, the passkey half of
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
+    half of
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
     if sealed and passkey_digest(passkeys) != cred_digest:
         return False
-    return any(c.discoverable for c in passkeys)
+    return any(passkey_is_way_past(c) for c in passkeys)
 
 
 #: The caller's rule for whether an OPENED TOTP secret is one the engine can compute codes with
@@ -2739,7 +2763,7 @@ def removal_keeps_way_past(
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
-    return trusted and any(c.discoverable for c in remaining)
+    return trusted and any(passkey_is_way_past(c) for c in remaining)
 
 
 def totp_removal(

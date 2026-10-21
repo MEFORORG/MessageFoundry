@@ -51,6 +51,13 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.service import _opened_totp_usable
+from messagefoundry.auth.tokens import credential_id_hash
+
+#: Discoverable passkeys stored under today's credential-id hash scheme (BACKLOG #3423): only such a
+#: row is a way past the sign-in lock, since only it can sign in.
+_PK_RESIDENT = credential_id_hash(b"rot-pk-resident")
+_PK_AGAIN = credential_id_hash(b"rot-pk-again")
+_RF_RESIDENT = credential_id_hash(b"rot-rf-resident")
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
@@ -438,13 +445,13 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     user = await store.get_user("rot-pk1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
     await store.add_webauthn_credential(
-        _cred("rot-pk1", "resident", id_hash="rot-pk-resident", created_at=2.0, discoverable=True)
+        _cred("rot-pk1", "resident", id_hash=_PK_RESIDENT, created_at=2.0, discoverable=True)
     )
     # The caller "checks" here and sees it ... then the holder removes it before the write.
-    assert await store.delete_webauthn_credential("rot-pk1", "rot-pk-resident")
+    assert await store.delete_webauthn_credential("rot-pk1", _PK_RESIDENT)
     assert not await rotate(), "the rotation landed after the discoverable passkey was removed"
     await store.add_webauthn_credential(
-        _cred("rot-pk1", "resident", id_hash="rot-pk-resident", created_at=3.0, discoverable=True)
+        _cred("rot-pk1", "resident", id_hash=_PK_RESIDENT, created_at=3.0, discoverable=True)
     )
     assert await rotate(), "a discoverable passkey did not open the rotation"
     user = await store.get_user("rot-pk1")
@@ -453,9 +460,9 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     # The conditional removals (AC-A3a): the last discoverable passkey goes only while TOTP stands,
     # and TOTP goes only while a discoverable passkey stands, each judged in its own write.
     assert not await store.delete_webauthn_credential(
-        "rot-pk1", "rot-pk-resident", require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
     ), "the last way past was deleted"
-    assert await store.get_webauthn_credential("rot-pk-resident") is not None
+    assert await store.get_webauthn_credential(_PK_RESIDENT) is not None
     assert await store.delete_webauthn_credential(
         "rot-pk1", "rot-pk-plain", require_way_past=True, totp_usable=_opened_totp_usable
     )
@@ -464,7 +471,7 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
         "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
     )
     assert await store.delete_webauthn_credential(
-        "rot-pk1", "rot-pk-resident", require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
     ), "TOTP stands, so the passkey may go"
     assert not await store.disable_totp(
         "rot-pk1", now=6.0, require_way_past=True, totp_usable=_opened_totp_usable
@@ -472,7 +479,7 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     user = await store.get_user("rot-pk1")
     assert user is not None and user.totp_enabled
     await store.add_webauthn_credential(
-        _cred("rot-pk1", "again", id_hash="rot-pk-again", created_at=7.0, discoverable=True)
+        _cred("rot-pk1", "again", id_hash=_PK_AGAIN, created_at=7.0, discoverable=True)
     )
     assert await store.disable_totp(
         "rot-pk1", now=8.0, require_way_past=True, totp_usable=_opened_totp_usable
@@ -506,14 +513,14 @@ async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
         "rot-rf1", expected_secret_cell=cell, recovery_code_hashes=[], now=2.0
     )
     await store.add_webauthn_credential(
-        _cred("rot-rf1", "resident", id_hash="rot-rf-resident", created_at=3.0, discoverable=True)
+        _cred("rot-rf1", "resident", id_hash=_RF_RESIDENT, created_at=3.0, discoverable=True)
     )
     with pytest.raises(ValueError):
-        await store.delete_webauthn_credential("rot-rf1", "rot-rf-resident", require_way_past=True)
+        await store.delete_webauthn_credential("rot-rf1", _RF_RESIDENT, require_way_past=True)
     assert not await store.delete_webauthn_credential(
-        "rot-rf1", "rot-rf-resident", require_way_past=True, totp_usable=_opened_totp_usable
+        "rot-rf1", _RF_RESIDENT, require_way_past=True, totp_usable=_opened_totp_usable
     ), "a refused TOTP freed the last discoverable passkey"
-    assert await store.get_webauthn_credential("rot-rf-resident") is not None
+    assert await store.get_webauthn_credential(_RF_RESIDENT) is not None
     await store.delete_all_webauthn_credentials("rot-rf1")
     with pytest.raises(ValueError):
         await store.set_password(

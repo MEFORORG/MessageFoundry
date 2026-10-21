@@ -183,6 +183,7 @@ from messagefoundry.store.store import (
     ad_map_seal_ok,
     discoverable_way_past,
     passkey_digest,
+    passkey_is_way_past,
     require_notify_email,
     role_seal_ok,
     seed_notify_email,
@@ -4746,7 +4747,7 @@ class AuthService:
         if passkey is not None and webauthn.available():
             held = await self._verified_passkeys(user)
             passkey_creds = [c for c in held or () if c.rp_id == passkey.rp_id]
-        with_passkey = passkey is not None and any(c.discoverable for c in passkey_creds)
+        with_passkey = passkey is not None and any(passkey_is_way_past(c) for c in passkey_creds)
         combined = with_passkey or (bool(code) and user.totp_enabled)
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
@@ -12238,7 +12239,7 @@ class AuthService:
         if not user.has_passkeys or not webauthn.available():
             return False
         held = await self._verified_passkeys(user)
-        return any(c.discoverable for c in held or ())
+        return any(passkey_is_way_past(c) for c in held or ())
 
     async def must_enrol_before_rotating(self, identity: Identity) -> bool:
         """Whether a password change by ``identity`` would be refused with

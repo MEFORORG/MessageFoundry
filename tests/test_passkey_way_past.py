@@ -946,6 +946,8 @@ async def test_the_scheme_rehash_keeps_a_passkey_discoverable_and_sealed(tmp_pat
                 discoverable=True,
             )
         )
+        # Under the bare digest it cannot sign in, so it is no way past until it is moved.
+        assert await service.must_enrol_before_rotating(identity)
         assert await service.rehash_webauthn_credentials() == (1, 0)
         (moved,) = await store.list_webauthn_credentials(identity.user_id)
         assert moved.credential_id_hash == credential_id_hash(raw) and moved.discoverable
@@ -953,5 +955,33 @@ async def test_the_scheme_rehash_keeps_a_passkey_discoverable_and_sealed(tmp_pat
         await store._db.execute("UPDATE webauthn_credentials SET discoverable = 0")
         await store._db.commit()
         assert await service.must_enrol_before_rotating(identity), "a flip passed the seal"
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
+    """A discoverable passkey whose stored hash names a scheme this release refuses can never be
+    found by the sign-in, so it is no way past: the rotation gate stays shut, the census names the
+    account as having none, and the store's conditional write refuses."""
+    from tests._webauthn_store_contract import _cred
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await store.add_webauthn_credential(
+            _cred(identity.user_id, "future", id_hash="wc9:" + "0" * 64, discoverable=True)
+        )
+        assert await service.must_enrol_before_rotating(identity)
+        assert not await store.set_password(
+            identity.user_id,
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=True,
+            totp_usable=_opened_totp_usable,
+        )
+        census = await lockable_account_census(store, AuthSettings())
+        assert census.no_way_past == (identity.username,) and census.passkey_only == ()
     finally:
         await store.close()
