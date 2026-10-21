@@ -840,13 +840,17 @@ push and error apart. It prints one line per state change, and for `merged` and 
 carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
 in the table above. **With `-Until merged` that state is acted on:** a PR read `behind` or `dirty`
 on consecutive checks of one head ends the wait with its own exit code instead of running to the
-timeout, so this is the three-armed watcher described just above, and the third arm is yours to
-act on by re-syncing. With `closed` and `checks-complete` it is only printed. `checks-complete`
-waits for every context the base branch requires, not only the checks that already exist.
+timeout. That adds the went-stale arm described just above, not the failing arm: a red required
+check reads `blocked` and still runs to the timeout. The exit line names which state it read, and
+the two need different fixes, so read it before you act: `behind` is an update from `main`,
+`dirty` is a conflict to resolve (see the table above). With `closed` the state is only printed,
+and the `checks-complete` line does not carry it. `checks-complete` waits for every context the
+base branch requires, not only the checks that already exist.
 
-Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are fixed, not
-options. Every read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and
-is conditional on the last ETag, so an unchanged answer does not count against the shared rate
+Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
+options: the two test seams that replace the sleep and the timeout are refused unless
+`MEFOR_WAIT_PR_TEST_SEAMS=1` is set, so never leave that variable set outside a test run. Every
+read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on the last ETag, so an unchanged answer does not count against the shared rate
 limit. The script's header is the one place that states the numbers, the exit codes, how many
 stale reads end a wait, and why it does not trip
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
