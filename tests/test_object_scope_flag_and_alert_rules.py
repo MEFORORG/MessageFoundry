@@ -14,9 +14,12 @@ NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -168,3 +171,76 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
         assert await ids("scoped") == ["all", "mine", "mine-targets-mine"]
         # An unprovisioned operator still sees the rule that names nobody.
         assert await ids("empty") == ["all"]
+
+
+async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3403: a read that withholds at least one rule writes ``alert_rules_withheld``, naming
+    the counts shown and withheld and no rule's contents. A read that withholds nothing writes none,
+    even a channel-scoped one. No read writes ``auth.channel_denied``."""
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "empty", Role.OPERATOR, [])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    # The same scoped caller against rules its scope fully covers withholds nothing.
+    covered = create_app(
+        engine,
+        auth=service,
+        alerts_settings=AlertsSettings(
+            rules=[AlertRule(id="all", connection="*"), AlertRule(id="mine", connection="IB_A")]
+        ),
+    )
+    async with (
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=covered), base_url="http://t"
+        ) as c_covered,
+    ):
+
+        async def withheld_rows(username: str, client: httpx.AsyncClient = c) -> list[Any]:
+            h = await _login(client, username)
+            latest = await engine.store.list_audit(limit=1)
+            last_id = latest[0]["id"] if latest else 0
+            assert (await client.get("/alerts/rules", headers=h)).status_code == 200
+            rows = [r for r in await engine.store.list_audit(limit=50) if r["id"] > last_id]
+            assert not [r for r in rows if r["action"] == "auth.channel_denied"], rows
+            return [r for r in rows if r["action"] == "alert_rules_withheld"]
+
+        total = len(_RULES.rules)
+        for username, shown in (("scoped", 3), ("empty", 1)):
+            rows = await withheld_rows(username)
+            assert len(rows) == 1, rows
+            row = rows[0]
+            assert row["actor"] == username
+            assert row["channel_id"] is None
+            assert json.loads(str(row["detail"])) == {"shown": shown, "withheld": total - shown}
+        assert await withheld_rows("wide") == []
+        assert await withheld_rows("scoped", c_covered) == []
+
+
+async def test_alert_rules_read_survives_a_refused_withheld_row(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3403: the row is written fail-soft. A store that refuses it leaves the narrowed
+    answer standing and logs the loss, rather than turning the read into a 500."""
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "scoped")
+        real = service.store.record_audit
+
+        async def refuse(action: str, **kwargs: Any) -> None:
+            if action == "alert_rules_withheld":
+                raise RuntimeError("store refused")
+            await real(action, **kwargs)
+
+        monkeypatch.setattr(service.store, "record_audit", refuse)
+        r = await c.get("/alerts/rules", headers=h)
+    assert r.status_code == 200, r.text
+    assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
+    assert "its audit row failed" in caplog.text

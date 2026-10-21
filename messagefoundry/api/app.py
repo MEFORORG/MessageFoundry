@@ -277,7 +277,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -3466,6 +3466,43 @@ async def _record_control_audit(
         channel_id=name if role == "source" else None,
         detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
         client=client,
+    )
+
+
+async def _audit_alert_rules_withheld(
+    request: Request, identity: Identity, shown: int, withheld: int
+) -> None:
+    """Record that ``GET /alerts/rules`` withheld ``withheld`` rules from a channel-scoped caller
+    (BACKLOG #3403). The detail is the two counts, never a rule's contents.
+
+    Not ``auth.channel_denied``: the read was answered, and that action feeds the security-signal
+    denial count, so routine alerts-page loads could raise a denial-burst alert.
+
+    Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
+    refusal is logged rather than turning the answered read into a 500. The row goes through the
+    auth service's store, the one its own audit rows use: only a channel-scoped caller withholds a
+    rule, such a caller exists only when that service is attached, and the engine may not be."""
+    auth = get_auth(request)
+    actor = identity.username
+    if auth is None:
+        _log.error(
+            "GET /alerts/rules withheld %d rules from %s with no auth service to audit it",
+            withheld,
+            scrub_log_argument(actor),
+        )
+        return
+    store = auth.store
+    await write_audit_soft(
+        lambda: store.record_audit(
+            "alert_rules_withheld",
+            actor=actor,
+            detail=json.dumps({"shown": shown, "withheld": withheld}),
+            client=client_ip(request),
+        ),
+        log=_log,
+        message="GET /alerts/rules withheld %d rules from %s, but its audit row failed",
+        args=lambda: (withheld, scrub_log_argument(actor)),
+        defects=AUDIT_WRITE_DEFECTS,
     )
 
 
@@ -8799,14 +8836,18 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
-        access. No secrets: the webhook URL, SMTP password and username are never returned —
-        transports are reported present-or-not. Gated by monitoring:read like /stats.
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
+        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
+        password and username are never returned — transports are reported present-or-not. Gated by
+        monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
-        ``IB_ACME_*``, is withheld."""
+        ``IB_ACME_*``, is withheld.
+
+        A read that withholds at least one rule writes an audit row; see
+        :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
@@ -8817,6 +8858,9 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
+        withheld = len(alerts.rules) - len(rules)
+        if withheld:
+            await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
 
         return AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),

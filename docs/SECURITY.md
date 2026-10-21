@@ -2006,9 +2006,13 @@ the same permission set on the same method reds CI until it is listed here.
 > reaches the engine, which answers 409 for a name with no `connections.toml` entry.
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it.
+> scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
+> `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
+> contents. Why it is not `auth.channel_denied` is in `_audit_alert_rules_withheld` in
+> `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
-> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route, the rules and the
+> `alert_rules_withheld` row. The console's
 > `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
 > roles.
 
