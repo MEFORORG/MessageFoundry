@@ -265,9 +265,8 @@ version.
 5. The console pairing prose. **Check the UI seam first** (below): if it moved, this item names
    the console released in the same pull request. Move the engine pin in the pairing install line
    of `README.md` and of `packaging/messagefoundry-webconsole/README.md`; the same test sweeps both
-   files. Move
-   by hand the engine versions that prose names as sharing the console's seam, and the engine
-   version in the *Admin console* section of `docs/SERVICE.md`. No test holds those.
+   files. Move by hand the engine versions that prose names as sharing the console's seam, and the
+   engine version in the *Admin console* section of `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the

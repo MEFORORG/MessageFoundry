@@ -51,8 +51,8 @@ def test_the_all_extras_exports_leave_the_console_out() -> None:
     ``--no-emit-package messagefoundry-webconsole`` writes it."""
     # The positive control: uv.lock does carry the console, so its absence below is the export
     # flag's doing, not a lock that never resolved the extra.
-    uv_lock = (_ROOT / "uv.lock").read_text(encoding="utf-8")
-    assert f'name = "{_CONSOLE}"' in uv_lock, "uv.lock no longer resolves the [webconsole] extra"
+    packages = tomllib.loads((_ROOT / "uv.lock").read_text(encoding="utf-8"))["package"]
+    assert any(p["name"] == _CONSOLE for p in packages), "uv.lock resolves no console package"
     for name in ("requirements.lock", "constraints.lock"):
         names = _pinned_names(_ROOT / name)
         assert "fastapi" in names, f"{name} parsed to no pins; the parser no longer reads it"

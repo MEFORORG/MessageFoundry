@@ -124,7 +124,9 @@ ALLOWLIST: dict[str, str] = {
     "messagefoundry-webconsole": (
         "reviewed 2026-10-21 -- this repository's own distribution "
         "(packaging/messagefoundry-webconsole). The age floor guards against a name somebody else "
-        "registered; the project registered this one itself, so its age proves nothing."
+        "registered; the project registered this one itself, so its age proves nothing. Remove "
+        "this entry after 2026-10-27, when the floor passes on its own, so every other check "
+        "covers the name again."
     ),
 }
 

@@ -58,7 +58,7 @@ Each console release sets two lower bounds and no upper bound (BACKLOG #1585):
 | Where | Requirement | The value |
 |---|---|---|
 | The console's [`pyproject.toml`](../packaging/messagefoundry-webconsole/pyproject.toml) | `messagefoundry>=X` | X is the first engine release that carries the seam the console supports. |
-| The engine's `[webconsole]` extra | `messagefoundry-webconsole>=A` | A is the console version being released. |
+| The engine's `[webconsole]` extra | `messagefoundry-webconsole>=A` | A is the console version being released, set once A is on PyPI (below). |
 
 **The floor is the fix.** A bare dependency is satisfied by any engine already installed, so `pip`
 keeps an older engine that lacks the functions the console calls. The floor makes resolution refuse
@@ -82,9 +82,9 @@ would break. So the console release commit raises the floor to X only when engin
 when the same commit bumps the engine's `__version__` to X, which removes that obstacle. PRs 1861
 and 2467 took the second route: one pull request carries the engine bump and the console release,
 and engine X is tagged first ([`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md)
-step 6). Between releases the floor on `main` lags the engine;
-that is harmless, because only the released wheel's value matters. The release gate checks that a
-floor exists, not that its value is current, so choosing X stays a release step.
+step 6). Between releases the floor on `main` lags the engine; that is harmless, because only the
+released wheel's value matters. The release gate checks that a floor exists, not that its value is
+current, so choosing X stays a release step.
 
 **The engine's `[webconsole]` floor follows the console's publish.** `uv lock` resolves it from the
 index, so it can name console A only once A is on PyPI.

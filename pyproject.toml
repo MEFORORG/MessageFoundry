@@ -347,9 +347,8 @@ fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64
 # docs/WEBCONSOLE-PACKAGE.md says why and when, and packaging/messagefoundry-webconsole/RELEASE.md
 # step 1 says how. security.yml's DEP-1 step says why the --all-extras lock exports leave the console
 # out. CI and a checkout still install the console editable, `-e packaging/messagefoundry-webconsole`.
-# With the
-# package absent, serve refuses an explicit serve_web_console=true and degrades a default-on console
-# to JSON-only with a warning (__main__).
+# With the package absent, serve refuses an explicit serve_web_console=true and degrades a default-on
+# console to JSON-only with a warning (__main__).
 # The legacy [api].serve_ui key is rejected at load (ADR 0118, settings._RELOCATED_TO_SECURITY).
 webconsole = ["messagefoundry-webconsole>=0.5.0"]
 dev = [

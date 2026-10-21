@@ -123,7 +123,7 @@ dotted arrow is a publish step that runs when its repository variable is set.
 Facts the labels leave out:
 
 - **The locks.** `uv.lock` is the resolver's record of `pyproject.toml`. `requirements.lock` is its
-  hashed export with every extra. The lock sync check fails when `uv.lock` is out of step with
+  hashed export with every extra, less the first-party web console. The lock sync check fails when `uv.lock` is out of step with
   `pyproject.toml`, or when an exported lock is out of step with `uv.lock`.
 - **The merge queue.** `ci.yml` and `security.yml` also trigger on the merge-queue commit. Branch
   protection reads the required checks there. The checked-in list of those checks is
