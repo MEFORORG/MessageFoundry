@@ -832,20 +832,23 @@ pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -P
 
 Measured 2026-10-21 in a worktree-isolated subagent: the PowerShell tool ran this form in the
 foreground and returned the script's exit code, a `run_in_background` run's task notification
-reported its exit 1, and the Bash tool refused the form there. Exits 0 and 2 in the background were
-not measured.
+reported its exit 1, and the Bash tool refused the form there. Exits 0, 2 and 3 in the background
+were not measured.
 
-`-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out and error
-apart. It prints one line per state change, and for `merged` and `closed` that line carries REST's
-lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values in the table
-above. **That state is printed, not acted on:** a branch that went `behind` while you waited still
-runs to the timeout, which is the two-armed watcher described just above. `checks-complete` waits
-for every context the base branch requires, not only the checks that already exist.
+`-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out, needs a
+push and error apart. It prints one line per state change, and for `merged` and `closed` that line
+carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
+in the table above. **With `-Until merged` that state is acted on:** a PR read `behind` or `dirty`
+on consecutive checks of one head ends the wait with its own exit code instead of running to the
+timeout, so this is the three-armed watcher described just above, and the third arm is yours to
+act on by re-syncing. With `closed` and `checks-complete` it is only printed. `checks-complete`
+waits for every context the base branch requires, not only the checks that already exist.
 
-Its interval floor, total ceiling and starting rate-budget floor are fixed, not options. Every read
-is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on
-the last ETag, so an unchanged answer does not count against the shared rate limit. The script's
-header is the one place that states the numbers, the exit codes, and why it does not trip
+Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are fixed, not
+options. Every read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and
+is conditional on the last ETag, so an unchanged answer does not count against the shared rate
+limit. The script's header is the one place that states the numbers, the exit codes, how many
+stale reads end a wait, and why it does not trip
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
 
 ### Resolving a conflict: never take a side wholesale
