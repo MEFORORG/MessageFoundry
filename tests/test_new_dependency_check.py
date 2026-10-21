@@ -12,15 +12,27 @@ unit test that did the same would be a network flake in the required leg.
 
 from __future__ import annotations
 
+import errno
+import functools
+import http.client
 import json
+import re
+import socket
+import ssl
+import time
 import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
 from scripts.security.new_dependency_check import (
     Finding,
+    RetryBudget,
+    _http_fetch,
     declared_distributions,
     main,
     normalize,
@@ -317,6 +329,306 @@ def test_main_exits_2_when_pypi_is_unreachable(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(mod, "_http_fetch", unreachable)
     assert main([]) == 2
+
+
+# --- transient retry (BACKLOG #3089): the link is retried, the answer never is ------------------
+#
+# These drive the SHIPPED _http_fetch -> _fetch_once path with only urllib.request.urlopen replaced, so
+# the 404 mapping and the transient classification under test are the real ones. Sleeps are recorded,
+# never slept.
+
+
+class _ReadFails:
+    """An outcome that connects, then raises ``exc`` from ``response.read()``."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes | _ReadFails) -> None:
+        self._body = body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        if isinstance(self._body, _ReadFails):
+            raise self._body.exc
+        return self._body
+
+
+def _script_urlopen(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[BaseException | bytes | _ReadFails]
+) -> list[str]:
+    """Replace urlopen with one that plays ``outcomes`` in order (the last repeats). Returns the URLs
+    it was called with, so a test counts attempts by what reached the wire."""
+    calls: list[str] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> _FakeResponse:
+        calls.append(request.full_url)
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return _FakeResponse(outcome)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return calls
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://pypi.org/pypi/x/json", code, "x", Message(), None)
+
+
+_GOOD_BODY = json.dumps(_fetch_all_good("fastapi")).encode()
+
+
+def _handshake_timeout() -> urllib.error.URLError:
+    """The exact shape the 2026-10-20 merge-group evictions logged. A fresh instance per use: one
+    shared exception re-raised across tests would accumulate every raise's frames on its traceback."""
+    return urllib.error.URLError(TimeoutError("_ssl.c:1064: The handshake operation timed out"))
+
+
+def _budget(remaining: int = 6) -> RetryBudget:
+    return RetryBudget(remaining=remaining)
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        _handshake_timeout(),
+        TimeoutError("timed out"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable")),
+        urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, "Temporary failure")),
+        urllib.error.URLError(OSError(errno.ENOTCONN, "Transport endpoint is not connected")),
+        _ReadFails(http.client.IncompleteRead(b"{", 100)),
+        _ReadFails(TimeoutError("The read operation timed out")),
+        _http_error(429),
+        _http_error(503),
+    ],
+    ids=[
+        "tls-handshake-timeout",
+        "read-timeout",
+        "reset",
+        "refused",
+        "net-unreachable",
+        "dns-eai-again",
+        "not-connected",
+        "incomplete-read-on-body",
+        "timeout-on-body",
+        "http-429",
+        "http-503",
+    ],
+)
+def test_a_transient_failure_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, transient: BaseException | _ReadFails
+) -> None:
+    calls = _script_urlopen(monkeypatch, [transient, _GOOD_BODY])
+    sleeps: list[float] = []
+    budget = _budget()
+
+    payload = _http_fetch("fastapi", budget=budget, sleep=sleeps.append)
+
+    assert payload is not None and payload["info"]["name"] == "fastapi"
+    assert len(calls) == 2, "a transient failure must be tried again, exactly once here"
+    assert len(sleeps) == 1 and 1.0 <= sleeps[0] < 1.5, f"backoff out of range: {sleeps}"
+    assert budget.remaining == 5
+
+
+def test_a_persistent_timeout_fails_after_the_attempts_are_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAIL CLOSED: retries delay the failure, they never replace it with a payload."""
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
+    sleeps: list[float] = []
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("fastapi", budget=_budget(), sleep=sleeps.append)
+
+    assert len(calls) == 3
+    assert len(sleeps) == 2 and sleeps[0] < sleeps[1], f"backoff must grow: {sleeps}"
+
+
+def test_a_404_is_not_retried_and_still_means_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _script_urlopen(monkeypatch, [_http_error(404)])
+    sleeps: list[float] = []
+
+    assert _http_fetch("ghost-pkg", budget=_budget(), sleep=sleeps.append) is None
+    assert len(calls) == 1 and sleeps == [], "a 404 is a definitive answer and must not be retried"
+
+
+@pytest.mark.parametrize(
+    "definitive",
+    [
+        _http_error(403),
+        _http_error(400),
+        b"<html>not json</html>",
+        b"[]",
+        b"\xff\xfe not utf-8",
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        urllib.error.URLError(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")),
+        urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+        urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden")),
+        urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, "Name or service not known")),
+        urllib.error.URLError("unknown url type: ftp"),
+    ],
+    ids=[
+        "http-403",
+        "http-400",
+        "malformed-json",
+        "json-not-an-object",
+        "not-utf-8",
+        "cert-verify-failed",
+        "tls-wrong-version",
+        "tls-eof",
+        "proxy-tunnel-403",
+        "dns-no-such-name",
+        "urlerror-with-text-reason",
+    ],
+)
+def test_a_definitive_failure_is_raised_at_once(
+    monkeypatch: pytest.MonkeyPatch, definitive: BaseException | bytes
+) -> None:
+    calls = _script_urlopen(monkeypatch, [definitive, _GOOD_BODY])
+    sleeps: list[float] = []
+
+    with pytest.raises((urllib.error.URLError, ValueError)):
+        _http_fetch("fastapi", budget=_budget(), sleep=sleeps.append)
+
+    assert len(calls) == 1 and sleeps == [], "a definitive answer must never be retried into a pass"
+
+
+def test_the_run_budget_caps_retries_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PyPI that is flaky on EVERY name must fail closed in minutes, not after 56 x 3 attempts."""
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
+    budget = _budget(remaining=1)
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("first", budget=budget, sleep=lambda _s: None)
+    assert len(calls) == 2 and budget.remaining == 0
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("second", budget=budget, sleep=lambda _s: None)
+    assert len(calls) == 3, "an exhausted budget must not retry"
+
+
+def test_no_retry_starts_once_the_run_window_has_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The time bound, not just the count: a closed window fails the first transient error at once."""
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout(), _GOOD_BODY])
+    budget = RetryBudget(remaining=6, window_ends=time.monotonic() - 1.0)
+
+    with pytest.raises(urllib.error.URLError):
+        _http_fetch("fastapi", budget=budget, sleep=lambda _s: None)
+    assert len(calls) == 1 and budget.remaining == 6
+
+
+def test_the_budget_defaults_are_read_when_it_is_made(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.security.new_dependency_check as mod
+
+    monkeypatch.setattr(mod, "_RUN_RETRY_BUDGET", 2)
+    monkeypatch.setattr(mod, "_RETRY_WINDOW_S", 50.0)
+    before = time.monotonic()
+    budget = RetryBudget()
+    assert budget.remaining == 2
+    assert before + 50.0 <= budget.window_ends <= time.monotonic() + 50.0
+
+
+def _zero_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.security.new_dependency_check as mod
+
+    monkeypatch.setattr(mod, "_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(mod, "_BACKOFF_JITTER_S", 0.0)
+
+
+def test_main_exits_2_after_retrying_a_persistent_handshake_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI end of the contract: exit 2 (unreachable), each retry logged with attempt and host."""
+    _zero_backoff(monkeypatch)
+    calls = _script_urlopen(monkeypatch, [_handshake_timeout()])
+
+    assert main([]) == 2
+    assert len(calls) == 3, "the sweep must stop at the first request whose retries are spent"
+    err = capsys.readouterr().err
+    assert "attempt 1 of 3 (URLError(TimeoutError))" in err
+    hosts = re.findall(
+        r"^::warning::PyPI request for '[^']+' to (\S+) failed transiently ", err, re.M
+    )
+    assert hosts == ["pypi.org", "pypi.org"], f"one warning per retry, naming the host: {hosts}"
+    assert "attempt 2 of 3" in err
+    assert {urllib.parse.urlsplit(url).hostname for url in calls} == {"pypi.org"}
+    assert "could not reach PyPI" in err
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [_ReadFails(http.client.IncompleteRead(b"{", 100)), b"\xff\xfe not utf-8", b"[]"],
+    ids=["incomplete-read", "not-utf-8", "json-not-an-object"],
+)
+def test_main_exits_2_not_1_when_the_body_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: bytes | _ReadFails,
+) -> None:
+    """Exit 1 means "a dependency failed vetting"; an unreadable reply is "could not see" -- exit 2.
+
+    And the reply itself stays out of the CI log: a UnicodeDecodeError's repr carries the whole body.
+    """
+    _zero_backoff(monkeypatch)
+    _script_urlopen(monkeypatch, [outcome])
+
+    assert main([]) == 2
+    assert "not utf-8" not in capsys.readouterr().err, "the response body leaked into the log"
+
+
+def _fail_once_then_good(name: str, *, timeout: float, seen: set[str]) -> dict:
+    if name not in seen:
+        seen.add(name)
+        raise _handshake_timeout()
+    return _fetch_all_good(name)
+
+
+def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One handshake timeout mid-sweep -- the 2026-10-20 eviction -- now clears instead of exiting 2.
+
+    Patches _fetch_once rather than urlopen because each name needs its own canonical payload. Every
+    name but fastapi is pre-marked as seen, so exactly one request fails once."""
+    import scripts.security.new_dependency_check as mod
+
+    _zero_backoff(monkeypatch)
+    seen = set(declared_distributions((_ROOT / "pyproject.toml").read_text(encoding="utf-8")))
+    seen.discard("fastapi")
+    monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=seen))
+
+    assert main([]) == 0
+    assert "fastapi" in seen, "the one transient failure never happened"
+
+
+def test_main_shares_one_budget_across_every_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three names each failing once need three retries; a run budget of two must fail closed.
+
+    A budget made per request (a partial or lambda that builds a RetryBudget per call) would pass
+    this run.
+    """
+    import scripts.security.new_dependency_check as mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(mod, "_RUN_RETRY_BUDGET", 2)
+    monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=set()))
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["alpha>=1", "bravo>=1", "charlie>=1"]\n',
+        encoding="utf-8",
+    )
+
+    assert main(["--pyproject", str(project)]) == 2
 
 
 def test_main_exits_2_when_the_sweep_examines_nothing(
