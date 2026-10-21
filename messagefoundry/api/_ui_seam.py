@@ -623,14 +623,16 @@ from typing import Any
 #: Vault BACKLOG #3373 (ADR 0197 Amendment A, wave 2): ``AuthService`` gained
 #: ``begin_passkey_sign_in`` and ``login`` gained the ``passkey`` keyword, carrying the new
 #: ``PasskeyProof``, for the combined passkey sign-in. ``POST /ui/login/passkey`` calls the first and
-#: ``POST /ui/login`` passes the second, so a skew is an AttributeError or a TypeError at sign-in;
-#: they force a bump. Re-derived with ``--write``.
+#: ``POST /ui/login`` passes the second. The console imports ``PasskeyProof`` at module scope, so a
+#: skew fails the console's import at mount, before any request; an engine that kept the name but
+#: lost a member would fail at sign-in instead. They force a bump. Re-derived with ``--write`` on
+#: this branch's tree (e45be008d9bd193a).
 #:
 #: Vault BACKLOG #3422 (engine PR 2453) added the additive ``totp_reenrolment_recommended`` field to
 #: ``MfaStatus`` and ``MfaStatusResponse`` and moved main's seam to 6d8b36eb7bb94bf0, with no note
-#: here. Vault BACKLOG #3373 then merged main; neither parent's value covered both, so the move
-#: comes from the merge. Re-derived with ``--write`` on the merged tree, so the value below covers
-#: both entries.
+#: here. Vault BACKLOG #3373 (at e45be008d9bd193a) then merged main; neither parent's value covered
+#: both, so the move comes from the merge. Re-derived with ``--write`` on the merged tree, so the
+#: value below covers both entries.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
