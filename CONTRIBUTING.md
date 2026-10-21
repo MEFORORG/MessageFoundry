@@ -290,8 +290,9 @@ the last console tag. The in-tree console moves with the engine seam, so compari
 always reads unchanged. If the seam has moved, the published console refuses the new engine, so
 prepare a console release in this same pull request, per
 [packaging/messagefoundry-webconsole/RELEASE.md](packaging/messagefoundry-webconsole/RELEASE.md)
-steps 0 and 2. It also moves the console version in the three files of item 5. **Tag the engine
-first, and the console only once the engine is on PyPI**; that file's step 6 says why.
+steps 0 to 3, which raise both floors and re-lock. It also moves the console version in the three
+files of item 5. **Tag the engine first, and the console only once the engine is on PyPI**; that
+file's step 6 says why.
 
 ## PHI / safety
 

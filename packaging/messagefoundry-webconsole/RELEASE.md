@@ -35,8 +35,7 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       landing the cross-seam CI matrix.
 - [ ] Choose the two **floors** for the pair. X is the first engine release that carries the seam in
       `SUPPORTED_ENGINE_SEAMS`; the console gets `messagefoundry>=X`. A is this console release; the
-      engine gets `messagefoundry-webconsole>=A` once A is on PyPI (step 1). Set **no ceiling** on
-      either side.
+      engine gets `messagefoundry-webconsole>=A` (step 1). Set **no ceiling** on either side.
       [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md#the-engine-requirement-is-a-floor-with-no-ceiling) gives
       the reasons (BACKLOG #1585).
 - [ ] Update [`CHANGELOG.md`](CHANGELOG.md) with the release entry.
@@ -49,9 +48,10 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       webconsole = ["messagefoundry-webconsole>=A"]
       ```
 
-      Do this in a pull request after console A is on PyPI, with step 3's re-lock.
+      Do this in the release commit, with the step 0 version bump and step 3's re-lock.
+      `tests/test_webconsole_extra.py` holds the floor equal to the in-tree console's `__version__`.
       [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md#the-engine-requirement-is-a-floor-with-no-ceiling)
-      says why it waits. The engine release already tagged carries the previous floor.
+      says why this resolves before A is on PyPI.
 
 ## 2. Set the package's engine dependency floor
 
@@ -71,11 +71,11 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] `uv lock`, then the DEP-1 exports exactly as `security.yml` runs them. The cyclic optional dep
       `messagefoundry[webconsole]` → `messagefoundry-webconsole` → `messagefoundry` resolves in
-      `uv.lock`. The two `--all-extras` exports leave the console out; `security.yml` says why.
+      `uv.lock`, to the in-tree console. The two `--all-extras` exports leave that console out, as
+      they leave out the engine; `security.yml` says why.
 - [ ] Run the **DEP-1 audit** with `python scripts/security/audit_all_platforms.py requirements.lock`
       — no known-CVE pins. The console's only dependency is the engine, whose closure that lock
-      holds. No DEP-1 lock pins the console itself, so no gate audits it. Not a bare
-      `pip-audit -r requirements.lock`;
+      holds. Not a bare `pip-audit -r requirements.lock`;
       `messagefoundry/security/audit_all_platforms.py` says why.
 - [ ] Verify the cyclic optional dep resolves under **both** `uv lock` and plain `pip`.
 
@@ -110,7 +110,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] **When the same pull request released engine X, tag `vX` first, and tag the console only once
       engine X is on PyPI.** A console published first requires an engine nobody can install, and a
-      PyPI version cannot be uploaded again if the engine release then fails.
+      PyPI version cannot be uploaded again if the engine release then fails. In the gap, engine X's
+      `[webconsole]` extra fails at resolve, because console A is not published yet; a plain
+      `pip install messagefoundry` is unaffected.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
       `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`
@@ -122,8 +124,8 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] Confirm the tag matches the PyPI version. (The tag == PyPI == mirror checker was retired
       with the publish machinery at the MEFORORG cutover; there is no mirror to compare against.)
-- [ ] Once an engine release carries step 1's floor, confirm `pip install
-      "messagefoundry[webconsole]"` resolves the pair above both floors. That proves the extra
+- [ ] Once both are published, confirm `pip install "messagefoundry[webconsole]"` resolves the
+      pair above both floors. That proves the extra
       installs, not that the pair matches; the handshake check below does that. With an engine
       published without the extra, 0.5.2 or earlier, this command installs the engine alone. Consoles before 0.4.0 declare a bare `messagefoundry` dependency, so they set no floor.
 

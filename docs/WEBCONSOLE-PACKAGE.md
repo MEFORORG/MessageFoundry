@@ -58,7 +58,7 @@ Each console release sets two lower bounds and no upper bound (BACKLOG #1585):
 | Where | Requirement | The value |
 |---|---|---|
 | The console's [`pyproject.toml`](../packaging/messagefoundry-webconsole/pyproject.toml) | `messagefoundry>=X` | X is the first engine release that carries the seam the console supports. |
-| The engine's `[webconsole]` extra | `messagefoundry-webconsole>=A` | A is the console version being released, set once A is on PyPI (below). |
+| The engine's `[webconsole]` extra | `messagefoundry-webconsole>=A` | A is the console version being released, set in the same release commit (below). |
 
 **The floor is the fix.** A bare dependency is satisfied by any engine already installed, so `pip`
 keeps an older engine that lacks the functions the console calls. The floor makes resolution refuse
@@ -86,8 +86,12 @@ step 6). Between releases the floor on `main` lags the engine; that is harmless,
 released wheel's value matters. The release gate checks that a floor exists, not that its value is
 current, so choosing X stays a release step.
 
-**The engine's `[webconsole]` floor follows the console's publish.** `uv lock` resolves it from the
-index, so it can name console A only once A is on PyPI.
+**The engine's `[webconsole]` floor is raised in the same release commit.** The engine
+`pyproject.toml`'s `[tool.uv.sources]` points uv at the in-tree console, so `uv lock` resolves the
+floor before console A is on PyPI, and `uv sync` installs the console that matches the tree's seam.
+uv alone reads that table. The published wheel's metadata names only `messagefoundry-webconsole>=A`,
+so pip resolves it from the index and refuses at resolve until A is published. uv does not compare
+the floor with the in-tree version, so `tests/test_webconsole_extra.py` holds the two equal.
 
 ### Before it imports the console, `serve` checks whose package it is
 
@@ -287,8 +291,8 @@ from `auth.service`, add a console route or change a route's gate, BACKLOG #2709
    deploying site. Widening it back to a range requires landing the cross-seam CI matrix in the same
    change.
 4. Confirm green: `python -m pytest tests/test_webconsole_seam_snapshot.py -q`.
-5. At release, set the package's `messagefoundry>=X` floor, and once the console is on PyPI the
-   engine `[webconsole]` floor. Set no ceiling; see
+5. At release, set the floor on both sides: the engine `[webconsole]` extra and the package's
+   `messagefoundry>=X` dependency. Set no ceiling; see
    [the floor section](#the-engine-requirement-is-a-floor-with-no-ceiling) and the RELEASE checklist.
 
 **After any merge that moved the contract surface, regenerate. A clean merge is not evidence of a

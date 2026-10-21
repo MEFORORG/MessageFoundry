@@ -343,7 +343,7 @@ vault = ["hvac>=2.3.0,<3", "requests>=2.32.2"]
 fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The browser ops console ([security].serve_web_console, ADR 0065/0143) is a separately-versioned
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
-# in-process via mount_ui. The extra is a floor with no ceiling, raised after each console release;
+# in-process via mount_ui. The extra is a floor with no ceiling, raised in each console release commit;
 # docs/WEBCONSOLE-PACKAGE.md says why and when, and packaging/messagefoundry-webconsole/RELEASE.md
 # step 1 says how. security.yml's DEP-1 step says why the --all-extras lock exports leave the console
 # out. CI and a checkout still install the console editable, `-e packaging/messagefoundry-webconsole`.
@@ -542,10 +542,9 @@ ci-quality = [
     "pytest-timeout>=2.3.1",
 ]
 
-# uv resolves the [webconsole] extra to the IN-TREE console, so uv.lock and `uv sync` carry the
-# console that matches this tree's engine seam, and the release PR can raise the extra's floor with
-# the console bump. uv alone reads this table: the built wheel's metadata names the distribution and
-# its floor only, and pip resolves it from the index.
+# uv resolves the [webconsole] extra to the IN-TREE console; pip never reads this table. Why, and
+# what it changes at release: docs/WEBCONSOLE-PACKAGE.md, "The engine requirement is a floor with no
+# ceiling".
 [tool.uv.sources]
 messagefoundry-webconsole = { path = "packaging/messagefoundry-webconsole", editable = true }
 
