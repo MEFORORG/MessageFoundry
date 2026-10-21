@@ -81,9 +81,11 @@ function Get-BlindOptions($Record) {
 }
 
 function Get-Latest($Records, [string]$Kind) {
-    # The latest record of a kind per decision it refers to.
+    # The latest record of a kind per decision it refers to. Ordered by id, which is the UTC write
+    # time to the millisecond with a random tail: `ts` reads back as a DateTime, whose string form
+    # sorts month first and drops the milliseconds.
     $map = @{}
-    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref } | Sort-Object { [string]$_.ts })) { $map[[string]$r.ref] = $r }
+    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref } | Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
     return $map
 }
 
@@ -155,13 +157,18 @@ $sampleIds = [System.Collections.Generic.List[string]]::new()
 foreach ($id in (Read-DigestSample $sampleFile)) { $sampleIds.Add($id) }
 $dayB = @($todayDecisions | Where-Object { $_.class -eq 'B' })
 $target = if ($Sample -ge 0) { $Sample } else { [Math]::Max(5, [int][Math]::Ceiling($dayB.Count * 0.1)) }
-$fresh = @($dayB | Where-Object { -not $sampleIds.Contains([string]$_.id) -and -not $ratings.ContainsKey([string]$_.id) } |
-        Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32([int]::MaxValue) })
+# A decision with one distinct option shows only its recommendation, so it cannot be rated blind.
+$fresh = @($dayB | Where-Object {
+        -not $sampleIds.Contains([string]$_.id) -and -not $ratings.ContainsKey([string]$_.id) -and @(Get-BlindOptions $_).Count -ge 2
+    } | Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32([int]::MaxValue) })
 foreach ($r in ($fresh | Select-Object -First ([Math]::Max(0, $target - $sampleIds.Count)))) { $sampleIds.Add([string]$r.id) }
 [System.IO.File]::WriteAllText($sampleFile, (ConvertTo-Json -InputObject @($sampleIds) -Compress))
 # What the owner still has to rate: drawn and not yet rated. Their give-aways stay hidden below.
 $sampled = @($dayB | Where-Object { $sampleIds.Contains([string]$_.id) -and -not $ratings.ContainsKey([string]$_.id) })
 $hidden = @($sampled | ForEach-Object { [string]$_.id })
+# A decision drawn on an earlier day and not yet rated is still blind; its reversal stays hidden too.
+$hiddenAnyDay = @(@(Get-DecisionDayRange $Day $Window) | ForEach-Object { Read-DigestSample (Join-Path $digests "$_.sample.json") } |
+        Where-Object { -not $ratings.ContainsKey($_) }) + $hidden
 
 $kill = @(& (Join-Path $PSScriptRoot 'afk-kill.ps1') -Status 2>$null) | Select-Object -Last 1
 $md = [System.Collections.Generic.List[string]]::new()
@@ -214,7 +221,7 @@ $rev = @($today | Where-Object { $_.kind -eq 'outcome' -and $_.outcome -eq 'reve
 $trip = @($today | Where-Object { $_.kind -eq 'tripwire' })
 if (-not ($rev.Count + $trip.Count)) { $md.Add('None.') }
 foreach ($r in $rev) {
-    if ($hidden -contains [string]$r.ref) { $md.Add('- a reversal of a decision in your blind sample, shown once you rate it'); continue }
+    if ($hiddenAnyDay -contains [string]$r.ref) { $md.Add('- a reversal of a decision in your blind sample, shown once you rate it'); continue }
     $md.Add("- reversal of ``$($r.ref)`` by $($r.seat): $(Get-Short ([string]$r.note))")
 }
 foreach ($r in $trip) {
@@ -267,7 +274,7 @@ foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-O
     # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
     # the latest one, 60 newer ratings must pass before the class is calibrated again.
     $verdicts = @($g.Group | Where-Object { $ratings.ContainsKey([string]$_.id) } |
-            Sort-Object { [string]$ratings[[string]$_.id].ts } | ForEach-Object { [string]$ratings[[string]$_.id].rating -eq 'disagree' })
+            Sort-Object { [string]$ratings[[string]$_.id].id } | ForEach-Object { [string]$ratings[[string]$_.id].rating -eq 'disagree' })
     $n = $verdicts.Count
     $lastBreach = -1
     for ($i = 59; $i -lt $n; $i++) {
@@ -282,7 +289,9 @@ foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-O
     $last14 = @($g.Group | Where-Object { $recent -contains (Get-DecisionIdDay ([string]$_.id)) })
     $revd = @($last14 | Where-Object { (Get-Outcome $_) -eq 'reversed' }).Count
     $revRate = if ($last14.Count) { $revd / $last14.Count } else { 0 }
-    $rateText = if ($last14.Count) { ('{0:P1}' -f $revRate) + $(if ($revRate -gt 0.05) { ' BREACH' } else { '' }) } else { 'n/a' }
+    # Invariant culture, so the table reads the same on every machine.
+    $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
+    $rateText = if ($last14.Count) { $pct + $(if ($revRate -gt 0.05) { ' BREACH' } else { '' }) } else { 'n/a' }
     $md.Add("| $seat | $class | $rated | $dis | $blind | $($last14.Count) | $revd | $rateText |")
 }
 

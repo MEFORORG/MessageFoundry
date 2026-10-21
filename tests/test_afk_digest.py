@@ -52,7 +52,7 @@ def rec(kind: str = "decision", day: str = TODAY, **fields: Any) -> dict[str, An
         "class": "B",
         "predicates": [],
         "recommendation": "",
-        "alternatives": [],
+        "alternatives": ["the other way"],
         "undo": "",
         "confidence": None,
         "reviewed": "no",
@@ -346,6 +346,29 @@ def test_two_sessions_on_one_item_is_a_collision(sb: Sandbox) -> None:
     out = digest(sb, "-Sample", "0")
     section = out[out.index("## Collisions") : out.index("## Class D")]
     assert "item 42" in section and "item 43" not in section
+
+
+def test_a_decision_with_one_option_is_never_drawn(sb: Sandbox) -> None:
+    """Its only option would be the recommendation, so a rating of it could not be blind."""
+    seed(
+        sb, [rec(recommendation="go", alternatives=[]), rec(recommendation="x", alternatives=["x"])]
+    )
+    assert "No unrated Class B decision today." in digest(sb)
+
+
+def test_a_reversal_of_an_earlier_days_unrated_sample_stays_hidden(sb: Sandbox) -> None:
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    drawn = rec(day=yesterday, recommendation="a")
+    seed(sb, [drawn])
+    digest(sb, "-Day", yesterday)
+    seed(sb, [rec("outcome", seat="lander", ref=drawn["id"], outcome="reversed", note="PR 9")])
+    out = digest(sb)
+    assert "shown once you rate it" in out and drawn["id"] not in out
+
+
+def test_an_impossible_day_is_refused(sb: Sandbox) -> None:
+    proc = sb.run(DIGEST, "-Day", "2026-02-30")
+    assert proc.returncode == 2 and "real date" in proc.stderr
 
 
 def test_an_unread_vault_marks_the_digest_incomplete(sb: Sandbox) -> None:

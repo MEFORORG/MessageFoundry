@@ -46,7 +46,11 @@ function Get-DecisionCoordRoot {
 function Resolve-DecisionDay([string]$Day) {
     # Today (UTC) by default; a malformed day is refused rather than read as a day with no records.
     if (-not $Day) { return [DateTime]::UtcNow.ToString('yyyy-MM-dd') }
-    if ($Day -notmatch '^\d{4}-\d{2}-\d{2}$') { throw "-Day must be yyyy-MM-dd, not '$Day'." }
+    $parsed = [DateTime]::MinValue
+    if ($Day -notmatch '^\d{4}-\d{2}-\d{2}$' -or -not [DateTime]::TryParseExact($Day, 'yyyy-MM-dd',
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        throw "-Day must be a real date as yyyy-MM-dd, not '$Day'."
+    }
     return $Day
 }
 
@@ -266,6 +270,7 @@ function Send-DecisionSpool {
         $_.Name.EndsWith('.json') -or ($_.Name.EndsWith('.posting') -and $_.LastWriteTimeUtc -lt $stale)
     } | Sort-Object Name
     $issues = @{}
+    $dayFailed = @{}
     foreach ($f in $files) {
         # Claim the file by renaming it, so two flushers do not both post it. A claim left by a
         # flusher that died is retaken after ten minutes; a double post then reads once by id.
@@ -279,7 +284,13 @@ function Send-DecisionSpool {
             $rec = [System.IO.File]::ReadAllText($claim) | ConvertFrom-Json -ErrorAction Stop
             $day = Get-DecisionIdDay ([string]$rec.id)
             if (-not $day) { throw "spool file $($f.Name) holds no valid id" }
-            if (-not $issues.ContainsKey($day)) { $issues[$day] = Get-DecisionDayIssue -Repo $Repo -Day $day -CoordRoot $CoordRoot }
+            # A day whose issue could not be found or made fails once per flush, not once per
+            # record: each try costs a listing and two POSTs from the shared REST budget.
+            if ($dayFailed.ContainsKey($day)) { throw $dayFailed[$day] }
+            if (-not $issues.ContainsKey($day)) {
+                try { $issues[$day] = Get-DecisionDayIssue -Repo $Repo -Day $day -CoordRoot $CoordRoot }
+                catch { $dayFailed[$day] = $_.Exception.Message; throw }
+            }
             $body = @{ body = (Format-DecisionComment $rec) } | ConvertTo-Json -Compress -Depth 4
             $r = Invoke-DecisionGh @('api', '-X', 'POST', "repos/$Repo/issues/$($issues[$day])/comments") -InputJson $body
             if ($r.Code -ne 0) {

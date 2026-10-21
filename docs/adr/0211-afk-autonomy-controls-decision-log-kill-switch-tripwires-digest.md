@@ -105,8 +105,8 @@ start"* is wave 2's driver rule, which calls `-Status`.
 `scripts/hooks/afk-tripwire.ps1` runs under `shell-guard-dispatch.ps1` on every Bash and PowerShell
 tool call. **It does not block, so this slice does not meet plan section 4.4, which says each
 tripwire "stops the act".** The brief for this slice left blocking out. Most of these acts are not
-denied by anything else either: the deny rules in `.claude/settings.json` cover only the plain
-prefixes `git push --force`, `git push -f` and `git reset --hard`. The context reaches the session
+denied by anything else either: the deny rules in `.claude/settings.json` match a few command
+prefixes only, and the hook's header names forms they miss. The context reaches the session
 with the call, so by the time it reads "stop" the act has run. What the hook gives is the record
 and the reminder. Making it block is the change that would meet section 4.4; it is not built.
 
@@ -115,16 +115,17 @@ On a hit it spools a `tripwire` record through `decision.ps1 -NoPost` and return
 means the act was **attempted**: the hook runs before the permission rules, so a command they
 then refuse is recorded too, with outcome `detected`. A command an earlier guard in the dispatcher
 denied never reaches the hook and leaves no record. The dispatcher now passes every non-deny
-guard's `additionalContext` through, joined in guard order onto the kept `ask` or `allow`
-decision, or alone when nothing decided, and says in it when a guard failed open on the same call.
+guard's `additionalContext` through, after the kept `ask` or `allow` decision's own and then in
+guard order, or alone when nothing decided, and says in it when a guard failed open on the same
+call.
 Its timeout rises from 60 to 75 seconds, the tripwire's 15-second share.
 
 | Section 4.4 tripwire | In this slice |
 |---|---|
-| `--no-verify` (and `git commit -n`) | **Hook**: recorded and flagged, not blocked. |
-| `--force`, `-f`, `--force-with-lease`, `--mirror`, a `+` refspec on push | **Hook**, not blocked. A command that starts with plain `git push --force` or `git push -f` is also refused by the deny rules in `.claude/settings.json`. |
+| `--no-verify`, and the other hook bypasses the header lists | **Hook**: recorded and flagged, not blocked. |
+| `--force`, `-f`, `--force-with-lease`, `--mirror`, a `+` refspec on push | **Hook**, not blocked. Some plain forms are also refused by the deny rules in `.claude/settings.json`. |
 | A ref deletion by push: `--delete`, `-d`, `--prune`, a `:<branch>` refspec | **Hook**, not blocked. |
-| `reset --hard` | **Hook**, not blocked. A command that starts with `git reset --hard` is also refused by the settings deny rules. |
+| `reset --hard` | **Hook**, not blocked. Some plain forms are also refused by the settings deny rules. |
 | `-Force` on `remove.ps1` or `claim.ps1`; `-AllowOrphanedAllocations` | **Hook**, not blocked. |
 | A write to `MEFOR_AFK_KILL` (not in section 4.4; added because any seat can write it) | **Hook**, not blocked. |
 | A diff touching Class C paths | **Rule only.** No hook reads a diff. |
@@ -149,7 +150,9 @@ commands; and a calibration table.
 **The blind sample.** Class B decisions from the day, drawn at random and saved locally, so a
 rerun shows the same sample. The target is 5 or 10 percent of the day's Class B decisions,
 whichever is more, or N with `-Sample N`; each run keeps the saved draw and tops it up from
-decisions logged since, so an early run does not freeze the day's sample. Each sampled decision
+decisions logged since, so an early run does not freeze the day's sample. A decision with fewer
+than two distinct options is never drawn, since its only option is the recommendation. Each
+sampled decision
 shows its options in an order fixed by a hash of its id, with no mark on the recommendation, and
 without the confidence, the undo path, the review or the outcome. The day's decision list and the
 reversals section leave the same things off a sampled decision until it is rated. `-Rate <id>
