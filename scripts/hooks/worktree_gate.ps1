@@ -73,8 +73,7 @@ param(
 # asserted, and this label can never again be the only thing a reader compares.
 $GateVersion = "2026.10.21.2"
 
-# Fail OPEN: any unhandled error must let the tool call through, never block it. The one exception is
-# hook input that does not parse, which is denied once the allowlist is read.
+# Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
 
 function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") {
@@ -2449,7 +2448,7 @@ $rehome
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
 #
-# ORDINAL, like every other prefix check in this file. Both sides are already Get-ComparablePath's
+# ORDINAL, as most prefix checks in this file already were. Both sides are already Get-ComparablePath's
 # lowercased form, so case needs no help; a culture comparison instead ignores zero-width and soft-hyphen
 # characters, and read `.claude/worktrees<U+200B>/x`, a directory inside the primary, as the exemption.
 function Test-Governed([string]$Candidate) {

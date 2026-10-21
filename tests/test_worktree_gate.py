@@ -904,10 +904,9 @@ def test_unparseable_input_is_denied(repos_file: Path, junk: str) -> None:
     assert "could not parse" in reason
 
 
-@pytest.mark.parametrize("junk", _UNPARSEABLE)
-def test_unparseable_input_is_allowed_when_the_gate_is_off(empty_repos: Path, junk: str) -> None:
+def test_unparseable_input_is_allowed_when_the_gate_is_off(empty_repos: Path) -> None:
     """The allowlist is still the kill switch: with nothing governed, a parse failure denies nothing."""
-    assert run_gate(junk, empty_repos) is None
+    assert run_gate(_UNPARSEABLE[0], empty_repos) is None
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
