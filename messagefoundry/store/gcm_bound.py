@@ -36,7 +36,9 @@ the store it protects, and when it was keyed on the DEK, a store recreated or re
 met no row and counted a used key from zero with no signal. A sub-key cannot be reused that way: a new
 store mints a new salt, and ``restore`` gives the store it writes a new one, so the key is new by
 construction and a count of zero is its TRUE count. The frozen v1 writer has no salt field and stays
-keyed on the DEK, so ``[store].aad_bind = false`` keeps the old exposure (ADR 0196).
+keyed on the DEK, so ``[store].aad_bind = false`` keeps the old exposure (ADR 0196). The stored row id
+is that fingerprint tagged with the scheme that made it, :func:`~messagefoundry.store.crypto.cipher_meta_key`
+(BACKLOG #3421); a row keyed on the bare fingerprint, written before tags, is folded into it.
 
 **Rotation semantics.** A NEW DEK derives new sub-keys, so it has no row and starts at zero -- no reset
 operation is needed, and none is offered. Zeroing an EXISTING key_id's row is deliberately *not*
