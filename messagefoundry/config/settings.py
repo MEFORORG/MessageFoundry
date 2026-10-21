@@ -8173,14 +8173,23 @@ LOCKOUT_THRESHOLD_CEILING = 100
 
 
 def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str]]:
-    """The ``[api].trusted_proxies`` entries that cover more than one address, as
-    ``(whole_family, ranges)``, in order and as written; a repeated spelling is named once
-    (BACKLOG #1131).
+    """Labels for the ``[api].trusted_proxies`` networks that cover more than one address, as
+    ``(whole_family, ranges)``. Each list keeps the input order across both families, and names each
+    network once, under the first spelling given for it: ``10.0.0.0/08`` and ``::ffff:10.0.0.0/104``
+    both name the network ``10.0.0.0/8`` does (BACKLOG #1131, #3393). A label is that first entry,
+    plus any later, different spelling, as ``10.0.0.0/8 (also written as ::ffff:10.0.0.0/104)``:
+    uvicorn trusts the network until every spelling is gone. So a label is an entry only when the
+    network is spelled once.
 
-    ``whole_family`` holds EVERY multi-address entry of a family whose entries, together, cover
+    ``whole_family`` holds EVERY multi-address network of a family whose entries, together, cover
     every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
-    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. ``ranges`` holds the
-    multi-address entries of every other family. A single-host entry is in neither.
+    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. Each entry counts toward a
+    family in each spelling :func:`uvicorn_trusted_hosts` hands uvicorn, the entry and its
+    :func:`_other_spelling`, so ``0.0.0.0/0`` completes the IPv6 family for ranges covering the rest
+    of ``::/0``. One rule goes past what uvicorn is handed: an IPv6 range holding the whole mapped
+    block, such as ``::/80``, trusts the mapped hop of every IPv4 host, so it counts as all of IPv4.
+    ``ranges`` holds the multi-address networks of every other family. A single-host entry is in
+    neither.
 
     The cutoff is one address, not a size. Every host inside a trusted range may set its own
     ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
@@ -8189,42 +8198,56 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     Each entry is read by :func:`_parse_trusted_proxy`, the load's own reader, and one it refuses is
     skipped. The load refuses such an entry (BACKLOG #2488, #3042), so on a loaded config nothing is
     skipped."""
-    v4: list[tuple[str, ipaddress.IPv4Network]] = []
-    v6: list[tuple[str, ipaddress.IPv6Network]] = []
-    for entry in dict.fromkeys(entries):  # a repeated entry is named once, in order
+    v4: list[ipaddress.IPv4Network] = []
+    v6: list[ipaddress.IPv6Network] = []
+    # Keyed by the network an entry names, so a respelling is not named twice. The value is every
+    # distinct spelling, in list order (a dict as an ordered set), and the family whose collapse
+    # decides the wording.
+    named: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, tuple[dict[str, None], int]] = {}
+    for entry in entries:
         try:
             parsed = _parse_trusted_proxy(entry)
         except ValueError:
             continue
-        # A host counts toward its family's collapse as its single-address network, and a mapped
-        # entry toward IPv4's, so ``::ffff:0:0/96`` is named as the whole family it trusts.
-        # A mapped entry also stays in IPv6's collapse, since uvicorn holds it as an IPv6 network.
+        # A host counts toward its family's collapse as its single-address network, in both
+        # spellings uvicorn is handed: a mapped entry toward IPv4's as the range it names, so
+        # ``::ffff:0:0/96`` is named as the whole family it trusts, and an IPv4 entry toward
+        # IPv6's as its mapped twin (BACKLOG #3042, #3393).
         net = ipaddress.ip_network(parsed)
+        for spelling in (net, _other_spelling(net)):
+            if isinstance(spelling, ipaddress.IPv4Network):
+                v4.append(spelling)
+            elif isinstance(spelling, ipaddress.IPv6Network):
+                v6.append(spelling)
+        every_ipv4 = _trusts_every_ipv4_host(net)
+        if every_ipv4:
+            # The ``::/80`` rule the docstring names. For ``0.0.0.0/0`` and ``::ffff:0:0/96`` the
+            # spellings above already added this, and a repeat changes no collapse.
+            v4.append(ipaddress.IPv4Network("0.0.0.0/0"))
         meaning = _ipv4_meaning(net)
-        if isinstance(net, ipaddress.IPv4Network):
-            v4.append((entry, net))
-        else:
-            v6.append((entry, net))
-            if isinstance(meaning, ipaddress.IPv4Network):
-                v4.append((entry, meaning))
-            elif _trusts_every_ipv4_host(net):
-                # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
-                # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
-                v4.append((entry, ipaddress.IPv4Network("0.0.0.0/0")))
+        if net.num_addresses > 1:
+            # An entry that counts toward IPv4 is judged by IPv4's collapse alone. That loses
+            # nothing: an IPv6 collapse covering every address covers the mapped block, and each
+            # entry inside or around that block, or whose mapped twin is, added an IPv4 view
+            # above, so IPv4 is whole too.
+            family = 4 if every_ipv4 or isinstance(meaning, ipaddress.IPv4Network) else 6
+            named.setdefault(meaning, ({}, family))[0].setdefault(entry)
+    # collapse_addresses takes one family at a time, so each is collapsed on its own.
+    covered = {
+        version
+        for version, collapsed in (
+            (4, ipaddress.collapse_addresses(v4)),
+            (6, ipaddress.collapse_addresses(v6)),
+        )
+        if any(n.prefixlen == 0 for n in collapsed)
+    }
     whole_family: list[str] = []
     ranges: list[str] = []
-    # collapse_addresses takes one family at a time, so each is collapsed on its own.
-    families: list[tuple[Sequence[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]], bool]]
-    families = [
-        (v4, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4))),
-        (v6, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6))),
-    ]
-    for family, covers_all in families:
-        multi = [entry for entry, net in family if net.num_addresses > 1]
-        (whole_family if covers_all else ranges).extend(multi)
-    # An entry counted in both families is named once, under the wider wording it earns.
-    whole_family = list(dict.fromkeys(whole_family))
-    return whole_family, [entry for entry in dict.fromkeys(ranges) if entry not in whole_family]
+    for spellings, family in named.values():
+        first, *others = spellings
+        also = f" (also written as {' and '.join(others)})" if others else ""
+        (whole_family if family in covered else ranges).append(first + also)
+    return whole_family, ranges
 
 
 def _auth_default(field: str) -> Any:
@@ -9494,7 +9517,8 @@ def security_loosenings(
     # own parser, _parse_trusted_proxy, which parses as uvicorn's _TrustedHosts does (__main__ hands
     # it the list plus each IPv4 entry's other spelling, uvicorn_trusted_hosts) and refuses at least
     # a host-bits entry such as "10.1.2.3/0" (BACKLOG #2488) and a zoned one (#3042), so none
-    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042). Not gated on
+    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042), and an IPv4 entry
+    # toward IPv6 as its mapped twin, since uvicorn is handed that twin too (#3393). Not gated on
     # sign-in: a forged source address poisons the audit trail either way.
     # A range short of a whole family is named too, with its own wording: any host inside it may
     # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
