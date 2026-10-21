@@ -42,14 +42,12 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     StoreSettings,
 )
-from messagefoundry.store.crypto import generate_key
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import MessageStore
+from tests._admin_account import provision_admin
 
 # The retracted "nobody can sign in" claim, one pattern shared with the doc guard that refuses it.
 from tests._sign_in_claim import SIGN_IN_CLAIM, rejoin_wrapped_hyphens
-
-# An Administrator with no address, written through the service: provision-admin can no longer
-# leave one (BACKLOG #1138). Same username as _ADMIN below.
-from tests.test_admin_set_notify_email import _seed
 
 # provision-admin's prompt stub and passphrase, imported rather than copied: that module pins them.
 from tests.test_provision_first_administrator import _PASSWORD, _tty
@@ -94,6 +92,23 @@ def _app(
 async def _start(app: FastAPI) -> None:
     async with app.router.lifespan_context(app):
         pass
+
+
+def _seed_addressless_admin(db: Path, key: str) -> None:
+    """A keyed store holding one provisioned Administrator, named ``_ADMIN``, with no address.
+
+    Neither ``provision-admin`` nor the service writes that state since BACKLOG #1138 and #3391, so
+    :func:`provision_admin` clears the address after the service wrote it."""
+
+    async def run() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await provision_admin(store, username=_ADMIN, password=_PASSWORD, notify_email=None)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def _provision(db: Path, monkeypatch: pytest.MonkeyPatch) -> int:
@@ -141,13 +156,14 @@ def test_an_administrator_with_no_address_is_pointed_at_the_offline_setter(
 
     ``provision-admin`` cannot help here, because an enabled local Administrator with a
     password exists, so naming it would send the operator to a command that refuses. It cannot leave this state either, since
-    BACKLOG #1138 made ``--email`` required, so the Administrator is written through the service.
+    BACKLOG #1138 made ``--email`` required, and #3391 made the service require it too, so the
+    Administrator is written through the service and its address cleared after.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
     db = tmp_path / "no-address.db"
-    _seed(db, key=key)
+    _seed_addressless_admin(db, key)
 
     with pytest.raises(RuntimeError) as refused:
         asyncio.run(_start(_app(db, key)))

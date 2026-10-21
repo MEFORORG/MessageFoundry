@@ -393,7 +393,8 @@ account held **before** the repair (BACKLOG #2019).
   the earlier holder learns where later notices go. The comparison is case-sensitive, so the same
   mailbox typed in a different case counts as a change. From BACKLOG #2288 until ADR 0183 Amendment
   D (2026-10-10), only a repair of an account that held an address needed `--email` (ADR 0183
-  Amendment C). Amendment D says where that refusal still applies. It cannot fire from this command.
+  Amendment C). Since BACKLOG #3391 the service behind the command also refuses a run with no
+  address, so that narrower refusal is gone.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role

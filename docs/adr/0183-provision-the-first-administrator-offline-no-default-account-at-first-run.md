@@ -23,6 +23,9 @@
 - **Amended 2026-10-16:** Amendment E below. `provision-admin` runs whenever no enabled **local**
   Administrator has a usable password, by owner ruling B258-R4 (vault BACKLOG #2711 step 1). A
   directory or federated Administrator no longer blocks it.
+- **Amended 2026-10-20:** the service requires the address too, not only the command, and
+  Amendment C's refusal, which could no longer fire, is removed (BACKLOG #3391). See the notes
+  under Amendments C and D.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -137,13 +140,16 @@ holds. See Amendment A.*
   (parametrized over both points)
   *(Amended 2026-10-04 by Amendment C: a re-run of a run given `--email` completes the row only
   when it is given `--email` too, which the same command already carries.
-  → `tests/test_provision_first_administrator.py::test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create`)*
+  → `tests/test_provision_first_administrator.py::test_a_run_that_stopped_after_the_create_is_completed_by_the_same_command`,
+  renamed 2026-10-20 from `test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create`
+  when BACKLOG #3391 removed that refusal.)*
 - **AC-5** — IF the named account holds roles, is disabled, or is directory-owned, THEN THE SYSTEM
   SHALL refuse rather than take it over.
   → `tests/test_provision_first_administrator.py::test_it_refuses_to_take_over_an_account_somebody_is_using`
   *(Amended 2026-10-04 by Amendment C: it also refuses an account that holds a notification
-  address when no `--email` is given.
-  → `tests/test_provision_first_administrator.py::test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email`)*
+  address when no `--email` is given. Superseded 2026-10-20 by BACKLOG #3391: the service refuses
+  every run with no address, whatever the row holds.
+  → `tests/test_provision_first_administrator.py::test_the_service_refuses_no_address_and_writes_nothing`)*
 - **AC-6** — IF no terminal is attached, THEN THE SYSTEM SHALL refuse, and THE SYSTEM SHALL expose no
   flag that supplies the password from argv or a file.
   → `tests/test_provision_first_administrator.py::test_cli_refuses_without_a_terminal`,
@@ -706,6 +712,13 @@ stored address still counts as none.*
 The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that said the account
 keeps the earlier holder's address with a warning is replaced there.
 
+*Retired 2026-10-20 by BACKLOG #3391. The service now requires the address from every caller, so
+this refusal could not fire, and `_existing_row_refusal` no longer carries it. Its purpose holds for
+the notification address by the wider rule: every run writes the `notify_email` it was given, so a
+repaired row's security notices never go to an address nobody chose. The profile `users.email` is
+not written on a repair and keeps what the account held, which may be the earlier holder's; see
+`docs/SECURITY.md`, *Provisioning the first administrator*.*
+
 ## Amendment D (2026-10-10) -- `--email` is required
 
 Made by BACKLOG #1138, on an owner ruling of 2026-10-10: require email, and keep SMTP as the only
@@ -736,8 +749,11 @@ with no address. MessageFoundry has no deployments, so the change costs no migra
   given with `_require_single_mailbox` and refuses a blank or malformed one. That is the shape of
   `create_local_user`, where the route requires the address and the service checks one when given.
   The command is its only production caller.
+  *Amended 2026-10-20 by BACKLOG #3391: the service now refuses no address too, through
+  `provision_notify_email`, the one check the command, `provision_refusal` and the write share.*
 - Amendment C's service refusal stays. From the command it can no longer fire, because every run
   carries `--email`, but it still guards any other caller of the service.
+  *Amended 2026-10-20 by BACKLOG #3391: removed. The service refusal above guards every caller.*
 - `admin-set-notify-email` stays. An enabled Administrator can still lack an address: a directory
   account granted the role, or a store an earlier build wrote. The setter is the exit there.
 - No second push channel is built. Email over SMTP stays the only one, so an account on a site
@@ -751,7 +767,8 @@ with no address. MessageFoundry has no deployments, so the change costs no migra
   `::test_cli_refuses_a_blank_email_before_the_prompt_and_the_open` and
   `::test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open`,
   with `::test_the_provisioned_administrator_carries_the_address_it_was_given` as the control. The
-  service half: `::test_a_blank_or_malformed_address_is_refused_and_writes_nothing`.
+  service half: `::test_a_blank_or_malformed_address_is_refused_and_writes_nothing`, and since
+  BACKLOG #3391 `::test_the_service_refuses_no_address_and_writes_nothing`.
 
 ## Amendment E (2026-10-16) -- the refusal asks for a local Administrator that can sign in
 
