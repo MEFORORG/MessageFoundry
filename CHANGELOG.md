@@ -3543,7 +3543,7 @@ ledger, so it has no public page.
   without it fails at import. On 0.137.2 to 0.139.x the walk is complete, but the guard against
   sync route dependencies cannot run. The engine still refused an undeclared route at request time
   on 0.137.0 and 0.137.1. The lock already pins 0.141.1. (`vault BACKLOG #2845`) Superseded in
-  this release: the floor is `fastapi>=0.143.1`.
+  this release: the floor is `fastapi>=0.143.1`, and the lock pins 0.143.1.
 - **The engine now counts every refusal of a route that declares no authorization.** It used to
   log only the first refusal of such a route, so a later burst wrote nothing. The ERROR line now
   repeats at most once a minute for each route. Each line says how many refusals came since the
