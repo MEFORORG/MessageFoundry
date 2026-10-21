@@ -674,7 +674,8 @@ async def test_source_after_read_leave_keeps_file_and_dedups(
     assert not any(p.startswith("/in/.processed") for p in client.files)  # never moved
     assert len(ledger.keys) == 1  # a HASHED key recorded
     (key,) = ledger.keys
-    assert len(key) == 64 and "a.hl7" not in key  # sha256 hex, no cleartext filename
+    # the scheme tag (BACKLOG #3424), then sha256 hex, no cleartext filename
+    assert key.startswith("fk1:") and len(key) == 68 and "a.hl7" not in key
     await src._poll_once()  # a second poll must NOT re-ingest
     assert h.bodies == [b"MSH|^~\\&|A"]
 
@@ -697,6 +698,25 @@ async def test_source_leave_durable_ledger_read_is_the_dedup(
     await src._poll_once()
     assert h.bodies == []  # ZERO emits — the durable read decided
     assert "/in/a.hl7" in client.files  # left in place
+
+
+async def test_source_leave_untagged_ledger_row_still_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #3424: a ledger row written before the key carried a scheme tag holds the bare digest.
+    # It must still mark its file read, or every file left in place would be read again once.
+    client = _FakeClient(files={"/in/a.hl7": b"AAA"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+    tagged, bare = src._file_key_forms("a.hl7", 3, None)
+    assert tagged == "fk1:" + bare
+    ledger.keys.add(bare)
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == []
+    assert ledger.keys == {bare}  # nothing re-recorded
 
 
 async def test_source_leave_distinct_remote_paths_get_distinct_keys(

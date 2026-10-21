@@ -1004,7 +1004,9 @@ async def test_file_source_leave_in_place_keeps_file_and_dedups(tmp_path: Path) 
     assert not (inbox / ".processed" / "m.hl7").exists()  # never moved
     assert len(ledger.keys) == 1
     (key,) = ledger.keys
-    assert len(key) == 64 and all(c in "0123456789abcdef" for c in key)  # a sha256 hex digest
+    tag, _, digest = key.partition(":")
+    assert tag == "fk1"  # the scheme tag (BACKLOG #3424), then a sha256 hex digest
+    assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
     assert "m.hl7" not in key  # the cleartext filename never appears in the key
     assert ledger.pruned >= 1  # pruned after recording a new file
 

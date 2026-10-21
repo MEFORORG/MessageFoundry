@@ -184,3 +184,19 @@ message files. A command to delete every saved collection, including stranded on
 **What it does not change.** Case bodies are still PHI when an author saves real messages, so the
 synthetic-case steer and the in-UI notice stay. The rerun still materializes inputs to a temp
 directory and deletes it in `finally`.
+
+## Amendment 2026-10-20 -- the SecretStorage key carries a scheme version (BACKLOG #3426)
+
+**What changed.** The key is now `messagefoundry.testBench.collections.v1.<digest>`. Before, it had
+no version, so a change to the digest would have left every saved collection under a key nothing
+reads. The release picks the scheme from a table compiled into it. No stored value names a scheme;
+the lookup refuses an unknown one, which guards the code path and not any stored data.
+
+**The move.** The first load moves a value from the unversioned key to the versioned one, write then
+delete, as stored and unparsed. A value already under the versioned key wins whole, with no merge. So
+a build from before this change that saves again after the move loses that save.
+
+**Reset.** The Delete prompt removes at least the versioned key and the unversioned one, after any
+running migration settles. It keeps a `workspaceState` map a failed migration left, which the next
+load merges. It does not reach a key stranded under an earlier storage URI (limit 3 of the
+2026-09-29 amendment), and that limit also covers an unversioned key of a workspace never reopened.

@@ -273,6 +273,21 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     counted_user = await h.service._load_user(counted)
     assert counted_user is not None
     assert await h.service._verified_passkeys(counted_user) is not None
+    # BACKLOG #3423: moving a passkey to a new hash re-seals the account over it, and is refused,
+    # like any passkey write, over a set that fails its digest.
+    assert await store.rehash_webauthn_credential(
+        counted, f"{counted}-pk-count", f"{counted}-pk-moved"
+    )
+    counted_user = await h.service._load_user(counted)
+    assert counted_user is not None
+    held = await h.service._verified_passkeys(counted_user)
+    assert held is not None and [c.credential_id_hash for c in held] == [f"{counted}-pk-moved"]
+    try:
+        await store.rehash_webauthn_credential(keyed, f"{keyed}-pk-store", f"{keyed}-pk-moved")
+    except RowSealError:
+        pass
+    else:
+        raise AssertionError("a passkey move over a set that fails its digest was not refused")
     # Clearing every passkey needs no check, so an administrator's reset still clears a bad set.
     assert await store.delete_all_webauthn_credentials(keyed) == 2
     reset = await h.service._load_user(keyed)
