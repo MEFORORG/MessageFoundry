@@ -26,7 +26,7 @@
   checks the running token by service_token_probe.py's token_problems, the windows-service-smoke
   leg's own rule. The other service runs as a local user with SID type none, which is what the
   installer gives such an account. Set-ServiceAccount is handed that user as ".\name", the spelling
-  the SCM stores (ConvertTo-ScmAccountName says why); the owner's name is passed unchanged. Only
+  the SCM stores ($OtherRunAs says why); the owner's name is passed unchanged. Only
   the registration is the installer's: the two work folders are plain folders with one grant each,
   not the engine's data directory.
 
@@ -66,6 +66,14 @@ $OtherService = "MeforDpapiSpikeB"
 $OtherUser = "mefor-dpapi-b"
 $OwnerAccount = "NT SERVICE\$OwnerService"
 $OtherAccount = "$env:COMPUTERNAME\$OtherUser"
+# The same user as the SCM stores it, for Set-ServiceAccount alone. Given COMPUTERNAME\mefor-dpapi-b,
+# the SCM stored .\mefor-dpapi-b (CI run 39524776520, both legs), and the lifted Set-ServiceAccount,
+# which drops only a ".\" prefix before it compares, refused it. ".\" does not translate to a SID,
+# so Set-ServiceAccount sends this as given, and the read-back is expected to match; no spike run has
+# shown that yet. Everything else keeps $OtherAccount, which does translate: the logon right (which
+# only warns on a name it cannot resolve, and the service would then fail with 1069), the SID type,
+# the folder grants, the SID lookup and the judge.
+$OtherRunAs = ".\$OtherUser"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $Installer = Join-Path $RepoRoot "scripts\service\install-service.ps1"
 $Worker = Join-Path $PSScriptRoot "dpapi_spike_worker.py"
@@ -140,27 +148,14 @@ function Stop-SpikeService([string]$Name) {
     if (-not (Stop-ServiceAndConfirm -ServiceName $Name)) { Write-Warning "$Name did not stop within 30 seconds" }
 }
 
-function ConvertTo-ScmAccountName([string]$Account) {
-    # The spelling the SCM stores for a run-as account: ".\name" for a local account given as
-    # COMPUTERNAME\name, and anything else as it is. Measured in CI run 39524776520 on both legs:
-    # given COMPUTERNAME\mefor-dpapi-b, the service's ObjectName read back as .\mefor-dpapi-b, and
-    # the lifted Set-ServiceAccount, which compares the two after dropping only a ".\" prefix,
-    # refused it. Given ".\name" it sends the name as is, because ".\" does not translate to a SID,
-    # and the read-back matches. The logon right, the SID type, the folder grants and the judge keep
-    # the COMPUTERNAME\name spelling, which does translate.
-    $prefix = "$env:COMPUTERNAME\"
-    if ($env:COMPUTERNAME -and $Account.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-        return ".\" + $Account.Substring($prefix.Length)
-    }
-    return $Account
-}
-
 function Register-SpikeService {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Role,
         [Parameter(Mandatory)][string]$Dir,
         [Parameter(Mandatory)][string]$Account,
+        # The spelling Set-ServiceAccount alone is handed. $OtherRunAs says why it can differ.
+        [Parameter(Mandatory)][string]$RunAs,
         [SecureString]$Password
     )
     # Every nssm set comes before the account changes: this nssm build prints "Invalid account name!"
@@ -177,12 +172,11 @@ function Register-SpikeService {
     Invoke-Nssm set $Name Start SERVICE_DEMAND_START
     # As install-service.ps1 does for every named account: the right first, then the account.
     Set-ServiceLogonRight -Account $Account
-    $runAs = ConvertTo-ScmAccountName $Account
-    if ($Password) { Set-ServiceAccount -ServiceName $Name -Account $runAs -Password $Password }
-    else { Set-ServiceAccount -ServiceName $Name -Account $runAs }
+    if ($Password) { Set-ServiceAccount -ServiceName $Name -Account $RunAs -Password $Password }
+    else { Set-ServiceAccount -ServiceName $Name -Account $RunAs }
     $choice = Get-ServiceSidTypeChoice -ServiceName $Name -ServiceAccount $Account
     Set-ServiceTokenHardening -ServiceName $Name -SidType $choice.SidType -Privileges $ServicePrivileges
-    "$Name registered as $Account (SCM: $runAs), SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
+    "$Name registered as $Account (SCM: $RunAs), SID type $($choice.SidType), privileges $($ServicePrivileges -join ', ')"
     "===== sc.exe qsidtype $Name ====="; (& sc.exe qsidtype $Name | Out-String).Trim()
     "===== sc.exe qprivs $Name ====="; (& sc.exe qprivs $Name | Out-String).Trim()
 }
@@ -227,8 +221,10 @@ try {
         -Description "dpapi-spike second account" | Out-Null
     Add-LocalGroupMember -SID "S-1-5-32-545" -Member $OtherUser
 
-    Register-SpikeService -Name $OwnerService -Role owner -Dir $OwnerDir -Account $OwnerAccount
-    Register-SpikeService -Name $OtherService -Role other -Dir $OtherDir -Account $OtherAccount -Password $secret
+    Register-SpikeService -Name $OwnerService -Role owner -Dir $OwnerDir -Account $OwnerAccount `
+        -RunAs $OwnerAccount
+    Register-SpikeService -Name $OtherService -Role other -Dir $OtherDir -Account $OtherAccount `
+        -RunAs $OtherRunAs -Password $secret
     # After the registration: a virtual account's SID resolves only once its service exists.
     New-SpikeFolder $OwnerDir $OwnerAccount
     New-SpikeFolder $OtherDir $OtherAccount

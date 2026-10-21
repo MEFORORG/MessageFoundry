@@ -488,19 +488,31 @@ def _identical(a: Path, b: Path) -> bool:
         return False
 
 
+def judge_files(owner_dir: Path, other_dir: Path) -> dict[str, Path]:
+    """Every file the judge reads. The rig waits on the reports and makes the copies, so it names
+    each of these, and no other report or blob."""
+    return {
+        "start1": owner_dir / owner_report(1),
+        "start2": owner_dir / owner_report(2),
+        "other": other_dir / OTHER_REPORT,
+        "user": owner_dir / USER_BLOB,
+        "user_copy": other_dir / FOREIGN_USER_BLOB,
+        "machine": owner_dir / MACHINE_BLOB,
+        "machine_copy": other_dir / FOREIGN_MACHINE_BLOB,
+    }
+
+
 def run_judge(args: argparse.Namespace) -> int:
-    owner_dir, other_dir = Path(args.owner_dir), Path(args.other_dir)
+    files = judge_files(Path(args.owner_dir), Path(args.other_dir))
     answers = judge_reports(
-        start1=_load(owner_dir / owner_report(1)),
-        start2=_load(owner_dir / owner_report(2)),
-        other=_load(other_dir / OTHER_REPORT),
+        start1=_load(files["start1"]),
+        start2=_load(files["start2"]),
+        other=_load(files["other"]),
         owner_sid=args.owner_sid,
         other_sid=args.other_sid,
         privileges=args.privilege,
-        user_copy_identical=_identical(owner_dir / USER_BLOB, other_dir / FOREIGN_USER_BLOB),
-        machine_copy_identical=_identical(
-            owner_dir / MACHINE_BLOB, other_dir / FOREIGN_MACHINE_BLOB
-        ),
+        user_copy_identical=_identical(files["user"], files["user_copy"]),
+        machine_copy_identical=_identical(files["machine"], files["machine_copy"]),
     )
     build = "not Windows"
     if sys.platform == "win32":

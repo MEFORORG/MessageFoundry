@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -393,16 +394,22 @@ foreach ($v in $values) {
 """
 
 
-def _lift_gaps(tmp_path: Path, drop: str = "") -> dict[str, Any]:
+def _run_pwsh(tmp_path: Path, name: str, script: str, *args: str) -> dict[str, Any]:
+    """Run a check script under pwsh against the rig and the installer; its last line is JSON."""
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
-    script = tmp_path / "lift_check.ps1"
-    script.write_text(_LIFT_CHECK, encoding="utf-8")
-    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
-    argv += ["-RigPath", str(_RIG), "-InstallerPath", str(_INSTALLER), "-Drop", drop]
+    path = tmp_path / name
+    path.write_text(script, encoding="utf-8")
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(path)]
+    argv += ["-RigPath", str(_RIG), "-InstallerPath", str(_INSTALLER), *args]
     done = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
     assert done.returncode == 0, done.stderr
     result: dict[str, Any] = json.loads(done.stdout.strip().splitlines()[-1])
+    return result
+
+
+def _lift_gaps(tmp_path: Path, drop: str = "") -> dict[str, Any]:
+    result = _run_pwsh(tmp_path, "lift_check.ps1", _LIFT_CHECK, "-Drop", drop)
     result["gaps"] = list(result["gaps"] or [])
     return result
 
@@ -428,40 +435,59 @@ def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:
     assert any("calls Get-FilePinProblem" in gap for gap in gaps), gaps
 
 
-# Lifts the installer's Set-ServiceAccount and the rig's ConvertTo-ScmAccountName, and runs them
-# over stubs that store a run-as name the way the SCM did in CI run 39524776520: a local account given
-# as COMPUTERNAME\name reads back as .\name. The verbatim arm is the control. It is that run's failure,
-# so a stub that stopped modelling the SCM would show here as a verbatim arm that passes.
+# Reads the rig's account wiring by the PowerShell AST, and runs the installer's Set-ServiceAccount
+# over stubs that store a run-as name the way the SCM did in CI run 39524776520: a local account
+# given as COMPUTERNAME\name reads back as .\name. The verbatim arm is the control. It is that run's
+# failure, so stubs that stopped modelling the SCM would show here as a verbatim arm that passes.
 _SPELLING_CHECK = r"""
 param([string]$RigPath, [string]$InstallerPath)
 $ErrorActionPreference = 'Stop'
-# Linux pwsh sets no COMPUTERNAME, and the rewrite the stubs model is keyed on it.
+# Linux pwsh sets no COMPUTERNAME, and both the rig's spelling and the stubs' rewrite key on it.
 if (-not $env:COMPUTERNAME) { $env:COMPUTERNAME = 'SPIKEHOST' }
 $L = [System.Management.Automation.Language.Parser]
 $fnType = [System.Management.Automation.Language.FunctionDefinitionAst]
 $assign = [System.Management.Automation.Language.AssignmentStatementAst]
+$cmdType = [System.Management.Automation.Language.CommandAst]
+$parType = [System.Management.Automation.Language.CommandParameterAst]
 $rig = $L::ParseFile($RigPath, [ref]$null, [ref]$null)
 $installer = $L::ParseFile($InstallerPath, [ref]$null, [ref]$null)
-foreach ($pair in @(@($installer, 'Set-ServiceAccount'), @($rig, 'ConvertTo-ScmAccountName'))) {
-  $f = @($pair[0].EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq $pair[1] })
-  if ($f.Count -ne 1) { throw "$($pair[1]) is defined $($f.Count) times at top level" }
-  . ([scriptblock]::Create($f[0].Extent.Text))
-}
-# The account the rig hands Register-SpikeService for the second service, from its own assignments.
+$f = @($installer.EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq 'Set-ServiceAccount' })
+if ($f.Count -ne 1) { throw "Set-ServiceAccount is defined $($f.Count) times at top level" }
+. ([scriptblock]::Create($f[0].Extent.Text))
+# The rig's account names, from its own top-level assignments, in the order it makes them.
 $top = @($rig.EndBlock.Statements | Where-Object { $_ -is $assign })
 $rhs = { param($n) @($top | Where-Object { $_.Left.Extent.Text -eq $n })[0].Right.Extent.Text }
-$OtherUser = & ([scriptblock]::Create((& $rhs '$OtherUser')))
-$OwnerService = & ([scriptblock]::Create((& $rhs '$OwnerService')))
-$other = & ([scriptblock]::Create((& $rhs '$OtherAccount')))
-$owner = & ([scriptblock]::Create((& $rhs '$OwnerAccount')))
-# Every Set-ServiceAccount call in the rig, by the text of its -Account argument.
-$sent = @($rig.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and
-    $args[0].GetCommandName() -eq 'Set-ServiceAccount' }, $true) | ForEach-Object {
-  $e = @($_.CommandElements); $text = ''
-  for ($i = 0; $i -lt $e.Count - 1; $i++) {
-    if ($e[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
-        $e[$i].ParameterName -eq 'Account') { $text = $e[$i + 1].Extent.Text } }
-  $text })
+foreach ($n in 'OwnerService', 'OtherUser', 'OwnerAccount', 'OtherAccount', 'OtherRunAs') {
+  Set-Variable -Name $n -Value (& ([scriptblock]::Create((& $rhs "`$$n")))) }
+# Each command's arguments by parameter name, as written: -P x and -P:x both.
+$argsOf = { param($cmd)
+  $h = [ordered]@{}; $e = @($cmd.CommandElements)
+  for ($i = 1; $i -lt $e.Count; $i++) {
+    if ($e[$i] -isnot $parType) { continue }
+    $h[$e[$i].ParameterName] = if ($e[$i].Argument) { $e[$i].Argument.Extent.Text }
+      elseif ($i + 1 -lt $e.Count -and $e[$i + 1] -isnot $parType) { $e[$i + 1].Extent.Text } else { '' } }
+  $h }
+$calls = { param($tree, $name) @($tree.FindAll({ $args[0] -is $cmdType -and
+  $args[0].GetCommandName() -eq $name }, $true) | ForEach-Object { & $argsOf $_ }) }
+$reg = @($rig.EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq 'Register-SpikeService' })[0]
+$res = [ordered]@{
+  host = $env:COMPUTERNAME; ownerService = $OwnerService; otherUser = $OtherUser
+  owner = $OwnerAccount; other = $OtherAccount; otherRunAs = $OtherRunAs
+  registrations = @(& $calls $rig 'Register-SpikeService')
+  setAccount = @(& $calls $reg.Body 'Set-ServiceAccount' | ForEach-Object { $_['Account'] })
+  logonRight = @(& $calls $reg.Body 'Set-ServiceLogonRight' | ForEach-Object { $_['Account'] })
+  sidType = @(& $calls $reg.Body 'Get-ServiceSidTypeChoice' | ForEach-Object { $_['ServiceAccount'] })
+  # A parameter reassigned in the body would no longer be what the caller passed.
+  reassigned = @($reg.Body.FindAll({ $args[0] -is $assign }, $true) | ForEach-Object { $_.Left.Extent.Text } |
+    Where-Object { $_ -in '$RunAs', '$Account' })
+  # The rig needs ".\name" NOT to translate on Windows, or Set-ServiceAccount turns it back into
+  # COMPUTERNAME\name. Read for a user that exists here; $null where no SAM is asked.
+  dotTranslates = $null
+}
+if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
+  try { $null = ([Security.Principal.NTAccount](".\" + [Environment]::UserName)).Translate(
+      [Security.Principal.SecurityIdentifier]); $res.dotTranslates = $true }
+  catch { $res.dotTranslates = $false } }
 # Stubs, defined after the lift so they win.
 $stored = ''; $startName = ''; $disabled = $false
 function Get-CimInstance { [pscustomobject]@{ Name = 'Svc' } }
@@ -474,37 +500,37 @@ function Invoke-CimMethod {
 function Get-ItemProperty { param($LiteralPath, $Name, $ErrorAction) [pscustomobject]@{ ObjectName = $script:stored } }
 function Set-Service { param($Name, $StartupType, $ErrorAction) $script:disabled = $true }
 $pw = ConvertTo-SecureString 'synthetic-pw-3411' -AsPlainText -Force
-$res = @{ other = $other; owner = $owner; ownerService = $OwnerService; sent = $sent
-  ownerRunAs = (ConvertTo-ScmAccountName $owner); host = $env:COMPUTERNAME }
-foreach ($arm in @(@('rig', (ConvertTo-ScmAccountName $other)), @('verbatim', $other))) {
+foreach ($arm in @(@('rig', $OtherRunAs), @('verbatim', $OtherAccount))) {
   $stored = ''; $startName = ''; $disabled = $false; $err = ''
   try { Set-ServiceAccount -ServiceName 'Svc' -Account $arm[1] -Password $pw } catch { $err = "$_" }
   $res[$arm[0]] = @{ startName = $startName; stored = $stored; disabled = $disabled; error = $err }
 }
-$res | ConvertTo-Json -Compress -Depth 4
+$res | ConvertTo-Json -Compress -Depth 5
 """
 
 
-def _spelling(tmp_path: Path) -> dict[str, Any]:
-    if shutil.which("pwsh") is None:
-        pytest.skip("SKIP (nothing run): pwsh not on PATH")
-    script = tmp_path / "spelling_check.ps1"
-    script.write_text(_SPELLING_CHECK, encoding="utf-8")
-    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
-    argv += ["-RigPath", str(_RIG), "-InstallerPath", str(_INSTALLER)]
-    done = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
-    assert done.returncode == 0, done.stderr
-    result: dict[str, Any] = json.loads(done.stdout.strip().splitlines()[-1])
-    return result
-
-
 def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Path) -> None:
-    r = _spelling(tmp_path)
-    user = "mefor-dpapi-b"
-    # What the rig passes for the second service: a local account, under this computer's name.
+    r = _run_pwsh(tmp_path, "spelling_check.ps1", _SPELLING_CHECK)
+    user = r["otherUser"]
+    assert user == "mefor-dpapi-b", "CONTROL FAILED: the rig's $OtherUser was not read"
+    # The rig's two spellings of the second account, from its own assignments.
     assert r["other"] == f"{r['host']}\\{user}", r
-    # Both of the rig's Set-ServiceAccount calls take the converted name, never $Account itself.
-    assert r["sent"] == ["$runAs", "$runAs"], r["sent"]
+    assert r["otherRunAs"] == f".\\{user}", r
+    # Each registration hands Set-ServiceAccount its RunAs, and everything else its Account: the
+    # second one the SCM spelling, the owner its virtual account both times.
+    regs = {reg["Name"]: reg for reg in r["registrations"]}
+    assert len(regs) == 2, r["registrations"]
+    assert regs["$OtherService"]["Account"] == "$OtherAccount", regs
+    assert regs["$OtherService"]["RunAs"] == "$OtherRunAs", regs
+    assert regs["$OwnerService"]["Account"] == regs["$OwnerService"]["RunAs"] == "$OwnerAccount", (
+        regs
+    )
+    assert r["owner"] == f"NT SERVICE\\{r['ownerService']}", r
+    assert r["setAccount"] == ["$RunAs", "$RunAs"], r["setAccount"]
+    # The logon right only warns on a name it cannot resolve, and ".\name" does not resolve, so a
+    # tidy-up that handed it $RunAs would leave the service to fail at start with 1069.
+    assert r["logonRight"] == ["$Account"] and r["sidType"] == ["$Account"], r
+    assert r["reassigned"] == [], r["reassigned"]
     # The control arm: CI run 39524776520's failure, so the stubs model the SCM's rewrite.
     verbatim = r["verbatim"]
     assert verbatim["stored"] == f".\\{user}", verbatim
@@ -513,15 +539,22 @@ def test_the_rig_hands_the_scm_the_local_account_spelling_it_stores(tmp_path: Pa
     rig = r["rig"]
     assert rig["startName"] == f".\\{user}" and rig["stored"] == f".\\{user}", rig
     assert rig["error"] == "" and rig["disabled"] is False, rig
-    # The owner's virtual account is not a local account and passes through unchanged.
-    assert r["owner"] == f"NT SERVICE\\{r['ownerService']}" and r["ownerRunAs"] == r["owner"], r
+    # Measured on this host only, and only on Windows: the runner image is not this host.
+    assert r["dotTranslates"] in (None, False), (
+        "'.\\name' translates here, so it would be canonicalised"
+    )
+    if sys.platform == "win32":
+        assert r["dotTranslates"] is False, (
+            "CONTROL FAILED: the translation was not tried on Windows"
+        )
 
 
-def test_the_rig_waits_on_and_copies_the_names_the_worker_writes() -> None:
-    # The rig is PowerShell and cannot import the worker's constants, so they are pinned here.
-    rig = _RIG.read_text(encoding="utf-8")
-    names = [W.owner_report(1), W.owner_report(2), W.OTHER_REPORT, W.USER_BLOB, W.MACHINE_BLOB]
-    names += [W.FOREIGN_USER_BLOB, W.FOREIGN_MACHINE_BLOB]
-    assert len(names) >= 7, "CONTROL FAILED: the worker's file names were not collected"
-    missing = [name for name in names if f'"{name}"' not in rig]
-    assert not missing, f"scripts/ci/dpapi_spike.ps1 no longer names {missing}"
+def test_the_rig_names_exactly_the_files_the_judge_reads() -> None:
+    # The rig is PowerShell and cannot import the worker's names, so the two sets are compared here.
+    # The worker's side is judge_files(), which run_judge reads its inputs through; the rig's side is
+    # every quoted report or blob name in it. A bare extension such as ".json" has no stem, so the
+    # pattern leaves it out.
+    worker = {path.name for path in W.judge_files(Path("owner"), Path("other")).values()}
+    assert worker, "CONTROL FAILED: judge_files() names no file"
+    rig = set(re.findall(r'"([\w-]+\.(?:json|blob))"', _RIG.read_text(encoding="utf-8")))
+    assert rig == worker, f"rig only: {sorted(rig - worker)}; worker only: {sorted(worker - rig)}"
