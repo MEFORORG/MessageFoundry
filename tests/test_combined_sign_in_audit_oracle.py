@@ -55,7 +55,7 @@ from messagefoundry.auth.audit_visibility import (
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
 )
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, _opened_totp_usable
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -896,6 +896,7 @@ async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_ve
                         lockout_seconds=900.0,
                         max_lockout_seconds=86_400.0,
                         now=time.time(),
+                        totp_usable=_opened_totp_usable,
                     )
 
             async def fixed_wrong(fn: Any, *args: Any) -> Any:

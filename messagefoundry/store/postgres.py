@@ -9524,8 +9524,8 @@ class PostgresStore:
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        totp_usable: TotpUsable,
         now: float | None = None,
-        totp_usable: TotpUsable | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
         atomic step.
@@ -9534,8 +9534,10 @@ class PostgresStore:
         even cross-node, which is the case only this backend has -- serialize on the row rather than
         each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
         the reason this has to be one call rather than three; the same locked read carries the
-        ``auth_provider`` and ``totp_enabled`` that decide the escalation (ADR 0197). Returns
-        ``(0, False, 0)`` for an unknown user."""
+        ``auth_provider`` that decides the escalation (ADR 0197), and for the SIGN-IN lock the
+        TOTP's usability is judged by ``totp_usable`` before the lock, on a cell the locked row must
+        still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an
+        unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         change = lockout_increment(

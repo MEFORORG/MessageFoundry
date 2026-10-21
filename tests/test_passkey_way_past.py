@@ -1193,3 +1193,36 @@ async def test_a_totp_cell_that_does_not_open_counts_for_nothing_and_is_logged(
         assert _TOTP_SECRET not in warned[0]
     finally:
         await store.close()
+
+
+async def test_the_escalation_rule_cannot_be_omitted() -> None:
+    """``increment_login_failure`` takes the TOTP rule as a REQUIRED keyword, never ``None``, so no
+    caller can omit it and silently turn the sign-in lock's escalation off. mypy refuses the
+    omission statically (the store protocol in ``base.py``); this is the runtime half."""
+    import inspect
+
+    store = await MessageStore.open(":memory:")
+    try:
+        param = inspect.signature(store.increment_login_failure).parameters["totp_usable"]
+        assert param.default is inspect.Parameter.empty
+        with pytest.raises(TypeError, match="totp_usable"):
+            await store.increment_login_failure(  # type: ignore[call-arg]
+                "nobody",
+                counter="sign_in",
+                threshold=3,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+            )
+        # An explicit None from a caller typed ``Any`` is refused too, never read as "no rule".
+        none: Any = None
+        with pytest.raises(TypeError, match="totp_usable"):
+            await store.increment_login_failure(
+                "nobody",
+                counter="sign_in",
+                threshold=3,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+                totp_usable=none,
+            )
+    finally:
+        await store.close()

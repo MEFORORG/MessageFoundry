@@ -2445,10 +2445,12 @@ class AuthStore(Protocol):
     # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
     # UPDATE, SQL Server under UPDLOCK). ``counter`` names which of the two counters the attempt
     # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
-    # reads ``auth_provider`` and ``totp_enabled`` to decide whether the lock escalates
-    # (``store.lockout_escalates``). Returns ``(attempts, just_locked, cycles)``; ``just_locked`` is
-    # decided INSIDE that atomic section and must not be recomputed outside it, where it is only the
-    # stale read again. See ``store.next_lockout_state`` for the policy.
+    # reads ``auth_provider`` for whether the lock escalates (``store.lockout_escalates``); for the
+    # SIGN-IN lock the TOTP's usability is judged before the lock, on a cell the locked row must
+    # still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(attempts, just_locked,
+    # cycles)``; ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
+    # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
+    # policy.
     async def increment_login_failure(
         self,
         user_id: str,
@@ -2457,10 +2459,11 @@ class AuthStore(Protocol):
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        # BACKLOG #3422: the caller's rule for whether an opened TOTP secret is usable. REQUIRED and
+        # never None, so no caller can omit it and silently turn the sign-in lock's escalation off:
+        # the sign-in lock escalates only where the account's TOTP is a way past by it.
+        totp_usable: Callable[[str | None], bool],
         now: float | None = None,
-        # BACKLOG #3422: the caller's rule for whether an opened TOTP secret is usable. The sign-in
-        # lock escalates only where the locked row's TOTP is a way past by it; with none it does not.
-        totp_usable: Callable[[str | None], bool] | None = None,
     ) -> LockoutIncrement: ...
 
     # --- roles / AD-group maps -----------------------------------------------

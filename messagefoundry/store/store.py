@@ -2765,7 +2765,7 @@ async def escalation_verdict(
     user_id: str,
     counter: LockoutCounter,
     *,
-    totp_usable: TotpUsable | None,
+    totp_usable: TotpUsable,
     now: float,
 ) -> TotpCounts | None:
     """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
@@ -2773,7 +2773,9 @@ async def escalation_verdict(
     live and can arm. It is judged on every such failure, not only near the threshold: a pre-lock
     read of the count cannot tell which of a parallel burst sets the lock. Everywhere else ``None``,
     which escalates nothing, and no cell is opened. The one copy every backend calls."""
-    if counter != "sign_in" or totp_usable is None:
+    if totp_usable is None:  # typed never None; refused loudly for a caller typed ``Any``
+        raise TypeError("increment_login_failure needs totp_usable, never None")
+    if counter != "sign_in":
         return None
     pre = await get_user(user_id)
     if (
@@ -16082,8 +16084,8 @@ class MessageStore:
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        totp_usable: TotpUsable,
         now: float | None = None,
-        totp_usable: TotpUsable | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
         atomic step.
@@ -16091,8 +16093,10 @@ class MessageStore:
         The re-read + compute + write run under one ``self._lock``, the way ``consume_totp_step``
         does, so two concurrent wrong credentials cannot both read the same pre-increment count and
         lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
-        this has to be one call rather than three; :func:`lockout_escalates` decides the escalation
-        from ``auth_provider`` and ``totp_enabled`` read in the SAME locked ``SELECT``.
+        this has to be one call rather than three. :func:`lockout_escalates` decides the escalation
+        from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock the TOTP's
+        usability is judged by ``totp_usable`` before the lock, on a cell the locked row must still
+        hold (:func:`escalation_verdict`, BACKLOG #3422). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""

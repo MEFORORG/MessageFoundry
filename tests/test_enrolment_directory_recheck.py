@@ -35,6 +35,7 @@ from messagefoundry.auth.service import (
     AuthService,
     DirectoryRefusal,
     Elevation,
+    _opened_totp_usable,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -328,6 +329,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         threshold=1,
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
+        totp_usable=_opened_totp_usable,
     )
 
 

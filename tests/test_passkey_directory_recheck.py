@@ -38,6 +38,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     AuthService,
     DirectoryRefusal,
     Elevation,
+    _opened_totp_usable,
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
@@ -331,6 +332,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
         threshold=1,
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
+        totp_usable=_opened_totp_usable,
     )
     p.directory.answer = DirectoryAnswer.DISABLED
 
@@ -348,6 +350,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         threshold=1,
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
+        totp_usable=_opened_totp_usable,
     )
 
 

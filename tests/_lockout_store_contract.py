@@ -14,9 +14,11 @@ SQL Server under ``UPDLOCK``.
 counter counts wrong passwords from a caller who has proved nothing. The second-step counter counts
 failures from a caller who has already proved one factor. Each carries its own lock and its own cycle
 count, and each lock doubles per cycle up to a ceiling only where the ADR says the owner has a way
-past it: the second-step lock on a local account, and the sign-in lock on a local account with TOTP
-enrolled. Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
-``auth_provider`` and ``totp_enabled`` read in the same locked ``SELECT`` as the count.
+past it: the second-step lock on a local account, and the sign-in lock on a local account with a
+usable TOTP enrolled. Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
+``auth_provider`` read in the same locked ``SELECT`` as the count and, for the sign-in lock, the
+TOTP's usability judged by the caller's ``totp_usable`` rule before the lock, on a cell the locked
+row must still hold (BACKLOG #3422). The rule is a required argument, so no call omits it.
 
 **Three separate SQL bodies implement one security policy, which is what this module is for.** One
 shared body, invoked from all three suites, makes "the backends agree" an assertion rather than a
@@ -95,7 +97,7 @@ async def _fail(
         lockout_seconds=lockout_seconds,
         max_lockout_seconds=MAX_LOCKOUT_SECONDS,
         now=now,
-        # The service's rule (BACKLOG #3422): without one the sign-in lock does not escalate.
+        # The service's rule (BACKLOG #3422), a required argument.
         totp_usable=_opened_totp_usable,
     )
     return (result.attempts, result.just_locked, result.cycles)
