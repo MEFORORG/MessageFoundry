@@ -48,6 +48,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+from messagefoundry.auth.service import _opened_totp_usable
+
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
 #: Seconds a first lock lasts in this contract. Long enough that "now" during the test is inside it.
@@ -107,6 +111,7 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_generated_credential(store)
     await _assert_conditional_rotation(store)
     await _assert_conditional_rotation_on_a_passkey(store)
+    await _assert_refused_totp_is_no_way_past(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -424,6 +429,7 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
                 password_generated=False,
                 must_change_password=False,
                 require_way_past=True,
+                totp_usable=_opened_totp_usable,
             )
         )
 
@@ -447,16 +453,18 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     # The conditional removals (AC-A3a): the last discoverable passkey goes only while TOTP stands,
     # and TOTP goes only while a discoverable passkey stands, each judged in its own write.
     assert not await store.delete_webauthn_credential(
-        "rot-pk1", "rot-pk-resident", require_way_past=True
+        "rot-pk1", "rot-pk-resident", require_way_past=True, totp_usable=_opened_totp_usable
     ), "the last way past was deleted"
     assert await store.get_webauthn_credential("rot-pk-resident") is not None
-    assert await store.delete_webauthn_credential("rot-pk1", "rot-pk-plain", require_way_past=True)
+    assert await store.delete_webauthn_credential(
+        "rot-pk1", "rot-pk-plain", require_way_past=True, totp_usable=_opened_totp_usable
+    )
     staged_cell = await store.set_totp_secret("rot-pk1", secret="JBSWY3DPEHPK3PXP", now=5.0)
     assert await store.enable_totp(
         "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
     )
     assert await store.delete_webauthn_credential(
-        "rot-pk1", "rot-pk-resident", require_way_past=True
+        "rot-pk1", "rot-pk-resident", require_way_past=True, totp_usable=_opened_totp_usable
     ), "TOTP stands, so the passkey may go"
     assert not await store.disable_totp("rot-pk1", now=6.0, require_way_past=True), (
         "TOTP went with no discoverable passkey left"
@@ -471,6 +479,60 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     assert user is not None and not user.totp_enabled
     await store.delete_all_webauthn_credentials("rot-pk1")
     await store.delete_user("rot-pk1")
+
+
+async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
+    """BACKLOG #3422 beside ADR 0197 Amendment A wave 2, on every backend: the conditional writes
+    count TOTP as a way past only through the caller's rule (``totp_usable``), so an enrolment this
+    release refuses does not free the last discoverable passkey, and does not open the rotation. A
+    conditional write that brings no rule is refused outright, never answered by the old test."""
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="rot-rf1",
+        username="rot-rf-alice",
+        auth_provider="local",
+        password_hash="h-issued",
+        must_change_password=True,
+        password_generated=False,
+        now=1.0,
+    )
+    cell = await store.set_totp_secret(
+        "rot-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=2.0
+    )
+    assert await store.enable_totp(
+        "rot-rf1", expected_secret_cell=cell, recovery_code_hashes=[], now=2.0
+    )
+    await store.add_webauthn_credential(
+        _cred("rot-rf1", "resident", id_hash="rot-rf-resident", created_at=3.0, discoverable=True)
+    )
+    with pytest.raises(ValueError):
+        await store.delete_webauthn_credential("rot-rf1", "rot-rf-resident", require_way_past=True)
+    assert not await store.delete_webauthn_credential(
+        "rot-rf1", "rot-rf-resident", require_way_past=True, totp_usable=_opened_totp_usable
+    ), "a refused TOTP freed the last discoverable passkey"
+    assert await store.get_webauthn_credential("rot-rf-resident") is not None
+    await store.delete_all_webauthn_credentials("rot-rf1")
+    with pytest.raises(ValueError):
+        await store.set_password(
+            "rot-rf1",
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=True,
+        )
+    assert not await store.set_password(
+        "rot-rf1",
+        password_hash="h-chosen",
+        password_generated=False,
+        must_change_password=False,
+        require_way_past=True,
+        totp_usable=_opened_totp_usable,
+    ), "a refused TOTP opened the rotation"
+    user = await store.get_user("rot-rf1")
+    assert user is not None and user.password_hash == "h-issued"
+    await store.disable_totp("rot-rf1", now=4.0)
+    await store.delete_user("rot-rf1")
 
 
 async def _assert_conditional_rotation(store: Any) -> None:
@@ -493,6 +555,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
+        totp_usable=_opened_totp_usable,
     )
     user = await store.get_user("rot-u1")
     assert user is not None
@@ -517,6 +580,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
+        totp_usable=_opened_totp_usable,
     )
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
@@ -531,6 +595,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_generated=False,
         must_change_password=False,
         require_way_past=True,
+        totp_usable=_opened_totp_usable,
     )
     user = await store.get_user("rot-u1")
     assert user is not None

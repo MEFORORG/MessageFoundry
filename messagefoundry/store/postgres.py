@@ -305,6 +305,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -9009,6 +9010,7 @@ class PostgresStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the
             # account row is locked, so a concurrent removal waits for this write.
@@ -9238,6 +9240,7 @@ class PostgresStore:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        require_totp_rule(require_way_past, totp_usable)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             if require_way_past:
                 # ADR 0197 Amendment A: the account row locked first, so two removals serialize.

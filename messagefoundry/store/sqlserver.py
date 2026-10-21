@@ -306,6 +306,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -13301,6 +13302,7 @@ class SqlServerStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
         # and a conditional rotation must know whether it matched. The passkeys the condition reads
         # are read in the write's own transaction; a removal that commits before the write moves
@@ -13519,6 +13521,7 @@ class SqlServerStore:
         is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592), and the
         count is read from ``OUTPUT`` (BACKLOG #2283). With ``require_way_past``, only while a way
         past remains after it, judged with the account row held (ADR 0197 Amendment A)."""
+        require_totp_rule(require_way_past, totp_usable)
         if not require_way_past:
             count = await self._write_passkeys_txn(
                 user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True

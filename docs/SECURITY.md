@@ -3245,10 +3245,12 @@ combined passkey sign-in. The two removal guards and the rotation write ask the 
 again inside their own store write, with the account row held, so two concurrent removals cannot
 both pass. **TOTP counts as a way past only while the engine can compute codes with it**: an
 enrolment whose marker this release refuses (BACKLOG #3422) matches no code, so its combined
-sign-in can never pass a lock. Every way-past gate (rotation, TOTP removal, passkey removal and the
-store's own re-check) and the census ask one rule for this. The census names an account holding
-such a TOTP beside a working discoverable passkey in both lists, and says that a factor reset would
-remove that passkey, so its holder enrols the authenticator app again instead.
+sign-in can never pass a lock. At least the rotation gate, passkey removal, the store's own
+re-check of both, TOTP removal, the sign-in lock notice and the census ask one rule for this; the
+store refuses a conditional write that brings no rule. Such a TOTP may be removed, which is the
+first step of enrolling it again. The census names an account holding one beside a working
+discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
+cure is the holder removing the authenticator app and enrolling it again.
 
 **Two limits of the passkey way past, stated.** At least these:
 

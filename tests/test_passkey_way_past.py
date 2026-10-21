@@ -392,6 +392,7 @@ async def test_a_passkey_flipped_to_discoverable_outside_the_store_opens_nothing
             password_generated=False,
             must_change_password=False,
             require_way_past=True,
+            totp_usable=_opened_totp_usable,
         )
         census = await lockable_account_census(store, AuthSettings())
         assert census.no_way_past == (identity.username,)
@@ -859,5 +860,57 @@ async def test_the_census_warns_that_a_reset_would_remove_a_working_passkey() ->
         assert census.passkey_only == (identity.username,)
         assert census.reset_would_remove_a_passkey == (identity.username,)
         assert census.no_way_past == ()
+    finally:
+        await store.close()
+
+
+async def test_a_refused_totp_can_be_removed_to_enrol_again() -> None:
+    """``disable_mfa``: a TOTP this release refuses is no way past, so the way-past refusal does not
+    keep it; removing it is the first step of enrolling again. Beside a passkey that is not
+    discoverable, so the last-factor rule (ADR 0068 decision 5) does not answer first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store, require_mfa=False)
+        identity, token, _ = await login_admin(setup)
+        await _register(setup, identity, token, resident_key=False)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        await _service(store).disable_mfa(identity)
+        row = await store.get_user(identity.user_id)
+        assert row is not None and not row.totp_enabled
+    finally:
+        await store.close()
+
+
+async def test_a_lock_notice_names_the_passkey_way_past_beside_a_refused_totp() -> None:
+    """The sign-in lock notice asks the same rule: beside a refused TOTP it names the combined
+    passkey sign-in, never the code sign-in that cannot pass."""
+    from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
+
+    events: list[SecurityEvent] = []
+
+    class _Notifier:
+        async def notify(self, event: SecurityEvent) -> bool:
+            events.append(event)
+            return True
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0,
+                login_rate_limit_enabled=False,
+                lockout_threshold=3,
+            ),
+            security_notifier=_Notifier(),
+        )
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        for i in range(3):
+            assert not (await service.login(identity.username, f"wrong-{i}")).ok
+        (lock,) = [e for e in events if e.event_type == ACCOUNT_LOCKED]
+        assert lock.detail.get("combined_passkey_sign_in") is True
+        assert "combined_sign_in" not in lock.detail
     finally:
         await store.close()

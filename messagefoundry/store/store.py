@@ -2663,6 +2663,14 @@ TotpUsable = Callable[[str | None], bool]
 TotpCounts = Callable[[UserAuthzRecord], bool]
 
 
+def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None:
+    """Refuse a conditional way-past write that brought no TOTP rule: without one an enrolment the
+    engine cannot compute with would count as a way past, which is the failure this rule exists to
+    stop (BACKLOG #3422). Raises :class:`ValueError`; every backend calls it first."""
+    if require_way_past and usable is None:
+        raise ValueError("a conditional way-past write needs totp_usable")
+
+
 def totp_counts_with(
     opener: Callable[[str, str | None], str | None], usable: TotpUsable | None
 ) -> TotpCounts | None:
@@ -2672,14 +2680,13 @@ def totp_counts_with(
     for no ``usable``, which leaves the stored-secret test alone."""
     if usable is None:
         return None
-    rule = usable
 
     def counts(record: UserAuthzRecord) -> bool:
         row = record.row
         if not row.totp_enabled or row.totp_secret is None:
             return False
         try:
-            return rule(opener(row.id, row.totp_secret))
+            return usable(opener(row.id, row.totp_secret))
         except CipherError:
             return False
 
@@ -2689,10 +2696,9 @@ def totp_counts_with(
 def _totp_is_way_past(record: UserAuthzRecord, totp_counts: TotpCounts | None) -> bool:
     """TOTP on with a secret, and, given ``totp_counts``, a secret the engine can compute with:
     an enrolment whose marker this release refuses is no way past (BACKLOG #3422)."""
-    row = record.row
     if totp_counts is not None:
         return totp_counts(record)
-    return row.totp_enabled and row.totp_secret is not None
+    return record.row.totp_enabled and record.row.totp_secret is not None
 
 
 def holds_way_past(
@@ -15386,6 +15392,7 @@ class MessageStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
         async with _writer_guard(self._db, self._lock):
             # The passkeys the condition reads are read under the same writer lock as the write.
             change = password_change(
@@ -15669,6 +15676,7 @@ class MessageStore:
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
         With ``require_way_past``, only while a way past remains after it, judged under the same
         writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
+        require_totp_rule(require_way_past, totp_usable)
         async with _writer_guard(self._db, self._lock):
             if require_way_past:
                 current = await self._read_user_record(user_id)

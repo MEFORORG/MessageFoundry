@@ -2245,8 +2245,10 @@ class LockableAccountCensus:
 
     @property
     def reset_would_remove_a_passkey(self) -> tuple[str, ...]:
-        """The accounts with an unusable TOTP whose working way past is a discoverable passkey: for
-        them the cure is a fresh TOTP enrolment, since ``reset-mfa`` also removes every passkey."""
+        """The accounts with an unusable TOTP whose working way past is a discoverable passkey, among
+        the population ``passkey_only`` covers: ``reset-mfa`` would also remove that passkey. The cure
+        is the store key for a cell that does not open, and removing and enrolling the app again for
+        an enrolment this release refuses."""
         return tuple(sorted(set(self.undecryptable_totp) & set(self.passkey_only)))
 
 
@@ -5098,7 +5100,9 @@ class AuthService:
             # account is its directory sign-in, not a password this engine can reset.
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
-        elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
+        elif user.auth_provider == AuthProvider.LOCAL.value and (
+            self._totp_way_past(user) if isinstance(user, VerifiedUser) else user.totp_enabled
+        ):
             notice["combined_sign_in"] = True
         elif (
             user.auth_provider == AuthProvider.LOCAL.value
@@ -12125,10 +12129,11 @@ class AuthService:
         never pass a lock, and it is no way past (BACKLOG #3422)."""
         if not user.totp_enabled:
             return False
+        # Opened directly, not through _totp_secret: a gate asks this on every confined request, and
+        # the cause is logged where a code is checked and by the census, not once per request here.
         try:
-            secret = self._totp_secret(user)
+            secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
         except CipherError:
-            _log_totp_undecryptable(user.username)
             return False
         return _opened_totp_usable(secret)
 
@@ -12261,13 +12266,15 @@ class AuthService:
                 len(census.undecryptable_totp),
                 ", ".join(census.undecryptable_totp),
             )
-        if census.reset_would_remove_a_passkey:
+        keep_passkey = census.reset_would_remove_a_passkey
+        if keep_passkey:
             _log.warning(
                 "ADR 0197: %d of those also hold a discoverable passkey that still gets them past a "
-                "lock: %s. Ask each to enrol the authenticator app again from the account page; a "
-                "factor reset (POST /users/{id}/reset-mfa) would also remove that passkey.",
-                len(census.reset_would_remove_a_passkey),
-                ", ".join(census.reset_would_remove_a_passkey),
+                "lock: %s. A factor reset (POST /users/{id}/reset-mfa) would also remove that "
+                "passkey. For a cell that does not open, fix the store key; for an enrolment this "
+                "release refuses, ask the holder to remove the authenticator app and enrol it again.",
+                len(keep_passkey),
+                ", ".join(keep_passkey),
             )
         await self._audit(
             "auth.lockable_account_census",
@@ -12276,6 +12283,7 @@ class AuthService:
                 {
                     "no_way_past": list(census.no_way_past),
                     "undecryptable_totp": list(census.undecryptable_totp),
+                    "reset_would_remove_a_passkey": list(keep_passkey),
                 }
             ),
         )
@@ -13422,9 +13430,10 @@ class AuthService:
         the user is notified out-of-band (ASVS 6.3.7).
 
         Raises :class:`ValueError` (:data:`TOTP_REMOVAL_REFUSED`) whenever ``[security].require_mfa``
-        covers the caller as a local account, TOTP is on, and no passkey recorded as discoverable
-        remains: TOTP is then the account's only way past the sign-in lock (ADR 0197 Amendment A,
-        AC-A3a; from wave 2 a discoverable passkey is one too). Otherwise it raises when TOTP is the
+        covers the caller as a local account, its TOTP is a way past the sign-in lock
+        (:meth:`_totp_way_past`), and no passkey recorded as discoverable remains: TOTP is then the
+        account's only way past (ADR 0197 Amendment A, AC-A3a; from wave 2 a discoverable passkey is
+        one too). A TOTP this release refuses is no way past, so this refusal does not keep it. Otherwise it raises when TOTP is the
         caller's LAST second factor and MFA is still required, the refusal
         :meth:`delete_webauthn_credential` also makes (ADR 0068 decision 5). BACKLOG #1022: these
         were two self-service routes to zero factors behind one step-up gate, and only one of them
@@ -13434,15 +13443,16 @@ class AuthService:
         every passkey and is deliberately unguarded. Nothing here narrows it.
         """
         user = await self._load_user(identity.user_id)
-        # ADR 0197 Amendment A, AC-A3a: removing TOTP removes a way past the sign-in lock, so a
-        # covered account may remove it only while a passkey recorded as discoverable remains
-        # (wave 2). A passkey that is not discoverable is no way past, so it does not count.
-        if (
+        # ADR 0197 Amendment A, AC-A3a: removing a TOTP that is a way past the sign-in lock is
+        # refused on a covered account unless a passkey recorded as discoverable remains (wave 2).
+        # A TOTP that is NO way past (an enrolment this release refuses, BACKLOG #3422) may go:
+        # removing it takes nothing away, and it is the first step of enrolling again.
+        keep_way_past = (
             user is not None
-            and user.totp_enabled
+            and self._totp_way_past(user)
             and self._covered_by_requirement(user, identity.roles)
-            and not await self._holds_discoverable_passkey(user)
-        ):
+        )
+        if user is not None and keep_way_past and not await self._holds_discoverable_passkey(user):
             raise ValueError(TOTP_REMOVAL_REFUSED)
         # Dropping to zero factors while MFA is required is not a lockout — it lands the user in the
         # enroll-required flow. So NEITHER self-service path is a recovery path, which is precisely
@@ -13460,11 +13470,6 @@ class AuthService:
             )
         # The store asks the way-past question again in its own write (ADR 0197 Amendment A), so a
         # passkey removal racing this one cannot leave the account with neither.
-        keep_way_past = (
-            user is not None
-            and user.totp_enabled
-            and self._covered_by_requirement(user, identity.roles)
-        )
         if (
             not await self._store.disable_totp(identity.user_id, require_way_past=keep_way_past)
             and keep_way_past

@@ -46,6 +46,7 @@ from messagefoundry.auth.service import (
     AuthService,
     _credential_lock_key,
     _directory_login_refusal,
+    _opened_totp_usable,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -3411,6 +3412,7 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
                 password_generated=False,
                 must_change_password=False,
                 require_way_past=True,
+                totp_usable=_opened_totp_usable,
             ), "the holder's conditional write must match here, TOTP is still on"
             await real_disable(user_id, **k)
 
