@@ -17,8 +17,9 @@
     -Until merged           exit 0 once the PR is merged. A PR read as closed WITHOUT merging on two
                             checks in a row is exit 1, not a wait until the timeout. One such read is
                             not enough, because closing and reopening is a common way to re-run CI.
-                            An open PR whose `mergeable_state` reads `dirty` on two checks in a row
-                            of the same head SHA is exit 3, "needs a push" (see below).
+                            An open PR whose `mergeable_state` reads `dirty` on two checks of the
+                            same head SHA is exit 3, "needs a push" (see below for what may sit
+                            between them).
     -Until closed           exit 0 once the PR is closed, merged or not.
     -Until checks-complete  exit 0 once every check run and every commit status on the PR's CURRENT
                             head has finished, whatever its conclusion, and every context its base
@@ -33,8 +34,9 @@
     and waiting longer will not help. It needs the conflict resolved by hand, not a mechanical
     rebase-and-push (docs/WORKTREES.md warns that treating one as the other is destructive), and a
     dequeue or disarm before the push (CLAUDE.md section 5, "Dequeue before pushing"). After exit
-    2, read the last state line before waiting again: a `behind` PR on a base with no merge queue
-    also times out (see below), and no further wait merges it.
+    2, read the last state line that carries a `mergeable_state` before waiting again: a PR that
+    stays `behind` on a base with no merge queue times out too (see below), and no further wait
+    merges it.
 
     ONE LINE PER STATE CHANGE. Each check computes a one-line state and prints it only when it
     differs from the last one printed, so a 60-minute wait on an unchanging PR prints a start line,
@@ -53,12 +55,13 @@
     2026-10-21: the engine's `main` requires the merge queue, the queue merges a behind branch
     without an update, and the REST PR object has no merge-queue field that would tell a behind PR
     the queue will merge from one it will not. UNMEASURED: how REST reads a behind PR the queue
-    could still merge, queued or not yet queued; the ruling rests on the queue building its own
-    merge group on the base, not on a reading taken here. So a `behind` wait runs to its timeout,
-    and the state line shows it; on a base with no queue, such as the vault's `main`, that line is
-    the cue to update the branch. For closed the state is printed and never acted on; the
-    checks-complete line does not carry it. A red required check is not acted on either: it reads
-    `blocked`, and the wait runs to its timeout.
+    could still merge, queued or not yet queued, and whether the base's rules endpoint reports a
+    queue that classic branch protection requires; the ruling rests on the queue building its own
+    merge group on the base, not on a reading taken here. So a wait on a PR that stays `behind`
+    runs to its timeout unless the queue merges it, and the state line shows it; on a base with no
+    queue, such as the vault's `main`, that line is the cue to update the branch. For closed the
+    state is printed and never acted on; the checks-complete line does not carry it. A red required
+    check is not acted on either: it reads `blocked`, and the wait runs to its timeout.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
