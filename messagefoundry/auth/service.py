@@ -182,6 +182,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     ad_map_seal_ok,
     discoverable_way_past,
+    log_unopened_totp,
     passkey_digest,
     passkey_is_way_past,
     require_notify_email,
@@ -4952,8 +4953,9 @@ class AuthService:
         cheaper way to reach the same answer."""
         return await self._store.increment_login_failure(
             user.id,
-            # BACKLOG #3422: the sign-in lock escalates only where the TOTP is a way past.
-            totp_way_past=counter != "sign_in" or await self._totp_way_past(user),
+            # BACKLOG #3422: the sign-in lock escalates only where the TOTP is a way past, judged
+            # by the store on the locked row's cell, and only where the failure may set the lock.
+            totp_usable=_opened_totp_usable,
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
@@ -5179,9 +5181,10 @@ class AuthService:
         second-step failure proved right (``"password"`` or ``"code"`` on a combined sign-in,
         ``"passkey"`` on a combined passkey sign-in, ``"first_step"`` on ``verify_mfa``), so the
         notice can tell the owner which one to replace;
-        only the owner receives it. A sign-in lock on a local account with TOTP enrolled tells the
+        only the owner receives it. A sign-in lock on a local account with a usable TOTP tells the
         owner the combined sign-in gets them in now; one on a local account with a discoverable
-        passkey tells it the combined passkey sign-in does."""
+        passkey tells it the combined passkey sign-in does. A record nobody checked against its seal
+        claims neither (BACKLOG #3422)."""
         if not failure.just_locked:
             return
         notice: dict[str, Any] = {
@@ -5194,7 +5197,11 @@ class AuthService:
             # account is its directory sign-in, not a password this engine can reset.
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
-        elif user.auth_provider == AuthProvider.LOCAL.value and await self._totp_way_past(user):
+        elif (
+            user.auth_provider == AuthProvider.LOCAL.value
+            and isinstance(user, VerifiedUser)
+            and await self._totp_way_past(user)
+        ):
             notice["combined_sign_in"] = True
         elif (
             user.auth_provider == AuthProvider.LOCAL.value
@@ -12215,22 +12222,23 @@ class AuthService:
         everywhere else but no way past the lock (the amendment's fact 11)."""
         return await self._totp_way_past(user) or await self._holds_discoverable_passkey(user)
 
-    async def _totp_way_past(self, user: UserRecord) -> bool:
+    async def _totp_way_past(self, user: VerifiedUser) -> bool:
         """Whether ``user``'s TOTP is a way past the sign-in lock: enabled, its cell opens, and the
         engine can compute codes with it (:func:`_opened_totp_usable`, the census rule). An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
         never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one on the record
-        read (the sealed one for a :class:`VerifiedUser`), opened OFF THE EVENT LOOP, since a
-        Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). A record built with
-        no row reads as no way past. Every way-past decision asks this: the rotation and removal
-        gates, the last-factor rule, the lock escalation and the lock notice."""
-        cell = None if user.row is None else user.row.totp_secret
+        read is the one the record's seal covered, opened OFF THE EVENT LOOP, since a Transit
+        cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). The service's way-past
+        decisions ask this: the rotation and removal gates, the last-factor rule and the lock
+        notice; the store's conditional writes and the lock escalation ask the same rule
+        (``totp_usable``) on the cell they lock."""
+        cell = user.totp_secret_cell
         if not user.totp_enabled or cell is None:
             return False
         try:
             secret = await asyncio.to_thread(self._store.open_totp_secret, user.id, cell)
         except CipherError:
-            _log_totp_undecryptable(user.username)
+            log_unopened_totp(user.id)
             return False
         return _opened_totp_usable(secret)
 
@@ -14336,8 +14344,10 @@ class AuthService:
         # A TOTP this release refuses is no factor the holder can use (BACKLOG #3422), so the
         # last-factor rule (ADR 0068 decision 5) does not count it either.
         last_second_factor = len(creds) == 1 and not await self._totp_way_past(user)
+        # An enrolled TOTP keeps the account MFA-bound whatever the scope, usable or not, so a
+        # refused one beside the last passkey makes this removal strand the holder too.
         if last_second_factor and self._mfa_required_for(
-            user, identity.roles, second_factor_enrolled=False
+            user, identity.roles, second_factor_enrolled=user.totp_enabled
         ):
             raise ValueError(
                 "this is your last second factor and MFA is required for your account — "
@@ -14379,7 +14389,10 @@ class AuthService:
         # account that now has none. The flag still gates the refusal above, which is about intent.
         # The re-read account's sealed passkey digest says whether a passkey remains (#2592).
         after = await self._load_user(identity.user_id)
-        factor_remains = after is not None and (after.has_passkeys or after.totp_enabled)
+        # A TOTP this release refuses is no remaining factor (BACKLOG #3422).
+        factor_remains = after is not None and (
+            after.has_passkeys or await self._totp_way_past(after)
+        )
         if not factor_remains:
             await self._notify_security(
                 MFA_DISABLED,

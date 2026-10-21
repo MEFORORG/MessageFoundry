@@ -95,6 +95,8 @@ async def _fail(
         lockout_seconds=lockout_seconds,
         max_lockout_seconds=MAX_LOCKOUT_SECONDS,
         now=now,
+        # The service's rule (BACKLOG #3422): without one the sign-in lock does not escalate.
+        totp_usable=_opened_totp_usable,
     )
     return (result.attempts, result.just_locked, result.cycles)
 
@@ -119,6 +121,7 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_conditional_rotation(store)
     await _assert_conditional_rotation_on_a_passkey(store)
     await _assert_refused_totp_is_no_way_past(store)
+    await _assert_refused_totp_keeps_the_fixed_sign_in_lock(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -488,6 +491,33 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     assert user is not None and not user.totp_enabled
     await store.delete_all_webauthn_credentials("rot-pk1")
     await store.delete_user("rot-pk1")
+
+
+async def _assert_refused_totp_keeps_the_fixed_sign_in_lock(store: Any) -> None:
+    """BACKLOG #3422 beside ADR 0197, on every backend: the sign-in lock escalates only where the
+    owner has a way past it, and a TOTP enrolment this release refuses is none, so its account keeps
+    the fixed lock on the second cycle. Judged by the caller's rule on the locked row's cell."""
+    await store.create_user(
+        user_id="lock-rf1",
+        username="lock-rf-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret(
+        "lock-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=1.0
+    )
+    assert await store.enable_totp(
+        "lock-rf1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+    )
+    first = await _lock_cycle(store, "lock-rf1", start=10_000.0, counter="sign_in")
+    second = await _lock_cycle(store, "lock-rf1", start=first + 1.0, counter="sign_in")
+    assert second - (first + 1.0 + THRESHOLD - 1) == LOCKOUT_SECONDS, (
+        "the sign-in lock escalated beside a refused TOTP"
+    )
+    await store.disable_totp("lock-rf1", now=99_999.0)
+    await store.delete_user("lock-rf1")
 
 
 async def _assert_refused_totp_is_no_way_past(store: Any) -> None:

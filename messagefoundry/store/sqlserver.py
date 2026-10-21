@@ -245,6 +245,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    TotpCounts,
     TotpUsable,
     UserAuthzRecord,
     UserChange,
@@ -13344,6 +13345,11 @@ class SqlServerStore:
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
         # and a conditional rotation must know whether it matched. The passkeys the condition reads
         # are read in the write's own transaction; a removal that commits before the write moves
@@ -13351,7 +13357,8 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # The account row first, under UPDLOCK, so a concurrent removal waits.
-                held = await self._read_user_record(cur, user_id) if require_way_past else None
+                if require_way_past:
+                    await self._read_user_record(cur, user_id)
                 change = password_change(
                     password_hash=password_hash,
                     password_generated=password_generated,
@@ -13360,7 +13367,7 @@ class SqlServerStore:
                     now=now,
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
-                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
+                    totp_counts=totp_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13468,21 +13475,25 @@ class SqlServerStore:
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 passkeys: list[WebAuthnCredential] = []
-                held = None
                 if require_way_past:
                     # The account row first, under UPDLOCK, so a concurrent removal waits.
-                    held = await self._read_user_record(cur, user_id)
+                    await self._read_user_record(cur, user_id)
                     passkeys = await self._account_passkeys(cur, user_id)
                 change = totp_removal(
                     now,
                     require_way_past=require_way_past,
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
-                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
+                    totp_counts=totp_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13570,6 +13581,11 @@ class SqlServerStore:
         count is read from ``OUTPUT`` (BACKLOG #2283). With ``require_way_past``, only while a way
         past remains after it, judged with the account row held (ADR 0197 Amendment A)."""
         require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         if not require_way_past:
             count = await self._write_passkeys_txn(
                 user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
@@ -13583,7 +13599,7 @@ class SqlServerStore:
                     await self._account_passkeys(cur, user_id),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
-                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, current),
+                    totp_counts=totp_counts,
                 ):
                     await conn.rollback()
                     return False
@@ -13897,6 +13913,29 @@ class SqlServerStore:
             ),
         )
 
+    async def _escalation_verdict(
+        self,
+        user_id: str,
+        counter: LockoutCounter,
+        *,
+        threshold: int,
+        totp_usable: TotpUsable | None,
+    ) -> TotpCounts | None:
+        """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
+        held and only where it can matter: a local account with TOTP on whose failure may set the
+        lock. Everywhere else ``None``, which escalates nothing, and no cell is opened."""
+        if counter != "sign_in" or totp_usable is None:
+            return None
+        pre = await self.get_user(user_id)
+        if (
+            pre is None
+            or pre.auth_provider != "local"
+            or not pre.totp_enabled
+            or pre.failed_attempts + 1 < threshold
+        ):
+            return None
+        return await judge_totp(self.open_totp_secret, totp_usable, pre)
+
     async def increment_login_failure(
         self,
         user_id: str,
@@ -13906,7 +13945,7 @@ class SqlServerStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         now: float | None = None,
-        totp_way_past: bool = True,
+        totp_usable: TotpUsable | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
         atomic step.
@@ -13925,7 +13964,9 @@ class SqlServerStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
-            totp_way_past=totp_way_past,
+            totp_counts=await self._escalation_verdict(
+                user_id, counter, threshold=threshold, totp_usable=totp_usable
+            ),
         )
         written = await self._write_user_txn(user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)

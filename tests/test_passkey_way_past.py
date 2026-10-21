@@ -829,6 +829,28 @@ async def test_a_refused_totp_does_not_open_the_rotation_gate(secret: str, rotat
         await store.close()
 
 
+async def test_the_way_past_refusal_answers_beside_a_refused_totp_and_two_passkeys() -> None:
+    """Two passkeys, so the last-factor rule does not answer: the service's way-past refusal
+    (through the store's re-check) does. A refused TOTP and a passkey that is not discoverable leave
+    no way past once the discoverable one goes, so its removal is refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store, require_mfa=False)
+        identity, token, _ = await login_admin(setup)
+        _, token = await _register(setup, identity, token, label="resident")
+        await _register(setup, identity, token, resident_key=False, label="plain")
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        by_label = {c.label: c for c in await store.list_webauthn_credentials(identity.user_id)}
+        with pytest.raises(ValueError) as refused:
+            await _service(store).delete_webauthn_credential(
+                identity, by_label["resident"].credential_id_hash
+            )
+        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 2
+    finally:
+        await store.close()
+
+
 async def test_a_refused_totp_may_go_while_a_discoverable_passkey_remains() -> None:
     """``disable_mfa``: removing a refused TOTP is allowed while a discoverable passkey stays as
     the account's working way past, the same rule as a usable TOTP."""
@@ -991,11 +1013,15 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
 # --- the refused-TOTP rule at the remaining sites, and off the event loop ---------------------------
 
 
-def test_a_keyless_open_ciphertext_cell_is_no_way_past() -> None:
-    """A keyless open hands the stored ciphertext through unchanged; that is no usable TOTP."""
+def test_a_keyless_open_ciphertext_cell_is_no_way_past(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A keyless open hands the stored ciphertext through unchanged; that is no usable TOTP. The
+    compute check is stubbed to pass, so only the ciphertext guard can answer."""
+    from messagefoundry.auth import service as service_module
     from messagefoundry.store.crypto import MARKER_PREFIX
 
+    monkeypatch.setattr(service_module, "_totp_unusable_reason", lambda _secret: None)
     assert not _opened_totp_usable(MARKER_PREFIX + "v2:opaque-ciphertext")
+    assert _opened_totp_usable(_TOTP_SECRET), "the stub should let a plain secret through"
 
 
 @pytest.mark.parametrize(("secret", "escalates"), [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)])

@@ -1986,9 +1986,9 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     assert keywords == {
         "counter",
         "threshold",
-        # BACKLOG #3422 beside ADR 0197 Amendment A wave 2: the caller's verdict that the TOTP is
-        # usable; the Local row and control 1 say a refused enrolment keeps the fixed lock.
-        "totp_way_past",
+        # BACKLOG #3422 beside ADR 0197 Amendment A wave 2: the caller's rule for a usable TOTP;
+        # the Local row and control 1 say a refused enrolment keeps the fixed lock.
+        "totp_usable",
         "lockout_seconds",
         "max_lockout_seconds",
         "now",

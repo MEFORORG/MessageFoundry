@@ -2699,37 +2699,56 @@ def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None
         raise ValueError("a conditional way-past write needs totp_usable")
 
 
+#: Accounts whose TOTP cell has been logged as not opening, so a gate asked on every request logs
+#: each account once per process rather than once per request. Account ids only.
+_UNOPENED_TOTP_LOGGED: set[str] = set()
+
+
+def log_unopened_totp(user_id: str) -> None:
+    """WARN, once per account per process, that a TOTP cell did not open while judging a way past
+    the sign-in lock: a store-key fault or a cipher service that did not answer. The account id
+    only, never the cell or anything it holds."""
+    if user_id in _UNOPENED_TOTP_LOGGED:
+        return
+    _UNOPENED_TOTP_LOGGED.add(user_id)
+    log.warning(
+        "a TOTP cell did not open while judging a way past the sign-in lock (account %s): a store "
+        "key or cipher service fault; until it opens the TOTP counts as no way past",
+        user_id,
+    )
+
+
 async def judge_totp(
     opener: Callable[[str, str | None], str | None],
     usable: TotpUsable | None,
-    record: UserAuthzRecord | None,
+    user: UserRecord | None,
 ) -> TotpCounts | None:
     """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
-    :func:`removal_keeps_way_past` and :func:`totp_removal`: ``record``'s TOTP cell, read inside the
-    write's own transaction with the account row held, opened with ``opener`` (the backend's
-    ``open_totp_secret``) and judged by ``usable`` ONCE, OFF THE EVENT LOOP, since a Transit cipher's
-    decrypt is a blocking HTTP call (CLAUDE.md section 6). The verdict holds only for that exact
-    cell: a write that finds another cell counts the TOTP for nothing. A cell that does not open is
-    logged and counts for nothing. ``None`` for no ``usable``."""
+    :func:`removal_keeps_way_past`, :func:`totp_removal` and :func:`lockout_increment`.
+
+    ``user`` is the account as read BEFORE the write takes its lock, so the cell is opened with
+    ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
+    with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
+    holding SQLite's writer lock or a row lock across it would stall every other write. Under the
+    lock the verdict holds only for that exact cell: a write that finds another cell counts the
+    TOTP for nothing, the closed direction. A cell that does not open counts for nothing
+    (:func:`log_unopened_totp`). ``None`` for no ``usable``."""
     if usable is None:
         return None
     rule = usable
-    cell = None if record is None or not record.row.totp_enabled else record.row.totp_secret
+    cell = (
+        None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
+    )
     verdict = False
-    if record is not None and cell is not None:
+    if user is not None and cell is not None:
 
         def judge(user_id: str, stored: str) -> bool:
             return rule(opener(user_id, stored))
 
         try:
-            verdict = await asyncio.to_thread(judge, record.row.id, cell)
+            verdict = await asyncio.to_thread(judge, user.id, cell)
         except CipherError:
-            # The account id only; never the cell or anything it holds.
-            log.warning(
-                "a TOTP cell did not open while judging a way past the sign-in lock (account %s); "
-                "it counts for nothing",
-                record.row.id,
-            )
+            log_unopened_totp(user.id)
 
     def counts(current: UserAuthzRecord) -> bool:
         return verdict and current.row.totp_enabled and current.row.totp_secret == cell
@@ -2872,13 +2891,13 @@ def lockout_increment(
     max_lockout_seconds: float,
     now: float,
     out: list[LockoutIncrement],
-    totp_way_past: bool = True,
+    totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
-    (:func:`next_lockout_state`). The answer is appended to ``out``. ``totp_way_past`` is the
-    caller's verdict that the account's TOTP is one the engine can compute codes with (BACKLOG
-    #3422): the sign-in lock escalates only where TOTP is on in the locked row AND that verdict
-    holds, so a TOTP enrolled or swapped meanwhile can only keep the fixed length."""
+    (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates
+    only where the locked row's TOTP is a way past by ``totp_counts`` (BACKLOG #3422): one the engine
+    can compute codes with, judged on that exact cell. With no verdict it does not escalate, the
+    closed direction for an owner who may have no way past."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
@@ -2893,7 +2912,11 @@ def lockout_increment(
             escalate=lockout_escalates(
                 counter,
                 auth_provider=r.row.auth_provider,
-                totp_enabled=r.row.totp_enabled and totp_way_past,
+                totp_enabled=(
+                    _totp_is_way_past(r, totp_counts)
+                    if counter == "sign_in"
+                    else r.row.totp_enabled
+                ),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
@@ -15448,10 +15471,14 @@ class MessageStore:
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
+        # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with _writer_guard(self._db, self._lock):
-            # The passkeys and the TOTP the condition reads are read under the same writer lock as
-            # the write.
-            held = await self._read_user_record(user_id) if require_way_past else None
+            # The passkeys the condition reads are read under the same writer lock as the write.
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
@@ -15460,7 +15487,7 @@ class MessageStore:
                 now=now,
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
-                totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
+                totp_counts=totp_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15631,17 +15658,21 @@ class MessageStore:
         Returns whether a row was written."""
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with _writer_guard(self._db, self._lock):
             # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
-            held = await self._read_user_record(user_id) if require_way_past else None
             change = totp_removal(
                 now,
                 require_way_past=require_way_past,
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
-                totp_counts=await judge_totp(self.open_totp_secret, totp_usable, held),
+                totp_counts=totp_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15743,6 +15774,11 @@ class MessageStore:
         With ``require_way_past``, only while a way past remains after it, judged under the same
         writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
         require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with _writer_guard(self._db, self._lock):
             if require_way_past:
                 current = await self._read_user_record(user_id)
@@ -15751,7 +15787,7 @@ class MessageStore:
                     await self._account_passkeys(user_id),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
-                    totp_counts=await judge_totp(self.open_totp_secret, totp_usable, current),
+                    totp_counts=totp_counts,
                 ):
                     return False
             count = await self._write_passkeys(
@@ -15985,6 +16021,29 @@ class MessageStore:
             )
             await self._commit()
 
+    async def _escalation_verdict(
+        self,
+        user_id: str,
+        counter: LockoutCounter,
+        *,
+        threshold: int,
+        totp_usable: TotpUsable | None,
+    ) -> TotpCounts | None:
+        """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
+        held and only where it can matter: a local account with TOTP on whose failure may set the
+        lock. Everywhere else ``None``, which escalates nothing, and no cell is opened."""
+        if counter != "sign_in" or totp_usable is None:
+            return None
+        pre = await self.get_user(user_id)
+        if (
+            pre is None
+            or pre.auth_provider != "local"
+            or not pre.totp_enabled
+            or pre.failed_attempts + 1 < threshold
+        ):
+            return None
+        return await judge_totp(self.open_totp_secret, totp_usable, pre)
+
     async def increment_login_failure(
         self,
         user_id: str,
@@ -15994,7 +16053,7 @@ class MessageStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         now: float | None = None,
-        totp_way_past: bool = True,
+        totp_usable: TotpUsable | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
         atomic step.
@@ -16016,7 +16075,9 @@ class MessageStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
-            totp_way_past=totp_way_past,
+            totp_counts=await self._escalation_verdict(
+                user_id, counter, threshold=threshold, totp_usable=totp_usable
+            ),
         )
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, change)
