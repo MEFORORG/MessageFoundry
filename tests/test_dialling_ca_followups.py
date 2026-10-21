@@ -212,7 +212,7 @@ async def test_a_dr_activation_its_preflight_refuses_names_no_path(
     for text in (str(abort), reason):
         assert _leaks(named, text) == [], text
         assert _ABORT_LINE in text
-        assert "stopped at its trust-anchor preflight" in text
+        assert "stopped at its preflight" in text
     assert abort.__context__ is None and abort.__cause__ is None
 
 

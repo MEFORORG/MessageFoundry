@@ -187,7 +187,8 @@ class _ActivationProgress:
     #: have moved the address. A cancellation that lands while the process is being created can
     #: leave it false for a hook that is then killed; the interrupted row still says it may have run.
     hook_ran: bool = False
-    #: Whether step 4's engine callback is inside its trust-anchor preflight, as it reports through
+    #: Whether step 4's engine callback is inside its preflight (the trust anchors and, in
+    #: ``serve``, the connection key files, BACKLOG #3402), as it reports through
     #: :meth:`DrCoordinator.note_profile_preflight`. It stays true when the preflight refuses or is
     #: cut off, so the rows then say that nothing was bound. A callback that reports nothing leaves
     #: it false, and the rows claim the more cautious case: that the reload may have bound.
@@ -288,7 +289,7 @@ class DrCoordinator:
         return self._settings
 
     def note_profile_preflight(self, running: bool) -> None:
-        """Record whether the ``activate_profile`` callback is inside its trust-anchor preflight.
+        """Record whether the ``activate_profile`` callback is inside its preflight.
 
         The engine sets it as its preflight starts and clears it once the preflight passes. A row
         for an attempt stopped in the preflight then makes no claim that a listener was bound, and
@@ -481,7 +482,7 @@ class DrCoordinator:
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
             reason = (
-                "DR activation stopped at its trust-anchor preflight, before any listener was bound"
+                "DR activation stopped at its preflight, before any listener was bound"
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"

@@ -131,7 +131,7 @@ against one case that matters, described under
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set `image:` to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set both `image:` fields (`copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -168,14 +168,20 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
   production.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
-  passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`).
+  passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`). Under the default `enforce` the engine
+  refuses a group-readable key file ([PHI.md](../docs/PHI.md) §2, *Key files*, which also says what
+  the Kubernetes manifests do about it). A Compose bind mount keeps the host's owner and mode, so own
+  the files by uid 10001 at mode `0600`; `compose.yaml` gives the commands.
 
 ## Healthcheck, signals, rotation
 
 - **Healthcheck:** `GET /health` is tokenless and always 200 — a **liveness** signal (it answers before
   the engine finishes starting; there is no unauthenticated readiness endpoint). The image probe uses
-  `curl -k https://127.0.0.1:8443/health` (the container presents its own, often self-signed, cert on
-  loopback, so `-k`/`--cacert` is **mandatory**) then falls back to `http://127.0.0.1:8765/health`.
+  `curl -k https://127.0.0.1:${MEFOR_API_PORT:-8765}/health`, which is 8443 under compose and the k8s
+  manifests (the container presents its own, often self-signed, cert on loopback, so `-k`/`--cacert`
+  is **mandatory**). It has no cleartext fallback, so a container whose TLS is broken reports
+  unhealthy (BACKLOG #1179).
+  **CORRECTED 2026-10-20:** this said the probe then fell back to `http://127.0.0.1:8765/health`.
 - **Graceful shutdown:** PID 1 is `tini`, which forwards `SIGTERM` → uvicorn lifespan → `engine.stop()`
   (drains MLLP clients within the `_CLIENT_SHUTDOWN_GRACE` bound). Give the orchestrator a stop grace of
   **≥30s** (`stop_grace_period` / `terminationGracePeriodSeconds`) to cover the ordered teardown — the
@@ -183,7 +189,11 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   serially), so raise it for many-listener graphs. A fully graceful shutdown exits **0**; **143**
   (128+SIGTERM) is also fine; **137** means it was SIGKILLed (grace exceeded = ungraceful).
 - **Cert rotation:** the **API** TLS context is built once at startup, so an API-cert renewal needs a
-  **container restart** (rolling restart across instances). **MLLP** certs reload on `POST /config/reload`.
+  **container restart** (rolling restart across instances). On the Kubernetes manifests it needs a new
+  **pod**, such as `kubectl rollout restart`: `copy-tls` copies the Secret only when a pod starts, so
+  a restart of the engine container alone reads the old copy. **MLLP** certs reload on `POST /config/reload`,
+  but on the Kubernetes manifests a reload re-reads the old copy too, so a rotated connection key
+  copied through `copy-tls` also needs a new pod.
 
 ## Residuals / gotchas
 

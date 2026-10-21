@@ -730,7 +730,7 @@ async def test_a_refused_activation_puts_the_threshold_back(
 
     assert caught.value.kind == "profile"
     # The preflight refused it before any bind, so the reason says so (vault BACKLOG #3094).
-    assert "stopped at its trust-anchor preflight" in str(caught.value)
+    assert "stopped at its preflight" in str(caught.value)
     assert "not readable" in str(caught.value)
     assert coord.active is False and engine.dr_active is False
     assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
@@ -1080,7 +1080,7 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert "did not answer within 0.5s" in str(caught.value)
     # Round 3, item 5. Red at aaab583091: the reason said the engine could not bind the priority
     # feeds, though the preflight stopped it before any bind.
-    assert "trust-anchor preflight" in str(caught.value)
+    assert "stopped at its preflight" in str(caught.value)
     assert "could not bind" not in str(caught.value)
     assert coord.active is False and engine.dr_active is False
     assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL

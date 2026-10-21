@@ -536,7 +536,11 @@ async def supervise(
     from messagefoundry.config.wiring import WiringError
 
     try:
-        specs = discover_shard_specs(
+        # Off the event loop: discovery runs every config module's top-level code, as a reload's
+        # load does, and the registry guard reads files, such as each connection key file's access
+        # list (BACKLOG #3402).
+        specs = await asyncio.to_thread(
+            discover_shard_specs,
             config,
             store_backend=store_backend,
             db_base=db_base,
