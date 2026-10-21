@@ -640,19 +640,21 @@ def test_dispatch_from_the_primary_is_denied(primary: Path, repos_file: Path, to
         ("Task", "claude-code-guide"),
     ],
 )
-def test_shell_less_subagent_types_may_dispatch_from_the_primary(
+def test_exempt_subagent_types_may_dispatch_from_the_primary(
     primary: Path, repos_file: Path, tool: str, subagent_type: str
 ) -> None:
-    """Plan section 6.1 (owner authorization 2026-10-21): these two built-in types carry no shell and no
-    write tool, so inheriting the primary's cwd cannot build or swap anything there."""
+    """docs/AUTONOMY-PLAN.md section 6, item 1 (owner authorization 2026-10-21): these two built-in types
+    carry no shell and no write tool, so inheriting the primary's cwd cannot build or swap anything."""
     assert run_gate(dispatch(primary, tool, subagent_type), repos_file) is None
 
 
 @pytest.mark.parametrize(
     ("tool", "subagent_type"),
     [
-        ("Agent", "Explore"),  # has Bash: a redirect evades rules 1 and 3
+        ("Agent", "Explore"),  # has Bash: a shell write evades rule 1
         ("Agent", "Plan"),
+        # No shell, but has Edit: "no shell" alone is not the criterion.
+        ("Agent", "statusline-setup"),
         ("Agent", "general-purpose"),
         ("Agent", "fork"),
         ("Agent", "explore"),
@@ -660,9 +662,9 @@ def test_shell_less_subagent_types_may_dispatch_from_the_primary(
         ("Agent", " web-fetch"),  # and exact: no trimming
         # The match is ORDINAL: PowerShell's culture comparison ignores these characters, so -ceq/-cin
         # would let each through.
-        ("Agent", "web-fetch​"),
-        ("Agent", "web­-fetch"),
-        ("Agent", "claude-code‍-guide"),
+        ("Agent", "web-fetch\u200b"),
+        ("Agent", "web\u00ad-fetch"),
+        ("Agent", "claude-code\u200d-guide"),
         ("Agent", ["web-fetch"]),  # a non-string must not be cast into a match
         ("Agent", None),  # an explicit JSON null
         ("Workflow", "web-fetch"),  # the exemption is for Agent/Task only
@@ -677,7 +679,9 @@ def test_other_dispatches_from_the_primary_stay_denied(
 
 def test_a_wrong_case_subagent_type_key_is_not_read(primary: Path, repos_file: Path) -> None:
     """A PSCustomObject property read ignores case, so the KEY must be matched ordinally too: the Agent
-    tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash."""
+    tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash. This covers a
+    lone wrong-case key only. A payload carrying both spellings makes ConvertFrom-Json throw, and the
+    gate's parse fails open for every rule; that predates this exemption."""
     payload = dispatch(primary, "Agent", "web-fetch", key="SUBAGENT_TYPE")
     assert_denied(run_gate(payload, repos_file))
 
