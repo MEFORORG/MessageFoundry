@@ -79,9 +79,9 @@ param(
     #
     # OPT-IN, and deliberately OFF by default. Rule 4 has never been installed, and turning it on as a
     # SIDE EFFECT of installing an unrelated fix would be a trap: with rules 2 and 4 both live, a session
-    # started in the primary has no in-session path to isolation at all -- it has no sanctioned path to
-    # a subagent that can build (see the `# Rule 2 --` comment block in worktree_gate.ps1) and cannot
-    # relocate itself, so it must be restarted elsewhere by a human. That is a hard stop on
+    # started in the primary has no in-session path to isolation at all -- rule 2 denies every dispatch
+    # it does not exempt (see the `# Rule 2 --` comment block in worktree_gate.ps1) and rule 4 denies
+    # relocating it, so it must be restarted elsewhere by a human. That is a hard stop on
     # workflow-by-default from the directory sessions naturally open in, and it is a decision the owner
     # makes on purpose (docs/WORKTREES.md), not one that rides along with a regex fix.
     #
