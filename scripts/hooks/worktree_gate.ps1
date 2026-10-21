@@ -22,7 +22,7 @@
          parent (measured: the parent's result came back with an EMPTY permission_denials list). Blocking
          the fan-out costs one second; letting it run costs the whole workflow. A Task/Agent call whose
          subagent_type is exactly web-fetch or claude-code-guide is exempt; the "# Rule 2" comment block
-         below says why and names the residuals.
+         below says why and names at least its residuals.
 
     KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
     made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
