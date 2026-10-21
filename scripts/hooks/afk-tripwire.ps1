@@ -8,9 +8,9 @@
 .DESCRIPTION
     IT DOES NOT BLOCK, AND SO IT DOES NOT MEET PLAN SECTION 4.4, which says a tripwire "stops the
     act". Blocking was left out of this slice by its brief. Most of these acts are not denied by
-    anything else either: the deny rules in .claude/settings.json cover only the plain prefixes
-    `git push --force`, `git push -f` and `git reset --hard`, so `--force-with-lease`, `--delete`,
-    `--no-verify`, `cd x && git reset --hard` and `remove.ps1 -Force` all run. The context this hook
+    anything else either: the deny rules in .claude/settings.json match a few command prefixes
+    only (read them there), so forms such as `--force-with-lease`, `--delete`, `--no-verify` and
+    `cd x && git reset --hard` run. The context this hook
     returns reaches the session with the call, not before it: the act has already run when the
     session reads "stop". What this hook gives is the RECORD and the reminder.
 
@@ -21,7 +21,8 @@
     recorded too. A command an earlier guard in the dispatcher denied never reaches this one.
 
     WHAT IT DETECTS, at least:
-      * `--no-verify` on any git subcommand, and `-n` on `git commit`;
+      * a hook bypass: `--no-verify` on any git subcommand, `-n` on `git commit`,
+        `git -c core.hooksPath=...`, and pre-commit's `SKIP=` in front of a command;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
@@ -67,7 +68,10 @@ function Split-TripwireSegments([string]$Text) {
     $cur = [System.Text.StringBuilder]::new()
     $quoted = $false
     $inTok = $false
-    $separators = ';|&(){}' + "`n"
+    # `(` and `{` open a new command (a subshell, a block), unless they follow `$`: `$(...)` and
+    # `${X}` are arguments of the command around them. `)` and `}` only end a token, so the flags
+    # after `git push origin $(git branch --show-current) --force` stay in the push's segment.
+    $separators = ';|&({' + "`n"
     # Dot-invoked, so they run in this scope and reset its variables.
     $endToken = {
         if ($inTok) { $toks.Add([pscustomobject]@{ T = $cur.ToString(); Q = $quoted }) }
@@ -89,9 +93,20 @@ function Split-TripwireSegments([string]$Text) {
             $i = $close + 1
             continue
         }
-        # A line continuation, bash's or PowerShell's, joins two lines into one command.
-        if (($ch -eq '\' -or $ch -eq '`') -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) { $i += 2; continue }
-        if ($ch -eq ' ' -or $ch -eq "`t" -or $ch -eq "`r") { . $endToken; $i++; continue }
+        # A line continuation, bash's or PowerShell's, joins two lines into one command; with CRLF
+        # line ends it is three characters.
+        if (($ch -eq '\' -or $ch -eq '`') -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) {
+            $i += $(if ($Text[$i + 1] -eq "`r" -and $i + 2 -lt $n -and $Text[$i + 2] -eq "`n") { 3 } else { 2 })
+            continue
+        }
+        # A comment runs to the end of its line, and a flag named in it is a mention.
+        if ($ch -eq '#' -and -not $inTok) {
+            $eol = $Text.IndexOf("`n", $i)
+            $i = if ($eol -lt 0) { $n } else { $eol }
+            continue
+        }
+        if ($ch -eq ' ' -or $ch -eq "`t" -or $ch -eq "`r" -or $ch -eq ')' -or $ch -eq '}') { . $endToken; $i++; continue }
+        if (($ch -eq '(' -or $ch -eq '{') -and $i -gt 0 -and $Text[$i - 1] -eq '$') { . $endToken; $i++; continue }
         if ($separators.Contains($ch)) { . $endSegment; $i++; continue }
         $null = $cur.Append($ch); $inTok = $true
         $i++
@@ -143,6 +158,10 @@ function Find-GitTripwires($Argv, $Hits) {
     $k = 0
     # Global options before the subcommand; -C, -c and the bare long forms take a value.
     while ($k -lt $Argv.Count -and $Argv[$k].T.StartsWith('-')) {
+        # A config override that points the hooks elsewhere skips them as surely as --no-verify.
+        if ($Argv[$k].T -ceq '-c' -and $k + 1 -lt $Argv.Count -and $Argv[$k + 1].T -match '^core\.hooksPath=') {
+            $Hits.Add('git -c core.hooksPath (hook bypass)')
+        }
         # The list Resolve-GitSubcommand in block-blanket-git-stage.ps1 uses; keep the two equal.
         if ($Argv[$k].T -cin @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix')) { $k++ }
         $k++
@@ -162,7 +181,8 @@ function Find-GitTripwires($Argv, $Hits) {
     if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $sub --no-verify") }
     switch -CaseSensitive ($sub) {
         'commit' {
-            if (@($flags | Where-Object { Test-ShortCluster $_ ([char]'n') 'mFCct' }).Count) { $Hits.Add('git commit -n (no-verify)') }
+            # -u takes its mode stuck on (`-uno`), so it ends a cluster like the value letters.
+            if (@($flags | Where-Object { Test-ShortCluster $_ ([char]'n') 'mFCctu' }).Count) { $Hits.Add('git commit -n (no-verify)') }
         }
         'reset' {
             if (@($flags | Where-Object { Test-LongOption $_ '--hard' 4 }).Count) { $Hits.Add('git reset --hard') }
@@ -196,7 +216,10 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
     if ($Depth -gt 2 -or -not $Command) { return }
     # Heredoc bodies and here-strings are file content or messages, not commands. The delimiter may
     # be quoted or backslash-escaped, and may hold dots and dashes (`<<"END-OF-MSG"`, `<<\EOF`).
-    $text = [regex]::Replace($Command, '(?s)<<-?[ \t]*\\?([''"]?)([\w.-]+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '<<HEREDOC')
+    # Only the body lines and the terminator go: the opener line stays, because a command after the
+    # heredoc on that line (`cat <<EOF | git commit --no-verify -F -`) is a command. The body is
+    # whole lines matched lazily, so an empty body ends at its own terminator.
+    $text = [regex]::Replace($Command, '(<<-?[ \t]*\\?([''"]?)([\w.-]+)\2[^\n]*\n)(?:[^\n]*\n)*?[ \t]*\3[ \t]*\r?(?=\n|$)', '$1')
     $text = [regex]::Replace($text, '(?s)@''\r?\n.*?\r?\n''@', "''")
     $text = [regex]::Replace($text, '(?s)@"\r?\n.*?\r?\n"@', "''")
     $skip = @('sudo', 'command', 'exec', 'time', 'nohup', 'env', 'do', 'then', 'else', 'if', 'while', 'until', '!', '.', 'elif')
@@ -211,6 +234,8 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
                 $seg[$k].T -match '^[A-Za-z_][A-Za-z0-9_]*=' -or $seg[$k].T -match '^\$[\w:]+$' -or
                 $seg[$k].T -in @('=', '+=') -or $skip -contains $seg[$k].T)) { $k++ }
         if ($k -ge $seg.Count) { continue }
+        # pre-commit's own skip list, set in front of the command it governs.
+        if (@($seg[0..$k] | Where-Object { -not $_.Q -and $_.T -match '^SKIP=.' }).Count) { $Hits.Add('SKIP= (pre-commit hook skip)') }
         $prog = Get-ProgramLeaf $seg[$k].T
         $argv = @(if ($k + 1 -lt $seg.Count) { $seg[($k + 1)..($seg.Count - 1)] })
         if ($prog -in @('bash', 'sh', 'zsh', 'dash', 'pwsh', 'powershell', 'cmd')) {
@@ -250,7 +275,7 @@ try {
     $cmdProp = $input_.Value.PSObject.Properties['command']
     if (-not $cmdProp) { exit 0 }
     # Every hit needs one of these words, so most shell calls stop here without being tokenised.
-    if ([string]$cmdProp.Value -notmatch '\bgit\b|remove\.ps1|claim\.ps1|AllowOrphanedAllocations|MEFOR_AFK_KILL') { exit 0 }
+    if ([string]$cmdProp.Value -notmatch '\bgit\b|remove\.ps1|claim\.ps1|AllowOrphanedAllocations|MEFOR_AFK_KILL|SKIP=') { exit 0 }
     $hits = [System.Collections.Generic.List[string]]::new()
     Find-Tripwires ([string]$cmdProp.Value) 0 $hits
     if (-not $hits.Count) { exit 0 }

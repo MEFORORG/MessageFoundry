@@ -50,9 +50,10 @@
 
     EVERY NON-DENY GUARD'S CONTEXT IS PASSED THROUGH. A guard's hookSpecificOutput.additionalContext
     (scripts/hooks/afk-tripwire.ps1 returns only that, ADR 0211) would have been read when the guard
-    was its own process, so it is kept here too: each later guard's context is joined, in guard
-    order, onto the kept decision's, or written alone when nothing decided. A deny still writes
-    only itself, because the command it refuses does not run.
+    was its own process, so it is kept here too: the kept decision's own context comes first, then
+    every other non-deny guard's in guard order, or they are written alone when nothing decided.
+    The kept decision is re-serialised to carry them, so its bytes then differ from the guard's
+    own. A deny still writes only itself, because the command it refuses does not run.
 
     FAIL-OPEN PER GUARD, AND VISIBLE. A guard that throws, exits non-zero other than 2, or whose
     path does not exist contributes an allow, and the others still run. Each failure is written to

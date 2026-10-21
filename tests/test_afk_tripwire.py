@@ -60,6 +60,26 @@ MUST_HIT = [
     pytest.param("git push -f origin b", "git push --force", id="push-f"),
     pytest.param("git -C D:/x push -uf origin b", "git push --force", id="push-cluster"),
     pytest.param("git --super-prefix x/ push --force", "git push --force", id="super-prefix"),
+    pytest.param(
+        "cat <<'EOF' | git commit --no-verify -F -\nmsg\nEOF",
+        "--no-verify",
+        id="command-after-heredoc-opener",
+    ),
+    pytest.param(
+        "cat <<EOF > f\nEOF\ngit push --force origin b", "git push --force", id="empty-heredoc"
+    ),
+    pytest.param(
+        "git push origin $(git branch --show-current) --force",
+        "git push --force",
+        id="subexpression-argument",
+    ),
+    pytest.param("git push origin ${BR} --force", "git push --force", id="braced-variable"),
+    pytest.param("git push \\\r\n--force origin b", "git push --force", id="crlf-continuation"),
+    pytest.param("if ($a) { git push --force }", "git push --force", id="powershell-block"),
+    pytest.param(
+        "git -c core.hooksPath=/dev/null commit -m x", "core.hooksPath", id="hooks-path-override"
+    ),
+    pytest.param("SKIP=ruff,mypy git commit -m x", "SKIP=", id="pre-commit-skip"),
     pytest.param("$null = git push --force origin b", "git push --force", id="ps-assignment"),
     pytest.param("$r = git reset --hard", "git reset --hard", id="ps-assignment-reset"),
     pytest.param('git push "--force" origin b', "git push --force", id="quoted-flag"),
@@ -119,6 +139,8 @@ MUST_PASS = [
     pytest.param("Remove-Item -Force x.txt", id="remove-item-force"),
     pytest.param("git log --format=%H -n 3", id="log-n"),
     pytest.param("git push --progress origin b", id="push-progress"),
+    pytest.param("git commit -uno -m x", id="commit-untracked-mode"),
+    pytest.param("git push origin b # never --force", id="flag-in-comment"),
     pytest.param("git commit -m '--no-verify'", id="quoted-flag-as-message"),
     pytest.param(
         "gh api repos/MEFORORG/MessageFoundry/actions/variables/MEFOR_AFK_KILL",
