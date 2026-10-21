@@ -59,8 +59,8 @@ for the checkouts named in its allowlist:
    back to the parent: the parent's result came back with an empty `permission_denials` list. A fan-out
    from the primary would therefore appear to succeed while writing nothing. Stopping the dispatch costs
    one second; letting it run costs the whole workflow. Only an `Agent`/`Task` call whose `subagent_type`
-   is exactly `web-fetch` or `claude-code-guide`, the two built-in types with no shell, passes; the
-   gate's rule 2 header comment says why and names the residual.
+   is exactly `web-fetch` or `claude-code-guide`, built-in types with neither a shell nor a write tool,
+   passes. The comment block above `Rule 2 --` in the gate says why and names the residuals.
 
 3. **A git command that swaps the primary's working tree** — `checkout`, `switch`, `reset`, `restore`,
    `stash`, `clean`, `rebase`, `merge`, `cherry-pick`, `revert`, `am`, `apply`.
