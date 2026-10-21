@@ -9,8 +9,8 @@ build-backend = "hatchling.build"
 # departure from messagefoundry-harness, which is deliberately lockstep). The import package
 # messagefoundry_webconsole/ lives at the REPO ROOT (so `from messagefoundry_webconsole import ...`
 # works from a checkout); this build pulls it into the wheel via force-include. The ENGINE wheel does
-# NOT contain messagefoundry_webconsole/ — the console installs as its own wheel (the engine declares
-# no [webconsole] extra until RELEASE.md step 1), and a JSON-only install stays byte-identical.
+# NOT contain messagefoundry_webconsole/ — the console installs as its own wheel (or through the
+# engine's [webconsole] extra, RELEASE.md step 1), and a JSON-only install stays byte-identical.
 
 [tool.hatch.version]
 path = "../../messagefoundry_webconsole/__init__.py"  # independent: the console's OWN __version__

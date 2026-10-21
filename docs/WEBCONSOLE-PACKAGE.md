@@ -14,13 +14,11 @@ This is the authoritative doc for that package: its architecture, the injection 
 package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (not version),
 how to develop and test it, and its **honest scope** (what the extraction does and does not decouple).
 
-> **The wheel is published; the engine-side extra is still not wired.** The distribution name
-> `messagefoundry-webconsole` was registered on PyPI on 2026-07-29 by the first `webconsole-v*` release,
-> so `pip install messagefoundry-webconsole` resolves to this project's own wheel. What is still missing
-> is the **engine** side: the engine `pyproject.toml` declares no `webconsole` key, so an install of the
-> engine's `webconsole` extra still fails. Install the console as its own distribution, or from a
-> checkout by path (`pip install -e packaging/messagefoundry-webconsole`). Wiring the extra is step 1 of
-> [`../packaging/messagefoundry-webconsole/RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md).
+> **The wheel is published.** The distribution name `messagefoundry-webconsole` was registered on PyPI
+> on 2026-07-29 by the first `webconsole-v*` release, so `pip install messagefoundry-webconsole`
+> resolves to this project's own wheel. The engine's `webconsole` extra installs it too, from the first
+> engine release that declares the extra; engine 0.5.2 and earlier do not. From a checkout, install it
+> by path (`pip install -e packaging/messagefoundry-webconsole`).
 
 ---
 
@@ -79,11 +77,17 @@ that engine.
 
 **The floor is raised at the console release, not ahead of it.** `main`'s engine still reports its
 last released version while it already carries a newer seam. A floor naming the next engine would
-not resolve against `main`'s editable engine until that engine is published, and the CI jobs that
-install the console editable would break. So engine X ships first, and the console release commit
-raises the floor to X. Between releases the floor on `main` lags the engine; that is harmless,
-because only the released wheel's value matters. The release gate checks that a floor exists, not
-that its value is current, so choosing X stays a release step.
+not resolve against `main`'s editable engine, and the CI jobs that install the console editable
+would break. So the console release commit raises the floor to X only when engine X is on PyPI, or
+when the same commit bumps the engine's `__version__` to X, which removes that obstacle. PRs 1861
+and 2467 took the second route: one pull request carries the engine bump and the console release,
+and engine X is tagged first ([`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md)
+step 6). Between releases the floor on `main` lags the engine;
+that is harmless, because only the released wheel's value matters. The release gate checks that a
+floor exists, not that its value is current, so choosing X stays a release step.
+
+**The engine's `[webconsole]` floor follows the console's publish.** `uv lock` resolves it from the
+index, so it can name console A only once A is on PyPI.
 
 ### Before it imports the console, `serve` checks whose package it is
 
@@ -283,8 +287,8 @@ from `auth.service`, add a console route or change a route's gate, BACKLOG #2709
    deploying site. Widening it back to a range requires landing the cross-seam CI matrix in the same
    change.
 4. Confirm green: `python -m pytest tests/test_webconsole_seam_snapshot.py -q`.
-5. At release, set the floor on both sides: the engine `[webconsole]` extra and the package's
-   `messagefoundry>=X` dependency. Set no ceiling; see
+5. At release, set the package's `messagefoundry>=X` floor, and once the console is on PyPI the
+   engine `[webconsole]` floor. Set no ceiling; see
    [the floor section](#the-engine-requirement-is-a-floor-with-no-ceiling) and the RELEASE checklist.
 
 **After any merge that moved the contract surface, regenerate. A clean merge is not evidence of a

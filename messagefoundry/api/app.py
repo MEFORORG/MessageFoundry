@@ -9887,8 +9887,8 @@ def create_app(
                     f"serve_ui requires the web console, and {console_import_failure(exc)}"
                 ) from exc
             # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste, so what it
-            # names has to be true. It once named a `webconsole` EXTRA that pyproject does not declare,
-            # so the command simply failed. It now names the DISTRIBUTION, whose name has been
+            # names has to be true. It once named a `webconsole` EXTRA that pyproject did not declare
+            # then, so the command simply failed. It now names the DISTRIBUTION, whose name has been
             # registered on PyPI since 2026-07-29 — a bare-name install of a CLAIMED name resolves to
             # this project's own wheel, which is what takes it out of dependency-confusion territory.
             # The previous wording here said to "point at the path install" while the string beneath it

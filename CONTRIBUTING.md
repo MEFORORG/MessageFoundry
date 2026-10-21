@@ -262,9 +262,10 @@ version.
    The test sweeps all six documents `docs/README.md` lists under *Start here*, so an engine pin,
    console pin or *for engine* phrase added to any of them is held too. A `$V` line is held only in
    the two guides named above. Run the test after the bump.
-5. The console pairing prose. **Check the UI seam first** (below): if it moved, this item follows
-   the console release instead. Move the engine pin in the pairing install line of `README.md`
-   and of `packaging/messagefoundry-webconsole/README.md`; the same test sweeps both files. Move
+5. The console pairing prose. **Check the UI seam first** (below): if it moved, this item names
+   the console released in the same pull request. Move the engine pin in the pairing install line
+   of `README.md` and of `packaging/messagefoundry-webconsole/README.md`; the same test sweeps both
+   files. Move
    by hand the engine versions that prose names as sharing the console's seam, and the engine
    version in the *Admin console* section of `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
@@ -287,10 +288,11 @@ What an engine bump does not move:
 **Check the UI seam.** Compare `ENGINE_UI_SEAM` in `messagefoundry/api/_ui_seam.py` with
 `SUPPORTED_ENGINE_SEAMS` in `git show webconsole-v<last>:messagefoundry_webconsole/__init__.py`,
 the last console tag. The in-tree console moves with the engine seam, so comparing against it
-always reads unchanged. If the seam has moved, the published console refuses the new engine, so the
-release needs a console release beside it
-([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release also moves the console
-version in the three files of item 5.
+always reads unchanged. If the seam has moved, the published console refuses the new engine, so
+prepare a console release in this same pull request, per
+[packaging/messagefoundry-webconsole/RELEASE.md](packaging/messagefoundry-webconsole/RELEASE.md)
+steps 0 and 2. It also moves the console version in the three files of item 5. **Tag the engine
+first, and the console only once the engine is on PyPI**; that file's step 6 says why.
 
 ## PHI / safety
 

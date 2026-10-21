@@ -4,7 +4,7 @@
 
 The defect this guards was live in **shipped code**, not just docs: ``api/app.py``'s ``serve_ui``
 RuntimeError told the operator to run ``pip install messagefoundry[webconsole]`` — an extra
-``pyproject.toml`` deliberately withholds until the wheel is published, so the command simply failed.
+``pyproject.toml`` then withheld until the wheel was published, so the command simply failed.
 Three docs additionally told users to ``pip install "messagefoundry-webconsole"`` from an index the
 distribution has never been published to.
 
@@ -191,8 +191,8 @@ def test_every_packaged_distribution_has_its_code_tree_scanned() -> None:
 
 
 def test_every_extra_named_in_shipped_text_is_declared() -> None:
-    """Mutation: restore ``pip install messagefoundry[webconsole]`` in ``api/app.py``. Red: named
-    below, because ``webconsole`` is not in ``[project.optional-dependencies]``."""
+    """Mutation: write ``pip install messagefoundry[nosuchextra]`` into ``api/app.py``. Red: named
+    below, because ``nosuchextra`` is not in ``[project.optional-dependencies]``."""
     declared = _declared_extras()
     problems: list[str] = []
     for path in _shipped_files():
