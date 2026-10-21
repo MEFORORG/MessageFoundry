@@ -682,24 +682,26 @@ never with mail. The evidence is probe PR
   specifically (§6).
 - **A command or script that would do harm on the wrong machine carries a circuit breaker (owner
   ruling 2026-10-21),** including one handed to the owner or written into a file. A `hostname;`
-  prefix alone does not count: it shows the mistake only after the command has run. Read the host
-  from `[Environment]::MachineName`, not `$env:COMPUTERNAME`, which is inherited and can be
-  overwritten. On Windows, `<HOST>` is the NetBIOS name, at most 15 characters, as
-  `[Environment]::MachineName` prints it on that machine. No form uses `exit`, which closes the
-  owner's PowerShell window when the text runs there. Nor `return`, which is easy to get wrong in a
-  pasted line. A pasted command puts its whole body inside
-  an if/else that runs nothing on another host:
+  prefix alone does not count: it shows the mistake only after the command has run. A pasted
+  command puts its whole body in an `else` that runs nothing elsewhere:
 
       if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { ... }
 
-  A machine-specific script checks its own host at the top, right after any `param()` block, or
-  inside `begin {}` if it has one. Keep `param()` first. Wrapped inside a check, it is not parsed as
-  one, so the script runs with its defaults and drops the caller's arguments. The scoped `Stop`
-  makes the throw hold even when the caller silences errors, inline or in a dot-sourced helper, and
-  a caller can still catch it. The `MachineName` read and this script form are Manager decisions of
-  2026-10-21:
+  A script checks its host first, right after any `param()`. A script with pipeline blocks checks
+  inside `begin {}`, added if it has none. Never wrap a script's body in an `else`: a `param()` block
+  inside one is not parsed as one. The scoped `Stop` makes the throw hold even when the caller
+  silences errors, and a caller can still catch it:
 
       if ([Environment]::MachineName -ne '<HOST>') { & { $ErrorActionPreference = 'Stop'; throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } }
+
+  The check does not stop code that runs before it, such as a `param()` default or `ValidateScript`.
+  Nor does it stop a `clean {}` block, which on pwsh 7.3 and later runs after the throw. Keep
+  machine-bound work out of such code. Read the host from `[Environment]::MachineName`, not
+  `$env:COMPUTERNAME`, which is inherited and can be overwritten. On Windows, `<HOST>` is the
+  NetBIOS name `[Environment]::MachineName` prints there, at most 15 characters. No form uses
+  `exit` or `return`; `exit` closes the owner's PowerShell window when the text runs there. The
+  owner ruling asks only for the breaker. The forms and rules in this bullet are Manager decisions
+  of 2026-10-21, from engine PR 2469.
 
 ---
 
