@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,14 +89,18 @@ def rate(remaining: int) -> dict[str, Any]:
 
 
 def pr(
-    state: str = "open", merged: bool = False, mergeable: str | None = "blocked", sha: str = SHA
+    state: str = "open",
+    merged: bool = False,
+    mergeable: str | None = "blocked",
+    sha: str = SHA,
+    base: str = "main",
 ) -> dict[str, Any]:
     return {
         "state": state,
         "merged": merged,
         "mergeable_state": mergeable,
         "head": {"sha": sha},
-        "base": {"ref": "main"},
+        "base": {"ref": base},
     }
 
 
@@ -175,6 +180,8 @@ def wait_pr(
         text=True,
         timeout=TIMEOUT,
         env=env,
+        # A known, empty working directory: a program gh resolves relative names against it.
+        cwd=tmp_path,
     )
     return Run(proc, log, sleeps, pids)
 
@@ -517,7 +524,7 @@ def test_a_refused_required_context_read_is_an_error_not_an_empty_set(tmp_path: 
 def test_two_reads_that_need_a_push_on_one_head_exit_3(tmp_path: Path, stale: str) -> None:
     run = wait_pr(tmp_path, "merged", {PR_PATH: [ok(pr(mergeable=stale))]})
     assert run.code == 3, run.err
-    assert f"needs a push: mergeable_state={stale} on two checks in a row of head {SHA}" in run.out
+    assert f"needs a push: mergeable_state={stale} on two checks of head {SHA}" in run.out
     assert run.sleeps == [120]
 
 
@@ -532,6 +539,8 @@ MERGED = ok(pr("closed", merged=True))
         ([DIRTY, ok(pr(mergeable="clean")), DIRTY, MERGED], 0, 3),
         # Dirty on head A, then on head B: B has been read dirty once, not twice.
         ([DIRTY, ok(pr(mergeable="dirty", sha="b" * 40)), MERGED], 0, 2),
+        # A retarget resets too: the first read against the new base is its first read.
+        ([DIRTY, ok(pr(mergeable="dirty", base="release")), MERGED], 0, 2),
         # A closed read resets too: closed and reopened is a fresh start.
         ([DIRTY, ok(pr("closed", mergeable="dirty")), DIRTY, MERGED], 0, 3),
         # Still computing, or no answer at all, neither counts nor resets: exit 3 on the third
@@ -543,6 +552,7 @@ MERGED = ok(pr("closed", merged=True))
     ids=[
         "clean-resets",
         "new-head-resets",
+        "new-base-resets",
         "closed-resets",
         "unknown-is-nothing",
         "null-is-nothing",
@@ -589,7 +599,6 @@ def test_a_gh_call_that_hangs_is_killed_and_counted_as_transient(tmp_path: Path)
     The timeout covers every call, so it is long enough for a cold pwsh start of the stub on a
     loaded runner, and short enough that three of them fit the per-test cap.
     """
-    psutil = pytest.importorskip("psutil")
     run = wait_pr(
         tmp_path,
         "merged",
@@ -602,7 +611,10 @@ def test_a_gh_call_that_hangs_is_killed_and_counted_as_transient(tmp_path: Path)
     assert "three transient failures in a row" in run.err
     assert run.sleeps == [120, 120, 120]
     assert len(run.hung) == 3
-    assert not [pid for pid in run.hung if psutil.pid_exists(pid)]
+    survivors = [pid for pid in run.hung if psutil.pid_exists(pid)]
+    for pid in survivors:  # so a regression fails here and does not leave 600 s sleepers behind
+        psutil.Process(pid).kill()
+    assert not survivors
 
 
 def test_the_timeout_seam_is_refused_outside_tests(tmp_path: Path) -> None:
