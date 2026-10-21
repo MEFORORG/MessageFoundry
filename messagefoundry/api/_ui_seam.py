@@ -632,12 +632,20 @@ from typing import Any
 #: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
 #: two methods. Re-derived with ``--write``.
 #:
+#: BACKLOG #3393: ``AdminHandlers`` gained ``refuse_own_channel_scope``, the channel-scope write's
+#: self-target refusal, which ``set_channel_scope`` also runs. ``/ui/users/{id}/channel-scope``
+#: calls it before its form checks, so a malformed post aimed at the caller's own account writes
+#: ``auth.self_target_refused`` rather than being answered by a form error with no row. The digest
+#: moved from ``a75c587ccc09a85c`` because the discovered surface grew. An older console on this
+#: engine is refused at mount; a newer console on an older engine would raise AttributeError at the
+#: save, and the pinned digest refuses that pair at mount first. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "a75c587ccc09a85c"
+ENGINE_UI_SEAM: str = "382cd35a6af61f7b"
 
 
 @dataclass(frozen=True, slots=True)
@@ -763,6 +771,8 @@ class AdminHandlers:
     update_user: Callable[..., Awaitable[Any]]
     set_user_roles: Callable[..., Awaitable[Any]]
     set_channel_scope: Callable[..., Awaitable[Any]]
+    # BACKLOG #3393: ``auth_routes._refuse_own_channel_scope``; its docstring says why.
+    refuse_own_channel_scope: Callable[..., Awaitable[Any]]
     reset_user_password: Callable[..., Awaitable[Any]]
     reset_user_mfa: Callable[..., Awaitable[Any]]
     # BACKLOG #1143 / #295 (ADR 0184 slice B): PUT and DELETE /users/{id}/federated-identity. Their

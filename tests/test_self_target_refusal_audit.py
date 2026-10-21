@@ -139,6 +139,34 @@ async def test_another_account_writes_no_refusal_row(
     assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
 
 
+async def test_demoting_another_administrator_succeeds_while_a_second_one_exists(
+    engine: Engine,
+) -> None:
+    """RED when: ``PUT /users/{id}/roles`` refuses to demote another administrator although the
+    caller, a second administrator, stays (BACKLOG #3393; #1149's round-2 finding 6). The
+    self-target guard and the last-administrator guard both sit on this route, and neither may
+    catch it. The demoted account's session ends, as every role write ends the target's."""
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    await _add(service, "admin2", Role.ADMINISTRATOR)
+    other = await engine.store.get_user_by_username("admin2")
+    assert other is not None
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root")).json()["token"]
+        other_tok = (await _login(c, "admin2")).json()["token"]
+        _r, tok = await _reauth(c, tok)
+        r = await c.put(
+            f"/users/{other.id}/roles", json={"roles": ["operator"]}, headers=_auth(tok)
+        )
+        gone = await c.get("/auth/me", headers=_auth(other_tok))
+        still = await c.get("/auth/me", headers=_auth(tok))
+    assert r.status_code == 200, r.text
+    assert await engine.store.get_user_role_ids(other.id) == ["operator"]
+    assert gone.status_code == 401, "the demoted administrator kept a session"
+    assert still.status_code == 200, "demoting another account ended the caller's session"
+    assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
+
+
 # --- vault BACKLOG #3260, limb 2: a self-service revoke that ends nothing --------------------------
 
 #: A well-formed session id that names no session.

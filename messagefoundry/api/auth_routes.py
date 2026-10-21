@@ -320,6 +320,30 @@ async def _refuse_if_self(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
+async def _refuse_own_channel_scope(
+    request: Request,
+    service: AuthService,
+    identity: Identity,
+    user_id: str,
+    target: UserRecord | None = None,
+) -> None:
+    """The channel-scope write's self-target refusal (BACKLOG #1149), one copy for both planes.
+
+    The console calls it through the seam before its own form checks (BACKLOG #3393), so a
+    self-target post with a malformed form is still refused and audited, not answered first by a
+    form error. ``set_channel_scope`` runs it again before the write, so the console's call adds
+    the order and takes nothing away."""
+    await _refuse_if_self(
+        request,
+        service,
+        identity,
+        user_id,
+        target,
+        op="channel_scope",
+        detail="another administrator must change your own channel scope",
+    )
+
+
 async def _prove_group_save(request: Request, identity: Identity, ended: frozenset[str]) -> None:
     """The step-up of a group-wide save whose revoke would end the sessions of ``ended``.
 
@@ -1842,14 +1866,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2): the write revokes the
         target's sessions, as the role write does."""
-        await _refuse_if_self(
-            request,
-            service,
-            identity,
-            user_id,
-            op="channel_scope",
-            detail="another administrator must change your own channel scope",
-        )
+        await _refuse_own_channel_scope(request, service, identity, user_id)
         try:
             await service.set_channel_scope(
                 user_id,
@@ -2352,6 +2369,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         update_user=update_user,
         set_user_roles=set_user_roles,
         set_channel_scope=set_channel_scope,
+        refuse_own_channel_scope=_refuse_own_channel_scope,
         reset_user_password=reset_user_password,
         reset_user_mfa=reset_user_mfa,
         bind_user_federated_identity=bind_user_federated_identity,

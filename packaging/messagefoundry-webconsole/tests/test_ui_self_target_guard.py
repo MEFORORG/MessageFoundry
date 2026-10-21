@@ -188,3 +188,109 @@ async def test_another_accounts_id_in_another_case_is_not_a_self_target(
     r = await c.post(url, headers=SAME_ORIGIN)
     assert r.status_code == 200, (r.status_code, r.text[:300])
     assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
+
+
+#: The channel-scope row of ``ROUTES``: its refusal text, which the tests below reuse.
+_SCOPE_WORDS = next(words for op, *_rest, words in ROUTES if op == "channel_scope")
+
+#: BACKLOG #3393: self-target channel-scope posts that a form check would refuse. The guard now
+#: runs before every one of them.
+_MALFORMED_SCOPE_FORMS = [
+    pytest.param({"scope_mode": "bogus"}, id="unknown-mode"),
+    pytest.param({"scope_mode": "list", "channels": ""}, id="empty-list"),
+    pytest.param({"scope_mode": "list", "channels": "*"}, id="all-channels-token-in-list"),
+    pytest.param({"scope_mode": "list", "channels": "not a connection!"}, id="bad-name"),
+]
+
+
+@pytest.mark.parametrize("spelling", ["exact", "upper"])
+@pytest.mark.parametrize("form", _MALFORMED_SCOPE_FORMS)
+async def test_a_malformed_self_target_scope_post_is_still_refused_and_audited(
+    engine: Engine,
+    root: tuple[httpx.AsyncClient, AuthService, str],
+    spelling: str,
+    form: dict[str, str],
+) -> None:
+    """RED when: ``/ui/users/{id}/channel-scope`` answers a malformed post aimed at the caller's
+    own account with its form error, before the self-target guard runs, so no
+    ``auth.self_target_refused`` row is written (BACKLOG #3393; #1149's round-2 finding 3)."""
+    c, _service, me = root
+    spelled = me if spelling == "exact" else me.upper()
+    before = await engine.store.get_user(me)
+
+    r = await c.post(f"/ui/users/{spelled}/channel-scope", data=form, headers=SAME_ORIGIN)
+
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert _SCOPE_WORDS in r.text
+    rows = await engine.store.list_audit(action="auth.self_target_refused", limit=10)
+    assert len(rows) == 1, "a malformed self-target post wrote no refusal row"
+    assert json.loads(str(rows[0]["detail"])) == {"op": "channel_scope", "user_id": me}
+    after = await engine.store.get_user(me)
+    assert after is not None and before is not None
+    assert (after.channel_scope, after.channel_scope_source) == (
+        before.channel_scope,
+        before.channel_scope_source,
+    )
+
+
+@pytest.mark.parametrize("form", _MALFORMED_SCOPE_FORMS)
+async def test_a_malformed_scope_post_on_another_account_gets_its_form_error(
+    engine: Engine, root: tuple[httpx.AsyncClient, AuthService, str], form: dict[str, str]
+) -> None:
+    """The control: the same posts aimed at another account still meet the form checks, and
+    write no refusal row."""
+    c, service, _me = root
+    other = await provision(service, "viewer1", [Role.VIEWER.value])
+    r = await c.post(f"/ui/users/{other}/channel-scope", data=form, headers=SAME_ORIGIN)
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert _SCOPE_WORDS not in r.text
+    assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
+
+
+#: The button each session-revoking route's form carries on a user page.
+_BUTTONS = {
+    "/roles": "Save roles",
+    "/channel-scope": "Save channel scope",
+    "/revoke-sessions": "Sign out all sessions",
+}
+#: (form action suffix, button) for the forms the caller's own user page no longer offers: every
+#: route of ``SESSION_REVOKING``, so a route that joins it must have its form hidden too.
+_SELF_HIDDEN_FORMS = [(suffix, _BUTTONS[suffix]) for suffix, _form in SESSION_REVOKING]
+#: Forms the caller's own page still offers. Their routes refuse the caller's account too, so each
+#: can only fail there; hiding them is outside BACKLOG #3393's scope, not a decision that they work.
+_SELF_KEPT_FORMS = ["/update", "/reset-password", "/reset-mfa", "/delete"]
+
+
+@pytest.mark.parametrize("spelling", ["exact", "upper"])
+async def test_the_own_user_page_offers_no_roles_scope_or_sign_out_form(
+    root: tuple[httpx.AsyncClient, AuthService, str], spelling: str
+) -> None:
+    """RED when: the caller's own user page offers Save roles, Save channel scope or Sign out all
+    sessions, each a form whose route refuses the caller's own account (BACKLOG #3393; #1149's
+    round-2 finding 2). Decided by the stored id, so the upper spelling is the caller's page too."""
+    c, _service, me = root
+    spelled = me if spelling == "exact" else me.upper()
+    r = await c.get(f"/ui/users/{spelled}")
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    for suffix, button in _SELF_HIDDEN_FORMS:
+        assert f'action="/ui/users/{me}{suffix}"' not in r.text, suffix
+        assert button not in r.text, button
+    for suffix in _SELF_KEPT_FORMS:
+        assert f'action="/ui/users/{me}{suffix}"' in r.text, suffix
+    assert "You cannot change your own roles here" in r.text
+    assert "You cannot change your own channel scope here" in r.text
+    assert 'href="/ui/account"' in r.text
+
+
+async def test_another_users_page_still_offers_the_three_forms(
+    root: tuple[httpx.AsyncClient, AuthService, str],
+) -> None:
+    """The control: another account's page renders all three forms and none of the notes."""
+    c, service, _me = root
+    other = await provision(service, "viewer1", [Role.VIEWER.value])
+    r = await c.get(f"/ui/users/{other}")
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    for suffix, button in _SELF_HIDDEN_FORMS:
+        assert f'action="/ui/users/{other}{suffix}"' in r.text, suffix
+        assert button in r.text, button
+    assert "You cannot change your own" not in r.text

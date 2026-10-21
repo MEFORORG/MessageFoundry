@@ -255,6 +255,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 all_roles,
                 error=error,
+                # BACKLOG #3393: by the stored id, as the self-target guard decides (#3259).
+                is_self=user.id == identity.user_id,
                 # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
                 federated=admin.federated_identity_view(user, service),
                 scope_draft=scope_draft,
@@ -449,6 +451,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
+        # BACKLOG #3393: before any form check; the guard's docstring says why. The row read here
+        # is the guard's target, and the directory-scope check below reuses it.
+        user = await service.store.get_user(user_id)
+        try:
+            await admin.refuse_own_channel_scope(request, service, identity, user_id, user)
+        except HTTPException as exc:
+            return await _user_detail(
+                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
+            )
         form = dict(await _form_pairs(request))
         names = [ln.strip() for ln in form.get("channels", "").splitlines() if ln.strip()]
         # The tri-state scope_mode keeps deny-all distinguishable from all-channels — an empty
@@ -519,8 +530,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
-        # falls through to the handler's own 404.
-        user = await service.store.get_user(user_id)
+        # falls through to the handler's own 404. The record is the one read before the guard.
         summary = None if user is None else admin.user_summary(user, [])
         ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
         if not ticked and summary is not None and needs_manual_scope_confirm(summary):
