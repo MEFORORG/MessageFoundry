@@ -13931,9 +13931,9 @@ class SqlServerStore:
         the row rather than each reading the same pre-increment count.
         :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
         than three; the same locked read carries the ``auth_provider`` that decides the escalation
-        (ADR 0197), and for the SIGN-IN lock the TOTP's usability is judged by ``totp_usable`` before
-        the lock, on a cell the locked row must still hold (``store.escalation_verdict``, BACKLOG
-        #3422). Returns ``(0, False, 0)`` for an unknown user."""
+        (ADR 0197), and for the SIGN-IN lock the TOTP's refusal is judged by ``totp_usable`` before
+        the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
+        must still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         change = lockout_increment(

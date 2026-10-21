@@ -488,7 +488,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     if census.unknown_totp:
         parts.append(
             "of those, could not be checked at all (unknown, not refused; check the store key and "
-            "the cipher service): " + ", ".join(census.unknown_totp)
+            "the cipher service before resetting any of them, since a reset destroys a healthy "
+            "enrolment): " + ", ".join(census.unknown_totp)
         )
     return CheckResult(
         rid,

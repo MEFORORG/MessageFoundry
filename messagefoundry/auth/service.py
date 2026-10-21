@@ -2370,6 +2370,18 @@ def _log_totp_refused(username: str) -> None:
     )
 
 
+def _log_totp_malformed(username: str) -> None:
+    """Log an account whose TOTP cell opens to a value that is not base32, so no code can be
+    computed from it. Judged unknown rather than refused (BACKLOG #3422), so the gates still count it
+    as an enabled TOTP; the store key is not the cause, and an administrator's factor reset is the
+    cure."""
+    _log.warning(
+        "the TOTP secret of account %r opens but is not a key codes can be computed with; every "
+        "gate still counts it as an enabled TOTP, and an administrator's factor reset clears it",
+        username,
+    )
+
+
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
     """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
     compared in constant time (ASVS 11.2.4); the stamps are not secret."""
@@ -2415,7 +2427,10 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     if reason == "refused":
         _log_totp_refused(user.username)
         return "refused"
-    return "usable" if reason is None else "unknown"
+    if reason == "malformed":
+        _log_totp_malformed(user.username)
+        return "unknown"
+    return "usable"
 
 
 def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
@@ -12407,8 +12422,9 @@ class AuthService:
             )
         if census.undecryptable_totp:
             _log.warning(
-                "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt or "
-                "compute with, so their combined sign-in cannot pass a lock: %s. Each is logged above "
+                "ADR 0197: %d account(s) have an enabled TOTP secret this engine could not decrypt "
+                "or compute with, so their combined sign-in may not pass a lock: %s. Each is logged "
+                "above "
                 "with its cause: check the store key for a cell that does not open; for an "
                 "enrolment this release refuses, have the holder remove the authenticator app and "
                 "enrol it again, or reset the account's factors (POST /users/{id}/reset-mfa), which "
@@ -12420,9 +12436,11 @@ class AuthService:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
                 "value would not compute): %s. Until they can be, every gate treats each as an "
-                "enabled TOTP. For a cell that does not open, check the store key and the cipher "
-                "service; a value that opens and will not compute needs the holder to remove the "
-                "authenticator app and enrol it again.",
+                "enabled TOTP, and its holder cannot remove it while no discoverable passkey "
+                "remains. For a cell that does not open, check the store key and the cipher "
+                "service before resetting anything, since a reset destroys a healthy enrolment; a "
+                "value that opens and will not compute is cleared by an administrator's factor "
+                "reset (POST /users/{id}/reset-mfa).",
                 len(census.unknown_totp),
                 ", ".join(census.unknown_totp),
             )

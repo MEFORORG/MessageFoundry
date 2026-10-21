@@ -2761,6 +2761,9 @@ async def judge_totp(
         except CipherError:
             log_unopened_totp(user.id)
             state = "unknown"
+        if state not in ("usable", "refused", "unknown"):
+            # A bool rule (the old shape) would read False as "not refused", which fails open.
+            raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
 
     return TotpJudgement(cell=cell, state=state)
 
@@ -2780,7 +2783,8 @@ async def escalation_verdict(
     live and can arm, and only where the pre-lock read says THIS failure sets a lock that the
     verdict could shorten: the count reaches ``threshold`` and the lock is not the first of its
     cycle count, since a first lock has the base length either way. So a wrong password below the
-    threshold opens no cell, and a username alone cannot drive one cipher call per guess.
+    threshold costs no cipher call HERE. Other paths still open the cell per request, at least the
+    combined sign-in's code check and the lock notice.
     Everywhere else ``None``, and no cell is opened; :func:`lockout_increment` then applies the
     plain ``totp_enabled`` rule to the locked row, so a pre-read that a racing write made stale
     (a parallel burst whose crossing failure read a lower count) escalates as before that rule
@@ -16122,9 +16126,10 @@ class MessageStore:
         does, so two concurrent wrong credentials cannot both read the same pre-increment count and
         lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
         this has to be one call rather than three. :func:`lockout_escalates` decides the escalation
-        from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock the TOTP's
-        usability is judged by ``totp_usable`` before the lock, on a cell the locked row must still
-        hold (:func:`escalation_verdict`, BACKLOG #3422). The count itself stays atomic.
+        from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
+        TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
+        later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
+        BACKLOG #3422). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""

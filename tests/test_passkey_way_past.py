@@ -1203,9 +1203,27 @@ async def test_a_totp_cell_that_does_not_open_is_judged_unknown_and_logged(
         await store.close()
 
 
+async def test_a_rule_that_answers_a_bool_is_refused_not_read_as_usable() -> None:
+    """The rule answers a :data:`TotpState`. A rule of the old bool shape would make ``False`` read
+    as "not refused", which fails open, so the judgement refuses any answer outside the tri-state."""
+    from messagefoundry.store.store import judge_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, _token, _ = await login_admin(service)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        user = await store.get_user(identity.user_id)
+        bool_rule: Any = lambda _secret: False  # noqa: E731
+        with pytest.raises(TypeError, match="TotpState"):
+            await judge_totp(store.open_totp_secret, bool_rule, user)
+    finally:
+        await store.close()
+
+
 async def test_the_escalation_rule_cannot_be_omitted() -> None:
     """``increment_login_failure`` takes the TOTP rule as a REQUIRED keyword, never ``None``, so no
-    caller can omit it and silently turn the sign-in lock's escalation off. mypy refuses the
+    caller can omit it and silently lose the refused-TOTP rule. mypy refuses the
     omission statically (the store protocol in ``base.py``); this is the runtime half."""
     import inspect
 
