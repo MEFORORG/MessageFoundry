@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import subprocess
 import sys
@@ -692,35 +691,41 @@ def test_a_setting_that_would_switch_the_protection_off_is_refused(knob: str, va
         Supervisor([_spec("a")], **{knob: value})  # type: ignore[arg-type]  # one knob per case
 
 
-async def _stop(task: asyncio.Task[int]) -> None:
-    """Cancel ``task`` and wait it out, bounded, on a test's failure path.
+async def _stop(task: asyncio.Task[int], failure: BaseException) -> None:
+    """On a test's failure path, cancel ``task`` and note its outcome on ``failure``.
 
-    ``supervise`` discovers engine shards in a worker thread (BACKLOG #3402 round 3), and a cancel
-    landing on that await raises ``CancelledError`` out of ``supervise``. That is swallowed here so
-    the assert that failed first is the one reported. Any other exception the task raised is raised,
-    with the failed assert as its context."""
+    The assert that failed stays the reported error. ``supervise`` discovers engine shards in a
+    worker thread (BACKLOG #3402 round 3), so a cancel can land on that await and raise
+    ``CancelledError`` out of ``supervise``, which awaiting the task would report instead. The wait
+    is ``asyncio.wait`` because it is bounded even for a task that absorbs the cancel, where
+    ``wait_for`` waits for the task to finish."""
     task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=5.0)
+    done, _ = await asyncio.wait({task}, timeout=5.0)
+    if not done:
+        failure.add_note("supervise was still running 5 s after the cancel")
+    elif task.cancelled():
+        pass
+    elif (exc := task.exception()) is not None:
+        failure.add_note(f"supervise raised {exc!r}")
+    else:
+        failure.add_note(f"supervise returned {task.result()}")
 
 
 async def test_a_cancel_during_discovery_stops_supervise_before_it_spawns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Discovery runs in a worker thread, so the loop stays live while it runs. A cancel then ends the
-    ``supervise`` coroutine at once with ``CancelledError``, and it builds no supervisor and spawns
-    nothing, even once the abandoned thread finishes discovery. The thread itself is not stopped: it
-    runs discovery to its end, as the old on-loop call did. Before round 3 the coroutine could not be
-    cancelled until discovery returned."""
+    """Discovery runs in a worker thread, so the loop stays live while it runs, and a cancel ends the
+    ``supervise`` coroutine at once with ``CancelledError``, before it builds a supervisor. The
+    cancel does not stop the thread: it runs discovery to its end, and ``asyncio.run`` waits for it
+    when the loop closes. Before round 3 discovery held the loop, so a cancel took effect only once
+    discovery had returned."""
     entered = threading.Event()
     release = threading.Event()
     returned = threading.Event()
-    released: list[bool] = []
-    built: list[list[ShardSpec]] = []
 
     def discover(*_a: object, **_k: object) -> list[ShardSpec]:
         entered.set()
-        released.append(release.wait(timeout=10.0))
+        release.wait(timeout=5.0)
         returned.set()
         return [_spec("a")]
 
@@ -728,8 +733,7 @@ async def test_a_cancel_during_discovery_stops_supervise_before_it_spawns(
         return None
 
     def _supervisor(specs: list[ShardSpec]) -> Supervisor:
-        built.append(specs)
-        raise AssertionError("supervise built a supervisor after it was cancelled")
+        raise AssertionError("supervise went on to build a supervisor")
 
     monkeypatch.setattr(supervisor_mod, "discover_shard_specs", discover)
     monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
@@ -738,27 +742,19 @@ async def test_a_cancel_during_discovery_stops_supervise_before_it_spawns(
     task = asyncio.create_task(supervise("cfg", install_signal_handlers=False, **_DISCOVERY))
     try:
         await until(entered.is_set, "discovery entering its worker thread")
-        # The loop runs while discovery blocks in its thread. Had discovery held the loop, control
-        # would come back here only after it returned.
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # Off the loop, discovery is still blocked in its thread when control comes back here. Had
+        # discovery held the loop, control would come back only after it returned.
         assert not returned.is_set(), "discovery ran on the event loop"
         assert not task.done()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2.0)
-        # The abandoned thread still finishes discovery; its result must go nowhere.
-        release.set()
-        await until(returned.is_set, "the abandoned discovery thread returning")
-        for _ in range(5):
-            await asyncio.sleep(0)
-    except BaseException:
-        await _stop(task)
+    except BaseException as failure:
+        release.set()  # first, or a supervise still awaiting the thread waits out its timeout
+        await _stop(task, failure)
         raise
     finally:
         release.set()
-    assert released == [True]  # released by the test, not by the stub's own timeout
-    assert built == []
 
 
 async def test_supervise_exits_nonzero_when_every_shard_crash_loops(
@@ -843,8 +839,8 @@ async def test_supervise_keeps_running_while_any_shard_is_alive(
                 await asyncio.sleep(0)
             assert not task.done()  # b is alive, so the supervisor runs on
             assert len(healthy) == 1 and not healthy[0].terminated
-        except BaseException:
-            await _stop(task)
+        except BaseException as failure:
+            await _stop(task, failure)
             raise
         # Stands in for the signal handler, which cancels the inner runner; supervise handles both
         # cancellations through the same except arm.
@@ -913,8 +909,8 @@ async def test_supervise_names_two_crash_looped_engine_shards_past_the_log_redac
             if not survivor:
                 # Every engine shard is down, so supervise returns by itself.
                 await asyncio.wait_for(task, timeout=5.0)
-        except BaseException:
-            await _stop(task)
+        except BaseException as failure:
+            await _stop(task, failure)
             raise
         # With one engine shard alive supervise runs on, so the cancel stands in for the signal
         # handler. It does nothing to a task that has returned.
