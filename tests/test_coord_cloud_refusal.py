@@ -431,6 +431,10 @@ NOT_GUARDED = {
     "worktree/session-context.ps1": "user-scope hook",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
+    # A dot-sourced library: it names where state lives and writes only its clone-local down-cache.
+    # Every script that calls it carries its own refusal.
+    "coord/coord-root.ps1": "resolver library, clone-local down-cache only",
+    "coord/coord_root.py": "resolver library, clone-local down-cache only",
     # Reads mefor-coord and writes nothing there, or writes only through a guarded script. A reader
     # a person runs by hand, whose empty answer would look clean, is guarded instead.
     "hooks/claim_check.py": "reader, commit-msg hook",
@@ -442,7 +446,6 @@ NOT_GUARDED = {
     "worktree/remove.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
-    "coord/install-git-hooks.ps1": "mention",
     "coord/rescue.ps1": "mention",
     "coord/unbacked_check.ps1": "mention",
     "worktree/register-hygiene-task.ps1": "mention",

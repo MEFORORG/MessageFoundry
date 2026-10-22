@@ -194,3 +194,105 @@ def test_dead_unc_fails_fast_and_caches_the_verdict(
     py2 = coord_root.resolve("claims", repo)
     assert py2.error is not None and "cached" in py2.error
     assert time.monotonic() - start < 30
+
+
+# Regressions from the adversarial review of 2026-10-21. Each one reproduced a twin disagreement, an
+# unbounded probe, or a cache that answered for the wrong root.
+
+
+def test_utf16_root_toml_agrees(repo: Path, tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    local = _local(repo)
+    local.mkdir(parents=True)
+    # What Windows PowerShell 5.1 writes with `>`: UTF-16LE with a BOM.
+    (local / "root.toml").write_bytes(f"shared_root = '{shared}'\r\n".encode("utf-16"))
+    ps, py = _both(repo, "mail")
+    assert py.error is None
+    assert _norm(py.path) == _norm(shared / "mail")
+
+
+def test_non_utf8_root_toml_is_an_error_on_both(repo: Path) -> None:
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_bytes("shared_root = 'C:/caf\xe9'\n".encode("cp1252"))
+    ps, py = _both(repo, "mail")
+    assert py.error is not None and ps["Error"] is not None
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["shared_root = 'C:\\a'\nshared_root = 'C:\\b'\n", "shared_root = 'C:\\a'\njunk\n"],
+)
+def test_every_line_of_root_toml_is_checked(repo: Path, body: str) -> None:
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(body, encoding="utf-8")
+    ps, py = _both(repo, "seats")
+    assert py.error is not None
+
+
+def test_a_root_toml_directory_is_an_error_not_a_fallback(repo: Path) -> None:
+    (_local(repo) / "root.toml").mkdir(parents=True)
+    ps, py = _both(repo, "seats")
+    assert py.error is not None and "not a file" in py.error
+
+
+def test_a_non_ascii_whitespace_char_is_not_trimmed_on_either_side(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared) + "\x1c")
+    ps, py = _both(repo, "seats")
+    assert py.error is not None
+
+
+def test_the_down_cache_answers_only_for_its_own_root(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    down = _local(repo) / "coord-root-down.json"
+    down.parent.mkdir(parents=True)
+    down.write_text(json.dumps({"root": r"\elsewhere\x", "at": "now"}), encoding="utf-8")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" not in py.error
+
+
+def test_a_future_stamped_down_cache_is_ignored(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    down = _local(repo) / "coord-root-down.json"
+    down.parent.mkdir(parents=True)
+    down.write_text(json.dumps({"root": _DEAD_UNC, "at": "later"}), encoding="utf-8")
+    future = time.time() + 86400
+    os.utime(down, (future, future))
+    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" not in py.error
+    os.utime(down, (future, future))
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" not in str(ps["Error"])
+
+
+def test_an_unresolvable_host_is_bounded_in_python(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A single-label name for a PC that is off: getaddrinfo is NOT covered by a socket timeout.
+    monkeypatch.setenv("MEFOR_COORD_ROOT", r"\meforprobezzq\share\mefor-coord")
+    start = time.monotonic()
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None
+    assert time.monotonic() - start < 3
+
+
+def test_missing_kind_does_not_throw_in_powershell(repo: Path) -> None:
+    script = f". '{PS}'; $r = Resolve-CoordDir -From '{repo}'; $r.Error"
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "needs -Kind" in proc.stdout

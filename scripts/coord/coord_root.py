@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import subprocess  # nosec B404 - fixed argv, no shell
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,8 +39,11 @@ DOWN_FILE = "coord-root-down.json"
 DOWN_TTL_SECONDS = 60
 PROBE_TIMEOUT_SECONDS = 1.5
 
-_ROOT_LINE = re.compile(r"\A\s*shared_root\s*=\s*'([^']*)'\s*(#.*)?\Z")
-_BLANK_OR_COMMENT = re.compile(r"\A\s*(#.*)?\Z")
+# ASCII space and tab only, on both twins. Python's \s and str.strip() also take \x1c-\x1f and \x85,
+# which .NET's do not, so a stray control character would resolve on one side and fail on the other.
+_WS = " \t\r\n"
+_ROOT_LINE = re.compile(r"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\Z")
+_BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -69,30 +73,49 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
 
 def shared_root(start: str | os.PathLike[str] | None = None) -> tuple[Path | None, str, str | None]:
     """``(path, source, error)``. ``source`` is ``env``, ``file`` or ``local``; path is None on error."""
-    env = os.environ.get(ROOT_ENV, "")
-    if env.strip():
-        return Path(env.strip()), "env", None
+    env = os.environ.get(ROOT_ENV, "").strip(_WS)
+    if env:
+        return Path(env), "env", None
     local = local_root(start)
     if local is None:
         return None, "local", f"git could not name the common dir for '{start}'"
     file = local / ROOT_FILE
     try:
-        if not file.is_file():
+        if not file.exists():
             return local, "local", None
-        for line in file.read_text(encoding="utf-8-sig").splitlines():
-            if _BLANK_OR_COMMENT.match(line):
-                continue
-            m = _ROOT_LINE.match(line)
-            if m and m.group(1).strip():
-                return Path(m.group(1).strip()), "file", None
+        if not file.is_file():
+            return None, "file", f"{file} exists but is not a file"
+        text = _decode(file.read_bytes())
+    except OSError as exc:
+        return None, "file", f"{file} could not be read: {exc}"
+    except UnicodeDecodeError:
+        return None, "file", f"{file} is not UTF-8 or UTF-16 with a byte-order mark"
+    found: str | None = None
+    for line in text.splitlines():
+        if _BLANK_OR_COMMENT.match(line):
+            continue
+        m = _ROOT_LINE.match(line)
+        if not m or not m.group(1).strip(_WS):
             return (
                 None,
                 "file",
                 f"{file} has a line that is not shared_root = '<path>' (single quotes): {line}",
             )
+        if found is not None:
+            return None, "file", f"{file} names shared_root more than once"
+        found = m.group(1).strip(_WS)
+    if found is None:
         return None, "file", f"{file} names no shared_root"
-    except OSError as exc:
-        return None, "file", f"{file} could not be read: {exc}"
+    return Path(found), "file", None
+
+
+def _decode(raw: bytes) -> str:
+    """UTF-16 with a BOM, UTF-8 with or without one, strictly. The PowerShell twin decodes the same way."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8", errors="strict")
 
 
 def unc_host(path: str) -> str | None:
@@ -105,17 +128,17 @@ def probe_root(path: Path, local: Path | None) -> str | None:
     server = unc_host(str(path))
     if server:
         down = local / DOWN_FILE if local else None
+        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
+        # skewed clock or a copied file, is ignored rather than trusted.
         try:
             if down is not None and down.is_file():
                 age = time.time() - down.stat().st_mtime
-                if age < DOWN_TTL_SECONDS:
+                cached = json.loads(down.read_text(encoding="utf-8")).get("root")
+                if cached == str(path) and 0 <= age < DOWN_TTL_SECONDS:
                     return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
-        except OSError:
+        except (OSError, ValueError, AttributeError):
             pass
-        try:
-            with socket.create_connection((server, 445), timeout=PROBE_TIMEOUT_SECONDS):
-                pass
-        except OSError:
+        if not _reachable(server):
             if down is not None:
                 try:
                     down.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +161,28 @@ def probe_root(path: Path, local: Path | None) -> str | None:
     except OSError as exc:
         return f"shared root {path} cannot be read: {exc}"
     return f"shared root {path} does not exist or is not a directory"
+
+
+def _reachable(server: str) -> bool:
+    """A TCP connect to port 445, bounded as a WHOLE by PROBE_TIMEOUT_SECONDS.
+
+    ``socket.create_connection``'s timeout covers each connect, not name resolution, and it tries every
+    resolved address in turn. Measured: an unresolvable single-label name took 7.2 s with a 1.5 s
+    timeout. So the attempt runs on a daemon thread and the caller waits only the bound.
+    """
+    result: list[bool] = []
+
+    def attempt() -> None:
+        try:
+            with socket.create_connection((server, 445), timeout=PROBE_TIMEOUT_SECONDS):
+                result.append(True)
+        except OSError:
+            result.append(False)
+
+    t = threading.Thread(target=attempt, daemon=True)
+    t.start()
+    t.join(PROBE_TIMEOUT_SECONDS)
+    return bool(result and result[0])
 
 
 def resolve(kind: str, start: str | os.PathLike[str] | None = None) -> CoordDir:

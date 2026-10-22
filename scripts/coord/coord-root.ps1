@@ -56,7 +56,24 @@ $script:CoordDownTtlSeconds = 60
 $script:CoordProbeTimeoutMs = 1500
 
 # A TOML literal string, and nothing else, on a `shared_root` key. An optional trailing comment.
-$script:CoordRootLine = [regex]"\A\s*shared_root\s*=\s*'([^']*)'\s*(#.*)?\z"
+# ASCII space and tab only, never \s: .NET's \s and Python's differ on \x1c-\x1f and \x85, and the twins
+# must give one answer.
+$script:CoordRootLine = [regex]"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\z"
+$script:CoordBlankLine = [regex]'\A[ \t]*(#.*)?\z'
+$script:CoordWs = [char[]]@(' ', "`t", "`r", "`n")
+
+function ConvertFrom-CoordRootBytes {
+    # UTF-16 with a BOM, UTF-8 with or without one, STRICTLY: Windows PowerShell 5.1 writes UTF-16 with
+    # `>`, and an ANSI file with a non-ASCII path must be an error on both twins, not a guess on one.
+    param([byte[]]$Raw)
+    if ($Raw.Length -ge 2 -and (($Raw[0] -eq 0xFF -and $Raw[1] -eq 0xFE) -or ($Raw[0] -eq 0xFE -and $Raw[1] -eq 0xFF))) {
+        $enc = if ($Raw[0] -eq 0xFF) { [System.Text.UnicodeEncoding]::new($false, $true, $true) } else { [System.Text.UnicodeEncoding]::new($true, $true, $true) }
+        return $enc.GetString($Raw, 2, $Raw.Length - 2)
+    }
+    $start = 0
+    if ($Raw.Length -ge 3 -and $Raw[0] -eq 0xEF -and $Raw[1] -eq 0xBB -and $Raw[2] -eq 0xBF) { $start = 3 }
+    return [System.Text.UTF8Encoding]::new($false, $true).GetString($Raw, $start, $Raw.Length - $start)
+}
 
 function Get-CoordLocalRoot {
     # <git-common-dir>/mefor-coord for the repository at $From, or $null when git cannot say.
@@ -74,31 +91,46 @@ function Get-CoordLocalRoot {
 function Get-CoordSharedRoot {
     # Returns @{ Path; Source = 'env'|'file'|'local'; Error }. Path is $null only when Error is set.
     param([string]$From)
-    $envValue = [Environment]::GetEnvironmentVariable($script:CoordRootEnv)
-    if (-not [string]::IsNullOrWhiteSpace($envValue)) {
-        return @{ Path = $envValue.Trim(); Source = 'env'; Error = $null }
+    $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
+    $envValue = $envValue.Trim($script:CoordWs)
+    if ($envValue) {
+        return @{ Path = $envValue; Source = 'env'; Error = $null }
     }
     $local = Get-CoordLocalRoot -From $From
     if (-not $local) {
         return @{ Path = $null; Source = 'local'; Error = "git could not name the common dir for '$From'" }
     }
     $file = Join-Path $local $script:CoordRootFile
+    $text = $null
     try {
-        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $file)) {
             return @{ Path = $local; Source = 'local'; Error = $null }
         }
-        foreach ($line in [System.IO.File]::ReadAllLines($file)) {
-            if ($line -match '\A\s*(#.*)?\z') { continue }
-            $m = $script:CoordRootLine.Match($line)
-            if ($m.Success -and $m.Groups[1].Value.Trim()) {
-                return @{ Path = $m.Groups[1].Value.Trim(); Source = 'file'; Error = $null }
-            }
-            return @{ Path = $null; Source = 'file'; Error = "$file has a line that is not shared_root = '<path>' (single quotes): $line" }
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            return @{ Path = $null; Source = 'file'; Error = "$file exists but is not a file" }
         }
-        return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" }
+        $raw = [System.IO.File]::ReadAllBytes($file)
     } catch {
         return @{ Path = $null; Source = 'file'; Error = "$file could not be read: $($_.Exception.Message)" }
     }
+    try { $text = ConvertFrom-CoordRootBytes -Raw $raw } catch {
+        return @{ Path = $null; Source = 'file'; Error = "$file is not UTF-8 or UTF-16 with a byte-order mark" }
+    }
+    # EVERY line is checked, not the first: a second shared_root, or junk after a valid one, is an error.
+    $found = $null
+    foreach ($line in ($text -split "`r`n|`n|`r")) {
+        if ($script:CoordBlankLine.IsMatch($line)) { continue }
+        $m = $script:CoordRootLine.Match($line)
+        if (-not $m.Success -or -not $m.Groups[1].Value.Trim($script:CoordWs)) {
+            return @{ Path = $null; Source = 'file'; Error = "$file has a line that is not shared_root = '<path>' (single quotes): $line" }
+        }
+        if ($null -ne $found) {
+            return @{ Path = $null; Source = 'file'; Error = "$file names shared_root more than once" }
+        }
+        $found = $m.Groups[1].Value.Trim($script:CoordWs)
+    }
+    if ($null -eq $found) { return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" } }
+    return @{ Path = $found; Source = 'file'; Error = $null }
 }
 
 function Test-CoordSharedKind {
@@ -120,10 +152,13 @@ function Test-CoordRoot {
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
+        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
+        # skewed clock or a copied file, is ignored rather than trusted.
         try {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
-                if ($age -lt $script:CoordDownTtlSeconds) {
+                $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
+                if ($cached -ceq $Path -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
                     return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
@@ -137,7 +172,7 @@ function Test-CoordRoot {
             try {
                 if ($down) {
                     New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
-                    [System.IO.File]::WriteAllText($down, ('{{"root":"{0}","at":"{1}"}}' -f ($Path -replace '\\', '\\'), [DateTime]::UtcNow.ToString('o')))
+                    [System.IO.File]::WriteAllText($down, (@{ root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
                 }
             } catch { }
             return @{ Ok = $false; Error = "shared root $Path is unreachable: no answer from ${server}:445 within $($script:CoordProbeTimeoutMs) ms" }
@@ -156,7 +191,10 @@ function Resolve-CoordDir {
     # A shared kind on a configured root is probed; a caller that writes exclusive state (a claim, an
     # allocation) refuses on Error. A caller that only reads may skip with a note. Neither may fall
     # back to LOCAL for a shared kind.
-    param([string]$From, [Parameter(Mandatory)][string]$Kind)
+    # $Kind is not Mandatory: under -NonInteractive a missing Mandatory parameter THROWS at binding,
+    # and this file never throws (header, constraint 4).
+    param([string]$From, [string]$Kind)
+    if (-not $Kind) { return @{ Path = $null; Shared = $false; Source = 'local'; Error = 'Resolve-CoordDir needs -Kind' } }
     $local = Get-CoordLocalRoot -From $From
     if (-not (Test-CoordSharedKind -Kind $Kind)) {
         if (-not $local) { return @{ Path = $null; Shared = $false; Source = 'local'; Error = "git could not name the common dir for '$From'" } }
