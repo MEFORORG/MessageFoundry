@@ -109,10 +109,12 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] **When the same pull request released engine X, tag `vX` first, and tag the console only once
       engine X is on PyPI.** A console published first requires an engine nobody can install, and a
-      PyPI version cannot be uploaded again if the engine release then fails. In the gap, installing
-      engine X with the `[webconsole]` extra fails at resolve, because console A is not published
-      yet (measured from a checkout of X). An unpinned install may instead pick an earlier engine;
-      that case is unmeasured. A plain `pip install messagefoundry` is unaffected.
+      PyPI version cannot be uploaded again if the engine release then fails. In the gap, a pip
+      install of exactly engine X with the `[webconsole]` extra fails at resolve, because PyPI does
+      not have console A yet. Measured with pip on a checkout whose floor named a console PyPI
+      lacked: "No matching distribution found for messagefoundry-webconsole". What an unpinned
+      `pip install "messagefoundry[webconsole]"` does then is unmeasured; it may fall back to an
+      earlier engine. A plain `pip install messagefoundry` is unaffected.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
       `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`

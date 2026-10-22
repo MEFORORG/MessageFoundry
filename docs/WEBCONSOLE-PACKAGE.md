@@ -91,11 +91,11 @@ current, so choosing X stays a release step.
 floor before console A is on PyPI, and `uv sync` installs the console that matches the tree's seam.
 uv alone reads that table. The published wheel's metadata names only `messagefoundry-webconsole>=A`,
 so pip resolves it from the index; RELEASE.md step 6 says what an install does before A is
-published. A checkout installs the console by path, never through the extra, since pip would fetch
-the published console rather than the tree's. The engine sdist ships that table too, so uv
-installing an unpacked engine sdist directory with the `[webconsole]` extra fails with
-`Distribution not found at .../packaging/messagefoundry-webconsole`; installing the sdist archive
-works. uv does not compare the floor with the in-tree version, so `tests/test_webconsole_extra.py`
+published. Under pip, a checkout installs the console by path, never through the extra, since pip
+would fetch the published console rather than the tree's. The engine sdist also ships
+`[tool.uv.sources]`, so uv installing at least an unpacked engine sdist directory with the
+`[webconsole]` extra fails with `Distribution not found at: file:///.../packaging/messagefoundry-webconsole`.
+Installing the sdist archive with the extra works once console A is on PyPI. uv does not compare the floor with the in-tree version, so `tests/test_webconsole_extra.py`
 holds the two equal.
 
 ### Before it imports the console, `serve` checks whose package it is
