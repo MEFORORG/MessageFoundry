@@ -7,8 +7,10 @@ Synthetic HL7 only. The planted value is a made-up PID segment, never real PHI.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import socket
@@ -388,6 +390,45 @@ def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
         spool.close()
 
 
+def _simulate_cpython_3149_syslog_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``SysLogHandler.__init__`` swallow a ``socket.gaierror`` from ``createSocket``, as
+    CPython 3.14.9 does (see ``_retry_a_swallowed_lookup``), whatever Python runs the test."""
+    real_init = logging.handlers.SysLogHandler.__init__
+
+    def _init(self: logging.handlers.SysLogHandler, *args: Any, **kwargs: Any) -> None:
+        create = self.createSocket
+
+        def _swallow() -> None:
+            with contextlib.suppress(socket.gaierror):
+                create()
+
+        self.createSocket = _swallow  # type: ignore[method-assign]
+        try:
+            real_init(self, *args, **kwargs)
+        finally:
+            vars(self).pop("createSocket", None)
+
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "__init__", _init)
+
+
+def test_the_cpython_3149_simulation_swallows_the_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The positive control for the simulated cases below: the simulation really swallows."""
+
+    def _no_such_name(self: Any) -> None:
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", _no_such_name)
+    handler = logging.handlers.SysLogHandler(
+        address=("siem.example.org", 6514), socktype=socket.SOCK_STREAM
+    )
+    assert getattr(handler, "socket", None) is None
+    handler.close()
+
+
+@pytest.mark.parametrize("cpython_3149", [False, True], ids=["native", "simulated-3.14.9"])
 @pytest.mark.parametrize(
     "error",
     [
@@ -401,9 +442,12 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     error: OSError,
+    cpython_3149: bool,
 ) -> None:
     """Waiting cannot fix a bad certificate or a name that does not resolve, so a spool must not
-    turn either into "not reachable yet"."""
+    turn either into "not reachable yet", on CPython 3.14.9 too."""
+    if cpython_3149:
+        _simulate_cpython_3149_syslog_init(monkeypatch)
 
     def _fail(self: Any) -> None:
         raise error
@@ -427,6 +471,55 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
     again = LogSpool(spool_dir, max_bytes=1_000)
     again.open()
     again.close()
+
+
+@pytest.mark.parametrize("protocol", ["udp", "tcp", "tls"])
+def test_a_name_that_does_not_resolve_fails_permanently_under_the_real_create_socket(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], protocol: str
+) -> None:
+    """The stdlib ``createSocket`` runs for real here and only the lookup is faked, so the UDP arm,
+    which builds the plain stdlib handler, is held to the simulated 3.14.9 behavior as well."""
+
+    def _no_such_name(*args: Any, **kwargs: Any) -> Any:
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    monkeypatch.setattr(socket, "getaddrinfo", _no_such_name)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="siem.example.org", port=514, protocol=protocol, tls_verify=False
+        ),
+    )
+    out = capsys.readouterr().out
+    assert installed is False
+    assert "ERROR" in out and "failed permanently" in out
+
+
+def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lookup that failed for a temporary reason is deferred to the spool, as before 3.14.9."""
+
+    def _try_again(*args: Any, **kwargs: Any) -> Any:
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
+
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    monkeypatch.setattr(socket, "getaddrinfo", _try_again)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="siem.example.org",
+            port=6514,
+            protocol="tcp",
+            spool_dir=str(spool_dir),
+            spool_max_bytes=1_000_000,
+        ),
+    )
+    out = capsys.readouterr().out
+    assert installed is True
+    assert "not reachable yet" in out
+    assert "failed permanently" not in out
 
 
 def test_a_transient_connect_failure_is_still_deferred(
