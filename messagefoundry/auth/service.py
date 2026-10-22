@@ -15864,9 +15864,9 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self) -> int:
-        """Revoke every unrevoked session held by an enabled directory account, lapsed ones
-        included. Returns the number revoked, which is the ``sessions_revoked`` the two map audit
-        rows record; it counts rows, not live sessions.
+        """Revoke every unrevoked session held by an enabled directory account whose record passes
+        its seal, lapsed ones included. Returns the number revoked, which is the
+        ``sessions_revoked`` the two map audit rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
         the group maps resolve to role sets and to channel scope, which is exactly what an
@@ -15884,12 +15884,13 @@ class AuthService:
 
         Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
         :meth:`_load_users`: every enabled directory account whose record passes its seal. An
-        account that fails its seal is left out, and so are its sessions. Each account's unrevoked
-        rows are then revoked with ``revoke_user_sessions``, so this needs no schema change on any
-        backend. The count it returns includes rows already past their limits, which the revoke
-        ends too. Unlike the reconciler this is NOT counted against the mass-revoke breaker: that
-        breaker exists to catch a directory the engine cannot read, and this is an administrator's
-        own step-up-gated edit.
+        account that fails its seal is reported by :meth:`_verified` and left out, and so are its
+        sessions. On a keyless store there is no seal to check, so no account is left out. Each
+        account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
+        needs no schema change on any backend. The count it returns includes rows already past their
+        limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
+        mass-revoke breaker: that breaker exists to catch a directory the engine cannot read, and
+        this is an administrator's own step-up-gated edit.
         """
         revoked = 0
         for user_id in sorted(await self.sessions_ended_by_ad_map_save()):
