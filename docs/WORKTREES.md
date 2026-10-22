@@ -990,7 +990,7 @@ You don't have to brief each new chat by hand. A `SessionStart` hook
 into every new Claude Code window. **When 2+ worktrees share this `.git`** it prints the
 parallel-session block. The block holds at least these: which worktree and branch this chat owns, the
 live peers, what they are building, the work claims, and the shared-memory write rule above. With a
-single worktree it prints only a fault line, when it could not read the session's worktree.
+single worktree it prints at most a line about which worktree it read, such as a fault line.
 
 The block is small on purpose. Past a size threshold, the harness saves a hook's output to a file. It
 then injects only a short preview of the head. This repository does not document that threshold. So

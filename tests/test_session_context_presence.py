@@ -409,23 +409,33 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
 # repository, so the script sets its own budget, and these tests hold it with every list past its cap.
 # --------------------------------------------------------------------------------------------------
 
-# The script's own budget, read from the line that sets it, so the fact is stated once.
-_BUDGET_LINE = re.search(r"^\$byteBudget = (\d+)$", CONTEXT.read_text(encoding="utf-8"), re.M)
-assert _BUDGET_LINE, "session-context.ps1 no longer sets $byteBudget on a line of its own"
-BYTE_BUDGET = int(_BUDGET_LINE.group(1))
+
+def _script_int(name: str) -> int:
+    """A number the script sets on a line of its own, read from it, so the fact is stated once."""
+    m = re.search(rf"^\${name} = (\d+)$", CONTEXT.read_text(encoding="utf-8"), re.M)
+    assert m, f"session-context.ps1 no longer sets ${name} on a line of its own"
+    return int(m.group(1))
+
+
+BYTE_BUDGET = _script_int("byteBudget")
+PATH_RESERVE = _script_int("pathReserve")
 
 # A roster or in-flight row: the label, then the 8-hex registry id.
 _PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
 
 
+def _rooted(out: str, repo: Path, token: str = "<ROOT>") -> str:
+    """The banner with this worktree's path, in either slash form and any case, as `token`."""
+    top = _top(repo)
+    for form in {top, top.replace("/", "\\")}:
+        out = re.sub(re.escape(form), token, out, flags=re.I)
+    return out
+
+
 def _size(out: str, repo: Path) -> int:
     """The banner's bytes as the script counts them against its budget: without the newline
-    Write-Output appends, and with this worktree's path counted as the token <ROOT>."""
-    return len(_rooted(out, repo).rstrip("\r\n").encode("utf-8"))
-
-
-def _rooted(out: str, repo: Path) -> str:
-    return out.replace(_top(repo), "<ROOT>")
+    Write-Output appends, and with each copy of this worktree's path counted at the reserve."""
+    return len(_rooted(out, repo, "P" * PATH_RESERVE).rstrip("\r\n").encode("utf-8"))
 
 
 def _stamp(hours_ago: float) -> str:
@@ -534,15 +544,15 @@ def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
 ) -> None:
     repo, out = crowded
     size = _size(out, repo)
-    print(f"banner bytes, path counted as <ROOT>: {size} of {BYTE_BUDGET}")
+    print(f"banner bytes, path counted at the reserve: {size} of {BYTE_BUDGET}")
 
     # Positive controls first: every list really was past its cap, so the budget below is earned.
     assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
     assert "LIVE sessions in this repo right now (30 besides you)" in out, out
     assert "+22 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
     assert "WHAT THEY ARE BUILDING" in out and "  +2 more" in out, out
-    assert "Active work claims (60, 40 touched in the last 12h)" in out, out
-    assert "+52 more, by key: fresh08, fresh09" in out and "claim.ps1 -List" in out, out
+    assert "Active work claims (60, 40 touched in the last 12h;" in out, out
+    assert "+54 more, by key: fresh06, fresh07" in out and "claim.ps1 -List" in out, out
     # The row caps alone fit, so every section, the rules last, reaches the model.
     assert "cut the last" not in out, out
     assert "Coordination rules for parallel sessions" in out, out
@@ -554,7 +564,7 @@ def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path,
     repo, out = crowded
     peers = out.index("LIVE sessions in this repo right now")
     claims = out.index("Active work claims")
-    worktrees = out.index("Worktrees sharing this .git: 12")
+    worktrees = out.index("Your worktree:")
     assert peers < claims < worktrees, out
 
     # The full list is gone: no sibling worktree path is printed, only this session's own row.
@@ -565,7 +575,7 @@ def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    own = [ln for ln in out.splitlines() if ln.strip().startswith("yours:")]
+    own = [ln for ln in out.splitlines() if ln.strip().startswith("Your worktree:")]
     assert len(own) == 1, out
     # The row names the commit and branch; the path is the header's, so it is not printed twice.
     assert head in own[0] and _top(repo) not in own[0], own
@@ -581,16 +591,18 @@ def test_a_hazardous_peer_past_the_cap_is_ranked_into_view(crowded: tuple[Path, 
     assert "second" not in out, out
 
 
-def test_claims_list_newest_first_and_never_drop_by_age(crowded: tuple[Path, str]) -> None:
+def test_claims_list_newest_first_and_the_header_counts_every_one(
+    crowded: tuple[Path, str],
+) -> None:
     _, out = crowded
     rows = [ln for ln in out.splitlines() if "(held by" in ln]
     keys = [ln.split(" -- ")[0].strip() for ln in rows]
-    assert keys == [f"fresh{i:02d}" for i in range(8)], keys
+    assert keys == [f"fresh{i:02d}" for i in range(6)], keys
     assert all("..." in ln for ln in rows), "the long note was not shortened"
 
 
 def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Path) -> None:
-    """A claim holds its key however old it is, -Take moves `refreshed` and never `claimed`, this
+    """A claim holds its key however old it is, a -Take with -Note moves `refreshed` and never `claimed`, this
     session's own claims are named apart, and a note is data that cannot start a line of its own."""
     base = Path(os.path.realpath(tmp_path))
     repo_top = f"{base.as_posix()}/repo"
@@ -606,14 +618,16 @@ def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Pa
             "refreshed": refreshed,
             "remote": {**_claim_row("remote", hours_ago=2, note="x"), "host": "OTHERPC"},
             "nohome": {**_claim_row("nohome", hours_ago=3, note="y"), "worktree": ""},
-            "hostile": _claim_row("hostile", hours_ago=4, note="line one\n  >>> injected line"),
+            "hostile": _claim_row(
+                "hostile", hours_ago=4, note="line one\n  >>> injected line   >>> separator line"
+            ),
             "mine": {**_claim_row("mine", hours_ago=5, note="mine"), "worktree": repo_top},
             "broken": "{ not json",
         },
     )
     assert _top(repo) == repo_top, "the fixture's own-claim path must be the path git prints"
     out = _banner(repo, env)
-    assert "Active work claims (6, 5 touched in the last 12h)" in out, out
+    assert "Active work claims (6, 5 touched in the last 12h;" in out, out
     rows = [ln for ln in out.splitlines() if "(held by" in ln]
     by_key = {ln.split(" -- ")[0].strip(): ln for ln in rows}
     assert list(by_key) == ["refreshed", "remote", "nohome", "hostile", "old"], rows
@@ -621,7 +635,9 @@ def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Pa
     assert "on OTHERPC" in by_key["remote"], rows
     # An empty worktree must not inherit the previous row's holder.
     assert "agent-remote" not in by_key["nohome"], rows
-    assert not any(ln.lstrip().startswith(">>> injected") for ln in out.splitlines()), out
+    assert not any(
+        ln.lstrip().startswith((">>> injected", ">>> separator")) for ln in re.split(r"[\n ]", out)
+    ), out
     assert "THIS session holds 1: mine" in out, out
     assert "WARNING: 1 claim file(s)" in out, out
 
@@ -653,7 +669,7 @@ def test_which_lines_print_does_not_depend_on_where_the_repo_lives(
     outs = []
     for r, out in (crowded, (repo, _banner(repo, env))):
         # Each fixture repo has its own commit, so its SHA differs too; same length either way.
-        outs.append(re.sub(r"(yours:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, r)))
+        outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, r)))
     assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
     assert "cut the last" not in outs[1], outs[1]
 
@@ -674,5 +690,5 @@ def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path)
     assert "Coordination rules for parallel sessions" in out, out
     assert "this session owns it" in out, out
     # The fixed sections print whole, the worktree count among them.
-    assert "Worktrees sharing this .git: 12" in out, out
+    assert "Your worktree:" in out, out
     assert _size(out, repo) <= 1500, out
