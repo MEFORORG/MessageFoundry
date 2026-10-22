@@ -63,9 +63,7 @@ because one arrived.
    scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
    korus `roles/WIKI.md`.
 3. **Declare your seat.** You CAN, through the Bash tool -- measured 2026-09-02, a headless `-p`
-   Builder did it. This card said the opposite until 2026-09-18, and that rule was self-confirming:
-   a Builder told it cannot declare does not try, renders undeclared, and confirms the rule. Quote
-   the Windows path; unquoted, the shell eats the backslashes.
+   Builder did it. Quote the Windows path; unquoted, the shell eats the backslashes.
    `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat builder -Goal "<one line>"`
 4. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
    blocked to you: `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
@@ -103,7 +101,9 @@ working tree:
 Read the korus `roles/COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
 disagree about this repository.
 
-Apply the driver and empower rules by default; load both skills at session start (off while
-`MEFOR_AFK_KILL` is on). See CLAUDE.md section 5.
+Apply the driver and empower rules by default; load both skills at session start. While
+`MEFOR_AFK_KILL` is not `off`, empower is off and the driver rules still apply. See CLAUDE.md
+section 5.
 
-Live state -- lane counts, throttles, item numbers -- belongs in a dated note, never here.
+This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
+belongs in a dated note, never here.
