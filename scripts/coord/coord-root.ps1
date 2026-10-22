@@ -96,6 +96,9 @@ function Get-CoordSharedRoot {
     $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
     $envValue = $envValue.Trim($script:CoordWs)
     if ($envValue) {
+        if (-not (Test-CoordAbsolutePath $envValue)) {
+            return @{ Path = $null; Source = 'env'; Error = "$($script:CoordRootEnv) is not an absolute path: $envValue" }
+        }
         return @{ Path = $envValue; Source = 'env'; Error = $null }
     }
     $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
@@ -132,7 +135,18 @@ function Get-CoordSharedRoot {
         $found = $m.Groups[1].Value.Trim($script:CoordWs)
     }
     if ($null -eq $found) { return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" } }
+    if (-not (Test-CoordAbsolutePath $found)) {
+        return @{ Path = $null; Source = 'file'; Error = "$file names a shared_root that is not an absolute path: $found" }
+    }
     return @{ Path = $found; Source = 'file'; Error = $null }
+}
+
+function Test-CoordAbsolutePath {
+    # A drive-rooted or UNC path, or (off Windows) a leading slash. A relative root resolves against
+    # each process's own cwd, which puts two sessions on two registries; `C:share` and `\share` are
+    # relative on Windows too. The Python twin carries the same pattern.
+    param([string]$Path)
+    return ($Path -cmatch '\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))')
 }
 
 function Test-CoordSharedKind {
@@ -226,9 +240,13 @@ function Get-CoordHost {
     return [Environment]::MachineName
 }
 
+# What a host field that is present but not a string reads as. It never equals a machine name, so the
+# record is NOT CHECKABLE HERE: only an ABSENT field means legacy, and guessing "this machine" for a
+# malformed one would let this disk judge, and reap, another PC's record. The Python twin matches.
+$script:CoordUnreadableHost = '<unreadable host>'
+
 function Get-CoordRecordHost {
-    # The host a record names, trimmed, or '' when it names none. A non-string value counts as none,
-    # so a malformed record reads as this machine's, the same as one written before the field existed.
+    # The host a record names, trimmed; '' when it names none; the unreadable marker when it is not text.
     param($Record)
     if ($null -eq $Record) { return '' }
     $h = $null
@@ -238,7 +256,8 @@ function Get-CoordRecordHost {
         $p = $Record.PSObject.Properties['host']
         if ($p) { $h = $p.Value }
     }
-    if ($h -isnot [string]) { return '' }
+    if ($null -eq $h) { return '' }
+    if ($h -isnot [string]) { return $script:CoordUnreadableHost }
     return $h.Trim($script:CoordWs)
 }
 

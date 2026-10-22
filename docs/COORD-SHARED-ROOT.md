@@ -228,12 +228,20 @@ design. Reads and builds keep working.
    precondition of step 7, and a separate change, because it moves both ends of the mail contract.
 5. Pick a quiet window. Announce it on the old mail lane.
 6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
-   `robocopy /E /COPY:DT`. Leave the originals in place.
+   `robocopy /E /COPY:DT`. Leave the originals in place. **Then stamp `host = ALIENWARE` on every
+   copied JSON record that has no `host`.** "No host means this machine" is true only on the PC that
+   wrote the record. Unstamped on the share, MEFORDEV01 would judge an ALIENWARE claim by its own disk,
+   read it as HOLDER GONE, and could reap it. The stamp needs a small script with a dry-run, written
+   with this step; nothing in step 3 does it.
 7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
 8. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
    back from a second account.
 9. Rename the old local copies to `*.pre-share` so nothing reads them by accident.
-10. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE.
+10. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE. **First merge
+    its own local state**, because it already runs sessions with its own clones: stamp `host =
+    MEFORDEV01` on its records, then copy its open claims, unread mail and seats to the share. Check
+    every `alloc/<kind>/<n>.json` it holds against the share before copying. A number both PCs
+    allocated is a collision the owner rules on, not one the copy may overwrite.
 
 ## Rollback
 

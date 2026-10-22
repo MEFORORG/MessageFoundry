@@ -296,6 +296,7 @@ _HOST_CASES: list[tuple[str, str]] = [
     ("empty", '{"host": ""}'),
     ("padded-other", '{"host": "X "}'),
     ("non-string", '{"host": 5}'),
+    ("array", '{"host": ["OTHER-PC"]}'),
     ("other", '{"host": "OTHER-PC"}'),
     ("this-lower-padded", json.dumps({"host": " " + coord_root.host().lower() + "\t"})),
 ]
@@ -336,7 +337,9 @@ def test_the_host_predicate_gives_one_answer_in_both_languages() -> None:
     assert want["missing"] == ["", True]
     assert want["null"] == ["", True]
     assert want["empty"] == ["", True]
-    assert want["non-string"] == ["", True], "a non-string host is no host"
+    # Present but not text is NOT legacy: it must never let this disk judge another PC's record.
+    assert want["non-string"] == [coord_root.UNREADABLE_HOST, False]
+    assert want["array"] == [coord_root.UNREADABLE_HOST, False]
     assert want["padded-other"] == ["X", coord_root.host().casefold() == "x"]
     assert want["other"] == ["OTHER-PC", False]
     assert want["this-lower-padded"] == [coord_root.host().lower(), True]
@@ -381,3 +384,31 @@ def test_resolving_the_shared_root_once_matches_per_kind_resolution(
     # A dead root is probed once and refused by the one-shot form too.
     monkeypatch.setenv("MEFOR_COORD_ROOT", str(tmp_path / "absent"))
     assert coord_root.resolve_shared_root(repo)[2] is not None
+
+
+# A relative root resolves against each process's cwd, so two sessions would use two registries.
+@pytest.mark.parametrize("value", ["share", r"..\coord", "C:share", r"\share"])
+def test_a_relative_env_root_is_an_error_on_both(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", value)
+    ps, py = _both(repo, "claims")
+    assert py.error is not None and "absolute" in py.error
+
+
+def test_a_relative_root_toml_value_is_an_error_on_both(repo: Path) -> None:
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text("shared_root = 'relative\\coord'\n", encoding="utf-8")
+    ps, py = _both(repo, "claims")
+    assert py.error is not None and "absolute" in py.error
+
+
+def test_a_form_feed_line_reads_the_same_on_both(repo: Path, tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '{shared}'\x0c\n", encoding="utf-8")
+    ps, py = _both(repo, "claims")
+    assert py.error is not None

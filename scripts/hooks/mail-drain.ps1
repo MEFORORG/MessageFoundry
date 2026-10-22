@@ -1115,16 +1115,12 @@ try {
                 } else {
                     # Both trees, when the shared root is not the local one. A citation in either
                     # protects a receipt; a walk of only one would delete a receipt the other still
-                    # quotes. On the share only seats/ and handoffs/ hold citing documents, so only
-                    # they are walked. The local walk skips the local mail/ tree, whose own names
-                    # would otherwise read as citations.
-                    $citedStems = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                    foreach ($citingKind in @('seats', 'handoffs')) {
-                        $citingDir = Join-Path $coordRoot $citingKind
-                        if (Test-Path -LiteralPath $citingDir -PathType Container) {
-                            $citedStems.UnionWith((Get-CitedStems -CoordRoot $citingDir -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
-                        }
-                    }
+                    # quotes. The share is walked WHOLE, minus its mail/, exactly as the local tree was
+                    # before the move: handoff documents land at the root and under handoff/ as well as
+                    # handoffs/, and a walk narrowed to named kinds deletes receipts cited elsewhere.
+                    # The local walk skips the local mail/ tree, whose own names would otherwise read
+                    # as citations.
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
                     if (Test-Path -LiteralPath $localCoordRoot -PathType Container) {
                         $citedStems.UnionWith((Get-CitedStems -CoordRoot $localCoordRoot -MailRoot (Join-Path $localCoordRoot 'mail') -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
                     }

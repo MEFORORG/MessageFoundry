@@ -44,6 +44,9 @@ PROBE_TIMEOUT_SECONDS = 1.5
 _WS = " \t\r\n"
 _ROOT_LINE = re.compile(r"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\Z")
 _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
+_LINE_BREAK = re.compile(r"\r\n|\n|\r")
+# A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
+_ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -81,6 +84,8 @@ def shared_root(
     """
     env = os.environ.get(ROOT_ENV, "").strip(_WS)
     if env:
+        if not _absolute(env):
+            return None, "env", f"{ROOT_ENV} is not an absolute path: {env}"
         return Path(env), "env", None
     if local is None:
         local = local_root(start)
@@ -98,7 +103,9 @@ def shared_root(
     except UnicodeDecodeError:
         return None, "file", f"{file} is not UTF-8 or UTF-16 with a byte-order mark"
     found: str | None = None
-    for line in text.splitlines():
+    # CR/LF only, as the PowerShell twin splits; str.splitlines() also breaks on \x0b, \x0c,
+    # \x1c-\x1e, \x85 and \u2028, so the two would read different lines out of one file.
+    for line in _LINE_BREAK.split(text):
         if _BLANK_OR_COMMENT.match(line):
             continue
         m = _ROOT_LINE.match(line)
@@ -113,7 +120,15 @@ def shared_root(
         found = m.group(1).strip(_WS)
     if found is None:
         return None, "file", f"{file} names no shared_root"
+    if not _absolute(found):
+        return None, "file", f"{file} names a shared_root that is not an absolute path: {found}"
     return Path(found), "file", None
+
+
+def _absolute(path: str) -> bool:
+    """A drive-rooted or UNC path. A relative root resolves against each process's own cwd, which
+    puts two sessions on two registries; ``C:share`` and ``\\share`` are relative on Windows too."""
+    return bool(_ABSOLUTE.match(path))
 
 
 def _decode(raw: bytes) -> str:
@@ -234,12 +249,18 @@ def host() -> str:
     return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
 
 
+# What a host field that is present but not a string reads as. It never equals a machine name, so the
+# record is NOT CHECKABLE HERE: only an ABSENT field means legacy, and guessing "this machine" for a
+# malformed one would let this disk judge, and reap, another PC's record.
+UNREADABLE_HOST = "<unreadable host>"
+
+
 def record_host(record: object) -> str:
-    """The host a record names, stripped, or '' when it names none. A non-str value counts as none."""
-    if not isinstance(record, dict):
+    """The host a record names, stripped; '' when it names none; UNREADABLE_HOST when it is not text."""
+    if not isinstance(record, dict) or record.get("host") is None:
         return ""
-    value = record.get("host")
-    return value.strip(_WS) if isinstance(value, str) else ""
+    value = record["host"]
+    return value.strip(_WS) if isinstance(value, str) else UNREADABLE_HOST
 
 
 def record_is_here(record: object) -> bool:
