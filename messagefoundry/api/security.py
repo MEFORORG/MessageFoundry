@@ -2102,7 +2102,7 @@ async def recheck_standing_or_refusal(
             # its traceback: ValueError and RuntimeError are also what a bug raises.
             log.warning(
                 "a standing re-check could not read the session again after the factor check"
-                " refused (%s); it names the factor",
+                " refused (%s); the refusal stands, as an unmet factor",
                 type(exc).__name__,
                 exc_info=True,
             )

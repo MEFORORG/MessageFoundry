@@ -742,9 +742,44 @@ async def test_a_store_fault_on_the_second_read_still_records_the_stop(
     assert len(faults) == 1 and faults[0].exc_info is not None
 
 
-async def _fault_the_read_after_the_factor(service: AuthService) -> None:
-    """From now on the factor check refuses, and the session read right after it raises a store
-    fault once per refusal."""
+async def test_a_defect_in_the_stop_row_with_no_cancel_still_raises(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404, the control for the cancel case above: with no cancel in flight, a defect
+    from the stop row's write raises, so a bug is not passed over as a store refusal."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+
+    async def defect() -> None:
+        raise NotImplementedError("a defect in the stop row's write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, defect)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    with pytest.raises(NotImplementedError):
+        await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+
+
+async def test_a_defect_on_the_second_read_is_not_taken_for_a_store_fault(engine: Engine) -> None:
+    """BACKLOG #3404: only a store fault on the read after a refused factor check keeps the
+    refusal. A defect, which ``store_call_errors()`` would otherwise catch as a ``RuntimeError``,
+    raises."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    await _fault_the_read_after_the_factor(service, NotImplementedError("a defect in the read"))
+    with pytest.raises(NotImplementedError):
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+
+
+async def _fault_the_read_after_the_factor(
+    service: AuthService, fault: Exception | None = None
+) -> None:
+    """From now on the factor check refuses, and the session read right after it raises ``fault``,
+    a store fault by default, once per refusal."""
     real_identity_for_token = service.identity_for_token
     armed = False
 
@@ -757,7 +792,7 @@ async def _fault_the_read_after_the_factor(service: AuthService) -> None:
         nonlocal armed
         if armed:
             armed = False
-            raise OSError("store connection lost")
+            raise OSError("store connection lost") if fault is None else fault
         return await real_identity_for_token(token, activity=activity)
 
     service.mfa_satisfied = unmet  # type: ignore[method-assign]
