@@ -665,29 +665,57 @@ def _bound_phrase(seconds: float) -> str:
     return f"bounded at {seconds:g} s"
 
 
+_OPENSSL_NAME_RE = re.compile(r"`(OPENSSL_[A-Z_]+)`")
+
+
 def _cipher_probe_drift(
     text: str, live_seconds: float, openssl_names: tuple[str, ...]
 ) -> list[str]:
-    """Section 4 must state the host cipher probes' timeout as the code sets it, and each variable
-    the ``openssl`` probe passes on top of its allowlist (vault BACKLOG #3804 items 3 and 5).
-    Before this, both were doc-side text that nothing read."""
+    """Section 4 must state the host cipher probes' timeout as the code sets it, and name exactly
+    the variables the ``openssl`` probe passes on top of its allowlist (vault BACKLOG #3804 items
+    3 and 5). Before this, both were doc-side text that nothing read."""
     # Whitespace is collapsed, so a re-wrap of the paragraph does not read as drift.
     section = " ".join(_section(text, 4).split())
     rendered = f"{_bound_phrase(live_seconds)} (`_PROBE_TIMEOUT_S`)"
     problems = [] if rendered in section else [f"section 4 does not state {rendered!r}"]
-    problems += [
-        f"section 4 does not name `{name}`, which the openssl probe passes"
-        for name in openssl_names
-        if f"`{name}`" not in section
-    ]
+    named = set(_OPENSSL_NAME_RE.findall(section))
+    if named != set(openssl_names):
+        problems.append(
+            f"section 4 names {sorted(named)} for the openssl probe, the code passes "
+            f"{sorted(openssl_names)}"
+        )
     return problems
+
+
+def _unbounded_probe_starts(source: str) -> list[str]:
+    """Each ``subprocess.run`` in ``cipher_policy.py`` that does not pass the timeout the page
+    states, or ``["no start"]`` when the scan finds none, so an empty scan cannot read clean."""
+    calls = [
+        node
+        for node in ast.walk(_parse(source))
+        if isinstance(node, ast.Call) and _called_name(node) == "run"
+    ]
+    if not calls:
+        return ["no start"]
+    return [
+        f"the start at line {call.lineno} does not pass timeout=_PROBE_TIMEOUT_S"
+        for call in calls
+        if not any(
+            kw.arg == "timeout"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id == "_PROBE_TIMEOUT_S"
+            for kw in call.keywords
+        )
+    ]
 
 
 def test_the_cipher_probe_text_matches_the_code() -> None:
     from messagefoundry.verify import cipher_policy
 
     live = (cipher_policy._PROBE_TIMEOUT_S, cipher_policy._OPENSSL_ENV)
-    _assert_no_drift(4, _cipher_probe_drift(_doc_text(), *live))
+    problems = _cipher_probe_drift(_doc_text(), *live)
+    problems += _unbounded_probe_starts(_package_sources()["verify/cipher_policy.py"])
+    _assert_no_drift(4, problems)
 
 
 def test_cipher_probe_text_drift_is_reported() -> None:
@@ -701,6 +729,79 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     assert _cipher_probe_drift(broken, seconds, names)
     assert _cipher_probe_drift(text, seconds + 1, names)
     assert _cipher_probe_drift(text, seconds, (*names, "OPENSSL_NEW"))
+    assert _cipher_probe_drift(text, seconds, names[1:])
+
+    source = _package_sources()["verify/cipher_policy.py"]
+    assert not _unbounded_probe_starts(source)
+    # One start loses the bound, the other keeps it.
+    assert source.count("timeout=_PROBE_TIMEOUT_S") == 2
+    assert _unbounded_probe_starts(source.replace("timeout=_PROBE_TIMEOUT_S", "timeout=5.0", 1))
+    assert _unbounded_probe_starts("x = 1\n") == ["no start"]
+
+
+#: The four builders in ``messagefoundry/childenv.py``.
+_BUILDERS = frozenset(
+    {"system_tool_environment", "worker_environment", "hook_environment", "engine_environment"}
+)
+_ENV_LIST_LEAD = "What each start gets, read from the builder it calls."
+_ENV_LIST_END = "At least these pass on the environment"
+_TICKED_RE = re.compile(r"`([^`]+)`")
+
+
+def _env_list_items(text: str) -> list[str]:
+    section = _section(text, 4)
+    start, end = section.find(_ENV_LIST_LEAD), section.find(_ENV_LIST_END)
+    assert 0 <= start < end, "section 4 has lost its environment list or the line after it"
+    return section[start:end].split("\n- ")[1:]
+
+
+def _builders_called(source: str) -> set[str]:
+    return {
+        name
+        for node in ast.walk(_parse(source))
+        if isinstance(node, ast.Call) and (name := _called_name(node)) in _BUILDERS
+    }
+
+
+def _env_list_drift(text: str, sources: Mapping[str, str]) -> list[str]:
+    """Each item of section 4's environment list names modules and builders; each module named must
+    call each builder named (vault BACKLOG #3804 item 3). What a builder lets through is
+    ``childenv.py``'s to say, and nothing here reads it."""
+    items = _env_list_items(text)
+    if not items:
+        return ["section 4's environment list has no items"]
+    problems: list[str] = []
+    for item in items:
+        ticked = _TICKED_RE.findall(item)
+        modules = [tok for tok in ticked if tok.endswith(".py")]
+        builders = {tok for tok in ticked if tok in _BUILDERS}
+        head = " ".join(item.split())[:60]
+        if not modules or not builders:
+            problems.append(f"the item {head!r} names no module or no builder")
+        for module in modules:
+            if module not in sources:
+                problems.append(f"the item {head!r} names {module}, which does not exist")
+            elif missing := builders - _builders_called(sources[module]):
+                problems.append(f"{module} does not call {sorted(missing)}, as {head!r} says")
+    return problems
+
+
+def test_the_environment_list_matches_the_code() -> None:
+    _assert_no_drift(4, _env_list_drift(_doc_text(), _package_sources()))
+
+
+def test_environment_list_drift_is_reported() -> None:
+    text, sources = _doc_text(), _package_sources()
+    assert not _env_list_drift(text, sources)
+    assert _env_list_drift(
+        _replace_once(text, "`pipeline/dr.py`, gets", "`pipeline/sandbox.py`, gets"), sources
+    )
+    assert _env_list_drift(_replace_once(text, "(`hook_environment`)", "(none)"), sources)
+    changed = dict(sources)
+    changed["pipeline/dr.py"] = _replace_once(
+        changed["pipeline/dr.py"], "env=hook_environment()", "env=engine_environment()"
+    )
+    assert _env_list_drift(text, changed)
 
 
 def test_the_scans_read_the_toolkit() -> None:

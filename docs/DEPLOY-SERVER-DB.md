@@ -789,8 +789,9 @@ too. That variable replaces the system file for the driver (measured, last table
 what the programs it starts may still write is listed once, in
 [`testing/VERIFY.md`](testing/VERIFY.md), *What writes, and what does not*. It is not part of
 `messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
-engine runs as, with the same environment, after the reboot on Windows. The programs it starts do
-not get all of that environment, as the manual commands run in your own shell do;
+engine runs as, with the same environment, after the reboot on Windows. That still matters:
+`verify` reads its settings and `OPENSSL_CONF` from it, and passes the OpenSSL variables on. But
+the programs it starts do not get all of it, as the manual commands run in your own shell do;
 [`DANGEROUS-FUNCTIONALITY.md`](DANGEROUS-FUNCTIONALITY.md) section 4, *What each child is
 handed*, states what each one gets.
 

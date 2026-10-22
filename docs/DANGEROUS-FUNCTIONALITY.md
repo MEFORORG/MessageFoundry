@@ -333,8 +333,8 @@ Three argument-list starts are not pinned that way:
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
 environment for the sandbox worker, the disaster-recovery hook and the engine shards. The module
 also builds one for the config-loading child that runs before any shard starts, and for the tray's
-branded relaunch. The list below says what each one gets; the module's docstring says why that is
-not an isolation boundary by itself. The tray's relaunch also takes its command line from that module, so it
+branded relaunch. The list after this paragraph says what each one gets; the module's docstring
+says why that is not an isolation boundary by itself. The tray's relaunch also takes its command line from that module, so it
 starts with `-P` like the engine's Python children. Its environment is the user's whole
 environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
 process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
@@ -346,32 +346,41 @@ isolation (vault BACKLOG #2701). A tray started by hand gets none of the options
 reads the user's `PYTHONPATH`. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path.
 
-What the other children get, read from the builder each start calls:
+What each start gets, read from the builder it calls. Each item names the modules and the
+builders, and a test checks that each module named calls each builder named:
 
-- The `icacls.exe` and `sc.exe` starts, and `verify/cipher_policy.py`'s `powershell.exe`, get the
-  platform's start-up names and nothing else (`system_tool_environment`, vault BACKLOG #2716).
-- The sandbox worker gets an allowlist (`worker_environment`): the platform's start-up names, the
-  interpreter's own variables, the engine switches its own code reads, and the names
-  `[sandbox].pass_environment` lists. No other inherited variable crosses.
-- The disaster-recovery hook gets everything outside the engine's `MEFOR_*` namespace, less the
-  few secret names the module lists outside it (`hook_environment`). A secret kept under any other
-  name still reaches it.
-- The engine shards and the config-loading child get the whole environment, secrets included,
-  less any empty or relative `PYTHONPATH` entry (`engine_environment`).
-- `verify/cipher_policy.py`'s `openssl` gets the platform's start-up names, the interpreter's own
-  variables, and the four variables OpenSSL reads to find its configuration: `OPENSSL_CONF`,
-  `OPENSSL_CONF_INCLUDE`, `OPENSSL_MODULES` and `OPENSSL_ENGINES` (`worker_environment`). No other
-  variable reaches it.
-- `security/audit_all_platforms.py`'s `pip` and `pip-audit` get what the disaster-recovery hook
-  gets, less any empty or relative `PYTHONPATH` entry (`hook_environment` over
-  `engine_environment`). So they keep the index, proxy and certificate settings they read from the
-  environment, and any other variable the runner set, a CI token among them, reaches them too.
+- The `icacls.exe` starts in `auth/trust_anchors.py` and `store/store.py`, the `sc.exe` starts in
+  `service.py` and `service_status.py`, and the `powershell.exe` start in
+  `verify/cipher_policy.py` get the platform's start-up names and nothing else
+  (`system_tool_environment`, vault BACKLOG #2716).
+- The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
+  platform's start-up names, the interpreter's own variables, the engine switches its own code
+  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
+  passed none.
+- The disaster-recovery hook, in `pipeline/dr.py`, gets everything outside the engine's `MEFOR_*`
+  namespace, less the few secret names the module lists outside it (`hook_environment`). A secret
+  kept under any other name still reaches it.
+- The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
+  branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
+  empty or relative `PYTHONPATH` entry (`engine_environment`).
+- The `openssl` start in `verify/cipher_policy.py` gets the platform's start-up names, the
+  interpreter's own variables, and the variables OpenSSL reads to find its configuration,
+  `OPENSSL_CONF`, `OPENSSL_CONF_INCLUDE`, `OPENSSL_MODULES` and `OPENSSL_ENGINES`
+  (`worker_environment`). No other variable reaches it.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
+  disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
+  over `engine_environment`). So they keep the index, proxy and certificate settings they read
+  from the environment, and any other variable the runner set, a CI token among them, reaches them
+  too.
 
-At least these hand over the environment they run with, on purpose: `checks.py`, which adds one
-variable; the tray's opens, where starting VS Code drops the two variables VS Code's own launcher
-manages; and the elevated service-control and install commands, because `ShellExecute` takes no
-environment argument. `tests/test_child_process_environment.py` lists each of those with its
-reason, and fails a new start whose environment does not come from one of that module's builders.
+At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
+variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
+launcher manages. The elevated service-control and install commands go through `ShellExecute`,
+which takes no environment argument, so the code chooses none; which environment Windows gives a
+child raised through the UAC prompt is not measured here. `tests/test_child_process_environment.py`
+lists each of those with its reason, and fails a new start whose environment does not come from
+one of that module's builders.
 
 **The other forms are the ones to look at hardest.**
 
@@ -405,7 +414,8 @@ imported by its path, never by name. No command it runs is looked up by a bare n
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
 Each of the module's two starts, `powershell.exe` and `openssl`, is bounded at 30 s
-(`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and the row reads ERROR.
+(`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and that reading is an
+ERROR.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
@@ -1149,7 +1159,9 @@ A test checks the lists and counts in seven sections. `tests/test_dangerous_func
 reads the code and fails when one of these no longer matches it:
 
 - the section 4 table: a new process start, or a start that changes form, such as a new
-  `shell=True`;
+  `shell=True`. In the list under *What each child is handed*, each module an item names must call
+  each builder it names. The host cipher probes' timeout and the `OPENSSL_*` names must match
+  `verify/cipher_policy.py`, and each of its starts must pass that timeout;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
 - the section 7 parser tables: a parse site the six patterns find that the first two tables omit,
@@ -1171,7 +1183,8 @@ reads the code and fails when one of these no longer matches it:
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Some things no test checks. They include what a script grants, what holds a site, and sections 1,
-2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether either
+2, 3 and 6. In section 4, no test checks what each builder lets through; that is
+`messagefoundry/childenv.py`'s to say. In section 7, no test checks which table a parse site belongs in, or whether either
 hand-read table is complete. In section 11, no test checks the settings a harness-started engine
 is given, the store reset, the listener bind addresses, or which row a parse site belongs in. The
 import-by-name and config-loader checks match the called name, so a call through another name
