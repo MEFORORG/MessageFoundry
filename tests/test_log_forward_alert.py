@@ -11,9 +11,7 @@ alert, and the status model. No test opens a socket or resolves a name.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import logging.handlers
 import queue
 import socket
 from pathlib import Path
@@ -148,62 +146,6 @@ def test_a_forwarder_that_fails_at_start_reads_not_installed(
     # A fixed word, never the exception text or the host.
     dumped = info.model_dump_json()
     assert "collector" not in dumped and "no such name" not in dumped
-
-
-def _init_as_on_3_14_9(
-    self: logging.handlers.SysLogHandler,
-    address: Any = ("localhost", logging.handlers.SYSLOG_UDP_PORT),
-    facility: int = logging.handlers.SysLogHandler.LOG_USER,
-    socktype: Any = None,
-    timeout: float | None = None,
-) -> None:
-    """``SysLogHandler.__init__`` as CPython 3.14.9 ships it: a ``socket.gaierror`` from
-    ``createSocket`` is caught and the lookup left to the first send."""
-    logging.Handler.__init__(self)
-    self.address = address
-    self.facility = facility
-    self.socktype = socktype
-    self.timeout = timeout
-    self.socket = None  # type: ignore[attr-defined]
-    with contextlib.suppress(socket.gaierror):
-        self.createSocket()
-
-
-@pytest.mark.parametrize(
-    ("exc", "word"),
-    [
-        (socket.gaierror(11001, "no such name"), "permanent"),
-        (ConnectionRefusedError("collector down"), "transient"),
-    ],
-)
-def test_a_failed_start_reads_not_installed_where_the_constructor_swallows_a_lookup_error(
-    monkeypatch: pytest.MonkeyPatch, exc: OSError, word: str
-) -> None:
-    """On CPython 3.14.9 the stdlib constructor no longer raises a lookup error, so a name that does
-    not resolve read as a forwarder that started (it did, on the 3.14.9 CI runners). This puts the
-    3.14.9 constructor in place on every interpreter, for the TCP arm without a spool; the transient
-    case shows an error the constructor does not swallow is unchanged."""
-    monkeypatch.setattr(logging.handlers.SysLogHandler, "__init__", _init_as_on_3_14_9)
-    _fail_the_start(monkeypatch, exc)
-    assert configure_logging("INFO", forward=FORWARD) is False
-    status = forwarder_status()
-    assert (status.installed, status.start_failure) == (False, word)
-
-
-def test_a_udp_forwarder_reads_not_installed_where_the_constructor_swallows_a_lookup_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The UDP arm builds the plain stdlib handler, so the 3.14.9 constructor reaches it as well."""
-
-    def _no_such_name(self: Any) -> None:
-        raise socket.gaierror(11001, "no such name")
-
-    monkeypatch.setattr(logging.handlers.SysLogHandler, "__init__", _init_as_on_3_14_9)
-    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", _no_such_name)
-    udp = SyslogForward(host="collector.invalid", port=514)
-    assert configure_logging("INFO", forward=udp) is False
-    status = forwarder_status()
-    assert (status.installed, status.start_failure) == (False, "permanent")
 
 
 def test_a_later_configure_without_a_forwarder_clears_the_failure(

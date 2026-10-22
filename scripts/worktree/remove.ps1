@@ -219,6 +219,12 @@ $linked = @()
 # Get-RepoWorktrees, ConvertTo-Norm, Get-NestedWorktrees and the occupancy fence. Every route uses
 # ConvertTo-Norm, because it must agree with claim.ps1's writer.
 . "$PSScriptRoot\..\coord\occupancy.ps1"
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    throw "remove.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was removed."
+}
+. $coordRootScript
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -565,6 +571,14 @@ if ($byPath) {
 # the target, and follows it ONE hop to that repository's common dir. Reading only this clone's
 # own registry would be blind to every claim once the setting is made. The clone's own registry is
 # read AS WELL: a claim taken before the setting was made, or by an older claim.ps1, is there.
+# This repository's shared root, resolved and probed once for both claims/ and alloc/. The target
+# worktree and $GitRoot share one common dir, so either names the same root.
+$script:OwnSharedRoot = $null
+function Get-OwnSharedRoot {
+    if ($null -eq $script:OwnSharedRoot) { $script:OwnSharedRoot = Resolve-CoordSharedRoot -From $GitRoot }
+    return $script:OwnSharedRoot
+}
+
 function Get-TargetClaimsDirs {
     $setting = "$(& git -C $WorktreePath config --get mefor.claimsRoot 2>$null)".Trim()
     # Exit 1 is "not set". Anything else is a config git could not read, which could hide the key.
@@ -572,11 +586,13 @@ function Get-TargetClaimsDirs {
     if ($code -ne 0 -and $code -ne 1) {
         throw "git could not read mefor.claimsRoot in '$WorktreePath' (exit $code), so claims are unknown. Nothing was removed."
     }
-    $own = "$(& git -C $WorktreePath rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $own) {
-        throw "git could not name the common git dir of '$WorktreePath', so claims are unknown. Nothing was removed."
+    # The registry may sit on the shared root (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names
+    # it. A resolver error is claims-unknown, which refuses like every other cannot-tell here.
+    $own = Get-OwnSharedRoot
+    if ($own.Error) {
+        throw "the claim registry of '$WorktreePath' could not be resolved ($($own.Error)), so claims are unknown. Nothing was removed."
     }
-    $dirs = @(Join-Path $own 'mefor-coord/claims')
+    $dirs = @(Join-Path $own.Path 'claims')
     if ($code -eq 0 -and $setting) {
         # claim.ps1 hands the value to git as it stands, so a relative one resolves against the
         # caller's shell. Nothing here can tell which shell that was.
@@ -589,11 +605,11 @@ function Get-TargetClaimsDirs {
             throw ("mefor.claimsRoot in '$WorktreePath' names '$setting', which is not a git repository, so " +
                 "claims are unknown. Nothing was removed.")
         }
-        $common = "$(& git -C $rootTop rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $common) {
-            throw "git could not name the common git dir of '$rootTop', so claims are unknown. Nothing was removed."
+        $hop = Resolve-CoordDir -From $rootTop -Kind 'claims'
+        if ($hop.Error) {
+            throw "the claim registry of '$rootTop' could not be resolved ($($hop.Error)), so claims are unknown. Nothing was removed."
         }
-        $dirs += Join-Path $common 'mefor-coord/claims'
+        $dirs += $hop.Path
     }
     return @($dirs | Sort-Object -Unique { ConvertTo-Norm $_ })
 }
@@ -629,8 +645,11 @@ function Read-RecordFile([System.IO.FileSystemInfo]$File) {
                 ($c.branch -is [string]) -and ($c.branch -eq '')
         }
     }
-    if ($problem) { return [pscustomobject]@{ Name = $File.Name; Record = $null; Holder = ''; Problem = $problem; Tombstone = $tombstone } }
-    [pscustomobject]@{ Name = $File.Name; Record = $c; Holder = (ConvertTo-Norm $c.worktree); Problem = ''; Tombstone = $tombstone }
+    if ($problem) { return [pscustomobject]@{ Name = $File.Name; Record = $null; Holder = ''; Problem = $problem; Tombstone = $tombstone; Elsewhere = $false } }
+    # ELSEWHERE: written on another machine, so its path names that machine's disk and can never be
+    # this tree, however the strings compare (docs/COORD-SHARED-ROOT.md). No `host` is this machine.
+    $elsewhere = -not (Test-CoordRecordIsHere $c)
+    [pscustomobject]@{ Name = $File.Name; Record = $c; Holder = (ConvertTo-Norm $c.worktree); Problem = ''; Tombstone = $tombstone; Elsewhere = $elsewhere }
 }
 
 function Read-ClaimFiles([string]$Dir) {
@@ -643,7 +662,7 @@ function Read-ClaimFiles([string]$Dir) {
 $claimsDirs = @(Get-TargetClaimsDirs)
 $claimFiles = @(Read-TargetClaims)
 if ($claimFiles.Count -gt 0) {
-    $heldKeys = @($claimFiles | Where-Object { $_.Holder -and $targetNorms -contains $_.Holder } | ForEach-Object { $_.Key })
+    $heldKeys = @($claimFiles | Where-Object { $_.Holder -and -not $_.Elsewhere -and $targetNorms -contains $_.Holder } | ForEach-Object { $_.Key })
     $claimsUnreadable = @($claimFiles | Where-Object { $_.Problem })
     if ($heldKeys.Count -gt 0 -or $claimsUnreadable.Count -gt 0) {
         if ($heldKeys.Count -gt 0) {
@@ -986,11 +1005,13 @@ else {
 #
 # BOTH ROUTES FAIL CLOSED on a common dir git cannot name and on an alloc directory that cannot be
 # listed. -Name used to read both as "no records found" (vault BACKLOG #2985, item 11, and #2988).
-$commonDirPre = "$(& git -C $GitRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
-if ($LASTEXITCODE -ne 0 -or -not $commonDirPre) {
-    throw "git could not name the common git dir of '$GitRoot', so allocations are unknown. Nothing was removed."
+# The allocation registry may sit on the shared root (docs/COORD-SHARED-ROOT.md); an error is
+# allocations-unknown, which refuses.
+$allocResolved = Get-OwnSharedRoot
+if ($allocResolved.Error) {
+    throw "the allocation registry of '$GitRoot' could not be resolved ($($allocResolved.Error)), so allocations are unknown. Nothing was removed."
 }
-$allocDirRoot = Join-Path $commonDirPre 'mefor-coord/alloc'
+$allocDirRoot = Join-Path $allocResolved.Path 'alloc'
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
@@ -1022,7 +1043,7 @@ if (Test-PresentOrThrow $allocDirRoot 'the allocation directory') {
         # The retired-allocator tombstone names no worktree on purpose, so it can strand nothing.
         if ($r.Tombstone) { continue }
         if ($r.Problem) { $allocUnreadable += "$($f.Name) ($($r.Problem))"; continue }
-        if ($targetNorms -notcontains $r.Holder) { continue }
+        if ($r.Elsewhere -or $targetNorms -notcontains $r.Holder) { continue }
         $a = $r.Record
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
         if ($onMain -ne $true) {
@@ -1112,7 +1133,7 @@ if (-not $byPath) { & git -C $RepoRoot worktree prune }
 # REPORTS, NEVER THROWS. The worktree is already gone by this point; throwing here would report the
 # whole removal as failed and invite a re-run of something that already succeeded.
 try {
-    $late = @(Read-TargetClaims | Where-Object { $_.Problem -or ($targetNorms -contains $_.Holder) })
+    $late = @(Read-TargetClaims | Where-Object { $_.Problem -or (-not $_.Elsewhere -and $targetNorms -contains $_.Holder) })
     foreach ($c in $late) {
         if ($c.Problem) {
             Write-Warning "claim file $($c.Name) $($c.Problem) and was left in place; it may name the removed worktree."

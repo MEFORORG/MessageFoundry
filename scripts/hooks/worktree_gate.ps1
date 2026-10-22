@@ -4468,8 +4468,75 @@ turned off and I need you to do it." Do not disable it yourself.
 # blocked trains people to route around it (rule 3's note above records that happening).
 # ---------------------------------------------------------------------------------------------------
 $targetCmp = Get-ComparablePath $target
+# RULE 1b'S SUBJECTS ARE EVERY COORDINATION ROOT, NOT ONLY THE LOCAL ONE (docs/COORD-SHARED-ROOT.md).
+# Seats, mail, claims and allocations may live on a SHARED root, an SMB share both PCs reach. Rule 1 never
+# governed that path (it is not under any primary checkout), so before this the gate let a write tool
+# hand-write claims/<item>.json there: the exact transfer rule 1b refuses locally. So the shared root is a
+# rule 1b subject too, and ONLY rule 1b's: an unarmed write there falls through to the rest of the gate
+# exactly as before, rather than taking the local root's exit-0 exemption. Every verdict this changes
+# moves ALLOW to DENY.
+#
+# READ LEXICALLY, WITH NO NETWORK CALL: $env:MEFOR_COORD_ROOT, then each governed root's
+# .git/mefor-coord/root.toml (scripts/coord/coord-root.ps1 is the resolver; this copy is inline because
+# the gate runs from a user-scope COPY that cannot dot-source the repo). A mapped drive letter whose
+# DisplayRoot is that share is folded onto it too, so the Z: spelling of a UNC root is caught. NOT
+# covered, stated rather than implied: the same server reached by another name (an IP for a hostname,
+# an FQDN), and a junction pointing into the share.
+$coordRoots = [System.Collections.Generic.List[object]]::new()
 foreach ($r in $roots) {
-    $coordRoot = "$($r.Compare)/.git/mefor-coord/"
+    $coordRoots.Add([pscustomobject]@{ Prefix = "$($r.Compare)/.git/mefor-coord/"; Shared = $false })
+}
+$sharedSpellings = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT)) { $sharedSpellings.Add($env:MEFOR_COORD_ROOT.Trim()) }
+foreach ($r in $roots) {
+    $rootToml = Join-Path $r.Display '.git/mefor-coord/root.toml'
+    try {
+        if (Test-Path -LiteralPath $rootToml -PathType Leaf) {
+            foreach ($line in [System.IO.File]::ReadAllLines($rootToml)) {
+                if ($line -match "\A\s*shared_root\s*=\s*'([^']+)'") { $sharedSpellings.Add($Matches[1].Trim()); break }
+            }
+        }
+    } catch { }
+}
+# A shared spelling that EQUALS, CONTAINS or sits INSIDE a governed root is a misconfiguration, never a
+# real share: honoured, it would put every worktree's source files under rule 1b's shape backstop and
+# refuse all code writes with a message about coordination state. It is ignored here; the resolver's
+# own refusal is what reports it.
+foreach ($spelling in $sharedSpellings) {
+    $cmp = Get-ComparablePath $spelling
+    if (-not $cmp) { continue }
+    $overlaps = $false
+    foreach ($r in $roots) {
+        if ($cmp -eq $r.Compare -or
+            $r.Compare.StartsWith("$cmp/", [System.StringComparison]::Ordinal) -or
+            $cmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $overlaps = $true; break }
+    }
+    if (-not $overlaps) { $coordRoots.Add([pscustomobject]@{ Prefix = "$cmp/"; Shared = $true }) }
+}
+$targetSpellings = [System.Collections.Generic.List[string]]::new()
+if ($targetCmp) { $targetSpellings.Add($targetCmp) }
+# The UNC spelling can only match a Shared entry, so with none there is no drive to look up.
+if (@($coordRoots | Where-Object { $_.Shared }).Count -gt 0 -and $targetCmp -match '^([a-z]):/') {
+    try {
+        $drive = Get-PSDrive -Name $Matches[1] -PSProvider FileSystem -ErrorAction Stop
+        if ($drive.DisplayRoot -and $drive.DisplayRoot.StartsWith('\\')) {
+            $unc = Get-ComparablePath ($drive.DisplayRoot.TrimEnd('\') + '\' + $targetCmp.Substring(3))
+            if ($unc) { $targetSpellings.Add($unc) }
+        }
+    } catch { }
+}
+$coordMatch = $null
+foreach ($cr in $coordRoots) {
+    foreach ($tc in $targetSpellings) {
+        if ($tc.StartsWith($cr.Prefix, [System.StringComparison]::Ordinal)) {
+            $coordMatch = [pscustomobject]@{ Root = $cr; Rest = $tc.Substring($cr.Prefix.Length) }
+            break
+        }
+    }
+    if ($coordMatch) { break }
+}
+
+if ($coordMatch) {
     # ORDINAL, EXPLICITLY, on both this match and the denylist's below. The one-argument
     # String.StartsWith overload compares under the CURRENT CULTURE, which SKIPS collation-ignorable
     # characters -- measured on this host, "<root>/.git/mefor-coord`u{200D}/evil".StartsWith("<root>/.git/
@@ -4478,8 +4545,7 @@ foreach ($r in $roots) {
     # and the comment above earns the word "required" only under it. It matters most on rule 1b: a
     # culture-sensitive denylist decides membership of a SECURITY list by collation, which is not a
     # property anyone auditing this file would think to check.
-    if (-not $targetCmp.StartsWith($coordRoot, [System.StringComparison]::Ordinal)) { continue }
-    $rest = $targetCmp.Substring($coordRoot.Length)
+    $rest = $coordMatch.Rest
 
     # CLASSIFY THE FILE THE WRITE LANDS ON, NOT THE SPELLING. `foo.json:bar.md` names an NTFS ALTERNATE
     # DATA STREAM of foo.json, and every classifier below would otherwise read the STREAM's name instead of
@@ -4600,21 +4666,23 @@ foreach ($r in $roots) {
     if (-not $armed -and
         [System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")) {
         $armed = @{
-            What = "a file under .git\mefor-coord\ that is not a handoff document or a delivery receipt," +
+            What = "a file under $(if ($coordMatch.Root.Shared) { 'the shared coordination root' } else { '.git\mefor-coord\' }) that is not a handoff document or a delivery receipt," +
                    " so this gate treats it as machine-read coordination state"
             Fix  = "if you meant to leave a NOTE, name it .md (or .txt); if you meant to append a delivery" +
                    " receipt, that is announce\sent\<session-id>.tsv"
         }
     }
 
-    if (-not $armed) { exit 0 }
+    # The local root's unarmed documents keep rule 1's exemption. The shared root never had one to keep.
+    if (-not $armed -and -not $coordMatch.Root.Shared) { exit 0 }
 
-    Write-Deny -Rule "1b" -Detail $target -Reason @"
-BLOCKED: this writes $($armed.What), which another gate on this machine reads as AUTHORITY ($(Get-SafeForMessage $target)).
+    if ($armed) { Write-Deny -Rule "1b" -Detail $target -Reason @"
+BLOCKED: this writes $($armed.What), which $(if ($coordMatch.Root.Shared) { 'another gate, on this PC or on any other PC sharing this root,' } else { 'another gate on this machine' }) reads as AUTHORITY ($(Get-SafeForMessage $target)).
 
-Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
-exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is
-neither. It lives in the git COMMON dir -- ONE file, shared by every
+$(if ($coordMatch.Root.Shared) { "Handoff documents and delivery receipts on the shared coordination root are allowed, but only by SHAPE:
+a .md or .txt document, or a .tsv receipt. This path is" } else { "Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
+exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is" })
+neither. It lives in $(if ($coordMatch.Root.Shared) { 'the SHARED coordination root, read by every session on every PC' } else { 'the git COMMON dir' }) -- ONE file, shared by every
 worktree at once -- and the gate that reads it decides from a single field, or from the file merely
 existing, so a hand-written copy is indistinguishable from a real one. That is how a write here forges an
 allocation the allocator never issued, transfers a claim whose holder still believes it is theirs, or turns
@@ -4628,7 +4696,7 @@ Do this instead:
 If the state itself is WRONG -- a stale claim, a ratchet left high by an earlier accident -- say so and let
 the user decide, naming the file and the change you want. Do not hand-edit it, and do not route around this
 with a shell command; that only removes the record of which session did it.
-"@
+"@ }
 }
 
 $root = Test-Governed $targetCmp

@@ -67,8 +67,9 @@ def repo(tmp_path: Path) -> Path:
     git(r, "config", "user.email", "t@example.invalid")
     git(r, "config", "user.name", "t")
     shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(CLAIM.parent / "coord-root.ps1", r / "scripts" / "coord" / "coord-root.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
-    git(r, "add", "f.txt", "scripts/coord/claim.ps1")
+    git(r, "add", "f.txt", "scripts/coord/claim.ps1", "scripts/coord/coord-root.ps1")
     git(r, "commit", "-qm", "base")
     return r
 

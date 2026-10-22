@@ -6,7 +6,8 @@
     DIFFERENT account reads to reconstitute a replacement fleet after an account switch.
 
 .DESCRIPTION
-    PURE READER over <git-common-dir>/mefor-coord/seats/. It writes nothing except the render
+    PURE READER over <shared root>/seats/ (coord-root.ps1; <git-common-dir>/mefor-coord/seats/ when
+    nothing is configured). It writes nothing except the render
     artifacts named below, and it holds NO liveness opinion of its own: the fence is
     session-registry.ps1's, dot-sourced. claim.ps1 already accreted a private Get-HolderLiveness
     beside the fence that six other files route through, and a second definition of a safety check
@@ -46,6 +47,14 @@
     100 main commits carry a (#N) squash suffix. The landed probe therefore compares CONTENT over a
     pathspec derived from the record's own mergeBase, and an empty pathspec is UNCHECKABLE, never
     AGREES.
+
+    A RECORD FROM ANOTHER PC IS NEVER JUDGED HERE. On a shared root the registry holds seats from
+    every PC, and both of this reader's liveness inputs -- the session-registry fence and the handoff
+    file on disk -- are per-PC. A seat running on the other PC has no session here and its paths do
+    not exist here, so judging it would read a live seat as INTERRUPTED and invite a respawn of work
+    still running. Such a record renders as ON <HOST> and is excluded from the respawn population and
+    the pointer census. A record with no `host` predates the field and is this PC's
+    (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would ship").
 #>
 [CmdletBinding()]
 param(
@@ -73,6 +82,7 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\session-registry.ps1"
 . "$PSScriptRoot\mail-key.ps1"
+. "$PSScriptRoot\coord-root.ps1"
 
 function Invoke-Git {
     param([string]$Dir, [string[]]$GitArgs)
@@ -90,9 +100,18 @@ if (-not $common) {
     Write-Error "fleet.ps1: not inside a git repository (or git failed). Cannot locate the seats layer."
     exit 2
 }
-$coord = Join-Path $common 'mefor-coord'
-$seatsDir = Join-Path $coord 'seats'
+# seats/ is a SHARED kind. A root that does not answer is a refusal, never a quiet read of the local
+# copy: that copy is the one the other PC never writes, so it would render as a complete, smaller fleet.
+$seatsRes = Resolve-CoordDir -From $repo -Kind 'seats' -LocalRoot (Join-Path ([string]$common).Trim() 'mefor-coord')
+if ($seatsRes.Error) {
+    # stderr directly, not Write-Error: under this file's 'Stop' preference Write-Error throws and the
+    # exit code would be 1 instead of the 2 this refusal documents.
+    [Console]::Error.WriteLine("fleet.ps1: the shared seat registry did not resolve, so nothing was read: $($seatsRes.Error)")
+    exit 2
+}
+$seatsDir = $seatsRes.Path
 $primary = Split-Path $common -Parent
+$thisHost = Get-CoordHost
 
 # ---------------------------------------------------------------------------------------------
 # Gather. Records first, then the fence, then the denominator.
@@ -366,8 +385,10 @@ foreach ($r in $records) {
 
     # Fence state, positive answers only. There is no heartbeat on this host and registry writes are
     # event-driven, so nothing here can PROVE a session is gone -- only that it is present.
-    $fence = 'UNKNOWN'
-    if ($fenceAvailable -and $sid) {
+    # The fence is this PC's session registry, so it is never asked about another PC's record.
+    $isHere = Test-CoordRecordIsHere $rec
+    $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
+    if ($isHere -and $fenceAvailable -and $sid) {
         try { $fence = (Get-SessionLiveness -SessionId $sid).State } catch { $fence = 'UNKNOWN' }
     }
 
@@ -387,6 +408,7 @@ foreach ($r in $records) {
         { $lifecycle -eq 'closed' }                    { 'CLOSED'; break }
         { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
         { $superseded }                                { 'SUPERSEDED'; break }
+        { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
         { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $fence -in @('UNVERIFIED', 'UNREADABLE') }   { 'POSSIBLY RUNNING'; break }
         { -not $fenceAvailable }                       { 'UNKNOWN-NO-FENCE'; break }
@@ -413,6 +435,8 @@ foreach ($r in $records) {
         WriterStale = $writerStale
         Branch      = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
         Worktree    = $wt
+        Host        = Get-CoordRecordHost $rec
+        IsHere      = $isHere
         Epoch       = if ($rec.PSObject.Properties.Name -contains 'poolEpoch') { [int]$rec.poolEpoch } else { $null }
         Rec         = $rec
         File        = $r.File
@@ -442,11 +466,14 @@ if ($null -eq $originMainFetchAgeMinutes) {
 # numerator alone cannot be read: "1 dangling" is a crisis at 2 pointers and noise at 200. Measured
 # 2026-08-22 the ratio was 2 broken of 3 recorded against 262 records -- the denominator is the part
 # that says the mechanism is unused, and the numerator is the part that says the few uses are wrong.
-$ptrTotal = 0; $ptrDangling = 0; $ptrDrifted = 0; $ptrUnreadable = 0
+$ptrTotal = 0; $ptrDangling = 0; $ptrDrifted = 0; $ptrUnreadable = 0; $ptrOtherHost = 0
 $ptrBoxes = @{}
 foreach ($o in $records) {
     $h = $o.Rec.handoff
     if (-not ($h -and $h.path)) { continue }
+    # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
+    # stop below for a document that resolves where it was written, so it is counted apart.
+    if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
     $ptrTotal++
     # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
     # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves
@@ -492,6 +519,8 @@ if ($ptrDangling -gt 0) {
 $receipt = [ordered]@{
     renderedAtUtc             = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
     seatsDir                  = $seatsDir
+    thisHost                  = $thisHost
+    recordsOtherHost          = @($rows | Where-Object { -not $_.IsHere }).Count
     rootsExamined             = $rootsExamined
     fenceAvailable            = $fenceAvailable
     recordsExamined           = $records.Count
@@ -521,6 +550,7 @@ $receipt = [ordered]@{
     handoffPointersDangling   = $ptrDangling
     handoffPointersDrifted    = $ptrDrifted
     handoffPointersUnreadable = $ptrUnreadable
+    handoffPointersOtherHost  = $ptrOtherHost
     stopConditions            = @($stops)
 }
 
@@ -538,6 +568,10 @@ if ($Chip) {
     $lines += "world has moved since -- RE-VERIFY BEFORE YOU ACT, do not trust a line because it is specific."
     $lines += ""
     $lines += "PREDECESSOR CHECKOUT: $($rec.worktree)"
+    if (-not $row.IsHere) {
+        $lines += "RECORDED ON $($row.Host.ToUpperInvariant()), NOT THIS PC ($thisHost). That checkout and any handoff path"
+        $lines += "below are on that PC, and nothing here could check them. Run the git steps there."
+    }
     $lines += "BRANCH: $($row.Branch)   (identified by NAME, never by a commit id -- a rebase reissues the id)"
     if ($rec.tip) { $lines += "ITS TIP WAS: $($rec.tip)  AS OF $($rec.asOf). Resolve the branch yourself; do not use this id as an identifier." }
     $lines += ""
@@ -607,10 +641,13 @@ if ($Chip) {
         # last turn ended 2026-08-19. Only a reader was ever going to catch it.
         $hp = [string]$rec.handoff.path
         $live = $null
-        try { if (Test-Path -LiteralPath $hp -PathType Leaf) { $live = (Get-Item -LiteralPath $hp -EA Stop).Length } }
+        try { if ($row.IsHere -and (Test-Path -LiteralPath $hp -PathType Leaf)) { $live = (Get-Item -LiteralPath $hp -EA Stop).Length } }
         catch { $live = $null }
         $wasBytes = $rec.handoff.bytes
-        if ($null -eq $live) {
+        if (-not $row.IsHere) {
+            $lines += "     NOT CHECKED: that path is on $($row.Host). Open it there."
+        }
+        elseif ($null -eq $live) {
             $lines += "     WARNING: THAT FILE IS NOT THERE NOW. Treat it as a lead, not a document."
         }
         elseif ($null -ne $wasBytes -and [long]$wasBytes -ne [long]$live) {
@@ -637,11 +674,12 @@ if ($Json) {
         # Handoff* are computed here, not read from the record: -Json is what another tool consumes,
         # and a consumer that got the recorded flag would inherit the same never-re-checked value the
         # human render stopped trusting above.
-        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch,
+        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Host, Epoch,
             @{n = 'HandoffPath'; e = { if ($_.Rec.handoff) { [string]$_.Rec.handoff.path } else { $null } } },
             @{n = 'HandoffState'; e = {
                     $h = $_.Rec.handoff
                     if (-not ($h -and $h.path)) { return $null }
+                    if (-not $_.IsHere) { return 'not-checkable-here' }
                     try {
                         if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { return 'dangling' }
                         if ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { return 'drifted' }
@@ -697,7 +735,7 @@ if ($folded -gt 0) { ""; "$folded row(s) folded as ORPHANED-STALE (older than $F
 
 ""
 "RESPAWN POPULATION (INTERRUPTED, HANDED): " + @($rows | Where-Object { $_.State -in @('INTERRUPTED', 'HANDED') }).Count
-"  Never respawned: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED."
+"  Never respawned: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED, ON <HOST> (another PC's seat)."
 "  Briefing for one row:  fleet.ps1 -Chip -BoxKey <box> -SessionKey <key>"
 
 $code = if ($fenceAvailable) { 0 } else { 2 }

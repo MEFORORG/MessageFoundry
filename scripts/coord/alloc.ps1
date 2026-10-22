@@ -154,7 +154,27 @@ $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
 $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-$allocRoot = Join-Path $common "mefor-coord/alloc"
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("alloc.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or allocated.")
+    exit 2
+}
+. $coordRootScript
+$thisHost = Get-CoordHost
+
+# THE REGISTRY IS FLEET-WIDE, SO IT FAILS CLOSED (docs/COORD-SHARED-ROOT.md, "Offline behaviour"). A
+# local fallback while the shared root is down would mint from a second registry that cannot see the
+# first, which is the clean-merging collision this script exists to prevent. -List and -ShowFloor
+# refuse too: each would print an answer read from the wrong registry as if it were the fleet's.
+$allocDir = Resolve-CoordDir -From $repo -Kind 'alloc'
+if ($allocDir.Error) {
+    [Console]::Error.WriteLine("alloc.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or allocated.")
+    [Console]::Error.WriteLine("  $($allocDir.Error)")
+    [Console]::Error.WriteLine("  Numbers are fleet-wide. This will not fall back to a local copy; retry when the shared root answers.")
+    exit 2
+}
+$allocRoot = $allocDir.Path
 $alloc = Join-Path $allocRoot $Kind
 New-Item -ItemType Directory -Force -Path $alloc | Out-Null
 
@@ -195,7 +215,7 @@ if ($List) {
         $dir = Join-Path $allocRoot $k
         $mine = @(Get-ChildItem $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
                 $c = Get-Content $_.FullName -Raw | ConvertFrom-Json
-                if ((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) { $c }
+                if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-CoordRecordIsHere $c)) { $c }
             })
         Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
     }
@@ -345,7 +365,10 @@ if (-not $ShowFloor) {
         # `owns` compare with; the TITLE half is this block's own, because neither of those reads the
         # title field at all. Saying "normalised exactly as -List" would cover one half and be vacuous
         # for the other -- and the other is the half that decides whether a number is re-issued.
+        # The HOST half too: the same path on another PC is another tree, and ledger_check.py::owns
+        # refuses its number here, so handing it back would name a number this tree cannot commit.
         if (((Get-PathKey "$($rec.worktree)") -ieq $ownerKey) -and
+            (Test-CoordRecordIsHere $rec) -and
             ((Get-AdrSlug "$($rec.title)") -eq $titleKey)) {
             # EVERYTHING KEPT HERE IS EITHER THE FILENAME OR FOLDED. `Number` and `Sort` come from the
             # file name, which is the authoritative key; the three free-text fields go through
@@ -832,6 +855,8 @@ for ($i = $start; $i -lt $start + 500; $i++) {
             title    = $Title
             branch   = $ownerBranch
             worktree = $ownerRepo
+            # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
+            host     = $thisHost
             claimed  = (Get-Date).ToString("o")
         } | ConvertTo-Json -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)

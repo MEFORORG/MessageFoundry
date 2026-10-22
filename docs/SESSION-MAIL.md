@@ -8,8 +8,11 @@ peer are therefore structurally unreachable by it, not merely hard to reach: a s
 **VS Code extension**, which is never entered into that map at all, and a session under a **different
 login**, whose config root is independent.
 
-Session mail is the async lane for exactly those two cases. It is a **file drop** under
-`<git-common-dir>/mefor-coord/mail/`, written by [`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1)
+Session mail is the async lane for exactly those two cases. It is a **file drop** under the
+coordination root's `mail/`: `<git-common-dir>/mefor-coord/mail/` by default, or the shared root's
+`mail/` when one is configured so that both PCs reach it ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md);
+[`scripts/coord/coord-root.ps1`](../scripts/coord/coord-root.ps1) resolves it). Paths below that say
+`mefor-coord/mail/` mean that root. It is written by [`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1)
 and delivered into a recipient's context by the [`scripts/hooks/mail-drain.ps1`](../scripts/hooks/mail-drain.ps1)
 hook.
 
@@ -151,6 +154,11 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
 
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
+- `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
+  registry holds a readable record for it. **Use this for a seat on another PC**: its worktree path
+  does not exist here, so the path form cannot reach it. **Not yet handled:** a seat id is derived
+  from the worktree path, so two PCs with a worktree at the SAME path share one seat id and one
+  mailbox, and mail to it reaches whichever PC drains first.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
 - `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,

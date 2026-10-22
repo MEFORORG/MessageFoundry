@@ -59,6 +59,7 @@ def repo(tmp_path: Path) -> Path:
     # strays landed there on the first run after the fix. Committing it means a linked worktree of this
     # fixture carries its own copy, which is how `peer_holding` still gets a claim held by the peer.
     shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(CLAIM.parent / "coord-root.ps1", r / "scripts" / "coord" / "coord-root.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")

@@ -92,10 +92,16 @@ $postMerge = Join-Path $hooksDir "post-merge"
 $durabilityMarker = "MessageFoundry durability hook"
 
 # The .py PAYLOADS the install path below Copy-Items into $hooksDir, listed for -Status to audit. The
-# install path still names its own file per section, because each carries its own why -- so a THIRD
+# install path still names its own file per section, because each carries its own why -- so a NEW
 # payload has to be added in both places. tests/test_installed_coord_hooks.py reads this list out of
 # this script rather than carrying its own copy, so at least the test cannot fall behind it.
-$payloads = @("claim_check.py", "push_guard.py")
+# A bare name's source is scripts\hooks\<name>. A name with a slash is a path under scripts\, installed
+# under its leaf: claim_check.py loads coord_root.py from its own directory, so the resolver ships too.
+$payloads = @("claim_check.py", "push_guard.py", "coord/coord_root.py")
+function Get-PayloadRelPath([string]$Payload) {
+    if ($Payload -match '/') { return "scripts/$Payload" }
+    return "scripts/hooks/$Payload"
+}
 
 # The VERBATIM hooks, and this is the declaration BACKLOG #1463 filed for: a source under
 # scripts\hooks\ that the install path Copy-Items into $hooksDir unchanged, mapped to EVERY installed
@@ -163,13 +169,21 @@ if ($Status) {
     # gate actually opened. Nothing anywhere said, and that silence is most of why the split between the
     # tool's registry and the gate's went unnoticed: a refusal against a registry in another repository
     # is indistinguishable, from the outside, from an item nobody has claimed.
+    # The directory itself is coord-root.ps1's answer, and may sit on the shared root
+    # (docs/COORD-SHARED-ROOT.md). A status line shows the error rather than a path nothing reads.
+    . (Join-Path $PSScriptRoot 'coord-root.ps1')
+    function Format-ClaimsDir([string]$From) {
+        $r = Resolve-CoordDir -From $From -Kind 'claims'
+        if ($r.Error) { return "UNRESOLVABLE -- $($r.Error)" }
+        if ($r.Source -ne 'local') { return "$($r.Path)  (shared root, from $($r.Source))" }
+        return $r.Path
+    }
     $claimsRoot = (& git -C $RepoRoot config --get mefor.claimsRoot)
     if ($claimsRoot) {
         $claimsRoot = $claimsRoot.Trim()
         $rootTop = (& git -C $claimsRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
         if ($rootTop) {
-            $rootCommon = (& git -C $rootTop.Trim() rev-parse --path-format=absolute --git-common-dir).Trim()
-            Write-Host "claims     : $(Join-Path $rootCommon 'mefor-coord/claims')"
+            Write-Host "claims     : $(Format-ClaimsDir $rootTop.Trim())"
             Write-Host "             ^ SHARED -- mefor.claimsRoot points at $($rootTop.Trim())"
         }
         else {
@@ -181,7 +195,7 @@ if ($Status) {
         }
     }
     else {
-        Write-Host "claims     : $(Join-Path $common 'mefor-coord/claims')  (this repository's own)"
+        Write-Host "claims     : $(Format-ClaimsDir $RepoRoot)  (this repository's own)"
     }
     Write-Host "commit-msg : $(if ($claimInstalled) { 'INSTALLED (claim gate)' } elseif (Test-Path $commitMsg) { 'present, but NOT ours' } else { 'not installed' })"
     Write-Host "pre-commit : $(if ($pcShim) { 'pre-commit framework (carries the ledger gate + leak gate)' } elseif ($stale) { 'STALE standalone ledger hook -- re-run this script to migrate' } elseif (Test-Path $preCommit) { 'present, but NOT ours' } else { 'NOT INSTALLED -- run: pre-commit install' })"
@@ -331,11 +345,12 @@ if ($Status) {
     # copy governs EVERY worktree at once, and the source-side tests keep passing while it does.
     # tests/test_installed_coord_hooks.py asserts the same parity from the pytest side.
     #
-    # Both payloads are reported every run, never just the offender: the install path copies both, so
+    # Every payload is reported every run, never just the offender: the install path copies all, so
     # "re-install to fix this one" is the wrong mental model of what re-running does.
     foreach ($payload in $payloads) {
-        $srcPy = Join-Path $RepoRoot "scripts\hooks\$payload"
-        $dstPy = Join-Path $hooksDir $payload
+        $srcRel = Get-PayloadRelPath $payload
+        $srcPy = Join-Path $RepoRoot $srcRel
+        $dstPy = Join-Path $hooksDir (Split-Path $payload -Leaf)
         $iSha = Get-HookPayloadHash $dstPy
         $sSha = Get-HookPayloadHash $srcPy
         Write-Host "payload    : $payload  installed $(& $shortSha $iSha) / source $(& $shortSha $sSha)"
@@ -356,7 +371,7 @@ if ($Status) {
             Write-Host "               tests/test_installed_coord_hooks.py notices; source-side tests stay green." -ForegroundColor Red
             Write-Host "               WORK OUT WHICH COPY IS OLDER FIRST. Re-installing from a checkout older" -ForegroundColor Yellow
             Write-Host "               than the installed hook downgrades it for every worktree on this box:" -ForegroundColor Yellow
-            Write-Host "                 git log --oneline -5 -- scripts/hooks/$payload"
+            Write-Host "                 git log --oneline -5 -- $srcRel"
             Write-Host "               Only once THIS checkout is confirmed newer, from a PLAIN terminal:" -ForegroundColor Yellow
             Write-Host "                 pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1"
         }
@@ -502,6 +517,8 @@ Remove-Item -LiteralPath (Join-Path $hooksDir "ledger_check.py") -Force -EA Sile
 # A commit-msg hook, because only commit-msg is handed the message file (as $1). The claim gate keys off
 # the SUBJECT declaring `BACKLOG #N`, so on pre-commit it would have nothing to read.
 Copy-Item (Join-Path $RepoRoot "scripts\hooks\claim_check.py") (Join-Path $hooksDir "claim_check.py") -Force
+# The gate loads the coordination resolver from its own directory; without it the gate refuses.
+Copy-Item (Join-Path $RepoRoot "scripts\coord\coord_root.py") (Join-Path $hooksDir "coord_root.py") -Force
 
 $claimHook = @'
 #!/bin/sh

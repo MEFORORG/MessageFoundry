@@ -53,18 +53,29 @@ if ($PSCmdlet.ParameterSetName -eq 'State' -and
 
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 
-function Get-CoordRoot {
-    $c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { throw 'not inside a git repository' }
-    return (Join-Path $c.Trim() 'mefor-coord')
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was written.")
+    exit 2
 }
+. $coordRootScript
+$thisHost = Get-CoordHost
+
+# Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
+# and an error refuses rather than writing a level into a local copy nobody else reads.
+$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+if ($sharedResolved.Error) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
+    exit 2
+}
+$claimsDirShared = Join-Path $sharedResolved.Path 'claims'
 
 function Get-ClaimHash([string]$Worktree) {
     # Hash of the claim KEYS this worktree holds. Used ONLY to invalidate a stated number when the
     # claim set moves -- never to derive one. The test runs one way: it can make a number stale, and
     # it can never make a stale number look fresh.
-    $coord = Get-CoordRoot
-    $dir = Join-Path $coord 'claims'
+    $dir = $claimsDirShared
     if (-not (Test-Path -LiteralPath $dir)) { return '' }
     $want = $Worktree.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     $keys = @()
@@ -75,6 +86,8 @@ function Get-ClaimHash([string]$Worktree) {
         if (-not $w) { continue }
         $w = $w.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($w -ne $want) { continue }
+        # The same path on another PC is another tree (docs/COORD-SHARED-ROOT.md). No host is this one.
+        if (-not (Test-CoordRecordIsHere $d)) { continue }
         $keys += $f.BaseName
     }
     if ($keys.Count -eq 0) { return 'none' }
@@ -86,8 +99,7 @@ function Get-ClaimHash([string]$Worktree) {
 
 $worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
-$coord    = Get-CoordRoot
-$lanesDir = Join-Path $coord 'lanes'
+$lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
@@ -96,6 +108,14 @@ New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
+}
+# THE BOX KEY IS A PATH, AND TWO PCs CAN SHARE A PATH. On a shared root the record at this key may
+# be another machine's lane. Taking it over would overwrite that lane's stated level with this one's,
+# so a write refuses and says so; -Show only reads, so it prints the record as it is. A record with no
+# `host` was written here, as every record before the field was.
+if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), whose worktree has the same path as this one. Nothing was written.")
+    exit 2
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
@@ -160,6 +180,8 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
+# docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
+$rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
 $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json')
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline

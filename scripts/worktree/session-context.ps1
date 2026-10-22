@@ -170,8 +170,28 @@ if ($root) {
         # BACKLOG #309: what the OTHER sessions are building, before you start building it too. The commit-msg
         # claim gate only enforces NUMBERED items; this banner is the whole mechanism for ad-hoc work -- and
         # ad-hoc work is what actually collided (three sessions, one npm advisory, two duplicate PRs).
-        $claimDir = Join-Path (& git rev-parse --path-format=absolute --git-common-dir 2>$null).Trim() "mefor-coord/claims"
-        $claimFiles = @(Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name)
+        #
+        # The registry may sit on the shared root (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names it.
+        # This banner only reads: a root that does not answer is one line saying so, never a local guess
+        # shown as the fleet's claims.
+        $claimDir = $null
+        $claimFault = ''
+        $coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+        if (Test-Path -LiteralPath $coordRootScript -PathType Leaf) {
+            try {
+                . $coordRootScript
+                $knownLocal = if ($commonDir) { Join-Path "$commonDir".Trim() 'mefor-coord' } else { '' }
+                $resolvedClaims = Resolve-CoordDir -From (Get-Location).Path -Kind 'claims' -LocalRoot $knownLocal
+                if ($resolvedClaims.Error) { $claimFault = $resolvedClaims.Error } else { $claimDir = $resolvedClaims.Path }
+            } catch { $claimFault = "coord-root.ps1 failed: $($_.Exception.Message)" }
+        } else {
+            $claimFault = "$coordRootScript is missing"
+        }
+        if ($claimFault) {
+            $lines += ""
+            $lines += "Active work claims: NOT READ -- the claim registry did not resolve ($claimFault)."
+        }
+        $claimFiles = @(if ($claimDir) { Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name })
         if ($claimFiles.Count -gt 0) {
             $meNorm = ($root -replace '\\', '/').TrimEnd('/')
             $lines += ""
@@ -179,7 +199,9 @@ if ($root) {
             foreach ($cf in $claimFiles) {
                 try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { continue }
                 $heldNorm = ($c.worktree -replace '\\', '/').TrimEnd('/')
-                $who = if ($heldNorm -ieq $meNorm) { "THIS session" } else { $c.worktree }
+                # A claim from another machine names that machine's path, so it is never THIS session.
+                $here = Test-CoordRecordIsHere $c
+                $who = if ($here -and $heldNorm -ieq $meNorm) { "THIS session" } elseif ($here) { $c.worktree } else { "$($c.worktree) on $(Get-CoordRecordHost $c)" }
                 $stale = ""
                 try {
                     $hrs = ((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
