@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,6 +92,10 @@ class Fleet:
         _git("worktree", "add", "-q", "--detach", str(path), "origin/main", cwd=repo or self.engine)
         return path
 
+    def own_wt(self) -> Path:
+        """The SAFE layout: a linked worktree in this session's own scratchpad."""
+        return self.add_worktree(self.scratch() / "eng-main")
+
     def git_dir(self, wt: Path) -> Path:
         return Path(_git("rev-parse", "--absolute-git-dir", cwd=wt))
 
@@ -150,22 +154,26 @@ def assert_safe(proc: subprocess.CompletedProcess[str]) -> None:
     assert proc.returncode == 0 and _verdict(proc) == "SAFE", (proc.stdout, proc.stderr)
 
 
+def _failed(proc: subprocess.CompletedProcess[str]) -> list[str]:
+    """The `x.` letters of the checks an UNSAFE run names."""
+    return [ln.strip()[:2] for ln in proc.stdout.splitlines()[1:]]
+
+
 def assert_unsafe(proc: subprocess.CompletedProcess[str], check: str) -> None:
     assert proc.returncode == 1 and _verdict(proc) == "UNSAFE", (proc.stdout, proc.stderr)
-    failed = [ln.strip()[:2] for ln in proc.stdout.splitlines()[1:]]
-    assert f"{check}." in failed, (check, proc.stdout)
+    assert f"{check}." in _failed(proc), (check, proc.stdout)
 
 
 # ---------------------------------------------------------------- the one SAFE layout
 
 
 def test_own_scratchpad_linked_worktree_is_safe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     assert_safe(fleet.check(wt))
 
 
 def test_the_repository_s_own_seat_markers_do_not_count_against_f(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (wt / ".claude" / "seat.local.txt").write_text("builder\n", encoding="utf-8")
     (wt / ".claude" / "ROLE.local.md").write_text("# card\n", encoding="utf-8")
     assert_safe(fleet.check(wt))
@@ -176,7 +184,7 @@ def test_the_repository_s_own_seat_markers_do_not_count_against_f(fleet: Fleet) 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the extended-length prefix is a Windows form")
 def test_an_extended_length_path_is_refused(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     assert_unsafe(fleet.check("\\\\?\\" + str(wt)), "a")
 
 
@@ -242,7 +250,7 @@ def test_a_link_inside_the_own_scratchpad_to_another_worktree_is_unsafe(fleet: F
     proc = fleet.check(link)
     assert_unsafe(proc, "c")
     # The link resolved to its target, which IS a fleet worktree: only ownership refused it.
-    assert "b." not in [ln.strip()[:2] for ln in proc.stdout.splitlines()[1:]], proc.stdout
+    assert "b." not in _failed(proc), proc.stdout
 
 
 def test_a_non_uuid_session_id_is_unsafe_even_where_its_directory_exists(fleet: Fleet) -> None:
@@ -251,17 +259,17 @@ def test_a_non_uuid_session_id_is_unsafe_even_where_its_directory_exists(fleet: 
     assert_unsafe(fleet.check(wt, sid="not-a-session"), "c")
 
 
-@pytest.mark.parametrize("sid", ["", "..", "proj", SID.upper() + "x"])
+@pytest.mark.parametrize("sid", ["-", "..", "proj", SID.upper() + "x"])
 def test_a_session_id_that_is_not_a_uuid_is_unsafe(fleet: Fleet, sid: str) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
-    assert_unsafe(fleet.check(wt, sid=sid or "-"), "c")
+    wt = fleet.own_wt()
+    assert_unsafe(fleet.check(wt, sid=sid), "c")
 
 
 # ---------------------------------------------------------------- d. not in a primary
 
 
 def test_a_session_in_the_primary_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     assert_unsafe(fleet.check(wt, cwd=fleet.engine), "d")
     (fleet.engine / "docs").mkdir()
     assert_unsafe(fleet.check(wt, cwd=fleet.engine / "docs"), "d")
@@ -271,14 +279,14 @@ def test_a_session_in_the_primary_is_unsafe(fleet: Fleet) -> None:
 
 
 def test_a_locked_worktree_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     _git("worktree", "lock", str(wt), cwd=fleet.engine)
     assert_unsafe(fleet.check(wt), "e")
 
 
 @pytest.mark.parametrize("marker", ["rebase-merge", "MERGE_HEAD", "BISECT_LOG"])
 def test_an_operation_in_progress_is_unsafe(fleet: Fleet, marker: str) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     state = fleet.git_dir(wt) / marker
     if marker.startswith("rebase"):
         state.mkdir()
@@ -291,14 +299,14 @@ def test_an_operation_in_progress_is_unsafe(fleet: Fleet, marker: str) -> None:
 
 
 def test_a_branch_whose_settings_differ_from_origin_main_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (wt / ".claude" / "settings.json").write_text('{"hooks": {}}\n', encoding="utf-8")
     _git("commit", "-q", "-am", "own hooks", cwd=wt)
     assert_unsafe(fleet.check(wt), "f")
 
 
 def test_a_branch_that_adds_mcp_json_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (wt / ".mcp.json").write_text("{}\n", encoding="utf-8")
     _git("add", ".mcp.json", cwd=wt)
     _git("commit", "-q", "-m", "own mcp", cwd=wt)
@@ -306,7 +314,7 @@ def test_a_branch_that_adds_mcp_json_is_unsafe(fleet: Fleet) -> None:
 
 
 def test_an_untracked_settings_local_file_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (wt / ".claude" / "settings.local.json").write_text("{}\n", encoding="utf-8")
     assert_unsafe(fleet.check(wt), "f")
 
@@ -316,7 +324,7 @@ def test_an_untracked_settings_local_file_is_unsafe(fleet: Fleet) -> None:
 
 @pytest.mark.parametrize("state", [{"variables": {"MEFOR_AFK_KILL": "on"}}, {"fail": True}])
 def test_the_kill_switch_not_off_is_unsafe(fleet: Fleet, state: dict[str, object]) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     fleet.sb.set_state(**state)
     assert_unsafe(fleet.check(wt), "g")
 
@@ -325,7 +333,7 @@ def test_the_kill_switch_not_off_is_unsafe(fleet: Fleet, state: dict[str, object
 
 
 def test_the_local_off_file_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     off = fleet.engine / ".git" / "mefor-coord" / "enter-check" / "OFF"
     off.parent.mkdir(parents=True)
     off.write_text("", encoding="utf-8")
@@ -337,7 +345,7 @@ def test_the_local_off_file_is_unsafe(fleet: Fleet) -> None:
 
 def test_an_exception_mid_check_is_unsafe(fleet: Fleet) -> None:
     """A fleet repository that is present but will not list throws inside check b."""
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     broken = fleet.base / "not-a-repo"
     broken.mkdir()
     proc = fleet.check(wt, fleet=broken)
@@ -346,7 +354,7 @@ def test_an_exception_mid_check_is_unsafe(fleet: Fleet) -> None:
 
 
 def test_no_sanitiser_is_unsafe_with_a_fixed_reason(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (fleet.sb.repo / "scripts" / "hooks" / "worktree_gate.ps1").unlink()
     proc = fleet.check(wt)
     assert proc.returncode == 1 and _verdict(proc) == "UNSAFE", proc.stdout
@@ -363,16 +371,13 @@ def test_reasons_are_folded_onto_one_line_each(fleet: Fleet) -> None:
 # ---------------------------------------------------------------- the hook
 
 
-def _payload(fleet: Fleet, path: Path | None, **tool_input: str) -> dict[str, object]:
-    ti: dict[str, str] = dict(tool_input)
-    if path is not None:
-        ti["path"] = str(path)
+def _payload(fleet: Fleet, path: Path) -> dict[str, object]:
     return {
         "session_id": SID,
         "cwd": str(fleet.home),
         "hook_event_name": "PreToolUse",
         "tool_name": "EnterWorktree",
-        "tool_input": ti,
+        "tool_input": {"path": str(path)},
     }
 
 
@@ -388,7 +393,7 @@ def _decision(proc: subprocess.CompletedProcess[str]) -> dict[str, object] | Non
 
 
 def test_the_hook_allows_on_safe(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     spec = _decision(fleet.hook(_payload(fleet, wt)))
     assert spec is not None and spec["permissionDecision"] == "allow", spec
 
@@ -402,7 +407,7 @@ def test_the_hook_gives_no_decision_on_unsafe(fleet: Fleet) -> None:
 
 
 def test_the_hook_gives_no_decision_when_the_kill_switch_is_on(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     fleet.sb.set_state(variables={"MEFOR_AFK_KILL": "on"})
     spec = _decision(fleet.hook(_payload(fleet, wt)))
     assert spec is not None and "permissionDecision" not in spec, spec
@@ -423,14 +428,14 @@ def test_the_hook_is_silent_without_a_path(fleet: Fleet, stdin: str) -> None:
 
 
 def test_the_hook_is_silent_without_a_cwd(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     payload = _payload(fleet, wt)
     del payload["cwd"]
     assert _decision(fleet.hook(payload)) is None
 
 
 def test_the_hook_gives_no_decision_when_the_check_is_missing(fleet: Fleet) -> None:
-    wt = fleet.add_worktree(fleet.scratch() / "eng-main")
+    wt = fleet.own_wt()
     (fleet.sb.repo / "scripts" / "worktree" / "enter-check.ps1").unlink()
     assert _decision(fleet.hook(_payload(fleet, wt))) is None
 
@@ -449,6 +454,18 @@ def test_the_hook_is_wired_for_enter_worktree_only() -> None:
     assert [g["matcher"] for g in groups] == ["EnterWorktree"], groups
 
 
-def test_a_fresh_uuid_is_the_shape_the_check_accepts() -> None:
-    """The fixture ids above are uuid-shaped, as a real session id is."""
-    assert str(uuid.UUID(SID)) == SID and str(uuid.UUID(OTHER_SID)) == OTHER_SID
+def test_the_marker_allow_list_names_what_the_hooks_write() -> None:
+    """Check f's two exempt files are the ones role-card-inject.ps1 writes, read from its source.
+
+    A rename there would otherwise turn every seated worktree UNSAFE, and the SAFE test above
+    writes the same literals itself, so it cannot see the drift.
+    """
+    writer = (ROOT / "scripts" / "hooks" / "role-card-inject.ps1").read_text(encoding="utf-8")
+    written = {
+        m.group(2)
+        for m in re.finditer(r"^\$(MarkerRelPath|RoleCopyRelPath) = '([^']+)'", writer, re.M)
+    }
+    check = CHECK.read_text(encoding="utf-8")
+    m = re.search(r"^\$localMarkers = @\(([^)]*)\)", check, re.M)
+    assert m is not None, "enter-check.ps1 no longer declares $localMarkers"
+    assert set(re.findall(r"'([^']+)'", m.group(1))) == written, (m.group(1), written)
