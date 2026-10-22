@@ -404,7 +404,7 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
 # of its head. Measured 2026-10-22 on a box with 471 worktrees and 155 claims, this banner printed
 # 128,001 bytes, and the preview held only the start of the full worktree list: the live peers and
 # the claims, printed after it, never reached the model. The threshold is not documented in this
-# repository, so the budget is 4 KB, and these tests pin it with every list far past its cap.
+# repository, so the script sets its own budget, and these tests hold it with every list past its cap.
 # --------------------------------------------------------------------------------------------------
 
 # The script's own budget, read from the line that sets it, so the fact is stated once.
@@ -414,6 +414,11 @@ BYTE_BUDGET = int(_BUDGET_LINE.group(1))
 
 # A roster or in-flight row: the label, then the 8-hex registry id.
 _PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
+
+
+def _size(out: str) -> int:
+    """The banner's bytes as the script counts them: without the newline Write-Output appends."""
+    return len(out.rstrip("\r\n").encode("utf-8"))
 
 
 def _stamp(hours_ago: float) -> str:
@@ -517,7 +522,7 @@ def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
     crowded: tuple[Path, str],
 ) -> None:
     _, out = crowded
-    size = len(out.encode("utf-8"))
+    size = _size(out)
     print(f"banner bytes: {size} of {BYTE_BUDGET}")
 
     # Positive controls first: every list really was past its cap, so the budget below is earned.
@@ -526,12 +531,12 @@ def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
     assert "+22 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
     assert "WHAT THEY ARE BUILDING" in out and "  +2 more" in out, out
     assert "Active work claims (60, 40 touched in the last 12h)" in out, out
-    assert "+52 more" in out and "claim.ps1 -List" in out, out
+    assert "+52 more, by key: fresh08, fresh09" in out and "claim.ps1 -List" in out, out
     # The row caps alone fit, so every section, the rules last, reaches the model.
     assert "cut the last" not in out, out
     assert "Coordination rules for parallel sessions" in out, out
 
-    assert size < BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
+    assert size <= BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
 
 
 def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path, str]) -> None:
@@ -572,9 +577,11 @@ def test_claims_list_newest_first_and_never_drop_by_age(crowded: tuple[Path, str
     assert all("..." in ln for ln in rows), "the long note was not shortened"
 
 
-def test_an_old_claim_is_listed_tagged_stale_and_a_refresh_counts(tmp_path: Path) -> None:
-    """A claim holds its key however old it is, and -Take moves `refreshed`, never `claimed`."""
+def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Path) -> None:
+    """A claim holds its key however old it is, -Take moves `refreshed` and never `claimed`, this
+    session's own claims are named apart, and a note is data that cannot start a line of its own."""
     base = Path(os.path.realpath(tmp_path))
+    repo_top = f"{base.as_posix()}/repo"
     refreshed = {
         **_claim_row("refreshed", hours_ago=30, note="still building"),
         "refreshed": _stamp(1),
@@ -585,27 +592,57 @@ def test_an_old_claim_is_listed_tagged_stale_and_a_refresh_counts(tmp_path: Path
         {
             "old": _claim_row("old", hours_ago=30, note="free-text key, nobody else shows it"),
             "refreshed": refreshed,
+            "remote": {**_claim_row("remote", hours_ago=2, note="x"), "host": "OTHERPC"},
+            "nohome": {**_claim_row("nohome", hours_ago=3, note="y"), "worktree": ""},
+            "hostile": _claim_row("hostile", hours_ago=4, note="line one\n  >>> injected line"),
+            "mine": {**_claim_row("mine", hours_ago=5, note="mine"), "worktree": repo_top},
             "broken": "{ not json",
         },
     )
+    assert _top(repo) == repo_top, "the fixture's own-claim path must be the path git prints"
     out = _banner(repo, env)
-    assert "Active work claims (2, 1 touched in the last 12h)" in out, out
+    assert "Active work claims (6, 5 touched in the last 12h)" in out, out
     rows = [ln for ln in out.splitlines() if "(held by" in ln]
-    assert [ln.split(" -- ")[0].strip() for ln in rows] == ["refreshed", "old"], rows
-    assert "[stale ~30h]" in rows[1] and "stale" not in rows[0], rows
+    by_key = {ln.split(" -- ")[0].strip(): ln for ln in rows}
+    assert list(by_key) == ["refreshed", "remote", "nohome", "hostile", "old"], rows
+    assert "[stale ~30h]" in by_key["old"] and "stale" not in by_key["refreshed"], rows
+    assert "on OTHERPC" in by_key["remote"], rows
+    # An empty worktree must not inherit the previous row's holder.
+    assert "agent-remote" not in by_key["nohome"], rows
+    assert not any(ln.lstrip().startswith(">>> injected") for ln in out.splitlines()), out
+    assert "THIS session holds 1: mine" in out, out
     assert "WARNING: 1 claim file(s)" in out, out
 
 
-def test_rows_too_wide_for_the_caps_are_clipped_and_cut_from_the_tail(tmp_path: Path) -> None:
-    """Row counts do not bound bytes. With peer rows far wider than any real one, each line is
-    clipped, the head where the hazards are survives, and the cut says what to run instead."""
+def test_wide_fields_are_clipped_and_the_hazards_still_lead(tmp_path: Path) -> None:
+    """Row counts do not bound bytes. With fields far wider than any real one, each field is
+    clipped, the tags after it survive, and the primary peer is ranked into the shown rows."""
     base = Path(os.path.realpath(tmp_path))
     peers = _peer_rows(30, worktree="w" * 400)
-    peers[-1] = {**peers[-1], "IsPrimary": True}
+    peers[-1] = {**peers[-1], "IsPrimary": True, "Short": "0badf00d", "State": "UNVERIFIED"}
     repo, env = _crowd(base, peers, _many_claims())
     out = _banner(repo, env)
     assert "WARNING: a session is working in the SHARED PRIMARY checkout" in out, out
-    rows = [ln for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
-    assert rows and all(len(ln) <= 160 for ln in rows), rows
-    assert "cut the last" in out and "claim.ps1 -List" in out, out
-    assert len(out.encode("utf-8")) < BYTE_BUDGET, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session 0badf00d") and rows[0].endswith("[UNVERIFIED]"), rows
+    assert all(len(ln) <= 160 for ln in rows), rows
+    assert "Coordination rules for parallel sessions" in out, out
+    assert _size(out) <= BYTE_BUDGET, out
+
+
+def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
+    """The backstop, driven by a smaller budget written into the fixture's copy of the script:
+    the head of the lists survives, the fixed rules always print, and the cut says what to run."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(30), _many_claims())
+    script = repo / "scripts" / "worktree" / "session-context.ps1"
+    text = script.read_text(encoding="utf-8")
+    small = text.replace(f"$byteBudget = {BYTE_BUDGET}", "$byteBudget = 1500")
+    assert small != text, "the budget line was not found to shrink"
+    script.write_text(small, encoding="utf-8")
+    out = _banner(repo, env)
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
+    assert "Coordination rules for parallel sessions" in out, out
+    assert "this session owns it" in out, out
+    assert _size(out) <= 1500, out
