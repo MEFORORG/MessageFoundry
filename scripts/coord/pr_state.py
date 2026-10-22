@@ -55,6 +55,8 @@ SCHEMA_VERSION = 1
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 CACHE_NAME = "pr-state.json"
 LOCK_NAME = "pr-state"
+#: The base whose required list, queue and protection are read.
+BASE_BRANCH = "main"
 #: The open-PR page size. A page that comes back this full may be truncated, and the cache says so.
 PR_PAGE = 100
 #: PRs per aliased required-context query. Each alias asks for up to CONTEXT_PAGE contexts.
@@ -114,9 +116,10 @@ class GhError(RuntimeError):
 
 class PollError(RuntimeError):
     def __init__(self, message: str, reset_at: str | None = None, part: str | None = None) -> None:
-        super().__init__(message)
+        # The message carries the part as its prefix, so a raise site names it once.
+        super().__init__(f"{part}: {message}" if part else message)
         self.reset_at = reset_at
-        #: Which request failed: "required-contexts", "main" or "contexts PRs a-b".
+        #: Which request failed: "pulls" or "contexts PRs a-b".
         self.part = part
 
 
@@ -184,7 +187,7 @@ query($owner: String!, $name: String!, $limit: Int!) {
         } } } }
       }
     }
-    mergeQueue(branch: "main") {
+    mergeQueue(branch: "%BASE%") {
       entries(first: 100) {
         totalCount
         nodes { position state enqueuedAt pullRequest { number } }
@@ -192,7 +195,7 @@ query($owner: String!, $name: String!, $limit: Int!) {
     }
   }
 }
-"""
+""".replace("%BASE%", BASE_BRANCH)
 
 
 def contexts_query(numbers: list[int]) -> str:
@@ -228,14 +231,14 @@ def graphql(
     except GhError as exc:
         # gh exits non-zero when the reply carries `errors`; read that reply for its resetAt.
         if '"errors"' not in exc.stdout:
-            raise PollError(f"{part}: {exc}", part=part) from exc
+            raise PollError(str(exc), part=part) from exc
         raw = exc.stdout
     try:
         doc = json.loads(raw)
     except ValueError as exc:
-        raise PollError(f"{part}: reply is not JSON ({len(raw)} bytes): {exc}", part=part) from exc
+        raise PollError(f"reply is not JSON ({len(raw)} bytes): {exc}", part=part) from exc
     if not isinstance(doc, dict):
-        raise PollError(f"{part}: reply is not an object", part=part)
+        raise PollError("reply is not an object", part=part)
     data = doc.get("data")
     rate = data.get("rateLimit") if isinstance(data, dict) else None
     if doc.get("errors"):
@@ -243,9 +246,9 @@ def graphql(
             str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in doc["errors"]
         )
         reset = rate.get("resetAt") if isinstance(rate, dict) else None
-        raise PollError(f"{part}: GraphQL errors: {msgs[:400]}", reset_at=reset, part=part)
+        raise PollError(f"GraphQL errors: {msgs[:400]}", reset_at=reset, part=part)
     if not isinstance(data, dict) or not isinstance(data.get("repository"), dict):
-        raise PollError(f"{part}: reply has no data.repository", part=part)
+        raise PollError("reply has no data.repository", part=part)
     return data["repository"], rate if isinstance(rate, dict) else {}
 
 
@@ -256,17 +259,15 @@ def fetch_required(gh: Gh, repo: str) -> list[str]:
     does not. The parsers are that module's, so the drift check and this poller read one way.
     """
     try:
-        branch = json.loads(gh(["api", f"repos/{repo}/branches/main"], None))
+        branch = json.loads(gh(["api", f"repos/{repo}/branches/{BASE_BRANCH}"], None))
         pages = json.loads(
-            gh(["api", "--paginate", "--slurp", f"repos/{repo}/rules/branches/main"], None)
+            gh(["api", "--paginate", "--slurp", f"repos/{repo}/rules/branches/{BASE_BRANCH}"], None)
         )
         rules = [rule for page in pages for rule in page]
         found = required_contexts.branch_protection_contexts(branch)
         found += required_contexts.ruleset_contexts(rules)
     except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
-        raise PollError(
-            f"required-contexts: unreadable: {exc!r}", part="required-contexts"
-        ) from exc
+        raise PollError(f"required contexts unreadable: {exc!r}") from exc
     return sorted(set(found))
 
 
@@ -294,7 +295,7 @@ def required_verdict(
     required: list[str] | None,
     contexts: dict[str, Any] | None,
     head_oid: str | None,
-    base: str | None = "main",
+    base: str | None = BASE_BRANCH,
 ) -> dict[str, Any]:
     """Classify a PR's head against the LIVE required list.
 
@@ -310,9 +311,9 @@ def required_verdict(
         "requiredByGithubNotInList": [],
         "reason": None,
     }
-    if base != "main":
-        # The list is main's. Judging another base's PR by it would be a verdict about nothing.
-        out["reason"] = f"base is {base!r}; only main's required list is read"
+    if base != BASE_BRANCH:
+        # The list is BASE_BRANCH's. Judging another base's PR by it is a verdict about nothing.
+        out["reason"] = f"base is {base!r}; only {BASE_BRANCH}'s required list is read"
         return out
     if required is None:
         out["reason"] = "no required-context list"
@@ -367,10 +368,8 @@ def _speaker(runs: list[Any]) -> Any:
     def key(run: Any) -> tuple[int, str]:
         if not isinstance(run, dict):
             return (0, "")
-        status = str(run.get("status") or run.get("state") or "").upper()
-        in_progress = status in pr_checks.UNSETTLED
         stamp = run.get("startedAt") or run.get("createdAt")
-        return (1 if in_progress else 0, str(stamp or ""))
+        return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""))
 
     return max(runs, key=key)
 
@@ -472,11 +471,11 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
             required_error = str(exc)
 
     repo_doc, rate = graphql(
-        gh, MAIN_QUERY, {"owner": owner, "name": name, "limit": PR_PAGE}, "main"
+        gh, MAIN_QUERY, {"owner": owner, "name": name, "limit": PR_PAGE}, "pulls"
     )
     conn = repo_doc.get("pullRequests") if isinstance(repo_doc.get("pullRequests"), dict) else None
     if conn is None or not isinstance(conn.get("nodes"), list):
-        raise PollError("main: reply has no pullRequests.nodes", part="main")
+        raise PollError("reply has no pullRequests.nodes", part="pulls")
     prs = [p for p in conn["nodes"] if isinstance(p, dict)]
     total = conn.get("totalCount")
     page = conn.get("pageInfo") if isinstance(conn.get("pageInfo"), dict) else {}
@@ -486,7 +485,11 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         or (isinstance(total, int) and total > len(prs))
     )
 
-    numbers = [p["number"] for p in prs if isinstance(p.get("number"), int)]
+    numbers = [
+        p["number"]
+        for p in prs
+        if isinstance(p.get("number"), int) and p.get("baseRefName") == BASE_BRANCH
+    ]
     rates = [rate]
     ctx: dict[int, dict[str, Any]] = {}
     if numbers:
@@ -815,14 +818,8 @@ def main(
         try:
             doc = poll(gh, args.repo, previous, start)
         except (PollError, GhError) as exc:
-            doc = failed(
-                args.repo,
-                previous,
-                str(exc),
-                start,
-                getattr(exc, "reset_at", None),
-                getattr(exc, "part", None),
-            )
+            reset_at, part = getattr(exc, "reset_at", None), getattr(exc, "part", None)
+            doc = failed(args.repo, previous, str(exc), start, reset_at=reset_at, part=part)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             # A reply shape this code did not expect. Recorded, so the cache does not go silently old.
             doc = failed(args.repo, previous, f"unexpected reply shape: {exc!r}", start)

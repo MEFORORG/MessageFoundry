@@ -45,6 +45,15 @@ def name_of(node: object) -> str:
     return str(node.get("name") or node.get("context") or "")
 
 
+def in_progress(node: object) -> bool:
+    """True while a node's ``status`` (CheckRun) or ``state`` (StatusContext) says it is running."""
+    if not isinstance(node, dict):
+        return False
+    status = str(node.get("status") or "").upper()
+    state = str(node.get("state") or "").upper()
+    return status in UNSETTLED or state in UNSETTLED
+
+
 def counts(rollup: object) -> tuple[int, int]:
     """``(failing, unsettled)`` over a ``statusCheckRollup`` payload.
 
@@ -58,11 +67,10 @@ def counts(rollup: object) -> tuple[int, int]:
         if not isinstance(node, dict):
             unsettled += 1
             continue
-        status = str(node.get("status") or "").upper()
         conclusion = str(node.get("conclusion") or "").upper()
         state = str(node.get("state") or "").upper()
         verdict = conclusion or state
-        if status in UNSETTLED or state in UNSETTLED:
+        if in_progress(node):
             unsettled += 1
         elif verdict in FAILING:
             failing += 1

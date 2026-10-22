@@ -23,6 +23,8 @@ from typing import Any
 
 import pytest
 
+from tests._dead_pid import never_live_pid
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "coord" / "pr_state.py"
 
@@ -359,7 +361,7 @@ def test_pr_on_another_base_is_not_judged_by_mains_list(tmp_path: Path) -> None:
 
 def test_release_never_deletes_another_pollers_lock(tmp_path: Path) -> None:
     lock = tmp_path / "locks" / "pr-state.lock"
-    other = "pid=999999 host=SOME-OTHER-PC at=now"
+    other = f"pid={never_live_pid()} host=SOME-OTHER-PC at=now"
     fake = FakeGh([_pr(1)], {1: _green()})
 
     def gh(args: list[str], stdin: str | None) -> str:
@@ -376,7 +378,7 @@ def test_steal_does_not_take_a_lock_that_changed_after_it_was_judged(
 ) -> None:
     (tmp_path / "locks").mkdir()
     lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text(f"pid=999999 host={ps.coord_root.host()} at=dead", encoding="utf-8")
+    lock.write_text(f"pid={never_live_pid()} host={ps.coord_root.host()} at=dead", encoding="utf-8")
     live = "pid=1 host=SOME-OTHER-PC at=live"
 
     def judged_dead_then_raced(holder: str) -> bool:
@@ -421,7 +423,7 @@ def test_backoff_skips_without_calling_gh(tmp_path: Path) -> None:
     _main(tmp_path, FakeGh([], {}, fail="boom"))  # nextPollNotBefore = NOW + 2 min
     gh = FakeGh([_pr(1)], {1: _green()})
     rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=1))
-    assert rc == 0 and gh.calls == [] and doc["error"] == "main: boom"
+    assert rc == 0 and gh.calls == [] and doc["error"] == "pulls: boom"
     rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=1), "--force")
     assert rc == 0 and doc["error"] is None
 
