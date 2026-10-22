@@ -48,6 +48,13 @@
     A non-deny decision (`ask`, `allow`) is kept, the first one wins, and it is written once every
     guard has run.
 
+    EVERY NON-DENY GUARD'S CONTEXT IS PASSED THROUGH. A guard's hookSpecificOutput.additionalContext
+    (scripts/hooks/afk-tripwire.ps1 returns only that, ADR 0211) would have been read when the guard
+    was its own process, so it is kept here too: the kept decision's own context comes first, then
+    every other non-deny guard's in guard order, or they are written alone when nothing decided.
+    The kept decision is re-serialised to carry them, so its bytes then differ from the guard's
+    own. A deny still writes only itself, because the command it refuses does not run.
+
     FAIL-OPEN PER GUARD, AND VISIBLE. A guard that throws, exits non-zero other than 2, or whose
     path does not exist contributes an allow, and the others still run. Each failure is written to
     stderr, and when no guard decided anything the run exits 1. That is the non-blocking hook
@@ -77,7 +84,8 @@
     read stops at its cap, but THIS file reads all of stdin first, so on the wired path the read
     itself is not bounded; only the parse is. The timeout in settings.json is the guards' former
     per-guard timeouts summed, so a run in which every guard finishes inside its old budget still
-    finishes inside this one.
+    finishes inside this one. afk-tripwire.ps1 never had its own handler, so its 15 seconds were
+    added when it joined (ADR 0211).
 
     WIRING IS NOT ASSERTED HERE ON PURPOSE. Which guards run is a property of settings.json.
     ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -150,6 +158,7 @@ function Clear-ShellGuardProofs {
 
 $ShellGuardFailed = $false
 $ShellGuardKept = $null
+$ShellGuardContexts = [System.Collections.Generic.List[string]]::new()
 # With no arguments the parameter is $null, and @($null) is one empty entry, not none.
 foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
     # Non-null only for the gate: the proof its run leaves for the account's entry.
@@ -240,7 +249,31 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         $ShellGuardStdout.Flush()
         exit 0
     }
-    if ($ShellGuardVerdict -and $null -eq $ShellGuardKept) { $ShellGuardKept = $ShellGuardOutput }
+    if ($ShellGuardVerdict -and $null -eq $ShellGuardKept) {
+        # The kept decision carries its own context already.
+        $ShellGuardKept = $ShellGuardOutput
+        continue
+    }
+    $ShellGuardContext = [string]$ShellGuardParsed.hookSpecificOutput.additionalContext
+    if ($ShellGuardContext) { $ShellGuardContexts.Add($ShellGuardContext) }
+}
+if ($ShellGuardContexts.Count) {
+    # Writing a context exits 0, which would hide a failed guard behind it; say so in the context.
+    if ($ShellGuardFailed) {
+        $ShellGuardContexts.Add('shell-guard-dispatch: at least one shell guard FAILED OPEN on this call, so it checked nothing; the hook stderr names it.')
+    }
+    try {
+        $ShellGuardAnswer = if ($null -ne $ShellGuardKept) { $ShellGuardKept | ConvertFrom-Json } else {
+            [pscustomobject]@{ hookSpecificOutput = [pscustomobject]@{ hookEventName = 'PreToolUse' } }
+        }
+        $ShellGuardOwn = [string]$ShellGuardAnswer.hookSpecificOutput.additionalContext
+        $ShellGuardJoined = @(@($ShellGuardOwn) + $ShellGuardContexts | Where-Object { $_ }) -join "`n`n"
+        $ShellGuardAnswer.hookSpecificOutput | Add-Member -NotePropertyName additionalContext -NotePropertyValue $ShellGuardJoined -Force
+        $ShellGuardKept = $ShellGuardAnswer | ConvertTo-Json -Compress -Depth 10
+    } catch {
+        # The kept decision still stands without the context.
+        [Console]::Error.WriteLine("shell-guard-dispatch: could not attach a guard's context: $($_.Exception.Message)")
+    }
 }
 if ($null -ne $ShellGuardKept) {
     $ShellGuardStdout.Write($ShellGuardKept)

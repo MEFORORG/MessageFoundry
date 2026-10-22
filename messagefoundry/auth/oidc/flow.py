@@ -146,6 +146,17 @@ class PendingFlow:
     #: Stamped by :meth:`FlowCache.put` on the cache's own clock, so :meth:`FlowCache.age` reads the
     #: same clock (BACKLOG #2301). ``0.0`` on a flow never staged, which reads as staged long ago.
     started: float = 0.0
+    #: STEP-UP flows only, set with ``step_up_session_hash``: the id of the user whose session
+    #: staged the flow. ``AuthService.oidc_step_up_flow`` says why the callback needs it (#3374).
+    #: Declared last so the positional order of the fields above did not move.
+    step_up_user_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # A step-up flow names both its session and its user, or neither, so every reader may ask
+        # either field "is this a step-up?" and get one answer (BACKLOG #3374). Checked on the type,
+        # so ``dataclasses.replace`` and a direct construction are held to it too.
+        if (self.step_up_session_hash is None) != (self.step_up_user_id is None):
+            raise ValueError("a step-up flow stages both its session hash and its user id")
 
 
 class FlowCache:
@@ -175,7 +186,10 @@ class FlowCache:
 
     @staticmethod
     def _key(flow_id: str) -> str:
-        return hashlib.sha256(flow_id.encode("ascii")).hexdigest()
+        # ``flow_id`` arrives from a cookie, before the callback charges any limiter, so this must
+        # not raise on any str: ``ascii`` raised UnicodeEncodeError on ``caf\xe9``, an unthrottled
+        # 500 (BACKLOG #3374). A minted id is base64url ASCII, so a non-ASCII one keys nothing.
+        return hashlib.sha256(flow_id.encode("utf-8", "surrogatepass")).hexdigest()
 
     def _prune(self, now: float) -> None:
         for k in [k for k, e in self._entries.items() if e.deadline <= now]:
@@ -255,6 +269,7 @@ def start_flow(
     clock: Callable[[], float] = time.monotonic,
     prior_session_hash: str | None = None,
     step_up_session_hash: str | None = None,
+    step_up_user_id: str | None = None,
     step_up_purpose: str | None = None,
     wall_clock: Callable[[], float] = time.time,
 ) -> tuple[str, PendingFlow]:
@@ -273,6 +288,7 @@ def start_flow(
         deadline=clock() + ttl_seconds,
         prior_session_hash=prior_session_hash,
         step_up_session_hash=step_up_session_hash,
+        step_up_user_id=step_up_user_id,
         step_up_purpose=step_up_purpose,
         issued_at=wall_clock(),
     )

@@ -146,6 +146,9 @@ _NO_DEPENDENCY_GATE: dict[tuple[str, str], tuple[tuple[int, ...], str | None]] =
     ("POST", "/auth/negotiate"): (_every_arm(400), None),
     # The console's sign-in form, its sign-out, and the start of federated sign-in.
     ("POST", "/ui/login"): (_every_arm(303), "/ui/login?e=bad"),
+    # The passkey sign-in's begin leg (ADR 0197 Amendment A wave 2). It reads no body, and the
+    # walk's app has no relying party (no public origin, no request-derived one), so it refuses.
+    ("POST", "/ui/login/passkey"): (_every_arm(404), None),
     ("POST", "/ui/logout"): (_every_arm(303), "/ui/login?e=loggedout"),
     ("POST", "/ui/oidc/start"): (_every_arm(303), "/ui/login?e=oidc_unavailable"),
     # The browser's CSP report sink. It takes any body from anyone and answers 204.

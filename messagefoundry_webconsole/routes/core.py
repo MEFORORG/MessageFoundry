@@ -47,8 +47,10 @@ from messagefoundry.auth.service import (
     DirectoryRefusal,
     Elevation,
     MfaStatus,
+    PasskeyProof,
 )
 from messagefoundry.auth.tokens import hash_bytes, hash_token
+from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.parsing import HL7PeekError, parse_tree
 from messagefoundry.parsing.tree import ParseTreeTooLargeError
@@ -65,6 +67,7 @@ from .._auth import (
     allow_reauth_attempt,
     assert_not_cross_site,
     assert_same_origin,
+    clear_passkey_sign_in_cookie,
     clear_session_cookie,
     confined_before_its_factor,
     consume_continuation,
@@ -73,6 +76,7 @@ from .._auth import (
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
+    passkey_sign_in_cookie_name,
     proof_spent_for,
     proxied_loopback_host,
     reauth_landing,
@@ -83,6 +87,7 @@ from .._auth import (
     require_ui_step_up_action,
     rotation_comes_first,
     session_token,
+    set_passkey_sign_in_cookie,
     set_session_cookie,
     settle_ui_action_step_up,
     spend_ui_action_step_up,
@@ -112,6 +117,14 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset(
 #: How many report bodies of one CSP violation BATCH the WARNING line summarises before it is
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
+
+#: The passkey sign-in cookie's lifetime: the engine's pre-auth challenge TTL, read from the engine,
+#: so the browser drops the handle when the challenge it names expires (ADR 0197 Amendment A).
+_PASSKEY_SIGN_IN_COOKIE_SECONDS = int(CHALLENGE_TTL_SECONDS)
+
+#: The longest passkey assertion the sign-in form passes on. A real one is a few hundred characters;
+#: a longer value is clamped, which makes it an invalid assertion rather than a large parse.
+_PASSKEY_ASSERTION_MAX_CHARS = 16_384
 
 #: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
 #: ``/ui/reauth/webauthn``: a constant, not the bucket's exact wait (BACKLOG #3293). The reason is
@@ -646,7 +659,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # precedent). oidc_available, not oidc_enabled -- the LINK should disappear while the IdP
         # is known-down, even though the start leg still attempts per-request (AC-8).
         oidc_enabled = bool(getattr(auth, "oidc_available", False))
-        resp = HTMLResponse(pages.login(e, sso_enabled=sso_enabled, oidc_enabled=oidc_enabled))
+        # ADR 0197 Amendment A, wave 2: the passkey sign-in, offered to every caller whenever the
+        # extra is installed and the relying party is known, so its presence says nothing about an
+        # account. Rendering stages nothing; the begin leg is a POST.
+        passkey_enabled = (
+            auth is not None and auth.webauthn_available() and webauthn_rp(request) is not None
+        )
+        resp = HTMLResponse(
+            pages.login(
+                e,
+                sso_enabled=sso_enabled,
+                oidc_enabled=oidc_enabled,
+                passkey_enabled=passkey_enabled,
+            )
+        )
         # ASVS 14.3.1: this render IS the post-termination landing page when either the outcome code
         # says so (the watchdog's ?e=expired, the redirect target of POST /ui/logout, or the
         # server's own expiry redirect) OR the browser still presents a session cookie that no
@@ -655,6 +681,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # resurrect a PHI page whose session no longer exists.
         if e in _CLEAR_SITE_DATA_LOGIN_CODES or await _has_stale_session_cookie(request, auth):
             resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+        return resp
+
+    @app.post("/ui/login/passkey")
+    @public_route("the passkey sign-in's begin leg; a session does not exist yet")
+    async def ui_login_passkey_begin(request: Request) -> Response:
+        """Stage the usernameless passkey sign-in's challenge (ADR 0197 Amendment A, wave 2, AC-A7).
+
+        A POST, so a page render stages nothing. Same-origin first, like the sign-in itself. The
+        engine charges the sign-in limiter (control 2) before it stages anything, and takes no
+        username, so the options name no account. The challenge's handle goes back as an HttpOnly
+        cookie that the sign-in POST carries; the body holds only the options."""
+        assert_same_origin(request)
+        auth = get_auth(request)
+        if auth is None:
+            raise HTTPException(503, "authentication is not configured")
+        rp = webauthn_rp(request)
+        if not auth.webauthn_available() or rp is None:
+            raise HTTPException(404, "passkey sign-in is not available on this server")
+        begun = auth.begin_passkey_sign_in(rp_id=rp[0], client=client_ip(request))
+        if begun is None:
+            raise HTTPException(
+                429,
+                "too many login attempts",
+                headers={"Retry-After": str(auth.login_retry_after())},
+            )
+        handle, options = begun
+        resp = JSONResponse({"options": json.loads(options)})
+        set_passkey_sign_in_cookie(
+            resp, handle, request=request, max_age=_PASSKEY_SIGN_IN_COOKIE_SECONDS
+        )
+        resp.headers["Cache-Control"] = "no-store"
         return resp
 
     @app.post("/ui/login")
@@ -690,6 +747,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)
+        # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
+        # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
+        # oversized assertion is simply an invalid one.
+        handle = request.cookies.get(passkey_sign_in_cookie_name(request))
+        assertion = form.get("passkey_assertion", "")[:_PASSKEY_ASSERTION_MAX_CHARS]
+        rp = webauthn_rp(request)
+        passkey = (
+            PasskeyProof(handle=handle, response_json=assertion, rp_id=rp[0], origin=rp[1])
+            if handle and assertion and rp is not None
+            else None
+        )
         outcome = await auth.login(
             form.get("username", ""),
             form.get("password", ""),
@@ -703,9 +771,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
             supersedes=session_token(request),
+            passkey=passkey,
         )
         if not outcome.ok or outcome.token is None:
-            return RedirectResponse("/ui/login?e=bad", status_code=303)
+            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
+            if handle:
+                clear_passkey_sign_in_cookie(refused, request)
+            return refused
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
@@ -727,6 +799,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             target = "/ui"
         resp = RedirectResponse(target, status_code=303)
         set_session_cookie(resp, outcome.token, request=request)
+        if handle:
+            clear_passkey_sign_in_cookie(resp, request)
         return resp
 
     @app.post("/ui/logout")
@@ -1699,7 +1773,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
             # still owes an enrolled factor stays here to answer it (BACKLOG #1954), and one that
-            # must enrol TOTP first never reaches this branch (rotation_comes_first is False).
+            # must enrol a factor with a way past first never reaches this branch
+            # (rotation_comes_first is False).
             return RedirectResponse("/ui/account/password", status_code=303)
         if await auth.mfa_satisfied(token):
             return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed

@@ -94,6 +94,7 @@ POST /ui/dead-letters/{channel_id}/{destination_name}/replay
 POST /ui/dr/activate
 POST /ui/dr/release
 POST /ui/login
+POST /ui/login/passkey
 POST /ui/logout
 POST /ui/messages/search/presets
 POST /ui/messages/search/presets/{preset_id}/delete

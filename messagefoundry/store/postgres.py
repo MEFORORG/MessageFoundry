@@ -248,6 +248,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    TotpUsable,
     UserAuthzRecord,
     UserChange,
     UserRecord,
@@ -271,6 +272,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_verdict,
     existing_roles_only,
     federated_bind,
     federated_unbind,
@@ -278,6 +280,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
+    judge_totp,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -294,6 +297,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
@@ -303,6 +307,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -319,8 +324,8 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_disable,
     totp_enable,
+    totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
@@ -974,7 +979,8 @@ _SCHEMA: list[str] = [
         label              VARCHAR(100) NOT NULL,
         aaguid             VARCHAR(64),
         created_at         DOUBLE PRECISION NOT NULL,
-        last_used_at       DOUBLE PRECISION
+        last_used_at       DOUBLE PRECISION,
+        discoverable       BOOLEAN NOT NULL DEFAULT FALSE
     )""",
     # BACKLOG #3423: the hash now carries a scheme tag ("wc1:" + 64 hex), wider than VARCHAR(64).
     # Widening a varchar is metadata-only here, and the primary key comes along unchanged. Guarded,
@@ -1155,6 +1161,12 @@ _SCHEMA.append(_gated_add_column("pending_approvals", "seal", "TEXT NOT NULL DEF
 # NULL on an existing row means the origin was not recorded.
 _SCHEMA.append(_gated_add_column("messages", "origin", "TEXT"))
 _SCHEMA.append(_gated_add_column("messages", "origin_actor", "TEXT"))
+# ADR 0197 Amendment A, wave 2: whether a passkey was registered as a discoverable credential, for a
+# webauthn_credentials table created before the column. FALSE on an existing row is the closed
+# direction: such a passkey is no way past the sign-in lock. In _SCHEMA, so no _MIGRATION_REV bump.
+_SCHEMA.append(
+    _gated_add_column("webauthn_credentials", "discoverable", "BOOLEAN NOT NULL DEFAULT FALSE")
+)
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -1279,8 +1291,8 @@ _PG_WEBAUTHN_REHASH: Final = "UPDATE webauthn_credentials SET credential_id_hash
 _PG_WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-    " aaguid, created_at, last_used_at)"
-    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+    " aaguid, created_at, last_used_at, discoverable)"
+    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
 )
 # The `$n` twins of store.py's approval statements (BACKLOG #2592); store.py states the contract.
 # The writes are used only by `_write_approval`.
@@ -9017,18 +9029,33 @@ class PostgresStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
         )
-        return await self._write_user_txn(user_id, change) is not None
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The passkeys the condition reads are read in the write's own transaction, after the
+            # account row is locked, so a concurrent removal waits for this write.
+            if require_way_past:
+                await self._read_user_record(conn, user_id)
+            change = password_change(
+                password_hash=password_hash,
+                password_generated=password_generated,
+                must_change_password=must_change_password,
+                require_way_past=require_way_past,
+                now=now,
+                passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
+                sealed=self._row_sealer is not None,
+                totp_counts=totp_counts,
+            )
+            return await self._write_user(conn, user_id, change) is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -9101,10 +9128,36 @@ class PostgresStore:
         tee_audits((audit,), appended, ts=now)
         return _rowcount(revoked)
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
+    async def disable_totp(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
-        await self._write_user_txn(user_id, lambda r: totp_disable(r, now))
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            passkeys: list[WebAuthnCredential] = []
+            if require_way_past:
+                # The account row first, locked, so a concurrent passkey removal waits for this.
+                await self._read_user_record(conn, user_id)
+                passkeys = await self._account_passkeys(conn, user_id)
+            change = totp_removal(
+                now,
+                require_way_past=require_way_past,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                totp_counts=totp_counts,
+            )
+            return await self._write_user(conn, user_id, change) is not None
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=$1", user_id)
@@ -9217,11 +9270,35 @@ class PostgresStore:
         row = await self._fetchone("SELECT 1 AS present FROM webauthn_credentials LIMIT 1")
         return row is not None
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
+    async def delete_webauthn_credential(
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if require_way_past:
+                # ADR 0197 Amendment A: the account row locked first, so two removals serialize.
+                current = await self._read_user_record(conn, user_id)
+                if current is None or not removal_keeps_way_past(
+                    current,
+                    await self._account_passkeys(conn, user_id),
+                    sealed=self._row_sealer is not None,
+                    drop_passkey=credential_id_hash,
+                    totp_counts=totp_counts,
+                ):
+                    return False
             count = await self._write_passkeys(
                 conn,
                 user_id,
@@ -9453,6 +9530,7 @@ class PostgresStore:
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        totp_usable: TotpUsable,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -9462,8 +9540,11 @@ class PostgresStore:
         even cross-node, which is the case only this backend has -- serialize on the row rather than
         each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
         the reason this has to be one call rather than three; the same locked read carries the
-        ``auth_provider`` and ``totp_enabled`` that decide the escalation (ADR 0197). Returns
-        ``(0, False, 0)`` for an unknown user."""
+        ``auth_provider`` that decides the escalation (ADR 0197), and for the SIGN-IN lock the
+        TOTP's refusal is judged by ``totp_usable`` before the lock, only for a failure that would
+        set a later-cycle lock, on a cell the locked row must still hold
+        (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an
+        unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         change = lockout_increment(
@@ -9473,6 +9554,15 @@ class PostgresStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
+            totp_counts=await escalation_verdict(
+                self.get_user,
+                self.open_totp_secret,
+                user_id,
+                counter,
+                totp_usable=totp_usable,
+                threshold=threshold,
+                now=now,
+            ),
         )
         async with self._timed_acquire() as conn, conn.transaction():
             written = await self._write_user(conn, user_id, change)
