@@ -36,8 +36,8 @@ walker skipped as not path-shaped, and every one was arithmetic. Re-run that lis
 or narrowing the path words; :data:`SITES` itself is the current count.
 
 **What it walks.** The engine, the web console, the toolkit and the harness (:data:`PY_ROOTS`), the
-IDE extension, and the operator-run scripts (every ``scripts/service/`` script, which owner rulings
-R3 and R1 put in scope). ``tee/``, the separately run relay, is left out by owner decision.
+IDE extension, and the operator-run scripts (every ``scripts/service/`` script: owner ruling R3 of
+2026-10-02 puts them in scope, and R1 of 2026-10-05 keeps ``measure-store-access.ps1`` among them). ``tee/``, the separately run relay, is left out by owner decision.
 
 **Grades.** Each site gets one:
 

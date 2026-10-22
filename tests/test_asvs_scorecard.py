@@ -1221,9 +1221,10 @@ def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path
         (".", "view-inert"),
         ("./", "view-inert"),
         ("scripts/absent.py", "view-inert"),
-        # A path the corpus would never read asks no view question and is named instead.
-        ("scripts", "unread-path"),
+        # A file the corpus would never read asks no view question and is named instead.
+        ("scripts", "view-inert"),
         ("tests/test_x.py", "unread-path"),
+        ("samples/config/x.py", "unread-path"),
     ],
 )
 def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
@@ -1474,7 +1475,7 @@ def test_absence_powershell_landing_names_the_comment_blanking_view(tmp_path: Pa
         ("ide/src/extension.ts", True),
         ("ide/media/view.js", True),
         ("messagefoundry_webconsole/static/app.js", True),
-        ("ide/esbuild.js", False),
+        ("ide/esbuild.js", True),
         ("ide/node_modules/dep/index.js", False),
         ("ide/out/extension.js", False),
         ("ide/src/test/suite/a.test.ts", False),
@@ -1501,25 +1502,11 @@ def test_corpus_reads_agrees_with_the_walk_over_the_real_tree() -> None:
     assert "scripts/service/measure-store-access.ps1" in walked
 
 
-def test_absence_corpus_skips_the_ides_unshipped_build_script(tmp_path: Path) -> None:
-    """``ide/.vscodeignore`` leaves esbuild.js out of the package, so a hit there is not shipped."""
+def test_absence_corpus_reads_the_ides_build_script(tmp_path: Path) -> None:
+    """esbuild.js does not ship, but its banner and defines land in the bundle, which is not read."""
     root = _absence_tree(tmp_path, {"ide/esbuild.js": "fetch('/ui/logs/tail')\n"})
-    assert _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')") == []
-    repo = Path(__file__).resolve().parents[1]
-    lines = (repo / "ide" / ".vscodeignore").read_text(encoding="utf-8").splitlines()
-    ignored = {s for line in lines if (s := line.strip()) and not s.startswith("#")}
-    unshipped = {
-        PurePosixPath(rel).relative_to("ide").as_posix()
-        for rel in scorecard_module._SCRIPT_UNSHIPPED_FILES
-    }
-    assert unshipped <= ignored, unshipped - ignored
-    # Both ways: a literal script file the package leaves out must not be read either. A glob
-    # such as ``**/*.ts`` drops the TypeScript sources the built bundle is made from, which the
-    # corpus does read, so only literal names count.
-    literal_scripts = {
-        e for e in ignored if e.endswith(scorecard_module._SCRIPT_SUFFIXES) and "*" not in e
-    }
-    assert literal_scripts <= unshipped, literal_scripts - unshipped
+    problems = _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')")
+    assert len(problems) == 1 and "FALSE" in problems[0], problems
 
 
 def test_absence_corpus_pairs_with_its_source_list(tmp_path: Path) -> None:
@@ -1583,7 +1570,7 @@ def test_powershell_view_makes_the_crypto_gates_decisions() -> None:
 
 
 def test_script_walk_matches_the_crypto_gates_walk() -> None:
-    """Parity: the gate's roots, suffixes and pruned directories, less IDE tests and build scripts."""
+    """Parity: the same roots, suffixes and pruned directories as the gate, less the IDE's tests."""
     from scripts.security import crypto_inventory_check as gate
 
     assert scorecard_module._SCRIPT_ROOTS == gate.NON_PYTHON_WALK_ROOTS
@@ -1599,9 +1586,7 @@ def test_script_walk_matches_the_crypto_gates_walk() -> None:
     mine = {p.relative_to(repo).as_posix() for p in scorecard_module._script_sources(repo)}
     tests = {p for p in theirs if p.startswith("ide/src/test/")}
     assert tests and mine, (len(tests), len(mine))  # both sides read something
-    unshipped = set(scorecard_module._SCRIPT_UNSHIPPED_FILES)
-    assert unshipped <= theirs, unshipped  # each entry names a file the gate still reads
-    assert mine == theirs - tests - unshipped
+    assert mine == theirs - tests
 
 
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:

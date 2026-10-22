@@ -1654,12 +1654,13 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             mutation_rel = PurePosixPath(a.mutation_path.replace("\\", "/"))
             # An in-scope operator script is read only through its view, so a claim naming one
             # lands there even before the file exists.
-            lands_in_view = mutation_rel.as_posix() in viewed_paths or _is_operator_powershell(
-                mutation_rel
-            )
-            # A path the corpus never reads gets no view: no view question about it can be answered,
+            # Every PowerShell file the corpus views is operator PowerShell, and each one lands.
+            ps_landing = _is_operator_powershell(mutation_rel)
+            lands_in_view = ps_landing or mutation_rel.as_posix() in viewed_paths
+            # A file the corpus never reads gets no view: no view question about it can be answered,
             # and the FALSE check below never sees that file, so the gap is named rather than silent.
-            unread = bool(mutation_rel.parts) and not _corpus_reads(mutation_rel)
+            # mutation_path names a file; a path with no suffix, such as a root, is not judged here.
+            unread = bool(mutation_rel.suffix) and not _corpus_reads(mutation_rel)
             if unread and not raw_inert:
                 findings.advise(
                     "unread-path",
@@ -1676,12 +1677,10 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             # advisories below only ever name the Python view: a PowerShell path either lands in
             # its view or is unread.
             asks_view = not unread and not mutation_rel.name.endswith(_SCRIPT_SUFFIXES)
-            # Every PowerShell file the corpus views is operator PowerShell, and each one lands.
-            ps_landing = _is_operator_powershell(mutation_rel)
-            searched = (
-                f"comment-blanking view of every {_OPERATOR_POWERSHELL_DIR}/ PowerShell file"
+            view, files = (
+                ("comment-blanking", f"{_OPERATOR_POWERSHELL_DIR}/ PowerShell")
                 if ps_landing
-                else f"code-only view of every {_CODE_ONLY_LABEL} file"
+                else ("code-only", _CODE_ONLY_LABEL)
             )
             if not raw_inert and asks_view:
                 mutation_view, cut = _pattern_view(mutation_rel, a.mutation) or _code_only_view(
@@ -1714,7 +1713,6 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                         )
             if raw_inert or view_inert:
                 # One site for both, so every INERT line has the one shape a parser reads.
-                view = "comment-blanking" if ps_landing else "code-only"
                 where = (
                     ""
                     if raw_inert
@@ -1738,7 +1736,11 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 # One site for both, for the same reason as INERT above.
                 # Keep "that tokenizes" word for word: the vault's baseline parser matches it. An
                 # operator PowerShell view always completes, so it counts as a file that tokenizes.
-                where = "" if not seen_raw else f", searched in the {searched} that tokenizes,"
+                where = (
+                    ""
+                    if not seen_raw
+                    else f", searched in the {view} view of every {files} file that tokenizes,"
+                )
                 findings.problems.append(
                     f"{c.id}: absence claim is BLIND — its positive control "
                     f"{a.positive_control!r}{where} matches nothing, so a zero result for "
@@ -1791,7 +1793,7 @@ _PYTHON_SKIP_DIRS: Final[frozenset[str]] = frozenset({".venv", "__pycache__"})
 def _is_python_source(rel: PurePosixPath) -> bool:
     """Whether the corpus reads a Python file at ``rel``, whether or not it exists."""
     return (
-        rel.suffix == ".py"
+        rel.suffix.lower() == ".py"
         and bool(rel.parts)
         and rel.parts[0] in _PYTHON_ROOTS
         and _PYTHON_SKIP_DIRS.isdisjoint(rel.parts)
@@ -1855,11 +1857,10 @@ _SCRIPT_SKIP_DIRS: Final[frozenset[str]] = frozenset(
 #: ship, and the Python corpus never reads ``tests/`` either. Read raw, a test's fixture data
 #: matches patterns written for shipped code, such as a handler named by a two-character string.
 _SCRIPT_TEST_DIRS: Final[frozenset[str]] = frozenset({"ide/src/test"})
-
-#: The second difference: build scripts the extension package leaves out. ``ide/.vscodeignore``
-#: drops ``esbuild.js``, which bundles the extension and never ships, so a pattern written for
-#: shipped code must not read FALSE on it.
-_SCRIPT_UNSHIPPED_FILES: Final[frozenset[str]] = frozenset({"ide/esbuild.js"})
+#: ``ide/esbuild.js`` is read on purpose, though ``ide/.vscodeignore`` leaves it out of the
+#: package. Its settings (a banner, a define, an inject) become text in the shipped
+#: ``dist/extension.js``, and ``dist/`` is pruned above, so it is the only place that text is read.
+#: A hit there can over-report; skipping it would go quiet on shipped code.
 
 
 def _is_script_source(rel: PurePosixPath) -> bool:
@@ -1871,7 +1872,6 @@ def _is_script_source(rel: PurePosixPath) -> bool:
         and parts[0] in _SCRIPT_ROOTS
         and _SCRIPT_SKIP_DIRS.isdisjoint(parts[1:-1])
         and not any(rel.is_relative_to(d) for d in _SCRIPT_TEST_DIRS)
-        and rel.as_posix() not in _SCRIPT_UNSHIPPED_FILES
     )
 
 
@@ -2025,7 +2025,7 @@ def _absence_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]
     for path in _absence_sources(root):
         text = path.read_text(encoding="utf-8", errors="replace")
         raw.append(text)
-        rel = PurePosixPath(path.relative_to(root).as_posix())
+        rel = _rel(root, path)
         pattern_text, seen_as = text, None
         got = _pattern_view(rel, text)
         if got is not None and got[1] is None:

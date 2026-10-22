@@ -43,8 +43,8 @@ context in every other session. The root file keeps the "never say vault cell" r
     change makes it do. A requirement's status (words such as gap, unmet, partial, residual, covered
     or still open), its coverage, any count or score from the scorecard, and any map pairing cell
     ids with paths stay vaulted — a path-to-cell map enumerates what IS covered over a closed public
-    domain, so it hands out what is NOT by subtraction. So no pull request, comment, commit message
-    or file may hold three or more requirement numbers each beside a path. Text already on a public
+    domain, so it hands out what is NOT by subtraction. So in a public repository, no pull request,
+    comment, commit message or file may hold three or more requirement numbers each beside a path. Text already on a public
     `main` is no precedent, and no seat sweeps it without a ruled item. Naming the terms discloses
     nothing; pasting the scorecard does. korus `roles/COMMON.md`, *A public repository never
     carries the scorecard's map*, is the source of record.
