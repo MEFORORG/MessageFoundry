@@ -978,6 +978,11 @@ _windows_only = pytest.mark.skipif(
 #: Each console case makes two launches, and each can wait in single_spawn before it starts, so the
 #: suite's --timeout=60 would fire before the labelled diagnostic in _run_gate_in_console could.
 _two_launch_budget = pytest.mark.timeout(300)
+#: The ordinal section's tests make up to five launches: the premise probe (once per worker), the
+#: shipped gate, one or two controls, and a further shipped run. Each is bounded by GATE_TIMEOUT_S and
+#: can wait in single_spawn first, so the suite's --timeout=60 would fire before any labelled
+#: diagnostic could. 300s is the console budget, kept rather than re-derived.
+_multi_launch_budget = pytest.mark.timeout(300)
 
 
 def _rebuilt_gate(dst: Path, old: str, new: str, why: str, *more: tuple[str, str]) -> Path:
@@ -1704,7 +1709,8 @@ def _host_premises() -> tuple[str, str]:
     (culture reason, git-output reason), each "" when the premise holds. One pwsh launch measures both.
 
     The controls need the culture comparison to ignore a soft hyphen and a zero-width space, to miss
-    a colon or a prefix before a combining mark, and to read `.m<U+00AD>d` as `.md`, as ICU does and
+    a colon or a prefix before a combining mark, and to read `.m<U+00AD>d` as `.md` and a leading soft
+    hyphen as absent (`<U+00AD>--` is `--`, `<U+00AD>-x` starts with `-`), as ICU does and
     invariant globalization does not. The git-backed tests also need pwsh to read git's output as
     UTF-8: it decodes it with [Console]::OutputEncoding, so under cp437 a non-ASCII path git reports
     arrives garbled, the lookalike is never seen, and the gate and its control agree. That is a defect
@@ -1713,15 +1719,23 @@ def _host_premises() -> tuple[str, str]:
         "$shy=[char]0xAD; $zw=[char]0x200B; $cm=[char]0x301; "
         "$ok=(('a'+$shy+'b') -eq 'ab') -and (('a'+$zw+'b') -eq 'ab') -and "
         "(-not ('c:/r/'+$cm+'a').StartsWith('c:/r/')) -and (('x:'+$cm+'y').IndexOf(':') -eq -1) -and "
-        "(('.m'+$shy+'d') -in @('.md')) -and (($shy+'-x').StartsWith('-')); "
+        "(('.m'+$shy+'d') -in @('.md')) -and (($shy+'-x').StartsWith('-')) -and "
+        "(($shy+'--') -eq '--'); "
         'Write-Output "$ok $([Console]::OutputEncoding.CodePage)"'
     )
-    proc = run_single(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
-        capture_output=True,
-        text=True,
-        timeout=GATE_TIMEOUT_S,
-    )
+    try:
+        proc = run_single(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True,
+            text=True,
+            timeout=GATE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Labelled as run_gate labels it, so a hung launch is not read as a gate regression.
+        raise AssertionError(
+            f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304), in the premise probe. "
+            "No gate logic ran; see run_gate for what this is and what to do."
+        ) from exc
     # A failed probe must not read as a host property: an empty stdout would otherwise skip every
     # control below as "not ICU's", and the suite would stay green with nothing discriminating.
     assert proc.returncode == 0, f"the premise probe failed: {proc.returncode} {proc.stderr!r}"
@@ -1773,7 +1787,7 @@ def lookalike_repo(tmp_path: Path) -> LookalikeRepo:
     return LookalikeRepo(primary=primary, wt1=wt1, lookalike=lookalike, repos=repos)
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_head_move_into_a_lookalike_of_the_session_s_own_worktree_is_denied(
     tmp_path: Path, lookalike_repo: LookalikeRepo
 ) -> None:
@@ -1803,7 +1817,7 @@ _GOVERNED_ORDINAL_ONLY = (
 )
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_primary(
     tmp_path: Path,
 ) -> None:
@@ -1840,7 +1854,7 @@ def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_prim
     assert run_gate(payload, repos, culture_3b) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
     tmp_path: Path,
 ) -> None:
@@ -1872,7 +1886,7 @@ def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
     assert run_gate(payload, repos, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
     tmp_path: Path, lookalike_repo: LookalikeRepo
 ) -> None:
@@ -1892,7 +1906,7 @@ def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
     assert own in assert_denied(run_gate(payload, repo.repos, control))
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primary(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1914,7 +1928,7 @@ def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primar
     assert cannot not in assert_denied(run_gate(payload, repos_file, control))
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1933,7 +1947,7 @@ def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
     assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 @pytest.mark.parametrize(
     ("head", "dest", "comparison", "culture"),
     [
@@ -1981,7 +1995,7 @@ def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
     assert run_gate(payload, repos, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1999,7 +2013,7 @@ def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
     assert run_gate(payload, repos_file, control) is None, "the ordinal-only control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_an_extension_that_only_collates_as_a_document_is_denied(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -2016,7 +2030,7 @@ def test_an_extension_that_only_collates_as_a_document_is_denied(
     assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
     tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2038,7 +2052,7 @@ def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
 def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
     tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2059,14 +2073,37 @@ def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
 
 
-@_two_launch_budget
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    ("ref", "ordinal", "culture"),
+    [
+        # A culture StartsWith read `<U+00AD>-x` as a flag.
+        (
+            f"{SOFT_HYPHEN}-x",
+            f"        if (-not $t.StartsWith('-', {_ORD})) {{ return $true }}",
+            "        if (-not $t.StartsWith('-')) { return $true }",
+        ),
+        # A culture `-eq` read `<U+00AD>--` as the separator.
+        (
+            f"{SOFT_HYPHEN}--",
+            f"if ([string]::Equals($t, '--', {_ORD})) {{ return $false }}",
+            "if ($t -eq '--') { return $false }",
+        ),
+    ],
+    ids=["flag", "separator"],
+)
 def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
-    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+    tmp_path: Path,
+    hijack_repo: HijackRepo,
+    hijack_repos_file: Path,
+    ref: str,
+    ordinal: str,
+    culture: str,
 ) -> None:
-    """Test-VerbMovesHead. A culture StartsWith read the reset target `<U+00AD>-x` as a flag, so the
-    reset was classed as moving no HEAD and `--git-dir=<primary>/.git` from outside was allowed."""
+    """Test-VerbMovesHead. A culture comparison read a reset target that begins with a soft hyphen
+    as a flag or as `--`, so the reset was classed as moving no HEAD and `--git-dir=<primary>/.git`
+    from outside was allowed."""
     _require_culture_premise()
-    ref = f"{SOFT_HYPHEN}-x"
     subprocess.run(["git", "branch", ref], cwd=hijack_repo.primary, check=True, capture_output=True)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -2075,32 +2112,8 @@ def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
     assert_denied(run_gate(payload, hijack_repos_file))
     control = _rebuilt_gate(
         tmp_path / "gate_culture_moves_head.ps1",
-        f"        if (-not $t.StartsWith('-', {_ORD})) {{ return $true }}",
-        "        if (-not $t.StartsWith('-')) { return $true }",
-        "Test-VerbMovesHead's flag test moved",
-    )
-    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
-
-
-@_two_launch_budget
-def test_a_reset_target_spelled_like_the_separator_still_moves_the_primary_s_head(
-    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
-) -> None:
-    """Test-VerbMovesHead's separator test. A culture `-eq` read the reset target `<U+00AD>--`, a
-    valid branch name, as `--`, so the reset was classed as moving no HEAD and
-    `--git-dir=<primary>/.git` from outside was allowed."""
-    _require_culture_premise()
-    ref = f"{SOFT_HYPHEN}--"
-    subprocess.run(["git", "branch", ref], cwd=hijack_repo.primary, check=True, capture_output=True)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    git_dir = hijack_repo.primary / ".git"
-    payload = bash(f'git --git-dir="{git_dir}" reset {ref}', cwd=elsewhere)
-    assert_denied(run_gate(payload, hijack_repos_file))
-    control = _rebuilt_gate(
-        tmp_path / "gate_culture_separator.ps1",
-        f"if ([string]::Equals($t, '--', {_ORD})) {{ return $false }}",
-        "if ($t -eq '--') { return $false }",
-        "Test-VerbMovesHead's separator test moved",
+        ordinal,
+        culture,
+        "a Test-VerbMovesHead comparison moved",
     )
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"

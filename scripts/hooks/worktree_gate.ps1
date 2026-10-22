@@ -2512,8 +2512,8 @@ $rehome
 # into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
 # 2026-10-21). That is NOT a claim that those denies protect the primary: `<primary><U+200B>` is a
 # different directory on NTFS and ext4. Dropping them would loosen the gate, which a change made for
-# ordinal comparison must not do, so whether they earn their place is left open here. Some comparisons elsewhere are ordinal now, where a match allows and ordinal therefore
-# denies at least as much. Culture comparisons remain, at least the deny-on-match ones such as rule 3d's
+# ordinal comparison must not do, so whether they earn their place is left open here. Some comparisons
+# elsewhere are ordinal now, where a match allows and ordinal therefore denies at least as much. Culture comparisons remain, at least the deny-on-match ones such as rule 3d's
 # governed test, rule 3c's `-eq` and class A's flag test, and sites nobody has audited. This is not a
 # census.
 function Test-Governed([string]$Candidate) {
@@ -4619,8 +4619,9 @@ foreach ($r in $roots) {
     # be a stream separator. Strip from there and judge the base: a registry keeps its real extension and
     # denies, while a stream on a genuine document stays a document.
     #
-    # THE COLON IS ONE MEMBER OF A SET, AND FOUR LAYERS COVER THE SET -- record which does what, because
-    # they fail independently and this line is only one of them. Win32 maps MANY spellings onto ONE file:
+    # THE COLON IS ONE MEMBER OF A SET, AND AT LEAST THE FOUR LAYERS BELOW COVER IT -- record which does
+    # what, because they fail independently and this line is only one of them. This is not a census of
+    # the set: tests/test_worktree_gate.py pins the spellings each layer is known to deny. Win32 maps MANY spellings onto ONE file:
     # measured on this box, `OFF.`, `OFF` with a trailing space, `OFF::$DATA` and `OFF:x.md` each create the
     # single file `OFF`, and announce-session.ps1 arms its kill switch on that file's existence alone.
     #
@@ -4644,6 +4645,11 @@ foreach ($r in $roots) {
     #                                  culture search misses, so `handoff/x.md:<U+0301>y` strips to a
     #                                  document and the backstop below would ALLOW it. The culture search
     #                                  left it whole and it was denied, so the disagreement denies it.
+    #                                  THIS LAYER PROTECTS NO REGISTRY that is known: its one measured
+    #                                  spelling is a stream on a document, the shape the strip allows
+    #                                  for `handoff/x.md:y`. It exists so that making the search ordinal
+    #                                  removes no deny the culture search gave, not because the deny is
+    #                                  shown to guard anything.
     #
     # The split was MEASURED by reverting each layer, not reasoned about, and the first draft of this comment
     # got it wrong in the safe-looking direction: it credited the strip with the `::$DATA` cases, which it
