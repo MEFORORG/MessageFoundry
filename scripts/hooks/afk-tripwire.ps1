@@ -301,7 +301,10 @@ try {
     $context = "AFK TRIPWIRE (ADR 0211; docs/AUTONOMY-PLAN.md section 4.4): this command carries $what. " +
         'Under the AFK-autonomy plan that makes it a Class C act. This hook does not block it, but do not ' +
         'run it on your own judgment: stop, and bring it to the owner in the Class C bundle, unless the ' +
-        "owner asked for exactly this in your own chat. $logged"
+        'owner asked for exactly this in your own chat. Two narrow cases are yours, and only while every ' +
+        'condition holds: a force-push of your own unshared branch (CLAUDE.md section 5), and a ' +
+        'cache-only remove.ps1 -Force on your own worktree (docs\WORKTREES.md, "Remove one"). ' +
+        "This record stands either way. $logged"
     $payload = [pscustomobject]@{
         hookSpecificOutput = [pscustomobject]@{ hookEventName = 'PreToolUse'; additionalContext = $context }
     }

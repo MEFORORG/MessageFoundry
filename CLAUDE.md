@@ -269,7 +269,7 @@ This section replaced the pre-2026-09-01 method. The retired rules are not repea
 retractions. At least these went:
 
 - plan, then wait for the owner's "go" before writing code, as a rule binding a Builder. It still
-  binds the Manager;
+  binds the Manager, on a plan that holds a class C item;
 - `/clear` and `/compact` as the fix for a stuck session;
 - declaring your own seat with `seat.ps1 -Declare`, **as a RULE. The MECHANISM stayed and has
   since become load-bearing for something that did not exist then -- see "Declare your seat"
@@ -437,7 +437,10 @@ invoking either (plan section 5.1, owner approvals 2026-10-21 and 2026-10-22). T
 classes A to D are defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3.
 **When `MEFOR_AFK_KILL` reads anything but `off`, empower is off** and the driver rules alone
 apply. Case and surrounding space are ignored, and an unread or missing variable counts as on;
-`scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). The Lander and the Watchdog keep
+`scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). While it is on, the grants this section
+takes from the plan are off too: a routine plan waits for the owner's go again, and the two class
+A acts and the cache-only `-Force` in `docs/WORKTREES.md` go back to the owner. A delegated
+question (the merge bullet below) is the owner's own answer, and the switch does not touch it. The Lander and the Watchdog keep
 their exemption: they never use `AskUserQuestion`, and put an owner question in a table instead.
 
 The brief is disposable. The BACKLOG item is the record.
@@ -511,9 +514,12 @@ never with mail. The evidence is probe PR
   **It waits for the owner's explicit "go" only on a plan that holds a class C item**, such as new
   product scope. A routine plan is class B under [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md)
   section 3 (plan section 5.2, owner approval 2026-10-21): the Manager logs it with
-  `scripts/coord/decision.ps1` (ADR 0211) and acts on that section's R4 bar, which sends every class B
-  decision through an adversarial review until 60 blind samples exist. Point the brief at the
-  relevant existing code; it measurably improves the result.
+  `scripts/coord/decision.ps1` (ADR 0211), and acts only after an adversarial review affirms it.
+  **Every class B decision takes that review for now**, whatever the sample count: plan section
+  10 opens the no-review path only in its last wave, per seat, as calibration passes. Plan section
+  5.2 retires the go *"once section 4 is built"*, and section 4 is only partly built, so this
+  retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Point
+  the brief at the relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
   running, what paths they touch, and whether they share the worktree. Hand down readings, not
@@ -705,7 +711,9 @@ never with mail. The evidence is probe PR
   to take, as class A in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3 (owner approval
   2026-10-22):** force-pushing your own unshared branch, which only your session has pushed, with no
   pull request open on it and no other branch built on it; and deleting disposable output your own
-  run made. The tripwire hook (ADR 0211) still records a force-push. What needs the owner is any
+  run made. The tripwire hook (ADR 0211) still records a force-push. The `git push --force` and
+  `-f` deny rules in `.claude/settings.json` still stand: where one refuses, the act is class D,
+  so name the command once rather than reach for a form the rule misses. What needs the owner is any
   other action git cannot undo. Examples: writing outside the worktree, a DB migration against
   a real store, a global install. A Builder cannot ask, so it must not take one. If your brief
   requires one, stop, push what is green, and say so in your exit report, which the Manager carries
