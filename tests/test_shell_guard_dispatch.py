@@ -11,10 +11,10 @@ guard file standalone. This module asserts the other half: that the dispatcher's
 payload is exactly what the guards decide standalone, taken in the settings file's order with the
 first deny winning, and that one guard's scope, failure or absence cannot change another's verdict.
 
-TWO DIFFERENCES ARE DELIBERATE. The dispatcher reads the payload as UTF-8 bytes, where a guard
-run on its own decodes it with the console code page, and it writes its decision with every
-non-ASCII character escaped. On an ASCII payload, or a UTF-8 console, neither changes a verdict;
-the encoding test at the end of this module is where they do.
+AT LEAST THESE DIFFERENCES ARE DELIBERATE: the dispatcher reads the payload as UTF-8 bytes and
+writes its decision with every non-ASCII character escaped (why is in its header), and a kept
+decision is re-serialised to carry other guards' contexts. The encoding test at the end of this
+module is where the first two change a verdict.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import atexit
 import ctypes
 import functools
 import json
-import locale
 import os
 import re
 import shutil
@@ -31,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -125,24 +125,25 @@ def _dispatch(guards: list[Path], raw: str, *, burst: bool = False) -> str:
     return _run(_dispatch_argv(guards), raw, burst=burst)
 
 
-def _console_output_encoding() -> str:
-    """The encoding a pwsh child of this process writes its stdout in: the console's output page,
-    or UTF-8 when there is no console, which is .NET's fallback."""
-    if sys.platform != "win32":
-        return "utf-8"
-    page = int(ctypes.WinDLL("kernel32").GetConsoleOutputCP())
-    return "utf-8" if page in (0, 65001) else f"cp{page}"
+def _same_decision(got: str, expected: str) -> bool:
+    """Whether the dispatcher's stdout is what the guards decided standalone.
 
-
-def _as_dispatched(standalone: str) -> str:
-    """A guard's standalone stdout as the dispatcher writes it: the same text, every non-ASCII
-    UTF-16 unit written as \\uXXXX. The text came in through two decodings, so it is first put back:
-    pwsh wrote it in the console's output page, and text-mode capture read it in the locale's."""
-    text = standalone.encode(locale.getpreferredencoding(False)).decode(_console_output_encoding())
-    units = text.encode("utf-16-le")
-    return "".join(
-        chr(u) if u < 0x80 else f"\\u{u:04x}"
-        for u in (int.from_bytes(units[i : i + 2], "little") for i in range(0, len(units), 2))
+    BYTE FOR BYTE WHEN THE STANDALONE OUTPUT IS ASCII, which the dispatcher's escaping leaves
+    unchanged. Otherwise the decision only: a standalone guard writes non-ASCII text in the
+    console's output page, which can best-fit a character ('e' for U+00E9 under cp932) or replace
+    it, so its reason cannot be rebuilt here, whatever page this process guesses. The dispatcher's
+    side must still be ASCII and parse."""
+    if expected.isascii():
+        return got == expected
+    if not got.isascii():
+        return False
+    try:
+        g, e = json.loads(got), json.loads(expected)
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        g["hookSpecificOutput"]["permissionDecision"]
+        == e["hookSpecificOutput"]["permissionDecision"]
     )
 
 
@@ -223,8 +224,9 @@ _CORPUS: list[str] = [
 
 
 def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> None:
-    """Byte-for-byte: the dispatcher's stdout is the first non-empty stdout of the guards run
-    standalone, in the settings file's order -- or nothing, when every guard allows."""
+    """The dispatcher's stdout is the first non-empty stdout of the guards run standalone, in the
+    settings file's order -- or nothing, when every guard allows. Byte for byte where that output
+    is ASCII; _same_decision says what is compared where it is not."""
     guards = _wired_guards()
     # Six concurrent pwsh launches are a storm, so each chunk holds the exclusive side of the spawn
     # lock (BACKLOG #1304). The test flaked once in a parallel suite run, with its detail lost; the
@@ -247,7 +249,7 @@ def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> N
                         (out for g in guards if (out := standalone[(raw, g)].result()).strip()), ""
                     )
                     got = dispatched[raw].result()
-                    if got != _as_dispatched(expected):
+                    if not _same_decision(got, expected):
                         mismatches.append((raw[:120], expected[:200], got[:200]))
     assert not mismatches, mismatches
 
@@ -1081,18 +1083,23 @@ _ENCODING_PROBE = (
 def test_the_payload_and_the_decision_are_utf8_whatever_the_console_code_page(
     tmp_path: Path, codepage: int
 ) -> None:
-    """Claude Code writes UTF-8 and reads the decision as UTF-8. Read through [Console]::In, this
-    file decoded the payload with the console code page and handed every guard the result: under
-    cp437 U+00E9 arrived as two characters, and under cp932 the backslash after U+200B was
-    swallowed and the payload stopped parsing. Written in the console's page, a decision echoing
-    U+30BD under cp932 carried a stray `\\` and no longer parsed. So the decision is read back here
-    as Claude Code reads it, as UTF-8.
+    """Claude Code writes the payload as UTF-8 and reads the decision as UTF-8, so the decision is
+    read back here that way. What each code page did to the old reads is in the dispatcher's
+    header.
 
     The dispatcher runs in a console of its own, so chcp reaches nothing pytest shares;
     tests/test_coord_alloc_floor.py has the incident. A bare chcp reports the page first, so a host
     that cannot take it skips rather than passing for the wrong reason."""
     if sys.platform != "win32":  # the skipif above already skips; this line tells mypy
         pytest.skip("Windows only")
+    if ctypes.WinDLL("kernel32").GetConsoleCP() == 0:
+        warnings.warn(
+            pytest.PytestWarning(
+                "this process has no console, so the check that chcp left the shared console "
+                "alone has nothing to measure; the encoding itself is still checked"
+            ),
+            stacklevel=1,
+        )
     probe = _guard(tmp_path, "encoding.ps1", _ENCODING_PROBE)
     raw = json.dumps(bash(_ENCODED_COMMAND), ensure_ascii=False).encode("utf-8")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

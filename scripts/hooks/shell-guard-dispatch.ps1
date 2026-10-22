@@ -107,17 +107,23 @@ param(
 )
 
 $ShellGuardStdout = [Console]::Out
+# Read-CcxHookInput in _hookinput.ps1 is the same byte read. It is not dot-sourced here because
+# scoping is dynamic, so its functions and $script: state would be visible to every guard.
 try {
     $ShellGuardPayload = [System.IO.StreamReader]::new(
         [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
 } catch {
-    exit 0
+    # No guard ran, so say so: exit 1 is the visible non-blocking hook error, as for a failed guard.
+    [Console]::Error.WriteLine("shell-guard-dispatch: could not read the hook input, so no guard ran: $($_.Exception.Message)")
+    exit 1
 }
 
 function ConvertTo-ShellGuardAscii([string]$Json) {
-    # A decision this file writes is JSON that parsed, so any non-ASCII character in it sits inside
-    # a string, where \uXXXX names the same character. Escaped, the bytes are the same in every code
-    # page, so the console's output page cannot break a deny the way it once broke the input.
+    # A decision this file writes parsed as JSON, so a non-ASCII character in it normally sits
+    # inside a string, where \uXXXX names the same character. Escaped, the bytes are the same in
+    # every code page, so the console's output page cannot break a deny the way it once broke the
+    # input. ConvertFrom-Json is lenient, so such a character can also sit outside a string; the
+    # escape there is no more valid than the character was, and Claude Code rejects either.
     [regex]::Replace($Json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 }
 
