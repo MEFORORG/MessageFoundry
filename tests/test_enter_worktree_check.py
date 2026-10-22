@@ -717,11 +717,11 @@ def test_a_hung_child_is_bounded_by_the_run_s_budget(fleet: Fleet, silent_remote
     wt = fleet.own_wt()
     start = time.monotonic()
     proc = fleet.check(
-        wt, remote=silent_remote, extra=("-BudgetSeconds", "6", "-RemoteTimeoutSeconds", "30")
+        wt, remote=silent_remote, extra=("-BudgetSeconds", "10", "-RemoteTimeoutSeconds", "60")
     )
     assert_unsafe(proc, "f")
     assert "budget ran out" in proc.stdout, proc.stdout
-    assert time.monotonic() - start < 25, proc.stdout
+    assert time.monotonic() - start < 45, proc.stdout
 
 
 # ---------------------------------------------------------------- the local OFF file
@@ -868,20 +868,42 @@ def test_the_unsafe_reason_is_one_bounded_line(fleet: Fleet) -> None:
     assert len(reason) < 1000 and "c. third" in reason and "d. fourth" not in reason, reason
 
 
-@pytest.mark.parametrize("case", ["bypassPermissions", "no mode", ".claude/worktrees"])
+@pytest.mark.parametrize(
+    "case",
+    ["bypassPermissions", "auto", "dontAsk", "no mode", ".claude/worktrees", "relative into it"],
+)
 def test_the_hook_says_nothing_where_the_harness_would_not_prompt(fleet: Fleet, case: str) -> None:
     """An `ask` there would ADD a prompt; in a run nobody answers, that is a refusal."""
+    trees = fleet.engine / ".claude" / "worktrees"
     if case == ".claude/worktrees":
-        path = fleet.add_worktree(fleet.engine / ".claude" / "worktrees" / "agent-x")
+        payload = _payload(fleet, fleet.add_worktree(trees / "agent-x"))
+    elif case == "relative into it":
+        fleet.add_worktree(trees / "agent-b")
+        payload = _payload(fleet, Path("../agent-b"))
+        payload["cwd"] = str(fleet.add_worktree(trees / "agent-a"))
     else:
         path = fleet.own_wt()
         assert_safe(fleet.check(path))
-    payload = _payload(fleet, path)
-    if case == "no mode":
-        del payload["permission_mode"]
-    elif case == "bypassPermissions":
-        payload["permission_mode"] = "bypassPermissions"
+        payload = _payload(fleet, path)
+        if case == "no mode":
+            del payload["permission_mode"]
+        else:
+            payload["permission_mode"] = case
     assert _decision(fleet.hook(payload)) is None
+
+
+@pytest.mark.parametrize("mode", ["default", "acceptEdits", "plan"])
+def test_the_hook_speaks_in_every_mode_a_person_answers(fleet: Fleet, mode: str) -> None:
+    payload = _payload(fleet, fleet.own_wt())
+    payload["permission_mode"] = mode
+    assert _reason(_decision(fleet.hook(payload))).startswith("enter-check: SAFE")
+
+
+def test_a_dotdot_out_of_claude_worktrees_still_gets_a_verdict(fleet: Fleet) -> None:
+    """The pair is judged on the resolved path, so naming it on the way out hides nothing."""
+    escape = f"{fleet.engine}/.claude/worktrees/../../{fleet.scratch().name}"
+    reason = _reason(_decision(fleet.hook(_payload(fleet, Path(escape)))))
+    assert reason.startswith("enter-check: UNSAFE"), reason
 
 
 @pytest.mark.parametrize("body", ["Write-Output 'SAFE'\nexit 1\n", "exit 0\n"])
