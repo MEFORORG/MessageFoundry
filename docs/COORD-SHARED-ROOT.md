@@ -60,13 +60,13 @@ that worked was a PR comment. Two lessons for the design:
 
 | Fact | Reading | Instrument |
 |---|---|---|
-| Backing | SMB share `\\192.168.4.21\Shared`, NTFS on a Windows host | `Get-PSDrive Z`, `Win32_LogicalDisk` |
-| Host | `192.168.4.21` reverse-resolves to `Nucbox01`, a third box, not MEFORDEV01 | `Dns.GetHostEntry` |
+| Backing | An SMB share on the LAN, NTFS on a Windows host, mapped by IP address | `Get-PSDrive Z`, `Win32_LogicalDisk` |
+| Host | The address reverse-resolves to `Nucbox01`, a third box, not MEFORDEV01 | `Dns.GetHostEntry` |
 | Kind | A real share, not a sync folder (no OneDrive or Offline Files layer found) | `net use`, `Win32_OfflineFilesCache` empty |
 | Round trip | ping under 1 ms; 20 x (exists + listing) took 76 ms, the same as 20 local listings of `seats/` | `Measure-Command` |
 | Client caches | directory cache 10 s, file-info cache 10 s, not-found cache 5 s, session timeout 60 s | `Get-SmbClientConfiguration` |
 | Mapping | `net use` shows Z: in this logon; `HKCU:\Network\Z` returned nothing | `Get-ItemProperty` |
-| Neighbours | The share already holds unrelated files, at least one whose name suggests exported keys | `Get-ChildItem Z:\` |
+| Neighbours | The share already holds unrelated files, and its access list is unknown | `Get-ChildItem Z:\` |
 
 Not measured from ALIENWARE, on purpose: whether an elevated shell or a service sees Z:, and atomic
 create and rename on the share. No probe file was written to Z: from this PC, because writing
@@ -79,29 +79,33 @@ A session on MEFORDEV01 ran the probe the owner asked for. Its report is
 
 | Fact | Reading |
 |---|---|
-| User and paths | Same Windows user as ALIENWARE. The profile's `Code` folder is a junction to `D:\Code`, so every common dir is on D:. Worktrees there report `D:\Code\...` paths. |
-| Mapping | Z: is `\\192.168.4.21\Shared`, by IP, persistent. `EnableLinkedConnections` is not set, so an elevated shell does not see Z:. That confirms the UNC-path rule. |
-| Host | `Nucbox01` resolves by mDNS (`Nucbox01.local`) and by reverse lookup. TCP 445 answers. ALIENWARE and MEFORHV01 answer neither ping nor 445 from MEFORDEV01, which does not matter: both PCs talk only to Nucbox01. |
-| Tools | git 2.55.0, gh 2.102.0, pwsh 7.6.7, Python 3.14.7, uv 0.13.1. All seven account slots are signed in; four run a desktop instance. |
+| User and paths | A separate LOCAL account that has the same name as ALIENWARE's, not one shared identity. The profile's `Code` folder is a junction to `D:\Code`, so every common dir is on D:. Worktrees there report `D:\Code\...` paths. |
+| Mapping | Z: is the same share, mapped by IP, persistent. `EnableLinkedConnections` is not set, so an elevated shell does not see Z:. That confirms the UNC-path rule. |
+| Host | `Nucbox01` resolves by mDNS (`Nucbox01.local`), not by DNS, and TCP 445 answers. Forward resolution from ALIENWARE was not measured. |
+| Tools | git 2.55.0, gh 2.102.0, pwsh 7.6.7, Python 3.14.7, uv 0.13.1. The same Claude accounts are signed in as on ALIENWARE. |
 | Power | Sleep on AC is never. |
 | Latency | 1 to 3 ms per round on Z:. The share was faster than a local temp folder. |
 | **CreateNew race** | Two processes, 100 slots: 51 and 49 wins, **no double winners and no empty rounds.** Exclusive create holds on this share, from one client. |
-| **Rename over a file being read** | **Not safe.** 2 of 50 `File.Move(..., $true)` calls failed with "Access is denied", and 56 of about 2,500 reads failed with a sharing violation. No reader saw partial content. |
+| **Rename over a file being read** | **Not safe.** 2 of 50 `File.Move(..., $true)` calls failed with "Access to the path is denied.", and 56 of about 2,500 reads failed with a sharing violation. No reader saw partial content. |
 | Local state | MEFORDEV01's own `mefor-coord` holds about 25,000 files: 4,634 under `seats/`, 2,834 under `mail/`, 880 under `alloc/`, 153 under `claims/`, plus large retired and backup trees. |
 
 What this changes:
 
 1. **Writers that replace a file by rename need a retry, and readers must treat a sharing
    violation as "retry", never as "missing" or "torn".** At least `seat.ps1` (its temp-then-rename
-   record write) and `lane.ps1` do this on shared kinds; `claim.ps1`'s refresh already retries.
+   record write), `lane.ps1` and `handoff.ps1 -Replace` do this on shared kinds; `claim.ps1`'s
+   refresh already retries.
    This is a new precondition of step 7.
 2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
    it again with one process on each PC before step 7, because the two clients' caches are the
    part no single-client test sees.
 3. **Merging MEFORDEV01 is a large step, not a footnote.** It copies live folders only, never the
-   retired or backup trees. Each of its 880 allocation records gets checked against the share.
-4. **Map by name, with a DHCP reservation for Nucbox01.** An IP mapping breaks silently if the
-   address changes. `root.toml` should name `\\Nucbox01\Shared\mefor-coord`.
+   retired or backup trees. Each of its ADR allocation records (`alloc/adr/`) gets checked against
+   the share. The retired backlog allocator's records and tombstones are not live numbers, so they
+   get their own disposition rather than a collision check.
+4. **Reserve Nucbox01's address in DHCP**, because an IP mapping breaks silently if it changes.
+   Name the share by IP in `root.toml` until forward resolution of `Nucbox01` is measured from both
+   PCs: every probe resolves the name first, and the name resolves only by mDNS.
 
 ## Why not the drive letter
 
@@ -205,8 +209,9 @@ because the share is reachable from more than one machine:
 
 - **Restrict the folder.** The owner chose the general `Shared` share, which already holds
   unrelated and possibly sensitive files and whose access list is unknown. So set an NTFS access
-  list on `\\Nucbox01\Shared\mefor-coord` that grants the owner's account alone, with inheritance
-  off. A dedicated share remains the stronger option.
+  list on `\\Nucbox01\Shared\mefor-coord` that grants only the accounts the two PCs present to
+  Nucbox01, with inheritance off. Those are two separate local accounts that share a name, so name
+  each one. A dedicated share remains the stronger option.
 - Mail bodies are free text. `mail.ps1` should refuse a body that matches the leak gate's secret
   patterns, the same patterns the pre-commit gate uses. That is a follow-up, not a precondition.
 
