@@ -10,6 +10,8 @@ Architecture Decision Records and report, **advisory-only** (never blocks a comm
   whether that file exists on disk. A *coverage gap* is a criterion whose linked test is missing.
   A link whose path climbs out of the repository root with ``..``, or names a DOS device such as
   ``NUL`` or ``nul.py``, is reported as outside the repository on every platform, never probed.
+  A LEADING run of ``./`` and ``../`` is dropped first and the rest read as root-relative, so only a
+  ``..`` after the first directory can climb out.
 * **Missing criteria** — an ``Accepted`` ADR with no acceptance-criteria block (recommended to add).
 * **Open clarifications** — unchecked ``- [ ]`` task items (the "clarify" step): questions that
   should be resolved before an ADR flips to ``Accepted``.
@@ -40,10 +42,23 @@ __all__ = [
 _DISCOVERY_GLOB = "[0-9]*.md"
 
 # A reference inside an Acceptance-Criteria block pointing at a test or fixture, e.g.
-# ``tests/test_foo.py::test_bar`` or ``fixtures/IB_ACME/adt.hl7``. The ``::node`` pytest selector is
-# captured but dropped for the on-disk existence check.
+# ``tests/test_foo.py::test_bar``, ``fixtures/IB_ACME/adt.hl7`` or
+# ``packaging/messagefoundry-webconsole/tests/test_webui_oidc.py``. The ``::node`` pytest selector
+# is captured but dropped for the on-disk existence check. The ref is the ``ref`` group.
+#
+# Anchored at the start of a path token: the lookbehind refuses to start inside one, so leading
+# directories are part of the ref. Unanchored, it read ``tests/...`` out of a full packaging path
+# and reported false gaps. The lookbehind also keeps the search linear, and keeps out an absolute
+# path and a URL's path after its host. A ref still reads after any character outside the path
+# class, at least ``?``, ``=``, ``#``, ``:``, ``~``, ``+`` and ``$``, so a URL can still yield one.
+#
+# A leading run of ``./`` and ``../`` is dropped, which reads the ref as root-relative. That is what
+# a markdown link target from ``docs/adr/`` means, ``[tests/x.py](../../tests/x.py)``; kept, it
+# would read as outside the root. A ``..`` after the first directory stays, for ``_inside``.
 _REF_RE = re.compile(
-    r"(?:tests|fixtures|samples|harness)/[A-Za-z0-9_./\-]+(?:::[A-Za-z0-9_\-\[\]]+)?"
+    r"(?<![A-Za-z0-9_./\-])(?:\.\.?/)*+"
+    r"(?P<ref>(?:[A-Za-z0-9_.\-]++/)*"
+    r"(?:tests|fixtures|samples|harness)/[A-Za-z0-9_./\-]+(?:::[A-Za-z0-9_\-\[\]]+)?)"
 )
 _STATUS_RE = re.compile(
     r"status[^A-Za-z]*\b(Proposed|Accepted|Superseded|Rejected|Reserved|Dropped)\b", re.IGNORECASE
@@ -251,7 +266,7 @@ def _criteria(lines: list[str], repo_root: Path) -> list[AcceptanceCriterion]:
         text = item[0].strip().lstrip("-*").strip()
         refs: list[str] = []
         for m in _REF_RE.finditer(blob):
-            ref = m.group(0)
+            ref = m.group("ref")
             if ref not in refs:
                 refs.append(ref)
         outside: list[str] = []
