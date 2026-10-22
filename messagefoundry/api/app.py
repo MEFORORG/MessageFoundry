@@ -279,7 +279,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -9816,6 +9816,7 @@ def create_app(
             return await recheck_standing_or_refusal(auth, token, Permission.MONITORING_READ)
 
         frames = 0
+        stopped: StandingRefusal | None = None
         try:
             await websocket.accept()
             while True:
@@ -9827,21 +9828,12 @@ def create_app(
                 # frame.
                 current = await _reauthorize()
                 if not isinstance(current, Identity):
-                    # One row per stopped feed, naming the rule and the frames sent (BACKLOG
-                    # #3404). The gate audits its own refusals; without this a feed ended by an
-                    # unmet second factor or a missing notification address left no trail. Written
-                    # before the close, as the export writes its stop before it raises. The close
-                    # is in a finally so a failed write still ends the feed with 1008, and the
-                    # write's error still propagates to be logged.
-                    try:
-                        await engine_obj.store.record_audit(
-                            "ws_stats.stopped",
-                            actor=handshake_identity.username,
-                            detail=json.dumps({"reason": current, "frames": frames}),
-                            client=client_ip(websocket),
-                        )
-                    finally:
-                        await websocket.close(code=1008)
+                    # Close first; the stop row waits for the `finally` below, after the slot is
+                    # given back. A slow store then neither holds a refused caller's socket open
+                    # nor keeps its slot from a new monitor socket. The exports write their stop
+                    # row first; this feed differs on purpose, so do not line it up with them.
+                    stopped = current
+                    await websocket.close(code=1008)
                     return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
                 # counts PLUS the SERVER-RENDERED, already-escaped connections fragment, so the /ui table
@@ -9873,6 +9865,33 @@ def create_app(
             return
         finally:
             state.ws_count = max(0, getattr(state, "ws_count", 1) - 1)
+            if stopped is not None:
+                # One row per feed the re-check stopped, naming the rule and the frames sent
+                # (BACKLOG #3404). The gate audits its own refusals; without this a feed ended by
+                # an unmet second factor or a missing notification address left no trail. Written
+                # here, so a close that raised because the client was already gone still records
+                # it, and a lost row is logged at ERROR rather than hidden under that close's error.
+                await write_audit_soft(
+                    lambda: engine_obj.store.record_audit(
+                        "ws_stats.stopped",
+                        actor=handshake_identity.username,
+                        detail=json.dumps({"reason": stopped, "frames": frames}),
+                        client=client_ip(websocket),
+                    ),
+                    log=_log,
+                    message=(
+                        "ws_stats.stopped audit row not written. Lost row: actor=%s client=%s"
+                        " reason=%s frames=%d"
+                    ),
+                    # Scrubbed for CodeQL py/log-injection, as the other lost-row lines are.
+                    args=lambda: (
+                        scrub_log_argument(handshake_identity.username),
+                        scrub_log_argument(str(client_ip(websocket))),
+                        stopped,
+                        frames,
+                    ),
+                    defects=AUDIT_WRITE_DEFECTS,
+                )
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).

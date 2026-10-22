@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
+from tests._refusal_log_capture import record_texts
 
 PW = "Sup3rSecret!!"
 
@@ -465,7 +467,7 @@ async def test_a_refusal_before_the_first_frame_records_a_stop_with_no_frames(
 
     monkeypatch.setattr(WebSocket, "accept", accept_then_unmeet)
     harness = _WSHarness(app, token)
-    await harness.run(timeout=5.0)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
     assert harness.frames == []
     assert harness.close_code == 1008
     assert await _stop_rows(engine) == [
@@ -528,26 +530,123 @@ async def test_a_session_that_ends_during_the_factor_check_is_named_ended(engine
     )
 
 
-async def test_a_failed_stop_row_write_still_closes_the_feed_with_1008(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+def _replace_the_stop_row_write(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: Engine,
+    write: Callable[[], Awaitable[None]],
 ) -> None:
-    """BACKLOG #3404: the close runs whether or not the stop row is written. A store that refuses
-    the write still ends the feed with the policy close, and the write's error still surfaces."""
+    """Run ``write`` in place of the ``ws_stats.stopped`` row's store write; other rows still land."""
+    real_record_audit = engine.store.record_audit
+
+    async def record_audit(action: str, **kwargs: Any) -> Any:
+        if action == "ws_stats.stopped":
+            return await write()
+        return await real_record_audit(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", record_audit)
+
+
+async def _refuse() -> None:
+    raise RuntimeError("store refused the write")
+
+
+@pytest.mark.parametrize("close_raises", [False, True], ids=["close-lands", "client-gone"])
+async def test_a_failed_stop_row_write_is_logged_and_the_feed_still_closes(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    close_raises: bool,
+) -> None:
+    """BACKLOG #3404: a store that refuses the stop row leaves an ERROR record naming the actor, the
+    client, the reason and the frames, and never the token. ``client-gone`` is the case the first build lost: the close
+    raised too, Starlette turned that into ``WebSocketDisconnect``, and the route's catch of it
+    swallowed the write's error. ``close-lands`` is the control, and pins the 1008 close."""
     monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
-    real_record_audit = engine.store.record_audit
-
-    async def refuse_the_stop_row(action: str, **kwargs: Any) -> Any:
-        if action == "ws_stats.stopped":
-            raise RuntimeError("store refused the write")
-        return await real_record_audit(action, **kwargs)
-
-    monkeypatch.setattr(engine.store, "record_audit", refuse_the_stop_row)
+    _replace_the_stop_row_write(monkeypatch, engine, _refuse)
     _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
     harness = _WSHarness(create_app(engine, auth=service), token)
-    with pytest.raises(RuntimeError, match="store refused the write"):
-        await harness.run(timeout=_HARNESS_TIMEOUT)
-    assert harness.close_code == 1008
+    if close_raises:
+        real_send = harness._send
+
+        async def send_fails_on_close(message: dict[str, object]) -> None:
+            if message["type"] == "websocket.close":
+                raise OSError("client gone")
+            await real_send(message)
+
+        harness._send = send_fails_on_close  # type: ignore[method-assign]
+    caplog.set_level(logging.ERROR, logger=app_module.__name__)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == (None if close_raises else 1008)
     assert len(harness.frames) == 1, harness.frames
+    lost = [
+        record
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(lost) == 1, caplog.records
+    assert lost[0].getMessage() == (
+        "ws_stats.stopped audit row not written. Lost row: actor=op client=127.0.0.1"
+        " reason=session_ended frames=1"
+    )
+    assert lost[0].exc_info is not None
+    assert not any(token in text for r in caplog.records for text in record_texts(r))
+
+
+async def test_the_close_does_not_wait_for_the_stop_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404: the feed closes, and gives its slot back, before it writes the stop row. A
+    write that blocks would otherwise hold a refused caller's socket open and keep its slot from a
+    new monitor socket, which the cap answers with 1013."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def blocking_write() -> None:
+        write_started.set()
+        await release_write.wait()
+
+    _replace_the_stop_row_write(monkeypatch, engine, blocking_write)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    try:
+        await asyncio.wait_for(write_started.wait(), _HARNESS_TIMEOUT)
+        assert harness.close_code == 1008
+        assert app.state.ws_count == 0
+        assert not task.done()
+    finally:
+        release_write.set()
+        await task
+
+
+async def test_a_client_that_disconnects_mid_feed_records_no_stop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404: only a refused re-check writes a stop row. A client that goes away while its
+    session still stands ends the feed through ``WebSocketDisconnect`` and records none, as
+    SECURITY.md says. The first frame lands, so the send that fails is a later one."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    real_send = harness._send
+
+    async def gone_after_one_frame(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.send" and harness.frames:
+            raise OSError("client gone")
+        await real_send(message)
+
+    harness._send = gone_after_one_frame  # type: ignore[method-assign]
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert len(harness.frames) == 1, harness.frames
+    assert harness.close_code is None
+    assert await _stop_rows(engine) == []
