@@ -1960,6 +1960,31 @@ def test_a_claim_held_by_a_pruned_worktree_is_released(fx: Fixture, sleeper: int
     assert res["_exit"] == 0
 
 
+def test_a_claim_from_ANOTHER_machine_is_never_reaped_with_the_tree(
+    fx: Fixture, sleeper: int
+) -> None:
+    """docs/COORD-SHARED-ROOT.md: on a shared registry two PCs can each have a tree at one path.
+
+    Removing THIS machine's tree ends nothing on the other PC, so its claim must survive. The legacy
+    record beside it has no ``host``, which means this machine, and is the positive control: released
+    in the same run, so the survivor did not pass by the sweep doing nothing.
+    """
+    live_record(fx, sleeper, fx.primary)
+    other = write_claim(fx, "other-pc-work", fx.sibling("clean"), note="that PC's work")
+    rec = json.loads(other.read_bytes())
+    rec["host"] = "OTHER-PC"
+    other.write_bytes(json.dumps(rec).encode("utf-8"))
+    legacy = write_claim(fx, "legacy-work", fx.sibling("clean"))
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] == "removed"
+    assert d["ClaimsReleased"] == ["legacy-work"]
+    assert other.exists(), "a removal here reaped another machine's live claim"
+    assert not legacy.exists()
+
+
 def test_a_claim_held_by_a_LIVING_worktree_is_never_released(fx: Fixture, sleeper: int) -> None:
     """The false positive, which is worse than the bug being fixed.
 

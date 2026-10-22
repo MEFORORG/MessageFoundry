@@ -1387,8 +1387,9 @@ function Read-OrphanLedger {
 }
 
 # --- Coordination claims stranded by a removal (BACKLOG #345) -------------------------------------
-# A work claim (scripts/coord/claim.ps1) is a JSON file under <git-common-dir>/mefor-coord/claims/. It
-# lives beside the SHARED object store, so it OUTLIVES the worktree that took it. Removing a worktree
+# A work claim (scripts/coord/claim.ps1) is a JSON file in the claims directory coord-root.ps1 names,
+# <git-common-dir>/mefor-coord/claims/ when nothing is configured. It lives outside any one worktree,
+# so it OUTLIVES the worktree that took it. Removing a worktree
 # therefore strands its claims, and `claim.ps1 -Take` hard-blocks on any claim file that exists -- so the
 # key becomes unclaimable by every future session until a human happens to run `-Release <key> -Force`.
 # Nothing surfaced that condition and nothing could: the registry has no way to observe that a holder
@@ -1399,7 +1400,25 @@ function Read-OrphanLedger {
 # EVIDENCE, not on elapsed time: it runs only from the branch that has already proven the directory is
 # gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
 # merely quiet is never touched by this.
-$claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' } else { '' }
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    throw "prune-merged.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was pruned or released."
+}
+. $coordRootScript
+
+# The registry may sit on the shared root, so coord-root.ps1 names it. A resolver ERROR is recorded
+# and shown, never replaced by a local guess: the run goes on with the claims unread, every
+# report-only suggestion is withheld as if a claim were unreadable, and no claim is released.
+$claimsError = ''
+$claimsDir = ''
+if ($gitCommonDir) {
+    $resolvedClaims = Resolve-CoordDir -From $RepoRoot -Kind 'claims' -LocalRoot (Join-Path $gitCommonDir 'mefor-coord')
+    if ($resolvedClaims.Error) { $claimsError = [string]$resolvedClaims.Error } else { $claimsDir = $resolvedClaims.Path }
+}
+if ($claimsError) {
+    Write-Note "WARNING: the claim registry could not be resolved, so no claim was read or released: $claimsError" 'Yellow'
+}
 
 # --- REPORT-ONLY, second pass: a tree holding a COORDINATION CLAIM is never suggested --------------
 # This runs here rather than with the rest of the report-only computation only because $claimsDir is
@@ -1420,7 +1439,8 @@ $claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' }
 # this worktree, so it withholds. Fails closed.
 if ($reportOnly.Count -gt 0) {
     $claimed = @{}
-    $claimUnreadable = $false
+    # Unresolved is not empty: withhold every suggestion, the same as an unreadable claim.
+    $claimUnreadable = [bool]$claimsError
     if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
             try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
@@ -1490,6 +1510,10 @@ function Remove-ClaimsHeldBy {
             continue
         }
         if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
+        # Another PC's claim at the same path is that PC's live work; removing this tree did not end it.
+        # A claim from ANOTHER machine names a path on that machine's disk (docs/COORD-SHARED-ROOT.md),
+        # so a removal here proves nothing about it even when the path string matches.
+        if (-not (Test-CoordRecordIsHere $c)) { continue }
         try {
             Remove-Item -LiteralPath $f.FullName -Force -EA Stop
             $released += [pscustomobject]@{ key = [string]$c.key; outcome = 'released'; detail = [string]$c.note }
@@ -1892,6 +1916,7 @@ if ($Json) {
         claims   = [pscustomobject]@{
             scanned    = $claimsScanned
             dir        = $claimsDir
+            error      = $(if ($claimsError) { $claimsError } else { $null })
             unreadable = @($claimsUnreadable.Values)
         }
         exitCode = $exit

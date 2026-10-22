@@ -2382,3 +2382,53 @@ def test_a_combining_mark_after_the_worktrees_slash_is_not_exempted(
     _require_culture_premise()
     target = primary / ".claude" / "worktrees" / f"{COMBINING_ACUTE}x" / "app.py"
     assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+# ------------------------------------------- rule 1b on the SHARED coordination root
+# docs/COORD-SHARED-ROOT.md moves seats, mail, claims and allocations onto a share both PCs reach. Rule 1
+# never governed that path, so without this a write tool could hand-write claims/<item>.json there: the
+# transfer rule 1b refuses locally. The control (nothing configured -> ALLOW) is what shows the new
+# check is the thing that fires, rather than some older rule.
+
+
+@pytest.fixture
+def shared_root(tmp_path: Path) -> Path:
+    d = tmp_path / "share" / "mefor-coord"
+    d.mkdir(parents=True)
+    return d
+
+
+@pytest.mark.parametrize("rest", ["claims/1032.json", "alloc/adr/0200.json", "seats/wt-1/s1.json"])
+def test_shared_root_registries_are_denied_when_named_by_env(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    target = shared_root / rest
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    assert run_gate(edit(target, cwd=worktree), repos_file) is None  # control: ungoverned before
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    reason = assert_denied(run_gate(edit(target, cwd=worktree), repos_file))
+    assert "SHARED coordination root" in reason
+    assert "new.ps1" not in reason
+
+
+def test_shared_root_named_by_root_toml_is_governed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    local = primary / ".git" / "mefor-coord"
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '{shared_root}'\n", encoding="utf-8")
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert_denied(run_gate(edit(shared_root / "claims" / "7.json", cwd=worktree), repos_file))
+
+
+def test_a_document_on_the_shared_root_is_still_allowed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert (
+        run_gate(edit(shared_root / "handoffs" / "RESUME-HERE.md", cwd=worktree), repos_file)
+        is None
+    )

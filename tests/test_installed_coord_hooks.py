@@ -274,6 +274,17 @@ def payloads_declared_by(root: Path) -> list[str]:
 PAYLOADS: list[str] = payloads_declared_by(ROOT)
 
 
+def payload_rel(name: str) -> str:
+    """A payload's source, as ``install-git-hooks.ps1``'s ``Get-PayloadRelPath`` names it: a bare name is
+    under ``scripts/hooks/``, and a name with a slash is a path under ``scripts/``."""
+    return f"scripts/{name}" if "/" in name else f"scripts/hooks/{name}"
+
+
+def payload_leaf(name: str) -> str:
+    """The file name a payload is installed under in the hooks directory."""
+    return name.rsplit("/", 1)[-1]
+
+
 def content_hash(data: bytes) -> str:
     """SHA-256 of a payload's CONTENT: raw bytes with CRLF folded to LF.
 
@@ -339,7 +350,7 @@ def source_is_committed_in(root: Path, name: str) -> bool:
     """
     try:
         out = subprocess.run(
-            ["git", "status", "--porcelain", "--", f"scripts/hooks/{name}"],
+            ["git", "status", "--porcelain", "--", payload_rel(name)],
             cwd=root,
             capture_output=True,
             text=True,
@@ -363,7 +374,7 @@ def test_the_payload_list_was_parsed_from_the_installer() -> None:
         f"no $payloads list parsed from {HOOK_INSTALLER} -- the parity test then parametrizes over an "
         f"empty set and pytest reports it as a SKIP, which reads like a pass"
     )
-    missing = [n for n in PAYLOADS if not (HOOK_SOURCE_DIR / n).is_file()]
+    missing = [n for n in PAYLOADS if not (ROOT / payload_rel(n)).is_file()]
     assert not missing, (
         f"the installer lists payloads with no source in this checkout: {missing} -- installing would "
         f"fail, and until then those hooks run from whatever copy is already in place"
@@ -379,9 +390,9 @@ def test_the_installed_coord_hook_matches_the_committed_source(name: str) -> Non
     different question. The hooks sit in the COMMON git dir, so one stale copy is stale for every
     worktree on the box at once, while the source-side tests stay green.
     """
-    source = HOOK_SOURCE_DIR / name
+    source = ROOT / payload_rel(name)
     hooks_dir = installed_hooks_dir()
-    installed = hooks_dir / name if hooks_dir else None
+    installed = hooks_dir / payload_leaf(name) if hooks_dir else None
     # Announce the target BEFORE any skip, exactly as test_gate_installed_parity.py does: the repo's
     # pytest config carries no -rs, so a skip renders as a bare dot with its reason invisible, and
     # "nothing was compared" then looks identical to "the comparison passed".
@@ -395,7 +406,7 @@ def test_the_installed_coord_hook_matches_the_committed_source(name: str) -> Non
         )
     if not payload_source_is_committed(name):
         pytest.skip(
-            f"SKIP (nothing compared): scripts/hooks/{name} has uncommitted changes -- the installed "
+            f"SKIP (nothing compared): {payload_rel(name)} has uncommitted changes -- the installed "
             f"copy is SUPPOSED to differ mid-edit. Re-run after committing."
         )
 
@@ -428,7 +439,7 @@ def test_the_installed_coord_hook_matches_the_committed_source(name: str) -> Non
         f"of the suite still passes.\n"
         f"WORK OUT WHICH COPY IS OLDER FIRST. Re-installing from a checkout older than the installed "
         f"payload downgrades it for every worktree on this box:\n"
-        f"    git log --oneline -5 -- scripts/hooks/{name}\n"
+        f"    git log --oneline -5 -- {payload_rel(name)}\n"
         f"Only once THIS checkout is confirmed the newer of the two, from a plain terminal:\n"
         f"    pwsh -NoProfile -File scripts\\coord\\install-git-hooks.ps1\n"
         f"That installer re-copies every payload it manages ({', '.join(PAYLOADS)}), not only this one; "
@@ -1057,7 +1068,7 @@ def test_the_coordination_hooks_are_actually_installed() -> None:
             else:
                 print(f"  {shim}: INSTALLED ({expected})")
         for name in PAYLOADS:
-            path = hooks_dir / name
+            path = hooks_dir / payload_leaf(name)
             if not path.is_file():
                 absent.append(f"{name}: NOT INSTALLED at {path}")
             else:
@@ -1460,11 +1471,11 @@ def audit_governed_root(root: Path, hooks_dir: Path | None) -> tuple[list[str], 
 
     notes.append(f"  {root}: payloads={payloads} hooks_dir={hooks_dir}")
     for name in payloads:
-        source = root / "scripts" / "hooks" / name
-        installed = hooks_dir / name
+        source = root / payload_rel(name)
+        installed = hooks_dir / payload_leaf(name)
         if not source.is_file():
             findings.append(
-                f"{root}: its installer lists {name}, which has no source at scripts/hooks/{name} -- "
+                f"{root}: its installer lists {name}, which has no source at {payload_rel(name)} -- "
                 f"installing there would fail, and until then that hook runs from whatever copy is "
                 f"already in place. REMEDY: reconcile that root's installer with that root's sources"
             )
@@ -1487,7 +1498,7 @@ def audit_governed_root(root: Path, hooks_dir: Path | None) -> tuple[list[str], 
                 f"committed (installed={installed_hash[:12]} at {installed}, "
                 f"source={source_hash[:12]}). Line endings are folded out of this comparison, so they "
                 f"differ in content. REMEDY: work out which copy is older FIRST -- "
-                f"`git -C {root} log --oneline -5 -- scripts/hooks/{name}` -- then, only if that "
+                f"`git -C {root} log --oneline -5 -- {payload_rel(name)}` -- then, only if that "
                 f"checkout is the newer of the two, run its own installer from a plain terminal IN "
                 f"THAT ROOT. Re-installing from the older side downgrades the hook for every worktree "
                 f"of that repository"

@@ -71,6 +71,9 @@ tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
+tests/test_coord_root.py
+tests/test_coord_shared_root_claims.py
+tests/test_coord_shared_root_seats_mail.py
 # The three below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
 # a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the

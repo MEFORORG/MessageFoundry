@@ -183,8 +183,25 @@ if ($Apply -and $ClaimsDir) {
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
-$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-$claimsDir = if ($ClaimsDir) { $ClaimsDir } else { Join-Path $common "mefor-coord/claims" }
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("claim-reconcile.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was scanned or released.")
+    exit 2
+}
+. $coordRootScript
+
+if ($ClaimsDir) { $claimsDir = $ClaimsDir }
+else {
+    # -Apply releases, so a fallback registry is not an option, and a report over one would read as
+    # the fleet's. Refuse both the same way (docs/COORD-SHARED-ROOT.md, "Offline behaviour").
+    $resolved = Resolve-CoordDir -From $repo -Kind 'claims'
+    if ($resolved.Error) {
+        [Console]::Error.WriteLine("claim-reconcile.ps1: the claim registry could not be resolved, so nothing was scanned or released: $($resolved.Error)")
+        exit 2
+    }
+    $claimsDir = $resolved.Path
+}
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
 
 function ConvertTo-Norm([string]$Path) {
@@ -479,6 +496,7 @@ function Test-StillReleasable([object]$Row) {
     try { $c = Get-Content -LiteralPath $file -Raw -EA Stop | ConvertFrom-Json -EA Stop }
     catch { return "the claim file no longer parses" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
+    if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
     $fresh = Read-WorktreeRegistry
     $script:registered = $fresh.Registered
     $script:locked = $fresh.Locked
@@ -510,6 +528,15 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
 
     if (-not $holder) {
         $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
+        continue
+    }
+    # A record from ANOTHER machine names a path on that machine's disk. Every test below reads this
+    # disk, so a live claim there would read as gone and deregistered, and -Apply would release it
+    # (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would ship"). Reported, never released.
+    if (-not (Test-CoordRecordIsHere $c)) {
+        $recHost = Get-CoordRecordHost $c
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "ELSEWHERE"
+            why = "ON $recHost -- not checkable here; reconcile it from that machine" }
         continue
     }
     if (Test-Path -LiteralPath $holder) {
@@ -715,7 +742,7 @@ if ($Apply) {
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE") })
 
 if ($Json) {
     [pscustomobject]@{

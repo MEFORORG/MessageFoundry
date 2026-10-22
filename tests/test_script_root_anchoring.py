@@ -121,6 +121,7 @@ def _coord_checkout(path: Path, *, drafted: int, boundary: int) -> Path:
     (path / "docs" / "adr").mkdir(parents=True)
     shutil.copy2(_ALLOC, path / "scripts" / "coord" / "alloc.ps1")
     shutil.copy2(_CLAIM, path / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(_CLAIM.parent / "coord-root.ps1", path / "scripts" / "coord" / "coord-root.ps1")
     (path / "docs" / "adr" / f"{drafted}-a-number-drafted-in-this-checkout.md").write_text(
         f"# ADR {drafted}\n", encoding="utf-8"
     )

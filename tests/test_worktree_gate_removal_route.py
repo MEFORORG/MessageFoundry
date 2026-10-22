@@ -71,7 +71,7 @@ def _build(tmp: Path, remove_ps1: str | None) -> SimpleNamespace:
     """A governed primary whose path CONTAINS A SPACE, with one worktree of each family.
 
     ``remove_ps1`` is the text of the primary's ``scripts/worktree/remove.ps1``, or None to copy the
-    real one with the two scripts it dot-sources. The space is there for the reason
+    real one with the scripts it dot-sources. The space is there for the reason
     ``tests/test_worktree_gate_emitter.py`` gives: without it every quoting assertion passes by accident.
     """
     primary = tmp / "Pri mary"
