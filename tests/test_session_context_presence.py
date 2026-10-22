@@ -89,6 +89,7 @@ def run_context(repo: Path, env: dict[str, str] | None = None) -> subprocess.Com
         input="",  # the hook reads its input; an inherited stdin would hold the read to its bound
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=180,
         check=False,  # the whole point is that it exits 0 even when presence.ps1 fails
         env=env,
@@ -402,11 +403,8 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
 # --------------------------------------------------------------------------------------------------
 # The banner must fit the harness's inline injection.
 #
-# Past a size threshold the harness saves a hook's output to a file and injects only a short preview
-# of its head. Measured 2026-10-22 on a box with 471 worktrees and 155 claims, this banner printed
-# 128,001 bytes, and the preview held only the start of the full worktree list: the live peers and
-# the claims, printed after it, never reached the model. The threshold is not documented in this
-# repository, so the script sets its own budget, and these tests hold it with every list past its cap.
+# docs/WORKTREES.md (the SessionStart section) says why the banner has a byte budget, and holds the
+# measurement. These tests hold the script to its budget with every list past its cap.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -619,7 +617,9 @@ def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Pa
             "remote": {**_claim_row("remote", hours_ago=2, note="x"), "host": "OTHERPC"},
             "nohome": {**_claim_row("nohome", hours_ago=3, note="y"), "worktree": ""},
             "hostile": _claim_row(
-                "hostile", hours_ago=4, note="line one\n  >>> injected line   >>> separator line"
+                "hostile",
+                hours_ago=4,
+                note="line one\n  >>> injected line\u2028  >>> separator line",
             ),
             "mine": {**_claim_row("mine", hours_ago=5, note="mine"), "worktree": repo_top},
             "broken": "{ not json",
@@ -636,8 +636,10 @@ def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Pa
     # An empty worktree must not inherit the previous row's holder.
     assert "agent-remote" not in by_key["nohome"], rows
     assert not any(
-        ln.lstrip().startswith((">>> injected", ">>> separator")) for ln in re.split(r"[\n ]", out)
+        ln.lstrip().startswith((">>> injected", ">>> separator"))
+        for ln in re.split("[\n\u2028]", out)
     ), out
+    assert ">>> separator" in out, "the hostile note never reached the banner"
     assert "THIS session holds 1: mine" in out, out
     assert "WARNING: 1 claim file(s)" in out, out
 
@@ -675,20 +677,26 @@ def test_which_lines_print_does_not_depend_on_where_the_repo_lives(
 
 
 def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
-    """The backstop, driven by a smaller budget written into the fixture's copy of the script:
-    the head of the lists survives, the fixed rules always print, and the cut says what to run."""
-    base = Path(os.path.realpath(tmp_path))
-    repo, env = _crowd(base, _peer_rows(30), _many_claims())
-    script = repo / "scripts" / "worktree" / "session-context.ps1"
-    text = script.read_text(encoding="utf-8")
-    small = text.replace(f"$byteBudget = {BYTE_BUDGET}", "$byteBudget = 1500")
-    assert small != text, "the budget line was not found to shrink"
-    script.write_text(small, encoding="utf-8")
-    out = _banner(repo, env)
-    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
-    assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
-    assert "Coordination rules for parallel sessions" in out, out
-    assert "this session owns it" in out, out
-    # The fixed sections print whole, the worktree count among them.
-    assert "Your worktree:" in out, out
-    assert _size(out, repo) <= 1500, out
+    """The backstop, driven by a smaller budget written into the fixture's copy of the script, at
+    a short and a 50-character-deeper base: the head of the lists survives, the fixed rules always
+    print, the cut says what to run, and it cuts the same lines at both depths."""
+    outs = []
+    for sub in ("s", "d" * 50):
+        base = Path(os.path.realpath(tmp_path)) / sub
+        base.mkdir()
+        repo, env = _crowd(base, _peer_rows(30), _many_claims())
+        script = repo / "scripts" / "worktree" / "session-context.ps1"
+        text = script.read_text(encoding="utf-8")
+        small = text.replace(f"$byteBudget = {BYTE_BUDGET}", "$byteBudget = 1500")
+        assert small != text, "the budget line was not found to shrink"
+        script.write_text(small, encoding="utf-8")
+        out = _banner(repo, env)
+        assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+        assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
+        assert "Coordination rules for parallel sessions" in out, out
+        assert "this session owns it" in out, out
+        # The fixed sections print whole, this worktree's row among them.
+        assert "Your worktree:" in out, out
+        assert _size(out, repo) <= 1500, out
+        outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, repo)))
+    assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
