@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.9 |
-| **Date** | October 2, 2026 |
+| **Version** | 2.10 |
+| **Date** | October 22, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -741,6 +741,14 @@ rule it departs from by identifier**, so the departure and the requirement canno
   direct pushes to `main`. The AI code-review pass also runs, as a rule the seats follow: nothing
   enforces it, and at least one path gets no review. The companion standard's section 6.6 and A.6
   say which. Revisit when a second maintainer joins.
+  **AI sessions also decide reversible judgment calls without asking the owner** (owner approvals
+  2026-10-21 and 2026-10-22). A routine plan is one: it no longer waits for the owner's go, which
+  is kept for a plan that holds an owner-reserved item. Each such decision is logged and, for now,
+  acted on only after an adversarial review affirms it. Neither the log nor the review is
+  enforced, and some of the controls planned around them are designed, not built. The owner's
+  ruling on a question may be a seat's record of the owner's `/driver` or `/empower` answer to it.
+  The companion standard's sections 6.2 and 6.6 and its A.6 entry *Autonomous class B decisions*
+  are the record.
   **CORRECTED 2026-10-02:** the owner ruled that this wording should match the process. This entry
   said only that peer review "cannot mean a *human second reviewer*", which left the maintainer as
   the assumed first reviewer. **Detailed record:** the AI-assisted-review compensating control — and the
@@ -860,6 +868,7 @@ resolves to a row below rather than to whatever requirement later took the numbe
 
 | Version | Date | Change |
 |---|---|---|
+| 2.10 | October 22, 2026 | **A.6 single-maintainer entry aligned with the companion standard's AFK-autonomy edits (owner approval 2026-10-22).** The entry now says that AI sessions decide reversible judgment calls without asking the owner, that a routine plan no longer waits for the owner's go, that the decision log and the adversarial review are not enforced, and that a delegated record can carry the owner's ruling. It points to [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md) sections 6.2 and 6.6 and its A.6 for the record. Nothing else changes, and no rule identifier changed. |
 | 2.9 | October 2, 2026 | **A.6 single-maintainer entry matches the process (owner ruling).** The entry now says that no human reads every diff and that review before merge is an AI code-review pass, and links to [`../CLAUDE.md`](../CLAUDE.md) section 5. No rule identifier changed: 147 requirements carry an identifier, as in version 2.8. |
 | 2.8 | September 25, 2026 | **SDS-3.10 added: ask what a record is able to hold before using what it holds to clear a suspect.** It follows SDS-3.9 under "Reviewing security prose". It is a sibling of SDS-3.8, which governs an instrument's output; this rule governs its capacity. A capacity question can clear a whole class of causes in one step. The rule also asks the author to name the class that step leaves open. Its worked case is a workflow set to `disabled_manually`, a state no file in a commit can hold. `CLAUDE.md` section 11 carries it as a short imperative, and the provenance note after the rules records where it came from. **147 requirements now carry an identifier**: the 146 of version 2.7 plus SDS-3.10. **One rule was added**; no rule was removed, weakened or reworded, and no identifier changed. |
 | 2.7 | September 24, 2026 | **Independent review is a desired state, not a requirement (owner ruling).** The §6.1 *Independent review* row called the third-party review + penetration test "the project's own pre-production gate (§6.3)", to be done "Before a production release". It now names it a desired state, not a requirement and not an ASVS mandate, and its timing is "Desired before a production release". SDS-6.4.3 is unchanged, and the row now points to it: a release still needs a current independent review or a dated risk acceptance. The companion [Secure Build Standards](Secure_Build_Standards.md) made the same change to signal 10. **146 requirements now carry an identifier**: the 145 of version 2.3 plus SDS-3.9, added in 2.6. Each release row states this count so a citation checker can confirm it still sees every rule; versions 2.4 to 2.6 omitted it. |
