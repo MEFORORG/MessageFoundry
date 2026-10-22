@@ -1080,9 +1080,8 @@ try {
             #
             # Move-CoordFileReplace (coord-root.ps1) is that same overwrite Move, retried with a bounded
             # backoff on a sharing violation or access denied, which an SMB share also raises.
-            $moved = $false
-            try { Move-CoordFileReplace -Source $tmp -Destination $file; $moved = $true } catch { }
-            if (-not $moved) {
+            try { Move-CoordFileReplace -Source $tmp -Destination $file }
+            catch {
                 # Never orphan the temp: this directory is the claim registry, and a k.json.<pid>.tmp
                 # nothing ever removes accumulates in it for the life of the repo.
                 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue

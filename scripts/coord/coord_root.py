@@ -298,12 +298,12 @@ def read_text(path: str | os.PathLike[str], encoding: str = "utf-8") -> str:
     violation propagates, so a caller never reads one as "missing" or "torn" without trying first.
     """
     sleep = RETRY_FIRST_SECONDS
-    for attempt in range(1, RETRY_TRIES + 1):
+    for _ in range(RETRY_TRIES - 1):
         try:
             return Path(path).read_text(encoding=encoding)
         except OSError as exc:
-            if attempt >= RETRY_TRIES or not sharing_violation(exc):
+            if not sharing_violation(exc):
                 raise
         time.sleep(sleep)
         sleep = min(sleep * 2, RETRY_MAX_SLEEP_SECONDS)
-    raise AssertionError("unreachable")  # pragma: no cover - the last attempt returns or raises
+    return Path(path).read_text(encoding=encoding)

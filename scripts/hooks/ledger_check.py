@@ -376,13 +376,13 @@ class Ledger:
         self._resolve_alloc()
         return self._alloc_error
 
-    def _read_alloc(self, alloc: Path, kind: str, number: str) -> Any:
+    def _read_alloc(self, kind: str, number: str) -> Any:
         """One allocation record, parsed. A sharing violation on an SMB share is retried first, so it
-        is never read as "no record"; OSError and ValueError still propagate to the caller."""
-        path = alloc / kind / f"{number}.json"
-        coord = self._coord
-        text = coord.read_text(path) if coord is not None else path.read_text(encoding="utf-8")
-        return json.loads(text)
+        is never read as "no record"; OSError and ValueError still propagate to the caller. Called only
+        once ``alloc`` resolved, which implies a loaded resolver."""
+        if self.alloc is None or self._coord is None:
+            raise OSError("the allocation registry did not resolve")
+        return json.loads(self._coord.read_text(self.alloc / kind / f"{number}.json"))
 
     # -- tree access ---------------------------------------------------------------------------------
     #
@@ -580,7 +580,7 @@ class Ledger:
         if self.alloc is None:
             return False
         try:
-            claim = self._read_alloc(self.alloc, kind, number)
+            claim = self._read_alloc(kind, number)
         except (OSError, ValueError):
             return False
         # ANOTHER MACHINE'S NUMBER IS NEVER THIS TREE'S, on either key. Its path names that PC's disk,
@@ -635,7 +635,7 @@ class Ledger:
         if self.alloc is None:
             return allocate
         try:
-            claim = self._read_alloc(self.alloc, kind, number)
+            claim = self._read_alloc(kind, number)
         except (OSError, ValueError):
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
