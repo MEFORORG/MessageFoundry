@@ -12,18 +12,39 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from datetime import UTC, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests._fake_gh import COORD, VAULT, Sandbox, make_sandbox
+from tests._fake_gh import (
+    COORD,
+    GUARDED_TIMEOUT_S,
+    VAULT,
+    Sandbox,
+    id_day,
+    make_sandbox,
+    utc_day_now,
+    utc_day_with_room,
+    with_default,
+)
 
 DIGEST = COORD / "digest.ps1"
 DECISION = COORD / "decision.ps1"
 MARKER = "<!-- mefor-decision v1 -->"
-TODAY = datetime.now(UTC).strftime("%Y-%m-%d")
+# A fixed day, which digest() passes as -Day unless a test names its own, so the seeded records
+# and the digested day never read the wall clock: a run that crosses UTC midnight would otherwise
+# seed one day and have digest.ps1 default to the next. A record decision.ps1 mints itself, a
+# -Rate rating included, is still dated by the wall clock, and lands in that day's issue; a test
+# that digests one names its day from utc_day_with_room().
+TODAY_DATE = date(2026, 6, 15)
+TODAY = TODAY_DATE.isoformat()
+
+
+def days_before(n: int) -> str:
+    return (TODAY_DATE - timedelta(days=n)).isoformat()
+
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
 
@@ -70,8 +91,7 @@ def seed(sb: Sandbox, records: list[dict[str, Any]]) -> None:
     state = sb.state
     store = state.setdefault("repos", {}).setdefault(VAULT, {"issues": [], "labels": []})
     for r in records:
-        day = f"{r['id'][1:5]}-{r['id'][5:7]}-{r['id'][7:9]}"
-        title = f"decision-log {day}"
+        title = f"decision-log {id_day(r['id'])}"
         issue = next((i for i in store["issues"] if i["title"] == title), None)
         if issue is None:
             issue = {
@@ -87,7 +107,7 @@ def seed(sb: Sandbox, records: list[dict[str, Any]]) -> None:
 
 
 def digest(sb: Sandbox, *args: str, code: int = 0) -> str:
-    proc = sb.run(DIGEST, *args)
+    proc = sb.run(DIGEST, *with_default(args, "-Day", TODAY))
     assert proc.returncode == code, (proc.stdout, proc.stderr)
     return proc.stdout
 
@@ -215,15 +235,19 @@ def test_rate_by_option_number_compares_with_the_hidden_recommendation(
     assert f"picked option {n}" in rating["note"]
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_rate_takes_agree_or_disagree_and_drops_a_rated_decision_from_the_pool(
     sb: Sandbox,
 ) -> None:
-    r = rec(item="5", recommendation="yes", alternatives=["no"])
+    # decision.ps1 dates the rating by the wall clock, and a digest reads no rating after its day,
+    # so this test's day is the real one, with room left in it for every run below.
+    day = utc_day_with_room()
+    r = rec(day=day, item="5", recommendation="yes", alternatives=["no"])
     seed(sb, [r])
-    digest(sb)
+    digest(sb, "-Day", day)
     assert sb.run(DIGEST, "-Rate", r["id"], "disagree").returncode == 0
     assert [x["rating"] for x in ratings(sb)] == ["disagree"]
-    assert "No unrated Class B decision today." in digest(sb, "-Sample", "5")
+    assert "No unrated Class B decision today." in digest(sb, "-Day", day, "-Sample", "5")
 
 
 @pytest.mark.parametrize(
@@ -272,11 +296,7 @@ def _calibration_row(out: str, seat: str, klass: str) -> list[str]:
 
 def _rated(count: int, disagree_first: int) -> list[dict[str, Any]]:
     """`count` Class B decisions over the last 20 days, each rated, the oldest ratings disagreeing."""
-    day = datetime.now(UTC) - timedelta(days=20)
-    decided = [
-        rec(day=(day + timedelta(days=i % 20)).strftime("%Y-%m-%d"), recommendation="r")
-        for i in range(count)
-    ]
+    decided = [rec(day=days_before(20 - i % 20), recommendation="r") for i in range(count)]
     rated = [
         rec(
             "rating",
@@ -320,7 +340,7 @@ def test_under_sixty_samples_stay_on_the_review_path(sb: Sandbox) -> None:
 
 
 def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox) -> None:
-    old = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d")
+    old = days_before(30)
     recent = [rec(seat="lander", recommendation="r") for _ in range(10)]
     stale = [rec(day=old, seat="lander", recommendation="r") for _ in range(10)]
     reversed_ = [
@@ -357,13 +377,23 @@ def test_a_decision_with_one_option_is_never_drawn(sb: Sandbox) -> None:
 
 
 def test_a_reversal_of_an_earlier_days_unrated_sample_stays_hidden(sb: Sandbox) -> None:
-    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = days_before(1)
     drawn = rec(day=yesterday, recommendation="a")
     seed(sb, [drawn])
     digest(sb, "-Day", yesterday)
     seed(sb, [rec("outcome", seat="lander", ref=drawn["id"], outcome="reversed", note="PR 9")])
     out = digest(sb)
     assert "shown once you rate it" in out and drawn["id"] not in out
+
+
+def test_with_no_day_the_digest_is_for_the_utc_day_it_runs(sb: Sandbox) -> None:
+    """Read either side of the run, so a run that crosses UTC midnight still passes."""
+    before = utc_day_now()
+    proc = sb.run(DIGEST, "-Sample", "0")
+    after = utc_day_now()
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    (day,) = [d for d in {before, after} if f"# AFK-autonomy digest, {d} (UTC)" in proc.stdout]
+    assert (sb.coord / "digests" / f"{day}.md").is_file()
 
 
 def test_an_impossible_day_is_refused(sb: Sandbox) -> None:
@@ -378,12 +408,17 @@ def test_an_unread_vault_marks_the_digest_incomplete(sb: Sandbox) -> None:
     assert "INCOMPLETE" in out and "Kill switch: **ON**" in out
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_end_to_end_a_logged_decision_is_sampled_and_rated(sb: Sandbox) -> None:
+    """The owner's flow: log now, run the digest with no -Day, rate what it drew."""
+    day = utc_day_with_room()
     args = ("-Log", "-Item", "7", "-Class", "B", "-Seat", "manager", "-Recommendation", "go")
     logged = sb.run(DECISION, *args, "-Alternative", "stop")
     assert logged.returncode == 0, logged.stderr
     did = logged.stdout.split()[1]
-    out = digest(sb, "-Sample", "1")
-    assert f"### `{did}`" in out
+    assert id_day(did) == day, "the id is not dated on the UTC day it was logged"
+    proc = sb.run(DIGEST, "-Sample", "1")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert f"### `{did}`" in proc.stdout
     assert sb.run(DIGEST, "-Rate", did, "agree").returncode == 0
     assert [r["ref"] for r in ratings(sb)] == [did]

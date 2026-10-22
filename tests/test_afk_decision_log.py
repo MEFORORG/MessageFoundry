@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests._fake_gh import COORD, Sandbox, make_sandbox
+from tests._fake_gh import (
+    COORD,
+    GUARDED_TIMEOUT_S,
+    Sandbox,
+    id_day,
+    make_sandbox,
+    utc_day_now,
+    utc_day_with_room,
+    with_default,
+)
 
 DECISION = COORD / "decision.ps1"
 
@@ -58,24 +66,29 @@ def _logged_id(stdout: str) -> str:
 
 
 def _list(sb: Sandbox, *args: str) -> list[dict[str, Any]]:
-    proc = sb.run(DECISION, "-List", "-Json", *args)
+    # Two days ending the listing's own, unless a test names its window: a record a test logged
+    # just before UTC midnight is still in the window when the listing runs just after it.
+    proc = sb.run(DECISION, "-List", "-Json", *with_default(args, "-Days", "2"))
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     rows: list[dict[str, Any]] = json.loads(proc.stdout) if proc.stdout.strip() else []
     return rows
 
 
 def test_log_posts_one_comment_to_the_days_issue_with_the_full_schema(sb: Sandbox) -> None:
+    before = utc_day_now()
     proc = sb.run(DECISION, *B_DECISION)
+    after = utc_day_now()
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert proc.stdout.strip().endswith("posted")
     issues = sb.issues()
-    day = datetime.now(UTC).strftime("%Y-%m-%d")
-    assert [i["title"] for i in issues] == [f"decision-log {day}"]
+    did = _logged_id(proc.stdout)
+    assert id_day(did) in {before, after}, "the id is not dated on the UTC day it was logged"
+    assert [i["title"] for i in issues] == [f"decision-log {id_day(did)}"]
     assert issues[0]["labels"] == ["decision-log"]
     (body,) = _comments(sb)
     assert body.startswith("<!-- mefor-decision v1 -->")
     rec = _list(sb)[0]
-    assert rec["id"] == _logged_id(proc.stdout)
+    assert rec["id"] == did
     assert rec["class"] == "B" and rec["item"] == "3905" and rec["seat"] == "manager"
     assert rec["predicates"] == [
         {"name": "live-state", "evidence": "gh pr view 2460 read at 17:02Z"},
@@ -88,7 +101,9 @@ def test_log_posts_one_comment_to_the_days_issue_with_the_full_schema(sb: Sandbo
     assert sb.spool() == [], "a posted record stayed in the spool"
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_a_second_record_reuses_the_days_issue_from_the_local_cache(sb: Sandbox) -> None:
+    utc_day_with_room()  # both records must land on one day's issue
     assert sb.run(DECISION, *B_DECISION).returncode == 0
     before = len(sb.calls)
     assert sb.run(DECISION, *B_DECISION).returncode == 0
@@ -99,10 +114,11 @@ def test_a_second_record_reuses_the_days_issue_from_the_local_cache(sb: Sandbox)
     assert methods == ["POST"], sb.calls[before:]
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_a_cached_issue_that_is_gone_is_listed_again_on_the_next_flush(sb: Sandbox) -> None:
+    day = utc_day_with_room()  # the second record must land on the day the cache names
     assert sb.run(DECISION, *B_DECISION).returncode == 0
     cache = sb.coord / "decisions" / "issues.json"
-    day = datetime.now(UTC).strftime("%Y-%m-%d")
     cache.write_text(json.dumps({f"MEFORORG/MessageFoundry-vault|{day}": 99}), encoding="utf-8")
     assert sb.run(DECISION, *B_DECISION).returncode == 4
     assert sb.run(DECISION, "-Flush").returncode == 0
@@ -175,7 +191,10 @@ def test_a_record_posted_twice_lists_once(sb: Sandbox) -> None:
     assert len(_list(sb)) == 1
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_list_says_incomplete_when_the_vault_cannot_be_read(sb: Sandbox) -> None:
+    # The one listing with the default window, today only, so the record must be logged today.
+    utc_day_with_room()
     assert sb.run(DECISION, *B_DECISION, "-NoPost").returncode == 0
     sb.set_state(fail=True)
     proc = sb.run(DECISION, "-List")
