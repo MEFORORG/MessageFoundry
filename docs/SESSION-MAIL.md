@@ -216,9 +216,9 @@ injectivity; the slug exists only so a human can tell boxes apart in a directory
 **The host is part of the key.** On a shared root two PCs can each hold a worktree at the same path, and
 a path-only key gave them one mailbox ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md), migration step
 4). Mail queued before that change sits under the old path-only key, which `ConvertTo-LegacyBoxKey`
-names. The drain moves that box's inbox into the new box before it reads, the watcher wakes on it, and
-`-Status` counts it. Nothing writes a new message under the old key, except a send to a seat id that
-was published before the change, because that id names the old box.
+names. The drain and the watcher move that box's inbox into the new box before they read, and
+`-Status` counts what is left there. Nothing writes a new message under the old key. A send to a seat
+id published before the change goes to the box that seat's worktree and host key to now.
 
 **One definition, dot-sourced by both ends.** The sender and the drain must compute the same key from
 the same path or mail is written to a box nobody reads -- and that failure is silent on both ends: the

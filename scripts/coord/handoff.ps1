@@ -150,6 +150,14 @@ if ($Where) {
     # that breaks.
     $box = ConvertTo-BoxKey -Path $wt.Trim()
     $dir = Join-Path $handoffs $box
+    # The key hashes the host too since docs/COORD-SHARED-ROOT.md step 4. A document written under the
+    # old path-only key is not moved, because it may be another PC's; it is named, so a second
+    # HANDOFF.md does not quietly stand beside a stale one.
+    $legacyDir = Join-Path $handoffs (ConvertTo-LegacyBoxKey -Path $wt.Trim())
+    if (-not (Test-Path -LiteralPath $dir) -and (Test-Path -LiteralPath $legacyDir -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $legacyDir -File -EA SilentlyContinue).Count -gt 0) {
+        [Console]::Error.WriteLine("handoff.ps1: this tree's handoff directory moved to $dir. Documents written before that are still in $legacyDir; retire or move them.")
+    }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     Write-Output $dir
     exit 0

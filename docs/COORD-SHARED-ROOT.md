@@ -256,15 +256,21 @@ design. Reads and builds keep working.
    tests. Behaviour is unchanged, because no root is configured yet.
 4. **BUILT.** Land the host-qualified box key: hash `<HOST>|<path>`, not the path alone, for seat
    ids, mailboxes and lane files. `ConvertTo-BoxKey` in `scripts/coord/mail-key.ps1` does this, and
-   `ConvertTo-LegacyBoxKey` is the one definition of the old key, for readers only. The drain moves
-   the old box's inbox into the new box before it reads, `seat.ps1` takes its prior record from the
-   old box once, and `fleet.ps1` marks an old-box record superseded by a newer one in the new box.
-   Writers write only the new key, except a send to a seat id published before the change, which
-   names the old box. A lane level is not carried over, because it is restated within minutes.
-   `lane.ps1` no longer refuses another host's record, since the key now keeps the two apart.
-   **Roll out by updating the primary checkout soon after the merge.** The mail hooks run from it,
-   so until it carries this change a drain there reads only the old box, and mail a new sender
-   queued in the new box waits.
+   `ConvertTo-LegacyBoxKey` is the one definition of the old key, for readers only. The drain and
+   the watcher move the old box's inbox into the new box before they read. `seat.ps1` takes its
+   prior from whichever of its two records was written last, and `fleet.ps1` treats a record in the
+   old box and one in the new box of the same tree as one seat. The lane hook reads the old lane
+   file when the new one is missing. A send to a seat id published before the change goes to the
+   new box. Writers write only the new key. `lane.ps1` no longer refuses another host's record,
+   since the key now keeps the two apart. A record read from an old box is judged by its `host`,
+   because every PC at that path shares the old name.
+   **Roll out by updating the primary checkout soon after the merge.** The hooks run from it, while
+   `mail.ps1`, `seat.ps1 -Declare` and `lane.ps1` run from each worktree's branch. Until the primary
+   carries this change, its drain reads only the old box, so mail a new sender queued waits, and its
+   lane hook reads only the old lane file.
+   **Copy mail and lanes to the share under host-qualified keys only** (steps 6 and 10). An old box
+   copied there would be read by every PC with a worktree at that path. Move each old inbox into
+   its new box first; the drain does exactly that for its own tree.
    Also before step 7: the rename-retry change for writers and readers of shared kinds, and the
    CreateNew race rerun with one process on each PC (see *What MEFORDEV01 measured*).
 5. Pick a quiet window. Announce it on the old mail lane.

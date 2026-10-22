@@ -110,9 +110,9 @@ try {
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
     $key = ConvertTo-BoxKey -Path $cwd
     $inboxDir = Join-Path $root "box/$key/inbox"
-    # Mail queued under the old path-only key still wakes the session; the drain then moves it into
-    # this box. Reading only, as everywhere: see ConvertTo-LegacyBoxKey.
-    $legacyInboxDir = Join-Path $root "box/$(ConvertTo-LegacyBoxKey -Path $cwd)/inbox"
+    # Mail queued under the old path-only key is moved into this box each pass, by the same function
+    # the drain uses, so the pending test below sees it under the one box the drain will read.
+    $legacyKey = ConvertTo-LegacyBoxKey -Path $cwd
     $shownDir = Join-Path $root "box/$key/shown"
     # Validated before any path is built from it, exactly as the drain does; $null means UNMARKABLE.
     $sessionKey = ConvertTo-SessionKey -SessionId ([string]$hook.session_id)
@@ -166,11 +166,8 @@ try {
             if ($owner -and $owner -match '^\d+ [0-9a-fA-F-]{36}$' -and $owner -ne $myToken) { exit 0 }
         }
 
-        # Any minted name in the legacy inbox is unshown by definition: the drain has not moved it yet.
-        $legacyPending = (Test-Path -LiteralPath $legacyInboxDir) -and
-            @(Get-ChildItem -LiteralPath $legacyInboxDir -Filter *.json -File -EA SilentlyContinue |
-                Where-Object { Split-MailFileName -Name $_.Name }).Count -gt 0
-        if ($legacyPending -or (Test-Path -LiteralPath $inboxDir)) {
+        Move-LegacyInbox -Root $root -Key $key -LegacyKey $legacyKey
+        if (Test-Path -LiteralPath $inboxDir) {
             # "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "THE INBOX IS NON-EMPTY". Those were the same
             # question until the drain stopped consuming at SessionStart: mail it shows now STAYS in the
             # inbox until the session's next turn boundary, so a non-empty inbox is the steady state
@@ -193,7 +190,7 @@ try {
                     # header gives. Its failure direction here is an extra wake, never a missed one.
                     -not (Test-FilePresent -Path (Join-Path $shownDir "$($p.Stem)--$sessionKey.marker"))
                 })
-            if ($legacyPending -or $pending.Count -gt 0) {
+            if ($pending.Count -gt 0) {
                 # Hand the same stdin straight through, so the drain resolves the identical box, applies
                 # the identical session filter, and writes the identical receipt.
                 $out = ($stdinRaw | & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'mail-drain.ps1') 2>$null)

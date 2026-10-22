@@ -62,10 +62,13 @@ function ConvertTo-BoxKey {
 }
 
 function ConvertTo-LegacyBoxKey {
-    # THE PATH-ONLY KEY, FOR READING ONLY. Every seat record, mailbox and lane file written before the
-    # host joined the key sits under this name. A reader looks here too so nothing already written
-    # goes unread; NO WRITER MAY CALL THIS. A new record under the legacy key is the collision step 4
-    # removed. This is the one definition of the old key.
+    # THE PATH-ONLY KEY, FOR READING ONLY. Every seat record, mailbox, lane file, handoff directory and
+    # writer-alive heartbeat written before the host joined the key sits under this name. A reader
+    # looks here too so nothing already written goes unread; NO WRITER MAY CALL THIS. A new record
+    # under the legacy key is the collision step 4 removed. This is the one definition of the old key.
+    #
+    # THE LEGACY BOX IS SHARED BY EVERY PC AT THIS PATH, so a record read from it is judged by its
+    # `host` field (Test-CoordRecordIsHere) before it is taken as this machine's.
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
     $norm = ConvertTo-BoxKeyPath -Path $Path
@@ -73,11 +76,17 @@ function ConvertTo-LegacyBoxKey {
 }
 
 function Get-BoxKeyHost {
-    # coord-root.ps1's Get-CoordHost when it is loaded, which is the one host rule. Some callers and
-    # test sandboxes dot-source this file alone, and the fallback is the same value that function
-    # returns today.
-    if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { return [string](Get-CoordHost) }
-    return [Environment]::MachineName
+    # coord-root.ps1's Get-CoordHost, the one host rule. A caller that dot-sourced this file alone
+    # gets it loaded from beside this file, and THROWS when it is missing rather than hashing a host
+    # from a second copy of the rule that could drift from the one the other end uses.
+    if (-not (Get-Command Get-CoordHost -ErrorAction SilentlyContinue)) {
+        $lib = Join-Path $PSScriptRoot 'coord-root.ps1'
+        if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
+            throw "mail-key.ps1: $lib is missing, so this machine's host cannot be named for a box key"
+        }
+        . $lib
+    }
+    return [string](Get-CoordHost)
 }
 
 function ConvertTo-BoxKeyPath {

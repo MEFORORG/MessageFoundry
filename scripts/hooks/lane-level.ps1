@@ -215,16 +215,28 @@ if ($laneFault) {
     Say "  'both lanes are fine' -- nothing was examined."
     Emit
 }
-# A lane file is named by the box key, which hashes the host as well as the path (mail-key.ps1), so a
-# lane record at this key is this machine's and needs no host check.
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\mail-key.ps1')
+function Read-LaneFor([string]$Worktree, [string]$HostName) {
+    # A lane file is named by the box key, which hashes the host as well as the path (mail-key.ps1),
+    # so the record at that key is this tree's. Failing that, the old path-only key, which a copy of
+    # lane.ps1 older than the change still writes (it runs from each worktree's branch, while this
+    # hook runs from the primary). Every PC at this path shares that old name, so a record there counts
+    # only when its host is this tree's host. No host means this machine, as everywhere.
+    $rec = Read-Json (Join-Path $lanesDir "$(ConvertTo-BoxKey -Path $Worktree -HostName $HostName).json")
+    if ($null -ne $rec) { return $rec }
+    $old = Read-Json (Join-Path $lanesDir "$(ConvertTo-LegacyBoxKey -Path $Worktree).json")
+    if ($null -eq $old -or $old -is [string]) { return $old }
+    $oldHost = Get-CoordRecordHost $old
+    if (-not $oldHost) { $oldHost = Get-CoordHost }
+    if ($oldHost -ine $HostName) { return $null }
+    return $old
+}
 $cwd = (Get-Location).Path
 $leaf = (Split-Path $cwd -Leaf)
 $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
 
 if ($leaf -match '^builder') {
-    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\mail-key.ps1')
-    $bk = ConvertTo-BoxKey -Path $cwd
-    $rec = Read-Json (Join-Path $lanesDir "$bk.json")
+    $rec = Read-LaneFor $cwd (Get-CoordHost)
     $need = ($null -eq $rec) -or ($rec -is [string])
     if (-not $need) {
         $t = if (Test-Has $rec 'turnsSinceStated') { [int]$rec.turnsSinceStated } else { 99 }
@@ -278,16 +290,17 @@ foreach ($d in $seatDirs) {
     if (((([datetime]::UtcNow) - $newest.LastWriteTimeUtc).TotalHours) -gt 6) { continue }
     $laneHost = Get-CoordRecordHost $s
     if (-not $laneHost) { $laneHost = Get-CoordHost }
+    # One lane per tree on one host, named by the box key that tree and host have now (mail-key.ps1),
+    # so the same path on two PCs is two lanes. seatBox is the directory the record was found in, which
+    # may be the old path-only one; the activity check reads its heartbeat there.
     $lanes += [pscustomobject]@{
-        box = $d.Name; worktree = $wt; at = $newest.LastWriteTimeUtc
-        # One lane per tree on one host. The host is part of the box key now (mail-key.ps1), so the
-        # same path on two PCs is two lanes; no host means this machine, as everywhere.
-        tree = ($laneHost.ToUpperInvariant() + '|' + $wt.Trim().TrimEnd('\', '/').ToLowerInvariant())
+        box = (ConvertTo-BoxKey -Path $wt -HostName $laneHost); seatBox = $d.Name
+        worktree = $wt; host = $laneHost; at = $newest.LastWriteTimeUtc
     }
 }
-# NEWEST BOX FIRST, so a tree holding both its old path-only seat box and its new one is read at the
-# new one, whose lane file is the one lane.ps1 now writes.
-$lanes = @($lanes | Sort-Object at -Descending | Group-Object tree | ForEach-Object { $_.Group | Select-Object -First 1 })
+# NEWEST SEAT BOX FIRST, so a tree holding both its old path-only seat box and its new one is judged
+# by the box its writer still stamps.
+$lanes = @($lanes | Sort-Object at -Descending | Group-Object box | ForEach-Object { $_.Group | Select-Object -First 1 })
 
 # RETIRE THE DEAD ONES WITH A REAL LIVENESS CALL, NOT A NAME MATCH. Measured 2026-08-23 without this
 # step: 12 "lanes" discovered against 2 live, every one printing three lines of NO-RECORD. That is the
@@ -304,7 +317,7 @@ try {
     foreach ($l in $lanes) {
         if ([datetime]::UtcNow -gt $deadline) { $unknown += $l; continue }
         try {
-            $a = Get-BoxActivity -BoxKey $l.box -WorktreePath $l.worktree -SeatsDir $seatsDir
+            $a = Get-BoxActivity -BoxKey $l.seatBox -WorktreePath $l.worktree -SeatsDir $seatsDir
             if (-not $a.Evaluable) { $unknown += $l; $live += $l }
             elseif ($a.Veto) { $live += $l }
         } catch { $unknown += $l; $live += $l }
@@ -313,11 +326,11 @@ try {
     # The helper itself did not load. Keep every candidate rather than silently narrowing.
     $live = $lanes; $unknown = $lanes
 }
-$lanes = @($live | Group-Object tree | ForEach-Object { $_.Group | Select-Object -First 1 })
+$lanes = @($live | Group-Object box | ForEach-Object { $_.Group | Select-Object -First 1 })
 $unknownBoxes = @($unknown | ForEach-Object { $_.box })
 
 $verdicts = @()
-foreach ($l in $lanes) { $verdicts += Get-LaneVerdict (Read-Json (Join-Path $lanesDir "$($l.box).json")) $l.box }
+foreach ($l in $lanes) { $verdicts += Get-LaneVerdict (Read-LaneFor $l.worktree $l.host) $l.box }
 
 $discovered = $verdicts.Count
 $notGreen = @($verdicts | Where-Object { -not $_.greenable }).Count

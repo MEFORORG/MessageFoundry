@@ -131,8 +131,9 @@ def test_two_hosts_at_one_path_get_two_keys() -> None:
     assert mine != theirs, "two PCs at one path must not share a seat id or a mailbox"
     # The readable half is unchanged, so a directory listing still names the tree.
     assert mine.rsplit("-", 1)[0] == theirs.rsplit("-", 1)[0] == "autonomy-plan"
-    # The control: the old path-only key is the collision this change removes.
-    assert _key(path, legacy=True) == _key(path.upper(), legacy=True)
+    # The controls. One host twice gives one key, so the difference above is the host's. And the old
+    # key, which has no host input at all, names neither box: it is a read-only name now.
+    assert _key(path, "ALIENWARE") == mine
     assert _key(path, legacy=True) not in (mine, theirs)
 
 
@@ -207,21 +208,72 @@ def test_another_hosts_box_at_this_path_is_not_read(repo: Path, shared: Path) ->
     assert list((shared / "mail" / "box" / theirs / "inbox").glob("*.json")), "left for its owner"
 
 
-def test_mail_under_the_legacy_key_is_moved_and_read(repo: Path, shared: Path) -> None:
-    legacy = _key(repo, legacy=True)
-    # A seat id published before the change IS the legacy key, and mail to it lands there.
-    _plant_seat(shared / "seats", legacy, str(repo), None)
-    assert _send(repo, shared, legacy, "queued before the change").returncode == 0
-    legacy_inbox = shared / "mail" / "box" / legacy / "inbox"
+def _queue_under_the_legacy_key(repo: Path, shared: Path, body: str) -> Path:
+    """Mail as a sender older than the change queued it: in the path-only box."""
+    assert _send(repo, shared, str(repo), body).returncode == 0
+    box = shared / "mail" / "box"
+    legacy_inbox = box / _key(repo, legacy=True) / "inbox"
+    legacy_inbox.mkdir(parents=True)
+    for f in (box / _key(repo) / "inbox").glob("*.json"):
+        f.rename(legacy_inbox / f.name)
     assert len(list(legacy_inbox.glob("*.json"))) == 1
+    return legacy_inbox
+
+
+def test_mail_under_the_legacy_key_is_moved_and_read(repo: Path, shared: Path) -> None:
+    legacy_inbox = _queue_under_the_legacy_key(repo, shared, "queued before the change")
+    # A file this channel did not mint is not counted as waiting: the drain would never move it.
+    (legacy_inbox / "note.json").write_text("{}", encoding="utf-8")
 
     status = _ps(COORD / "mail.ps1", repo, "-Status", "-Json", env=_env(shared))
     assert status.returncode == 0, status.stderr
     assert json.loads(status.stdout)["LegacyInbox"] == 1
 
     assert "queued before the change" in _drain(repo, shared)
-    assert not list(legacy_inbox.glob("*.json")), "the drain moves the legacy inbox into its box"
-    assert list((shared / "mail" / "box" / _key(repo) / "inbox").glob("*.json"))
+    assert [f.name for f in legacy_inbox.glob("*.json")] == ["note.json"]
+    assert list((shared / "mail" / "box" / _key(repo) / "inbox").glob("*--*.json"))
+
+
+def test_the_watcher_wakes_on_mail_under_the_legacy_key(repo: Path, shared: Path) -> None:
+    _queue_under_the_legacy_key(repo, shared, "wake me")
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(HOOKS / "mail-watch.ps1"),
+            "-MaxWaitSeconds",
+            "15",
+            "-PollSeconds",
+            "1",
+        ],
+        cwd=str(repo),
+        input=json.dumps({"cwd": str(repo), "session_id": SESSION}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=_env(shared),
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "wake me" in proc.stderr
+
+
+def test_a_legacy_seat_id_is_sent_to_the_new_box(repo: Path, shared: Path) -> None:
+    """A seat id published before the change names the old box, which every PC at the path reads."""
+    legacy = _key(repo, legacy=True)
+    _plant_seat(shared / "seats", legacy, str(repo), None)
+    proc = _send(repo, shared, legacy, "to an old id")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)[0]["Key"] == _key(repo)
+    assert not (shared / "mail" / "box" / legacy).exists()
+
+    # When the newest record under that old id is another host's, the mail goes to THAT host's box.
+    time.sleep(0.05)
+    _plant_seat(shared / "seats", legacy, str(repo), OTHER, sessionKey="sess-q")
+    proc = _send(repo, shared, legacy, "to the other pc")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)[0]["Key"] == _key(repo, OTHER)
 
 
 # ------------------------------------------------------------------------------------ seats
@@ -291,3 +343,96 @@ def test_a_legacy_record_from_another_host_is_not_adopted(repo: Path, shared: Pa
     assert _declare(repo, shared, "sess-b").returncode == 0
     rec = json.loads((shared / "seats" / _key(top) / "sess-b.json").read_text(encoding="utf-8"))
     assert rec.get("goal") != "the other pc's goal"
+
+
+def test_a_legacy_record_stamped_with_this_host_is_still_found(repo: Path, shared: Path) -> None:
+    """The migration copies records under their old path-only directories and stamps `host`, so the
+    old key is read for ANY record and judged by host, not only for records with no host."""
+    top = _top(repo)
+    seats = shared / "seats"
+    old = _plant_seat(
+        seats,
+        _key(top, legacy=True),
+        top,
+        os.environ["COMPUTERNAME"],
+        sessionKey="sess-d",
+        goal="stamped by the migration",
+        asOf=_hours_ago(1),
+    )
+    assert _declare(repo, shared, "sess-d").returncode == 0
+    rec = json.loads((seats / _key(top) / "sess-d.json").read_text(encoding="utf-8"))
+    assert rec["goal"] == "stamped by the migration"
+
+    fleet = _ps(COORD / "fleet.ps1", repo, "-Json", env=_env(shared))
+    assert fleet.returncode in (0, 2), fleet.stderr
+    rows = {r["Box"]: r for r in json.loads(fleet.stdout)["rows"]}
+    assert rows[old.parent.name]["State"] == "SUPERSEDED"
+
+
+def test_a_legacy_record_written_after_the_new_one_is_the_prior(repo: Path, shared: Path) -> None:
+    """An older seat.ps1 on a worktree's branch may still write the old box while the hook writes the
+    new one. The record written last wins, whichever box it is in."""
+    top = _top(repo)
+    seats = shared / "seats"
+    _plant_seat(seats, _key(top), top, None, sessionKey="sess-c", goal="stale", asOf=_hours_ago(2))
+    time.sleep(0.05)
+    _plant_seat(
+        seats, _key(top, legacy=True), top, None, sessionKey="sess-c", goal="declared later"
+    )
+    assert _declare(repo, shared, "sess-c").returncode == 0
+    rec = json.loads((seats / _key(top) / "sess-c.json").read_text(encoding="utf-8"))
+    assert rec["goal"] == "declared later"
+
+
+# ------------------------------------------------------------------------------------ lanes
+
+
+@pytest.fixture
+def builder(tmp_path: Path) -> Path:
+    """A repo whose leaf names a builder lane, so the lane hook asks it for its level."""
+    r = tmp_path / "builder-lane"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    return r
+
+
+def _lane_hook(cwd: Path, shared: Path) -> str:
+    proc = _ps(
+        HOOKS / "lane-level.ps1",
+        cwd,
+        env=_env(shared),
+        stdin=json.dumps({"hook_event_name": "Stop"}),
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _plant_lane(shared: Path, key: str, host: str | None) -> None:
+    lanes = shared / "lanes"
+    lanes.mkdir(exist_ok=True)
+    rec: dict[str, Any] = {
+        "v": 1,
+        "statedFree": 1,
+        "statedInFlight": 1,
+        "statedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "turnsSinceStated": 0,
+    }
+    if host is not None:
+        rec["host"] = host
+    (lanes / f"{key}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+NAG = "Your lane level is unstated or stale"
+
+
+def test_the_lane_hook_reads_a_lane_file_under_the_legacy_key(builder: Path, shared: Path) -> None:
+    assert NAG in _lane_hook(builder, shared), "the control: no lane file at all is stale"
+    _plant_lane(shared, _key(builder, legacy=True), None)
+    assert NAG not in _lane_hook(builder, shared)
+
+
+def test_the_lane_hook_ignores_another_hosts_legacy_lane_file(builder: Path, shared: Path) -> None:
+    _plant_lane(shared, _key(builder, legacy=True), OTHER)
+    assert NAG in _lane_hook(builder, shared)
+    _plant_lane(shared, _key(builder), None)
+    assert NAG not in _lane_hook(builder, shared), "this host's own lane file is read first"

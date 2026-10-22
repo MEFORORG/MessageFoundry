@@ -377,6 +377,22 @@ function Get-AgeHours($iso) {
     } catch { return $null }
 }
 
+# EACH RECORD'S TREE: the box its worktree and host key to now (docs/COORD-SHARED-ROOT.md, step 4).
+# A record in the old path-only box of that worktree belongs to the same tree as one in the new box,
+# because one session crosses the change with a record in each: seat.ps1 writes the new box only,
+# while an older copy of it may still write the old one. Anything else keeps its own box.
+foreach ($r in $records) {
+    $tree = $r.Box
+    $w = if ($r.Rec.PSObject.Properties.Name -contains 'worktree') { [string]$r.Rec.worktree } else { '' }
+    if ($w -and $r.Box -ceq (ConvertTo-LegacyBoxKey -Path $w)) {
+        $tree = ConvertTo-BoxKey -Path $w -HostName (Get-CoordRecordHost $r.Rec)
+    }
+    $r | Add-Member -NotePropertyName Tree -NotePropertyValue $tree -Force
+}
+# Legacy-box records a newer record of the same tree supersedes. No writer reaches them now, so the
+# pointer census below skips them: a pointer there could never be repaired while the seat lives.
+$frozenLegacy = @{}
+
 $rows = @()
 foreach ($r in $records) {
     $rec = $r.Rec
@@ -395,22 +411,16 @@ foreach ($r in $records) {
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
     $ageH = Get-AgeHours $rec.asOf
 
-    # SUPERSEDED: a newer record in the same box, or a later record naming this one as predecessor.
-    # A record under the OLD path-only key is also superseded by a newer one in the box the same
-    # worktree and host now key to (docs/COORD-SHARED-ROOT.md, step 4). seat.ps1 carries a session
-    # across that change by writing the new box only, so the legacy record stops moving and would
-    # otherwise read as a second, interrupted seat.
-    $successorBox = $null
-    if ($wt -and $r.Box -ceq (ConvertTo-LegacyBoxKey -Path $wt)) {
-        $successorBox = ConvertTo-BoxKey -Path $wt -HostName (Get-CoordRecordHost $rec)
-    }
+    # SUPERSEDED: a newer record of the same tree (above), or a later record naming this one as
+    # predecessor. Without the tree, a session that crossed the box-key change reads as two seats.
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
-        if ($o.Box -ne $r.Box -and $o.Box -cne $successorBox) { continue }
+        if ($o.Tree -cne $r.Tree) { continue }
         $oAge = Get-AgeHours $o.Rec.asOf
         if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
     }
+    if ($superseded -and $r.Tree -cne $r.Box) { $frozenLegacy[$r.File] = $true }
 
     $state = switch ($true) {
         { $lifecycle -eq 'closed' }                    { 'CLOSED'; break }
@@ -482,6 +492,8 @@ foreach ($o in $records) {
     # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
     # stop below for a document that resolves where it was written, so it is counted apart.
     if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
+    # A frozen legacy copy of a live seat's record; its pointer is the newer record's to answer for.
+    if ($frozenLegacy.ContainsKey($o.File)) { continue }
     $ptrTotal++
     # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
     # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves

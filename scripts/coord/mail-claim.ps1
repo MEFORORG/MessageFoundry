@@ -372,7 +372,9 @@ function New-ClaimAttempt {
 
 function Move-LegacyInbox {
     # Moves mail waiting in the LEGACY box (ConvertTo-LegacyBoxKey) into this worktree's box, so a
-    # message queued before the host joined the key is still read. Returns the number moved.
+    # message queued before the host joined the key is still read. It returns nothing: two drains
+    # racing on one file both see it present at the shared destination, so a count would be false.
+    # mail.ps1 -Status reports what is left in the legacy box instead.
     #
     # ONLY inbox/, and only names this channel minted. claiming/ belongs to a drain that may still be
     # running, and stranded/, seen/ and expired/ stay where mail.ps1 -List reports them. Shown-markers
@@ -385,22 +387,20 @@ function Move-LegacyInbox {
         [Parameter(Mandatory)][string]$Key,
         [Parameter(Mandatory)][string]$LegacyKey
     )
-    if ($LegacyKey -ceq $Key) { return 0 }
+    if ($LegacyKey -ceq $Key) { return }
     $src = Join-Path $Root "box/$LegacyKey/inbox"
-    if (-not [System.IO.Directory]::Exists($src)) { return 0 }
+    if (-not [System.IO.Directory]::Exists($src)) { return }
     $names = @()
     try { $names = @([System.IO.Directory]::EnumerateFiles($src) | ForEach-Object { [System.IO.Path]::GetFileName($_) }) }
-    catch { return 0 }
+    catch { return }
     $dst = Join-Path $Root "box/$Key/inbox"
-    $moved = 0
     foreach ($n in $names) {
         $p = Split-MailFileName -Name $n
         if (-not $p) { continue }
+        # A failed move leaves the file where -Status counts it, so the failure stays visible.
         try {
             [System.IO.Directory]::CreateDirectory($dst) | Out-Null
-            $r = Move-Claimed -Source (Join-Path $src $n) -DestinationDir $dst -Stem $p.Stem -Token $p.Token
-            if ($r.Won) { $moved++ }
+            $null = Move-Claimed -Source (Join-Path $src $n) -DestinationDir $dst -Stem $p.Stem -Token $p.Token
         } catch { }
     }
-    return $moved
 }

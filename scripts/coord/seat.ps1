@@ -928,20 +928,23 @@ try {
     # the declared half survive a -Record that knows nothing about them.
     #
     # THE BOX KEY HASHES THE HOST TOO (docs/COORD-SHARED-ROOT.md, step 4). A session that began before
-    # that change has its record under the old path-only key, so when the new path holds nothing the
-    # prior is read from there, once, and the record is then written ONLY under the new key. A legacy
-    # record from another host shares this path but is that PC's seat, so it is never adopted.
+    # that change has its record under the old path-only key, and a copy of this script older than the
+    # change (one worktree's branch, while the hook runs the primary's) may still write there. So the
+    # prior is whichever of the two records was written LAST, and the record is then written ONLY under
+    # the new key. A legacy record from another host shares this path but is that PC's seat, so it is
+    # never adopted.
     $prior = $null
-    $priorPath = $recPath
-    if (-not (Test-Path -LiteralPath $recPath)) {
-        $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
-        if (Test-Path -LiteralPath $legacyPath) { $priorPath = $legacyPath }
+    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+    $priors = @()
+    foreach ($p in @($recPath, $legacyPath)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            $one = Get-Content -LiteralPath $p -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            if ($p -ne $recPath -and -not (Test-CoordRecordIsHere $one)) { continue }
+            $priors += [pscustomobject]@{ Rec = $one; At = (Get-Item -LiteralPath $p -EA Stop).LastWriteTimeUtc }
+        } catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
     }
-    if (Test-Path -LiteralPath $priorPath) {
-        try { $prior = Get-Content -LiteralPath $priorPath -Raw -EA Stop | ConvertFrom-Json -EA Stop }
-        catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
-        if ($prior -and $priorPath -ne $recPath -and -not (Test-CoordRecordIsHere $prior)) { $prior = $null }
-    }
+    if ($priors.Count -gt 0) { $prior = ($priors | Sort-Object At -Descending | Select-Object -First 1).Rec }
 
     function Prior([string]$Name, $Default) {
         if ($prior -and ($prior.PSObject.Properties.Name -contains $Name)) { return $prior.$Name }
