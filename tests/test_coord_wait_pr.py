@@ -733,7 +733,7 @@ def test_a_new_comment_that_does_not_match_is_counted_and_never_printed(tmp_path
         tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
     )
     assert run.code == 2, run.err
-    assert "comments after id 1: 1 new, 0 by the author matching" in run.out
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
     assert "chatting" not in run.out
     assert "met:" not in run.out
 
@@ -744,7 +744,7 @@ def test_a_matching_comment_that_existed_at_the_start_is_not_new(tmp_path: Path)
         tmp_path, {COMMENTS: [ok([before])], SINCE: [ok([before])]}, "-MaxMinutes", "4"
     )
     assert run.code == 2, run.err
-    assert "comments after id 5: 0 new, 0 by the author matching" in run.out
+    assert "last read: 0 comments after id 5, 0 by the author matching" in run.out
     assert "pushed abc" not in run.out
     assert run.paths().count(SINCE) == 2
 
@@ -755,21 +755,21 @@ def test_a_matching_comment_by_anyone_else_does_not_end_the_wait(tmp_path: Path)
         tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, stranger])]}, "-MaxMinutes", "2"
     )
     assert run.code == 2, run.err
-    assert "comments after id 1: 1 new, 0 by the author matching" in run.out
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
     assert "force-push" not in run.out
 
 
 def test_author_replaces_the_pr_author_and_skips_the_pr_read(tmp_path: Path) -> None:
-    mine = comment(2, "BUILDER-STATUS: done", login="manager-bot")
+    mine = comment(2, "BUILDER-STATUS: done", login="manager_bot")
     run = wait_pr(
         tmp_path,
         "comment",
         {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, mine])]},
         "-Author",
-        "Manager-Bot",
+        "Manager_Bot",
     )
     assert run.code == 0, run.err
-    assert "author=manager-bot" in met_line(run.out)
+    assert "author=manager_bot" in met_line(run.out)
     assert PR_PATH not in run.paths()
 
 
@@ -802,7 +802,7 @@ def test_a_304_on_the_since_read_is_not_counted(tmp_path: Path) -> None:
     assert f"If-None-Match: {etag}" in since_calls[1]
     assert "5 requests, 1 of them 304 and not counted" in run.out
     # The 304 read is the same state as the read before it, so it prints nothing new.
-    assert run.out.count("comments after id 1: 0 new, 0 by the author matching") == 1
+    assert run.out.count("last read: 0 comments after id 1, 0 by the author matching") == 1
 
 
 def test_the_printed_line_is_cleaned_and_capped(tmp_path: Path) -> None:
@@ -813,6 +813,8 @@ def test_the_printed_line_is_cleaned_and_capped(tmp_path: Path) -> None:
     first_line = (
         "BUILDER-ASK: a\x1b[31mb\N{RIGHT-TO-LEFT OVERRIDE}c\N{ZERO WIDTH SPACE}d"
         "\N{LINE SEPARATOR}e\t\N{TAG LATIN CAPITAL LETTER I}f\N{LATIN SMALL LETTER E WITH ACUTE}"
+        # Case-insensitive matching folds these two into ASCII letters, so -creplace is needed.
+        "\N{KELVIN SIGN}\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
     )
     dirty = comment(2, first_line + "x" * 1000 + "\nSECRET")
     dirty["html_url"] = "https://example.test/\N{RIGHT-TO-LEFT OVERRIDE}evil"
@@ -821,7 +823,7 @@ def test_the_printed_line_is_cleaned_and_capped(tmp_path: Path) -> None:
     line = met_line(run.out)
     assert "url=https://example.test/ evil first line: " in line
     first = line.split(" first line: ", 1)[1]
-    assert first.startswith("BUILDER-ASK: a [31mb c d e   f?" + "x" * 10)
+    assert first.startswith("BUILDER-ASK: a [31mb c d e   f???" + "x" * 10)
     assert first.endswith("x...")
     assert len(first) == 300
     assert "SECRET" not in run.out
@@ -867,10 +869,29 @@ def test_after_comment_id_delivers_the_next_existing_comment_lowest_id_first(
     assert run.sleeps == []
 
 
-def test_an_after_comment_id_above_every_comment_is_an_error(tmp_path: Path) -> None:
-    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])]}, "-AfterCommentId", "10")
+def test_an_after_comment_id_above_every_comment_is_said_and_waited_on(tmp_path: Path) -> None:
+    """A deleted comment leaves exactly this, so the next comment above it must still count."""
+    ask = comment(11, "BUILDER-ASK: after the deleted one")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, ask])]}, "-AfterCommentId", "10"
+    )
+    assert run.code == 0, run.err
+    assert "-AfterCommentId 10 is above every issue comment on the PR (newest 1)" in run.out
+    assert "id=11 " in met_line(run.out)
+
+
+def test_a_pr_with_no_author_login_is_an_error_not_an_empty_author(tmp_path: Path) -> None:
+    """An empty author would match a comment that has no author either."""
+    nobody = comment(2, "BUILDER-ASK: x")
+    nobody["user"] = None
+    run = wait_comment(
+        tmp_path,
+        {PR_PATH: [ok({**pr(), "user": None})], COMMENTS: [ok([OLD, nobody])]},
+        "-AfterCommentId",
+        "1",
+    )
     assert run.code == 1
-    assert "-AfterCommentId 10 is above every issue comment on the PR (newest 1)" in run.err
+    assert "the PR names no author login" in run.err
 
 
 @pytest.mark.parametrize(
