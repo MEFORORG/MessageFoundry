@@ -616,6 +616,19 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
+def _retry_a_swallowed_lookup(handler: logging.handlers.SysLogHandler) -> None:
+    """Connect again when ``handler`` has no socket, so a lookup failure raises at construction.
+
+    CPython 3.14.9 catches a ``socket.gaierror`` from ``createSocket`` in ``SysLogHandler.__init__``
+    and leaves ``socket`` None, deferring the lookup to the first send. A name that does not
+    resolve would then read as a forwarder that started. Before 3.14.9 the error raised from
+    ``__init__``, and this restores that. It is a second lookup, so what raises is that lookup's
+    error, not the one ``__init__`` swallowed. A stdlib ``createSocket`` that succeeds always sets
+    ``socket``, so with the real one the retry runs only after a swallowed error."""
+    if getattr(handler, "socket", None) is None:
+        handler.createSocket()
+
+
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
     any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't park the calling
@@ -663,6 +676,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         kwargs["timeout"] = timeout
         try:
             super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+            _retry_a_swallowed_lookup(self)
         except OSError as exc:
             # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
@@ -933,9 +947,15 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    return logging.handlers.SysLogHandler(
+    handler = logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
     )
+    try:
+        _retry_a_swallowed_lookup(handler)
+    except OSError:
+        handler.close()
+        raise
+    return handler
 
 
 class _ForwardQueueListener(logging.handlers.QueueListener):

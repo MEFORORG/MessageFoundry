@@ -16,11 +16,14 @@ from typing import Literal
 from urllib.parse import urlencode
 
 import httpx
-from _ui_clients import create_local_user_chosen, issue_continuation
+
+# Re-exported explicitly: the split test_webui_*.py files import ADT and PW from here.
+from _ui_clients import ADT as ADT
+from _ui_clients import PW as PW
+from _ui_clients import issue_continuation, provision, seed_message
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
@@ -33,8 +36,6 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 
-PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
-ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # An HL7 field carrying HTML metacharacters — the XSS payload the browser must never execute.
 XSS_RAW = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|X1|P|2.5.1\rPID|1||1||<script>alert(1)</script>\r"
 
@@ -70,27 +71,7 @@ def _client(engine: Engine, service: AuthService, *, serve_ui: bool = True) -> h
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_chosen(
-        service,
-        username=username,
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[r.value for r in roles],
-        actor="test",
-    )
-    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
-    # fixture still stands for an operator who has been provisioned; the channel axis itself
-    # is exercised in tests/test_channel_rbac.py.
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id,
-        password_hash=user.password_hash,
-        must_change_password=False,
-        password_generated=False,
-    )
+    await provision(service, username, [r.value for r in roles])
 
 
 async def _cookie_login(c: httpx.AsyncClient, username: str) -> httpx.Response:
@@ -115,15 +96,7 @@ async def _mint_action(
     return await c.post("/ui/reauth", data=data, headers={"Sec-Fetch-Site": "same-origin"})
 
 
-async def _seed(engine: Engine, raw: str = ADT, control_id: str = "MSG1") -> str:
-    return await engine.store.enqueue_message(
-        channel_id="ch1",
-        raw=raw,
-        deliveries=[("archive", raw)],
-        control_id=control_id,
-        message_type="ADT^A01",
-        source_type="file",
-    )
+_seed = seed_message
 
 
 # An EDITED body distinct from ADT (a different MRN/name) — stands in for the operator's client-side
@@ -254,27 +227,7 @@ async def _post_pairs(
 
 async def _add_with_role_ids(service: AuthService, username: str, role_ids: list[str]) -> None:
     """Like _add, but with raw role ids (so a CUSTOM role can be assigned)."""
-    user_id = await create_local_user_chosen(
-        service,
-        username=username,
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=role_ids,
-        actor="test",
-    )
-    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
-    # fixture still stands for an operator who has been provisioned; the channel axis itself
-    # is exercised in tests/test_channel_rbac.py.
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id,
-        password_hash=user.password_hash,
-        must_change_password=False,
-        password_generated=False,
-    )
+    await provision(service, username, role_ids)
 
 
 async def _start_two_out(engine: Engine, tmp_path: Path) -> None:
