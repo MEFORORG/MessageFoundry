@@ -6,10 +6,10 @@
     verdict in the owner's permission prompt (ADR 0212).
 
 .DESCRIPTION
-    The harness asks "Allow Claude to use EnterWorktree?" when a session enters a worktree outside
-    `.claude/worktrees/`, unless the session runs under bypassPermissions. This hook runs the check
-    and puts its verdict in that prompt, so the owner sees it before answering. Where the harness
-    would not prompt, it says nothing, so it never adds a prompt.
+    The harness asks "Allow Claude to use EnterWorktree?" for some worktree entries. This hook runs
+    the check and puts its verdict in that prompt, so the owner sees it before answering. It
+    speaks only where the harness prompts anyway, so it adds no prompt; ADR 0212 section 2 says
+    where that is.
 
     IT NEVER ALLOWS AND NEVER DENIES. Its one decision is `ask`, whose reason the harness shows the
     user in the permission prompt. This script and the check run from `${CLAUDE_PROJECT_DIR}`, a
@@ -20,11 +20,10 @@
 
     On SAFE: `ask`, with a reason that starts `enter-check: SAFE`. On UNSAFE: `ask`, with a reason
     that starts `enter-check: UNSAFE` and gives the first reasons, folded onto one line and
-    bounded. On anything else it returns NO decision, and the prompt, if any, shows unannotated:
-    this machine's OFF file, a missing or failing check, a verdict it does not recognise, a path
-    under `.claude/worktrees/`, a `permission_mode` of bypassPermissions or none, or an input
-    naming no `path` (EnterWorktree with `name` creates a new worktree, which this hook does not
-    judge).
+    bounded. Otherwise it returns NO decision, and the prompt, if any, shows unannotated. That
+    covers at least: this machine's OFF file, a missing or failing check, output that is not a
+    verdict, an input it does not judge (EnterWorktree with `name` creates a new worktree), and
+    every entry where the harness would not prompt.
 
     TO SILENCE IT: per machine with the OFF file, or permanently, as scripts/worktree/enter-check.ps1's
     header says (ADR 0212 records the same two).
@@ -73,13 +72,15 @@ try {
     $cwd = Get-CcxHookPayloadCwd -Payload $hook
     if ([string]::IsNullOrWhiteSpace($path) -or -not $cwd.Cwd) { exit 0 }
 
-    # Annotate only a prompt the harness shows anyway; an `ask` anywhere else ADDS a prompt, and
-    # in a run nobody answers, a prompt is a refusal. docs/SESSION-DRIFT-CONTROLS.md records the
-    # harness's rule: it asks for a path outside `.claude/worktrees/`, by design not inside it, and
-    # never under bypassPermissions. A mode the input does not name is not assumed to prompt.
+    # Speak only where the harness prompts anyway (ADR 0212 section 2): an `ask` anywhere else
+    # ADDS a prompt, and in a run nobody answers, a prompt is a refusal. Only the modes in which a
+    # person answers the prompt count; auto, dontAsk, bypassPermissions, none or a new one do not.
     $mode = if ($props['permission_mode']) { [string]$props['permission_mode'].Value } else { '' }
-    if (-not $mode -or $mode -ceq 'bypassPermissions') { exit 0 }
-    $segs = @($path.Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    if ($mode -cnotin @('default', 'acceptEdits', 'plan')) { exit 0 }
+    # Judged as the harness resolves it, against the session's cwd, so `..` cannot move a path
+    # into or out of `.claude/worktrees/` in this test alone.
+    $full = [System.IO.Path]::GetFullPath($path, $cwd.Cwd)
+    $segs = @($full.Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
     for ($i = 0; $i + 1 -lt $segs.Count; $i++) {
         if ($segs[$i] -ieq '.claude' -and $segs[$i + 1] -ieq 'worktrees') { exit 0 }
     }
