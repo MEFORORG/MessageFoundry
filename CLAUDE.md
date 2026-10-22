@@ -695,13 +695,13 @@ never with mail. The evidence is probe PR
       if ([Environment]::MachineName -ne '<HOST>') { & { $ErrorActionPreference = 'Stop'; throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } }
 
   The check does not stop code that runs before it, such as a `param()` default or `ValidateScript`.
-  Nor does it stop a `clean {}` block, which on pwsh 7.3 and later runs after the throw. Keep
-  machine-bound work out of such code. Read the host from `[Environment]::MachineName`, not
-  `$env:COMPUTERNAME`, which is inherited and can be overwritten. On Windows, `<HOST>` is the
-  NetBIOS name `[Environment]::MachineName` prints there, at most 15 characters. No form uses
-  `exit` or `return`; `exit` closes the owner's PowerShell window when the text runs there. The
-  owner ruling asks only for the breaker. The forms and rules in this bullet are Manager decisions
-  of 2026-10-21, from engine PR 2469.
+  Nor does it stop a `clean {}` block, which runs after the throw. Keep machine-bound work out of
+  such code. Read the host from `[Environment]::MachineName`, not `$env:COMPUTERNAME`, which is
+  inherited and can be overwritten. On Windows, `<HOST>` is the NetBIOS name
+  `[Environment]::MachineName` prints there, at most 15 characters. No form uses `exit` or
+  `return`; `exit` closes the owner's PowerShell window when the text runs there. The
+  `MachineName` read, the ban on `exit` and `return`, and the scoped-`Stop` script form are Manager
+  decisions of 2026-10-21, from engine PR 2469.
 
 ---
 
