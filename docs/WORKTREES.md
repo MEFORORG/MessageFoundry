@@ -206,10 +206,13 @@ may run the same line once more with `-Force` added, on **its own** worktree onl
 made or that its claim or seat record names, when all three of these hold:
 
 1. The refusal is the one for uncommitted changes, untracked files or ignored files, and every line
-   it lists is an *ignored* directory (`!! <path>/`) named `venv`, `node_modules`, `__pycache__`,
-   `.mypy_cache`, `.ruff_cache` or `.pytest_cache`. An untracked (`??`) line, a `.venv` below the
-   tree root (vault BACKLOG #1017 point (i)), a listed file, a line marked as a link or unreadable,
-   a `flagged` line, and a list cut short with `... and N more` all fail this.
+   it lists is an *ignored* directory: `!! venv/` at the tree root, or `!! <path>/` named
+   `node_modules`, `__pycache__`, `.mypy_cache`, `.ruff_cache` or `.pytest_cache`. An untracked
+   (`??`) line, a `venv` or `.venv` below the tree root (vault BACKLOG #1017 point (i)), a listed
+   file, a line marked as a link or unreadable, a `flagged` line, and a list cut short with
+   `... and N more` all fail this. The script already tolerates the other names in that ignored
+   form, so in practice this covers a root `venv`. A refusal that lists a file such as
+   `.claude/seat.local.txt` is not cache-only, and stays final.
 2. `git -C <tree> status --porcelain --untracked-files=all` prints nothing.
 3. The tree's branch tip is on the remote: `git ls-remote origin refs/heads/<branch>` prints the
    SHA the tree's `HEAD` holds. Name the full ref: `--heads <branch>` also matches a branch whose

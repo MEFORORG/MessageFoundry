@@ -436,12 +436,15 @@ text moved in wave 2*.
 invoking either (plan section 5.1, owner approvals 2026-10-21 and 2026-10-22). The decision
 classes A to D are defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3.
 **When `MEFOR_AFK_KILL` reads anything but `off`, empower is off** and the driver rules alone
-apply. Case and surrounding space are ignored, and an unread or missing variable counts as on;
-`scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). While it is on, the grants this section
-takes from the plan are off too: a routine plan waits for the owner's go again, and the two class
-A acts and the cache-only `-Force` in `docs/WORKTREES.md` go back to the owner. A delegated
-question (the merge bullet below) is the owner's own answer, and the switch does not touch it. The Lander and the Watchdog keep
-their exemption: they never use `AskUserQuestion`, and put an owner question in a table instead.
+apply, in ask-mode: no class B or C decision is acted on without the owner (plan section 4.3).
+Case and surrounding space are ignored, and an unread or missing variable counts as on. Read it
+with `scripts/coord/afk-kill.ps1 -Status` (ADR 0211) before a class A or B act, not only at
+session start. While it is on, the grants this section takes from the plan are off too: a routine
+plan waits for the owner's go again, and the two class A acts and the cache-only `-Force` in
+`docs/WORKTREES.md` go back to the owner. A delegated question (the merge bullet below) is the
+owner's own answer, and the switch does not touch it. The Lander and the Watchdog keep their
+exemption: they never use `AskUserQuestion`, and put an owner question in a table instead. A
+Builder still gets one turn: it puts an owner question in its report, never in `AskUserQuestion`.
 
 The brief is disposable. The BACKLOG item is the record.
 
