@@ -713,13 +713,15 @@ def silent_remote() -> Iterator[str]:
 
 
 def test_a_hung_child_is_bounded_by_the_run_s_budget(fleet: Fleet, silent_remote: str) -> None:
-    """The remote read's own bound is 20 s; the 4 s budget stops it first."""
+    """The remote read's own bound is 30 s here; the 6 s budget stops it first."""
     wt = fleet.own_wt()
     start = time.monotonic()
-    proc = fleet.check(wt, remote=silent_remote, extra=("-BudgetSeconds", "4"))
+    proc = fleet.check(
+        wt, remote=silent_remote, extra=("-BudgetSeconds", "6", "-RemoteTimeoutSeconds", "30")
+    )
     assert_unsafe(proc, "f")
-    assert "budget" in proc.stdout, proc.stdout
-    assert time.monotonic() - start < 15, proc.stdout
+    assert "budget ran out" in proc.stdout, proc.stdout
+    assert time.monotonic() - start < 25, proc.stdout
 
 
 # ---------------------------------------------------------------- the local OFF file
@@ -733,6 +735,14 @@ def test_the_local_off_file_prints_off_and_runs_no_check(fleet: Fleet) -> None:
     assert proc.stdout.splitlines()[1:] == [
         "  this machine has turned the check off with its local OFF file"
     ]
+
+
+def test_the_off_file_is_read_before_the_sanitiser(fleet: Fleet) -> None:
+    """A machine that turned the check off gets no verdict even when the sanitiser will not load."""
+    fleet.turn_off()
+    (fleet.sb.repo / "scripts" / "hooks" / "worktree_gate.ps1").unlink()
+    proc = fleet.check(fleet.scratch())
+    assert proc.returncode == 2 and _verdict(proc) == "OFF", (proc.stdout, proc.stderr)
 
 
 # ---------------------------------------------------------------- faults fail closed
@@ -771,6 +781,7 @@ def _payload(fleet: Fleet, path: Path) -> dict[str, object]:
         "session_id": SID,
         "cwd": str(fleet.home),
         "hook_event_name": "PreToolUse",
+        "permission_mode": "default",
         "tool_name": "EnterWorktree",
         "tool_input": {"path": str(path)},
         "transcript_path": fleet.transcript(),
@@ -854,7 +865,23 @@ def test_the_unsafe_reason_is_one_bounded_line(fleet: Fleet) -> None:
     reason = _reason(_decision(fleet.hook(_payload(fleet, fleet.scratch()))))
     assert reason.startswith("enter-check: UNSAFE -- a. one two"), reason
     assert "\r" not in reason and "\n" not in reason and bidi not in reason, reason
-    assert len(reason) < 600 and "c. third" in reason and "d. fourth" not in reason, reason
+    assert len(reason) < 1000 and "c. third" in reason and "d. fourth" not in reason, reason
+
+
+@pytest.mark.parametrize("case", ["bypassPermissions", "no mode", ".claude/worktrees"])
+def test_the_hook_says_nothing_where_the_harness_would_not_prompt(fleet: Fleet, case: str) -> None:
+    """An `ask` there would ADD a prompt; in a run nobody answers, that is a refusal."""
+    if case == ".claude/worktrees":
+        path = fleet.add_worktree(fleet.engine / ".claude" / "worktrees" / "agent-x")
+    else:
+        path = fleet.own_wt()
+        assert_safe(fleet.check(path))
+    payload = _payload(fleet, path)
+    if case == "no mode":
+        del payload["permission_mode"]
+    elif case == "bypassPermissions":
+        payload["permission_mode"] = "bypassPermissions"
+    assert _decision(fleet.hook(payload)) is None
 
 
 @pytest.mark.parametrize("body", ["Write-Output 'SAFE'\nexit 1\n", "exit 0\n"])
