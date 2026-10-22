@@ -84,6 +84,7 @@ tests/test_coord_fleet_fetch_clock.py
 tests/test_durability_hook_provenance.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
+tests/test_enter_worktree_check.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_payload_cwd.py
 tests/test_hook_prose_folding.py
