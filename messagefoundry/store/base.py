@@ -51,6 +51,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import (
     AuditMacFn,
     Cipher,
+    CipherError,
     CipherInfo,
     UnmarkedRefusalHook,
     make_cipher,
@@ -3445,6 +3446,31 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     first. Cached, because naming a server driver imports it: build it at startup, so the first
     refusal does not run that import on the event loop (vault BACKLOG #3145, #3113)."""
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
+
+
+@cache
+def audit_write_errors() -> tuple[type[Exception], ...]:
+    """What a refused audit write raises, at least on the store backends and key modes named here
+    (BACKLOG #2137, #3403). The auth service's store-refusal audit writes and the API's
+    ``alert_rules_withheld`` row catch this set; at least a few other audit writes catch their own.
+
+    :func:`store_call_errors`: the drivers' own errors, ``RuntimeError`` for the engine's own
+    refusals (the acquire timeout, a keyless audit append), ``OSError`` for a connection lost at the
+    socket, and ``ValueError``, which aiosqlite raises for a closed connection before sqlite3 is
+    reached. ``CipherError``, which a ``vault_transit`` store raises when Transit cannot compute the
+    audit-chain MAC (ADR 0138). And the driver roots that set stops beneath: ``sqlite3.Error``,
+    which takes ``sqlite3.InterfaceError``, and pyodbc's ``Error`` through
+    :func:`store_connect_errors`, which says when pyodbc raises it. So, unlike
+    :func:`store_driver_errors`, this set reads a SQLite interface error as a refusal: an audit
+    write's caller keeps its answer either way, and the row's loss is logged.
+
+    Every class in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` is inside this set, so a
+    caller that passes them as ``defects`` still raises them, because
+    :func:`~messagefoundry.audit_write.write_audit_soft` tries ``defects`` first. Cached, like
+    :func:`store_call_errors`, because naming a server driver imports it: build it at startup."""
+    import sqlite3
+
+    return (CipherError, sqlite3.Error, *store_call_errors(), *store_connect_errors())
 
 
 def store_open_errors() -> tuple[type[Exception], ...]:

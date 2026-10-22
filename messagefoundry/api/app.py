@@ -458,7 +458,12 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
-from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.base import (
+    ResendError,
+    Store,
+    audit_write_errors,
+    build_store_cipher,
+)
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
@@ -3468,6 +3473,65 @@ async def _record_control_audit(
         channel_id=name if role == "source" else None,
         detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
         client=client,
+    )
+
+
+async def _audit_alert_rules_withheld(
+    request: Request, identity: Identity, shown: int, withheld: int
+) -> None:
+    """Record that ``GET /alerts/rules`` withheld ``withheld`` rules from a channel-scoped caller
+    (BACKLOG #3403). The detail is the two counts, never a rule's contents.
+
+    Not ``auth.channel_denied``: the read was answered, and that action feeds the security-signal
+    denial count, so routine alerts-page loads could raise a denial-burst alert.
+
+    Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
+    refusal, and a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` too, is
+    logged at ERROR with its traceback, and the narrowed answer still returns. A fault outside the
+    catch set, :func:`~messagefoundry.store.base.audit_write_errors`, still escapes as a 500. The
+    auth service's own audit writes catch the same set. A cancel that lands during the write waits a
+    bounded time for the row, and a row that still does not land is logged at ERROR with its counts
+    (:func:`_write_through_cancel`). Why the row is not coalesced is in docs/SECURITY.md.
+
+    The row goes through the auth service's store, the one its own audit rows use: only a
+    channel-scoped caller withholds a rule, such a caller exists only when that service is attached,
+    and the engine may not be."""
+    auth = get_auth(request)
+    actor = identity.username
+    if auth is None:
+        _log.error(
+            "GET /alerts/rules showed %d and withheld %d rules from %s with no auth service to "
+            "audit it",
+            shown,
+            withheld,
+            scrub_log_argument(actor),
+        )
+        return
+    store = auth.store
+    client = client_ip(request)
+    detail = json.dumps({"shown": shown, "withheld": withheld})
+    await write_audit_soft(
+        lambda: _write_through_cancel(
+            store.record_audit("alert_rules_withheld", actor=actor, detail=detail, client=client),
+            lambda: (
+                f"{_lost_row('alert_rules_withheld', actor, detail)} "
+                f"client={scrub_log_argument(client or '-')}"
+            ),
+        ),
+        log=_log,
+        # Not the route: the console's alerts page reads the rules through this handler too.
+        message="a read of the alert rules showed %d and withheld %d rules from %s at %s, but its "
+        "audit row failed",
+        args=lambda: (
+            shown,
+            withheld,
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+        ),
+        # (), as write_audit_soft's docstring asks where a raise would replace the answer the
+        # caller owes. A 500 here would also tell a scoped caller that hidden rules exist.
+        defects=(),
+        errors=audit_write_errors(),
     )
 
 
@@ -8801,14 +8865,18 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
-        access. No secrets: the webhook URL, SMTP password and username are never returned —
-        transports are reported present-or-not. Gated by monitoring:read like /stats.
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
+        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
+        password and username are never returned — transports are reported present-or-not. Gated by
+        monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
-        ``IB_ACME_*``, is withheld."""
+        ``IB_ACME_*``, is withheld.
+
+        A read that withholds at least one rule writes an audit row; see
+        :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
@@ -8820,7 +8888,7 @@ def create_app(
 
         rules = [r for r in alerts.rules if visible(r)]
 
-        return AlertsConfig(
+        config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
             webhook_timeout=alerts.webhook_timeout,
             webhook_allowed_hosts=list(alerts.webhook_allowed_hosts),
@@ -8856,6 +8924,13 @@ def create_app(
                 for r in rules
             ],
         )
+        # After the answer is built, so a fault building it writes no row. Serialization through
+        # response_model runs later, so a fault there still leaves the row. The console renders
+        # after this returns, so the row records what was withheld, not that a page was seen.
+        withheld = len(alerts.rules) - len(rules)
+        if withheld:
+            await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
+        return config
 
     # --- config provenance ---------------------------------------------------
 

@@ -2009,9 +2009,27 @@ the same permission set on the same method reds CI until it is listed here.
 > reaches the engine, which answers 409 for a name with no `connections.toml` entry.
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it.
+> scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
+> `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
+> contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
+> or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row
+> a cancel cuts off is logged at ERROR too, but the cancelled read does not answer. The catch set
+> is `audit_write_errors()` in `messagefoundry/store/base.py`, which the auth service's
+> store-refusal audit writes catch too, and any other fault still escapes as a 500. So a
+> missing row does not prove nothing was withheld. The row is not coalesced. With the default
+> `audit_all_authorization_decisions`, every JSON request already writes a grant row, so this
+> adds at most one row per request. With that switch off, this row is the only one such a read
+> writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
+> that polled would need the row coalesced. The counts are a disclosure in their own right. A
+> scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
+> lie outside its scope. A `logs:view` holder reads them in the ERROR line a lost row leaves.
+> Without either, one extra write's latency can show that some rule was withheld. It cannot show
+> which rules or how many. Why it is not
+> `auth.channel_denied` is in `_audit_alert_rules_withheld` in
+> `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
-> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route, the rules and the
+> `alert_rules_withheld` row. The console's
 > `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
 > roles.
 
@@ -5972,7 +5990,10 @@ on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
-and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
+and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
+that records the narrowing. The alert-rules read is an exception. When it withholds a rule, it
+writes `alert_rules_withheld`. So do the console pages that read the rules through its handler
+(BACKLOG #3403). PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
 
