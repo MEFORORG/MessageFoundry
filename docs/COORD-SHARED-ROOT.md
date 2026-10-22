@@ -105,13 +105,18 @@ The fix is part of the change, not a follow-up:
 3. A record with no `host` is treated as this machine's, which is true of every record written
    before the change.
 
-## The worktree gate must follow the root
+## The worktree gate must follow the root, by tightening
 
-`worktree_gate.ps1` denies writes outside the worktree, with **one** exemption:
-`<primary>/.git/mefor-coord/`. Moving the shared root without moving that exemption makes every
-seat declare, mail send and claim a denied write. Widen the exemption to the configured shared root
-and nothing else, the way it was narrowed to `mefor-coord/` alone. This is a control change, so it
-needs its own code review.
+**CORRECTED 2026-10-21.** This section first said the gate's exemption must widen to the shared
+root. Reading the gate showed the opposite. Rule 1 refuses a write tool's target under the primary
+checkout only, so a target on the share is not governed at all, and nothing needs exempting. What
+does not follow the root is **rule 1b**: it refuses a hand-written file under `alloc/`, `claims/`
+and the other machine-read registries, because a hand-written claim TRANSFERS a live one. On the
+share, rule 1b would not fire, so a Write tool could forge a claim or an allocation there.
+
+The fix is a tightening: rule 1b also matches the configured shared root. The gate reads that root
+lexically (env var, then each root's `root.toml`) and makes no network call, so it adds no latency
+to a tool call. The installed copy of the gate changes only when `install-gate.ps1` runs again.
 
 ## Offline behaviour: fail closed for exclusive ops, fail open fast for reads
 
