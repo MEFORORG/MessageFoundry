@@ -650,13 +650,12 @@ never with mail. The evidence is probe PR
   Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
   trials the skill then ran at the previous call's level (measured 2026-10-13). Make the
   `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,
-  never before it. The tag is the skill's `<level> effort -> ...` line. Where a reviewer fork
-  exists, read the tag with korus `scripts/quality/review_tag.py`, which reads the fork's
-  transcript. There, never take it from memory or the skill's prose. Run the tool by path from your
-  engine worktree, with `--target` set to the nonce. In your QA line, give the level you passed,
-  and quote the tag verbatim with the note 4e requires. korus `roles/BUILDER.md` *4e*, read at
-  `origin/main`, gives that note, the inline case, and what to write when the tool finds nothing or
-  refuses.
+  never before it. The tag is the skill's `<level> effort -> ...` line. Read it with korus
+  `scripts/quality/review_tag.py`, run by path from your engine worktree, with `--target` set to
+  the nonce. The tool reads the reviewer fork's transcript. Where no fork exists, it exits 3, and
+  4e says what to write then. Never take a fork's tag from memory or the skill's prose. In your QA
+  line, give the level you passed, and quote the tag verbatim with the note 4e requires. korus
+  `roles/BUILDER.md` *4e*, read at `origin/main`, gives the QA line's full format.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
