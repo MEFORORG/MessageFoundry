@@ -2,29 +2,32 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    PreToolUse hook for EnterWorktree: auto-allow entering a worktree only when
-    scripts/worktree/enter-check.ps1 says SAFE (ADR 0212).
+    PreToolUse hook for EnterWorktree: show scripts/worktree/enter-check.ps1's SAFE or UNSAFE
+    verdict in the owner's permission prompt (ADR 0212).
 
 .DESCRIPTION
-    The owner was shown "Allow Claude to use EnterWorktree?" each time a session entered a
-    throwaway worktree it had made under its own scratchpad. This hook answers that prompt for the
-    one case enter-check.ps1 proves safe, and changes nothing else.
+    The owner is shown "Allow Claude to use EnterWorktree?" each time a session enters a worktree.
+    This hook runs the check and puts its verdict in that prompt, so the owner sees it before
+    answering.
 
-    IT NEVER DENIES. On SAFE it returns permissionDecision `allow`. On UNSAFE, on any error, or
-    when the input names no `path` (EnterWorktree with `name` creates a new worktree, which this
-    hook does not judge), it returns NO decision, so the normal prompt shows. On UNSAFE it adds
-    `additionalContext` saying why the call was not auto-allowed.
+    IT NEVER ALLOWS AND NEVER DENIES. Its one decision is `ask`, whose reason the harness shows the
+    user in the permission prompt. This script and the check run from the session's own editable
+    tree, so the session could change what they print; an `allow` from them would be the session
+    approving itself. ADR 0212 records why an allow is deferred until it comes from an installed
+    copy outside every session-writable tree.
 
-    A deny from another hook wins over this allow: the opt-in `-EnterWorktreeGate` matcher of
-    scripts/hooks/worktree_gate.ps1, when installed, denies under its rule 4, and that is intended.
-    This hook does not change the workspace-trust prompt either.
+    On SAFE: `ask`, with a reason that starts `enter-check: SAFE`. On UNSAFE: `ask`, with a reason
+    that starts `enter-check: UNSAFE` and gives the first reasons, folded onto one line and
+    bounded. On anything else -- this machine's OFF file, a missing or failing check, a verdict it
+    does not recognise, or an input naming no `path` (EnterWorktree with `name` creates a new
+    worktree, which this hook does not judge) -- it returns NO decision, and the normal prompt
+    shows unannotated.
 
-    TO DISABLE IT: fleet-wide, per machine, or permanently, as scripts/worktree/enter-check.ps1's
-    header says (ADR 0212 records the same three).
+    TO SILENCE IT: per machine with the OFF file, or permanently, as scripts/worktree/enter-check.ps1's
+    header says (ADR 0212 records the same two).
 
-    -FleetRepos, -FleetRemotes and -TempRoot are passed through to enter-check.ps1 for tests. The settings entry
-    passes neither, so the defaults apply; whoever can edit that entry's arguments can already
-    edit the permission rules beside it.
+    -FleetRepos, -FleetRemotes and -TempRoot are passed through to enter-check.ps1 for tests. The
+    settings entry passes none, so the defaults apply.
 #>
 param(
     [string[]]$FleetRepos,
@@ -35,9 +38,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Write-HookOutput([hashtable]$Specific) {
-    $Specific['hookEventName'] = 'PreToolUse'
-    [Console]::Out.Write((@{ hookSpecificOutput = $Specific } | ConvertTo-Json -Compress -Depth 4))
+function Write-Ask([string]$Reason) {
+    # The only decision this hook writes, fixed here rather than passed in.
+    $out = @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'ask'; permissionDecisionReason = $Reason } }
+    [Console]::Out.Write(($out | ConvertTo-Json -Compress -Depth 4))
+}
+
+function Get-PromptText([string]$Text, [int]$Max) {
+    # Shown in the owner's prompt: one line, no control or format character (a bidi override can
+    # reorder what the owner reads), and bounded.
+    $t = (($Text -replace '\p{C}', ' ') -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max - 3) + '...' }
+    return $t
 }
 
 try {
@@ -47,11 +59,11 @@ try {
     $hook = $text | ConvertFrom-Json -ErrorAction Stop
     if ($hook -isnot [pscustomobject]) { exit 0 }
     $props = $hook.PSObject.Properties
-    # The allow is for this one tool, whatever matcher a settings file wires the hook under.
+    # The verdict is for this one tool, whatever matcher a settings file wires the hook under.
     if (-not $props['tool_name'] -or [string]$props['tool_name'].Value -cne 'EnterWorktree') { exit 0 }
     $toolInput = if ($props['tool_input']) { $props['tool_input'].Value } else { $null }
     if ($toolInput -isnot [pscustomobject] -or -not $toolInput.PSObject.Properties['path']) { exit 0 }
-    # Only `path` is judged, so an input carrying anything else gets no decision.
+    # Only `path` is judged, so an input carrying anything else gets no verdict.
     if (@($toolInput.PSObject.Properties | Where-Object { $_.Name -cne 'path' }).Count) { exit 0 }
     $path = [string]$toolInput.PSObject.Properties['path'].Value
     $sid = if ($props['session_id']) { [string]$props['session_id'].Value } else { '' }
@@ -68,16 +80,19 @@ try {
     $verdict = if ($lines.Count) { [string]$lines[0] } else { '' }
 
     if ($code -eq 0 -and $verdict -ceq 'SAFE') {
-        Write-HookOutput @{
-            permissionDecision       = 'allow'
-            permissionDecisionReason = 'enter-check.ps1: SAFE -- a linked worktree in this session''s own scratchpad, with origin/main''s .claude/, and the kill switch OFF (ADR 0212)'
-        }
+        Write-Ask ('enter-check: SAFE -- a linked fleet worktree in this session''s own scratchpad, at an ' +
+            'unmodified commit of the remote''s main, entered from outside any primary checkout. Advisory: ' +
+            'the check runs from the session''s own tree (ADR 0212)')
         exit 0
     }
-    $why = (@($lines | Select-Object -Skip 1) | ForEach-Object { ([string]$_).Trim() }) -join ' '
-    Write-HookOutput @{
-        additionalContext = "enter-worktree-check (ADR 0212) did not auto-allow this EnterWorktree call, so the owner is asked as usual. enter-check.ps1 printed: $verdict $why"
+    if ($code -eq 1 -and $verdict -ceq 'UNSAFE') {
+        # At most three reasons of at most 160 characters each, so the reason stays one short line.
+        $why = @($lines | Select-Object -Skip 1 -First 3 | ForEach-Object { Get-PromptText ([string]$_) 160 } | Where-Object { $_ }) -join '; '
+        if (-not $why) { $why = 'no reason printed' }
+        Write-Ask "enter-check: UNSAFE -- $why (ADR 0212)"
+        exit 0
     }
+    # OFF (exit 2), or output that is not a verdict: no decision, so the prompt shows unannotated.
     exit 0
 }
 catch {
