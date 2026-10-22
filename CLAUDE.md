@@ -431,6 +431,14 @@ nobody checked it. A Manager seat added, the same day, that spawning should be r
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
 
+**Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
+`driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
+invoking either (plan section 5.1, owner approval 2026-10-21). The decision classes A to D are
+defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3. **When
+`MEFOR_AFK_KILL` reads anything but exactly `off`, empower is off** and the driver rules alone
+apply; `scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). The Lander and the Watchdog keep
+their exemption: they never use `AskUserQuestion`, and put an owner question in a table instead.
+
 The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
@@ -498,9 +506,13 @@ never with mail. The evidence is probe PR
 
 ### The Manager plans, dispatches, and holds the owner's attention
 
-- **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
-  waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
-  improves the result.
+- **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan.
+  **It waits for the owner's explicit "go" only on a plan that holds a class C item**, such as new
+  product scope. A routine plan is class B under [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md)
+  section 3 (plan section 5.2, owner approval 2026-10-21): the Manager logs it with
+  `scripts/coord/decision.ps1` (ADR 0211) and acts on that section's R4 bar, which sends every class B
+  decision through an adversarial review until 60 blind samples exist. Point the brief at the
+  relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
   running, what paths they touch, and whether they share the worktree. Hand down readings, not
@@ -523,6 +535,11 @@ never with mail. The evidence is probe PR
 
       git -C <korus clone> fetch origin
       git -C <korus clone> show origin/main:roles/BUILDER.md
+
+- **Where a korus playbook and `COMMON.md` disagree, the newer owner ruling wins; failing that, the
+  stricter rule wins.** Record the conflict as a class C item for the daily digest (plan section
+  5.2, owner approval 2026-10-21). This replaces the *"no seat picks a winner"* rule in korus
+  `roles/COMMON.md`, *Where a role playbook and this file disagree, the owner decides*.
 
 - **A checkout is not a ref, and an `ls` of a directory is not evidence that you have the file.**
   A missing playbook is the quietest failure in this list. Why the pointer moved, and what the
