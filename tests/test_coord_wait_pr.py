@@ -69,7 +69,10 @@ if ($resp.ContainsKey('etag')) { "Etag: $($resp['etag'])" }
 if ($resp.ContainsKey('headers')) { $resp['headers'] }
 'X-Ratelimit-Resource: core'
 ''
-if ($resp.ContainsKey('body')) { ConvertTo-Json -Compress -Depth 20 -InputObject $resp['body'] }
+# Escaped, so a non-ASCII test character survives this child's console code page on its way out.
+if ($resp.ContainsKey('body')) {
+    ConvertTo-Json -Compress -Depth 20 -EscapeHandling EscapeNonAscii -InputObject $resp['body']
+}
 if ([int]$resp['status'] -ge 300) { [Console]::Error.WriteLine("gh: HTTP $($resp['status'])"); exit 1 }
 exit 0
 """
@@ -674,3 +677,156 @@ def test_a_weak_etag_keeps_its_quotes_on_the_way_to_gh(tmp_path: Path) -> None:
     assert run.code == 0, run.err
     pr_calls = [c for c in run.calls if c[-1] == PR_PATH]
     assert f"If-None-Match: {etag}" in pr_calls[1]
+
+
+COMMENTS = f"repos/{REPO}/issues/{PR}/comments?per_page=100&page=1"
+# One second before the newest `updated_at` the starting read saw, in GitHub's own clock.
+SINCE = f"repos/{REPO}/issues/{PR}/comments?since=2026-10-22T09:59:59Z&per_page=100&page=1"
+
+
+def comment(cid: int, body: str, updated: str = "2026-10-22T10:00:00Z") -> dict[str, Any]:
+    return {
+        "id": cid,
+        "body": body,
+        "user": {"login": "cloud-builder"},
+        "html_url": f"https://github.com/{REPO}/pull/{PR}#issuecomment-{cid}",
+        "updated_at": updated,
+    }
+
+
+def met_line(out: str) -> str:
+    lines = [line for line in out.splitlines() if "met: comment." in line]
+    assert len(lines) == 1, out
+    return lines[0]
+
+
+OLD = comment(1, "LGTM")
+
+
+def test_a_new_matching_comment_exits_0_with_one_line(tmp_path: Path) -> None:
+    ask = comment(2, "BUILDER-ASK: which base?\r\nthe rest of the body", "2026-10-22T10:05:00Z")
+    run = wait_pr(tmp_path, "comment", {COMMENTS: [ok([OLD])], SINCE: [ok([OLD]), ok([OLD, ask])]})
+    assert run.code == 0, run.err
+    line = met_line(run.out)
+    assert line.endswith(
+        f"id=2 author=cloud-builder url=https://github.com/{REPO}/pull/{PR}#issuecomment-2"
+        " first line: BUILDER-ASK: which base?"
+    )
+    assert "the rest of the body" not in run.out
+    assert run.paths() == ["rate_limit", COMMENTS, SINCE, SINCE]
+    assert run.sleeps == [120, 120]
+
+
+def test_a_new_comment_that_does_not_match_is_counted_and_never_printed(tmp_path: Path) -> None:
+    chat = comment(2, "just chatting, BUILDER-ASK: not on the first line")
+    run = wait_pr(
+        tmp_path, "comment", {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert "comments after id 1: 1 new, none matching" in run.out
+    assert "chatting" not in run.out
+    assert "met:" not in run.out
+
+
+def test_a_matching_comment_that_existed_at_the_start_is_not_new(tmp_path: Path) -> None:
+    before = comment(5, "BUILDER-STATUS: pushed abc")
+    run = wait_pr(
+        tmp_path, "comment", {COMMENTS: [ok([before])], SINCE: [ok([before])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert "comments after id 5: 0 new, none matching" in run.out
+    assert "pushed abc" not in run.out
+    assert run.paths().count(SINCE) == 2
+
+
+def test_match_replaces_the_default_pattern(tmp_path: Path) -> None:
+    """The lower id matches only the default, so it being skipped shows the default was replaced."""
+    ask = comment(2, "BUILDER-ASK: default only")
+    done = comment(3, "DONE: custom")
+    run = wait_pr(
+        tmp_path,
+        "comment",
+        {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, ask, done])]},
+        "-Match",
+        "^DONE:",
+    )
+    assert run.code == 0, run.err
+    assert met_line(run.out).endswith("first line: DONE: custom")
+    assert "default only" not in run.out
+
+
+def test_a_304_on_the_since_read_is_not_counted(tmp_path: Path) -> None:
+    etag = '"s1"'
+    ask = comment(2, "BUILDER-STATUS: green")
+    run = wait_pr(
+        tmp_path,
+        "comment",
+        {
+            COMMENTS: [ok([OLD])],
+            SINCE: [ok([OLD], etag), {"status": 304, "etag": etag}, ok([OLD, ask], '"s2"')],
+        },
+    )
+    assert run.code == 0, run.err
+    since_calls = [c for c in run.calls if c[-1] == SINCE]
+    assert len(since_calls) == 3
+    assert f"If-None-Match: {etag}" not in since_calls[0]
+    assert f"If-None-Match: {etag}" in since_calls[1]
+    assert "4 requests, 1 of them 304 and not counted" in run.out
+    # The 304 read is the same state as the read before it, so it prints nothing new.
+    assert run.out.count("comments after id 1: 0 new, none matching") == 1
+
+
+def test_the_printed_line_is_cleaned_and_capped(tmp_path: Path) -> None:
+    """Control, format and line-separator characters become spaces; it stops at 300 characters."""
+    dirty = comment(2, "BUILDER-ASK: a\x1b[31mb‮c​d e\t" + "x" * 1000 + "\nSECRET")
+    run = wait_pr(tmp_path, "comment", {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, dirty])]})
+    assert run.code == 0, run.err
+    first = met_line(run.out).split(" first line: ", 1)[1]
+    assert first.startswith("BUILDER-ASK: a [31mb c d e " + "x" * 10)
+    assert first.endswith("x...")
+    assert len(first) == 300
+    assert "SECRET" not in run.out
+
+
+def test_a_comment_wait_that_sees_nothing_times_out_with_exit_2(tmp_path: Path) -> None:
+    """With no comment at the start there is no `since`, so the first path is read again."""
+    run = wait_pr(tmp_path, "comment", {COMMENTS: [ok([])]}, "-MaxMinutes", "4")
+    assert run.code == 2, run.err
+    assert "timeout: comment not met within 4 min" in run.out
+    assert run.paths() == ["rate_limit", COMMENTS, COMMENTS, COMMENTS]
+    assert run.sleeps == [120, 120]
+
+
+def test_after_comment_id_delivers_the_next_existing_comment_lowest_id_first(
+    tmp_path: Path,
+) -> None:
+    """Two comments in one interval: the second is fetched by waiting again after the first."""
+    first = comment(2, "BUILDER-ASK: one")
+    second = comment(3, "BUILDER-ASK: two")
+    run = wait_pr(
+        tmp_path,
+        "comment",
+        {COMMENTS: [ok([OLD, second, first])]},
+        "-AfterCommentId",
+        "1",
+    )
+    assert run.code == 0, run.err
+    assert "id=2 " in met_line(run.out)
+    assert run.sleeps == []
+
+
+@pytest.mark.parametrize("flag", [("-Match", "^X"), ("-AfterCommentId", "3")])
+def test_comment_options_with_another_until_are_an_error(
+    tmp_path: Path, flag: tuple[str, str]
+) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [MERGED]}, *flag)
+    assert run.code == 1
+    assert f"{flag[0]} applies only to -Until comment" in run.err
+    assert run.calls == []
+
+
+def test_an_invalid_match_pattern_is_an_error_before_any_call(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "comment", {}, "-Match", "(")
+    assert run.code == 1
+    assert "-Match is not a valid regular expression" in run.err
+    assert run.calls == []
