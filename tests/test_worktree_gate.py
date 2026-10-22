@@ -358,6 +358,7 @@ def test_a_lookalike_of_the_primary_itself_stays_governed(
 ) -> None:
     """The culture half of the governed test, kept on purpose: rules 1 and 3 answer through it, and
     without it a write into a lookalike of the primary, denied today, would be allowed."""
+    _require_culture_premise()
     lookalike = tmp_path / (primary.name + "\u200b") / "src" / "app.py"
     assert_denied(run_gate(edit(lookalike, cwd=primary), repos_file))
 
@@ -1701,6 +1702,9 @@ def test_a_HEAD_move_in_an_isolated_builders_own_nested_tree_is_allowed(
 SOFT_HYPHEN = chr(0xAD)
 COMBINING_ACUTE = chr(0x301)
 _ORD = "[System.StringComparison]::Ordinal"
+#: A scanner's two readings as shipped, and the control that keeps only origin/main's culture one.
+_BOTH_READINGS = "${name} = @(" + _ORD + ", [System.StringComparison]::CurrentCulture)"
+_CULTURE_READING = "${name} = @([System.StringComparison]::CurrentCulture)"
 
 
 @functools.cache
@@ -2045,8 +2049,8 @@ def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert_denied(run_gate(payload, hijack_repos_file))
     control = _rebuilt_gate(
         tmp_path / "gate_culture_dest.ps1",
-        f"            if ($tok.StartsWith('-', {_ORD})) {{ continue }}\n            $dest",
-        "            if ($tok.StartsWith('-')) { continue }\n            $dest",
+        _BOTH_READINGS.format(name="destCmps"),
+        _CULTURE_READING.format(name="destCmps"),
         "class A's destination scanner moved",
     )
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
@@ -2066,8 +2070,8 @@ def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert_denied(run_gate(payload, hijack_repos_file))
     control = _rebuilt_gate(
         tmp_path / "gate_culture_victim.ps1",
-        f"            if ($tok.StartsWith('-', {_ORD})) {{ continue }}\n            $victimRaw",
-        "            if ($tok.StartsWith('-')) { continue }\n            $victimRaw",
+        _BOTH_READINGS.format(name="victimCmps"),
+        _CULTURE_READING.format(name="victimCmps"),
         "rule 3d's victim scan moved",
     )
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
@@ -2080,8 +2084,8 @@ def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
         # A culture StartsWith read `<U+00AD>-x` as a flag.
         (
             f"{SOFT_HYPHEN}-x",
-            f"        if (-not $t.StartsWith('-', {_ORD})) {{ return $true }}",
-            "        if (-not $t.StartsWith('-')) { return $true }",
+            _BOTH_READINGS.format(name="headMoveCmps"),
+            _CULTURE_READING.format(name="headMoveCmps"),
         ),
         # A culture `-eq` read `<U+00AD>--` as the separator.
         (
@@ -2117,3 +2121,206 @@ def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
         "a Test-VerbMovesHead comparison moved",
     )
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+# --- an ordinal prefix test must not allow what the culture one denied ----------------------------
+#
+# Ordinal Equals matches only identical strings, so where a match allows, it denies at least as much
+# as the culture `-eq`. ORDINAL StartsWith DOES NOT: a combining mark after the prefix makes the
+# culture StartsWith false and the ordinal one true. So `-<U+0301>x` is a flag to the ordinal scanners
+# and a positional to the culture ones that origin/main ran. Each row below is denied by origin/main
+# and was allowed by the first cut of the ordinal scanners.
+
+#: Each class A shape git reads as a branch switch, and the shipped gate must deny from another
+#: session's seat. ``{b}`` is the free branch.
+_CLASS_A_DOUBLE_DASH_SWITCHES = [
+    # A trailing `--` has no pathspec after it, so git switches (pinned below for switch).
+    "checkout {b} --",
+    "checkout {b} -- 2>&1",
+    "checkout {b} -- # note",
+    # `git switch` takes no pathspec at all: `--` only ends its options.
+    "switch {b} --",
+    "switch -- {b}",
+]
+
+
+@pytest.mark.parametrize("tail", _CLASS_A_DOUBLE_DASH_SWITCHES)
+def test_a_double_dash_does_not_let_a_branch_switch_through_class_A(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """Class A bailed on any `--` after the verb, reading it as a file restore, so `git -C <victim>
+    checkout free-branch --` switched another session's worktree."""
+    cmd = f'git -C "{hijack_repo.victim}" ' + tail.format(b="free-branch")
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+def test_a_double_dash_with_a_pathspec_after_it_is_still_a_restore(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """The bail kept: `checkout <ref> -- <path>` restores files and leaves HEAD where it was."""
+    cmd = f'git -C "{hijack_repo.victim}" checkout free-branch -- f.txt'
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+def test_git_switch_reads_a_double_dash_as_ending_options(tmp_path: Path) -> None:
+    """Why `switch -- <branch>` is on the deny side: git switches, it does not restore."""
+    repo = tmp_path / "SwitchRepo"
+    repo.mkdir()
+    git = _committed_repo(repo)
+    git("branch", "free")
+    git("switch", "-q", "--", "free")
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert head.stdout.strip() == "free"
+
+
+def test_a_repository_token_switch_after_a_double_dash_moves_the_primary_s_head(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Test-VerbMovesHead read `switch -- <branch>` as a restore, so `--git-dir=<primary>/.git`
+    from outside moved the primary's HEAD unrefused."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" switch -- free-branch', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ['-- "{lead}/../../{victim}"', '--force -- "{lead}/../../{victim}"'],
+    ids=["separator", "flag-then-separator"],
+)
+def test_the_token_after_a_double_dash_is_the_victim_whatever_it_starts_with(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str
+) -> None:
+    """Rule 3d's victim scan skipped `-<U+0301>/../../<victim>` as a flag, found no victim, and
+    allowed a removal git performs: after `--` it reads the token as a path."""
+    lead = f"-{COMBINING_ACUTE}"
+    (hijack_repo.mine / lead).mkdir()
+    cmd = "git worktree remove " + spelling.format(lead=lead, victim=hijack_repo.victim.name)
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+def test_git_removes_the_worktree_named_after_a_double_dash(hijack_repo: HijackRepo) -> None:
+    """Why the row above is a real removal, not a refused command."""
+    lead = f"-{COMBINING_ACUTE}"
+    (hijack_repo.mine / lead).mkdir()
+    subprocess.run(
+        ["git", "worktree", "remove", "--", f"{lead}/../../{hijack_repo.victim.name}"],
+        cwd=hijack_repo.mine,
+        check=True,
+        capture_output=True,
+    )
+    assert not hijack_repo.victim.exists()
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        # origin/main's culture scan named this token the victim.
+        '"{cm}/../../{victim}"',
+        # origin/main's culture scan skipped the soft-hyphen token and named the next one.
+        '"{shy}" "{victim_abs}"',
+    ],
+    ids=["combining-mark", "soft-hyphen-then-victim"],
+)
+def test_every_reading_of_the_victim_scan_is_judged(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str
+) -> None:
+    """The ordinal scan and the culture scan pick different victims here. Each is denied by one of
+    them, so the rule judges both."""
+    _require_culture_premise()
+    cm = f"-{COMBINING_ACUTE}"
+    (hijack_repo.mine / cm).mkdir()
+    cmd = "git worktree remove " + spelling.format(
+        cm=cm,
+        shy=f"{SOFT_HYPHEN}-x",
+        victim=hijack_repo.victim.name,
+        victim_abs=hijack_repo.victim,
+    )
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    ("branch", "args"),
+    [
+        # origin/main's culture scan named `-<U+0301>x` the destination.
+        (f"-{COMBINING_ACUTE}x", f"-{COMBINING_ACUTE}x"),
+        # origin/main's culture scan skipped `<U+00AD>-x` and named free-branch.
+        (None, f"{SOFT_HYPHEN}-x free-branch"),
+    ],
+    ids=["combining-mark", "soft-hyphen-then-branch"],
+)
+def test_every_reading_of_the_destination_scan_is_judged(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, branch: str | None, args: str
+) -> None:
+    """Class A's destination scanner, the same two readings as rule 3d's victim scan."""
+    _require_culture_premise()
+    if branch:
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{branch}", "HEAD"],
+            cwd=hijack_repo.primary,
+            check=True,
+            capture_output=True,
+        )
+    cmd = f'git -C "{hijack_repo.victim}" checkout {args}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    "args",
+    [f"-{COMBINING_ACUTE}x", f"--hard #{COMBINING_ACUTE}x"],
+    ids=["flag", "comment"],
+)
+def test_every_reading_of_a_reset_s_arguments_is_judged(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path, args: str
+) -> None:
+    """Test-VerbMovesHead. The ordinal reading took `-<U+0301>x` for a flag and `#<U+0301>x` for a
+    comment, so the reset named no commit and `--git-dir=<primary>/.git` was allowed; origin/main's
+    culture reading named a commit and denied."""
+    _require_culture_premise()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" reset {args}', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+
+
+# --- Test-Governed's nested-worktree exemption: the culture test AND the composed ordinal one -------
+
+
+def test_a_decomposed_spelling_of_the_primary_still_exempts_its_nested_worktrees(
+    tmp_path: Path,
+) -> None:
+    """The culture comparison reads `Re<U+0301>po` as `R<U+00E9>po`, so the governed test matches a
+    decomposed spelling of an allowlisted primary. The ordinal exemption did not, and denied every
+    write into a nested worktree under that spelling: a false deny, the shape that wedges isolated
+    Builders. Composing both sides first restores origin/main's allow."""
+    _require_culture_premise()
+    composed = tmp_path / f"R{E_ACUTE}po"
+    decomposed = tmp_path / f"Re{COMBINING_ACUTE}po"
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{composed}\n", encoding="utf-8")
+    own = decomposed / ".claude" / "worktrees" / "wt-1"
+    assert run_gate(edit(own / "src" / "app.py", cwd=own), repos) is None
+    # The decomposed primary itself stays governed.
+    assert_denied(run_gate(edit(decomposed / "src" / "app.py", cwd=decomposed), repos))
+
+
+def test_a_combining_mark_after_the_worktrees_slash_is_not_exempted(
+    primary: Path, repos_file: Path
+) -> None:
+    """The culture StartsWith misses the exemption prefix before a combining mark, so origin/main
+    denied this write; the ordinal exemption alone allowed it. The exemption needs both."""
+    _require_culture_premise()
+    target = primary / ".claude" / "worktrees" / f"{COMBINING_ACUTE}x" / "app.py"
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
