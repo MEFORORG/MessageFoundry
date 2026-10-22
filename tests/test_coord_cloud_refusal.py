@@ -477,6 +477,7 @@ NOT_GUARDED = {
     "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
+    "hooks/usage-headroom-inject.ps1": "project hook; clone-local cache of what this session saw",
     # A dot-sourced library: it names where state lives and writes only its clone-local down-cache.
     # Every script that calls it carries its own refusal.
     "coord/coord-root.ps1": "resolver library, clone-local down-cache only",

@@ -861,7 +861,10 @@ def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) ->
         "APPDATA": str(appdata),
     }
     payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
-    ctx = context_of(None, env_extra=env, payload=payload)
+    # -DedupDir only, so a re-run of this test cannot meet its own last-printed state in the real
+    # coordination root and get the one-line repeat instead of the block it asserts on.
+    dedup = ["-DedupDir", str(tmp_path / "dedup")]
+    ctx = context_of(None, env_extra=env, payload=payload, extra_args=dedup)
     assert str(usage / "status.json") in ctx, ctx
     assert "44.5%" in ctx and "named by the desktop app's record" in ctx, ctx
 
@@ -913,3 +916,156 @@ def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Pat
     _, _, fresh = run_hook(state, env_extra=DESKTOP, extra_args=args)
     assert fresh is not None and "verdict: OK" in fresh, fresh
     assert FALLBACK_LABEL not in fresh, fresh
+
+
+# --- a repeat gets one short line ------------------------------------------------------------------
+
+REPEAT = "[usage headroom: verdict "
+
+
+def dedup_context(
+    state: Path,
+    dedup: Path | None,
+    session_id: str | None = "dedup-session",
+    agent_id: str | None = None,
+    **kw: Any,
+) -> str:
+    """One firing with the last-printed state kept in ``dedup``; returns the injected text."""
+    doc: dict[str, Any] = {"tool_name": "Task", "tool_input": {}}
+    if session_id is not None:
+        doc["session_id"] = session_id
+    if agent_id is not None:
+        doc["agent_id"] = agent_id
+    extra = ["-DedupDir", str(dedup)] if dedup is not None else []
+    return context_of(state, payload=json.dumps(doc), extra_args=extra + kw.pop("extra", []), **kw)
+
+
+def is_full(ctx: str) -> bool:
+    return ctx.startswith("[usage headroom, read at the spawn point") and "verdict:" in ctx
+
+
+def is_repeat(ctx: str, verdict: str) -> bool:
+    return ctx.startswith(f"{REPEAT}{verdict}, unchanged")
+
+
+def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: Path) -> None:
+    """The second firing is the assertion the always-print hook fails. Its control is the same pair
+    of firings with the repeat check off, which must both print in full, so the assertion can see a
+    repeated block and is not merely failing on a parameter the old hook lacked."""
+    state, dedup = tmp_path / "state", tmp_path / "dedup"
+    collect(state, reading(five=42.0, seven=31.0))
+    for _ in range(2):
+        assert is_full(dedup_context(state, None)), (
+            "control: with no -DedupDir every firing is full"
+        )
+
+    first = dedup_context(state, dedup)
+    assert is_full(first) and "verdict: OK" in first, first
+
+    again = dedup_context(state, dedup)
+    assert is_repeat(again, "OK"), f"an unchanged OK repeated the block: {again}"
+    assert len(again.encode()) < 100, again
+
+    # Still OK, but the 5-hour number moved from the 40s to the 50s, so the block prints again.
+    collect(state, reading(five=55.0, seven=31.0))
+    moved = dedup_context(state, dedup)
+    assert is_full(moved) and "55.0%" in moved, moved
+    assert is_repeat(dedup_context(state, dedup), "OK")
+
+    # A WORSE state is never hidden: OK to WARN prints in full, and so does every WARN after it.
+    collect(state, reading(five=90.0, seven=31.0))
+    for _ in range(2):
+        warn = dedup_context(state, dedup)
+        assert is_full(warn) and "verdict: WARN" in warn, warn
+
+    # Back to an OK this session saw before WARN: the last thing it saw was WARN, so it is a change.
+    collect(state, reading(five=55.0, seven=31.0))
+    assert is_full(dedup_context(state, dedup))
+
+    # Another session, or a subagent inside this one, has seen nothing, so it gets the block.
+    assert is_full(dedup_context(state, dedup, session_id="another-session"))
+    assert is_full(dedup_context(state, dedup, agent_id="a-subagent"))
+    assert is_repeat(dedup_context(state, dedup, agent_id="a-subagent"), "OK")
+
+
+def test_unknown_repeats_short_but_a_high_number_under_it_does_not(tmp_path: Path) -> None:
+    state, dedup = tmp_path / "state", tmp_path / "dedup"
+    collect(state, reading())
+    age_document(state, 60)
+    assert is_full(dedup_context(state, dedup))
+    assert is_repeat(dedup_context(state, dedup), "UNKNOWN")
+
+    # The Steward fallback is ungraded, so a 90% there arrives under an UNKNOWN verdict.
+    env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    never = tmp_path / "never-published"
+    steward = tmp_path / "dedup-steward"
+    low = steward_files(tmp_path, {ORG: steward_entry(five=41.5)})
+    assert "41.5%" in dedup_context(never, steward, env_extra=env, extra=low)
+    assert is_repeat(dedup_context(never, steward, env_extra=env, extra=low), "UNKNOWN"), (
+        "control: a low fallback reading under UNKNOWN does repeat short"
+    )
+    high = steward_files(tmp_path, {ORG: steward_entry(five=90.0)})
+    for _ in range(2):
+        ctx = dedup_context(never, steward, env_extra=env, extra=high)
+        assert is_full(ctx) and "90.0%" in ctx, ctx
+
+
+def test_unreadable_expired_or_missing_state_prints_the_block(tmp_path: Path) -> None:
+    state, dedup = tmp_path / "state", tmp_path / "dedup"
+    collect(state, reading())
+
+    assert is_full(dedup_context(state, dedup))
+    files = list(dedup.glob("*.usage-headroom"))
+    assert len(files) == 1, f"expected one state file, found {files}"
+    assert is_repeat(dedup_context(state, dedup), "OK"), "control: the state file is live"
+
+    # Older than the reprint interval: the session may have compacted the block away since.
+    old = time.time() - 31 * 60
+    os.utime(files[0], (old, old))
+    assert is_full(dedup_context(state, dedup)), "an expired state file hid the block"
+
+    # A directory where the state file should be: it can be neither read nor written.
+    files[0].unlink()
+    files[0].mkdir()
+    for _ in range(2):
+        assert is_full(dedup_context(state, dedup)), "an unreadable state file hid the block"
+
+    for _ in range(2):
+        assert is_full(dedup_context(state, tmp_path / "nosid", session_id=None))
+    assert not (tmp_path / "nosid").exists(), "a payload with no session id must write no state"
+
+
+STUB_READER = (
+    "param([string]$StateDir,[switch]$Json,[int]$MaxAgeMinutes)\n"
+    '\'{"state":"OK","config_root":"stub",'
+    '"five_hour":{"state":"OK","used_percentage":10,"reading_age_min":1},'
+    '"seven_day":{"state":"OK","used_percentage":10,"reading_age_min":1}}\'\n'
+)
+
+
+def test_the_production_state_lands_under_the_common_dir_without_git(tmp_path: Path) -> None:
+    """No -StateDir and no -DedupDir: the hook finds <common dir>/mefor-coord/usage-headroom through
+    _hookinput.ps1. A copy in a fixture checkout keeps the real clone's state out of the test."""
+    repo = tmp_path / "repo"
+    hooks = repo / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    for name in (HOOK.name, "_hookinput.ps1"):
+        shutil.copy(HOOK.parent / name, hooks / name)
+    (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    stub = tmp_path / "reader.ps1"
+    stub.write_text(STUB_READER)
+
+    payload = json.dumps({"tool_name": "Task", "session_id": "prod-path", "tool_input": {}})
+    args = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(hooks / HOOK.name)]
+    args += ["-UsageScript", str(stub)]
+    seen = []
+    for _ in range(2):
+        proc = subprocess.run(
+            args, input=payload, capture_output=True, text=True, timeout=TIMEOUT, env=_env()
+        )
+        assert proc.returncode == 0, proc.stderr
+        seen.append(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
+    assert is_full(seen[0]), seen[0]
+    assert is_repeat(seen[1], "OK"), seen[1]
+    assert len(list((repo / ".git" / "mefor-coord" / "usage-headroom").glob("*"))) == 1
