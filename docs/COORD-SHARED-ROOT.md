@@ -90,16 +90,18 @@ What this changes:
 1. **BUILT. Writers that replace a file by rename need a retry, and readers must treat a sharing
    violation as "retry", never as "missing" or "torn".** `coord-root.ps1` holds the one helper:
    `Move-CoordFileReplace` renames in one step and retries a sharing violation or access denied, and
-   `Read-CoordText` retries a sharing violation. Each tries 8 times, sleeping 25 ms and doubling to a
-   250 ms cap, about 1.1 s in all. A missing file is never retried, and when the tries run out the
-   original error surfaces. The writers on shared kinds use it, at least `seat.ps1`, `lane.ps1`,
-   `handoff.ps1` and `claim.ps1`'s refresh. `seat.ps1` and `lane.ps1` had used `Move-Item -Force`,
-   which deletes before it renames, so a reader could find the record missing. The readers of seat,
+   `Read-CoordText` retries the same errors, and opens sharing read, write and delete so that it
+   never blocks a rename itself. The retry is short and bounded; its numbers live once, in that
+   file. A missing file is never retried, and when the tries run out the original error surfaces.
+   At least these writers on shared kinds use it: `seat.ps1`, `lane.ps1`, `handoff.ps1` and
+   `claim.ps1`'s refresh. `seat.ps1` and `lane.ps1` had used `Move-Item -Force`, which deletes
+   before it renames, so a reader could find the record missing. At least the main readers of seat,
    claim, allocation, lane, handoff and mail records use `Read-CoordText`. The Python twin,
-   `read_text` in `coord_root.py`, serves the claim and ledger gates, which only read. Python's
-   `open()` reports a sharing violation as a bare `PermissionError(13)`, so on Windows the twin
-   retries any `PermissionError`. `tests/test_coord_smb_retry.py` holds each against a second
-   process holding the file with no sharing, with a plain-call control that must fail.
+   `read_text` in `coord_root.py`, serves the claim and ledger gates, which only read.
+   `tests/test_coord_smb_retry.py` holds each against a second process holding the file with no
+   sharing, with a plain-call control that must fail. **Not covered:** `alloc.ps1` still rewrites
+   `alloc/.floor-highwater` in place rather than by rename, `tombstone-retired-backlog-allocator.ps1`
+   reads and writes without the helper, and `mail-claim.ps1` keeps its own claim-by-rename protocol.
 2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
    it again with one process on each PC before step 7, because the two clients' caches are the
    part no single-client test sees.

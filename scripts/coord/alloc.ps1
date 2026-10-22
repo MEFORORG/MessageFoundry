@@ -549,7 +549,7 @@ function Get-Floor {
     $watermark = Join-Path $alloc ".floor-highwater"
     $computed = [int](($seen | Measure-Object -Maximum).Maximum)
     $previous = 0
-    if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
+    if (Test-Path $watermark) { [void][int]::TryParse(([string](Read-CoordText $watermark)).Trim(), [ref]$previous) }
 
     # NAME THE CAUSE, AND DO NOT SEND THE OPERATOR AFTER A REMEDY THAT CANNOT WORK. This used to end
     # "re-fetch them before trusting any number-space reasoning here", which is wrong twice over now:

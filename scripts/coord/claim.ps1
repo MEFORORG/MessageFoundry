@@ -1071,12 +1071,10 @@ try {
             # like one refresh per invocation but is cheap to absorb. Failing is the SAFE direction: the
             # old note survives and the claim stays ours. Losing the lock is not.
             #
-            # The catch is deliberately UNTYPED. PowerShell wraps an exception thrown by a .NET METHOD in
-            # a MethodInvocationException, so `catch [System.IO.IOException]` around this call never
-            # matches -- the failure escapes to $ErrorActionPreference = "Stop", the cleanup below never
-            # runs, and the temp file is orphaned in the claim registry. (Written typed first; the
-            # orphaned-temp assertion is what caught it.) Every failure here has the same right answer
-            # anyway: leave the old note, keep the claim, say so.
+            # The catch is deliberately UNTYPED: a failure of any type that escaped it would reach
+            # $ErrorActionPreference = "Stop", the cleanup below would never run, and the temp file
+            # would be orphaned in the claim registry. Every failure here has the same right answer:
+            # leave the old note, keep the claim, say so.
             #
             # Move-CoordFileReplace (coord-root.ps1) is that same overwrite Move, retried with a bounded
             # backoff on a sharing violation or access denied, which an SMB share also raises.

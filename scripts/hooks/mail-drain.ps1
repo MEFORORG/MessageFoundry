@@ -667,8 +667,7 @@ function Get-CitedStems {
         # `_retired-notes.md` in an ordinary directory is not, and stays a citation like any other.
         $at = $p.IndexOf($excluded, [StringComparison]::OrdinalIgnoreCase)
         if ($at -ge 0 -and $p.IndexOf($sep, $at + 1) -ge 0) { continue }
-        # [string]: an empty file reads as nothing, and Matches() refuses $null.
-        $text = [string](Read-CoordText $p -Encoding ([System.Text.Encoding]::Latin1))
+        $text = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::Latin1)
         foreach ($m in $re.Matches($text)) {
             # Test-MailStem is the authority; the pattern only proposes. See Get-MailStemPattern.
             if (Test-MailStem -Stem $m.Value) { [void]$out.Add($m.Value) }
@@ -1264,7 +1263,7 @@ try {
         }
 
         $m = $null
-        try { $m = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { }
+        try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { }
         # A NULL CHECK IS NOT A SHAPE CHECK. `[1,2,3]` and `"just a string"` are both valid JSON and
         # both non-null, so a bare `-not $m` admitted them: each rendered as a full message frame with
         # blank kind and sent and a body of "(empty body)", got a receipt, moved to seen/, and was

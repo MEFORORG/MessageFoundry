@@ -211,8 +211,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Write') {
             }
             throw
         }
-        $written = [System.IO.File]::ReadAllBytes($dest)
-        if (-not [System.Linq.Enumerable]::SequenceEqual($written, $bytes)) {
+        # Read back through the retrying reader. Latin-1 maps each byte to one char, so comparing the
+        # two strings compares the bytes.
+        $latin1 = [System.Text.Encoding]::Latin1
+        if ([string](Read-CoordText $dest -Encoding $latin1) -cne $latin1.GetString($bytes)) {
             throw "Wrote $dest but its bytes do not match $From."
         }
     } catch {

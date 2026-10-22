@@ -269,8 +269,8 @@ def record_is_here(record: object) -> bool:
     return not recorded or recorded.casefold() == host().casefold()
 
 
-# The SMB read retry, the same numbers as Read-CoordText in coord-root.ps1, whose header says why it
-# exists. Python only reads shared records, so the rename half of that helper has no twin here.
+# The read half of the SMB retry, with the same numbers as Read-CoordText in coord-root.ps1, whose
+# header says why it exists. Python only reads shared records, so the rename half has no twin here.
 RETRY_TRIES = 8
 RETRY_FIRST_SECONDS = 0.025
 RETRY_MAX_SLEEP_SECONDS = 0.25
@@ -278,31 +278,33 @@ RETRY_MAX_SLEEP_SECONDS = 0.25
 _SHARING_WINERRORS = frozenset({32, 33})
 
 
-def sharing_violation(exc: OSError) -> bool:
-    """True for what a Windows sharing or lock violation can look like. Never for a missing file.
+def transient_io_error(exc: OSError) -> bool:
+    """True for a sharing or lock violation, or access denied. Never for a missing file.
 
-    Measured 2026-10-21: ``open()`` goes through the C runtime, which reports a sharing violation as a
-    bare ``PermissionError(13)`` with no ``winerror``. That is indistinguishable from a real access
-    denial, so on Windows both are retried; a real denial costs one bounded wait, then raises as before.
+    The same set Test-CoordTransientIoError retries. Access denied covers a file with a delete
+    pending. It also covers a sharing violation here, because ``open()`` goes through the C runtime,
+    which reports one as a bare ``PermissionError(13)`` with no ``winerror`` (measured 2026-10-21). A
+    real denial therefore costs one bounded wait, then raises as before.
     """
-    winerror = getattr(exc, "winerror", None)
-    if winerror is not None:
-        return winerror in _SHARING_WINERRORS
+    if isinstance(exc, FileNotFoundError | NotADirectoryError):
+        return False
+    if getattr(exc, "winerror", None) in _SHARING_WINERRORS:
+        return True
     return os.name == "nt" and isinstance(exc, PermissionError)
 
 
 def read_text(path: str | os.PathLike[str], encoding: str = "utf-8") -> str:
-    """A file's text, retrying a sharing violation briefly.
+    """A file's text, retrying the transient errors above briefly.
 
-    A missing file raises FileNotFoundError at once. When the tries run out, the last sharing
-    violation propagates, so a caller never reads one as "missing" or "torn" without trying first.
+    A missing file raises FileNotFoundError at once. When the tries run out, the last error
+    propagates, so a caller never reads a held file as "missing" or "torn" without trying first.
     """
     sleep = RETRY_FIRST_SECONDS
     for _ in range(RETRY_TRIES - 1):
         try:
             return Path(path).read_text(encoding=encoding)
         except OSError as exc:
-            if not sharing_violation(exc):
+            if not transient_io_error(exc):
                 raise
         time.sleep(sleep)
         sleep = min(sleep * 2, RETRY_MAX_SLEEP_SECONDS)

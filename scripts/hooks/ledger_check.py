@@ -638,6 +638,8 @@ class Ledger:
             claim = self._read_alloc(kind, number)
         except (OSError, ValueError):
             return allocate
+        if not isinstance(claim, dict):
+            return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]

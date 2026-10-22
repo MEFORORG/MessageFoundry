@@ -37,17 +37,18 @@
       1. NO top-level param() block.
       2. NO assignment to a preference variable.
       3. NO I/O and NO pipeline output at load time.
-      4. NEVER THROWS from a resolver function. Errors come back in the result's Error field. The two
-         file helpers below are the one exception, by design: each stands in for a .NET call that
-         throws, so after its retries it rethrows that call's own exception for the caller's catch.
-
-    SMB SHARING VIOLATIONS. Measured on the share 2026-10-21: replacing a file by rename while another
-    process read it failed 2 of 50 times with "Access to the path is denied.", and 56 of about 2,500
-    reads failed with a sharing violation. Both clear in milliseconds. Move-CoordFileReplace and
-    Read-CoordText retry exactly those, briefly and boundedly; a missing file is never retried. A
-    writer must not use `Move-Item -Force` instead: it is delete-then-rename, so a reader can find the
-    name missing in between.
+      4. NEVER THROWS from a resolver function. Errors come back in the result's Error field. The file
+         helpers at the end (Invoke-CoordIoRetry and the two that use it) are the exception, by
+         design: each stands in for a .NET call that throws, so after its retries it rethrows that
+         call's own exception for the caller's catch.
     Its Python twin is scripts/coord/coord_root.py; tests/test_coord_root.py holds both to one answer.
+
+    SMB SHARING VIOLATIONS. On the share, a rename over a file another process is reading, and a read
+    of a file being replaced, can fail for a few milliseconds (docs/COORD-SHARED-ROOT.md, *What
+    MEFORDEV01 measured*). Move-CoordFileReplace and Read-CoordText retry those, briefly and
+    boundedly; a missing file is never retried. A writer must not use `Move-Item -Force` instead: it
+    is delete-then-rename, so a reader can find the name missing in between. The read twin is
+    read_text in coord_root.py; tests/test_coord_smb_retry.py holds both.
 
 .EXAMPLE
     . (Join-Path $PSScriptRoot 'coord-root.ps1')
@@ -295,25 +296,30 @@ function Get-CoordInnerException {
 }
 
 function Test-CoordTransientIoError {
-    # True for the errors an SMB share raises while another process holds the file: a sharing or lock
-    # violation, and (for a rename only) access denied. A missing file or directory is never transient.
-    param($Exception, [switch]$AllowAccessDenied)
+    # True for the errors a file raises while another process holds it: a sharing or lock violation, or
+    # access denied (a rename onto an open file, or a file with a delete pending). A missing file or
+    # directory is never transient. The Python twin retries the same set.
+    param($Exception)
     $e = Get-CoordInnerException $Exception
     if ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) { return $false }
-    if ($AllowAccessDenied -and $e -is [System.UnauthorizedAccessException]) { return $true }
+    if ($e -is [System.UnauthorizedAccessException]) { return $true }
     return ($e -is [System.IO.IOException] -and $script:CoordSharingHResults -contains $e.HResult)
 }
 
 function Invoke-CoordIoRetry {
     # Runs $Action, retrying the transient errors above with a short bounded backoff. When the tries run
     # out, or the error is not transient, it rethrows the .NET exception itself, so a caller's typed
-    # catch still matches.
-    param([scriptblock]$Action, [switch]$AllowAccessDenied)
+    # catch still matches. The loop is bounded and returns after the throw, because a caller running
+    # under SilentlyContinue with no try of its own suppresses the throw.
+    param([scriptblock]$Action)
     $sleep = $script:CoordRetryFirstMs
-    for ($try = 1; ; $try++) {
+    for ($try = 1; $try -le $script:CoordRetryTries; $try++) {
         try { return (& $Action) } catch {
             $ex = Get-CoordInnerException $_.Exception
-            if ($try -ge $script:CoordRetryTries -or -not (Test-CoordTransientIoError $ex -AllowAccessDenied:$AllowAccessDenied)) { throw $ex }
+            if ($try -ge $script:CoordRetryTries -or -not (Test-CoordTransientIoError $ex)) {
+                throw $ex
+                return
+            }
         }
         Start-Sleep -Milliseconds $sleep
         $sleep = [Math]::Min($sleep * 2, $script:CoordRetryMaxSleepMs)
@@ -321,31 +327,50 @@ function Invoke-CoordIoRetry {
 }
 
 function ConvertTo-CoordFullPath {
-    # .NET resolves a relative path against the process cwd, not against PowerShell's location.
+    # .NET resolves a relative path, and a drive-relative one such as `C:x`, against the process's own
+    # cwd, not against PowerShell's location. PowerShell's own resolver gets both right.
     param([string]$Path)
-    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
-    return (Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
 }
 
 function Move-CoordFileReplace {
     # Renames $Source onto $Destination in one step, retrying a sharing violation or access denied.
     # -NoOverwrite keeps an existing destination and throws IOException, which is never retried.
+    # A read-only destination is replaced, as `Move-Item -Force` replaced it: File.Move refuses one.
     param([string]$Source, [string]$Destination, [switch]$NoOverwrite)
     $src = ConvertTo-CoordFullPath $Source
     $dst = ConvertTo-CoordFullPath $Destination
     $overwrite = -not $NoOverwrite
-    Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
+    try {
+        Invoke-CoordIoRetry -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
+    } catch [System.UnauthorizedAccessException] {
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
+        if (-not $overwrite -or $null -eq $attrs -or -not ($attrs -band [System.IO.FileAttributes]::ReadOnly)) { throw }
+        [System.IO.File]::SetAttributes($dst, $attrs -band -bnot [System.IO.FileAttributes]::ReadOnly)
+        Invoke-CoordIoRetry -Action { [System.IO.File]::Move($src, $dst, $true) }
+    }
 }
 
 function Read-CoordText {
-    # A file's whole text, retrying a sharing violation. A missing file throws FileNotFoundException at
-    # once, so a caller's "missing" path is unchanged. An empty file emits nothing, exactly as
-    # `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as it did before.
-    # -Encoding defaults to UTF-8 with byte-order-mark detection, as ReadAllText does.
+    # A file's whole text, retrying the transient errors above. A missing file throws
+    # FileNotFoundException at once, so a caller's "missing" path is unchanged. An empty file emits
+    # nothing, exactly as `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as before.
+    # It opens sharing read, write AND delete, more than `Get-Content` (read and write): a reader must
+    # never be what blocks a writer's rename. File.ReadAllText shares read only, which would.
+    # With no -Encoding it reads UTF-8 and honours a byte-order mark; an explicit -Encoding is taken
+    # as given, with no detection.
     param([string]$Path, [System.Text.Encoding]$Encoding)
     $full = ConvertTo-CoordFullPath $Path
-    $enc = if ($Encoding) { $Encoding } else { [System.Text.Encoding]::UTF8 }
-    $text = Invoke-CoordIoRetry -Action { [System.IO.File]::ReadAllText($full, $enc) }
+    $text = Invoke-CoordIoRetry -Action {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        try {
+            $reader = if ($Encoding) { [System.IO.StreamReader]::new($stream, $Encoding, $false) }
+                      else { [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true) }
+            try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally { $stream.Dispose() }
+    }
     if ($text.Length -eq 0) { return }
     return $text
 }

@@ -203,6 +203,10 @@ def test_a_refresh_that_cannot_be_written_leaves_the_old_claim_intact(repo: Path
             "the claim file was unlinked -- a peer could take the key in that window"
         )
     assert proc.returncode != 0 or read_claim(repo, "k")["note"] in {"first", "second"}
+    # The hold blocks only the rename, so the run must reach the designed refusal, not die earlier on
+    # the read of the claim it is refreshing.
+    if proc.returncode != 0:
+        assert "Could NOT refresh" in proc.stdout, (proc.stdout, proc.stderr)
     # Whatever happened, the file is still parseable -- that is the property the gate depends on.
     assert read_claim(repo, "k")["key"] == "k"
     # And nothing was orphaned: this directory is the claim registry, not a scratch space.

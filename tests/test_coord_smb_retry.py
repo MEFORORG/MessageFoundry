@@ -3,10 +3,8 @@
 """The SMB sharing-violation retry: ``Move-CoordFileReplace`` and ``Read-CoordText`` in
 ``scripts/coord/coord-root.ps1``, and the read twin ``read_text`` in ``coord_root.py``.
 
-Measured on the share 2026-10-21 (docs/COORD-SHARED-ROOT.md, *What MEFORDEV01 measured*): a rename
-over a file another process was reading failed 2 of 50 times, and 56 of about 2,500 reads failed with
-a sharing violation. A local disk raises the same errors when another process holds the file open with
-no sharing, so each arm here holds the target that way from a second process, and pairs the helper
+The share's failures are in docs/COORD-SHARED-ROOT.md, *What MEFORDEV01 measured*. A local disk raises
+the same errors when another process holds the file open with no sharing, so each timed arm here holds the target that way from a second process, and pairs the helper
 with a control: the plain .NET or Python call, in the same setup, must fail. Without the control a
 pass could mean the hold never landed.
 """
@@ -114,7 +112,7 @@ def _holder(tmp_path: Path, target: Path, sync: Path, hold_ms: int) -> subproces
     )  # fmt: skip
 
 
-def _held(tmp_path: Path, action: str, hold_ms: int = 200) -> dict[str, Any]:
+def _held(tmp_path: Path, action: str, hold_ms: int = 500) -> dict[str, Any]:
     """Run one PowerShell action while a second process holds the target with no sharing."""
     sync = tmp_path / f"sync-{action}"
     sync.mkdir()
@@ -123,17 +121,22 @@ def _held(tmp_path: Path, action: str, hold_ms: int = 200) -> dict[str, Any]:
     source = tmp_path / f"{action}.tmp"
     source.write_text('{"v": "new"}', encoding="utf-8")
     holder = _holder(tmp_path, target, sync, hold_ms)
-    actor = _script(tmp_path, "actor.ps1", ACTOR)
-    proc = subprocess.run(
-        [
-            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(actor),
-            "-Sync", str(sync), "-Action", action, "-Source", str(source), "-Target", str(target),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )  # fmt: skip
-    _, holder_err = holder.communicate(timeout=60)
+    try:
+        actor = _script(tmp_path, "actor.ps1", ACTOR)
+        proc = subprocess.run(
+            [
+                "pwsh", "-NoProfile", "-NonInteractive", "-File", str(actor),
+                "-Sync", str(sync), "-Action", action, "-Source", str(source), "-Target", str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )  # fmt: skip
+        _, holder_err = holder.communicate(timeout=60)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.communicate()
     assert proc.returncode == 0 and holder.returncode == 0, (proc.stderr, holder_err)
     out: dict[str, Any] = json.loads(proc.stdout)
     out["target"] = target.read_text(encoding="utf-8")
@@ -171,11 +174,11 @@ def test_control_a_plain_read_fails_while_held(tmp_path: Path) -> None:
 
 
 def test_a_hold_longer_than_the_retries_surfaces_the_original_error(tmp_path: Path) -> None:
-    out = _held(tmp_path, "read", hold_ms=4000)
+    out = _held(tmp_path, "read", hold_ms=8000)
     assert not out["ok"], out
     assert out["type"] == "System.IO.IOException" and out["hresult"] == SHARING_VIOLATION, out
-    # Bounded: about 1.1 s of sleeps, never the whole hold.
-    assert 900 <= out["ms"] < 3000, out
+    # Bounded: the sleeps alone set the floor, and the hold outlasts the ceiling by a wide margin.
+    assert 900 <= out["ms"] < 6000, out
 
 
 def _ps(body: str) -> dict[str, Any]:
@@ -194,11 +197,12 @@ def _ps(body: str) -> dict[str, Any]:
 def test_a_missing_file_is_not_retried(tmp_path: Path) -> None:
     missing = tmp_path / "gone.json"
     src = tmp_path / "also-gone.tmp"
+    # A first sleep of 5 s makes any retry unmistakable, without a tight bound on a slow runner.
     out = _ps(
         f"""
+$script:CoordRetryFirstMs = 5000
 $r = [ordered]@{{}}
-# Each action twice, keeping the second: the first call pays PowerShell's one-time compile cost.
-foreach ($a in 'read', 'read', 'move', 'move') {{
+foreach ($a in 'read', 'move') {{
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {{
         if ($a -eq 'read') {{ Read-CoordText '{missing}' | Out-Null }}
@@ -213,8 +217,61 @@ $r | ConvertTo-Json -Compress
     )
     for action in ("read", "move"):
         assert out[action]["type"] == "FileNotFound", out
-        # Under the first backoff sleep: no retry ran.
-        assert out[action]["ms"] < 25, out
+        assert out[action]["ms"] < 2500, out
+
+
+def test_a_silenced_caller_never_loops_forever(tmp_path: Path) -> None:
+    """Under SilentlyContinue, with no try, a caller suppresses the rethrow. The loop must still end."""
+    proc = subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+            f". '{PS}'; $ErrorActionPreference = 'SilentlyContinue'; "
+            f"$x = Read-CoordText '{tmp_path / 'gone.json'}'; 'done'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )  # fmt: skip
+    assert proc.stdout.strip().endswith("done"), (proc.stdout, proc.stderr)
+
+
+def test_a_reader_shares_with_a_writer_and_a_rename(tmp_path: Path) -> None:
+    """A file held open for writing reads; a file being read can still be renamed over."""
+    f = tmp_path / "rec.json"
+    f.write_text('{"v": "old"}', encoding="utf-8")
+    tmp = tmp_path / "rec.tmp"
+    tmp.write_text('{"v": "new"}', encoding="utf-8")
+    out = _ps(
+        f"""
+$r = [ordered]@{{}}
+$w = [System.IO.File]::Open('{f}', 'Open', 'ReadWrite', 'ReadWrite')
+try {{ $r.helper = Read-CoordText '{f}' }} catch {{ $r.helper = 'FAILED' }}
+try {{ [void][System.IO.File]::ReadAllText('{f}'); $r.control = 'read' }} catch {{ $r.control = 'FAILED' }}
+$w.Dispose()
+$r | ConvertTo-Json -Compress
+"""
+    )
+    assert out["control"] == "FAILED", (
+        f"the writer's handle did not conflict, so this proves nothing: {out}"
+    )
+    assert json.loads(out["helper"]) == {"v": "old"}, out
+
+
+def test_a_read_only_destination_is_replaced_as_move_item_did(tmp_path: Path) -> None:
+    dst = tmp_path / "rec.json"
+    dst.write_text('{"v": "old"}', encoding="utf-8")
+    src = tmp_path / "rec.tmp"
+    src.write_text('{"v": "new"}', encoding="utf-8")
+    out = _ps(
+        f"""
+[System.IO.File]::SetAttributes('{dst}', 'ReadOnly')
+$r = [ordered]@{{}}
+try {{ Move-CoordFileReplace -Source '{src}' -Destination '{dst}'; $r.ok = $true }} catch {{ $r.ok = "$_" }}
+$r | ConvertTo-Json -Compress
+"""
+    )
+    assert out["ok"] is True, out
+    assert json.loads(dst.read_text(encoding="utf-8")) == {"v": "new"}
 
 
 def test_an_empty_file_reads_as_nothing_like_get_content(tmp_path: Path) -> None:
@@ -239,45 +296,54 @@ def _py_held(tmp_path: Path, hold_ms: int, read: Any) -> tuple[object, float]:
     target = tmp_path / "py.json"
     target.write_text('{"v": "old"}', encoding="utf-8")
     holder = _holder(tmp_path, target, sync, hold_ms)
-    (sync / "ready").write_text("x", encoding="utf-8")
-    deadline = time.monotonic() + 60
-    while not (sync / "held").exists():
-        assert time.monotonic() < deadline, "the holder never took the file"
-        time.sleep(0.002)
-    start = time.monotonic()
     try:
-        result: object = read(target)
-    except OSError as exc:
-        result = exc
-    elapsed = time.monotonic() - start
-    _, holder_err = holder.communicate(timeout=60)
+        (sync / "ready").write_text("x", encoding="utf-8")
+        deadline = time.monotonic() + 60
+        while not (sync / "held").exists():
+            assert time.monotonic() < deadline, "the holder never took the file"
+            time.sleep(0.002)
+        start = time.monotonic()
+        try:
+            result: object = read(target)
+        except OSError as exc:
+            result = exc
+        elapsed = time.monotonic() - start
+        _, holder_err = holder.communicate(timeout=60)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.communicate()
     assert holder.returncode == 0, holder_err
     return result, elapsed
 
 
 def test_twin_read_succeeds_after_the_hold_ends(tmp_path: Path) -> None:
-    result, elapsed = _py_held(tmp_path, 200, coord_root.read_text)
+    result, elapsed = _py_held(tmp_path, 500, coord_root.read_text)
     assert isinstance(result, str) and json.loads(result) == {"v": "old"}, result
     assert elapsed >= 0.1
 
 
 def test_twin_control_a_plain_read_fails_while_held(tmp_path: Path) -> None:
-    result, _ = _py_held(tmp_path, 200, lambda p: Path(p).read_text(encoding="utf-8"))
+    result, _ = _py_held(tmp_path, 500, lambda p: Path(p).read_text(encoding="utf-8"))
     # Python's open() reports the sharing violation through the C runtime: errno 13, no winerror.
-    assert isinstance(result, PermissionError) and coord_root.sharing_violation(result), result
+    assert isinstance(result, PermissionError) and coord_root.transient_io_error(result), result
 
 
 def test_twin_a_hold_longer_than_the_retries_surfaces_the_original_error(tmp_path: Path) -> None:
-    result, elapsed = _py_held(tmp_path, 4000, coord_root.read_text)
+    result, elapsed = _py_held(tmp_path, 8000, coord_root.read_text)
     assert isinstance(result, PermissionError), result
-    assert 0.9 <= elapsed < 3.0, elapsed
+    assert 0.9 <= elapsed < 6.0, elapsed
 
 
-def test_twin_a_missing_file_is_not_retried(tmp_path: Path) -> None:
+def test_twin_a_missing_file_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A first sleep of 5 s makes any retry unmistakable, as in the PowerShell arm.
+    monkeypatch.setattr(coord_root, "RETRY_FIRST_SECONDS", 5.0)
     start = time.monotonic()
     with pytest.raises(FileNotFoundError):
         coord_root.read_text(tmp_path / "gone.json")
-    assert time.monotonic() - start < coord_root.RETRY_FIRST_SECONDS
+    assert time.monotonic() - start < 2.5
 
 
 def test_twin_carries_the_same_retry_numbers() -> None:
