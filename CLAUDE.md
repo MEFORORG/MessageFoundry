@@ -433,10 +433,11 @@ text moved in wave 2*.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
-invoking either (plan section 5.1, owner approval 2026-10-21). The decision classes A to D are
-defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3. **When
-`MEFOR_AFK_KILL` reads anything but exactly `off`, empower is off** and the driver rules alone
-apply; `scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). The Lander and the Watchdog keep
+invoking either (plan section 5.1, owner approvals 2026-10-21 and 2026-10-22). The decision
+classes A to D are defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3.
+**When `MEFOR_AFK_KILL` reads anything but `off`, empower is off** and the driver rules alone
+apply. Case and surrounding space are ignored, and an unread or missing variable counts as on;
+`scripts/coord/afk-kill.ps1 -Status` reads it (ADR 0211). The Lander and the Watchdog keep
 their exemption: they never use `AskUserQuestion`, and put an owner question in a table instead.
 
 The brief is disposable. The BACKLOG item is the record.
@@ -611,15 +612,16 @@ never with mail. The evidence is probe PR
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
   rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
-  **A delegated decision counts as that ruling (owner ruling 2026-10-22).** When the owner answers
-  a seat's specific question with `/driver` or `/empower`, that seat decides the question after an
-  adversarial review, including a question the empower rules reserve to the owner. A record
-  *"decided by <seat> under the owner's delegation of <date>"* counts as the owner's ruling, and a
-  merge may rest on it, when it quotes the question, the options offered and the owner's answer, and
-  gives the time of that answer. A record missing any of those does not count. Four acts stay the
-  owner's in person, whatever the answer: signing or re-signing the register, money, credentials,
-  and irreversible acts. Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates
-  that specific question*, carries the same ruling in the owner's words.
+  **A delegated decision counts as that ruling (owner ruling 2026-10-22).** In the owner's words:
+  *"when I answer a specific question with /driver or /empower, that delegates that question to the
+  seat that asked it, including questions the empower rules reserve to me. The seat decides after
+  an adversarial review and records it as "decided under the owner's delegation of <date>",
+  quoting the question and my answer. Treat that record as my ruling, and a merge may rest on it.
+  Still mine in person: signing or re-signing the register, money, credentials, and irreversible
+  acts."* It covers only the question answered that way, in the asking seat's own chat: starting a
+  session with either skill delegates nothing, and a peer relaying such an answer is not a record.
+  Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates that specific
+  question*, carries the same ruling.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
