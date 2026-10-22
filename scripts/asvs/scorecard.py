@@ -528,7 +528,7 @@ class Findings:
     #: while GONE and AMBIGUOUS are both zero. Keys include at least ``line``, ``sym``, ``ctx``,
     #: ``unparseable``, ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889), and the
     #: absence-claim producers ``view-inert``, ``view-blind`` and ``view-undetermined`` (BACKLOG
-    #: #2210), which are not about an anchor either.
+    #: #2210) and ``unread-path``, which are not about an anchor either.
     #:
     #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
     #: are two records of one event, and the pairing is what the summary divides by. Five call sites
@@ -1629,6 +1629,11 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     such as a fragment's unclosed bracket, left no text unblanked, so that view is judged whole
     (BACKLOG #2275). A view FAIL does not skip the FALSE check, because the pattern is well-formed
     and its hits still mean something.
+
+    A ``mutation_path`` naming a file the corpus would never read, such as PowerShell outside the
+    operator directory, asks no view question and is named ``unread-path``: a reintroduction there is
+    invisible to the FALSE check, and nothing else would say so. Each message names the view the
+    claim was judged against, code-only for Python and comment-blanking for operator PowerShell.
     """
     raw_texts, pattern_texts, viewed = _absence_corpus(root)
     viewed_paths = {p for p in viewed if p is not None}
@@ -1649,15 +1654,36 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             mutation_rel = PurePosixPath(a.mutation_path.replace("\\", "/"))
             # An in-scope operator script is read only through its view, so a claim naming one
             # lands there even before the file exists.
-            lands_in_view = mutation_rel.as_posix() in viewed_paths or _is_operator_powershell(
-                mutation_rel
-            )
+            # Every PowerShell file the corpus views is operator PowerShell, and each one lands.
+            ps_landing = _is_operator_powershell(mutation_rel)
+            lands_in_view = ps_landing or mutation_rel.as_posix() in viewed_paths
+            # A file the corpus never reads gets no view: no view question about it can be answered,
+            # and the FALSE check below never sees that file, so the gap is named rather than silent.
+            # mutation_path names a file. An existing directory is not judged here, and a `..`
+            # segment is unread whatever it lexically starts with.
+            unread = bool(mutation_rel.parts) and not (root / mutation_rel).is_dir()
+            unread = unread and (".." in mutation_rel.parts or not _corpus_reads(mutation_rel))
+            if unread and not raw_inert:
+                findings.advise(
+                    "unread-path",
+                    f"{c.id}: absence claim's reintroduction lands in {a.mutation_path!r}, a file "
+                    f"the absence corpus never reads, so {a.pattern!r} would stay quiet on a "
+                    "reintroduction there. The claim is judged only against the files the corpus "
+                    "reads",
+                )
             view_inert = False
             # The view is chosen by the claim's path, by the corpus's own rule, whether or not that
-            # file exists yet. A shipped root or no path at all is asked of the Python view, since
-            # such a claim covers every root. A TypeScript or JavaScript path is read raw, so it
-            # asks no view question at all.
-            asks_view = not mutation_rel.name.endswith(_SCRIPT_SUFFIXES)
+            # file exists yet. A Python file the corpus reads, or no path at all, is asked of the
+            # Python view, since such a claim covers every root. A TypeScript or JavaScript path is
+            # read raw, and an unread path has no view, so neither asks a view question. So the two
+            # advisories below only ever name the Python view: a PowerShell path either lands in
+            # its view or is unread.
+            asks_view = not unread and not mutation_rel.name.endswith(_SCRIPT_SUFFIXES)
+            view, files = (
+                ("comment-blanking", _POWERSHELL_LABEL)
+                if ps_landing
+                else ("code-only", _CODE_ONLY_LABEL)
+            )
             if not raw_inert and asks_view:
                 mutation_view, cut = _pattern_view(mutation_rel, a.mutation) or _code_only_view(
                     a.mutation
@@ -1692,7 +1718,7 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 where = (
                     ""
                     if raw_inert
-                    else f" once the code-only view {a.mutation_path!r} is read through blanks it"
+                    else f" once the {view} view {a.mutation_path!r} is read through blanks it"
                 )
                 findings.problems.append(
                     f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
@@ -1704,7 +1730,7 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             control_rx = re.compile(a.positive_control)
             seen_raw = any(control_rx.search(t) for t in raw_texts)
             if lands_in_view:
-                same_kind = powershell_views if _is_powershell(mutation_rel) else python_views
+                same_kind = powershell_views if ps_landing else python_views
                 seen_view = any(control_rx.search(t) for t in same_kind)
             else:
                 seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
@@ -1715,8 +1741,7 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 where = (
                     ""
                     if not seen_raw
-                    else f", searched in the code-only view of every {_CODE_ONLY_LABEL} file "
-                    "that tokenizes,"
+                    else f", searched in the {view} view of every {files} file that tokenizes,"
                 )
                 findings.problems.append(
                     f"{c.id}: absence claim is BLIND — its positive control "
@@ -1728,11 +1753,26 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             elif not seen_view:
                 # Raw, the control speaks, and the control corpus is never narrowed. But every
                 # sighting is text the pattern cannot read, so it must not pass as proof silently.
+                # Every raw sighting is in a viewed file, so name the views that hid it.
+                hid_in_powershell = {
+                    _is_powershell(PurePosixPath(seen_as))
+                    for raw_text, seen_as in zip(raw_texts, viewed, strict=True)
+                    if seen_as is not None and control_rx.search(raw_text)
+                }
+                hidden = " or in ".join(
+                    (
+                        f"{_POWERSHELL_LABEL} comments, which the comment-blanking view hides"
+                        if is_ps
+                        else f"{_CODE_ONLY_LABEL} comments or string contents, which the code-only "
+                        "view hides"
+                    )
+                    for is_ps in sorted(hid_in_powershell)
+                )
                 findings.advise(
                     "view-blind",
                     f"{c.id}: absence claim's positive control {a.positive_control!r} is sighted "
-                    f"only in {_CODE_ONLY_LABEL} comments or string contents, which the code-only "
-                    f"view hides from {a.pattern!r}, so the sighting proves nothing about that search",
+                    f"only in {hidden} from {a.pattern!r}, so the sighting proves nothing about "
+                    "that search",
                 )
             hits = _grep_count(a.pattern, pattern_texts)
             if hits:
@@ -1754,53 +1794,66 @@ def _absence_sources(root: Path) -> list[Path]:
     return _python_sources(root) + _operator_powershell_sources(root) + _script_sources(root)
 
 
+#: The roots whose ``*.py`` the corpus reads. messagefoundry_toolkit receives code that moves out of
+#: messagefoundry/ (ADR 0201), so an absence claim must keep reading it there.
+_PYTHON_ROOTS: Final[tuple[str, ...]] = (
+    "messagefoundry",
+    "messagefoundry_webconsole",
+    "messagefoundry_toolkit",
+    "harness",
+    "scripts",
+)
+_PYTHON_SKIP_DIRS: Final[frozenset[str]] = frozenset({".venv", "__pycache__"})
+
+
+def _is_python_source(rel: PurePosixPath) -> bool:
+    """Whether the corpus reads a Python file at ``rel``, whether or not it exists."""
+    return (
+        rel.suffix.lower() == ".py"
+        and bool(rel.parts)
+        and rel.parts[0] in _PYTHON_ROOTS
+        and _PYTHON_SKIP_DIRS.isdisjoint(rel.parts)
+    )
+
+
 def _python_sources(root: Path) -> list[Path]:
     out: list[Path] = []
-    # messagefoundry_toolkit receives code that moves out of messagefoundry/ (ADR 0201), so an
-    # absence claim must keep reading it there.
-    for pkg in (
-        "messagefoundry",
-        "messagefoundry_webconsole",
-        "messagefoundry_toolkit",
-        "harness",
-        "scripts",
-    ):
+    for pkg in _PYTHON_ROOTS:
         base = root / pkg
         if base.is_dir():
+            # Case-insensitive on every platform, as the rule is, so the two agree on Linux too.
             out.extend(
                 p
-                for p in base.rglob("*.py")
-                if ".venv" not in p.parts and "__pycache__" not in p.parts
+                for p in base.rglob("*.py", case_sensitive=False)
+                if _is_python_source(_rel(root, p))
             )
     return out
 
 
+def _rel(root: Path, p: Path) -> PurePosixPath:
+    return PurePosixPath(p.relative_to(root).as_posix())
+
+
 #: The directory of operator-run PowerShell. Owner ruling R3 (2026-10-02) puts the operator-run
 #: scripts in the assessed scope: ``scripts/service/`` and any script the operator documentation
-#: tells a deployer to run. ``docs/ASVS-ASSESSMENT-METHOD.md`` section 2 states that scope. Every
-#: other ``.ps1`` under ``scripts/`` is coordination, worktree, hook or development tooling, which R3
-#: puts out, so it is not read. That is a reading of today's tree and nothing enforces it: an
-#: operator-run ``.ps1`` added outside this directory is unread until it is named here.
+#: tells a deployer to run. Owner ruling R1 (2026-10-05) puts ``measure-store-access.ps1`` in it,
+#: replacing a reading of R3 that left it out, so every script in the directory is read. ``docs/ASVS-ASSESSMENT-METHOD.md`` section 2
+#: states that scope. Every other ``.ps1`` under ``scripts/`` is coordination, worktree, hook or
+#: development tooling, which R3 puts out, so it is not read. That is a reading of today's tree and
+#: nothing enforces it: an operator-run ``.ps1`` added outside this directory is unread until it is
+#: named here. A claim whose ``mutation_path`` names one is named ``unread-path``, not judged silently.
 _OPERATOR_POWERSHELL_DIR: Final[str] = "scripts/service"
+
+#: The operator PowerShell, as a reader sees it named in a finding.
+_POWERSHELL_LABEL: Final[str] = f"{_OPERATOR_POWERSHELL_DIR}/ PowerShell"
 
 #: Matched case-insensitively, as the crypto gate's PowerShell arm matches them.
 _POWERSHELL_SUFFIXES: Final[tuple[str, ...]] = (".ps1", ".psm1")
 
-#: Under :data:`_OPERATOR_POWERSHELL_DIR` but outside the assessed scope. The method document's
-#: section 2 classifies it out, by a reading the owner may overrule: a CI measurement, not a
-#: deployment step. Remove it from this set when that reading falls.
-_OUT_OF_SCOPE_POWERSHELL: Final[frozenset[str]] = frozenset(
-    {"scripts/service/measure-store-access.ps1"}
-)
-
 
 def _is_operator_powershell(rel: PurePosixPath) -> bool:
     """Whether ``rel`` names in-scope operator PowerShell, whether or not the file exists."""
-    return (
-        _is_powershell(rel)
-        and rel.is_relative_to(_OPERATOR_POWERSHELL_DIR)
-        and rel.as_posix() not in _OUT_OF_SCOPE_POWERSHELL
-    )
+    return _is_powershell(rel) and rel.is_relative_to(_OPERATOR_POWERSHELL_DIR)
 
 
 def _operator_powershell_sources(root: Path) -> list[Path]:
@@ -1809,9 +1862,7 @@ def _operator_powershell_sources(root: Path) -> list[Path]:
     if not base.is_dir():
         return []
     return sorted(
-        p
-        for p in base.rglob("*")
-        if p.is_file() and _is_operator_powershell(PurePosixPath(p.relative_to(root).as_posix()))
+        p for p in base.rglob("*") if p.is_file() and _is_operator_powershell(_rel(root, p))
     )
 
 
@@ -1830,6 +1881,22 @@ _SCRIPT_SKIP_DIRS: Final[frozenset[str]] = frozenset(
 #: ship, and the Python corpus never reads ``tests/`` either. Read raw, a test's fixture data
 #: matches patterns written for shipped code, such as a handler named by a two-character string.
 _SCRIPT_TEST_DIRS: Final[frozenset[str]] = frozenset({"ide/src/test"})
+#: ``ide/esbuild.js`` is read on purpose, though ``ide/.vscodeignore`` leaves it out of the
+#: package. Its settings (a banner, a define, an inject) become text in the shipped
+#: ``dist/extension.js``, and ``dist/`` is pruned above, so it is the only place that text is read.
+#: A hit there can over-report; skipping it would go quiet on shipped code.
+
+
+def _is_script_source(rel: PurePosixPath) -> bool:
+    """Whether the corpus reads a TypeScript or JavaScript file at ``rel``, existing or not."""
+    parts = rel.parts
+    return (
+        rel.name.endswith(_SCRIPT_SUFFIXES)
+        and len(parts) > 1
+        and parts[0] in _SCRIPT_ROOTS
+        and _SCRIPT_SKIP_DIRS.isdisjoint(parts[1:-1])
+        and not any(rel.is_relative_to(d) for d in _SCRIPT_TEST_DIRS)
+    )
 
 
 def _script_sources(root: Path) -> list[Path]:
@@ -1852,7 +1919,8 @@ def _script_sources(root: Path) -> list[Path]:
                 if d not in _SCRIPT_SKIP_DIRS
                 and (dirpath / d).relative_to(root).as_posix() not in _SCRIPT_TEST_DIRS
             ]
-            out.extend(dirpath / f for f in filenames if f.endswith(_SCRIPT_SUFFIXES))
+            # Pruning above only saves the walk; the predicate decides.
+            out.extend(dirpath / f for f in filenames if _is_script_source(_rel(root, dirpath / f)))
     return sorted(out)
 
 
@@ -1907,6 +1975,15 @@ def _is_powershell(rel: PurePosixPath) -> bool:
     return rel.suffix.lower() in _POWERSHELL_SUFFIXES
 
 
+def _corpus_reads(rel: PurePosixPath) -> bool:
+    """Whether :func:`_absence_sources` would read a file at ``rel``, whether or not it exists.
+
+    The three predicates each walk filters its files through, so the answer and the walk share one
+    rule set.
+    """
+    return _is_python_source(rel) or _is_operator_powershell(rel) or _is_script_source(rel)
+
+
 def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | None:
     """The view the absence pattern reads ``text`` through at ``rel``, or ``None`` for raw.
 
@@ -1915,7 +1992,7 @@ def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | Non
     """
     if _is_powershell(rel):
         return _powershell_code_only(text), None
-    if rel.suffix.lower() == ".py" and rel.parts and rel.parts[0] in _CODE_ONLY_ROOTS:
+    if _is_python_source(rel) and rel.parts[0] in _CODE_ONLY_ROOTS:
         return _code_only_view(text)
     return None
 
@@ -1972,7 +2049,7 @@ def _absence_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]
     for path in _absence_sources(root):
         text = path.read_text(encoding="utf-8", errors="replace")
         raw.append(text)
-        rel = PurePosixPath(path.relative_to(root).as_posix())
+        rel = _rel(root, path)
         pattern_text, seen_as = text, None
         got = _pattern_view(rel, text)
         if got is not None and got[1] is None:
@@ -3530,7 +3607,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  plus {sum(n for _, n in others)} advisory(ies) that are NOT line drift "
                 f"({named}), counted apart: one anchor can raise three, and neither a scratch-tree "
-                "advisory nor an absence claim's view advisory is about an anchor at all.",
+                "advisory nor an absence claim's view or unread-path advisory is about an anchor at all.",
                 file=sys.stderr,
             )
     for p in findings.problems:
