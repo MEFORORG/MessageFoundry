@@ -59,7 +59,7 @@ function Emit {
 
 function Read-Json([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    try { return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    try { return Read-CoordText $Path | ConvertFrom-Json }
     catch { return 'UNREADABLE' }
 }
 

@@ -254,7 +254,7 @@ function ConvertTo-Stamp($Value) {
 }
 
 function Get-Mine([string]$Path) {
-    $c = Get-Content $Path -Raw | ConvertFrom-Json
+    $c = Read-CoordText $Path | ConvertFrom-Json
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
     $me = ($holder -replace '\\', '/').TrimEnd('/')
     # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
@@ -753,7 +753,7 @@ function Show-List {
         # Rows are now printed after every one is built, so one unreadable file would otherwise hide the
         # whole listing instead of only the rows after it. Say so in its own row and carry on.
         try {
-            $c = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            $c = Read-CoordText $f.FullName | ConvertFrom-Json
             if ($null -eq $c) { throw "the file is empty" }
         }
         catch {
@@ -1077,11 +1077,11 @@ try {
             # runs, and the temp file is orphaned in the claim registry. (Written typed first; the
             # orphaned-temp assertion is what caught it.) Every failure here has the same right answer
             # anyway: leave the old note, keep the claim, say so.
+            #
+            # Move-CoordFileReplace (coord-root.ps1) is that same overwrite Move, retried with a bounded
+            # backoff on a sharing violation or access denied, which an SMB share also raises.
             $moved = $false
-            foreach ($attempt in 1..5) {
-                try { [System.IO.File]::Move($tmp, $file, $true); $moved = $true; break }
-                catch { Start-Sleep -Milliseconds (20 * $attempt) }
-            }
+            try { Move-CoordFileReplace -Source $tmp -Destination $file; $moved = $true } catch { }
             if (-not $moved) {
                 # Never orphan the temp: this directory is the claim registry, and a k.json.<pid>.tmp
                 # nothing ever removes accumulates in it for the life of the repo.

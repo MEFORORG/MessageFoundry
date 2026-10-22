@@ -181,7 +181,7 @@ function Get-ClaimNotes {
         if (-not (Test-Path -LiteralPath $ClaimsDir)) { return $map }
         foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
-                $c = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                $c = Read-CoordText $f.FullName | ConvertFrom-Json
                 if (-not ($c.worktree -and $c.note)) { continue }
                 if (-not (Test-CoordRecordIsHere $c)) { continue }
                 $hrs = $null

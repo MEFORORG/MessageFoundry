@@ -418,7 +418,7 @@ function Get-SeatIndex {
     }
     foreach ($f in @(Get-ChildItem -LiteralPath $script:SeatsDir -Recurse -Filter *.json -EA SilentlyContinue)) {
         # One malformed record must never take the walk down; a record caught mid-write has this shape.
-        try { $r = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+        try { $r = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
         if (-not $r.sessionId) { continue }
         $script:Census.SeatRecords++
         if ($null -eq $script:Census.SeatNewest -or $f.LastWriteTime -gt $script:Census.SeatNewest) {

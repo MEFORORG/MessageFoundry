@@ -1443,7 +1443,7 @@ if ($reportOnly.Count -gt 0) {
     $claimUnreadable = [bool]$claimsError
     if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
-            try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+            try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
             catch { $claimUnreadable = $true; continue }
             $n = ConvertTo-Norm ([string]$c.worktree)
             if ($n) { $claimed[$n] = $true }
@@ -1474,7 +1474,7 @@ $claimsUnreadable = @{}
 $claimsScanned = [bool]($claimsDir -and (Test-Path -LiteralPath $claimsDir))
 if ($claimsScanned) {
     foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
-        try { Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop | Out-Null }
+        try { Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop | Out-Null }
         catch {
             $claimsUnreadable[(ConvertTo-Norm $f.FullName)] = [pscustomobject]@{
                 file = $f.Name; detail = $_.Exception.Message
@@ -1501,7 +1501,7 @@ function Remove-ClaimsHeldBy {
     $released = @()
     foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
         try {
-            $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
         }
         catch {
             # UNREADABLE IS NOT ABSENT. A claim file we cannot parse might name this worktree, so we

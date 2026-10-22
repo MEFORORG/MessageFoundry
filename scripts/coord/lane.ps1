@@ -80,7 +80,7 @@ function Get-ClaimHash([string]$Worktree) {
     $want = $Worktree.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     $keys = @()
     foreach ($f in (Get-ChildItem -LiteralPath $dir -Filter *.json -Recurse -File -ErrorAction SilentlyContinue)) {
-        try { $d = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        try { $d = Read-CoordText $f.FullName | ConvertFrom-Json } catch { continue }
         $w = ''
         if ($d.PSObject.Properties.Name -contains 'worktree' -and $d.worktree) { $w = [string]$d.worktree }
         if (-not $w) { continue }
@@ -107,7 +107,7 @@ New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $rec = $null
 if (Test-Path -LiteralPath $file) {
-    try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
+    try { $rec = Read-CoordText $file | ConvertFrom-Json } catch { $rec = $null }
 }
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
 # path has its own file and this one can never be it. A record under the old path-only key is not
@@ -180,7 +180,9 @@ $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
 $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json')
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline
-Move-Item -LiteralPath $tmp -Destination $file -Force
+# One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
+# which deletes first, so the lane hook could read the level as missing.
+Move-CoordFileReplace -Source $tmp -Destination $file
 
 if ($Asked) {
     Write-Host "lane: recorded that a dispatcher asked. No number written."

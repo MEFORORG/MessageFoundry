@@ -36,7 +36,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 #: THE ONE DEFINITION OF AN INDEX ROW (BACKLOG #2003). index_rows is the one enumeration built on
@@ -376,6 +376,14 @@ class Ledger:
         self._resolve_alloc()
         return self._alloc_error
 
+    def _read_alloc(self, alloc: Path, kind: str, number: str) -> Any:
+        """One allocation record, parsed. A sharing violation on an SMB share is retried first, so it
+        is never read as "no record"; OSError and ValueError still propagate to the caller."""
+        path = alloc / kind / f"{number}.json"
+        coord = self._coord
+        text = coord.read_text(path) if coord is not None else path.read_text(encoding="utf-8")
+        return json.loads(text)
+
     # -- tree access ---------------------------------------------------------------------------------
     #
     # CI uses a TWO-dot diff (`base HEAD`), deliberately, not three-dot (`base...HEAD`).
@@ -572,7 +580,7 @@ class Ledger:
         if self.alloc is None:
             return False
         try:
-            claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
+            claim = self._read_alloc(self.alloc, kind, number)
         except (OSError, ValueError):
             return False
         # ANOTHER MACHINE'S NUMBER IS NEVER THIS TREE'S, on either key. Its path names that PC's disk,
@@ -627,7 +635,7 @@ class Ledger:
         if self.alloc is None:
             return allocate
         try:
-            claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
+            claim = self._read_alloc(self.alloc, kind, number)
         except (OSError, ValueError):
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))

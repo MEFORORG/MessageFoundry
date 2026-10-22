@@ -357,7 +357,7 @@ function Get-PoolEpoch {
     $f = Join-Path $SeatsDir '.pool-epoch'
     if (-not (Test-Path -LiteralPath $f)) { return 1 }
     try {
-        $v = (Get-Content -LiteralPath $f -Raw -EA Stop).Trim()
+        $v = (Read-CoordText $f).Trim()
         if ($v -match '\A[0-9]+\z') { return [int]$v }
     } catch { }
     return 1
@@ -475,7 +475,7 @@ function Get-ClaimsFor {
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue)) {
         try {
-            $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
         } catch { continue }
         $holder = $null
         foreach ($n in @('worktree', 'holderWorktree', 'cwd')) {
@@ -508,7 +508,7 @@ function Get-AllocationsFor {
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($kindDir in @(Get-ChildItem -LiteralPath $dir -Directory -EA SilentlyContinue)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $kindDir.FullName -Filter *.json -EA SilentlyContinue)) {
-            try { $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
             $aw = $null
             foreach ($n in @('worktree', 'allocWorktree', 'cwd')) {
                 if ($j.PSObject.Properties.Name -contains $n) { $aw = [string]$j.$n; break }
@@ -667,7 +667,9 @@ function Write-RecordAtomic {
     $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + '.tmp')
     $json = $Object | ConvertTo-Json -Depth 8
     Set-Content -LiteralPath $tmp -Value $json -Encoding utf8 -EA Stop
-    Move-Item -LiteralPath $tmp -Destination $Path -Force -EA Stop
+    # One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
+    # which deletes first, so a reader could find the record missing.
+    Move-CoordFileReplace -Source $tmp -Destination $Path
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -742,7 +744,7 @@ function Invoke-ClearHandoff {
         return (Refuse "no record at $recPath.")
     }
     try {
-        $rec = Get-Content -LiteralPath $recPath -Raw -EA Stop | ConvertFrom-Json -DateKind String -EA Stop
+        $rec = Read-CoordText $recPath | ConvertFrom-Json -DateKind String -EA Stop
     } catch {
         return (Refuse "record at $recPath is unreadable: $($_.Exception.Message)")
     }
@@ -939,7 +941,7 @@ try {
     foreach ($p in @($recPath, $legacyPath)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }
         try {
-            $one = Get-Content -LiteralPath $p -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            $one = Read-CoordText $p | ConvertFrom-Json -EA Stop
             if ($p -ne $recPath -and -not (Test-CoordRecordIsHere $one)) { continue }
             # By what the RECORD says, never by file time: a copy or a host stamp moves the file time.
             # ConvertFrom-Json may hand asOf back as a [datetime]; compare instants, not culture text.

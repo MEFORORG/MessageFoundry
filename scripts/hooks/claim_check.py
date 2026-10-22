@@ -416,7 +416,7 @@ def _holder(claims: Path, item: str) -> dict[str, object] | None:
     payload (a bare list/string) is treated the same way -- it cannot name a holder, so it grants nothing."""
     f = claims / f"{item}.json"
     try:
-        loaded = json.loads(f.read_text(encoding="utf-8"))
+        loaded = json.loads(_coord_root().read_text(f))
     except (OSError, ValueError):
         return None
     return loaded if isinstance(loaded, dict) else None

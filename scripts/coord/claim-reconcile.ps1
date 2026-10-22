@@ -493,7 +493,7 @@ function Get-PresentHolderVerdict {
 function Test-StillReleasable([object]$Row) {
     $file = $Row.claimFile
     if (-not (Test-Path -LiteralPath $file)) { return "the claim file is gone" }
-    try { $c = Get-Content -LiteralPath $file -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+    try { $c = Read-CoordText $file | ConvertFrom-Json -EA Stop }
     catch { return "the claim file no longer parses" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
     if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
@@ -512,7 +512,7 @@ $script:prByKey = @{}
 foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
     $verdict = "UNKNOWN"; $why = ""; $key = $f.BaseName; $holder = ""; $branch = ""
 
-    try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+    try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
     catch {
         # An unreadable claim belongs to the registry, not to any worktree. It is reported and never
         # released: we could not read whose it is, and claim_check.py reads a malformed claim as

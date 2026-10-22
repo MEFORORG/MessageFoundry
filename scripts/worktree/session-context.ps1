@@ -197,7 +197,7 @@ if ($root) {
             $lines += ""
             $lines += "Active work claims ($($claimFiles.Count)) -- do NOT start one held by another session:"
             foreach ($cf in $claimFiles) {
-                try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { continue }
+                try { $c = Read-CoordText $cf.FullName | ConvertFrom-Json } catch { continue }
                 $heldNorm = ($c.worktree -replace '\\', '/').TrimEnd('/')
                 # A claim from another machine names that machine's path, so it is never THIS session.
                 $here = Test-CoordRecordIsHere $c

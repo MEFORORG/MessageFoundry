@@ -202,7 +202,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Write') {
     $tmp = Join-Path $handoffs ".$Write.$PID.tmp"
     try {
         [System.IO.File]::WriteAllBytes($tmp, $bytes)
-        try { [System.IO.File]::Move($tmp, $dest, $Replace.IsPresent) }
+        # Retried on an SMB sharing violation (coord-root.ps1); an existing name without -Replace is not.
+        try { Move-CoordFileReplace -Source $tmp -Destination $dest -NoOverwrite:(-not $Replace) }
         catch [System.IO.IOException] {
             if (-not $Replace -and (Test-Path -LiteralPath $dest)) {
                 Write-Output "REFUSED: $dest appeared while writing. If it is yours, re-run with -Replace. If not, pick a name with a -<slug> suffix."
@@ -310,7 +311,7 @@ foreach ($e in $entries) {
 $pointed = @{}
 if (Test-Path -LiteralPath $seatsDir) {
     foreach ($f in @(Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter *.json -File -EA SilentlyContinue)) {
-        try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+        try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
         catch { continue }
         if ($rec.handoff -and $rec.handoff.path) { $pointed[(Split-Path ([string]$rec.handoff.path) -Leaf)] = $true }
     }

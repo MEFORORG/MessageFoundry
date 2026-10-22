@@ -140,6 +140,10 @@ if (Test-Path -LiteralPath $rootsLib) { . $rootsLib }
 # Same contract: definitions only. seats/ and alloc/ are SHARED kinds and come from it.
 $coordRootLib = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\coord-root.ps1'
 if (Test-Path -LiteralPath $coordRootLib) { . $coordRootLib }
+# codex-seats/ is read even with no resolver, so the record reader needs a plain stand-in there.
+if (-not (Get-Command Read-CoordText -ErrorAction SilentlyContinue)) {
+    function Read-CoordText([string]$Path) { Get-Content -LiteralPath $Path -Raw -ErrorAction Stop }
+}
 
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -191,7 +195,7 @@ try {
         $cands = Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter '*.json' -File -EA SilentlyContinue |
                  Sort-Object LastWriteTimeUtc -Descending
         foreach ($f in $cands) {
-            try { $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
             $wt = [string]$j.worktree
             if (-not $wt) { continue }
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
@@ -271,7 +275,7 @@ try {
     if ($sharedError) { $lines += ''; $lines += "LEDGER NUMBERS: not checked, the shared root did not answer." }
     if ($allocDir -and (Test-Path -LiteralPath $allocDir)) {
         foreach ($f in (Get-ChildItem -LiteralPath $allocDir -Recurse -Filter '*.json' -File -EA SilentlyContinue)) {
-            try { $a = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+            try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
             $aw = [string]$a.worktree
             if (-not $aw) { continue }
             # Another machine's allocation names a path on that machine's disk, so the same path here

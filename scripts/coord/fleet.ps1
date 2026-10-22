@@ -124,7 +124,7 @@ if (Test-Path -LiteralPath $seatsDir) {
                      Where-Object { $_.Name -notlike '.*' })) {
         foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -EA SilentlyContinue)) {
             try {
-                $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
+                $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
                 $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
             } catch {
                 # A record being written RIGHT NOW has exactly this shape. Counted, never dropped:

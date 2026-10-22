@@ -634,7 +634,7 @@ function Read-RecordFile([System.IO.FileSystemInfo]$File) {
     $c = $null
     $problem = ''
     $tombstone = $false
-    try { $c = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    try { $c = Read-CoordText $File.FullName | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { $problem = 'does not parse' }
     if (-not $problem) {
         if ($c -isnot [System.Management.Automation.PSCustomObject]) { $problem = 'is not one JSON object' }
