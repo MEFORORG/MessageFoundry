@@ -10,6 +10,11 @@ WHAT MUST HOLD IS EQUIVALENCE, NOT A NEW POLICY. Each guard keeps its own tests,
 guard file standalone. This module asserts the other half: that the dispatcher's decision on a
 payload is exactly what the guards decide standalone, taken in the settings file's order with the
 first deny winning, and that one guard's scope, failure or absence cannot change another's verdict.
+
+TWO DIFFERENCES ARE DELIBERATE. The dispatcher reads the payload as UTF-8 bytes, where a guard
+run on its own decodes it with the console code page, and it writes its decision with every
+non-ASCII character escaped. On an ASCII payload, or a UTF-8 console, neither changes a verdict;
+the encoding test at the end of this module is where they do.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import atexit
 import ctypes
 import functools
 import json
+import locale
 import os
 import re
 import shutil
@@ -117,6 +123,27 @@ def _dispatch_argv(guards: Sequence[Path | str]) -> list[str]:
 
 def _dispatch(guards: list[Path], raw: str, *, burst: bool = False) -> str:
     return _run(_dispatch_argv(guards), raw, burst=burst)
+
+
+def _console_output_encoding() -> str:
+    """The encoding a pwsh child of this process writes its stdout in: the console's output page,
+    or UTF-8 when there is no console, which is .NET's fallback."""
+    if sys.platform != "win32":
+        return "utf-8"
+    page = int(ctypes.WinDLL("kernel32").GetConsoleOutputCP())
+    return "utf-8" if page in (0, 65001) else f"cp{page}"
+
+
+def _as_dispatched(standalone: str) -> str:
+    """A guard's standalone stdout as the dispatcher writes it: the same text, every non-ASCII
+    UTF-16 unit written as \\uXXXX. The text came in through two decodings, so it is first put back:
+    pwsh wrote it in the console's output page, and text-mode capture read it in the locale's."""
+    text = standalone.encode(locale.getpreferredencoding(False)).decode(_console_output_encoding())
+    units = text.encode("utf-16-le")
+    return "".join(
+        chr(u) if u < 0x80 else f"\\u{u:04x}"
+        for u in (int.from_bytes(units[i : i + 2], "little") for i in range(0, len(units), 2))
+    )
 
 
 def _decision(stdout: str) -> dict[str, Any] | None:
@@ -220,7 +247,7 @@ def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> N
                         (out for g in guards if (out := standalone[(raw, g)].result()).strip()), ""
                     )
                     got = dispatched[raw].result()
-                    if got != expected:
+                    if got != _as_dispatched(expected):
                         mismatches.append((raw[:120], expected[:200], got[:200]))
     assert not mismatches, mismatches
 
@@ -1034,34 +1061,40 @@ def test_the_gate_gets_a_large_payload_whole_and_a_failed_feed_blocks(tmp_path: 
 # ================================================================== the payload's encoding
 
 
-#: Denies only when the command arrives whole: U+00E9 as one character, and U+200B followed by the
-#: backslash a cp932 lead byte would swallow. A mangled or unparseable payload is no deny.
+#: The command the encoding test sends: U+200B before the `\` a cp932 lead byte would swallow,
+#: U+00E9, which cp437 reads as two characters, and U+30BD, which cp932 writes as 83 5C.
+_ENCODED_COMMAND = "ls Other" + chr(0x200B) + "\\x" + chr(0xE9) + chr(0x30BD)
+
+#: Denies only when the command arrives whole, and echoes it in the reason, so the deny carries
+#: non-ASCII text out. A mangled or unparseable payload is no deny.
 _ENCODING_PROBE = (
     "$c = ([Console]::In.ReadToEnd() | ConvertFrom-Json).tool_input.command\n"
-    "$want = 'ls Other' + [char]0x200B + '\\x' + [char]0xE9\n"
-    "if ($c -ceq $want) { " + _DENY % "whole" + " }"
+    "$want = 'ls Other' + [char]0x200B + '\\x' + [char]0xE9 + [char]0x30BD\n"
+    "if ($c -ceq $want) { [Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+    "permissionDecision='deny';permissionDecisionReason=('whole ' + $c)}} | ConvertTo-Json -Compress)) }"
 )
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="console code pages are a Windows concept")
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("codepage", [437, 932])
-def test_every_guard_gets_the_payload_as_utf8_whatever_the_console_code_page(
+def test_the_payload_and_the_decision_are_utf8_whatever_the_console_code_page(
     tmp_path: Path, codepage: int
 ) -> None:
-    """Claude Code writes UTF-8. Read through [Console]::In, this file decoded it with the console
-    code page and handed every guard the result: under cp437 U+00E9 arrived as two characters, and
-    under cp932 the backslash after U+200B was swallowed and the payload stopped parsing.
+    """Claude Code writes UTF-8 and reads the decision as UTF-8. Read through [Console]::In, this
+    file decoded the payload with the console code page and handed every guard the result: under
+    cp437 U+00E9 arrived as two characters, and under cp932 the backslash after U+200B was
+    swallowed and the payload stopped parsing. Written in the console's page, a decision echoing
+    U+30BD under cp932 carried a stray `\\` and no longer parsed. So the decision is read back here
+    as Claude Code reads it, as UTF-8.
 
     The dispatcher runs in a console of its own, so chcp reaches nothing pytest shares;
     tests/test_coord_alloc_floor.py has the incident. A bare chcp reports the page first, so a host
-    that cannot take it skips rather than passing for the wrong reason. The cp437 case discriminates
-    only from a console whose page is not already UTF-8, which chcp guarantees here."""
+    that cannot take it skips rather than passing for the wrong reason."""
     if sys.platform != "win32":  # the skipif above already skips; this line tells mypy
         pytest.skip("Windows only")
     probe = _guard(tmp_path, "encoding.ps1", _ENCODING_PROBE)
-    command = "ls Other" + chr(0x200B) + "\\x" + chr(0xE9)
-    raw = json.dumps(bash(command), ensure_ascii=False).encode("utf-8")
+    raw = json.dumps(bash(_ENCODED_COMMAND), ensure_ascii=False).encode("utf-8")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     with single_spawn():
@@ -1087,11 +1120,15 @@ def test_every_guard_gets_the_payload_as_utf8_whatever_the_console_code_page(
                 else f"putting it back FAILED, {ctypes.get_last_error()}"
             )
         )
-    out = proc.stdout.decode(f"cp{codepage}", errors="replace")
-    page, _, decision = out.partition("\n")
+    page, _, decision = proc.stdout.partition(b"\n")
     # A word match, not a suffix: a localized chcp may end its line with a period.
-    if not re.search(rf"\b{codepage}\b", page):
-        pytest.skip(f"this host's console did not take cp{codepage}: {out!r}")
+    if not re.search(rf"\b{codepage}\b".encode(), page):
+        pytest.skip(f"this host's console did not take cp{codepage}: {proc.stdout!r}")
     err = proc.stderr.decode(f"cp{codepage}", errors="replace")
     assert proc.returncode == 0, f"the probe failed, so the payload did not parse: {err}"
-    assert assert_denied(_decision(decision)) == "whole", f"the probe saw a mangled payload: {err}"
+    assert decision.strip(), f"the probe saw a mangled payload and allowed: {err}"
+    try:
+        parsed = json.loads(decision.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"the decision does not parse as UTF-8 JSON: {decision!r}") from exc
+    assert assert_denied(parsed) == "whole " + _ENCODED_COMMAND

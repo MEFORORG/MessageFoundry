@@ -25,6 +25,10 @@
     the next `\`, so a valid payload stops parsing. Every guard sees this file's decoding, so the
     defect reached all of them. This file reads stdin to the end, so a guard that reads the
     process's own stdin handle finds it at end of file and must take [Console]::In instead.
+    THE DECISION GOES OUT AS ASCII for the same reason: written in the console's output page, a
+    deny echoing U+30BD under cp932 carried the bytes 83 5C, a stray `\` in a JSON string, and a
+    deny that does not parse decides nothing. Every non-ASCII character is written as \uXXXX.
+    A guard run on its own, outside this file, still reads and writes in the console's page.
 
     ***SCOPE IS ISOLATED; THE PROCESS IS NOT.*** At least these are shared by every guard in the
     run, and none of the guards wired today touches them: the current location, environment
@@ -108,6 +112,13 @@ try {
         [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
 } catch {
     exit 0
+}
+
+function ConvertTo-ShellGuardAscii([string]$Json) {
+    # A decision this file writes is JSON that parsed, so any non-ASCII character in it sits inside
+    # a string, where \uXXXX names the same character. Escaped, the bytes are the same in every code
+    # page, so the console's output page cannot break a deny the way it once broke the input.
+    [regex]::Replace($Json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 }
 
 function Write-ShellGuardFailure([string]$Path, [string]$Why) {
@@ -253,7 +264,7 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         continue
     }
     if ($ShellGuardVerdict -ceq 'deny') {
-        $ShellGuardStdout.Write($ShellGuardOutput)
+        $ShellGuardStdout.Write((ConvertTo-ShellGuardAscii $ShellGuardOutput))
         $ShellGuardStdout.Flush()
         exit 0
     }
@@ -284,7 +295,7 @@ if ($ShellGuardContexts.Count) {
     }
 }
 if ($null -ne $ShellGuardKept) {
-    $ShellGuardStdout.Write($ShellGuardKept)
+    $ShellGuardStdout.Write((ConvertTo-ShellGuardAscii $ShellGuardKept))
     $ShellGuardStdout.Flush()
     exit 0
 }
