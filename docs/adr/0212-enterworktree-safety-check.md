@@ -37,17 +37,18 @@ SAFE requires all of these:
 | a | The path canonicalises: full path, every junction and symlink along it resolved to its final target, every segment on disk under the name given. An 8.3 short name is refused, not expanded. A `\\?\`, `\\.\` or UNC path is refused. |
 | b | It is a linked worktree, never a primary, listed by `git worktree list --porcelain -z` of a fleet repository (`D:/Code/MessageFoundry`, `D:/Code/MessageFoundry-vault`, `D:/Code/korus`), compared canonical to canonical. |
 | c | It is under this session's own scratchpad, by segments: `<temp>\claude\<one segment>\<session id>\scratchpad\<more>`, the session id a uuid matched exactly at that position. `.claude/worktrees/` is never allowed: another session's subagent trees live there, and the session registry cannot see them. |
-| d | The session's cwd is not in the primary checkout of a fleet repository. Relocating from a primary re-files the transcript, which is why `worktree_gate.ps1` rule 4 exists, so that case keeps its prompt. |
-| e | The worktree is not locked, and its git dir shows no rebase, merge, cherry-pick, revert or bisect in progress. |
-| f | Its HEAD's `.claude` and `.mcp.json` have the same object ids as `origin/main`'s, an absent path absent on both sides. Its working tree holds no modified, untracked or ignored file under either path, except the seat marker and the role card copy this repository's own hooks write. |
+| d | The session neither is nor was launched in the primary checkout of a fleet repository. Relocating from a primary re-files the transcript, which is why `worktree_gate.ps1` rule 4 exists, so that case keeps its prompt. A `cd` moves the hook input's `cwd`, so two reads: the `cwd`, and the project directory of `transcript_path`, which the harness names after the launch directory. A slug maps a separator and a `-` alike, so only an exact match with a primary's slug counts; a launch in a primary's subdirectory is caught only while the session's cwd stays in that primary. |
+| e | The worktree is not locked. Its `.git` file names its own admin dir under the repository's `worktrees/`, and that dir names it back, so a repointed `.git` cannot choose the state e and f read. That dir shows no rebase, merge, cherry-pick, revert, sequencer or bisect in progress. |
+| f | Its HEAD's `.claude`, `.mcp.json`, `scripts/hooks` and `scripts/coord` have the same object ids as `origin/main`'s, an absent path absent on both sides; the tracked settings run hook code from the last two. In its working tree no index entry under them is flagged assume-unchanged or skip-worktree (`git status` reports neither as modified), nothing under them is modified or untracked, and nothing under `.claude` or `.mcp.json` is ignored either, the seat marker and role card copy included: `role-card-inject.ps1` picks the injected card from them. |
 | g | `scripts/coord/afk-kill.ps1 -Status` prints `OFF`. Any other output, an error or a timeout fails. |
 | h | No file exists at `<engine git common dir>/mefor-coord/enter-check/OFF`. |
 
 ### 2. A PreToolUse hook, `scripts/hooks/enter-worktree-check.ps1`
 
 Wired in `.claude/settings.json` under matcher `EnterWorktree`, as an added entry. It reads the
-hook input as UTF-8 bytes through `_hookinput.ps1`. With no `path` (a new worktree by `name`) or
-no `cwd`, it says nothing. Otherwise it runs the check. On SAFE it returns
+hook input as UTF-8 bytes through `_hookinput.ps1`. With a `tool_name` other than
+`EnterWorktree`, no `path` (a new worktree by `name`) or no `cwd`, it says nothing. Otherwise it
+runs the check, passing `session_id`, `cwd` and `transcript_path`. On SAFE it returns
 `permissionDecision: allow`. On anything else it returns no decision, so the owner's prompt shows
 as before, with `additionalContext` saying why the call was not auto-allowed. **It never returns
 `deny`**, and any fault returns no decision.
@@ -76,9 +77,15 @@ Every disable leaves the prompt in place, which is the state before this ADR.
   reads OFF. While it reads ON, which is also what an unset or unreadable variable reads, every
   EnterWorktree still prompts.
 - The check costs about two seconds per EnterWorktree call, most of it the kill-switch read.
-- Check f's working-tree half is stricter than the brief, which named only the HEAD tree. A
-  `.claude/settings.local.json` left in the working tree would carry its own permissions and is
-  invisible to a tree comparison.
+- Checks d, e and f are stricter than the brief, after review. The brief's d read only the
+  current `cwd`; e did not verify the admin dir; f compared only the HEAD tree of `.claude` and
+  `.mcp.json`. A working-tree `.claude/settings.local.json`, an edit hidden by skip-worktree, or a
+  branch that rewrites a hook script would each have passed.
+- A worktree a session edits hook code in, or declares its seat in, prompts on its next entry.
+- The fleet repositories are fixed paths, as the brief set them, so on a clone anywhere else check
+  b never passes and the feature is inert there, which costs a prompt and nothing else.
+- The temp root is read as Node's `os.tmpdir()` reads it (TEMP before TMP on Windows), not as
+  .NET's GetTempPath does. A TEMP spelled with an 8.3 short name fails check c.
 
 ## Rejected
 
@@ -89,3 +96,7 @@ Every disable leaves the prompt in place, which is the state before this ADR.
 - **A fail-open check**, in the pattern of `ErrorAction SilentlyContinue` with a default of allow.
   A check that could not run must cost a prompt, never grant one.
 - **Returning `deny` on UNSAFE.** That would block an entry the owner might approve.
+- **Exempting the seat marker and role card copy from f.** `role-card-inject.ps1` reads them to
+  choose the seat card it injects, so a planted one changes the session's instructions.
+- **Telling the session how to turn the kill switch off** in the UNSAFE reason. Only the owner sets
+  it, and the reason reaches the model.
