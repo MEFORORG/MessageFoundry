@@ -298,13 +298,18 @@ try {
             $logged = "Not recorded: $($_.Exception.Message)"
         }
     }
+    # CLAUDE.md section 5 gives a session two of these acts as its own, so name them only on a hit
+    # that could be one of them; any other hit keeps the plain Class C advice.
+    $narrow = ''
+    if ($hits -contains 'git push --force' -or $hits -contains 'remove.ps1 -Force') {
+        $narrow = 'Two narrow cases are yours, only while the kill switch reads off and every condition holds: ' +
+            'a force-push of your own unshared branch (CLAUDE.md section 5), and a cache-only remove.ps1 ' +
+            '-Force on your own worktree (docs\WORKTREES.md, "Remove one"). This record stands either way. '
+    }
     $context = "AFK TRIPWIRE (ADR 0211; docs/AUTONOMY-PLAN.md section 4.4): this command carries $what. " +
         'Under the AFK-autonomy plan that makes it a Class C act. This hook does not block it, but do not ' +
         'run it on your own judgment: stop, and bring it to the owner in the Class C bundle, unless the ' +
-        'owner asked for exactly this in your own chat. Two narrow cases are yours, and only while every ' +
-        'condition holds: a force-push of your own unshared branch (CLAUDE.md section 5), and a ' +
-        'cache-only remove.ps1 -Force on your own worktree (docs\WORKTREES.md, "Remove one"). ' +
-        "This record stands either way. $logged"
+        "owner asked for exactly this in your own chat. $narrow$logged"
     $payload = [pscustomobject]@{
         hookSpecificOutput = [pscustomobject]@{ hookEventName = 'PreToolUse'; additionalContext = $context }
     }

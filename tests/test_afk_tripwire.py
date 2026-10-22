@@ -162,6 +162,26 @@ def test_ordinary_commands_and_mentions_do_not_trip(sb: Sandbox, command: str) -
     assert _run(sb, command) is None
 
 
+@pytest.mark.parametrize(
+    ("command", "named"),
+    [
+        ("git push --force origin b", True),
+        ("pwsh -NoProfile -File scripts/worktree/remove.ps1 -Path x -Force", True),
+        ("git commit --no-verify -m x", False),
+        ("git reset --hard", False),
+    ],
+)
+def test_the_two_narrow_cases_are_named_only_on_a_hit_that_could_be_one(
+    sb: Sandbox, command: str, named: bool
+) -> None:
+    """CLAUDE.md section 5 makes these two acts a session's own; any other hit stays plain Class C."""
+    context = _run(sb, command)
+    assert context is not None, f"{command!r} did not trip"
+    assert ("Two narrow cases are yours" in context) is named, context
+    if named:
+        assert "kill switch reads off" in context, context
+
+
 def test_powershell_tool_commands_trip_too(sb: Sandbox) -> None:
     assert _run(sb, "git reset --hard", tool="PowerShell") is not None
 

@@ -252,6 +252,16 @@ def test_the_removal_is_no_longer_handed_to_the_user_where_a_route_exists(
         assert "Otherwise -Force is the user's switch" in folded, reason
 
 
+@pytest.mark.parametrize("family", [f for f in _FAMILIES if f != "managed"])
+def test_the_own_tree_text_names_the_cache_only_exception(
+    repo: SimpleNamespace, family: str
+) -> None:
+    """The text a session standing IN the tree reads carries the same bounded exception."""
+    folded = " ".join(_deny(repo, family, "victim").split())
+    assert "If it refuses, that is final for a session, save the cache-only case" in folded, folded
+    assert 'docs\\WORKTREES.md, "Remove one"' in folded, folded
+
+
 @pytest.mark.parametrize("verb", ["remove", "move"])
 @pytest.mark.parametrize("standing_in", ["victim", "primary"])
 @pytest.mark.parametrize("family", _FAMILIES)
