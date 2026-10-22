@@ -47,6 +47,7 @@ touched.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,12 +59,22 @@ from tests._no_prompt import run_holding_stdin_open
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane.ps1"
 
 
-def _pwsh(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _pwsh(
+    repo: Path, *args: str, root: Path | str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run lane.ps1 in ``repo``. ``root`` sets MEFOR_COORD_ROOT; otherwise an inherited one is
+    dropped, so the throwaway repo's own local root is the one in use."""
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    if root is not None:
+        env["MEFOR_COORD_ROOT"] = str(root)
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=repo,
+        env=env,
+        timeout=60,
     )
 
 
@@ -160,3 +171,88 @@ def test_a_statement_missing_a_number_refuses_instead_of_prompting(
     assert "-Free" in err and "-InFlight" in err, err
     # Refused means NOTHING written: the lanes directory is created on the write path.
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+# -SHOW IS A STRICT READ. A read-only fleet pane polls `lane.ps1 -Show` every minute from many
+# sessions, and the shared root may be a share it cannot write. Before this change -Show ran
+# `New-Item -Force` on `<root>\lanes` and `<root>\lanes\.tmp` on every call, so it created both on a
+# fresh root, and threw on a read-only one. MEASURED 2026-10-22: all four tests below fail against
+# that code. The third passes its first arm, the found record, which is the must-not-fire control.
+
+# TEST-NET-1 (RFC 5737): never routed, so a connect to it can only time out.
+_DEAD_UNC = r"\\192.0.2.1\nothing\mefor-coord"
+
+
+def _tree(top: Path) -> list[str]:
+    """Every file and directory under ``top``, as sorted relative paths: the before/after instrument."""
+    return sorted(str(p.relative_to(top)) for p in top.rglob("*"))
+
+
+def test_show_with_no_lanes_dir_creates_nothing_and_says_absent(repo: Path) -> None:
+    before = _tree(repo)
+    assert any(p.startswith(".git") for p in before), "the instrument must see .git to count"
+
+    proc = _pwsh(repo, "-Show")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _tree(repo) == before, "lane.ps1 -Show wrote to the repository"
+    rec = json.loads(proc.stdout)
+    assert "no lanes directory" in rec["absent"], rec
+    assert rec["statedFree"] is None and rec["statedInFlight"] is None
+
+
+def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
+    repo: Path, tmp_path: Path
+) -> None:
+    if os.name != "nt":
+        pytest.skip("the deny ACE is a Windows ACL")
+    shared = tmp_path / "read-only-root"
+    shared.mkdir()
+    user = os.environ["USERNAME"]
+    # Deny adding a file or a subdirectory on the root itself, not inherited, so cleanup can delete it.
+    subprocess.run(
+        ["icacls", str(shared), "/deny", f"{user}:(AD,WD)"], check=True, capture_output=True
+    )
+    try:
+        write = _pwsh(repo, "-Free", "1", "-InFlight", "0", root=shared)
+        # The control: the ACE really does stop a write, so a green -Show below is not vacuous.
+        assert write.returncode != 0, "the deny ACE did not stop a write; the test proves nothing"
+        assert not any(shared.iterdir())
+
+        proc = _pwsh(repo, "-Show", root=shared)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "no lanes directory" in json.loads(proc.stdout)["absent"]
+        assert not any(shared.iterdir())
+    finally:
+        subprocess.run(["icacls", str(shared), "/remove:d", user], check=True, capture_output=True)
+
+
+def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_one(
+    repo: Path,
+) -> None:
+    assert _pwsh(repo, "-Free", "2", "-InFlight", "1", "-Note", "n").returncode == 0
+    proc = _pwsh(repo, "-Show")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = json.loads(proc.stdout)
+    assert "absent" not in rec, rec
+    assert rec["statedFree"] == 2 and rec["statedInFlight"] == 1
+
+    record = _lane_record(repo)
+    record.write_text("{not json", encoding="utf-8")
+    rec = json.loads(_pwsh(repo, "-Show").stdout)
+    assert "could not be read" in rec["absent"], rec
+    record.unlink()
+    rec = json.loads(_pwsh(repo, "-Show").stdout)
+    assert "no lane record at" in rec["absent"], rec
+
+
+def test_show_on_a_dead_share_does_not_write_the_down_cache(repo: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("a UNC root is a Windows path")
+    down = repo / ".git" / "mefor-coord" / "coord-root-down.json"
+    proc = _pwsh(repo, "-Show", root=_DEAD_UNC)
+    assert proc.returncode == 2 and "unreachable" in proc.stderr, proc.stdout + proc.stderr
+    assert not down.exists(), "lane.ps1 -Show wrote the resolver's down cache"
+    # The control: a write call on the same root does record the verdict, so the cache path is right.
+    _pwsh(repo, "-Free", "1", "-InFlight", "0", root=_DEAD_UNC)
+    assert down.is_file()

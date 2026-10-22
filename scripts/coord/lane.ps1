@@ -64,7 +64,8 @@ $thisHost = Get-CoordHost
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+# -Show writes nothing, not even the resolver's down cache: a read-only fleet pane polls it.
+$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path -NoCacheWrite:$Show
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2
@@ -103,8 +104,6 @@ $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
-New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
-
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
@@ -129,9 +128,30 @@ if (-not $rec) {
 }
 
 if ($Show) {
+    # -SHOW IS A STRICT READ. A read-only pane polls it every minute from many sessions, and the root
+    # may be a share it cannot write, so it creates no directory and writes no file. With no record it
+    # prints the blank record above plus an `absent` field saying why, so an empty lane never reads as
+    # a stated one. A record that was found prints unchanged, with no `absent` field.
+    # The read above does not keep why it found no record, so the file is parsed once more here; the
+    # common case, a readable record, costs that one read and no Test-Path.
+    $found = $false
+    try { $found = $null -ne (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { }
+    if (-not $found) {
+        $absent = if (-not (Test-Path -LiteralPath $lanesDir -PathType Container)) {
+            "no lanes directory at $lanesDir, so no lane has been recorded on this root"
+        } elseif (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            "no lane record at $file"
+        } else {
+            "the lane record at $file could not be read"
+        }
+        $rec | Add-Member -NotePropertyName absent -NotePropertyValue $absent -Force
+    }
     $rec | ConvertTo-Json -Depth 5
     exit 0
 }
+
+# Made here, on the write path only, so -Show above creates nothing.
+New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $nowUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
