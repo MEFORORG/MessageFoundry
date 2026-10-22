@@ -645,16 +645,18 @@ never with mail. The evidence is probe PR
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
   instead of your diff. Name the diff too, so it matches what you committed. Write the level as a
-  bare first word, with no punctuation after it. For example: `xhigh round-<hex> Review this
-  branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.` Pass the
-  arguments on one line. The period form, `xhigh.`, does not parse as a level. In two trials the
-  skill then ran at the previous call's level (measured 2026-10-13). Make the `round-<hex>` nonce
-  fresh each round with 4e's recipe, and put it right after the level, never before it. The tag
-  is the skill's `<level> effort -> ...` line. Read it from the reviewer fork's transcript where one
-  exists, never from memory or the skill's prose. Run korus `scripts/quality/review_tag.py` by path
-  from your engine worktree, with `--target` set to the nonce. In your QA line, give the level you
-  passed and that tag. korus `roles/BUILDER.md` *4e*, read at `origin/main`, gives the fields,
-  including the inline case and what to write when the tool finds nothing or refuses.
+  bare first word, with no punctuation after it. For example:
+  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.`
+  Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
+  trials the skill then ran at the previous call's level (measured 2026-10-13). Make the
+  `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,
+  never before it. The tag is the skill's `<level> effort -> ...` line. Read it with korus
+  `scripts/quality/review_tag.py`, which reads the reviewer fork's transcript; never take it from
+  memory or the skill's prose. Run the tool by path from your engine worktree, with `--target` set
+  to the nonce and `--ascii`, since section 11 bans the glyphs. In your QA line, give the level you
+  passed and quote that tag verbatim, noting the ascii spelling. korus `roles/BUILDER.md` *4e*,
+  read at `origin/main`, gives the fields, including the inline case and what to write when the
+  tool finds nothing or refuses.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
