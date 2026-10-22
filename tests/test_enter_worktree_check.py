@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""scripts/worktree/enter-check.ps1 and its PreToolUse hook auto-allow only a SAFE worktree (ADR 0212).
+"""scripts/worktree/enter-check.ps1 gives an advisory verdict, and its hook shows it (ADR 0212).
+
+The hook never allows: on SAFE and on UNSAFE it returns `ask` with the verdict as the reason the
+owner's prompt shows, and on the OFF file or any fault it returns no decision at all.
 
 Each test builds a fleet repository with its own bare origin, and a temp root laid out the way the
 harness lays out a session's scratchpad: ``<temp>/claude/<project>/<session>/scratchpad/``. The
-scripts run from a sandbox copy (tests/_fake_gh.py) with a fake gh first on PATH, so the kill
-switch is read from a state file and the real repository variable is never touched.
+scripts run from a sandbox copy (tests/_fake_gh.py), so the real tree is never touched.
 
 Every UNSAFE case below is one check's own positive control: the layout differs from the SAFE one
 in exactly the way that check exists to catch.
@@ -17,9 +19,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,6 +122,8 @@ class Fleet:
         *,
         fleet: Path | None = None,
         transcript: str | None = None,
+        remote: str | None = None,
+        extra: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         # One repository: `pwsh -File` binds `a,b` as ONE string, not an array.
         return self.sb.run(
@@ -130,12 +137,20 @@ class Fleet:
             "-FleetRepos",
             str(fleet or self.engine),
             "-FleetRemotes",
-            str(self.origin),
+            remote or str(self.origin),
             "-TempRoot",
             str(self.temp),
             "-TranscriptPath",
             self.transcript() if transcript is None else transcript,
+            *extra,
         )
+
+    def turn_off(self) -> Path:
+        """Create this machine's OFF file in the engine's git common dir."""
+        off = self.engine / ".git" / "mefor-coord" / "enter-check" / "OFF"
+        off.parent.mkdir(parents=True, exist_ok=True)
+        off.write_text("", encoding="utf-8")
+        return off
 
     def transcript(self, launched_in: Path | None = None) -> str:
         """Where the harness files the transcript of a session launched in ``launched_in``."""
@@ -160,7 +175,6 @@ class Fleet:
 def fleet(tmp_path: Path) -> Fleet:
     sb = make_sandbox(tmp_path)
     shutil.copytree(ROOT / "scripts" / "worktree", sb.repo / "scripts" / "worktree")
-    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
     base = tmp_path / "fleet"
     base.mkdir()
     engine = _make_repo(base, "engine")
@@ -218,6 +232,14 @@ def test_an_extended_length_path_is_refused(fleet: Fleet) -> None:
 
 def test_a_missing_path_is_unsafe(fleet: Fleet) -> None:
     assert_unsafe(fleet.check(fleet.scratch() / "nothing-here"), "a")
+
+
+def test_a_relative_path_is_refused_not_joined_to_the_cwd(fleet: Fleet) -> None:
+    """Joined to -SessionCwd, this names the SAFE worktree; the harness may resolve it elsewhere."""
+    wt = fleet.own_wt()
+    proc = fleet.check(wt.name, cwd=wt.parent)
+    assert_unsafe(proc, "a")
+    assert "not fully qualified" in proc.stdout, proc.stdout
 
 
 # ---------------------------------------------------------------- b. a linked fleet worktree
@@ -657,55 +679,60 @@ def test_a_second_admin_dir_naming_the_worktree_cannot_lend_its_head(fleet: Flee
     assert_unsafe(fleet.check(wt), "f")
 
 
-# ---------------------------------------------------------------- g. kill switch
+# ---------------------------------------------------------------- the run's time budget
 
 
-@pytest.mark.parametrize("state", [{"variables": {"MEFOR_AFK_KILL": "on"}}, {"fail": True}])
-def test_the_kill_switch_not_off_is_unsafe(fleet: Fleet, state: dict[str, object]) -> None:
+@pytest.fixture
+def silent_remote() -> Iterator[str]:
+    """An HTTP remote that accepts a connection and never answers, so `git ls-remote` hangs."""
+    server = socket.create_server(("127.0.0.1", 0))
+    held: list[socket.socket] = []
+    stop = threading.Event()
+
+    def accept() -> None:
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            held.append(conn)
+
+    t = threading.Thread(target=accept, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{server.getsockname()[1]}/engine.git"
+    finally:
+        stop.set()
+        t.join(timeout=5)
+        for conn in held:
+            conn.close()
+        server.close()
+
+
+def test_a_hung_child_is_bounded_by_the_run_s_budget(fleet: Fleet, silent_remote: str) -> None:
+    """The remote read's own bound is 20 s; the 4 s budget stops it first."""
     wt = fleet.own_wt()
-    fleet.sb.set_state(**state)
-    assert_unsafe(fleet.check(wt), "g")
-
-
-def test_a_kill_switch_read_that_hangs_is_bounded(fleet: Fleet) -> None:
-    """afk-kill.ps1 gives up on a hung gh at 10 s and leaves it running; the read must not wait on it."""
-    wt = fleet.own_wt()
-    fleet.sb.set_state(hang=45, variables={"MEFOR_AFK_KILL": "off"})
     start = time.monotonic()
-    proc = fleet.sb.run(
-        CHECK,
-        "-Path",
-        str(wt),
-        "-SessionId",
-        SID,
-        "-SessionCwd",
-        str(fleet.home),
-        "-FleetRepos",
-        str(fleet.engine),
-        "-FleetRemotes",
-        str(fleet.origin),
-        "-TempRoot",
-        str(fleet.temp),
-        "-TranscriptPath",
-        fleet.transcript(),
-        "-KillSwitchTimeoutSeconds",
-        "15",
-    )
-    assert_unsafe(proc, "g")
-    assert time.monotonic() - start < 35, proc.stdout
+    proc = fleet.check(wt, remote=silent_remote, extra=("-BudgetSeconds", "4"))
+    assert_unsafe(proc, "f")
+    assert "budget" in proc.stdout, proc.stdout
+    assert time.monotonic() - start < 15, proc.stdout
 
 
-# ---------------------------------------------------------------- h. local disable file
+# ---------------------------------------------------------------- the local OFF file
 
 
-def test_the_local_off_file_is_unsafe(fleet: Fleet) -> None:
-    wt = fleet.own_wt()
-    off = fleet.engine / ".git" / "mefor-coord" / "enter-check" / "OFF"
-    off.parent.mkdir(parents=True)
-    off.write_text("", encoding="utf-8")
-    proc = fleet.check(wt)
-    assert_unsafe(proc, "h")
+def test_the_local_off_file_prints_off_and_runs_no_check(fleet: Fleet) -> None:
+    off = fleet.turn_off()
+    proc = fleet.check(fleet.own_wt())
+    assert proc.returncode == 2 and _verdict(proc) == "OFF", (proc.stdout, proc.stderr)
     assert str(off) not in proc.stdout and "mefor-coord" not in proc.stdout, proc.stdout
+    assert proc.stdout.splitlines()[1:] == [
+        "  this machine has turned the check off with its local OFF file"
+    ]
 
 
 # ---------------------------------------------------------------- faults fail closed
@@ -751,35 +778,89 @@ def _payload(fleet: Fleet, path: Path) -> dict[str, object]:
 
 
 def _decision(proc: subprocess.CompletedProcess[str]) -> dict[str, object] | None:
+    """The hook's decision, asserting on every call that it is `ask` or nothing."""
     assert proc.returncode == 0, proc.stderr
-    assert "deny" not in proc.stdout, proc.stdout
+    assert '"allow"' not in proc.stdout and '"deny"' not in proc.stdout, proc.stdout
     if not proc.stdout.strip():
         return None
     out = json.loads(proc.stdout)
     spec: dict[str, object] = out["hookSpecificOutput"]
     assert spec["hookEventName"] == "PreToolUse"
+    assert spec["permissionDecision"] == "ask", spec
     return spec
 
 
-def test_the_hook_allows_on_safe(fleet: Fleet) -> None:
+def _reason(spec: dict[str, object] | None) -> str:
+    assert spec is not None
+    return str(spec["permissionDecisionReason"])
+
+
+def _break_check(fleet: Fleet, body: str | None) -> None:
+    """Replace the sandbox's check with ``body``, or delete it when ``body`` is None."""
+    check = fleet.sb.repo / CHECK.relative_to(ROOT)
+    if body is None:
+        check.unlink()
+    else:
+        check.write_text(body, encoding="utf-8")
+
+
+@pytest.mark.parametrize("case", ["safe", "unsafe", "throws", "bad-exit", "off", "missing"])
+def test_the_hook_never_allows(fleet: Fleet, case: str) -> None:
+    """Whatever the check says or does: `ask` on a verdict, no decision otherwise, never `allow`."""
+    if case == "safe":
+        path = fleet.own_wt()
+    elif case == "unsafe":
+        path = fleet.add_worktree(fleet.scratch(OTHER_SID) / "w")
+    else:
+        # Nothing below reads the tree, so none is built.
+        path = fleet.scratch()
+    if case == "throws":
+        _break_check(fleet, "throw 'boom'\n")
+    elif case == "bad-exit":
+        _break_check(fleet, "Write-Output 'SAFE'\nexit 3\n")
+    elif case == "off":
+        fleet.turn_off()
+    elif case == "missing":
+        _break_check(fleet, None)
+    spec = _decision(fleet.hook(_payload(fleet, path)))
+    assert (spec is not None) == (case in {"safe", "unsafe"}), (case, spec)
+
+
+def test_the_hook_asks_with_a_safe_reason_on_safe(fleet: Fleet) -> None:
     wt = fleet.own_wt()
-    spec = _decision(fleet.hook(_payload(fleet, wt)))
-    assert spec is not None and spec["permissionDecision"] == "allow", spec
+    reason = _reason(_decision(fleet.hook(_payload(fleet, wt))))
+    assert reason.startswith("enter-check: SAFE"), reason
+    assert "origin/main" not in reason and "kill switch" not in reason, reason
 
 
-def test_the_hook_gives_no_decision_on_unsafe(fleet: Fleet) -> None:
+def test_the_hook_asks_with_an_unsafe_reason_on_unsafe(fleet: Fleet) -> None:
     wt = fleet.add_worktree(fleet.scratch(OTHER_SID) / "eng-main")
-    spec = _decision(fleet.hook(_payload(fleet, wt)))
-    assert spec is not None and "permissionDecision" not in spec, spec
-    assert "did not auto-allow" in str(spec["additionalContext"])
-    assert "c." in str(spec["additionalContext"])
+    reason = _reason(_decision(fleet.hook(_payload(fleet, wt))))
+    assert reason.startswith("enter-check: UNSAFE"), reason
+    assert "c." in reason, reason
 
 
-def test_the_hook_gives_no_decision_when_the_kill_switch_is_on(fleet: Fleet) -> None:
-    wt = fleet.own_wt()
-    fleet.sb.set_state(variables={"MEFOR_AFK_KILL": "on"})
-    spec = _decision(fleet.hook(_payload(fleet, wt)))
-    assert spec is not None and "permissionDecision" not in spec, spec
+def test_the_unsafe_reason_is_one_bounded_line(fleet: Fleet) -> None:
+    """The check's reasons reach the owner's prompt: folded, stripped of format characters, capped."""
+    bidi = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE, which reorders what the owner reads
+    long = "x" * 900
+    _break_check(
+        fleet,
+        "Write-Output 'UNSAFE'\n"
+        f'Write-Output "  a. one`r`ntwo{bidi}{long}"\n'
+        "Write-Output '  b. second'\nWrite-Output '  c. third'\nWrite-Output '  d. fourth'\n"
+        "exit 1\n",
+    )
+    reason = _reason(_decision(fleet.hook(_payload(fleet, fleet.scratch()))))
+    assert reason.startswith("enter-check: UNSAFE -- a. one two"), reason
+    assert "\r" not in reason and "\n" not in reason and bidi not in reason, reason
+    assert len(reason) < 600 and "c. third" in reason and "d. fourth" not in reason, reason
+
+
+@pytest.mark.parametrize("body", ["Write-Output 'SAFE'\nexit 1\n", "exit 0\n"])
+def test_the_hook_gives_no_decision_when_verdict_and_exit_disagree(fleet: Fleet, body: str) -> None:
+    _break_check(fleet, body)
+    assert _decision(fleet.hook(_payload(fleet, fleet.scratch()))) is None
 
 
 @pytest.mark.parametrize(
@@ -811,28 +892,21 @@ def test_the_hook_is_silent_without_a_path(fleet: Fleet, stdin: str) -> None:
 
 
 def test_the_hook_is_silent_when_the_input_carries_more_than_a_path(fleet: Fleet) -> None:
-    payload = _payload(fleet, fleet.own_wt())
+    payload = _payload(fleet, fleet.scratch())
     payload["tool_input"] = {**payload["tool_input"], "name": "other"}  # type: ignore[dict-item]
     assert _decision(fleet.hook(payload)) is None
 
 
 def test_the_hook_is_silent_for_another_tool(fleet: Fleet) -> None:
-    payload = _payload(fleet, fleet.own_wt())
+    payload = _payload(fleet, fleet.scratch())
     payload["tool_name"] = "Grep"
     assert _decision(fleet.hook(payload)) is None
 
 
 def test_the_hook_is_silent_without_a_cwd(fleet: Fleet) -> None:
-    wt = fleet.own_wt()
-    payload = _payload(fleet, wt)
+    payload = _payload(fleet, fleet.scratch())
     del payload["cwd"]
     assert _decision(fleet.hook(payload)) is None
-
-
-def test_the_hook_gives_no_decision_when_the_check_is_missing(fleet: Fleet) -> None:
-    wt = fleet.own_wt()
-    (fleet.sb.repo / "scripts" / "worktree" / "enter-check.ps1").unlink()
-    assert _decision(fleet.hook(_payload(fleet, wt))) is None
 
 
 def test_the_hook_is_wired_for_enter_worktree_only() -> None:
