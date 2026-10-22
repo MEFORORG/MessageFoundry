@@ -211,10 +211,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Write') {
             }
             throw
         }
-        # Read back through the retrying reader. Latin-1 maps each byte to one char, so comparing the
-        # two strings compares the bytes.
+        # Read back through the retrying reader. Latin-1 maps each byte to one char, so an ORDINAL
+        # compare of the two strings compares the bytes. Not -cne: it is culture-aware and ignores NUL.
         $latin1 = [System.Text.Encoding]::Latin1
-        if ([string](Read-CoordText $dest -Encoding $latin1) -cne $latin1.GetString($bytes)) {
+        $written = [string](Read-CoordText $dest -Encoding $latin1)
+        if (-not [string]::Equals($written, $latin1.GetString($bytes), [System.StringComparison]::Ordinal)) {
             throw "Wrote $dest but its bytes do not match $From."
         }
     } catch {

@@ -270,10 +270,8 @@ function Get-Mine([string]$Path) {
 # git-bash on the same clone, and a mixed-newline JSONL file is one of those things nothing complains
 # about until a parser splits differently from the writer.
 #
-# The catch is deliberately UNTYPED, for the reason written out at the claim-refresh Move below:
-# PowerShell wraps an exception thrown by a .NET METHOD in a MethodInvocationException, so a typed
-# `catch [System.IO.IOException]` here would never match and the failure would escape to
-# $ErrorActionPreference = "Stop" instead of being retried.
+# The catch is deliberately UNTYPED: every failure here has the same answer, retry, and one that
+# escaped a typed catch would reach $ErrorActionPreference = "Stop" instead.
 function Add-HistoryLine([string]$Line) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`n")
     foreach ($attempt in 1..5) {

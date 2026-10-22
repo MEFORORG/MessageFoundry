@@ -279,17 +279,18 @@ _SHARING_WINERRORS = frozenset({32, 33})
 
 
 def transient_io_error(exc: OSError) -> bool:
-    """True for a sharing or lock violation, or access denied. Never for a missing file.
+    """True for a sharing or lock violation. Never for a missing file.
 
-    The same set Test-CoordTransientIoError retries. Access denied covers a file with a delete
-    pending. It also covers a sharing violation here, because ``open()`` goes through the C runtime,
-    which reports one as a bare ``PermissionError(13)`` with no ``winerror`` (measured 2026-10-21). A
-    real denial therefore costs one bounded wait, then raises as before.
+    The same set Read-CoordText retries, with one difference Python cannot avoid. ``open()`` goes
+    through the C runtime, which reports a sharing violation as a bare ``PermissionError(13)`` with no
+    ``winerror`` (measured 2026-10-21). That is indistinguishable from a real denial, so on Windows a
+    PermissionError with no winerror is retried too; a real denial costs one bounded wait.
     """
     if isinstance(exc, FileNotFoundError | NotADirectoryError):
         return False
-    if getattr(exc, "winerror", None) in _SHARING_WINERRORS:
-        return True
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _SHARING_WINERRORS
     return os.name == "nt" and isinstance(exc, PermissionError)
 
 

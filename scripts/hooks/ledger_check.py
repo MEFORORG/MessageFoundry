@@ -636,7 +636,13 @@ class Ledger:
             return allocate
         try:
             claim = self._read_alloc(kind, number)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return allocate
+        except OSError:
+            # The record exists but stayed unreadable through the retries. Allocating again would burn
+            # this number, so say to retry instead.
+            return "the allocation record exists but could not be read just now -- retry the commit"
+        except ValueError:
             return allocate
         if not isinstance(claim, dict):
             return allocate

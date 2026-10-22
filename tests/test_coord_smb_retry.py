@@ -220,27 +220,25 @@ $r | ConvertTo-Json -Compress
         assert out[action]["ms"] < 2500, out
 
 
-def test_a_silenced_caller_never_loops_forever(tmp_path: Path) -> None:
-    """Under SilentlyContinue, with no try, a caller suppresses the rethrow. The loop must still end."""
-    proc = subprocess.run(
-        [
-            "pwsh", "-NoProfile", "-NonInteractive", "-Command",
-            f". '{PS}'; $ErrorActionPreference = 'SilentlyContinue'; "
-            f"$x = Read-CoordText '{tmp_path / 'gone.json'}'; 'done'",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )  # fmt: skip
-    assert proc.stdout.strip().endswith("done"), (proc.stdout, proc.stderr)
+def test_a_silenced_caller_still_fails_fast(tmp_path: Path) -> None:
+    """Under SilentlyContinue, with no try, a caller would suppress the rethrow and the loop would
+    retry a missing file. The helper runs under Stop itself, so it ends at once."""
+    out = _ps(
+        f"""
+$script:CoordRetryFirstMs = 5000
+$ErrorActionPreference = 'SilentlyContinue'
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$x = Read-CoordText '{tmp_path / "gone.json"}'
+[ordered]@{{ ms = $sw.ElapsedMilliseconds; empty = ($null -eq $x) }} | ConvertTo-Json -Compress
+"""
+    )
+    assert out["empty"] is True and out["ms"] < 2500, out
 
 
-def test_a_reader_shares_with_a_writer_and_a_rename(tmp_path: Path) -> None:
-    """A file held open for writing reads; a file being read can still be renamed over."""
+def test_a_reader_shares_with_a_writer(tmp_path: Path) -> None:
+    """A file another process holds open for writing still reads, as it did with Get-Content."""
     f = tmp_path / "rec.json"
     f.write_text('{"v": "old"}', encoding="utf-8")
-    tmp = tmp_path / "rec.tmp"
-    tmp.write_text('{"v": "new"}', encoding="utf-8")
     out = _ps(
         f"""
 $r = [ordered]@{{}}

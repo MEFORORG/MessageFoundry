@@ -664,12 +664,15 @@ function Write-RecordAtomic {
     $dir = Split-Path $Path -Parent
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     # Temp file in the SAME directory: a rename across volumes is a copy, and a copy is not atomic.
-    $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + '.tmp')
+    # A unique temp: two writers of one record (a heartbeat and a declare) must not share one, or
+    # the second rename finds its source already gone.
+    $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + '.' + [guid]::NewGuid().ToString('n') + '.tmp')
     $json = $Object | ConvertTo-Json -Depth 8
     Set-Content -LiteralPath $tmp -Value $json -Encoding utf8 -EA Stop
     # One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
     # which deletes first, so a reader could find the record missing.
-    Move-CoordFileReplace -Source $tmp -Destination $Path
+    try { Move-CoordFileReplace -Source $tmp -Destination $Path }
+    catch { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue; throw }
 }
 
 # ---------------------------------------------------------------------------------------------

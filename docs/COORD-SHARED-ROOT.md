@@ -88,20 +88,23 @@ A session on MEFORDEV01 ran the probe the owner asked for. Its report is
 What this changes:
 
 1. **BUILT. Writers that replace a file by rename need a retry, and readers must treat a sharing
-   violation as "retry", never as "missing" or "torn".** `coord-root.ps1` holds the one helper:
-   `Move-CoordFileReplace` renames in one step and retries a sharing violation or access denied, and
-   `Read-CoordText` retries the same errors, and opens sharing read, write and delete so that it
-   never blocks a rename itself. The retry is short and bounded; its numbers live once, in that
-   file. A missing file is never retried, and when the tries run out the original error surfaces.
-   At least these writers on shared kinds use it: `seat.ps1`, `lane.ps1`, `handoff.ps1` and
-   `claim.ps1`'s refresh. `seat.ps1` and `lane.ps1` had used `Move-Item -Force`, which deletes
-   before it renames, so a reader could find the record missing. At least the main readers of seat,
-   claim, allocation, lane, handoff and mail records use `Read-CoordText`. The Python twin,
-   `read_text` in `coord_root.py`, serves the claim and ledger gates, which only read.
-   `tests/test_coord_smb_retry.py` holds each against a second process holding the file with no
-   sharing, with a plain-call control that must fail. **Not covered:** `alloc.ps1` still rewrites
-   `alloc/.floor-highwater` in place rather than by rename, `tombstone-retired-backlog-allocator.ps1`
-   reads and writes without the helper, and `mail-claim.ps1` keeps its own claim-by-rename protocol.
+   violation as "retry", never as "missing" or "torn".** `coord-root.ps1` holds two helpers.
+   `Move-CoordFileReplace` renames in one step. It retries a sharing violation or access denied.
+   `Read-CoordText` retries a sharing violation. It shares read, write and delete, so it can read a
+   file another process holds open for writing. Both retry briefly and stop after a fixed number of
+   tries. A missing file is never retried. When the tries run out, the original error surfaces. The
+   numbers are in `coord-root.ps1`, and a test holds the Python twin to the same ones.
+   At least these writers on shared kinds use the rename helper: `seat.ps1`, `lane.ps1`,
+   `handoff.ps1` and `claim.ps1`'s refresh. `seat.ps1` and `lane.ps1` had used `Move-Item -Force`.
+   That command deletes before it renames, so a reader could find the record missing.
+   At least the main readers of seat, claim, allocation, lane, handoff and mail records use
+   `Read-CoordText`. The Python twin, `read_text` in `coord_root.py`, serves the claim and ledger
+   gates, which only read. `tests/test_coord_smb_retry.py` tests each one against a second process
+   that holds the file with no sharing. Each test has a control: the plain call must fail.
+   **Not covered, at least:** `alloc.ps1` still rewrites `alloc/<kind>/.floor-highwater` in place.
+   `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
+   report reads each handoff with its own capped read. `mail-claim.ps1` keeps its own claim-by-rename
+   protocol, and the drain's citation walk fails closed on a held file without retrying.
 2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
    it again with one process on each PC before step 7, because the two clients' caches are the
    part no single-client test sees.

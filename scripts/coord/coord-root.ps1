@@ -296,33 +296,39 @@ function Get-CoordInnerException {
 }
 
 function Test-CoordTransientIoError {
-    # True for the errors a file raises while another process holds it: a sharing or lock violation, or
-    # access denied (a rename onto an open file, or a file with a delete pending). A missing file or
-    # directory is never transient. The Python twin retries the same set.
-    param($Exception)
+    # True for a sharing or lock violation, the error a file raises while another process holds it.
+    # -AllowAccessDenied adds access denied, which is what a RENAME onto an open file raises; a read
+    # leaves it out, so a real denial on a read fails at once. A missing file is never transient.
+    param($Exception, [switch]$AllowAccessDenied)
     $e = Get-CoordInnerException $Exception
     if ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) { return $false }
-    if ($e -is [System.UnauthorizedAccessException]) { return $true }
+    if ($AllowAccessDenied -and $e -is [System.UnauthorizedAccessException]) { return $true }
     return ($e -is [System.IO.IOException] -and $script:CoordSharingHResults -contains $e.HResult)
 }
 
 function Invoke-CoordIoRetry {
     # Runs $Action, retrying the transient errors above with a short bounded backoff. When the tries run
     # out, or the error is not transient, it rethrows the .NET exception itself, so a caller's typed
-    # catch still matches. The loop is bounded and returns after the throw, because a caller running
-    # under SilentlyContinue with no try of its own suppresses the throw.
-    param([scriptblock]$Action)
-    $sleep = $script:CoordRetryFirstMs
-    for ($try = 1; $try -le $script:CoordRetryTries; $try++) {
+    # catch still matches.
+    # A caller under SilentlyContinue with no try suppresses the rethrow and execution goes on past it,
+    # so the flag set first makes the helper return nothing at once, as `Get-Content` would there.
+    # The locals carry a prefix because $Action runs in this scope: a name it shares with a local would
+    # read the local, not the caller's variable.
+    param([scriptblock]$Action, [switch]$AllowAccessDenied)
+    $coordIoSleep = $script:CoordRetryFirstMs
+    $coordIoDone = $false
+    for ($coordIoTry = 1; $coordIoTry -le $script:CoordRetryTries; $coordIoTry++) {
         try { return (& $Action) } catch {
-            $ex = Get-CoordInnerException $_.Exception
-            if ($try -ge $script:CoordRetryTries -or -not (Test-CoordTransientIoError $ex)) {
-                throw $ex
-                return
+            $coordIoEx = Get-CoordInnerException $_.Exception
+            if ($coordIoTry -ge $script:CoordRetryTries -or
+                -not (Test-CoordTransientIoError $coordIoEx -AllowAccessDenied:$AllowAccessDenied)) {
+                $coordIoDone = $true
+                throw $coordIoEx
             }
         }
-        Start-Sleep -Milliseconds $sleep
-        $sleep = [Math]::Min($sleep * 2, $script:CoordRetryMaxSleepMs)
+        if ($coordIoDone) { return }
+        Start-Sleep -Milliseconds $coordIoSleep
+        $coordIoSleep = [Math]::Min($coordIoSleep * 2, $script:CoordRetryMaxSleepMs)
     }
 }
 
@@ -337,27 +343,34 @@ function Move-CoordFileReplace {
     # Renames $Source onto $Destination in one step, retrying a sharing violation or access denied.
     # -NoOverwrite keeps an existing destination and throws IOException, which is never retried.
     # A read-only destination is replaced, as `Move-Item -Force` replaced it: File.Move refuses one.
+    # If that replace still fails, the read-only mark is put back.
     param([string]$Source, [string]$Destination, [switch]$NoOverwrite)
     $src = ConvertTo-CoordFullPath $Source
     $dst = ConvertTo-CoordFullPath $Destination
     $overwrite = -not $NoOverwrite
     try {
-        Invoke-CoordIoRetry -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
+        Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
     } catch [System.UnauthorizedAccessException] {
         $attrs = $null
         try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
         if (-not $overwrite -or $null -eq $attrs -or -not ($attrs -band [System.IO.FileAttributes]::ReadOnly)) { throw }
         [System.IO.File]::SetAttributes($dst, $attrs -band -bnot [System.IO.FileAttributes]::ReadOnly)
-        Invoke-CoordIoRetry -Action { [System.IO.File]::Move($src, $dst, $true) }
+        try {
+            Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $true) }
+        } catch {
+            try { [System.IO.File]::SetAttributes($dst, $attrs) } catch { }
+            throw
+        }
     }
 }
 
 function Read-CoordText {
-    # A file's whole text, retrying the transient errors above. A missing file throws
-    # FileNotFoundException at once, so a caller's "missing" path is unchanged. An empty file emits
-    # nothing, exactly as `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as before.
-    # It opens sharing read, write AND delete, more than `Get-Content` (read and write): a reader must
-    # never be what blocks a writer's rename. File.ReadAllText shares read only, which would.
+    # A file's whole text, retrying a sharing violation. A missing file throws FileNotFoundException at
+    # once, so a caller's "missing" path is unchanged. An empty file emits nothing, exactly as
+    # `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as before.
+    # It opens sharing read, write and delete, at least what `Get-Content` shares, so it reads a file
+    # another process holds open for writing. File.ReadAllText shares read only and would fail there.
+    # A reader still blocks a rename onto the file it holds; the writer's retry covers that.
     # With no -Encoding it reads UTF-8 and honours a byte-order mark; an explicit -Encoding is taken
     # as given, with no detection.
     param([string]$Path, [System.Text.Encoding]$Encoding)
