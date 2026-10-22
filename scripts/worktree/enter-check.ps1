@@ -34,7 +34,7 @@
          through a link is refused, because the session can repoint its own link afterwards.
       d. The session neither is nor was launched in the primary checkout of a fleet repository.
          Rule 4 of scripts/hooks/worktree_gate.ps1 exists because relocating out of the primary
-         re-files the chat transcript, so that case keeps its prompt. Two reads, because a `cd`
+         re-files the chat transcript, so that case reads UNSAFE. Two reads, because a `cd`
          moves the cwd: -SessionCwd, where the session is now, and the project directory of
          -TranscriptPath, which is where the transcript is filed. Only an exact match with a
          primary's slug counts (a slug maps a separator and a `-` alike), so a session launched
@@ -88,7 +88,7 @@
     directory in the order Node's os.tmpdir() reads it (TEMP, then TMP, on Windows; TMPDIR, TMP,
     TEMP elsewhere), which is where the harness puts a session's scratchpad. .NET's own
     GetTempPath prefers TMP, so it can name another directory. A TEMP spelled with an 8.3 short
-    name fails check c, which costs a prompt.
+    name fails check c, so the verdict reads UNSAFE.
 
 .PARAMETER TranscriptPath
     The hook input's `transcript_path`. With none, check d fails.
@@ -107,7 +107,10 @@ param(
 )
 
 $safe = $false
-$budgetEnd = [DateTime]::UtcNow.AddSeconds($BudgetSeconds)
+# Monotonic, so a wall-clock step cannot stretch or cut the budget.
+$budgetWatch = [System.Diagnostics.Stopwatch]::StartNew()
+function Get-BudgetLeftMs { [Math]::Max(0, $BudgetSeconds * 1000 - $script:budgetWatch.ElapsedMilliseconds) }
+$budgetSpent = "the check's $BudgetSeconds s budget ran out"
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -123,7 +126,7 @@ $gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
 function Start-Child {
     # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
     param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText, [hashtable]$SetEnv)
-    if ([DateTime]::UtcNow -ge $script:budgetEnd) { throw "the check's $BudgetSeconds s budget is spent" }
+    if ((Get-BudgetLeftMs) -le 0) { throw "$Exe was not started: $budgetSpent" }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
@@ -150,10 +153,11 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
     # budget, is killed and this throws.
     $p = $Child.Process
     try {
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $allowMs = [long]$TimeoutSeconds * 1000
         $bound = "did not finish within $TimeoutSeconds s"
-        if ($script:budgetEnd -lt $deadline) { $deadline = $script:budgetEnd; $bound = "was stopped when the check's $BudgetSeconds s budget ran out" }
-        $left = { [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds) }
+        if ((Get-BudgetLeftMs) -lt $allowMs) { $allowMs = Get-BudgetLeftMs; $bound = "was stopped: $budgetSpent" }
+        $waited = [System.Diagnostics.Stopwatch]::StartNew()
+        $left = { [int][Math]::Max(0, $allowMs - $waited.ElapsedMilliseconds) }
         $done = $true
         if ($Child.Write) {
             $done = $Child.Write.Wait((& $left))
@@ -168,8 +172,10 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
         return [pscustomobject]@{ Code = $p.ExitCode; Out = $Child.Out.Result; Err = $Child.Err.Result }
     }
     catch {
-        # Whatever stopped the wait, a timeout or a failed write, the child's tree does not outlive
-        # it. Unconditional: a child that has exited can leave a grandchild holding its pipes.
+        # Whatever stopped the wait, a timeout or a failed write, the child's tree is killed.
+        # Unconditional: a child that has exited can leave a grandchild holding its pipes, and on
+        # Windows Kill($true) still reaches it then. On Linux and macOS it does not, since .NET
+        # stops at a child that has exited and the grandchild is reparented, so it can outlive the run.
         try { $p.Kill($true) } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
         throw
     }
@@ -365,8 +371,9 @@ function Get-PrimaryHolding([string]$Canon, $Lists) {
 }
 
 # This machine's OFF file silences the check, so it is read before anything else, the sanitiser
-# included, and a silenced run costs one git call. A read that fails only means not silenced: it
-# says so on stderr and costs no reason line, because silence is not a safety property.
+# included, and a silenced run costs one git call. A read that fails only means not silenced and
+# costs no reason line. Its stderr line reaches a person running the check by hand; under the
+# hook, which exits 0, the harness does not surface it.
 try {
     if (-not $FleetRepos) { throw 'no engine repository named' }
     $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
@@ -485,7 +492,7 @@ try {
                         "$($l.Repo) (the transcript's project directory)"
                     }
                 })
-            if ($inPrimary) { Add-Failure 'd' "the session is in the primary checkout of $($inPrimary -join ', '); relocating from there re-files the transcript, so the prompt stays" }
+            if ($inPrimary) { Add-Failure 'd' "the session is in the primary checkout of $($inPrimary -join ', '); relocating from there re-files the transcript" }
             else { [void]$passed.Add('d') }
         }
         catch { Add-Failure 'd' "where the session is or was launched could not be checked: $($_.Exception.Message)" }
