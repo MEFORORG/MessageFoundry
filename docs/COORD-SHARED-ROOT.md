@@ -256,9 +256,10 @@ design. Reads and builds keep working.
 2. On each PC, in a desktop shell, an elevated shell and a scheduled task, a probe script measures:
    UNC reachability, exclusive create (two processes race 100 times, exactly one wins each time),
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
-   Tools: `scripts/coord/coord-race.ps1` runs the exclusive-create race, one process per PC with a
-   shared `-StartAtUtc`, and `coord-race.ps1 -Compare` judges it: exit 3 on a double winner or an
-   empty slot, and exit 2 when the two sides did not overlap, so the run proves nothing.
+   Tools: `scripts/coord/coord-race.ps1` runs the exclusive-create race. Start one process on each
+   PC with the same `-StartAtUtc`. Then `coord-race.ps1 -Compare` judges the result. Exit 3 means
+   exclusive create failed, and exit 2 means the run was not a valid race. Its `.NOTES` block lists
+   every exit case.
 3. Land the resolver, the `host` field, the host-aware liveness checks and the gate tightening, with
    tests. Behaviour is unchanged, because no root is configured yet.
 4. Land the host-qualified box key: hash `<host>|<path>`, not the path alone, for seat ids,
@@ -276,8 +277,8 @@ design. Reads and builds keep working.
    with this step; nothing in step 3 does it.
    Tools: `scripts/coord/coord-migrate.ps1 -Source <local> -Target <share>` does the copy and the
    stamp in one pass, in place of robocopy. It is a dry run unless `-Apply`. It copies only the
-   shared kinds, skips retired, backup, temp and cache trees, and never overwrites. It exits 3 on
-   any conflict, allocation collision, or record it could not stamp safely.
+   shared kinds, skips retired, backup, temp and cache trees, and never overwrites. Exit 3 means at
+   least one finding needs a person. Its `.NOTES` block lists every exit case.
 7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
 8. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
    back from a second account.
