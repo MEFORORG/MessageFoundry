@@ -26,6 +26,7 @@ from messagefoundry.api import approvals as approvals_module
 from messagefoundry.api import tls as tls_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+from messagefoundry.auth import service as auth_service_module
 from messagefoundry.config.fingerprint import ConfigDirMissing
 from messagefoundry.store.base import audit_write_errors, store_call_errors
 from tests._ast_sites import call_sites, parse_source
@@ -291,11 +292,12 @@ def fake_pyodbc(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
     module.DatabaseError = _PyodbcDatabaseError  # type: ignore[attr-defined]
     module.InterfaceError = _PyodbcInterfaceError  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pyodbc", module)
-    audit_write_errors.cache_clear()
-    store_call_errors.cache_clear()
+    caches = (audit_write_errors, store_call_errors, auth_service_module._session_write_errors)
+    for cached in caches:
+        cached.cache_clear()
     yield module
-    audit_write_errors.cache_clear()
-    store_call_errors.cache_clear()
+    for cached in caches:
+        cached.cache_clear()
 
 
 def test_the_audit_write_catch_set_takes_the_driver_roots(fake_pyodbc: ModuleType) -> None:
@@ -320,8 +322,15 @@ def test_every_audit_write_defect_is_inside_the_catch_set() -> None:
 
 
 def test_the_auth_service_and_the_alert_rules_row_share_one_catch_set() -> None:
-    """BACKLOG #3403: no private copy of the audit-write catch set survives beside the shared one."""
+    """BACKLOG #3403: neither file keeps a private copy of the old audit-write catch set, the
+    function or its inlined tuple, beside the shared one. It checks those known shapes, not every
+    way to spell a catch set."""
+    copies = (
+        "def _audit_write_errors",
+        "(CipherError, *store_call_errors())",
+        "(*store_call_errors(), CipherError)",
+    )
     for name in ("auth/service.py", "api/app.py"):
         text = (_ENGINE / name).read_text(encoding="utf-8")
-        assert "def _audit_write_errors" not in text, name
+        assert not [c for c in copies if c in text], name
         assert "audit_write_errors()" in text, name

@@ -258,9 +258,9 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
     ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
     than :func:`~messagefoundry.store.base.audit_write_errors`, which also takes every
-    ``RuntimeError`` and ``CipherError``: a session row's seal is a local HMAC, so no Transit call
-    can refuse it, and an engine ``RuntimeError`` other than the acquire timeout still reads as a
-    defect."""
+    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: a session
+    row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
+    other than the acquire timeout still reads as a defect."""
     return store_open_errors()
 
 
@@ -9143,8 +9143,8 @@ class AuthService:
         already applied, nor for the hold, the breaker, the referral, the probe fault, the
         configuration refusal or a paging refusal. It would also skip every account after this
         one. So a store refusal of a type :func:`~messagefoundry.store.base.audit_write_errors`
-        names is logged at ERROR, naming the action and the actor, and the pass goes on. Any other error still raises and
-        ends the pass. The log line is the only record of a refused row: nothing retries it.
+        names is logged at ERROR, naming the action and the actor, and the pass goes on. Any other
+        error still raises and ends the pass. The log line is the only record of a refused row: nothing retries it.
 
         A revocation or rename these rows record has already committed; the conflict row records a
         rename that was refused. A revocation's notice is sent inline, so it still goes. **A
@@ -12802,7 +12802,7 @@ class AuthService:
             # cancellation can land after the store committed the revoke, and the row then says
             # ``session_ended: false`` for a session that did end.
             rotated = hash_token(elevation.token)
-            refused = (*store_call_errors(), CipherError)
+            refused = audit_write_errors()
             session_ended = False
             try:
                 session_ended = await write_audit_soft(

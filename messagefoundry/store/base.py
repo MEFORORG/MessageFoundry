@@ -3451,8 +3451,8 @@ def store_call_errors() -> tuple[type[Exception], ...]:
 @cache
 def audit_write_errors() -> tuple[type[Exception], ...]:
     """What a refused audit write raises, at least on the store backends and key modes named here
-    (BACKLOG #2137, #3403). The one catch set the auth service's audit writes and the API's
-    ``alert_rules_withheld`` row share.
+    (BACKLOG #2137, #3403). The auth service's store-refusal audit writes and the API's
+    ``alert_rules_withheld`` row catch this set; at least a few other audit writes catch their own.
 
     :func:`store_call_errors`: the drivers' own errors, ``RuntimeError`` for the engine's own
     refusals (the acquire timeout, a keyless audit append), ``OSError`` for a connection lost at the
@@ -3460,9 +3460,9 @@ def audit_write_errors() -> tuple[type[Exception], ...]:
     reached. ``CipherError``, which a ``vault_transit`` store raises when Transit cannot compute the
     audit-chain MAC (ADR 0138). And the driver roots that set stops beneath: ``sqlite3.Error``,
     which takes ``sqlite3.InterfaceError``, and pyodbc's ``Error`` through
-    :func:`store_connect_errors`. pyodbc raises that root for a SQLSTATE it does not map, such as a
-    deadlock victim, and its ``InterfaceError`` for a failed login. The pyodbc entry is left out
-    when it is not installed.
+    :func:`store_connect_errors`, which says when pyodbc raises it. So, unlike
+    :func:`store_driver_errors`, this set reads a SQLite interface error as a refusal: an audit
+    write's caller keeps its answer either way, and the row's loss is logged.
 
     Every class in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` is inside this set, so a
     caller that passes them as ``defects`` still raises them, because
