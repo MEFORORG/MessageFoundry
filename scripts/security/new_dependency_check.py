@@ -120,15 +120,7 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 
 # Reviewed exceptions: distribution -> reason. Deliberately a code constant rather than a file, so
 # adding one shows up in a diff with its justification attached.
-ALLOWLIST: dict[str, str] = {
-    "messagefoundry-webconsole": (
-        "reviewed 2026-10-21 -- this repository's own distribution "
-        "(packaging/messagefoundry-webconsole). The age floor guards against a name somebody else "
-        "registered; the project registered this one itself, so its age proves nothing. Remove "
-        "this entry after 2026-10-27, when the floor passes on its own, so every other check "
-        "covers the name again."
-    ),
-}
+ALLOWLIST: dict[str, str] = {}
 
 
 def normalize(name: str) -> str:
