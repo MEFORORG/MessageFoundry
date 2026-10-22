@@ -15,8 +15,9 @@
 
     IT FAILS CLOSED. The verdict starts false and is set only by the last statement of the checks,
     and only when every one of the six checks below recorded its own pass. A check that throws,
-    times out, or is skipped because an earlier one failed records no pass. The whole run is
-    bounded by -BudgetSeconds, so the hook finishes inside its settings timeout.
+    times out, or is skipped because an earlier one failed records no pass. Every child process
+    is bounded by -BudgetSeconds as well as its own timeout. The in-process reads (path
+    canonicalisation, Test-Path) are not, so a stalled volume runs into the hook's settings timeout.
 
     SAFE requires ALL of:
 
@@ -69,9 +70,10 @@
       * permanently: remove the EnterWorktree entry from .claude/settings.json.
 
 .PARAMETER BudgetSeconds
-    The bound on the whole run. Every child process is killed at its own timeout or at this
+    The bound on the run's child processes. Every child is killed at its own timeout or at this
     budget, whichever comes first, and none starts once it is spent. 40 s plus pwsh's start-up
-    stays under the 60 s timeout the settings entry gives the hook.
+    stays under the 60 s timeout the settings entry gives the hook, unless an in-process read
+    (a directory enumeration or Test-Path on a stalled volume) holds the run past it.
 
 .PARAMETER FleetRepos
     The fleet repositories. The FIRST is the engine, whose git common dir holds the OFF file. The
@@ -108,27 +110,6 @@ $safe = $false
 $budgetEnd = [DateTime]::UtcNow.AddSeconds($BudgetSeconds)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-# One sanitiser for every line printed. Loaded first: with none, no attacker-chosen text may be
-# printed at all, so the verdict is UNSAFE with a fixed reason.
-try {
-    $gate = Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/worktree_gate.ps1'
-    $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($gate, [ref]$null, [ref]$parseErrors)
-    if (@($parseErrors).Count) { throw 'worktree_gate.ps1 does not parse' }
-    $defs = @($ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SafeForMessage'
-            }, $true))
-    if ($defs.Count -ne 1) { throw "worktree_gate.ps1 defines Get-SafeForMessage $($defs.Count) times" }
-    # Dot-sourced at script level, so the gate's own definition lands in this script's scope.
-    . ([scriptblock]::Create($defs[0].Extent.Text))
-}
-catch {
-    Write-Output 'UNSAFE'
-    Write-Output '  the message sanitiser could not be loaded from scripts/hooks/worktree_gate.ps1, so no other reason is printed'
-    exit 1
-}
 
 $failures = [System.Collections.Generic.List[string]]::new()
 $passed = [System.Collections.Generic.HashSet[string]]::new()
@@ -170,7 +151,8 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
     $p = $Child.Process
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-        if ($script:budgetEnd -lt $deadline) { $deadline = $script:budgetEnd }
+        $bound = "did not finish within $TimeoutSeconds s"
+        if ($script:budgetEnd -lt $deadline) { $deadline = $script:budgetEnd; $bound = "was stopped when the check's $BudgetSeconds s budget ran out" }
         $left = { [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds) }
         $done = $true
         if ($Child.Write) {
@@ -181,13 +163,14 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
         # holds the pipe open after the child itself has exited.
         $done = $done -and $p.WaitForExit((& $left)) -and
         [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($Child.Out, $Child.Err), (& $left))
-        if (-not $done) { throw "$($Child.Name) did not finish within $TimeoutSeconds s or the check's $BudgetSeconds s budget" }
+        if (-not $done) { throw "$($Child.Name) $bound" }
         $p.WaitForExit()
         return [pscustomobject]@{ Code = $p.ExitCode; Out = $Child.Out.Result; Err = $Child.Err.Result }
     }
     catch {
-        # Whatever stopped the wait, a timeout or a failed write, the child does not outlive it.
-        try { if (-not $p.HasExited) { $p.Kill($true) } } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
+        # Whatever stopped the wait, a timeout or a failed write, the child's tree does not outlive
+        # it. Unconditional: a child that has exited can leave a grandchild holding its pipes.
+        try { $p.Kill($true) } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
         throw
     }
     finally { $p.Dispose() }
@@ -381,21 +364,43 @@ function Get-PrimaryHolding([string]$Canon, $Lists) {
     }
 }
 
+# This machine's OFF file silences the check, so it is read before anything else, the sanitiser
+# included, and a silenced run costs one git call. A read that fails only means not silenced: it
+# says so on stderr and costs no reason line, because silence is not a safety property.
 try {
-    # This machine's OFF file silences the check: read first, so a silenced run costs one git call.
-    # A read that fails is a failure, never silence, so the owner still sees a verdict.
-    try {
-        if (-not $FleetRepos) { throw 'no engine repository named' }
-        $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
-        if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
-        if (Test-Path -LiteralPath (Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF')) {
-            Write-Output 'OFF'
-            Write-Output '  this machine has turned the check off with its local OFF file'
-            exit 2
-        }
+    if (-not $FleetRepos) { throw 'no engine repository named' }
+    $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
+    if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
+    if (Test-Path -LiteralPath (Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF')) {
+        Write-Output 'OFF'
+        Write-Output '  this machine has turned the check off with its local OFF file'
+        exit 2
     }
-    catch { Add-Failure 'off' "the local OFF file could not be checked: $($_.Exception.Message)" }
+}
+catch { [Console]::Error.WriteLine("enter-check: the local OFF file could not be read: $($_.Exception.Message)") }
 
+# One sanitiser for every line printed. Loaded before any check: with none, no attacker-chosen text may be
+# printed at all, so the verdict is UNSAFE with a fixed reason.
+try {
+    $gate = Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/worktree_gate.ps1'
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($gate, [ref]$null, [ref]$parseErrors)
+    if (@($parseErrors).Count) { throw 'worktree_gate.ps1 does not parse' }
+    $defs = @($ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SafeForMessage'
+            }, $true))
+    if ($defs.Count -ne 1) { throw "worktree_gate.ps1 defines Get-SafeForMessage $($defs.Count) times" }
+    # Dot-sourced at script level, so the gate's own definition lands in this script's scope.
+    . ([scriptblock]::Create($defs[0].Extent.Text))
+}
+catch {
+    Write-Output 'UNSAFE'
+    Write-Output '  the message sanitiser could not be loaded from scripts/hooks/worktree_gate.ps1, so no other reason is printed'
+    exit 1
+}
+
+try {
     $target = $null
     $rawFull = $null
     $lists = @()
