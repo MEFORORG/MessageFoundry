@@ -20,7 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -979,13 +979,16 @@ _windows_only = pytest.mark.skipif(
 _two_launch_budget = pytest.mark.timeout(300)
 
 
-def _rebuilt_gate(dst: Path, old: str, new: str, why: str) -> Path:
-    """The shipped gate with ``old`` replaced by ``new``, for a control. The rewrite is ASSERTED to
-    have happened: a pattern that silently matched nothing would produce a control byte-identical to
-    the gate under test, and the pair would then agree for the wrong reason."""
+def _rebuilt_gate(dst: Path, old: str, new: str, why: str, *more: tuple[str, str]) -> Path:
+    """The shipped gate with ``old`` replaced by ``new``, and each further (old, new) pair in turn,
+    for a control. Each rewrite is ASSERTED to have happened: a pattern that silently matched nothing
+    would produce a control byte-identical to the gate under test, and the pair would then agree for
+    the wrong reason."""
     src = GATE.read_text(encoding="utf-8")
-    assert src.count(old) == 1, why
-    dst.write_text(src.replace(old, new), encoding="utf-8")
+    for before, after in ((old, new), *more):
+        assert src.count(before) == 1, f"{why}: {before!r}"
+        src = src.replace(before, after)
+    dst.write_text(src, encoding="utf-8")
     return dst
 
 
@@ -1290,6 +1293,21 @@ def test_a_config_write_to_a_disarm_key_still_denies(
 # isolates this change as the cause rather than asserting it.
 
 
+def _committed_repo(where: Path) -> Callable[..., None]:
+    """A git repository at ``where`` with one commit on ``main``; returns a ``git`` runner there."""
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=where, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "gate@example.invalid")
+    git("config", "user.name", "gate")
+    (where / "f.txt").write_text("one\n", encoding="utf-8")
+    git("add", "f.txt")
+    git("commit", "-qm", "one")
+    return git
+
+
 class HijackRepo(NamedTuple):
     """A governed primary plus two of its linked worktrees: the session's own, and another session's."""
 
@@ -1324,16 +1342,7 @@ NON_HEAD_MOVING_VERBS = [
 def hijack_repo(tmp_path: Path) -> HijackRepo:
     primary = tmp_path / "GateRepo"
     primary.mkdir()
-
-    def git(*args: str) -> None:
-        subprocess.run(["git", *args], cwd=primary, check=True, capture_output=True)
-
-    git("init", "-q", "-b", "main")
-    git("config", "user.email", "gate@example.invalid")
-    git("config", "user.name", "gate")
-    (primary / "f.txt").write_text("one\n", encoding="utf-8")
-    git("add", "f.txt")
-    git("commit", "-qm", "one")
+    git = _committed_repo(primary)
     mine = tmp_path / "GateRepo-mine"
     git("worktree", "add", "-q", "-b", "my-branch", str(mine))
     (mine / "sub").mkdir()
@@ -1674,3 +1683,168 @@ def test_a_HEAD_move_in_an_isolated_builders_own_nested_tree_is_allowed(
         capture_output=True,
     )
     assert run_gate(bash("git merge main", cwd=own), hijack_repos_file) is None
+
+
+# --- path comparisons are ordinal where ordinal denies at least as much ---------------------------
+#
+# A culture comparison ignores a soft hyphen or a zero-width character, so it reads `<p>-wt1<U+00AD>`
+# as `<p>-wt1`. Each test below runs the shipped gate and a control rebuilt with that one comparison
+# put back as it was, and the control is asserted to answer the other way.
+
+SOFT_HYPHEN = chr(0xAD)
+COMBINING_ACUTE = chr(0x301)
+_ORD = "[System.StringComparison]::Ordinal"
+
+
+class LookalikeRepo(NamedTuple):
+    """A governed primary with two linked worktrees whose paths differ only by a soft hyphen."""
+
+    primary: Path
+    wt1: Path
+    lookalike: Path
+    repos: Path
+
+
+@pytest.fixture
+def lookalike_repo(tmp_path: Path) -> LookalikeRepo:
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    wt1 = tmp_path / "GateRepo-wt1"
+    git("worktree", "add", "-q", "-b", "wt1-branch", str(wt1))
+    lookalike = tmp_path / f"GateRepo-wt1{SOFT_HYPHEN}"
+    git("worktree", "add", "-q", "-b", "other-branch", str(lookalike))
+    repos = tmp_path / "lookalike_repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    return LookalikeRepo(primary=primary, wt1=wt1, lookalike=lookalike, repos=repos)
+
+
+def test_a_head_move_into_a_lookalike_of_the_session_s_own_worktree_is_denied(
+    tmp_path: Path, lookalike_repo: LookalikeRepo
+) -> None:
+    """Rule 3b's own-worktree test. The culture `-eq` read the lookalike, another session's
+    worktree, as this session's own, and allowed `reset --hard` into it."""
+    repo = lookalike_repo
+    payload = bash(f'git -C "{repo.lookalike}" reset --hard main', cwd=repo.wt1)
+    reason = assert_denied(run_gate(payload, repo.repos))
+    assert "could not parse" not in reason
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_own_top.ps1",
+        f"[string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, {_ORD})",
+        "(Get-ComparablePath $ownTopRaw) -eq $selfTop",
+        "rule 3b's own-worktree comparison moved",
+    )
+    assert run_gate(payload, repo.repos, control) is None, "the culture control denied too"
+    # The session's real own worktree is still its own.
+    assert run_gate(bash("git reset --hard main", cwd=repo.wt1), repo.repos) is None
+
+
+#: Test-Governed's comparison as shipped, and with its culture half removed: the step the culture
+#: half is kept against. Used only to build controls.
+_GOVERNED_LINE = 'if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or $Candidate.StartsWith("$c/", $ord)) {'
+_GOVERNED_ORDINAL_ONLY = (
+    'if ([string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {'
+)
+
+
+def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_primary(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree at `<primary><U+200B>`. The shipped gate denies a head move into it from
+    another session through rule 3, because Test-Governed keeps its culture half. Rule 3b's primary
+    test is reached only without that half, so both controls drop it: rule 3b with its culture `-eq`
+    read the lookalike as the primary, left it to rule 3, and the move was allowed; ordinal, it is a
+    linked worktree, and the move is denied."""
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    lookalike = tmp_path / f"GateRepo{ZWSP}"
+    git("worktree", "add", "-q", "-b", "lookalike-branch", str(lookalike))
+    elsewhere = tmp_path / "GateRepo-elsewhere"
+    git("worktree", "add", "-q", "-b", "elsewhere-branch", str(elsewhere))
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    payload = bash(f'git -C "{lookalike}" reset --hard main', cwd=elsewhere)
+
+    assert_denied(run_gate(payload, repos))
+    why = "Test-Governed's comparison or rule 3b's primary test moved"
+    ordinal_3b = _rebuilt_gate(
+        tmp_path / "gate_ordinal_3b.ps1", _GOVERNED_LINE, _GOVERNED_ORDINAL_ONLY, why
+    )
+    culture_3b = _rebuilt_gate(
+        tmp_path / "gate_culture_3b.ps1",
+        _GOVERNED_LINE,
+        _GOVERNED_ORDINAL_ONLY,
+        why,
+        (f"[string]::Equals($selfTop, $mainWt, {_ORD})", "$selfTop -eq $mainWt"),
+    )
+    assert_denied(run_gate(payload, repos, ordinal_3b))
+    assert run_gate(payload, repos, culture_3b) is None, "the culture control denied too"
+
+
+def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
+    tmp_path: Path,
+) -> None:
+    """Rule 3d's governed test. A repository inside the governed root whose directory name starts
+    with a combining mark has a common dir the culture StartsWith does not see under the root, so
+    `git worktree remove` of its linked worktree was allowed. The ordinal half sees it."""
+    root = tmp_path / "Governed"
+    nested = root / f"{COMBINING_ACUTE}x"
+    nested.mkdir(parents=True)
+    git = _committed_repo(nested)
+    victim = tmp_path / "nested-wt"
+    git("worktree", "add", "-q", "-b", "victim-branch", str(victim))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{root}\n", encoding="utf-8")
+    payload = bash(f'git worktree remove "{victim}"', cwd=elsewhere)
+
+    assert_denied(run_gate(payload, repos))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_3d.ps1",
+        'if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or\n'
+        f'                $victimCmp.StartsWith("$($r.Compare)/", {_ORD})) {{ $govWt = $r; break }}',
+        'if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) '
+        "{ $govWt = $r; break }",
+        "rule 3d's governed test moved",
+    )
+    assert run_gate(payload, repos, control) is None, "the culture control denied too"
+
+
+def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
+    tmp_path: Path, lookalike_repo: LookalikeRepo
+) -> None:
+    """Rule 3d's self test, which picks the text only: both deny. The culture `-eq` told the session
+    the lookalike was the worktree it is running in."""
+    repo = lookalike_repo
+    payload = bash(f'git worktree move "{repo.lookalike}" ../elsewhere', cwd=repo.wt1)
+    own = "THE WORKTREE THIS SESSION IS RUNNING IN"
+    assert own not in assert_denied(run_gate(payload, repo.repos))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_isself.ps1",
+        f"[string]::Equals($victimTop, $selfTop, {_ORD})",
+        "($victimTop -eq $selfTop)",
+        "rule 3d's self test moved",
+    )
+    assert own in assert_denied(run_gate(payload, repo.repos, control))
+
+
+def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primary(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Get-SessionRoot picks the text only: EnterWorktree is denied either way. The culture `-eq`
+    read a directory at `<primary><U+200B>`, which is no worktree of it, as the primary, and handed
+    the reader a command in that checkout."""
+    cwd = tmp_path / f"{primary.name}{ZWSP}"
+    cwd.mkdir()
+    payload = enter_worktree(cwd)
+    cannot = "CANNOT TELL YOU WHICH CHECKOUT"
+    assert cannot in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_session_root.ps1",
+        f"        if ([string]::Equals($CwdCmp, $r.Compare, {_ORD}) -or\n",
+        "        if ($CwdCmp -eq $r.Compare -or\n",
+        "Get-SessionRoot's comparison moved",
+    )
+    assert cannot not in assert_denied(run_gate(payload, repos_file, control))

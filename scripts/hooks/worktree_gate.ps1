@@ -2419,7 +2419,7 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # standing outside every governed checkout.
 function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     foreach ($r in $roots) {
-        if ($CwdCmp -eq $r.Compare -or
+        if ([string]::Equals($CwdCmp, $r.Compare, [System.StringComparison]::Ordinal) -or
             $CwdCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
     }
     if (-not $CwdRaw) { return $null }
@@ -2431,7 +2431,7 @@ function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     $commonCmp = Get-ComparablePath $common $CwdRaw
     if (-not $commonCmp) { return $null }
     foreach ($r in $roots) {
-        if ($commonCmp -eq $r.Compare -or
+        if ([string]::Equals($commonCmp, $r.Compare, [System.StringComparison]::Ordinal) -or
             $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
     }
     return $null
@@ -2506,8 +2506,12 @@ $rehome
 # exemption uses it alone. The governed test
 # keeps its culture match beside the ordinal one, because the two disagree in BOTH directions (measured:
 # a combining mark after the slash makes the culture StartsWith false and the ordinal one true), and
-# dropping either loses a deny. The culture half still matters: rule 3b's own culture `-eq` hands a
-# linked worktree at `<primary><U+200B>` back to rule 3 as the primary, so rule 3 must govern it.
+# dropping either loses a deny. RULE 3b NO LONGER LEANS ON THE CULTURE HALF: its own comparisons are
+# ordinal, so without this half it would read a linked worktree at `<primary><U+200B>` as a linked
+# worktree. THE HALF STAYS ANYWAY, because this function also answers rules 1 and 3: without it, a write
+# into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
+# 2026-10-21). Path comparisons elsewhere in this file are ordinal where ordinal denies at least as much;
+# the ones that keep a culture half say why beside them.
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
     $ord = [System.StringComparison]::Ordinal
@@ -2539,6 +2543,10 @@ function Get-RootCommonDirCmp($Root) {
     # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
     $where = $Root.Display
     $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    # CULTURE, LEFT AS IT WAS. Ordinal here would send more roots to rule 3c's path test, which denies
+    # more only while the root's git dir sits under it; a separate git dir breaks that, so the change
+    # is not shown to deny at least as much. Git reports the toplevel of the directory it was handed,
+    # so the two spellings differing by an ignorable character is not a shape this is known to meet.
     if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
         $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
@@ -2606,7 +2614,7 @@ function Get-OwnWorktreeRemedy([string]$CwdRaw, [object[]]$List, [string]$MainWt
             if ("$ln" -notmatch '^worktree\s+(.+)$') { continue }
             $wt = Get-ComparablePath $Matches[1]
             if (-not $wt) { continue }
-            if (($cwdCmp -eq $wt -or $cwdCmp.StartsWith("$wt/", [System.StringComparison]::Ordinal)) -and
+            if (([string]::Equals($cwdCmp, $wt, [System.StringComparison]::Ordinal) -or $cwdCmp.StartsWith("$wt/", [System.StringComparison]::Ordinal)) -and
                 $wt.Length -gt $best.Length) { $best = $wt }
         }
         $prefix = "$MainWt/.claude/worktrees/"
@@ -2785,7 +2793,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
 
     $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
-    if (-not $selfTop -or $selfTop -eq $mainWt) { return }        # $wtRaw IS the primary -- Rule 3 owns it
+    if (-not $selfTop -or [string]::Equals($selfTop, $mainWt, [System.StringComparison]::Ordinal)) { return }        # $wtRaw IS the primary -- Rule 3 owns it
 
     if ($isHeadMove) {
         # CLASS B. The target is a governed LINKED worktree; the only remaining question is whether it is
@@ -2809,7 +2817,10 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         if (-not $CwdRaw) { return }
         $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
-        if ((Get-ComparablePath $ownTopRaw) -eq $selfTop) { return }   # the session's OWN worktree
+        # ORDINAL, because a match ALLOWS. A culture `-eq` ignores a soft hyphen or a zero-width
+        # character, so a session in `<p>-wt1` read `<p>-wt1<U+00AD>`, another session's worktree, as
+        # its own and was allowed `reset --hard` into it. The same holds for the primary test above.
+        if ([string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, [System.StringComparison]::Ordinal)) { return }   # the session's OWN worktree
 
         $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
         # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
@@ -3539,6 +3550,9 @@ What to do instead:
         # $govCfg IS NOT RE-INITIALISED HERE. It is set once above the candidate loop, because clearing
         # it per candidate would make the chain's answer depend on the LAST candidate walked instead of
         # the first that answered -- the opposite of what the chain is for.
+        # BOTH `-eq` BELOW STAY CULTURE. A match governs the config and so denies; an ordinal-only
+        # equality would stop matching a common dir that differs by an ignorable character, and allow
+        # a write this rule denies today. The prefix halves are ordinal already.
         foreach ($r in $roots) {
             $rootCommon = Get-RootCommonDirCmp $r
             if (-not $rootCommon) {
@@ -3776,8 +3790,11 @@ What to do instead:
         if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
         $victimCmp = Get-ComparablePath $victimCommon $victimAbs
         $govWt = $null
+        # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds denies. The
+        # ordinal half catches a combining mark after the slash, which the culture StartsWith misses.
         foreach ($r in $roots) {
-            if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) { $govWt = $r; break }
+            if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or
+                $victimCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govWt = $r; break }
         }
         if (-not $govWt) { continue }
 
@@ -3801,7 +3818,7 @@ What to do instead:
         if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
-        $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
+        $isSelf = $victimTop -and $selfTop -and [string]::Equals($victimTop, $selfTop, [System.StringComparison]::Ordinal)
 
         # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
         # already does and this one did not. It matters MORE after the quote-aware tokeniser above:
@@ -3898,12 +3915,12 @@ What to do instead:
         # script refuses by its own check; the reverse costs a route.
         $govLeaf = Split-Path $govWt.Display -Leaf
         $sibPrefix = "$($govWt.Compare)-"
-        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
+        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix, [System.StringComparison]::Ordinal) -and
                      -not $victimTop.Substring($sibPrefix.Length).Contains('/')
         $isManaged = $victimTop -and ($victimTop -match '/\.claude/worktrees(/|$)')
         # THE PRIMARY ITSELF IS NOBODY'S TO REMOVE. Git never removes a main worktree and the script
         # refuses it by name, so printing the -Path line for it would hand the reader a dead end.
-        $isPrimary = $victimTop -and ($victimTop -eq $govWt.Compare)
+        $isPrimary = $victimTop -and [string]::Equals($victimTop, $govWt.Compare, [System.StringComparison]::Ordinal)
         $pathRoute = (-not $isManaged) -and (-not $isPrimary) -and
                      (Test-ScriptDeclaresParameter $govWt.Display 'remove.ps1' 'Path')
         # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
@@ -4737,7 +4754,7 @@ try {
             # "REUSE one if it is yours", displacing a real worktree off the 8-item cap below. The one part
             # of this hook whose entire job is steering the next action was steering it back at the tree we
             # had just refused. Compare against the canonicalised form.
-            Where-Object { (Get-ComparablePath $_) -ne $root.Compare }
+            Where-Object { -not [string]::Equals((Get-ComparablePath $_), $root.Compare, [System.StringComparison]::Ordinal) }
     )
 } catch { $worktrees = @() }
 
