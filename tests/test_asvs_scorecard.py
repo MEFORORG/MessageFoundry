@@ -19,7 +19,7 @@ import re
 import subprocess
 import time
 from dataclasses import replace
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, get_args
 
 import pytest
@@ -1506,9 +1506,20 @@ def test_absence_corpus_skips_the_ides_unshipped_build_script(tmp_path: Path) ->
     root = _absence_tree(tmp_path, {"ide/esbuild.js": "fetch('/ui/logs/tail')\n"})
     assert _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')") == []
     repo = Path(__file__).resolve().parents[1]
-    ignored = (repo / "ide" / ".vscodeignore").read_text(encoding="utf-8").splitlines()
-    for rel in scorecard_module._SCRIPT_UNSHIPPED_FILES:
-        assert PurePath(rel).relative_to("ide").as_posix() in ignored, rel
+    lines = (repo / "ide" / ".vscodeignore").read_text(encoding="utf-8").splitlines()
+    ignored = {s for line in lines if (s := line.strip()) and not s.startswith("#")}
+    unshipped = {
+        PurePosixPath(rel).relative_to("ide").as_posix()
+        for rel in scorecard_module._SCRIPT_UNSHIPPED_FILES
+    }
+    assert unshipped <= ignored, unshipped - ignored
+    # Both ways: a literal script file the package leaves out must not be read either. A glob
+    # such as ``**/*.ts`` drops the TypeScript sources the built bundle is made from, which the
+    # corpus does read, so only literal names count.
+    literal_scripts = {
+        e for e in ignored if e.endswith(scorecard_module._SCRIPT_SUFFIXES) and "*" not in e
+    }
+    assert literal_scripts <= unshipped, literal_scripts - unshipped
 
 
 def test_absence_corpus_pairs_with_its_source_list(tmp_path: Path) -> None:
