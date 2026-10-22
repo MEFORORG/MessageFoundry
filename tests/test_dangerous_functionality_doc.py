@@ -661,6 +661,41 @@ def test_code_drift_is_reported() -> None:
     assert _start_drift(text, _start_sites(sources))
 
 
+def _cipher_probe_bound_drift(text: str, live_seconds: float) -> list[str]:
+    """Section 4 must state the host cipher probes' timeout as the code sets it (vault BACKLOG
+    #3804 item 5). Before this, the bound was a doc-side literal that nothing read."""
+    rendered = f"bounded at {live_seconds:g} s (`_PROBE_TIMEOUT_S`)"
+    # Whitespace is collapsed, so a re-wrap of the paragraph does not read as drift.
+    section = " ".join(_section(text, 4).split())
+    if rendered not in section:
+        return [f"section 4 does not state {rendered!r}, the value of cipher_policy's timeout"]
+    return []
+
+
+def test_the_cipher_probe_bound_matches_the_code() -> None:
+    from messagefoundry.verify import cipher_policy
+
+    problems = _cipher_probe_bound_drift(_doc_text(), cipher_policy._PROBE_TIMEOUT_S)
+    assert not problems, (
+        "docs/DANGEROUS-FUNCTIONALITY.md section 4 has drifted from the code:\n  "
+        + "\n  ".join(problems)
+    )
+
+
+def test_cipher_probe_bound_drift_is_reported() -> None:
+    """Break the page, then the code, in memory, and each must be reported."""
+    from messagefoundry.verify import cipher_policy
+
+    live = cipher_policy._PROBE_TIMEOUT_S
+    text = _doc_text()
+    assert not _cipher_probe_bound_drift(text, live)
+    stated = f"bounded at {live:g} s"
+    assert _cipher_probe_bound_drift(
+        _replace_once(text, stated, f"bounded at {live * 10:g} s"), live
+    )
+    assert _cipher_probe_bound_drift(text, live + 1)
+
+
 def test_the_scans_read_the_toolkit() -> None:
     """The toolkit holds no site today, so a scan that skipped it would pass the same way. It must be
     read, keyed by its package name, and a site planted in it must reach at least the five checks

@@ -344,12 +344,36 @@ process's import path (vault BACKLOG #2852). The relaunch it starts repeats that
 the login command adds where `PYTHONNOUSERSITE` is set, as every Python child repeats its parent's
 isolation (vault BACKLOG #2701). A tray started by hand gets none of the options, and its relaunch
 reads the user's `PYTHONPATH`. Section 3, under
-*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The `icacls.exe` and `sc.exe` starts get
-the platform's start-up names and nothing else, from the same module (vault BACKLOG #2716). The other
-starts in the table hand over the whole environment. One of them leaves two names out: when the
-tray starts VS Code, it drops the two variables VS Code's own launcher manages. `tests/test_child_process_environment.py`
-lists each of those with its reason, and fails a new start whose environment does not come from
-that module.
+*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path.
+
+What the other children get, read from the builder each start calls:
+
+- The `icacls.exe` and `sc.exe` starts get the platform's start-up names and nothing else
+  (`system_tool_environment`, vault BACKLOG #2716).
+- The sandbox worker gets an allowlist (`worker_environment`): the platform's start-up names, the
+  interpreter's own variables, the engine switches its own code reads, and the names
+  `[sandbox].pass_environment` lists. No other inherited variable crosses.
+- The disaster-recovery hook gets everything outside the engine's `MEFOR_*` namespace, less the
+  few secret names the module lists outside it (`hook_environment`). A secret kept under any other
+  name still reaches it.
+- The engine shards and the config-loading child get the whole environment, secrets included,
+  less any empty or relative `PYTHONPATH` entry (`engine_environment`).
+- `verify/cipher_policy.py` starts `powershell.exe` with the platform's start-up names only, as
+  the `icacls.exe` and `sc.exe` starts are. It starts `openssl` with the platform's start-up names,
+  the interpreter's own variables, and the four variables OpenSSL reads to find its configuration:
+  `OPENSSL_CONF`, `OPENSSL_CONF_INCLUDE`, `OPENSSL_MODULES` and `OPENSSL_ENGINES`. No other
+  variable reaches either.
+- `security/audit_all_platforms.py` starts `pip` and `pip-audit` with everything outside the
+  engine's `MEFOR_*` namespace and the module's listed secret names, less any empty or relative
+  `PYTHONPATH` entry (`hook_environment` over `engine_environment`). So they keep the index, proxy
+  and certificate settings they read from the environment, and any other variable the runner set,
+  a CI token among them, reaches them too.
+
+At least these hand over the environment they run with, on purpose: `checks.py`, which adds one
+variable; the tray's opens, where starting VS Code drops the two variables VS Code's own launcher
+manages; and the elevated service-control and install commands, because `ShellExecute` takes no
+environment argument. `tests/test_child_process_environment.py` lists each of those with its
+reason, and fails a new start whose environment does not come from one of that module's builders.
 
 **The other forms are the ones to look at hardest.**
 
@@ -382,6 +406,8 @@ setting or message reaches it, and it calls `Get-TlsCipherSuite` through the sys
 imported by its path, never by name. No command it runs is looked up by a bare name, so a
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
+Each of the module's two starts, `powershell.exe` and `openssl`, is bounded at 30 s
+(`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and the row reads ERROR.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
@@ -747,7 +773,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke` runs NSSM the same way. |
+| `measure-store-access.ps1` | An operator-run measurement script, in the assessment scope like the rest of this folder by owner ruling of 2026-10-05 ([`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2). It measures whether the service account and the operator can both open one store; it is not a deployment step, and the CI job `windows-service-smoke` runs it too. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke` runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
