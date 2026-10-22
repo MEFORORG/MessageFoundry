@@ -339,6 +339,12 @@ The metadata caps are not decoration: a cap on the body alone is a cap with an o
 unbounded `from.branch` pushes the preamble off the top of the injection just as effectively as an
 unbounded body would.
 
+**A `[SESSION-ANNOUNCE]` message renders as one line.** The drain shows the sender's claimed worktree,
+branch, intent and touching on a single `    | ` line marked `[UNVERIFIED]`, between the usual id
+delimiters, and drops the rest of the envelope. An audit of 196 mailed messages found 85 were
+announces. A body with an HL7-shaped line is not summarised, so the withholding backstop still applies.
+The selection pass still charges the full body, so the caps above stay an upper bound.
+
 **Where the numbers come from.** These anchors were measured in this repo on 2026-08-05. The
 per-injection **total** is not one of them: it is derived from the other caps, `5 * (2000 + 560)`, so
 that the message cap is the one that binds. That derivation is the correction BACKLOG #1386 records.

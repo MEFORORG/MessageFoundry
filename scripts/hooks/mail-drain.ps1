@@ -436,6 +436,12 @@ function Get-CleanLines {
 $BODY_PREFIX = '    | '
 $BODY_PREFIX_BYTES = $BODY_PREFIX.Length
 
+# The paste backstop's one pattern, shared by Format-Body and Format-AnnounceLine. Two copies would
+# let a segment added to one slip past the other.
+$HL7_SEGMENT_START = '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|'
+# The one-line render of an announce, before the on-disk pointer is appended.
+$MAX_ANNOUNCE_CHARS = 400
+
 function Measure-BodyBytes {
     # Bytes, not characters, and measured on the SANITISED text. Get-Clean has already substituted
     # every non-ASCII code point, so one character is one byte here -- which is the only reason a
@@ -475,7 +481,7 @@ function Format-Body {
     # body". This is a backstop
     # for the realistic accident, and its presence is not evidence that the queue is PHI-safe.
     foreach ($l in $Lines) {
-        if ($l -cmatch '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|') {
+        if ($l -cmatch $HL7_SEGMENT_START) {
             return [pscustomobject]@{
                 Lines     = @(
                     "    | [mefor-mail: body withheld -- it contains a line shaped like an HL7 segment, and"
@@ -522,6 +528,34 @@ function Format-Body {
         $out += "    |  The whole message is on disk at $DiskPath.]"
     }
     return [pscustomobject]@{ Lines = @($out); Withheld = $false; Truncated = $truncated }
+}
+
+function Format-AnnounceLine {
+    # A [SESSION-ANNOUNCE] BROADCAST RENDERS AS ONE LINE. An audit of 196 mailed messages found 85
+    # were announces, each about 600 bytes framed, and the reader needs four facts from one: who,
+    # which branch, what they intend, and what they touch. Everything else in the body is the
+    # sender's envelope. $null means "not an announce, render it in full", and so does any line
+    # Format-Body would withhold, so the HL7 backstop is never bypassed by this shortcut.
+    #
+    # The line is message content, so it carries the '    | ' prefix like any body line, and every
+    # field went through Get-Clean on its way here. Only the frame delimiters stay at column 0.
+    param([string[]]$Lines, [string]$FromCwd, [string]$FromBranch, [string]$DiskPath)
+    if (-not $Lines -or -not ([string]$Lines[0]).StartsWith('[SESSION-ANNOUNCE]')) { return $null }
+    foreach ($l in $Lines) { if ($l -cmatch $HL7_SEGMENT_START) { return $null } }
+    # Get-CleanLines has trimmed every line, so a wrapped intent's continuation lines arrive as bare
+    # text. Any 'word:' line starts a new field; anything else continues the current one.
+    $f = @{ intent = ''; touching = '' }
+    $cur = ''
+    foreach ($l in @($Lines | Select-Object -Skip 1)) {
+        if ($l -match '\A([a-z-]+):\s*(.*)\z') { $cur = $Matches[1]; if ($f.ContainsKey($cur)) { $f[$cur] = $Matches[2] }; continue }
+        if ($l -and $f.ContainsKey($cur)) { $f[$cur] = "$($f[$cur]) $l" }
+    }
+    $intent = if ($f.intent) { $f.intent } else { '(none given)' }
+    $text = "announce: $FromCwd (branch $FromBranch); intent: $intent"
+    if ($f.touching) { $text += "; touching: $($f.touching)" }
+    $text = Get-Fold $text
+    if ($text.Length -gt $MAX_ANNOUNCE_CHARS) { $text = $text.Substring(0, $MAX_ANNOUNCE_CHARS - 3) + "...  [the rest is on disk at $DiskPath]" }
+    return "$BODY_PREFIX$text  [UNVERIFIED]"
 }
 
 function Write-MailReceipt {
@@ -1684,6 +1718,13 @@ try {
         #
         # The rule is now literally true: message-derived text cannot reach column 0 anywhere.
         $lines += "--- message id=$($d.Item.Id)"
+        $ann = Format-AnnounceLine -Lines $d.Item.CleanLines -FromCwd $fromCwd -FromBranch $fromBr -DiskPath $restPath
+        if ($ann) {
+            $lines += $ann
+            $lines += "--- end message id=$($d.Item.Id)"
+            $lines += ""
+            continue
+        }
         # [UNVERIFIED] sits at the POINT OF USE so the reader does not have to carry the preamble down
         # thirty lines to a message header.
         $lines += "    | claimed-from: $fromCwd  (branch $fromBr)  [UNVERIFIED]"

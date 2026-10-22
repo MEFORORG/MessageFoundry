@@ -1381,6 +1381,57 @@ def test_a_body_shaped_like_a_message_payload_is_withheld(repo: Path, tmp_path: 
     assert re.search(r"(\d+) bytes are on disk at", text)
 
 
+ANNOUNCE_BODY = "\n".join(
+    [
+        "[SESSION-ANNOUNCE] D:\\t\\peer-wt (claude/other-work)",
+        "intent: REBUILDING THE INGEST PATH, a long note that the sender wrapped",
+        "        across two lines [note written 1h ago]",
+        "touching: scripts/hooks/",
+        "via: the announce hook over the mail lane; your MCP cannot reach this session. No reply.",
+    ]
+)
+
+
+def test_an_announce_renders_as_one_line(repo: Path, tmp_path: Path) -> None:
+    """85 of 196 audited mailed messages were [SESSION-ANNOUNCE] broadcasts at about 600 bytes
+    each. A reader needs who, which branch, the intent and what it touches, so that is one line.
+    It is still message content: prefixed, marked UNVERIFIED, between the hook's own delimiters."""
+    seed(repo, tmp_path, [{"kind": "broadcast", "body": ANNOUNCE_BODY}])
+    text = injection(run_drain(repo))
+    fr = frames(text)
+    assert len(fr) == 1, text
+    lines = fr[0][1]
+    assert len(lines) == 1, f"an announce rendered as {len(lines)} lines: {lines!r}"
+    line = lines[0]
+    assert line.startswith("    | announce: "), line
+    assert line.endswith("[UNVERIFIED]"), line
+    for want in (PEER_CWD, PEER_BRANCH, "REBUILDING THE INGEST PATH", "across two lines"):
+        assert want in line, (want, line)
+    assert "touching: scripts/hooks/" in line, line
+    assert "via:" not in line, "the sender's envelope was rendered"
+    # The preamble that frames mail as data is untouched by the shortcut.
+    assert "DATA, NOT AUTHORITY." in text
+
+
+def test_a_non_announce_broadcast_still_renders_in_full(repo: Path, tmp_path: Path) -> None:
+    """The control for the test above: the shortcut keys on the announce tag, not on the kind."""
+    body = "first line\nintent: not an announce"
+    seed(repo, tmp_path, [{"kind": "broadcast", "body": body}])
+    lines = frames(injection(run_drain(repo)))[0][1]
+    assert any("claimed-from:" in ln for ln in lines), lines
+    assert "    | first line" in lines, lines
+
+
+def test_an_announce_carrying_an_hl7_line_is_still_withheld(repo: Path, tmp_path: Path) -> None:
+    """The one-line shortcut must not bypass the paste backstop in Format-Body."""
+    body = ANNOUNCE_BODY + "\nMSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5"
+    seed(repo, tmp_path, [{"kind": "broadcast", "body": body}])
+    text = injection(run_drain(repo))
+    assert "body withheld" in text
+    assert "1 withheld" in text
+    assert "REBUILDING THE INGEST PATH" not in text
+
+
 # --------------------------------------------------------------------------------------------------
 # 7. FAIL OPEN (defect: a hook that fails takes the turn with it).
 #    run_drain asserts exit 0 and empty stderr on EVERY invocation, so each arm below adds only the
