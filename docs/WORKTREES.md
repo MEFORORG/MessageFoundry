@@ -987,13 +987,19 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 You don't have to brief each new chat by hand. A `SessionStart` hook
 ([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
-into every new Claude Code window. It always prints the project's Ultracode working-default
-reminder, and **when 2+ worktrees
-share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
-full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
-working-default line.
+into every new Claude Code window. **When 2+ worktrees share this `.git`** it prints the
+parallel-session block. The block holds at least these: which worktree and branch this chat owns, the
+live peers, what they are building, the work claims, and the shared-memory write rule above. With a
+single worktree it prints only a fault line, when it could not read the session's worktree.
 
-**Who is actually live — `presence.ps1`.** The worktree list above is the set of *checkouts*, not the
+The block is small on purpose. Past a size threshold, the harness saves a hook's output to a file. It
+then injects only a short preview of the head. This repository does not document that threshold. So
+the script sets its own byte budget, on its `$byteBudget` line. The high-signal sections print first.
+Each list stops at a cap and names the command that shows the rest. Past the budget, the script cuts
+the end of the lists and says so. On 2026-10-22, with 471 worktrees and 155 claims, the old banner
+printed every worktree and ran to 128,001 bytes. The peers and claims never reached the model.
+
+**Who is actually live — `presence.ps1`.** The worktree count is the set of *checkouts*, not the
 set of *sessions*: most worktrees usually have nobody in them, and the collision that matters — someone
 editing the shared primary right now — is invisible from it. The banner therefore also lists **live
 sessions**, from [../scripts/coord/presence.ps1](../scripts/coord/presence.ps1). Run it directly any time:

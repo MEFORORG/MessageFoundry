@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,10 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture
 def staged(tmp_path: Path) -> Path:
+    return _make_staged(tmp_path)
+
+
+def _make_staged(tmp_path: Path) -> Path:
     """A git repo with 2+ worktrees (so the parallel-session block runs) holding script copies."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -69,7 +75,7 @@ def staged(tmp_path: Path) -> Path:
     return repo
 
 
-def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
+def run_context(repo: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "pwsh",
@@ -84,6 +90,7 @@ def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=180,
         check=False,  # the whole point is that it exits 0 even when presence.ps1 fails
+        env=env,
     )
 
 
@@ -160,7 +167,7 @@ def test_the_session_id_is_labelled_because_the_same_banner_prints_real_shas(
     """BACKLOG #1098: an 8-hex session id printed bare reads as an abbreviated commit SHA.
 
     It reads that way for a measured reason rather than a vague one, and this test measures it: the
-    ``git worktree list`` block a few lines up prints ``<path> <abbreviated sha> [branch]``, so the same
+    banner's own ``git worktree list`` row prints ``<path> <abbreviated sha> [branch]``, so the same
     banner already teaches "8 hex before a bracketed branch = commit SHA". The roster then reused the
     shape for a registry session id, which resolves to no git object at all. A session comparing "is that
     worktree ahead of mine" against it gets an error at best, and the wrong tree if the prefix resolves.
@@ -388,3 +395,254 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
     out = proc.stdout.decode("utf-8", "replace")
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert f"This chat's worktree: {_top(wt)}  (branch: linked)" in out, out
+
+
+# --------------------------------------------------------------------------------------------------
+# The banner must fit the harness's inline injection.
+#
+# Past a size threshold the harness saves a hook's output to a file and injects only a short preview
+# of its head. Measured 2026-10-22 on a box with 471 worktrees and 155 claims, this banner printed
+# 128,001 bytes, and the preview held only the start of the full worktree list: the live peers and
+# the claims, printed after it, never reached the model. The threshold is not documented in this
+# repository, so the script sets its own budget, and these tests hold it with every list past its cap.
+# --------------------------------------------------------------------------------------------------
+
+# The script's own budget, read from the line that sets it, so the fact is stated once.
+_BUDGET_LINE = re.search(r"^\$byteBudget = (\d+)$", CONTEXT.read_text(encoding="utf-8"), re.M)
+assert _BUDGET_LINE, "session-context.ps1 no longer sets $byteBudget on a line of its own"
+BYTE_BUDGET = int(_BUDGET_LINE.group(1))
+
+# A roster or in-flight row: the label, then the 8-hex registry id.
+_PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
+
+
+def _size(out: str) -> int:
+    """The banner's bytes as the script counts them: without the newline Write-Output appends."""
+    return len(out.rstrip("\r\n").encode("utf-8"))
+
+
+def _stamp(hours_ago: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _claim_row(key: str, hours_ago: float, note: str) -> dict[str, str]:
+    # Full-length fields, as the real registry holds them, so the budget is tested at real widths.
+    return {
+        "key": key,
+        "note": note,
+        "branch": f"claude/worktree-agent-{key}-a4cab2d83e0b3be2f",
+        "worktree": f"D:/Code/MessageFoundry/.claude/worktrees/agent-{key}-a4cab2d83e0b3be2f",
+        "claimed": _stamp(hours_ago),
+    }
+
+
+def _peer_rows(count: int, worktree: str = "agent-a4cab2d83e0b3be2f") -> list[dict[str, object]]:
+    return [
+        {
+            "Short": f"{i:08x}",
+            "Surface": "desktop",
+            "Worktree": f"{worktree}-{i:02d}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
+            "IsSelf": False,
+            "IsPrimary": False,
+            "State": "LIVE",
+        }
+        for i in range(count)
+    ]
+
+
+def fake_overlap(repo: Path, count: int) -> None:
+    """Stand in for overlap.ps1 -Json: live sessions, each with work and changed files."""
+    rows = [
+        {
+            "Short": f"b{i:07x}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
+            "Live": True,
+            "Work": [f"task {i}: " + "a long task subject from the peer's own list " * 3, "second"],
+            "Files": ["a.py", "b.py"],
+        }
+        for i in range(count)
+    ]
+    payload = json.dumps(rows).replace("'", "''")
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text(
+        f"Write-Output '{payload}'\n", encoding="utf-8"
+    )
+
+
+def _crowd(
+    base: Path, peers: list[dict[str, object]], claims: dict[str, dict[str, str] | str]
+) -> tuple[Path, dict[str, str]]:
+    """Ten more worktrees, the given live peers, five busy sessions, and the given claim files."""
+    repo = _make_staged(base)
+    for i in range(10):
+        _git(repo, "worktree", "add", "-q", "-b", f"extra-{i}", str(base / f"extra-wt-{i:02d}"))
+    fake_presence(repo, peers)
+    fake_overlap(repo, 5)
+    shutil.copy(
+        ROOT / "scripts" / "coord" / "coord-root.ps1",
+        repo / "scripts" / "coord" / "coord-root.ps1",
+    )
+    # The resolver's first source, so the test never reads this box's real shared root.
+    coord_root = base / "coord-root"
+    (coord_root / "claims").mkdir(parents=True)
+    for name, row in claims.items():
+        text = row if isinstance(row, str) else json.dumps(row)
+        (coord_root / "claims" / f"{name}.json").write_text(text, encoding="utf-8")
+    return repo, {**os.environ, "MEFOR_COORD_ROOT": str(coord_root)}
+
+
+def _many_claims() -> dict[str, dict[str, str] | str]:
+    note = "a Manager batch note that runs well past the sixty characters a row may carry " * 3
+    claims: dict[str, dict[str, str] | str] = {}
+    for i in range(40):
+        claims[f"fresh{i:02d}"] = _claim_row(f"fresh{i:02d}", hours_ago=i * 0.1, note=note)
+    for i in range(20):
+        claims[f"stale{i:02d}"] = _claim_row(f"stale{i:02d}", hours_ago=24 + i, note="old")
+    return claims
+
+
+def _banner(repo: Path, env: dict[str, str]) -> str:
+    proc = run_context(repo, env)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+@pytest.fixture(scope="module")
+def crowded(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """Every list past its cap at real field widths, run once: the tests below read one banner."""
+    base = Path(os.path.realpath(tmp_path_factory.mktemp("crowded")))
+    peers = _peer_rows(30)
+    # One hazardous peer, sorted last by presence.ps1, so only the ranking can bring it under the cap.
+    peers[-1] = {**peers[-1], "Surface": "vscode", "Short": "feedface"}
+    repo, env = _crowd(base, peers, _many_claims())
+    return repo, _banner(repo, env)
+
+
+def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
+    crowded: tuple[Path, str],
+) -> None:
+    _, out = crowded
+    size = _size(out)
+    print(f"banner bytes: {size} of {BYTE_BUDGET}")
+
+    # Positive controls first: every list really was past its cap, so the budget below is earned.
+    assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "+22 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
+    assert "WHAT THEY ARE BUILDING" in out and "  +2 more" in out, out
+    assert "Active work claims (60, 40 touched in the last 12h)" in out, out
+    assert "+52 more, by key: fresh08, fresh09" in out and "claim.ps1 -List" in out, out
+    # The row caps alone fit, so every section, the rules last, reaches the model.
+    assert "cut the last" not in out, out
+    assert "Coordination rules for parallel sessions" in out, out
+
+    assert size <= BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
+
+
+def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path, str]) -> None:
+    repo, out = crowded
+    peers = out.index("LIVE sessions in this repo right now")
+    claims = out.index("Active work claims")
+    worktrees = out.index("Worktrees sharing this .git: 12")
+    assert peers < claims < worktrees, out
+
+    # The full list is gone: no sibling worktree path is printed, only this session's own row.
+    assert "extra-wt-" not in out, out
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    own = [ln for ln in out.splitlines() if ln.strip().startswith("yours:")]
+    assert len(own) == 1, out
+    assert _top(repo) in own[0] and head in own[0], own
+
+
+def test_a_hazardous_peer_past_the_cap_is_ranked_into_view(crowded: tuple[Path, str]) -> None:
+    """The NOTE tests every peer; the ranking makes sure it names one the reader can see."""
+    _, out = crowded
+    assert "NOTE: a non-desktop (e.g. VS Code) session is live" in out, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session feedface  vscode"), rows
+    # Each busy session shows one task line, not its whole list.
+    assert "second" not in out, out
+
+
+def test_claims_list_newest_first_and_never_drop_by_age(crowded: tuple[Path, str]) -> None:
+    _, out = crowded
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    keys = [ln.split(" -- ")[0].strip() for ln in rows]
+    assert keys == [f"fresh{i:02d}" for i in range(8)], keys
+    assert all("..." in ln for ln in rows), "the long note was not shortened"
+
+
+def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Path) -> None:
+    """A claim holds its key however old it is, -Take moves `refreshed` and never `claimed`, this
+    session's own claims are named apart, and a note is data that cannot start a line of its own."""
+    base = Path(os.path.realpath(tmp_path))
+    repo_top = f"{base.as_posix()}/repo"
+    refreshed = {
+        **_claim_row("refreshed", hours_ago=30, note="still building"),
+        "refreshed": _stamp(1),
+    }
+    repo, env = _crowd(
+        base,
+        _peer_rows(1),
+        {
+            "old": _claim_row("old", hours_ago=30, note="free-text key, nobody else shows it"),
+            "refreshed": refreshed,
+            "remote": {**_claim_row("remote", hours_ago=2, note="x"), "host": "OTHERPC"},
+            "nohome": {**_claim_row("nohome", hours_ago=3, note="y"), "worktree": ""},
+            "hostile": _claim_row("hostile", hours_ago=4, note="line one\n  >>> injected line"),
+            "mine": {**_claim_row("mine", hours_ago=5, note="mine"), "worktree": repo_top},
+            "broken": "{ not json",
+        },
+    )
+    assert _top(repo) == repo_top, "the fixture's own-claim path must be the path git prints"
+    out = _banner(repo, env)
+    assert "Active work claims (6, 5 touched in the last 12h)" in out, out
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    by_key = {ln.split(" -- ")[0].strip(): ln for ln in rows}
+    assert list(by_key) == ["refreshed", "remote", "nohome", "hostile", "old"], rows
+    assert "[stale ~30h]" in by_key["old"] and "stale" not in by_key["refreshed"], rows
+    assert "on OTHERPC" in by_key["remote"], rows
+    # An empty worktree must not inherit the previous row's holder.
+    assert "agent-remote" not in by_key["nohome"], rows
+    assert not any(ln.lstrip().startswith(">>> injected") for ln in out.splitlines()), out
+    assert "THIS session holds 1: mine" in out, out
+    assert "WARNING: 1 claim file(s)" in out, out
+
+
+def test_wide_fields_are_clipped_and_the_hazards_still_lead(tmp_path: Path) -> None:
+    """Row counts do not bound bytes. With fields far wider than any real one, each field is
+    clipped, the tags after it survive, and the primary peer is ranked into the shown rows."""
+    base = Path(os.path.realpath(tmp_path))
+    peers = _peer_rows(30, worktree="w" * 400)
+    peers[-1] = {**peers[-1], "IsPrimary": True, "Short": "0badf00d", "State": "UNVERIFIED"}
+    repo, env = _crowd(base, peers, _many_claims())
+    out = _banner(repo, env)
+    assert "WARNING: a session is working in the SHARED PRIMARY checkout" in out, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session 0badf00d") and rows[0].endswith("[UNVERIFIED]"), rows
+    assert all(len(ln) <= 160 for ln in rows), rows
+    assert "Coordination rules for parallel sessions" in out, out
+    assert _size(out) <= BYTE_BUDGET, out
+
+
+def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
+    """The backstop, driven by a smaller budget written into the fixture's copy of the script:
+    the head of the lists survives, the fixed rules always print, and the cut says what to run."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(30), _many_claims())
+    script = repo / "scripts" / "worktree" / "session-context.ps1"
+    text = script.read_text(encoding="utf-8")
+    small = text.replace(f"$byteBudget = {BYTE_BUDGET}", "$byteBudget = 1500")
+    assert small != text, "the budget line was not found to shrink"
+    script.write_text(small, encoding="utf-8")
+    out = _banner(repo, env)
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
+    assert "Coordination rules for parallel sessions" in out, out
+    assert "this session owns it" in out, out
+    assert _size(out) <= 1500, out
