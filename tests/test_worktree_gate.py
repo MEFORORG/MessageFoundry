@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -973,6 +974,9 @@ ZWSP = chr(0x200B)  # E2 80 8B
 _windows_only = pytest.mark.skipif(
     sys.platform != "win32", reason="console code pages are a Windows concept"
 )
+#: Each console case makes two launches, and each can wait in single_spawn before it starts, so the
+#: suite's --timeout=60 would fire before the labelled diagnostic in _run_gate_in_console could.
+_two_launch_budget = pytest.mark.timeout(300)
 
 
 def _rebuilt_gate(dst: Path, old: str, new: str, why: str) -> Path:
@@ -1026,12 +1030,20 @@ def _run_gate_in_console(
         try:
             stdout, stderr = proc.communicate(raw, timeout=GATE_TIMEOUT_S)
         except subprocess.TimeoutExpired as exc:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-            proc.communicate()
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=30
+            )
+            proc.kill()
+            dump: tuple[bytes | None, bytes | None]
+            try:
+                dump = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                dump = (exc.stdout, exc.stderr)
             raise AssertionError(
                 f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304). A process launch "
                 "that never returned, NOT evidence that the gate's behaviour changed; run_gate's "
-                f"docstring says what to do. LAUNCHED {_pwsh_identity()}"
+                f"docstring says what to do.\nCHILD STDOUT before the kill: {dump[0]!r}\n"
+                f"CHILD STDERR before the kill: {dump[1]!r}\nLAUNCHED {_pwsh_identity()}"
             ) from exc
     after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
@@ -1047,7 +1059,8 @@ def _run_gate_in_console(
         )
     out = stdout.decode(f"cp{codepage}", errors="replace")
     page, _, decision = out.partition("\n")
-    if not page.strip().endswith(f" {codepage}"):
+    # A word match, not a suffix: a localized chcp may end its line with a period.
+    if not re.search(rf"\b{codepage}\b", page):
         pytest.skip(f"this host's console did not take cp{codepage}: {out!r}")
     assert proc.returncode == 0, out + stderr.decode(f"cp{codepage}", errors="replace")
     return json.loads(decision) if decision.strip() else None
@@ -1083,6 +1096,7 @@ def test_a_non_ascii_primary_is_governed_on_raw_utf8_input(tmp_path: Path, char:
 
 
 @_windows_only
+@_two_launch_budget
 @pytest.mark.parametrize("codepage", [437, 932])
 @pytest.mark.parametrize("char", [E_ACUTE, ZWSP])
 def test_a_non_ascii_primary_is_governed_whatever_the_console_code_page(
@@ -1106,6 +1120,7 @@ def test_a_non_ascii_primary_is_governed_whatever_the_console_code_page(
 
 
 @_windows_only
+@_two_launch_budget
 @pytest.mark.parametrize("char", [A_ACUTE, ZWSP])
 def test_a_double_byte_code_page_does_not_wedge_an_ungoverned_call(
     tmp_path: Path, repos_file: Path, console_reader_gate: Path, char: str
@@ -1119,6 +1134,21 @@ def test_a_double_byte_code_page_does_not_wedge_an_ungoverned_call(
     assert _run_gate_in_console(GATE, raw, repos_file, 932) is None
     control = _run_gate_in_console(console_reader_gate, raw, repos_file, 932)
     assert "could not parse" in assert_denied(control)
+
+
+def test_a_stdin_read_that_throws_is_denied_not_retried(tmp_path: Path, repos_file: Path) -> None:
+    """Retried through [Console]::In, a read that failed part-way would decode only what it left
+    behind. The control throws where the byte read starts; the call is ungoverned and well formed,
+    so a gate that fell back and read it would allow it."""
+    gate = _rebuilt_gate(
+        tmp_path / "worktree_gate_read_throws.ps1",
+        _BYTE_READ_GUARD,
+        "if ($true) { throw 'simulated read failure' }\n    if ($false) {",
+        "the byte read's guard moved; fix _BYTE_READ_GUARD rather than deleting the control",
+    )
+    other = tmp_path / "Other" / "x.py"
+    assert run_gate(edit(other, other.parent), repos_file) is None
+    assert "could not parse" in assert_denied(run_gate(edit(other, other.parent), repos_file, gate))
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------

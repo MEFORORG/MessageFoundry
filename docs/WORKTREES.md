@@ -1518,7 +1518,7 @@ registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.js
    session's chat transcript under the worktree's slug, so the conversation drops out of the session list of
    the window it was born in (nothing is deleted; the window just stops looking there). Open a **fresh**
    session directly on the worktree instead. Any session already relocated and gone missing is recoverable —
-   see the recovery tool below. (Fail-open like the rest, with one exception: hook input the gate cannot parse as JSON is denied in
+   see the recovery tool below. (Fail-open like the rest, with one exception: hook input the gate cannot read, or cannot parse as JSON, is denied in
    every session while the gate is on.)
 
 Reads are never gated: asking a question or planning in the primary stays frictionless. Only building is

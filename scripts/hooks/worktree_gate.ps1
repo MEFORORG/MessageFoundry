@@ -10,7 +10,7 @@
     one branch and reach the other worktrees only once each merged it.
 
     It denies at least these two things, only inside a governed primary checkout; the rules below add
-    more, and hook input it cannot parse is denied anywhere while the gate is on (see FAILS OPEN):
+    more, and hook input it cannot read or parse is denied anywhere while the gate is on (see FAILS OPEN):
 
       1. A Write/Edit/MultiEdit/NotebookEdit whose TARGET PATH is inside the primary checkout -- its working
          tree, AND the shared .git beside it. Those are two different things and the difference is
@@ -32,10 +32,10 @@
     the repo; the counts and the population are in docs/WORKTREE-GATE.md.
 
     FAILS OPEN on error paths such as missing fields and an unreadable allowlist. A guardrail that
-    wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT DOES NOT PARSE IS
-    ONE EXCEPTION: while the allowlist governs anything, it is DENIED in every session, governed or
-    not, because the gate cannot tell whether such a call is governed (see the comment above the
-    ConvertFrom-Json call).
+    wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT CANNOT BE READ OR
+    DOES NOT PARSE IS ONE EXCEPTION: while the allowlist governs anything, it is DENIED in every
+    session, governed or not, because the gate cannot tell whether such a call is governed (see the
+    comments above the stdin read and the ConvertFrom-Json call).
 
     This is a guardrail against the ACCIDENTAL primary edit -- the "I forgot to spin up a worktree" case.
     It is NOT a security boundary: it inspects tool arguments, so a file written from a shell command is
@@ -2334,9 +2334,14 @@ $hookUnparseable = $false
 # stdin to the end and hands the payload over through [Console]::SetIn, so the byte read finds EOF
 # and returns nothing. Reading only the bytes there allowed every Bash and PowerShell call (measured:
 # tests/test_shell_guard_dispatch.py went red). ON THAT PATH THE TEXT IS ONLY AS GOOD AS THE
-# DISPATCHER'S OWN READ: while it reads through [Console]::In, every Bash and PowerShell call it
-# dispatches still meets both defects above. A byte read that throws is denied below, not retried
-# through [Console]::In, which would decode only what the failed read left behind.
+# DISPATCHER'S OWN READ: while it reads through [Console]::In, a dispatched call whose payload
+# carries non-ASCII text, on a console whose page is not UTF-8, still meets the defects above.
+# A byte read that throws is denied below, not retried through [Console]::In. Run alone, that
+# reader would decode only what the failed read left behind. Dispatched, it would hold the whole
+# payload, but nothing here tells the two paths apart, so a throw denies on both.
+# Read-CcxHookInput in _hookinput.ps1 is the same byte read for other hooks; this one is inlined
+# because only this file is installed, and it differs on purpose in the fallback and the deny. It
+# has no time bound, as [Console]::In had none: a bound needs a verdict for a read that times out.
 $hookParseError = ""
 $hookRead = $false
 try {
