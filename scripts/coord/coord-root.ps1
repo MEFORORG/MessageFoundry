@@ -90,13 +90,15 @@ function Get-CoordLocalRoot {
 
 function Get-CoordSharedRoot {
     # Returns @{ Path; Source = 'env'|'file'|'local'; Error }. Path is $null only when Error is set.
-    param([string]$From)
+    # No probe; Resolve-CoordSharedRoot adds one. A caller that already holds <common>/mefor-coord
+    # passes it as -LocalRoot, and no git process is spawned.
+    param([string]$From, [string]$LocalRoot)
     $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
     $envValue = $envValue.Trim($script:CoordWs)
     if ($envValue) {
         return @{ Path = $envValue; Source = 'env'; Error = $null }
     }
-    $local = Get-CoordLocalRoot -From $From
+    $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
     if (-not $local) {
         return @{ Path = $null; Source = 'local'; Error = "git could not name the common dir for '$From'" }
     }
@@ -186,6 +188,20 @@ function Test-CoordRoot {
     }
 }
 
+function Resolve-CoordSharedRoot {
+    # The shared root itself, probed. Returns @{ Path; Source; Error }. A caller that needs several
+    # shared kinds resolves once and joins each kind onto Path, rather than paying one probe per kind.
+    param([string]$From, [string]$LocalRoot)
+    $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
+    $root = Get-CoordSharedRoot -From $From -LocalRoot $local
+    if ($root.Error) { return $root }
+    if ($root.Source -ne 'local') {
+        $probe = Test-CoordRoot -Path $root.Path -LocalRoot $local
+        if (-not $probe.Ok) { return @{ Path = $null; Source = $root.Source; Error = $probe.Error } }
+    }
+    return $root
+}
+
 function Resolve-CoordDir {
     # The directory for one kind of coordination state. Returns @{ Path; Shared; Source; Error }.
     # A shared kind on a configured root is probed; a caller that writes exclusive state (a claim, an
@@ -193,23 +209,42 @@ function Resolve-CoordDir {
     # back to LOCAL for a shared kind.
     # $Kind is not Mandatory: under -NonInteractive a missing Mandatory parameter THROWS at binding,
     # and this file never throws (header, constraint 4).
-    param([string]$From, [string]$Kind)
+    param([string]$From, [string]$Kind, [string]$LocalRoot)
     if (-not $Kind) { return @{ Path = $null; Shared = $false; Source = 'local'; Error = 'Resolve-CoordDir needs -Kind' } }
-    $local = Get-CoordLocalRoot -From $From
+    $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
     if (-not (Test-CoordSharedKind -Kind $Kind)) {
         if (-not $local) { return @{ Path = $null; Shared = $false; Source = 'local'; Error = "git could not name the common dir for '$From'" } }
         return @{ Path = (Join-Path $local $Kind); Shared = $false; Source = 'local'; Error = $null }
     }
-    $root = Get-CoordSharedRoot -From $From
+    $root = Resolve-CoordSharedRoot -From $From -LocalRoot $local
     if ($root.Error) { return @{ Path = $null; Shared = $true; Source = $root.Source; Error = $root.Error } }
-    if ($root.Source -ne 'local') {
-        $probe = Test-CoordRoot -Path $root.Path -LocalRoot $local
-        if (-not $probe.Ok) { return @{ Path = $null; Shared = $true; Source = $root.Source; Error = $probe.Error } }
-    }
     return @{ Path = (Join-Path $root.Path $Kind); Shared = $true; Source = $root.Source; Error = $null }
 }
 
 function Get-CoordHost {
     # The name every shared record carries, so a reader on another PC can tell it is not checkable here.
     return [Environment]::MachineName
+}
+
+function Get-CoordRecordHost {
+    # The host a record names, trimmed, or '' when it names none. A non-string value counts as none,
+    # so a malformed record reads as this machine's, the same as one written before the field existed.
+    param($Record)
+    if ($null -eq $Record) { return '' }
+    $h = $null
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains('host')) { $h = $Record['host'] }
+    } else {
+        $p = $Record.PSObject.Properties['host']
+        if ($p) { $h = $p.Value }
+    }
+    if ($h -isnot [string]) { return '' }
+    return $h.Trim($script:CoordWs)
+}
+
+function Test-CoordRecordIsHere {
+    # True when a record is this machine's to judge: it names no host, or names this one.
+    param($Record)
+    $h = Get-CoordRecordHost $Record
+    return (-not $h) -or ($h -ieq (Get-CoordHost))
 }

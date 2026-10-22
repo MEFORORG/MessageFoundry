@@ -395,17 +395,17 @@ try {
         # firing Stop a timeout for nothing. A root that cannot even be NAMED gets a placeholder and a
         # line saying so, never the local path: a note written there is one the other PC never reads.
         # The prompt still goes out, because a memory prompt must not depend on the share.
-        $stateRoot = $coord
-        $rootNote = ''
         $coordRootLib = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+        $sr = @{ Path = $null; Error = "$coordRootLib is missing" }
         if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
             . $coordRootLib
-            $sr = Get-CoordSharedRoot -From $cwd
-            if ($sr.Error) {
-                $stateRoot = '<shared coordination root>'
-                $rootNote = "The shared coordination root did not resolve ($($sr.Error)), so -StateRoot above is a placeholder. Fix root.toml or MEFOR_COORD_ROOT first."
-            }
-            else { $stateRoot = $sr.Path }
+            $sr = Get-CoordSharedRoot -From $cwd -LocalRoot $coord
+        }
+        $stateRoot = $sr.Path
+        $rootNote = ''
+        if ($sr.Error) {
+            $stateRoot = '<shared coordination root>'
+            $rootNote = "The shared coordination root did not resolve ($($sr.Error)), so -StateRoot above is a placeholder. Fix root.toml or MEFOR_COORD_ROOT first."
         }
         $reason = Get-Reason -Coord $coord -Seat $seat -StateRoot $stateRoot
         if ($rootNote) { $reason += "`n$rootNote" }

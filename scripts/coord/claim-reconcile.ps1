@@ -183,17 +183,13 @@ if ($Apply -and $ClaimsDir) {
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     [Console]::Error.WriteLine("claim-reconcile.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was scanned or released.")
     exit 2
 }
 . $coordRootScript
-$thisHost = Get-CoordHost
 
 if ($ClaimsDir) { $claimsDir = $ClaimsDir }
 else {
@@ -207,13 +203,6 @@ else {
     $claimsDir = $resolved.Path
 }
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
-
-# No `host` field means this machine: every record written before the field was written here.
-function Get-RecordHost($Record) {
-    $p = $Record.PSObject.Properties['host']
-    if ($null -eq $p -or $null -eq $p.Value) { return '' }
-    return ([string]$p.Value).Trim()
-}
 
 function ConvertTo-Norm([string]$Path) {
     if (-not $Path) { return "" }
@@ -507,8 +496,7 @@ function Test-StillReleasable([object]$Row) {
     try { $c = Get-Content -LiteralPath $file -Raw -EA Stop | ConvertFrom-Json -EA Stop }
     catch { return "the claim file no longer parses" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
-    $h = Get-RecordHost $c
-    if ($h -and -not ($h -ieq $thisHost)) { return "the claim is now held on $h" }
+    if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
     $fresh = Read-WorktreeRegistry
     $script:registered = $fresh.Registered
     $script:locked = $fresh.Locked
@@ -545,8 +533,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     # A record from ANOTHER machine names a path on that machine's disk. Every test below reads this
     # disk, so a live claim there would read as gone and deregistered, and -Apply would release it
     # (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would ship"). Reported, never released.
-    $recHost = Get-RecordHost $c
-    if ($recHost -and -not ($recHost -ieq $thisHost)) {
+    if (-not (Test-CoordRecordIsHere $c)) {
+        $recHost = Get-CoordRecordHost $c
         $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "ELSEWHERE"
             why = "ON $recHost -- not checkable here; reconcile it from that machine" }
         continue

@@ -107,10 +107,7 @@ if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScrip
 try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
 
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     [Console]::Error.WriteLine("claim.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or recorded.")
@@ -123,17 +120,8 @@ $thisHost = Get-CoordHost
 # ship"). On a shared root a claim taken on another PC names a worktree path that does not exist HERE,
 # so a Test-Path on it would read a live claim as HOLDER GONE and invite a -Force release. Only a record
 # from this machine can be judged by this machine's disk. No `host` field means this machine: every
-# record written before the field existed was written on the one PC that had a registry.
-function Get-RecordHost($Record) {
-    if ($null -eq $Record) { return '' }
-    $p = $Record.PSObject.Properties['host']
-    if ($null -eq $p -or $null -eq $p.Value) { return '' }
-    return "$($p.Value)".Trim()
-}
-function Test-RecordIsHere($Record) {
-    $h = Get-RecordHost $Record
-    return (-not $h) -or ($h -ieq $thisHost)
-}
+# record written before the field existed was written on the one PC that had a registry. The
+# predicate is Test-CoordRecordIsHere in coord-root.ps1.
 
 # WHO HOLDS THE CLAIM, which is a different question from where this script lives (BACKLOG #1346).
 # Defaults to $repo, so every existing invocation behaves exactly as it always has.
@@ -270,7 +258,7 @@ function Get-Mine([string]$Path) {
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
     $me = ($holder -replace '\\', '/').TrimEnd('/')
     # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
-    [pscustomobject]@{ Claim = $c; IsMine = (($held -ieq $me) -and (Test-RecordIsHere $c)) }
+    [pscustomobject]@{ Claim = $c; IsMine = (($held -ieq $me) -and (Test-CoordRecordIsHere $c)) }
 }
 
 # ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
@@ -388,11 +376,11 @@ function Get-OccupancyOnce {
     return $script:OccupancyProbe
 }
 
-function Get-HolderLiveness([string]$HeldPath, [string]$RecordHost = '') {
+function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
     # A holder on another machine is NOT CHECKABLE HERE, and that is a state of its own rather than
     # `gone` or `unknown`: this disk says nothing about that PC's worktrees (docs/COORD-SHARED-ROOT.md).
-    if ($RecordHost -and -not ($RecordHost -ieq $thisHost)) {
-        return [pscustomobject]@{ State = 'elsewhere'; QuietHours = $null; Occupants = $null; Host = $RecordHost }
+    if (-not (Test-CoordRecordIsHere $Record)) {
+        return [pscustomobject]@{ State = 'elsewhere'; QuietHours = $null; Occupants = $null; Host = (Get-CoordRecordHost $Record) }
     }
     try {
         if (-not (Test-Path -LiteralPath $HeldPath)) {
@@ -786,7 +774,7 @@ function Show-List {
             $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
-            $live = Get-HolderLiveness $held (Get-RecordHost $c)
+            $live = Get-HolderLiveness $held $c
             $state = $live.State
             switch ($live.State) {
                 'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
@@ -868,7 +856,7 @@ if ($Release) {
         # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
         # the operator is deciding whether to take someone else's key. Now the recommendation is only
         # made in the one state that can be proven, and the live case says the opposite.
-        $live = Get-HolderLiveness $info.Claim.worktree (Get-RecordHost $info.Claim)
+        $live = Get-HolderLiveness $info.Claim.worktree $info.Claim
         Write-Host ""
         switch ($live.State) {
             'gone' {
@@ -952,7 +940,7 @@ if ($Release) {
         # The machine the release ran on, beside the machine the claim was taken on: on a shared root
         # the two can differ, and a reader needs both to tell a cross-PC takeover from a routine one.
         host            = $thisHost
-        prior_host      = Get-RecordHost $info.Claim
+        prior_host      = Get-CoordRecordHost $info.Claim
         # THE ACTOR (BACKLOG #1358), read as a pair with released_by per the header. WHY A RECORD AND
         # NOT A WARNING: a misdirected -Take is refused by the commit gate at the point of use, and
         # nothing anywhere re-reads a release record, so a wrong actor here is never contradicted.
@@ -1123,7 +1111,7 @@ try {
     # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
     # offer -Force as a flat third option with no way to tell a dead holder from a live one, so the
     # cheapest way past the gate was also the one that causes the duplicate build it exists to prevent.
-    $live = Get-HolderLiveness $info.Claim.worktree (Get-RecordHost $info.Claim)
+    $live = Get-HolderLiveness $info.Claim.worktree $info.Claim
     Write-Host ""
     switch ($live.State) {
         'elsewhere' {

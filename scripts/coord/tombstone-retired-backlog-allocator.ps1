@@ -96,10 +96,7 @@ $resolved = (& git --git-dir=$($GitCommonDir.Trim()) rev-parse --path-format=abs
 if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "-GitCommonDir '$GitCommonDir' is not a git directory." }
 $GitCommonDir = $resolved.Trim()
 
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or written.")
@@ -111,8 +108,7 @@ $thisHost = Get-CoordHost
 # The allocation registry may live on the shared root, and a tombstone written beside a local copy
 # would lift no allocator that reads the shared one. It refuses rather than fall back, -Check
 # included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
-# -From is the common dir itself: git resolves the same repository from inside it.
-$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc'
+$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
 if ($allocDir.Error) {
     [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
     exit 4

@@ -1068,7 +1068,8 @@ def _drain_loading_the_real_libraries() -> str:
     """
     text = DRAIN.read_text(encoding="ascii")
     prefix = '"$PSScriptRoot\\..\\coord\\'
-    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
+    # Three: mail-key.ps1, mail-claim.ps1 and coord-root.ps1, which names the mail root.
+    assert text.count(prefix) == 3, "the drain no longer dot-sources its libraries the same way"
     reader = "Join-Path $PSScriptRoot '_hookinput.ps1'"
     assert text.count(reader) == 1, "the drain no longer loads its input reader the same way"
     out = text.replace(prefix, '"' + str(COORD) + "\\")

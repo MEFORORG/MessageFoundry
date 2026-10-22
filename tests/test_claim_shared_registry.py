@@ -83,6 +83,8 @@ def _checkout(path: Path) -> Path:
     shutil.copy2(_CLAIM, path / "scripts" / "coord" / "claim.ps1")
     shutil.copy2(_CLAIM.parent / "coord-root.ps1", path / "scripts" / "coord" / "coord-root.ps1")
     shutil.copy2(_CHECK, path / "scripts" / "hooks" / "claim_check.py")
+    # The gate loads the coordination resolver from ../coord/, as it does in this checkout.
+    shutil.copy2(_CLAIM.parent / "coord_root.py", path / "scripts" / "coord" / "coord_root.py")
     (path / "code.py").write_text("x = 1\n", encoding="utf-8")
     _git("init", "-b", "main", ".", cwd=path)
     _git("config", "user.email", "t@example.invalid", cwd=path)

@@ -163,20 +163,23 @@ if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
 # Where the queue lives. One definition, shared by every coordination script; see its header.
 . "$PSScriptRoot\coord-root.ps1"
 
+# mail/ and seats/ are both SHARED kinds on one root, so it is resolved and probed once per run.
+$script:MailSharedRoot = $null
+function Get-MailSharedRoot {
+    if ($null -eq $script:MailSharedRoot) { $script:MailSharedRoot = Resolve-CoordSharedRoot -From (Get-Location).Path }
+    return $script:MailSharedRoot
+}
+
 function Get-MailRoot {
     param([string]$Override)
     if ($Override) { return $Override }
-    $c = & git rev-parse --path-format=absolute --git-common-dir 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $c) {
-        throw "Not inside a git worktree: refusing to guess where the mail queue lives."
-    }
-    # mail/ is a SHARED kind. On Error this refuses and never falls back to the local root: a send
-    # queued there would sit in a box the other PC's drain never reads, under a "Queued" line.
-    $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'mail'
+    # On Error this refuses and never falls back to the local root: a send queued there would sit in
+    # a box the other PC's drain never reads, under a "Queued" line.
+    $r = Get-MailSharedRoot
     if ($r.Error) {
         throw "REFUSED: the shared mail root did not resolve, so nothing was read or sent: $($r.Error)"
     }
-    return $r.Path
+    return (Join-Path $r.Path 'mail')
 }
 
 function Get-SeatsDirForMail {
@@ -184,11 +187,11 @@ function Get-SeatsDirForMail {
     # the sibling seats/ directory, which is where the resolver puts it beside a real mail root.
     param([string]$MailRootUsed, [string]$Override)
     if ($Override) { return (Join-Path (Split-Path -Parent $MailRootUsed) 'seats') }
-    $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'seats'
+    $r = Get-MailSharedRoot
     if ($r.Error) {
         throw "REFUSED: the shared seat registry did not resolve, so a seat id cannot be looked up: $($r.Error)"
     }
-    return $r.Path
+    return (Join-Path $r.Path 'seats')
 }
 
 function Resolve-SeatRecipient {
@@ -209,8 +212,7 @@ function Resolve-SeatRecipient {
     # A directory with no readable record is not evidence a seat exists; refuse rather than mint.
     if ($null -eq $best) { return $null }
     $wt = if ($best.PSObject.Properties.Name -contains 'worktree') { [string]$best.worktree } else { '' }
-    $h = if ($best.PSObject.Properties.Name -contains 'host') { [string]$best.host } else { '' }
-    return [pscustomobject]@{ Key = $Id; Worktree = $wt; Host = $h }
+    return [pscustomobject]@{ Key = $Id; Worktree = $wt; Host = (Get-CoordRecordHost $best) }
 }
 
 # The worktree -> box key function. ONE definition, shared with the drain hook: if the two ends

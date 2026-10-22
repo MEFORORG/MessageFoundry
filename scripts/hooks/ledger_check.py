@@ -29,14 +29,13 @@ worse than no gate. `git commit --no-verify` is the escape hatch; the --ci run i
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import os
 import re
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
@@ -304,139 +303,33 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
     return text
 
 
-# WHERE SHARED COORDINATION STATE LIVES (docs/COORD-SHARED-ROOT.md). A COPY of the resolution in
-# scripts/coord/coord_root.py, because a test runs patched copies of this gate from outside the tree,
-# where an import of the sibling would fail. claim_check.py carries the same copy for the installed
-# hook. Same kinds, same root.toml rules, same order (env, root.toml, local) and the same rule that an
-# error never falls back to the local path. tests/test_coord_shared_root_claims.py holds the copies to one answer. It
-# omits only the down-verdict cache, which saves time across processes and changes no answer.
-_COORD_SHARED_KINDS: tuple[str, ...] = (
-    "seats",
-    "mail",
-    "claims",
-    "alloc",
-    "handoffs",
-    "wiki",
-    "lanes",
-    "owner-log",
+# WHERE SHARED COORDINATION STATE LIVES is scripts/coord/coord_root.py, loaded by path: a sibling
+# coord_root.py first (a copy of this gate sitting beside one), then ../coord/coord_root.py (the repo).
+# None loading leaves the ADR-ownership arm refusing, never reading a guessed local path.
+_COORD_ROOT_CANDIDATES = (
+    Path(__file__).resolve().with_name("coord_root.py"),
+    Path(__file__).resolve().parent.parent / "coord" / "coord_root.py",
 )
-_COORD_ROOT_ENV = "MEFOR_COORD_ROOT"
-# ASCII space and tab only, as in coord_root.py: Python's \s and str.strip() also take \x1c-\x1f and
-# \x85, which .NET's do not, so the twins would answer differently on a stray control character.
-_COORD_WS = " \t\r\n"
-_COORD_ROOT_LINE = re.compile(r"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\Z")
-_COORD_BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
-_COORD_UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
-_COORD_PROBE_SECONDS = 1.5
 
 
-def _coord_root_toml(file: Path) -> tuple[Path | None, str | None]:
-    """``(root, error)`` from a root.toml that exists: one ``shared_root`` literal-string line, no other."""
-    try:
-        if not file.is_file():
-            return None, f"{file} exists but is not a file"
-        raw = file.read_bytes()
-    except OSError as exc:
-        return None, f"{file} could not be read: {exc}"
-    try:
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            text = raw.decode("utf-16")
-        else:
-            text = raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None, f"{file} is not UTF-8 or UTF-16 with a byte-order mark"
-    found: str | None = None
-    for line in text.splitlines():
-        if _COORD_BLANK_OR_COMMENT.match(line):
+def _coord_root() -> ModuleType | None:
+    """``coord_root.py``, loaded by path, or None when no candidate loads."""
+    for candidate in _COORD_ROOT_CANDIDATES:
+        if not candidate.is_file():
             continue
-        m = _COORD_ROOT_LINE.match(line)
-        if not m or not m.group(1).strip(_COORD_WS):
-            return (
-                None,
-                f"{file} has a line that is not shared_root = '<path>' (single quotes): {line}",
-            )
-        if found is not None:
-            return None, f"{file} names shared_root more than once"
-        found = m.group(1).strip(_COORD_WS)
-    if found is None:
-        return None, f"{file} names no shared_root"
-    return Path(found), None
-
-
-def _coord_reachable(server: str) -> bool:
-    """A TCP connect to port 445, bounded as a WHOLE: name resolution is outside a socket timeout."""
-    result: list[bool] = []
-
-    def attempt() -> None:
+        spec = importlib.util.spec_from_file_location("_mefor_coord_root", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before it runs, because its dataclass looks its own module up while it is defined.
+        sys.modules[spec.name] = mod
         try:
-            with socket.create_connection((server, 445), timeout=_COORD_PROBE_SECONDS):
-                result.append(True)
-        except OSError:
-            result.append(False)
-
-    t = threading.Thread(target=attempt, daemon=True)
-    t.start()
-    t.join(_COORD_PROBE_SECONDS)
-    return bool(result and result[0])
-
-
-def _coord_dir(kind: str, start: str) -> tuple[Path | None, str | None]:
-    """``(directory, error)`` for one kind of coordination state, resolved from the repository at ``start``."""
-    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
-        ["git", "-C", start, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    common = proc.stdout.strip()
-    local = Path(common) / "mefor-coord" if proc.returncode == 0 and common else None
-    if kind not in _COORD_SHARED_KINDS:
-        if local is None:
-            return None, f"git could not name the common dir for '{start}'"
-        return local / kind, None
-    env = os.environ.get(_COORD_ROOT_ENV, "").strip(_COORD_WS)
-    if env:
-        root = Path(env)
-    elif local is None:
-        return None, f"git could not name the common dir for '{start}'"
-    else:
-        file = local / "root.toml"
-        try:
-            if not file.exists():
-                return local / kind, None
-        except OSError as exc:
-            return None, f"{file} could not be read: {exc}"
-        from_file, error = _coord_root_toml(file)
-        if from_file is None:
-            return None, error
-        root = from_file
-    # A configured root is probed before any file call: a dead SMB server hangs one for a minute.
-    unc = _COORD_UNC.match(str(root))
-    if unc and not _coord_reachable(unc.group(1)):
-        ms = int(_COORD_PROBE_SECONDS * 1000)
-        return (
-            None,
-            f"shared root {root} is unreachable: no answer from {unc.group(1)}:445 within {ms} ms",
-        )
-    try:
-        if not root.is_dir():
-            return None, f"shared root {root} does not exist or is not a directory"
-    except OSError as exc:
-        return None, f"shared root {root} cannot be read: {exc}"
-    return root / kind, None
-
-
-def _coord_this_host() -> str:
-    """The name a shared record carries: PowerShell's ``[Environment]::MachineName``."""
-    return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
-
-
-def _coord_record_is_here(record: dict[str, object]) -> bool:
-    """True for a record written on this machine. No ``host`` field means this machine: every record
-    written before the field existed was written on the one PC that had a registry."""
-    recorded = str(record.get("host") or "").strip()
-    return not recorded or recorded.casefold() == _coord_this_host().casefold()
+            spec.loader.exec_module(mod)
+        except (OSError, SyntaxError, ImportError):
+            sys.modules.pop(spec.name, None)
+            continue
+        return mod
+    return None
 
 
 class Ledger:
@@ -447,18 +340,41 @@ class Ledger:
         # The registry lives beside the SHARED object store, so every worktree of this repo sees the same
         # allocations — and a different clone gets its own, automatically. Unless a shared root is
         # configured (docs/COORD-SHARED-ROOT.md), when every clone on every PC sees ONE registry there.
-        # Only the ownership arm reads it, and that arm never runs in CI, so CI resolves nothing. An
-        # error is kept, not replaced by a local guess: the ownership arm refuses and names it.
-        self.alloc: Path | None = None
-        self.alloc_error: str | None = None
-        if not ci:
-            self.alloc, self.alloc_error = _coord_dir("alloc", str(self.repo))
+        # Only the ownership arm reads it, so it resolves on first use: a commit adding no ADR, and CI,
+        # where that arm never runs, probe nothing. An error is kept, not replaced by a local guess:
+        # the ownership arm refuses and names it.
+        self._alloc_resolved = False
+        self._alloc: Path | None = None
+        self._alloc_error: str | None = None
+        self._coord: ModuleType | None = None
         self.failures: list[str] = []
         # Per-run memos. Every entry is derived from a REF, and refs do not move inside one run of a
         # pre-commit hook -- so a repeat lookup is pure waste, and each one costs git subprocesses.
         # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
+
+    def _resolve_alloc(self) -> None:
+        if self._alloc_resolved:
+            return
+        self._alloc_resolved = True
+        self._coord = _coord_root()
+        if self._coord is None:
+            tried = ", ".join(str(c) for c in _COORD_ROOT_CANDIDATES)
+            self._alloc_error = f"coord_root.py could not be loaded (tried {tried})"
+            return
+        resolved = self._coord.resolve("alloc", str(self.repo))
+        self._alloc, self._alloc_error = resolved.path, resolved.error
+
+    @property
+    def alloc(self) -> Path | None:
+        self._resolve_alloc()
+        return self._alloc
+
+    @property
+    def alloc_error(self) -> str | None:
+        self._resolve_alloc()
+        return self._alloc_error
 
     # -- tree access ---------------------------------------------------------------------------------
     #
@@ -661,7 +577,9 @@ class Ledger:
             return False
         # ANOTHER MACHINE'S NUMBER IS NEVER THIS TREE'S, on either key. Its path names that PC's disk,
         # and two PCs can check out one branch name, so neither arm below is exclusive across PCs.
-        if not isinstance(claim, dict) or not _coord_record_is_here(claim):
+        # A resolved registry implies a loaded resolver, so _coord is set whenever alloc is.
+        coord = self._coord
+        if not isinstance(claim, dict) or coord is None or not coord.record_is_here(claim):
             return False
         mine = str(self.repo).replace("\\", "/").casefold()
         theirs = str(claim.get("worktree", "")).replace("\\", "/").casefold()
@@ -704,20 +622,20 @@ class Ledger:
         remedy block is precisely what that defect forged.
         """
         allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
+        # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
+        # is the right one.
+        if self.alloc is None:
+            return allocate
         try:
-            if self.alloc is None:
-                raise OSError("no allocation registry")
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            # No record at all: nobody holds it, so allocating is the only move and the ONLY case
-            # where it is the right one.
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
-        elsewhere = isinstance(claim, dict) and not _coord_record_is_here(claim)
-        if worktree and elsewhere:
-            where = _safe_for_message(claim.get("host", ""))
+        coord = self._coord
+        if worktree and coord is not None and not coord.record_is_here(claim):
+            where = _safe_for_message(coord.record_host(claim))
             lines.append(f"    1. commit from the worktree that holds it, ON {where}:  {worktree}")
         elif worktree:
             lines.append(f"    1. commit from the worktree that holds it:  {worktree}")

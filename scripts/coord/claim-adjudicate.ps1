@@ -118,17 +118,13 @@ try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     [Console]::Error.WriteLine("claim-adjudicate.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was scanned.")
     exit 2
 }
 . $coordRootScript
-$thisHost = Get-CoordHost
 
 if ($ClaimsDir) { $claimsDir = $ClaimsDir }
 else {
@@ -317,8 +313,8 @@ foreach ($f in $files) {
     # A record from ANOTHER machine names a path on that machine's disk, so Test-Path here says
     # nothing about it (docs/COORD-SHARED-ROOT.md). It reads as held, never as gone or stranded. No
     # `host` field means this machine: every record written before the field was written here.
-    $recHost = if ($c.PSObject.Properties['host'] -and $null -ne $c.host) { ([string]$c.host).Trim() } else { '' }
-    if ($recHost -and -not ($recHost -ieq $thisHost)) {
+    if (-not (Test-CoordRecordIsHere $c)) {
+        $recHost = Get-CoordRecordHost $c
         if (-not $IncludeHeld) {
             $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
                 item = ""; banner = ""; citations = @(); verdict = "ELSEWHERE"

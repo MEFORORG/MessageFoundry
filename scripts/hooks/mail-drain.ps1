@@ -795,29 +795,25 @@ try {
     # output at Stop re-wakes the model. It never falls back to the local queue: mail sent from the
     # other PC is not there, so a local read would render "no mail" for mail that exists.
     $localCoordRoot = Join-Path $common.Trim() 'mefor-coord'
-    $root = $null
-    $coordRootLib = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+    # A missing resolver is the same skip as a dead root: never a read of a local copy of a shared kind.
+    $coordRootLib = "$PSScriptRoot\..\coord\coord-root.ps1"
+    $mr = @{ Path = $null; Error = "$coordRootLib is missing" }
     if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
         . $coordRootLib
-        $mr = Resolve-CoordDir -From $coordFrom -Kind 'mail'
-        if ($mr.Error) {
-            $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
-                "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
-            if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
-            else { Write-Injection -Event $eventName -Text $note }
-            exit 0
-        }
-        $root = $mr.Path
+        $mr = Resolve-CoordSharedRoot -From $coordFrom -LocalRoot $localCoordRoot
     }
-    else {
-        # The resolver shipped beside this hook is missing, so this checkout predates it. Read the
-        # queue where that checkout's senders wrote it.
-        $root = Join-Path $localCoordRoot 'mail'
+    if ($mr.Error) {
+        $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
+            "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
+        if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
+        else { Write-Injection -Event $eventName -Text $note }
+        exit 0
     }
     # The coordination root is named in its own variable because the receipt sweep's citation guard
     # reads the coordination tree OUTSIDE mail/. On a shared root that is the share (seats/, handoffs/)
     # AND the local tree, which still holds anything written before the move; see Get-CitedStems.
-    $coordRoot = Split-Path -Parent $root
+    $coordRoot = $mr.Path
+    $root = Join-Path $coordRoot 'mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
     $asOf = [DateTime]::UtcNow.ToString('o')
@@ -1114,12 +1110,24 @@ try {
             # only reason the two passes exist.
             $citedStems = $null
             try {
-                $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
-                # Both trees, when the shared root is not the local one. A citation in either protects a
-                # receipt; a walk of only one would delete a receipt the other still quotes.
-                if ([System.IO.Path]::GetFullPath($coordRoot).TrimEnd('\', '/') -ine [System.IO.Path]::GetFullPath($localCoordRoot).TrimEnd('\', '/') -and
-                    (Test-Path -LiteralPath $localCoordRoot -PathType Container)) {
-                    $citedStems.UnionWith((Get-CitedStems -CoordRoot $localCoordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
+                if ([System.IO.Path]::GetFullPath($coordRoot).TrimEnd('\', '/') -ieq [System.IO.Path]::GetFullPath($localCoordRoot).TrimEnd('\', '/')) {
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
+                } else {
+                    # Both trees, when the shared root is not the local one. A citation in either
+                    # protects a receipt; a walk of only one would delete a receipt the other still
+                    # quotes. On the share only seats/ and handoffs/ hold citing documents, so only
+                    # they are walked. The local walk skips the local mail/ tree, whose own names
+                    # would otherwise read as citations.
+                    $citedStems = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($citingKind in @('seats', 'handoffs')) {
+                        $citingDir = Join-Path $coordRoot $citingKind
+                        if (Test-Path -LiteralPath $citingDir -PathType Container) {
+                            $citedStems.UnionWith((Get-CitedStems -CoordRoot $citingDir -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
+                        }
+                    }
+                    if (Test-Path -LiteralPath $localCoordRoot -PathType Container) {
+                        $citedStems.UnionWith((Get-CitedStems -CoordRoot $localCoordRoot -MailRoot (Join-Path $localCoordRoot 'mail') -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
+                    }
                 }
             }
             catch { $citedStems = $null; $sweepFailed = $true }

@@ -48,12 +48,6 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A test that does not set the variable must never inherit a live one.
-    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
-
-
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"

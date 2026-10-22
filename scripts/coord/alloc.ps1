@@ -154,10 +154,7 @@ $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
 $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     [Console]::Error.WriteLine("alloc.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or allocated.")
@@ -213,19 +210,12 @@ function Get-AdrSlug([string]$t) { ($t.ToLowerInvariant() -replace '[^a-z0-9]+',
 # reason, and its docstring says a remedy block is precisely what that defect forged.
 function ConvertTo-Safe([string]$s) { ($s -replace '[\p{C}]', ' ').Trim() }
 
-# A record with no `host` was written on this machine: every record before the field existed was.
-function Test-RecordIsHere($Record) {
-    $p = $Record.PSObject.Properties['host']
-    $h = if ($null -ne $p -and $null -ne $p.Value) { ([string]$p.Value).Trim() } else { '' }
-    return (-not $h) -or ($h -ieq $thisHost)
-}
-
 if ($List) {
     foreach ($k in @("adr", "backlog")) {
         $dir = Join-Path $allocRoot $k
         $mine = @(Get-ChildItem $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
                 $c = Get-Content $_.FullName -Raw | ConvertFrom-Json
-                if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-RecordIsHere $c)) { $c }
+                if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-CoordRecordIsHere $c)) { $c }
             })
         Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
     }
@@ -378,7 +368,7 @@ if (-not $ShowFloor) {
         # The HOST half too: the same path on another PC is another tree, and ledger_check.py::owns
         # refuses its number here, so handing it back would name a number this tree cannot commit.
         if (((Get-PathKey "$($rec.worktree)") -ieq $ownerKey) -and
-            (Test-RecordIsHere $rec) -and
+            (Test-CoordRecordIsHere $rec) -and
             ((Get-AdrSlug "$($rec.title)") -eq $titleKey)) {
             # EVERYTHING KEPT HERE IS EITHER THE FILENAME OR FOLDED. `Number` and `Sort` come from the
             # file name, which is the authoritative key; the three free-text fields go through

@@ -7,8 +7,8 @@ format and the reachability probe. This module answers the same questions for th
 and out-of-repo helpers, and ``tests/test_coord_root.py`` holds the two to one answer.
 
 Stdlib only, and it imports nothing from ``messagefoundry``: the installed git hooks run it from
-``.git/hooks`` with whatever interpreter the hook found. A hook that cannot import this file carries
-a copy; ``SHARED_KINDS`` and the regex are what a parity test compares.
+``.git/hooks`` with whatever interpreter the hook found. The hooks load this file by path rather than
+carry a copy, and ``install-git-hooks.ps1`` puts it beside them.
 """
 
 from __future__ import annotations
@@ -71,12 +71,19 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     return Path(common) / "mefor-coord"
 
 
-def shared_root(start: str | os.PathLike[str] | None = None) -> tuple[Path | None, str, str | None]:
-    """``(path, source, error)``. ``source`` is ``env``, ``file`` or ``local``; path is None on error."""
+def shared_root(
+    start: str | os.PathLike[str] | None = None, *, local: Path | None = None
+) -> tuple[Path | None, str, str | None]:
+    """``(path, source, error)``. ``source`` is ``env``, ``file`` or ``local``; path is None on error.
+
+    No probe; ``resolve_shared_root`` adds one. A caller already holding ``<common>/mefor-coord``
+    passes it as ``local`` and no git process is spawned.
+    """
     env = os.environ.get(ROOT_ENV, "").strip(_WS)
     if env:
         return Path(env), "env", None
-    local = local_root(start)
+    if local is None:
+        local = local_root(start)
     if local is None:
         return None, "local", f"git could not name the common dir for '{start}'"
     file = local / ROOT_FILE
@@ -185,25 +192,57 @@ def _reachable(server: str) -> bool:
     return bool(result and result[0])
 
 
-def resolve(kind: str, start: str | os.PathLike[str] | None = None) -> CoordDir:
+def resolve_shared_root(
+    start: str | os.PathLike[str] | None = None, *, local: Path | None = None
+) -> tuple[Path | None, str, str | None]:
+    """The shared root itself, probed: ``(path, source, error)``.
+
+    A caller needing several shared kinds resolves once and joins each kind onto the path.
+    """
+    if local is None:
+        local = local_root(start)
+    root, source, error = shared_root(start, local=local)
+    if error is not None or root is None:
+        return None, source, error or "no shared root"
+    if source != "local":
+        why = probe_root(root, local)
+        if why is not None:
+            return None, source, why
+    return root, source, None
+
+
+def resolve(
+    kind: str, start: str | os.PathLike[str] | None = None, *, local: Path | None = None
+) -> CoordDir:
     """The directory for one kind of coordination state. Never falls back to LOCAL for a shared kind."""
-    local = local_root(start)
+    if local is None:
+        local = local_root(start)
     if kind not in SHARED_KINDS:
         if local is None:
             return CoordDir(
                 None, False, "local", f"git could not name the common dir for '{start}'"
             )
         return CoordDir(local / kind, False, "local", None)
-    root, source, error = shared_root(start)
-    if error is not None or root is None:
+    root, source, error = resolve_shared_root(start, local=local)
+    if root is None:
         return CoordDir(None, True, source, error or "no shared root")
-    if source != "local":
-        why = probe_root(root, local)
-        if why is not None:
-            return CoordDir(None, True, source, why)
     return CoordDir(root / kind, True, source, None)
 
 
 def host() -> str:
     """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``."""
     return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
+
+
+def record_host(record: object) -> str:
+    """The host a record names, stripped, or '' when it names none. A non-str value counts as none."""
+    if not isinstance(record, dict):
+        return ""
+    value = record.get("host")
+    return value.strip(_WS) if isinstance(value, str) else ""
+
+
+def record_is_here(record: object) -> bool:
+    """True when a record is this machine's to judge: it names no host, or names this one."""
+    recorded = record_host(record)
+    return not recorded or recorded.casefold() == host().casefold()

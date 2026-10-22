@@ -69,14 +69,13 @@ nothing changes: the registry is this repository's own, exactly as it has always
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import os
 import re
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
+from types import ModuleType
 
 # WHICH `#N` IN A SUBJECT IS A BACKLOG CITATION (BACKLOG #1347). `(BACKLOG #71, #72)` is the house
 # form: the prefix appears ONCE and the siblings after it are bare, so a BACKLOG token governs every
@@ -218,139 +217,44 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
 #: including ones sitting beside a different engine tree or none at all.
 _CLAIMS_ROOT_KEY = "mefor.claimsRoot"
 
-# WHERE SHARED COORDINATION STATE LIVES (docs/COORD-SHARED-ROOT.md). A COPY of the resolution in
-# scripts/coord/coord_root.py, because install-git-hooks.ps1 copies this file ALONE into the git hooks
-# directory, where an import of the sibling would fail at the moment the gate runs. Same kinds, same
-# root.toml regex, same order (env, root.toml, local) and the same rule that an error never falls
-# back to the local path. tests/test_coord_shared_root_claims.py holds the copies to one answer. It
-# omits only the down-verdict cache, which saves time across processes and changes no answer.
-_COORD_SHARED_KINDS: tuple[str, ...] = (
-    "seats",
-    "mail",
-    "claims",
-    "alloc",
-    "handoffs",
-    "wiki",
-    "lanes",
-    "owner-log",
+# WHERE SHARED COORDINATION STATE LIVES is scripts/coord/coord_root.py, loaded by path. Installed, it
+# sits beside this file in the git hooks directory (install-git-hooks.ps1 copies both); in the repo it
+# is ../coord/coord_root.py. A gate that cannot load it refuses rather than guess a local path.
+_COORD_ROOT_CANDIDATES = (
+    Path(__file__).resolve().with_name("coord_root.py"),
+    Path(__file__).resolve().parent.parent / "coord" / "coord_root.py",
 )
-_COORD_ROOT_ENV = "MEFOR_COORD_ROOT"
-# ASCII space and tab only, as in coord_root.py: Python's \s and str.strip() also take \x1c-\x1f and
-# \x85, which .NET's do not, so the twins would answer differently on a stray control character.
-_COORD_WS = " \t\r\n"
-_COORD_ROOT_LINE = re.compile(r"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\Z")
-_COORD_BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
-_COORD_UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
-_COORD_PROBE_SECONDS = 1.5
+_coord_root_module: ModuleType | None = None
 
 
-def _coord_root_toml(file: Path) -> tuple[Path | None, str | None]:
-    """``(root, error)`` from a root.toml that exists: one ``shared_root`` literal-string line, no other."""
-    try:
-        if not file.is_file():
-            return None, f"{file} exists but is not a file"
-        raw = file.read_bytes()
-    except OSError as exc:
-        return None, f"{file} could not be read: {exc}"
-    try:
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            text = raw.decode("utf-16")
-        else:
-            text = raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None, f"{file} is not UTF-8 or UTF-16 with a byte-order mark"
-    found: str | None = None
-    for line in text.splitlines():
-        if _COORD_BLANK_OR_COMMENT.match(line):
+def _coord_root() -> ModuleType:
+    """``coord_root.py``, loaded once by path. Raises ClaimRegistryError when neither copy loads."""
+    global _coord_root_module
+    if _coord_root_module is not None:
+        return _coord_root_module
+    tried: list[str] = []
+    for candidate in _COORD_ROOT_CANDIDATES:
+        tried.append(str(candidate))
+        if not candidate.is_file():
             continue
-        m = _COORD_ROOT_LINE.match(line)
-        if not m or not m.group(1).strip(_COORD_WS):
-            return (
-                None,
-                f"{file} has a line that is not shared_root = '<path>' (single quotes): {line}",
-            )
-        if found is not None:
-            return None, f"{file} names shared_root more than once"
-        found = m.group(1).strip(_COORD_WS)
-    if found is None:
-        return None, f"{file} names no shared_root"
-    return Path(found), None
-
-
-def _coord_reachable(server: str) -> bool:
-    """A TCP connect to port 445, bounded as a WHOLE: name resolution is outside a socket timeout."""
-    result: list[bool] = []
-
-    def attempt() -> None:
+        spec = importlib.util.spec_from_file_location("_mefor_coord_root", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before it runs, because its dataclass looks its own module up while it is defined.
+        sys.modules[spec.name] = mod
         try:
-            with socket.create_connection((server, 445), timeout=_COORD_PROBE_SECONDS):
-                result.append(True)
-        except OSError:
-            result.append(False)
-
-    t = threading.Thread(target=attempt, daemon=True)
-    t.start()
-    t.join(_COORD_PROBE_SECONDS)
-    return bool(result and result[0])
-
-
-def _coord_dir(kind: str, start: str) -> tuple[Path | None, str | None]:
-    """``(directory, error)`` for one kind of coordination state, resolved from the repository at ``start``."""
-    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
-        ["git", "-C", start, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+            spec.loader.exec_module(mod)
+        except (OSError, SyntaxError, ImportError):
+            sys.modules.pop(spec.name, None)
+            continue
+        _coord_root_module = mod
+        return mod
+    raise ClaimRegistryError(
+        "coord_root.py could not be loaded, so the claim registry cannot be located. Tried: "
+        + ", ".join(tried)
+        + ". Re-run scripts/coord/install-git-hooks.ps1."
     )
-    common = proc.stdout.strip()
-    local = Path(common) / "mefor-coord" if proc.returncode == 0 and common else None
-    if kind not in _COORD_SHARED_KINDS:
-        if local is None:
-            return None, f"git could not name the common dir for '{start}'"
-        return local / kind, None
-    env = os.environ.get(_COORD_ROOT_ENV, "").strip(_COORD_WS)
-    if env:
-        root = Path(env)
-    elif local is None:
-        return None, f"git could not name the common dir for '{start}'"
-    else:
-        file = local / "root.toml"
-        try:
-            if not file.exists():
-                return local / kind, None
-        except OSError as exc:
-            return None, f"{file} could not be read: {exc}"
-        from_file, error = _coord_root_toml(file)
-        if from_file is None:
-            return None, error
-        root = from_file
-    # A configured root is probed before any file call: a dead SMB server hangs one for a minute.
-    unc = _COORD_UNC.match(str(root))
-    if unc and not _coord_reachable(unc.group(1)):
-        ms = int(_COORD_PROBE_SECONDS * 1000)
-        return (
-            None,
-            f"shared root {root} is unreachable: no answer from {unc.group(1)}:445 within {ms} ms",
-        )
-    try:
-        if not root.is_dir():
-            return None, f"shared root {root} does not exist or is not a directory"
-    except OSError as exc:
-        return None, f"shared root {root} cannot be read: {exc}"
-    return root / kind, None
-
-
-def _coord_this_host() -> str:
-    """The name a shared record carries: PowerShell's ``[Environment]::MachineName``."""
-    return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
-
-
-def _coord_record_is_here(record: dict[str, object]) -> bool:
-    """True for a record written on this machine. No ``host`` field means this machine: every record
-    written before the field existed was written on the one PC that had a registry."""
-    recorded = str(record.get("host") or "").strip()
-    return not recorded or recorded.casefold() == _coord_this_host().casefold()
 
 
 class GitReadError(RuntimeError):
@@ -470,10 +374,10 @@ def _claims_dir(repo: str) -> tuple[Path, str | None]:
             raise ClaimRegistryError(f"'{shared}' is not a git repository")
     # The hop above decides WHICH clone's configuration names the root; the resolver decides where
     # that clone's claims live, which may be the shared root. An error refuses, never falls back.
-    claims, error = _coord_dir("claims", host)
-    if error is not None or claims is None:
-        raise ClaimRegistryError(error or "no claims directory")
-    return claims, (host if shared else None)
+    resolved = _coord_root().resolve("claims", host)
+    if resolved.error is not None or resolved.path is None:
+        raise ClaimRegistryError(resolved.error or "no claims directory")
+    return resolved.path, (host if shared else None)
 
 
 def _repo() -> str:
@@ -669,7 +573,7 @@ def main() -> int:
             f"  Where this gate looks is decided by {_CLAIMS_ROOT_KEY}: set, it names another\n"
             f"  repository whose registry serves this one; unset, the registry is this repository's\n"
             f"  own. That repository's claims may then live on a shared root, named by\n"
-            f"  {_COORD_ROOT_ENV} or by mefor-coord/root.toml (docs/COORD-SHARED-ROOT.md). One of\n"
+            f"  MEFOR_COORD_ROOT or by mefor-coord/root.toml (docs/COORD-SHARED-ROOT.md). One of\n"
             f"  those reads failed, or the shared root did not answer. The gate refuses rather than\n"
             f"  fall back to a registry nothing writes, where every claim would read as absent.\n"
             f"  Check them, then commit again:\n"
@@ -689,13 +593,14 @@ def main() -> int:
                 f"          {take}"
             )
             continue
-        if not _coord_record_is_here(claim):
+        if not _coord_root().record_is_here(claim):
             # Another machine's claim, whatever its path says (docs/COORD-SHARED-ROOT.md). This
             # machine cannot tell whether that holder is alive, so it prints no -Force remedy.
             problems.append(
                 f"  BACKLOG #{item} is claimed on ANOTHER machine:\n"
                 f"      held by: {_safe_for_message(claim.get('worktree'))} "
-                f"[{_safe_for_message(claim.get('branch'))}] on {_safe_for_message(claim.get('host'))}\n"
+                f"[{_safe_for_message(claim.get('branch'))}] on "
+                f"{_safe_for_message(_coord_root().record_host(claim))}\n"
                 f"      since  : {_safe_for_message(claim.get('claimed'))}\n"
                 f"      note   : {_safe_for_message(claim.get('note'))}\n"
                 f"      Do not build it in parallel. That holder is not checkable from here; ask on\n"

@@ -1400,16 +1400,12 @@ function Read-OrphanLedger {
 # EVIDENCE, not on elapsed time: it runs only from the branch that has already proven the directory is
 # gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
 # merely quiet is never touched by this.
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     throw "prune-merged.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was pruned or released."
 }
 . $coordRootScript
-$thisHost = Get-CoordHost
 
 # The registry may sit on the shared root, so coord-root.ps1 names it. A resolver ERROR is recorded
 # and shown, never replaced by a local guess: the run goes on with the claims unread, every
@@ -1417,19 +1413,11 @@ $thisHost = Get-CoordHost
 $claimsError = ''
 $claimsDir = ''
 if ($gitCommonDir) {
-    $resolvedClaims = Resolve-CoordDir -From $RepoRoot -Kind 'claims'
+    $resolvedClaims = Resolve-CoordDir -From $RepoRoot -Kind 'claims' -LocalRoot (Join-Path $gitCommonDir 'mefor-coord')
     if ($resolvedClaims.Error) { $claimsError = [string]$resolvedClaims.Error } else { $claimsDir = $resolvedClaims.Path }
 }
 if ($claimsError) {
     Write-Note "WARNING: the claim registry could not be resolved, so no claim was read or released: $claimsError" 'Yellow'
-}
-
-# A record from ANOTHER machine names a path on that machine's disk (docs/COORD-SHARED-ROOT.md), so a
-# removal here proves nothing about it even when the path string matches. No `host` is this machine.
-function Test-ClaimIsHere($Claim) {
-    $p = $Claim.PSObject.Properties['host']
-    $h = if ($null -ne $p -and $null -ne $p.Value) { ([string]$p.Value).Trim() } else { '' }
-    return (-not $h) -or ($h -ieq $thisHost)
 }
 
 # --- REPORT-ONLY, second pass: a tree holding a COORDINATION CLAIM is never suggested --------------
@@ -1523,7 +1511,9 @@ function Remove-ClaimsHeldBy {
         }
         if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
         # Another PC's claim at the same path is that PC's live work; removing this tree did not end it.
-        if (-not (Test-ClaimIsHere $c)) { continue }
+        # A claim from ANOTHER machine names a path on that machine's disk (docs/COORD-SHARED-ROOT.md),
+        # so a removal here proves nothing about it even when the path string matches.
+        if (-not (Test-CoordRecordIsHere $c)) { continue }
         try {
             Remove-Item -LiteralPath $f.FullName -Force -EA Stop
             $released += [pscustomobject]@{ key = [string]$c.key; outcome = 'released'; detail = [string]$c.note }

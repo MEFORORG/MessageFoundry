@@ -219,16 +219,12 @@ $linked = @()
 # Get-RepoWorktrees, ConvertTo-Norm, Get-NestedWorktrees and the occupancy fence. Every route uses
 # ConvertTo-Norm, because it must agree with claim.ps1's writer.
 . "$PSScriptRoot\..\coord\occupancy.ps1"
-# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
-# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
-# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
 $coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     throw "remove.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was removed."
 }
 . $coordRootScript
-$thisHost = Get-CoordHost
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -575,6 +571,14 @@ if ($byPath) {
 # the target, and follows it ONE hop to that repository's common dir. Reading only this clone's
 # own registry would be blind to every claim once the setting is made. The clone's own registry is
 # read AS WELL: a claim taken before the setting was made, or by an older claim.ps1, is there.
+# This repository's shared root, resolved and probed once for both claims/ and alloc/. The target
+# worktree and $GitRoot share one common dir, so either names the same root.
+$script:OwnSharedRoot = $null
+function Get-OwnSharedRoot {
+    if ($null -eq $script:OwnSharedRoot) { $script:OwnSharedRoot = Resolve-CoordSharedRoot -From $GitRoot }
+    return $script:OwnSharedRoot
+}
+
 function Get-TargetClaimsDirs {
     $setting = "$(& git -C $WorktreePath config --get mefor.claimsRoot 2>$null)".Trim()
     # Exit 1 is "not set". Anything else is a config git could not read, which could hide the key.
@@ -584,11 +588,11 @@ function Get-TargetClaimsDirs {
     }
     # The registry may sit on the shared root (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names
     # it. A resolver error is claims-unknown, which refuses like every other cannot-tell here.
-    $own = Resolve-CoordDir -From $WorktreePath -Kind 'claims'
+    $own = Get-OwnSharedRoot
     if ($own.Error) {
         throw "the claim registry of '$WorktreePath' could not be resolved ($($own.Error)), so claims are unknown. Nothing was removed."
     }
-    $dirs = @($own.Path)
+    $dirs = @(Join-Path $own.Path 'claims')
     if ($code -eq 0 -and $setting) {
         # claim.ps1 hands the value to git as it stands, so a relative one resolves against the
         # caller's shell. Nothing here can tell which shell that was.
@@ -644,9 +648,7 @@ function Read-RecordFile([System.IO.FileSystemInfo]$File) {
     if ($problem) { return [pscustomobject]@{ Name = $File.Name; Record = $null; Holder = ''; Problem = $problem; Tombstone = $tombstone; Elsewhere = $false } }
     # ELSEWHERE: written on another machine, so its path names that machine's disk and can never be
     # this tree, however the strings compare (docs/COORD-SHARED-ROOT.md). No `host` is this machine.
-    $hostProp = $c.PSObject.Properties['host']
-    $recHost = if ($null -ne $hostProp -and $hostProp.Value -is [string]) { $hostProp.Value.Trim() } else { '' }
-    $elsewhere = [bool]($recHost -and -not ($recHost -ieq $thisHost))
+    $elsewhere = -not (Test-CoordRecordIsHere $c)
     [pscustomobject]@{ Name = $File.Name; Record = $c; Holder = (ConvertTo-Norm $c.worktree); Problem = ''; Tombstone = $tombstone; Elsewhere = $elsewhere }
 }
 
@@ -1005,11 +1007,11 @@ else {
 # listed. -Name used to read both as "no records found" (vault BACKLOG #2985, item 11, and #2988).
 # The allocation registry may sit on the shared root (docs/COORD-SHARED-ROOT.md); an error is
 # allocations-unknown, which refuses.
-$allocResolved = Resolve-CoordDir -From $GitRoot -Kind 'alloc'
+$allocResolved = Get-OwnSharedRoot
 if ($allocResolved.Error) {
     throw "the allocation registry of '$GitRoot' could not be resolved ($($allocResolved.Error)), so allocations are unknown. Nothing was removed."
 }
-$allocDirRoot = $allocResolved.Path
+$allocDirRoot = Join-Path $allocResolved.Path 'alloc'
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).

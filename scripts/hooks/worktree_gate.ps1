@@ -4485,7 +4485,8 @@ foreach ($spelling in $sharedSpellings) {
 }
 $targetSpellings = [System.Collections.Generic.List[string]]::new()
 if ($targetCmp) { $targetSpellings.Add($targetCmp) }
-if ($targetCmp -match '^([a-z]):/') {
+# The UNC spelling can only match a Shared entry, so with none there is no drive to look up.
+if (@($coordRoots | Where-Object { $_.Shared }).Count -gt 0 -and $targetCmp -match '^([a-z]):/') {
     try {
         $drive = Get-PSDrive -Name $Matches[1] -PSProvider FileSystem -ErrorAction Stop
         if ($drive.DisplayRoot -and $drive.DisplayRoot.StartsWith('\\')) {

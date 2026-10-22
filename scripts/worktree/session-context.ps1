@@ -176,16 +176,16 @@ if ($root) {
         # shown as the fleet's claims.
         $claimDir = $null
         $claimFault = ''
-        $thisHost = [Environment]::MachineName
         $coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
         if (Test-Path -LiteralPath $coordRootScript -PathType Leaf) {
             try {
                 . $coordRootScript
-                $resolvedClaims = Resolve-CoordDir -From (Get-Location).Path -Kind 'claims'
+                $knownLocal = if ($commonDir) { Join-Path "$commonDir".Trim() 'mefor-coord' } else { '' }
+                $resolvedClaims = Resolve-CoordDir -From (Get-Location).Path -Kind 'claims' -LocalRoot $knownLocal
                 if ($resolvedClaims.Error) { $claimFault = $resolvedClaims.Error } else { $claimDir = $resolvedClaims.Path }
             } catch { $claimFault = "coord-root.ps1 failed: $($_.Exception.Message)" }
         } else {
-            $claimDir = Join-Path (& git rev-parse --path-format=absolute --git-common-dir 2>$null).Trim() "mefor-coord/claims"
+            $claimFault = "$coordRootScript is missing"
         }
         if ($claimFault) {
             $lines += ""
@@ -200,9 +200,8 @@ if ($root) {
                 try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { continue }
                 $heldNorm = ($c.worktree -replace '\\', '/').TrimEnd('/')
                 # A claim from another machine names that machine's path, so it is never THIS session.
-                $recHost = if ($c.PSObject.Properties['host'] -and $c.host) { ([string]$c.host).Trim() } else { '' }
-                $here = (-not $recHost) -or ($recHost -ieq $thisHost)
-                $who = if ($here -and $heldNorm -ieq $meNorm) { "THIS session" } elseif ($here) { $c.worktree } else { "$($c.worktree) on $recHost" }
+                $here = Test-CoordRecordIsHere $c
+                $who = if ($here -and $heldNorm -ieq $meNorm) { "THIS session" } elseif ($here) { $c.worktree } else { "$($c.worktree) on $(Get-CoordRecordHost $c)" }
                 $stale = ""
                 try {
                     $hrs = ((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours

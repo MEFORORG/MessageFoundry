@@ -47,12 +47,6 @@ def _load_py() -> ModuleType:
 coord_root = _load_py()
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An owner shell with the variable set must not steer these tests into the live shared root.
-    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
-
-
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"
@@ -62,13 +56,9 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _local(repo: Path) -> Path:
-    common = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return Path(common) / "mefor-coord"
+    local = coord_root.local_root(repo)
+    assert local is not None
+    return Path(local)
 
 
 def _ps(repo: Path, kind: str) -> dict[str, object]:
@@ -296,3 +286,98 @@ def test_missing_kind_does_not_throw_in_powershell(repo: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "needs -Kind" in proc.stdout
+
+
+# One host predicate, in both languages. Each case is a JSON record both sides parse, so a disagreement
+# here is two readers judging one record differently: one reads a live claim as gone, the other not.
+_HOST_CASES: list[tuple[str, str]] = [
+    ("missing", '{"worktree": "x"}'),
+    ("null", '{"host": null}'),
+    ("empty", '{"host": ""}'),
+    ("padded-other", '{"host": "X "}'),
+    ("non-string", '{"host": 5}'),
+    ("other", '{"host": "OTHER-PC"}'),
+    ("this-lower-padded", json.dumps({"host": " " + coord_root.host().lower() + "\t"})),
+]
+
+
+def _ps_hosts(records: list[str]) -> list[list[object]]:
+    # Each JSON record through ConvertFrom-Json, then three that only PowerShell can build: a
+    # hashtable naming another host, a hashtable naming this one, and $null.
+    quoted = ", ".join("'" + r.replace("'", "''") + "'" for r in records)
+    script = (
+        f". '{PS}'; "
+        f"$recs = @(@({quoted}) | ForEach-Object {{ $_ | ConvertFrom-Json }}) + "
+        "@(@{ host = 'OTHER-PC' }, @{ host = (Get-CoordHost).ToLowerInvariant() }, $null); "
+        "ConvertTo-Json -Compress -InputObject @($recs | ForEach-Object { "
+        ",@((Get-CoordRecordHost $_), (Test-CoordRecordIsHere $_)) })"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    out: list[list[object]] = json.loads(proc.stdout)
+    return out
+
+
+def test_the_host_predicate_gives_one_answer_in_both_languages() -> None:
+    records = [r for _, r in _HOST_CASES]
+    py_records: list[object] = [json.loads(r) for r in records]
+    py_records += [{"host": "OTHER-PC"}, {"host": coord_root.host().lower()}, None]
+    py = [[coord_root.record_host(r), coord_root.record_is_here(r)] for r in py_records]
+    ps = _ps_hosts(records)
+    names = [n for n, _ in _HOST_CASES] + ["dict-other", "dict-this", "none"]
+    assert dict(zip(names, ps, strict=True)) == dict(zip(names, py, strict=True))
+    # And the answers themselves, so two twins that are wrong the same way still fail.
+    want = dict(zip(names, py, strict=True))
+    assert want["missing"] == ["", True]
+    assert want["null"] == ["", True]
+    assert want["empty"] == ["", True]
+    assert want["non-string"] == ["", True], "a non-string host is no host"
+    assert want["padded-other"] == ["X", coord_root.host().casefold() == "x"]
+    assert want["other"] == ["OTHER-PC", False]
+    assert want["this-lower-padded"] == [coord_root.host().lower(), True]
+    assert want["dict-other"] == ["OTHER-PC", False]
+    assert want["dict-this"][1] is True
+    assert want["none"] == ["", True]
+
+
+def test_resolving_the_shared_root_once_matches_per_kind_resolution(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    local = _local(repo)
+    local.mkdir(parents=True, exist_ok=True)
+    (local / "root.toml").write_text(f"shared_root = '{shared}'\n", encoding="utf-8")
+    root, source, error = coord_root.resolve_shared_root(repo)
+    assert (root, source, error) == (shared, "file", None)
+    assert coord_root.resolve("claims", repo).path == shared / "claims"
+    # local= names the clone's root without git: a start that is no repository still resolves.
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    assert coord_root.resolve_shared_root(elsewhere, local=local)[0] == shared
+    assert coord_root.resolve("claims", elsewhere, local=local).path == shared / "claims"
+    script = (
+        f". '{PS}'; $a = Resolve-CoordSharedRoot -From '{repo}'; "
+        f"$b = Resolve-CoordSharedRoot -From '{elsewhere}' -LocalRoot '{local}'; "
+        f"$c = Resolve-CoordDir -From '{elsewhere}' -Kind 'claims' -LocalRoot '{local}'; "
+        "ConvertTo-Json -Compress @($a.Path, $a.Source, $a.Error, $b.Path, $c.Path)"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    a_path, a_source, a_error, b_path, c_path = json.loads(proc.stdout)
+    assert _norm(a_path) == _norm(shared) and a_source == "file" and a_error is None
+    assert _norm(b_path) == _norm(shared)
+    assert _norm(c_path) == _norm(shared / "claims")
+    # A dead root is probed once and refused by the one-shot form too.
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(tmp_path / "absent"))
+    assert coord_root.resolve_shared_root(repo)[2] is not None

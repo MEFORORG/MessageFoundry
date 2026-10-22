@@ -162,12 +162,12 @@ try {
     # be a second definition of "where" (coord-root.ps1's header), and wrong once a root is configured.
     $sharedRoot = $null
     $sharedError = "$coordRootLib is missing, so the coordination root could not be resolved"
-    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) {
-        $sr = Resolve-CoordDir -From $top -Kind 'seats'
+    $haveResolver = [bool](Get-Command Resolve-CoordSharedRoot -ErrorAction SilentlyContinue)
+    if ($haveResolver) {
+        $sr = Resolve-CoordSharedRoot -From $top -LocalRoot $coord
         if ($sr.Error) { $sharedError = [string]$sr.Error }
-        else { $sharedError = ''; $sharedRoot = Split-Path -Parent $sr.Path }
+        else { $sharedError = ''; $sharedRoot = $sr.Path }
     }
-    $thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
     # Nothing to restore when neither root holds any state. Checked AFTER the shared root is known,
     # because on a shared root the local one may never have been created. A root that did not answer
     # is not "nothing": that case goes on to say so below.
@@ -197,7 +197,8 @@ try {
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
             # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
             # one's. A record with no host predates the field and is this PC's.
-            if ($j.PSObject.Properties['host'] -and $j.host -and ([string]$j.host -ine $thisHost)) { continue }
+            # Only codex-seats/ is read with no resolver loaded, and that registry is local by kind.
+            if ($haveResolver -and -not (Test-CoordRecordIsHere $j)) { continue }
             # A Codex restart may not inherit the goal of a Claude session in this tree.
             if ($env:KORUS_AGENT -eq 'codex') {
                 if (-not $env:KORUS_SESSION_ID) { continue }
@@ -275,7 +276,7 @@ try {
             if (-not $aw) { continue }
             # Another machine's allocation names a path on that machine's disk, so the same path here
             # is a different tree and the number is not this one's to lose. No `host` is this machine.
-            if ($a.PSObject.Properties['host'] -and $a.host -and ([string]$a.host).Trim() -ine $thisHost) { continue }
+            if (-not (Test-CoordRecordIsHere $a)) { continue }
             # EXACT match, never a prefix. Sibling worktrees in this repo are named as extensions of
             # each other (...-cfbf59 and ...-cfbf59-connscale-ci-claim), so a prefix test claims another
             # tree's numbers as your own.

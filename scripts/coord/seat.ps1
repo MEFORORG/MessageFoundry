@@ -258,20 +258,6 @@ function Invoke-Git {
 # Locate the layer and the worktree.
 # ---------------------------------------------------------------------------------------------
 
-function Test-RecordIsHere {
-    # Was this record written on THIS machine? A record with no `host` predates the field, and every
-    # such record was written when the registry was per-PC, so it is this machine's. Anything that
-    # judges a record by probing a path on disk must ask this first: a worktree or handoff path from
-    # another PC is absent here by construction, and "absent here" is not "gone".
-    param($Rec)
-    if ($null -eq $Rec) { return $true }
-    $h = $null
-    if ($Rec -is [System.Collections.IDictionary]) { if ($Rec.Contains('host')) { $h = $Rec['host'] } }
-    elseif ($Rec.PSObject.Properties.Name -contains 'host') { $h = $Rec.host }
-    if (-not $h) { return $true }
-    return ([string]$h -ieq (Get-CoordHost))
-}
-
 function Resolve-Worktree {
     param([string]$Hint)
     $start = if ($Hint) { $Hint } else { (Get-Location).Path }
@@ -495,7 +481,7 @@ function Get-ClaimsFor {
         if (-not $holder) { continue }
         # A claim taken on another machine names a path on THAT machine's disk. The same path string
         # here is a different tree, so the claim is not this one's (docs/COORD-SHARED-ROOT.md).
-        if (-not (Test-RecordIsHere $j)) { continue }
+        if (-not (Test-CoordRecordIsHere $j)) { continue }
         $hnorm = $holder.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($hnorm -ne $norm) { continue }
         $at = $null
@@ -526,7 +512,7 @@ function Get-AllocationsFor {
             }
             if (-not $aw) { continue }
             # Same reason as Get-ClaimsFor: another machine's allocation at this path is not this tree's.
-            if (-not (Test-RecordIsHere $j)) { continue }
+            if (-not (Test-CoordRecordIsHere $j)) { continue }
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
             $at = $null
             foreach ($n in @('claimed', 'allocatedAt', 'at')) {
@@ -765,8 +751,8 @@ function Invoke-ClearHandoff {
     # A RECORD FROM ANOTHER PC IS NOT CHECKABLE HERE. Its pointer names a path on that PC's disk, so
     # Test-Path below would read it as missing and clear a pointer that still resolves where it was
     # written. docs/COORD-SHARED-ROOT.md, "The bug a plain path change would ship".
-    if (-not (Test-RecordIsHere $rec)) {
-        return (Refuse "record $TargetBox/$TargetSession was written on $($rec.host), not $(Get-CoordHost). Its pointer is not checkable here; clear it from $($rec.host).")
+    if (-not (Test-CoordRecordIsHere $rec)) {
+        return (Refuse "record $TargetBox/$TargetSession was written on $(Get-CoordRecordHost $rec), not $(Get-CoordHost). Its pointer is not checkable here; clear it from $(Get-CoordRecordHost $rec).")
     }
 
     $prior = if ($names -contains 'handoff') { $rec.handoff } else { $null }
@@ -871,10 +857,10 @@ try {
         exit ([int][bool]$ClearHandoff)
     }
 
-    # ONE PROBE OF THE SHARED ROOT, through the seats kind. claims/ and alloc/ sit beside seats/ on
-    # the same root by the resolver's contract, so they are joined to its parent rather than probed
-    # twice more on every Stop.
-    $seatsRes = Resolve-CoordDir -From $wt -Kind 'seats'
+    # ONE git call and ONE probe of the shared root. seats/, claims/, alloc/ and handoffs/ all sit on
+    # it by the resolver's contract, so each is joined to it rather than probed again on every Stop.
+    $localRoot = Get-CoordLocalRoot -From $wt
+    $seatsRes = Resolve-CoordSharedRoot -From $wt -LocalRoot $localRoot
     if ($seatsRes.Error) {
         # The hook paths (-Record, -Prompt) must exit 0 and must not block a turn, so they write
         # nothing and say why on stderr. Every CLI verb is a writer the caller is waiting on, so it
@@ -887,13 +873,13 @@ try {
         [System.Console]::Error.WriteLine("seat.ps1: REFUSED: the shared seat registry did not resolve, so nothing was written: $($seatsRes.Error)")
         exit 1
     }
-    $script:SharedRoot = Split-Path -Parent $seatsRes.Path
+    $script:SharedRoot = $seatsRes.Path
 
-    $script:SeatsDir = $seatsRes.Path
+    $script:SeatsDir = Join-Path $script:SharedRoot 'seats'
     # Claude's process inventory cannot establish Codex liveness. Keep its inputs unchanged.
     # codex-seats/ is not a shared kind, so the resolver keeps it on the LOCAL root.
     if ($env:KORUS_AGENT -eq 'codex') {
-        $script:SeatsDir = (Resolve-CoordDir -From $wt -Kind 'codex-seats').Path
+        $script:SeatsDir = (Resolve-CoordDir -From $wt -Kind 'codex-seats' -LocalRoot $localRoot).Path
     }
     if (-not (Test-Path -LiteralPath $script:SeatsDir)) {
         New-Item -ItemType Directory -Path $script:SeatsDir -Force | Out-Null
@@ -1027,7 +1013,7 @@ try {
         lifecycleAt      = $lifecycleAt
         boxKey           = $boxKey
         # The machine that wrote this record. Every liveness reader checks it before probing a path
-        # on its own disk; see Test-RecordIsHere and docs/COORD-SHARED-ROOT.md.
+        # on its own disk; see Test-CoordRecordIsHere and docs/COORD-SHARED-ROOT.md.
         host             = Get-CoordHost
         worktree         = $wt
         worktreeSource   = 'git rev-parse --show-toplevel'

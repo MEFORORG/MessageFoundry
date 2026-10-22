@@ -177,15 +177,13 @@ function Get-ClaimNotes {
     # (docs/COORD-SHARED-ROOT.md). No `host` means this machine: the field postdates per-PC registries.
     param([string]$ClaimsDir)
     $map = @{}
-    $thisHost = Get-CoordHost
     try {
         if (-not (Test-Path -LiteralPath $ClaimsDir)) { return $map }
         foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
                 $c = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
                 if (-not ($c.worktree -and $c.note)) { continue }
-                $claimHost = if ($c.PSObject.Properties['host'] -and $c.host) { ([string]$c.host).Trim() } else { '' }
-                if ($claimHost -and $claimHost -ine $thisHost) { continue }
+                if (-not (Test-CoordRecordIsHere $c)) { continue }
                 $hrs = $null
                 # An unparseable or absent stamp leaves $hrs null, and the caller then prints the note
                 # with no age claim at all -- an unknown age must not be rendered as a fresh one.
@@ -888,12 +886,12 @@ try {
         # claims sit beside it, as they always did. A root that does not answer costs the notes only:
         # one line on stderr, and the roster still renders, because this hook must never block a prompt.
         $claimsDir = ''
-        # Loaded on both paths: Get-ClaimNotes needs Get-CoordHost even when -StateDir names the claims.
+        # Loaded on both paths: Get-ClaimNotes needs Test-CoordRecordIsHere even when -StateDir names the claims.
         . (Join-Path $PSScriptRoot '..\coord\coord-root.ps1')
         if ($stateDirInjected) { $claimsDir = Join-Path (Split-Path $StateDir -Parent) 'claims' }
         else {
             $claimsFrom = if ($top) { $top } else { (Get-Location).Path }
-            $cr = Resolve-CoordDir -From $claimsFrom -Kind 'claims'
+            $cr = Resolve-CoordDir -From $claimsFrom -Kind 'claims' -LocalRoot (Join-Path $cd 'mefor-coord')
             if ($cr.Error) { try { [Console]::Error.WriteLine("[announce] claim notes skipped: $($cr.Error)") } catch { } }
             else { $claimsDir = $cr.Path }
         }

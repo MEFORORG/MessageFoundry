@@ -92,17 +92,18 @@ try {
     # line on stderr and exit 0, never a hang and never a watch on the local copy, which mail from the
     # other PC never reaches. The resolver's probe is bounded and its DOWN verdict is cached, so a dead
     # share costs this arming one short timeout at most.
-    $root = Join-Path $common.Trim() 'mefor-coord/mail'
+    # A missing resolver is the same skip as a dead root: never a watch on a local copy of a shared kind.
     $coordRootLib = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+    $mr = @{ Path = $null; Error = "$coordRootLib is missing" }
     if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
         . $coordRootLib
-        $mr = Resolve-CoordDir -From $cwd -Kind 'mail'
-        if ($mr.Error) {
-            try { [Console]::Error.WriteLine("mail-watch: not watching, the shared mail root did not resolve: $($mr.Error)") } catch { }
-            exit 0
-        }
-        $root = $mr.Path
+        $mr = Resolve-CoordDir -From $cwd -Kind 'mail' -LocalRoot (Join-Path $common.Trim() 'mefor-coord')
     }
+    if ($mr.Error) {
+        try { [Console]::Error.WriteLine("mail-watch: not watching, the shared mail root did not resolve: $($mr.Error)") } catch { }
+        exit 0
+    }
+    $root = $mr.Path
 
     # mail-claim.ps1 dot-sources mail-key.ps1, so this takes both halves of the contract at once and
     # cannot end up holding only the box key. What is needed from it is the SHOWN-MARKER name shape.

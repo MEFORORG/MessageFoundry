@@ -102,7 +102,7 @@ if (-not $common) {
 }
 # seats/ is a SHARED kind. A root that does not answer is a refusal, never a quiet read of the local
 # copy: that copy is the one the other PC never writes, so it would render as a complete, smaller fleet.
-$seatsRes = Resolve-CoordDir -From $repo -Kind 'seats'
+$seatsRes = Resolve-CoordDir -From $repo -Kind 'seats' -LocalRoot (Join-Path ([string]$common).Trim() 'mefor-coord')
 if ($seatsRes.Error) {
     # stderr directly, not Write-Error: under this file's 'Stop' preference Write-Error throws and the
     # exit code would be 1 instead of the 2 this refusal documents.
@@ -112,16 +112,6 @@ if ($seatsRes.Error) {
 $seatsDir = $seatsRes.Path
 $primary = Split-Path $common -Parent
 $thisHost = Get-CoordHost
-
-# The host a record was written on, or '' for a record that predates the field (this PC's).
-function Get-RecordHost($rec) {
-    if ($rec -and ($rec.PSObject.Properties.Name -contains 'host') -and $rec.host) { return [string]$rec.host }
-    return ''
-}
-function Test-RecordIsHere($rec) {
-    $h = Get-RecordHost $rec
-    return (-not $h) -or ($h -ieq $thisHost)
-}
 
 # ---------------------------------------------------------------------------------------------
 # Gather. Records first, then the fence, then the denominator.
@@ -396,7 +386,7 @@ foreach ($r in $records) {
     # Fence state, positive answers only. There is no heartbeat on this host and registry writes are
     # event-driven, so nothing here can PROVE a session is gone -- only that it is present.
     # The fence is this PC's session registry, so it is never asked about another PC's record.
-    $isHere = Test-RecordIsHere $rec
+    $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
     if ($isHere -and $fenceAvailable -and $sid) {
         try { $fence = (Get-SessionLiveness -SessionId $sid).State } catch { $fence = 'UNKNOWN' }
@@ -418,7 +408,7 @@ foreach ($r in $records) {
         { $lifecycle -eq 'closed' }                    { 'CLOSED'; break }
         { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
         { $superseded }                                { 'SUPERSEDED'; break }
-        { -not $isHere }                               { "ON $((Get-RecordHost $rec).ToUpperInvariant())"; break }
+        { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
         { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $fence -in @('UNVERIFIED', 'UNREADABLE') }   { 'POSSIBLY RUNNING'; break }
         { -not $fenceAvailable }                       { 'UNKNOWN-NO-FENCE'; break }
@@ -445,7 +435,7 @@ foreach ($r in $records) {
         WriterStale = $writerStale
         Branch      = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
         Worktree    = $wt
-        Host        = Get-RecordHost $rec
+        Host        = Get-CoordRecordHost $rec
         IsHere      = $isHere
         Epoch       = if ($rec.PSObject.Properties.Name -contains 'poolEpoch') { [int]$rec.poolEpoch } else { $null }
         Rec         = $rec
@@ -483,7 +473,7 @@ foreach ($o in $records) {
     if (-not ($h -and $h.path)) { continue }
     # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
     # stop below for a document that resolves where it was written, so it is counted apart.
-    if (-not (Test-RecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
+    if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
     $ptrTotal++
     # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
     # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves

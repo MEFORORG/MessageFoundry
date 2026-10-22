@@ -124,18 +124,14 @@ if ($missing) {
 function Get-HandoffCoordRoot {
     param([string]$Override)
     if ($Override) { return $Override }
-    $common = & git @( if ($RepoHint) { @('-C', $RepoHint) } else { @() } ) rev-parse --path-format=absolute --git-common-dir 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $common) {
-        throw "Not inside a git worktree: refusing to guess where the coordination state lives."
-    }
-    # The parent of the shared handoffs/ directory is the shared root itself, which also holds seats/.
+    # The shared root holds both handoffs/ and seats/.
     $from = if ($RepoHint) { $RepoHint } else { (Get-Location).Path }
-    $r = Resolve-CoordDir -From $from -Kind 'handoffs'
+    $r = Resolve-CoordSharedRoot -From $from
     if ($r.Error) {
         Write-Output "FAILED: the shared coordination root did not resolve, so nothing was read, moved or written: $($r.Error)"
         exit 2
     }
-    return (Split-Path -Parent $r.Path)
+    return $r.Path
 }
 
 $coord = Get-HandoffCoordRoot -Override $CoordDir

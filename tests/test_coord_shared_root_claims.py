@@ -14,8 +14,8 @@ claims, allocations, lanes and the owner log:
   a sweep, and never count as this tree's. A record with no ``host`` is this machine's, which keeps
   every legacy record judged exactly as before. Every such test pairs the two.
 
-The two Python git hooks carry a copy of the resolver (``claim_check.py`` is installed ALONE into
-``.git/hooks``), so the last section holds each copy to ``coord_root.py`` on the same cases.
+The two Python git hooks load ``coord_root.py`` by path rather than carry a copy, so the last section
+checks that an installed gate finds it beside itself and refuses when it is missing.
 """
 
 from __future__ import annotations
@@ -71,12 +71,6 @@ claim_check = _load(HOOKS / "claim_check.py", "claim_check_for_shared_claims")
 ledger_check = _load(HOOKS / "ledger_check.py", "ledger_check_for_shared_claims")
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An owner shell with the variable set must not steer these tests into the live shared root.
-    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
-
-
 def git(repo: Path, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=TIMEOUT, check=True
@@ -110,9 +104,9 @@ def shared(tmp_path: Path) -> Path:
 
 
 def local_coord(repo: Path) -> Path:
-    return Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()) / (
-        "mefor-coord"
-    )
+    local = coord_root.local_root(repo)
+    assert local is not None
+    return Path(local)
 
 
 def run(
@@ -390,95 +384,6 @@ def test_adjudicate_reports_another_machines_claim_as_elsewhere(
 
 
 # --------------------------------------------------------------------------------------------------
-# The two hook copies of the resolver give coord_root.py's answer
-# --------------------------------------------------------------------------------------------------
-
-
-def _bare_repo(tmp_path: Path) -> Path:
-    r = tmp_path / "plain"
-    r.mkdir()
-    subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
-    return r
-
-
-@pytest.mark.parametrize("copy", [claim_check, ledger_check], ids=["claim_check", "ledger_check"])
-def test_the_hook_copies_carry_the_same_kinds_and_pattern(copy: ModuleType) -> None:
-    assert copy._COORD_SHARED_KINDS == coord_root.SHARED_KINDS
-    assert copy._COORD_ROOT_LINE.pattern == coord_root._ROOT_LINE.pattern
-    assert copy._COORD_UNC.pattern == coord_root._UNC.pattern
-
-
-def _case(name: str, repo: Path, shared: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    toml = local_coord(repo) / "root.toml"
-    if name == "env":
-        monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
-    elif name == "toml":
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_text(f"# comment\nshared_root = '{shared}'  # trailing\n", encoding="utf-8")
-    elif name == "bad-toml":
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_text(f'shared_root = "{shared}"\n', encoding="utf-8")
-    elif name == "empty-toml":
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_text("# nothing here\n", encoding="utf-8")
-    elif name == "env-missing":
-        monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared / "absent"))
-    elif name == "dup-toml":
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_text(f"shared_root = '{shared}'\nshared_root = '{shared}'\n", encoding="utf-8")
-    elif name == "utf16-toml":
-        # What Windows PowerShell 5.1's `>` writes. Both twins decode it; neither guesses an ANSI file.
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_bytes(f"shared_root = '{shared}'\r\n".encode("utf-16"))
-    elif name == "ansi-toml":
-        toml.parent.mkdir(parents=True, exist_ok=True)
-        toml.write_bytes(b"shared_root = '\xe9'\n")
-
-
-@pytest.mark.parametrize("copy", [claim_check, ledger_check], ids=["claim_check", "ledger_check"])
-@pytest.mark.parametrize(
-    "case",
-    [
-        "nothing",
-        "env",
-        "toml",
-        "bad-toml",
-        "empty-toml",
-        "env-missing",
-        "dup-toml",
-        "utf16-toml",
-        "ansi-toml",
-    ],
-)
-@pytest.mark.parametrize("kind", ["claims", "alloc", "overlap-cache"])
-def test_the_hook_copies_resolve_as_coord_root_does(
-    copy: ModuleType,
-    case: str,
-    kind: str,
-    tmp_path: Path,
-    shared: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = _bare_repo(tmp_path)
-    _case(case, repo, shared, monkeypatch)
-    want = coord_root.resolve(kind, repo)
-    path, error = copy._coord_dir(kind, str(repo))
-    assert (error is None) == (want.error is None), (case, error, want)
-    assert path == want.path
-    broken = ("bad-toml", "empty-toml", "env-missing", "dup-toml", "ansi-toml")
-    if case in broken and kind != "overlap-cache":
-        assert error is not None, "a broken configuration must refuse, never fall back"
-
-
-@pytest.mark.parametrize("copy", [claim_check, ledger_check], ids=["claim_check", "ledger_check"])
-def test_the_hook_copies_name_the_same_host(copy: ModuleType) -> None:
-    assert copy._coord_this_host() == coord_root.host()
-    assert copy._coord_record_is_here({"worktree": "x"}), "no host field is this machine"
-    assert copy._coord_record_is_here({"host": coord_root.host().lower()})
-    assert not copy._coord_record_is_here({"host": OTHER})
-
-
-# --------------------------------------------------------------------------------------------------
 # The hooks themselves: shared registry, and another machine's record is never this tree's
 # --------------------------------------------------------------------------------------------------
 
@@ -555,3 +460,41 @@ def test_the_ledger_gate_never_grants_another_machines_number(
     ledger = ledger_check.Ledger(ci=False)
     assert ledger.alloc is None and ledger.alloc_error
     assert not ledger.owns("adr", "0003"), "an unresolved registry grants nothing"
+
+
+def _gate_copy(tmp_path: Path, with_resolver: bool) -> Path:
+    """claim_check.py laid out as install-git-hooks.ps1 lays it out, with or without coord_root.py."""
+    hooks = tmp_path / "installed-hooks"
+    hooks.mkdir()
+    shutil.copy2(HOOKS / "claim_check.py", hooks / "claim_check.py")
+    if with_resolver:
+        shutil.copy2(COORD / "coord_root.py", hooks / "coord_root.py")
+    return hooks / "claim_check.py"
+
+
+@pytest.mark.parametrize("with_resolver", [True, False], ids=["beside", "missing"])
+def test_an_installed_claim_gate_loads_the_resolver_beside_it_or_refuses(
+    repo: Path, shared: Path, tmp_path: Path, with_resolver: bool
+) -> None:
+    (repo / "code.py").write_text("x = 1\n", encoding="utf-8")
+    git(repo, "add", "code.py")
+    top = git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
+    write_claim(shared / "claims", "42", top, "main", this_host())
+    gate = _gate_copy(tmp_path, with_resolver)
+    msg = repo / "COMMIT_MSG.tmp"
+    msg.write_text("feat: thing (BACKLOG #42)\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    env["MEFOR_COORD_ROOT"] = str(shared)
+    proc = subprocess.run(
+        [sys.executable, str(gate), str(msg)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=TIMEOUT,
+    )
+    if with_resolver:
+        assert proc.returncode == 0, proc.stderr
+    else:
+        assert proc.returncode == 1, proc.stderr
+        assert "coord_root.py could not be loaded" in proc.stderr

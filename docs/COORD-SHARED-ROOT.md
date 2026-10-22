@@ -1,8 +1,8 @@
 # Sharing fleet coordination state across two PCs
 
-**Status: APPROVED by the owner, 2026-10-21. Migration steps 3 (resolver, host field, host-aware
+**Status: APPROVED by the owner, 2026-10-21. Migration step 3 (resolver, host field, host-aware
 liveness, gate) are BUILT on this branch. No root is configured anywhere, so behaviour is unchanged
-until step 6.**
+until step 7.**
 
 Known gaps after step 3, at least:
 
@@ -14,7 +14,7 @@ Known gaps after step 3, at least:
   `<git-common-dir>/mefor-coord/seats`. It should import `scripts/coord/coord_root.py`. That edit is
   outside the worktree, so it is the owner's.
 - **CLAUDE.md section 5's wiki command** passes `-StateRoot` as the local root. Once a root is
-  configured, it must name the shared root instead. That edit lands with step 6.
+  configured, it must name the shared root instead. That edit lands with step 7.
 
 Owner answers, 2026-10-21:
 
@@ -220,21 +220,25 @@ design. Reads and builds keep working.
 2. On each PC, in a desktop shell, an elevated shell and a scheduled task, a probe script measures:
    UNC reachability, exclusive create (two processes race 100 times, exactly one wins each time),
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
-3. Land the resolver, the `host` field, the host-aware liveness checks and the gate exemption, with
+3. Land the resolver, the `host` field, the host-aware liveness checks and the gate tightening, with
    tests. Behaviour is unchanged, because no root is configured yet.
-4. Pick a quiet window. Announce it on the old mail lane.
-5. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
+4. Land the host-qualified box key: hash `<host>|<path>`, not the path alone, for seat ids,
+   mailboxes and lane files, keeping one read of the old key for records with no `host`. Until it
+   lands, two PCs with a worktree at the same path share one seat id and one mailbox. This is a
+   precondition of step 7, and a separate change, because it moves both ends of the mail contract.
+5. Pick a quiet window. Announce it on the old mail lane.
+6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
    `robocopy /E /COPY:DT`. Leave the originals in place.
-6. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
-7. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
+7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
+8. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
    back from a second account.
-8. Rename the old local copies to `*.pre-share` so nothing reads them by accident.
-9. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE.
+9. Rename the old local copies to `*.pre-share` so nothing reads them by accident.
+10. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE.
 
 ## Rollback
 
 1. Delete `root.toml`, or set `MEFOR_COORD_ROOT` to the local path. The next hook call is local.
-2. Copy back anything written to the share since step 6 that the fleet still needs, at least open
+2. Copy back anything written to the share since step 7 that the fleet still needs, at least open
    claims and unread mail.
 3. Rename the `*.pre-share` copies back.
 

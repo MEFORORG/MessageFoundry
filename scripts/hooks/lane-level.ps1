@@ -202,12 +202,11 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 } else {
     try {
         . $coordRootScript
-        $from = (Get-Location).Path
-        $sr = Resolve-CoordDir -From $from -Kind 'seats'
-        if ($sr.Error) { $laneFault = $sr.Error } else { $seatsDir = $sr.Path }
-        if (-not $laneFault) {
-            $lr = Resolve-CoordDir -From $from -Kind 'lanes'
-            if ($lr.Error) { $laneFault = $lr.Error } else { $lanesDir = $lr.Path }
+        $sr = Resolve-CoordSharedRoot -From (Get-Location).Path
+        if ($sr.Error) { $laneFault = $sr.Error }
+        else {
+            $seatsDir = Join-Path $sr.Path 'seats'
+            $lanesDir = Join-Path $sr.Path 'lanes'
         }
     } catch { $laneFault = "coord-root.ps1 failed: $($_.Exception.Message)" }
 }
@@ -216,13 +215,12 @@ if ($laneFault) {
     Say "  'both lanes are fine' -- nothing was examined."
     Emit
 }
-$thisHost = Get-CoordHost
 # A lane record from ANOTHER machine at this box key is that PC's lane, whose worktree happens to share
 # this path. It says nothing about this lane, so it reads as no record. No `host` field is this machine.
 function Read-LaneRecord([string]$Path) {
     $rec = Read-Json $Path
     if ($null -eq $rec -or $rec -is [string]) { return $rec }
-    if ((Test-Has $rec 'host') -and $rec.host -and -not (([string]$rec.host).Trim() -ieq $thisHost)) { return $null }
+    if (-not (Test-CoordRecordIsHere $rec)) { return $null }
     return $rec
 }
 $cwd = (Get-Location).Path
