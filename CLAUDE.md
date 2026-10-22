@@ -886,9 +886,12 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   store), and conflating them causes real errors.
 - **ASVS vocabulary lives in [`scripts/asvs/CLAUDE.md`](scripts/asvs/CLAUDE.md).** Never say "vault
   cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor", and keep that apart
-  from *verifier drift*. The vocabulary is public; cell ids, coverage and gaps stay vaulted, and so
-  does any map pairing cell ids with paths. Quote a number the tool prints only with the ref pair it
-  prints beside it. The current score:
+  from *verifier drift*. The vocabulary is public, and a requirement number may tag a sentence that
+  says what the code does. A requirement's status, coverage and gaps, any count or score from the
+  scorecard, and any map pairing cell ids with paths stay vaulted, so no public artifact holds three
+  or more requirement numbers each beside a path. Text already public is no precedent, and nobody
+  sweeps it without a ruled item. Quote a number the tool prints only in a private place, with the
+  ref pair it prints beside it. The current score:
 
   ```
   python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status

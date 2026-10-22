@@ -36,8 +36,8 @@ walker skipped as not path-shaped, and every one was arithmetic. Re-run that lis
 or narrowing the path words; :data:`SITES` itself is the current count.
 
 **What it walks.** The engine, the web console, the toolkit and the harness (:data:`PY_ROOTS`), the
-IDE extension, and the operator-run scripts (``scripts/service/`` less ``measure-store-access.ps1``,
-a CI measurement). ``tee/``, the separately run relay, is left out by owner decision.
+IDE extension, and the operator-run scripts (every ``scripts/service/`` script, which owner rulings
+R3 and R1 put in scope). ``tee/``, the separately run relay, is left out by owner decision.
 
 **Grades.** Each site gets one:
 
@@ -91,9 +91,8 @@ PY_ROOTS: tuple[str, ...] = (
     "harness",
 )
 
-#: The operator-run scripts: ``scripts/service/`` less this one CI measurement.
+#: The operator-run scripts. Owner ruling R1 (2026-10-05) keeps ``measure-store-access.ps1`` among them.
 _SCRIPTS_DIR = _ROOT / "scripts" / "service"
-_SCRIPTS_EXCLUDED = frozenset({"measure-store-access.ps1"})
 
 _IDE_SRC = _ROOT / "ide" / "src"
 
@@ -311,7 +310,7 @@ def derived_ide_sites() -> dict[str, int]:
 
 
 def derived_script_sites() -> dict[str, int]:
-    paths = [p for p in sorted(_SCRIPTS_DIR.glob("*.ps1")) if p.name not in _SCRIPTS_EXCLUDED]
+    paths = sorted(_SCRIPTS_DIR.glob("*.ps1"))
     return _count_per_file(paths, _PS_JOIN)
 
 
@@ -917,6 +916,13 @@ SCRIPT_SITES: dict[str, Site] = {
         "Fixed names under paths the operator passes or the script derives (repo root, install "
         "root and its site-packages and dist-info folders, project root, data directory, NSSM "
         "directory, temp), plus registry keys named after the service's own images.",
+    ),
+    "scripts/service/measure-store-access.ps1": Site(
+        21,
+        OPERATOR,
+        "Fixed names under paths the operator passes or the script derives (data directory, NSSM "
+        "directory, repo root, temp and its work directory), and a phase label the script itself "
+        "passes with every non-alphanumeric run replaced.",
     ),
     "scripts/service/uninstall-net-helper.ps1": Site(
         1, OPERATOR, "A fixed name under the install directory."

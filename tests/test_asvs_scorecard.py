@@ -19,7 +19,7 @@ import re
 import subprocess
 import time
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, get_args
 
 import pytest
@@ -1216,17 +1216,24 @@ def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path
 
 
 @pytest.mark.parametrize(
-    "mutation_path",
-    [".", "./", "scripts", "scripts/absent.py", "tests/test_x.py"],
+    ("mutation_path", "kind"),
+    [
+        (".", "view-inert"),
+        ("./", "view-inert"),
+        ("scripts/absent.py", "view-inert"),
+        # A path the corpus would never read asks no view question and is named instead.
+        ("scripts", "unread-path"),
+        ("tests/test_x.py", "unread-path"),
+    ],
 )
 def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
-    tmp_path: Path, mutation_path: str
+    tmp_path: Path, mutation_path: str, kind: str
 ) -> None:
     """Only a file the corpus read through the view counts; nothing else may crash."""
     root = _absence_tree(tmp_path, {})
     f = _absence_findings(root, *_SAMESITE, mutation_path=mutation_path)
     assert f.problems == []
-    assert f.advisory_kinds == {"view-inert": 1}
+    assert f.advisory_kinds == {kind: 1}
 
 
 def test_absence_mutation_path_with_a_backslash_is_read_through_the_view(tmp_path: Path) -> None:
@@ -1306,13 +1313,12 @@ def test_absence_quiet_on_a_powershell_comment(tmp_path: Path, text: str) -> Non
     "rel",
     [
         "scripts/coord/tool.ps1",
-        "scripts/service/measure-store-access.ps1",
         "tee/run.ps1",
         "samples/install.ps1",
     ],
 )
 def test_absence_quiet_on_powershell_outside_the_assessed_scope(tmp_path: Path, rel: str) -> None:
-    """Negative control: R3 puts tooling out, the method reads the CI measurement out, R4 tee/."""
+    """Negative control: R3 puts tooling out, R4 tee/, and samples/ ships in no wheel."""
     root = _absence_tree(tmp_path, {rel: "Import-Certificate -FilePath $ca\n"})
     assert _absence_problems(root, *_PS_CERT) == []
 
@@ -1383,15 +1389,13 @@ def test_absence_view_is_chosen_by_the_claims_path_even_when_the_file_is_absent(
     # The control must be sighted in a PowerShell view; the Python fixture's class does not count.
     f = _absence_findings(root, *_PS_CERT, mutation_path=new_ps)
     assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
-    # Outside the scope, the claim does not land: the Python view answers, as an advisory.
+    # Outside the scope, the claim does not land and asks no view question. The corpus never
+    # reads the file, so that is named rather than judged silently (BACKLOG #3566).
     f = _absence_findings(
-        root,
-        r"(?i)Import-Certificate",
-        "# Import-Certificate",
-        "x",
-        "scripts/service/measure-store-access.ps1",
+        root, r"(?i)Import-Certificate", "# Import-Certificate", "x", "scripts/coord/tool.ps1"
     )
-    assert f.problems == [], f.problems
+    assert f.problems == [] and f.advisory_kinds == {"unread-path": 1}, f.advisories
+    assert "'scripts/coord/tool.ps1', a file the absence corpus never reads" in f.advisories[0]
     for rel in ("messagefoundry_webconsole/static/app.js", "ide/src/x.ts"):
         f = _absence_findings(root, *_SAMESITE, mutation_path=rel)
         assert f.problems == [] and f.advisories == [], (rel, f.advisories)
@@ -1411,6 +1415,100 @@ def test_absence_landing_control_must_be_sighted_in_the_same_kind_of_view(tmp_pa
     assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
     f = _absence_findings(root, *_PS_CERT, control="SameSite=None", mutation_path=_SERVICE_PS)
     assert f.problems == [] and f.advisories == [], (f.problems, f.advisories)
+
+
+def test_absence_reads_the_store_access_measurement_as_operator_powershell(
+    tmp_path: Path,
+) -> None:
+    """Owner ruling R1 (2026-10-05) put the measurement in scope, so a call in it reads FALSE."""
+    rel = "scripts/service/measure-store-access.ps1"
+    root = _absence_tree(tmp_path, {rel: "Import-Certificate -FilePath $ca\n"})
+    problems = _absence_problems(root, *_PS_CERT)
+    assert len(problems) == 1 and "FALSE" in problems[0], problems
+    assert rel in {p.relative_to(root).as_posix() for p in scorecard_module._absence_sources(root)}
+    # A claim landing in it is asked of the PowerShell view, so a comment mutation is INERT.
+    f = _absence_findings(root, r"(?i)Import-Certificate", "# Import-Certificate", "FilePath", rel)
+    assert [p.split(" — ")[0] for p in f.problems] == [
+        "1.1.1: absence claim is INERT",
+        "1.1.1: absence claim is FALSE",
+    ], f.problems
+
+
+def test_absence_powershell_landing_names_the_comment_blanking_view(tmp_path: Path) -> None:
+    """A claim judged against the PowerShell view says so, never the Python code-only view."""
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "$x = 1\n"})
+    f = _absence_findings(
+        root, r"(?i)Import-Certificate", "# Import-Certificate", "x", mutation_path=_SERVICE_PS
+    )
+    assert len(f.problems) == 1, f.problems
+    assert f"once the comment-blanking view '{_SERVICE_PS}'" in f.problems[0], f.problems
+    assert "code-only" not in f.problems[0], f.problems
+    # The control is sighted only in a Python view, so the PowerShell search finds nothing.
+    f = _absence_findings(root, *_PS_CERT, control="Control", mutation_path=_SERVICE_PS)
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    assert (
+        "searched in the comment-blanking view of every scripts/service/ PowerShell file that "
+        "tokenizes," in f.problems[0]
+    ), f.problems
+    # The Python wording is unchanged, word for word, because the vault's baseline parser reads it.
+    root = _absence_tree(tmp_path / "py", {"scripts/tool.py": "x = 1\n"})
+    f = _absence_findings(root, "clamd", "import clamd", mutation_path="scripts/tool.py")
+    assert (
+        "searched in the code-only view of every scripts/ file that tokenizes," in (f.problems[0])
+    ), f.problems
+
+
+@pytest.mark.parametrize(
+    ("rel", "read"),
+    [
+        ("messagefoundry/a.py", True),
+        ("harness/x/b.py", True),
+        ("scripts/coord/c.py", True),
+        ("messagefoundry/__pycache__/a.py", False),
+        ("tests/test_a.py", False),
+        ("tee/a.py", False),
+        ("scripts/service/install-service.ps1", True),
+        ("scripts/service/measure-store-access.ps1", True),
+        ("scripts/service/sub/x.PSM1", True),
+        ("scripts/coord/tool.ps1", False),
+        ("ide/src/extension.ts", True),
+        ("ide/media/view.js", True),
+        ("messagefoundry_webconsole/static/app.js", True),
+        ("ide/esbuild.js", False),
+        ("ide/node_modules/dep/index.js", False),
+        ("ide/out/extension.js", False),
+        ("ide/src/test/suite/a.test.ts", False),
+        ("tee/static/app.js", False),
+        ("messagefoundry_webconsole/static/app.css", False),
+        ("README.md", False),
+    ],
+)
+def test_corpus_reads_answers_by_the_walks_rules(tmp_path: Path, rel: str, read: bool) -> None:
+    """The one-path rule agrees with the walk, file by file, read or not."""
+    assert scorecard_module._corpus_reads(PurePosixPath(rel)) is read
+    root = _absence_tree(tmp_path, {rel: "x = 1\n"})
+    walked = {p.relative_to(root).as_posix() for p in scorecard_module._absence_sources(root)}
+    assert (rel in walked) is read, walked
+
+
+def test_corpus_reads_agrees_with_the_walk_over_the_real_tree() -> None:
+    """Every file the corpus reads in this repository is one the one-path rule says it reads."""
+    repo = Path(__file__).resolve().parents[1]
+    walked = [p.relative_to(repo).as_posix() for p in scorecard_module._absence_sources(repo)]
+    assert walked
+    assert [r for r in walked if not scorecard_module._corpus_reads(PurePosixPath(r))] == []
+    # Owner ruling R1 (2026-10-05): the store-access measurement is operator PowerShell, and read.
+    assert "scripts/service/measure-store-access.ps1" in walked
+
+
+def test_absence_corpus_skips_the_ides_unshipped_build_script(tmp_path: Path) -> None:
+    """``ide/.vscodeignore`` leaves esbuild.js out of the package, so a hit there is not shipped."""
+    root = _absence_tree(tmp_path, {"ide/esbuild.js": "fetch('/ui/logs/tail')\n"})
+    assert _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')") == []
+    repo = Path(__file__).resolve().parents[1]
+    ignored = (repo / "ide" / ".vscodeignore").read_text(encoding="utf-8").splitlines()
+    for rel in scorecard_module._SCRIPT_UNSHIPPED_FILES:
+        assert PurePath(rel).relative_to("ide").as_posix() in ignored, rel
 
 
 def test_absence_corpus_pairs_with_its_source_list(tmp_path: Path) -> None:
@@ -1474,7 +1572,7 @@ def test_powershell_view_makes_the_crypto_gates_decisions() -> None:
 
 
 def test_script_walk_matches_the_crypto_gates_walk() -> None:
-    """Parity: the same roots, suffixes and pruned directories as the gate, less the IDE's tests."""
+    """Parity: the gate's roots, suffixes and pruned directories, less IDE tests and build scripts."""
     from scripts.security import crypto_inventory_check as gate
 
     assert scorecard_module._SCRIPT_ROOTS == gate.NON_PYTHON_WALK_ROOTS
@@ -1490,7 +1588,9 @@ def test_script_walk_matches_the_crypto_gates_walk() -> None:
     mine = {p.relative_to(repo).as_posix() for p in scorecard_module._script_sources(repo)}
     tests = {p for p in theirs if p.startswith("ide/src/test/")}
     assert tests and mine, (len(tests), len(mine))  # both sides read something
-    assert mine == theirs - tests
+    unshipped = set(scorecard_module._SCRIPT_UNSHIPPED_FILES)
+    assert unshipped <= theirs, unshipped  # each entry names a file the gate still reads
+    assert mine == theirs - tests - unshipped
 
 
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
