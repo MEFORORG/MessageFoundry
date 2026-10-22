@@ -130,7 +130,12 @@ def test_one_handler_runs_every_shell_guard_through_the_dispatcher() -> None:
     assert Path(argv[4]).name == DISPATCHER.name, argv
     names = [g.name for g in _wired_guards()]
     assert sorted(names) == sorted(
-        ["block-api-burn.ps1", "block-unbounded-fs-scan.ps1", "block-blanket-git-stage.ps1"]
+        [
+            "block-api-burn.ps1",
+            "block-unbounded-fs-scan.ps1",
+            "block-blanket-git-stage.ps1",
+            "afk-tripwire.ps1",
+        ]
     ), names
     # The bounded guard first: it refuses an over-long payload unread, so a huge payload never
     # reaches the guards that parse whatever they are given. The dispatcher's header says why.

@@ -49,6 +49,19 @@ PRESENCE_TAIL = (
     " list no other session, so nothing was read."
 )
 SEAT_DECLARE = ("-Declare", "-Seat", "builder", "-Goal", "cloud refusal test")
+# Spooled only, so the control outside the cloud needs no gh.
+DECISION_LOG = (
+    "-Log",
+    "-Item",
+    "1",
+    "-Class",
+    "B",
+    "-Seat",
+    "builder",
+    "-Recommendation",
+    "x",
+    "-NoPost",
+)
 # The report's offline shape: no gh, no fetch, no roots beyond the sandbox clone.
 HYGIENE_OFFLINE = ("-SkipGh", "-SkipFetch", "-NoExtraRoots")
 # Outside the census, which reads the directory's name: this script never names it.
@@ -158,6 +171,9 @@ def _run(
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
+        pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
+        pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
+        pytest.param("coord/digest.ps1", (), id="digest"),
         *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
         pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
@@ -329,6 +345,7 @@ def test_presence_lists_a_fixture_session_outside_the_cloud(repo: Path, tmp_path
         pytest.param(
             "worktree/hygiene-report.ps1", HYGIENE_OFFLINE, "hygiene", id="hygiene-report"
         ),
+        pytest.param("coord/decision.ps1", DECISION_LOG, "decisions", id="decision-log"),
     ],
 )
 def test_each_writer_writes_outside_the_cloud(
@@ -339,6 +356,17 @@ def test_each_writer_writes_outside_the_cloud(
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     out = _coord_dir(repo) / written
     assert out.is_dir() and any(out.iterdir()), f"{script} wrote nothing under {written}/"
+
+
+@needs_pwsh
+@needs_windows
+def test_the_digest_takes_its_normal_path_outside_the_cloud(repo: Path) -> None:
+    """The control for the digest: a malformed -Rate is refused by its own check, which runs only
+    past the cloud refusal and needs no gh. Its full path is held by tests/test_afk_digest.py."""
+    proc = _run(repo, "coord/digest.ps1", "-Rate", "not-an-id", "agree", cloud=False)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert "is not a decision id" in proc.stderr
+    assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
 
 
 @needs_pwsh
@@ -396,6 +424,9 @@ GUARDED = (
     "coord/lane.ps1",
     "coord/tombstone-retired-backlog-allocator.ps1",
     "worktree/hygiene-report.ps1",
+    # The AFK-autonomy decision log and its digest (ADR 0211): vault work, which stays local.
+    "coord/decision.ps1",
+    "coord/digest.ps1",
     # The readers, whose empty answer in a VM looks clean.
     "coord/overlap.ps1",
     "coord/claim-adjudicate.ps1",
@@ -429,6 +460,8 @@ NOT_GUARDED = {
     "hooks/mail-watch.ps1": "user-scope hook, retired from the wiring",
     "hooks/wiki-write-prompt.ps1": "user-scope hook",
     "worktree/session-context.ps1": "user-scope hook",
+    # Defines functions only; its two callers, decision.ps1 and digest.ps1, carry the refusal.
+    "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
     # Reads mefor-coord and writes nothing there, or writes only through a guarded script. A reader
