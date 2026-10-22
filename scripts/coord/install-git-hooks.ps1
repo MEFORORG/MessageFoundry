@@ -163,13 +163,21 @@ if ($Status) {
     # gate actually opened. Nothing anywhere said, and that silence is most of why the split between the
     # tool's registry and the gate's went unnoticed: a refusal against a registry in another repository
     # is indistinguishable, from the outside, from an item nobody has claimed.
+    # The directory itself is coord-root.ps1's answer, and may sit on the shared root
+    # (docs/COORD-SHARED-ROOT.md). A status line shows the error rather than a path nothing reads.
+    . (Join-Path $PSScriptRoot 'coord-root.ps1')
+    function Format-ClaimsDir([string]$From) {
+        $r = Resolve-CoordDir -From $From -Kind 'claims'
+        if ($r.Error) { return "UNRESOLVABLE -- $($r.Error)" }
+        if ($r.Source -ne 'local') { return "$($r.Path)  (shared root, from $($r.Source))" }
+        return $r.Path
+    }
     $claimsRoot = (& git -C $RepoRoot config --get mefor.claimsRoot)
     if ($claimsRoot) {
         $claimsRoot = $claimsRoot.Trim()
         $rootTop = (& git -C $claimsRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
         if ($rootTop) {
-            $rootCommon = (& git -C $rootTop.Trim() rev-parse --path-format=absolute --git-common-dir).Trim()
-            Write-Host "claims     : $(Join-Path $rootCommon 'mefor-coord/claims')"
+            Write-Host "claims     : $(Format-ClaimsDir $rootTop.Trim())"
             Write-Host "             ^ SHARED -- mefor.claimsRoot points at $($rootTop.Trim())"
         }
         else {
@@ -181,7 +189,7 @@ if ($Status) {
         }
     }
     else {
-        Write-Host "claims     : $(Join-Path $common 'mefor-coord/claims')  (this repository's own)"
+        Write-Host "claims     : $(Format-ClaimsDir $RepoRoot)  (this repository's own)"
     }
     Write-Host "commit-msg : $(if ($claimInstalled) { 'INSTALLED (claim gate)' } elseif (Test-Path $commitMsg) { 'present, but NOT ours' } else { 'not installed' })"
     Write-Host "pre-commit : $(if ($pcShim) { 'pre-commit framework (carries the ledger gate + leak gate)' } elseif ($stale) { 'STALE standalone ledger hook -- re-run this script to migrate' } elseif (Test-Path $preCommit) { 'present, but NOT ours' } else { 'NOT INSTALLED -- run: pre-commit install' })"

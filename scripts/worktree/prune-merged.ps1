@@ -1399,7 +1399,45 @@ function Read-OrphanLedger {
 # EVIDENCE, not on elapsed time: it runs only from the branch that has already proven the directory is
 # gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
 # merely quiet is never touched by this.
-$claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' } else { '' }
+# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
+# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
+# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
+# answer is then this same local path. With the variable or a root.toml present and no resolver to
+# read it, it refuses: a guess would split the fleet into two registries.
+$coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
+function Get-CoordKindDir([string]$From, [string]$Kind) {
+    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
+    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
+    $local = Join-Path "$c".Trim() 'mefor-coord'
+    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
+        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
+    }
+    return @{ Path = (Join-Path $local $Kind); Error = $null }
+}
+$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+
+# The registry may sit on the shared root, so coord-root.ps1 names it. A resolver ERROR is recorded
+# and shown, never replaced by a local guess: the run goes on with the claims unread, every
+# report-only suggestion is withheld as if a claim were unreadable, and no claim is released.
+$claimsError = ''
+$claimsDir = ''
+if ($gitCommonDir) {
+    $resolvedClaims = Get-CoordKindDir -From $RepoRoot -Kind 'claims'
+    if ($resolvedClaims.Error) { $claimsError = [string]$resolvedClaims.Error } else { $claimsDir = $resolvedClaims.Path }
+}
+if ($claimsError) {
+    Write-Note "WARNING: the claim registry could not be resolved, so no claim was read or released: $claimsError" 'Yellow'
+}
+
+# A record from ANOTHER machine names a path on that machine's disk (docs/COORD-SHARED-ROOT.md), so a
+# removal here proves nothing about it even when the path string matches. No `host` is this machine.
+function Test-ClaimIsHere($Claim) {
+    $p = $Claim.PSObject.Properties['host']
+    $h = if ($null -ne $p -and $null -ne $p.Value) { ([string]$p.Value).Trim() } else { '' }
+    return (-not $h) -or ($h -ieq $thisHost)
+}
 
 # --- REPORT-ONLY, second pass: a tree holding a COORDINATION CLAIM is never suggested --------------
 # This runs here rather than with the rest of the report-only computation only because $claimsDir is
@@ -1420,7 +1458,8 @@ $claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' }
 # this worktree, so it withholds. Fails closed.
 if ($reportOnly.Count -gt 0) {
     $claimed = @{}
-    $claimUnreadable = $false
+    # Unresolved is not empty: withhold every suggestion, the same as an unreadable claim.
+    $claimUnreadable = [bool]$claimsError
     if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
             try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
@@ -1490,6 +1529,8 @@ function Remove-ClaimsHeldBy {
             continue
         }
         if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
+        # Another PC's claim at the same path is that PC's live work; removing this tree did not end it.
+        if (-not (Test-ClaimIsHere $c)) { continue }
         try {
             Remove-Item -LiteralPath $f.FullName -Force -EA Stop
             $released += [pscustomobject]@{ key = [string]$c.key; outcome = 'released'; detail = [string]$c.note }
@@ -1892,6 +1933,7 @@ if ($Json) {
         claims   = [pscustomobject]@{
             scanned    = $claimsScanned
             dir        = $claimsDir
+            error      = $(if ($claimsError) { $claimsError } else { $null })
             unreadable = @($claimsUnreadable.Values)
         }
         exitCode = $exit

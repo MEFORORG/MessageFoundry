@@ -30,9 +30,12 @@ worse than no gate. `git commit --no-verify` is the escape hatch; the --ci run i
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
@@ -301,15 +304,155 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
     return text
 
 
+# WHERE SHARED COORDINATION STATE LIVES (docs/COORD-SHARED-ROOT.md). A COPY of the resolution in
+# scripts/coord/coord_root.py, because a test runs patched copies of this gate from outside the tree,
+# where an import of the sibling would fail. claim_check.py carries the same copy for the installed
+# hook. Same kinds, same root.toml rules, same order (env, root.toml, local) and the same rule that an
+# error never falls back to the local path. tests/test_coord_shared_root_claims.py holds the copies to one answer. It
+# omits only the down-verdict cache, which saves time across processes and changes no answer.
+_COORD_SHARED_KINDS: tuple[str, ...] = (
+    "seats",
+    "mail",
+    "claims",
+    "alloc",
+    "handoffs",
+    "wiki",
+    "lanes",
+    "owner-log",
+)
+_COORD_ROOT_ENV = "MEFOR_COORD_ROOT"
+# ASCII space and tab only, as in coord_root.py: Python's \s and str.strip() also take \x1c-\x1f and
+# \x85, which .NET's do not, so the twins would answer differently on a stray control character.
+_COORD_WS = " \t\r\n"
+_COORD_ROOT_LINE = re.compile(r"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\Z")
+_COORD_BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
+_COORD_UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
+_COORD_PROBE_SECONDS = 1.5
+
+
+def _coord_root_toml(file: Path) -> tuple[Path | None, str | None]:
+    """``(root, error)`` from a root.toml that exists: one ``shared_root`` literal-string line, no other."""
+    try:
+        if not file.is_file():
+            return None, f"{file} exists but is not a file"
+        raw = file.read_bytes()
+    except OSError as exc:
+        return None, f"{file} could not be read: {exc}"
+    try:
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = raw.decode("utf-16")
+        else:
+            text = raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None, f"{file} is not UTF-8 or UTF-16 with a byte-order mark"
+    found: str | None = None
+    for line in text.splitlines():
+        if _COORD_BLANK_OR_COMMENT.match(line):
+            continue
+        m = _COORD_ROOT_LINE.match(line)
+        if not m or not m.group(1).strip(_COORD_WS):
+            return (
+                None,
+                f"{file} has a line that is not shared_root = '<path>' (single quotes): {line}",
+            )
+        if found is not None:
+            return None, f"{file} names shared_root more than once"
+        found = m.group(1).strip(_COORD_WS)
+    if found is None:
+        return None, f"{file} names no shared_root"
+    return Path(found), None
+
+
+def _coord_reachable(server: str) -> bool:
+    """A TCP connect to port 445, bounded as a WHOLE: name resolution is outside a socket timeout."""
+    result: list[bool] = []
+
+    def attempt() -> None:
+        try:
+            with socket.create_connection((server, 445), timeout=_COORD_PROBE_SECONDS):
+                result.append(True)
+        except OSError:
+            result.append(False)
+
+    t = threading.Thread(target=attempt, daemon=True)
+    t.start()
+    t.join(_COORD_PROBE_SECONDS)
+    return bool(result and result[0])
+
+
+def _coord_dir(kind: str, start: str) -> tuple[Path | None, str | None]:
+    """``(directory, error)`` for one kind of coordination state, resolved from the repository at ``start``."""
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+        ["git", "-C", start, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    common = proc.stdout.strip()
+    local = Path(common) / "mefor-coord" if proc.returncode == 0 and common else None
+    if kind not in _COORD_SHARED_KINDS:
+        if local is None:
+            return None, f"git could not name the common dir for '{start}'"
+        return local / kind, None
+    env = os.environ.get(_COORD_ROOT_ENV, "").strip(_COORD_WS)
+    if env:
+        root = Path(env)
+    elif local is None:
+        return None, f"git could not name the common dir for '{start}'"
+    else:
+        file = local / "root.toml"
+        try:
+            if not file.exists():
+                return local / kind, None
+        except OSError as exc:
+            return None, f"{file} could not be read: {exc}"
+        from_file, error = _coord_root_toml(file)
+        if from_file is None:
+            return None, error
+        root = from_file
+    # A configured root is probed before any file call: a dead SMB server hangs one for a minute.
+    unc = _COORD_UNC.match(str(root))
+    if unc and not _coord_reachable(unc.group(1)):
+        ms = int(_COORD_PROBE_SECONDS * 1000)
+        return (
+            None,
+            f"shared root {root} is unreachable: no answer from {unc.group(1)}:445 within {ms} ms",
+        )
+    try:
+        if not root.is_dir():
+            return None, f"shared root {root} does not exist or is not a directory"
+    except OSError as exc:
+        return None, f"shared root {root} cannot be read: {exc}"
+    return root / kind, None
+
+
+def _coord_this_host() -> str:
+    """The name a shared record carries: PowerShell's ``[Environment]::MachineName``."""
+    return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
+
+
+def _coord_record_is_here(record: dict[str, object]) -> bool:
+    """True for a record written on this machine. No ``host`` field means this machine: every record
+    written before the field existed was written on the one PC that had a registry."""
+    recorded = str(record.get("host") or "").strip()
+    return not recorded or recorded.casefold() == _coord_this_host().casefold()
+
+
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
         self.base = base
         self.repo = Path(git("rev-parse", "--path-format=absolute", "--show-toplevel").strip())
-        common = git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
         # The registry lives beside the SHARED object store, so every worktree of this repo sees the same
-        # allocations — and a different clone gets its own, automatically.
-        self.alloc = Path(common) / "mefor-coord" / "alloc"
+        # allocations — and a different clone gets its own, automatically. Unless a shared root is
+        # configured (docs/COORD-SHARED-ROOT.md), when every clone on every PC sees ONE registry there.
+        # Only the ownership arm reads it, and that arm never runs in CI, so CI resolves nothing. An
+        # error is kept, not replaced by a local guess: the ownership arm refuses and names it.
+        self.alloc: Path | None = None
+        self.alloc_error: str | None = None
+        if not ci:
+            self.alloc, self.alloc_error = _coord_dir("alloc", str(self.repo))
         self.failures: list[str] = []
         # Per-run memos. Every entry is derived from a REF, and refs do not move inside one run of a
         # pre-commit hook -- so a repeat lookup is pure waste, and each one costs git subprocesses.
@@ -510,9 +653,15 @@ class Ledger:
         owner-ruled recovery in docs/LEDGER-GATE.md -- recreate a worktree at the recorded path --
         remains valid and is now the second resort rather than the only one.
         """
+        if self.alloc is None:
+            return False
         try:
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            return False
+        # ANOTHER MACHINE'S NUMBER IS NEVER THIS TREE'S, on either key. Its path names that PC's disk,
+        # and two PCs can check out one branch name, so neither arm below is exclusive across PCs.
+        if not isinstance(claim, dict) or not _coord_record_is_here(claim):
             return False
         mine = str(self.repo).replace("\\", "/").casefold()
         theirs = str(claim.get("worktree", "")).replace("\\", "/").casefold()
@@ -556,6 +705,8 @@ class Ledger:
         """
         allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
         try:
+            if self.alloc is None:
+                raise OSError("no allocation registry")
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             # No record at all: nobody holds it, so allocating is the only move and the ONLY case
@@ -564,7 +715,11 @@ class Ledger:
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
-        if worktree:
+        elsewhere = isinstance(claim, dict) and not _coord_record_is_here(claim)
+        if worktree and elsewhere:
+            where = _safe_for_message(claim.get("host", ""))
+            lines.append(f"    1. commit from the worktree that holds it, ON {where}:  {worktree}")
+        elif worktree:
             lines.append(f"    1. commit from the worktree that holds it:  {worktree}")
         if branch:
             lines.append(f"    2. or check that branch out and commit there: {branch}")
@@ -598,6 +753,15 @@ class Ledger:
         the registry. Dropping the recover-first advice on this branch would have re-introduced the
         BACKLOG #1414 number-burn through the door opened to close it.
         """
+        if self.alloc is None:
+            # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
+            return (
+                f"ADR {number} cannot be checked -- the allocation registry did not resolve",
+                f"{_safe_for_message(self.alloc_error)}. The gate refuses rather than read a local "
+                "copy that another PC's allocations never reach (docs/COORD-SHARED-ROOT.md).",
+                "retry when the shared coordination root answers, or check MEFOR_COORD_ROOT and\n"
+                "      mefor-coord/root.toml",
+            )
         where = self.alloc / "adr" / (number + ".json")
         remedy = self.ownership_remedy("adr", number)
         if seen.truncated:

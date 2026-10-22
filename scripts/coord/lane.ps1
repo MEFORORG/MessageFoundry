@@ -53,18 +53,42 @@ if ($PSCmdlet.ParameterSetName -eq 'State' -and
 
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 
-function Get-CoordRoot {
-    $c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { throw 'not inside a git repository' }
-    return (Join-Path $c.Trim() 'mefor-coord')
+# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
+# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
+# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
+# answer is then this same local path. With the variable or a root.toml present and no resolver to
+# read it, it refuses: a guess would split the fleet into two registries.
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
+function Get-CoordKindDir([string]$From, [string]$Kind) {
+    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
+    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
+    $local = Join-Path "$c".Trim() 'mefor-coord'
+    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
+        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
+    }
+    return @{ Path = (Join-Path $local $Kind); Error = $null }
+}
+$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+
+# Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
+# and an error refuses rather than writing a level into a local copy nobody else reads.
+$here = (Get-Location).Path
+$lanesResolved = Get-CoordKindDir -From $here -Kind 'lanes'
+$claimsResolved = Get-CoordKindDir -From $here -Kind 'claims'
+foreach ($r in @($lanesResolved, $claimsResolved)) {
+    if ($r.Error) {
+        [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($r.Error)")
+        exit 2
+    }
 }
 
 function Get-ClaimHash([string]$Worktree) {
     # Hash of the claim KEYS this worktree holds. Used ONLY to invalidate a stated number when the
     # claim set moves -- never to derive one. The test runs one way: it can make a number stale, and
     # it can never make a stale number look fresh.
-    $coord = Get-CoordRoot
-    $dir = Join-Path $coord 'claims'
+    $dir = $claimsResolved.Path
     if (-not (Test-Path -LiteralPath $dir)) { return '' }
     $want = $Worktree.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     $keys = @()
@@ -75,6 +99,9 @@ function Get-ClaimHash([string]$Worktree) {
         if (-not $w) { continue }
         $w = $w.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($w -ne $want) { continue }
+        # The same path on another PC is another tree (docs/COORD-SHARED-ROOT.md). No host is this one.
+        $h = if ($d.PSObject.Properties.Name -contains 'host' -and $d.host) { ([string]$d.host).Trim() } else { '' }
+        if ($h -and -not ($h -ieq $thisHost)) { continue }
         $keys += $f.BaseName
     }
     if ($keys.Count -eq 0) { return 'none' }
@@ -86,8 +113,7 @@ function Get-ClaimHash([string]$Worktree) {
 
 $worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
-$coord    = Get-CoordRoot
-$lanesDir = Join-Path $coord 'lanes'
+$lanesDir = $lanesResolved.Path
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
@@ -96,6 +122,15 @@ New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
+}
+# THE BOX KEY IS A PATH, AND TWO PCs CAN SHARE A PATH. On a shared root the record at this key may
+# be another machine's lane. Taking it over would overwrite that lane's stated level with this one's,
+# so a write refuses and says so; -Show only reads, so it prints the record as it is. A record with no
+# `host` was written here, as every record before the field was.
+if (-not $Show -and $rec -and ($rec.PSObject.Properties.Name -contains 'host') -and $rec.host -and
+    -not (([string]$rec.host).Trim() -ieq $thisHost)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $($rec.host), whose worktree has the same path as this one. Nothing was written.")
+    exit 2
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
@@ -160,6 +195,8 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
+# docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
+$rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
 $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json')
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline

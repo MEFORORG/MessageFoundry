@@ -107,6 +107,41 @@ if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScrip
 try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
 
+# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
+# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
+# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
+# answer is then this same local path. With the variable or a root.toml present and no resolver to
+# read it, it refuses: a guess would split the fleet into two registries.
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
+function Get-CoordKindDir([string]$From, [string]$Kind) {
+    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
+    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
+    $local = Join-Path "$c".Trim() 'mefor-coord'
+    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
+        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
+    }
+    return @{ Path = (Join-Path $local $Kind); Error = $null }
+}
+$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+
+# THE MACHINE A RECORD WAS WRITTEN ON (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would
+# ship"). On a shared root a claim taken on another PC names a worktree path that does not exist HERE,
+# so a Test-Path on it would read a live claim as HOLDER GONE and invite a -Force release. Only a record
+# from this machine can be judged by this machine's disk. No `host` field means this machine: every
+# record written before the field existed was written on the one PC that had a registry.
+function Get-RecordHost($Record) {
+    if ($null -eq $Record) { return '' }
+    $p = $Record.PSObject.Properties['host']
+    if ($null -eq $p -or $null -eq $p.Value) { return '' }
+    return "$($p.Value)".Trim()
+}
+function Test-RecordIsHere($Record) {
+    $h = Get-RecordHost $Record
+    return (-not $h) -or ($h -ieq $thisHost)
+}
+
 # WHO HOLDS THE CLAIM, which is a different question from where this script lives (BACKLOG #1346).
 # Defaults to $repo, so every existing invocation behaves exactly as it always has.
 $holder = $repo
@@ -187,8 +222,18 @@ if ($claimsRoot) {
     $registryRepo = $rootTop.Trim()
 }
 
-$common = (& git -C $registryRepo rev-parse --path-format=absolute --git-common-dir).Trim()
-$claims = Join-Path $common "mefor-coord/claims"
+# Resolved from $registryRepo, so the claimsRoot hop above still decides WHICH clone's configuration
+# names the root. A resolver error refuses every verb, -List included: a listing of a local fallback
+# would show an empty or stale registry as if it were the fleet's, and -Take or -Release against one
+# would split the fleet into two registries (docs/COORD-SHARED-ROOT.md, "Offline behaviour").
+$claimsDir = Get-CoordKindDir -From $registryRepo -Kind 'claims'
+if ($claimsDir.Error) {
+    [Console]::Error.WriteLine("claim.ps1: REFUSED -- the claim registry could not be resolved, so nothing was read or recorded.")
+    [Console]::Error.WriteLine("  $($claimsDir.Error)")
+    [Console]::Error.WriteLine("  Claims are fleet-wide. This will not fall back to a local copy; retry when the shared root answers.")
+    exit 2
+}
+$claims = $claimsDir.Path
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
 
 # THE RELEASE LEDGER (BACKLOG #1068). A release used to be `Remove-Item` and nothing else, so a
@@ -231,7 +276,8 @@ function Get-Mine([string]$Path) {
     $c = Get-Content $Path -Raw | ConvertFrom-Json
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
     $me = ($holder -replace '\\', '/').TrimEnd('/')
-    [pscustomobject]@{ Claim = $c; IsMine = ($held -ieq $me) }
+    # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
+    [pscustomobject]@{ Claim = $c; IsMine = (($held -ieq $me) -and (Test-RecordIsHere $c)) }
 }
 
 # ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
@@ -349,7 +395,12 @@ function Get-OccupancyOnce {
     return $script:OccupancyProbe
 }
 
-function Get-HolderLiveness([string]$HeldPath) {
+function Get-HolderLiveness([string]$HeldPath, [string]$RecordHost = '') {
+    # A holder on another machine is NOT CHECKABLE HERE, and that is a state of its own rather than
+    # `gone` or `unknown`: this disk says nothing about that PC's worktrees (docs/COORD-SHARED-ROOT.md).
+    if ($RecordHost -and -not ($RecordHost -ieq $thisHost)) {
+        return [pscustomobject]@{ State = 'elsewhere'; QuietHours = $null; Occupants = $null; Host = $RecordHost }
+    }
     try {
         if (-not (Test-Path -LiteralPath $HeldPath)) {
             return [pscustomobject]@{ State = 'gone'; QuietHours = $null; Occupants = $null }
@@ -742,10 +793,11 @@ function Show-List {
             $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
-            $live = Get-HolderLiveness $held
+            $live = Get-HolderLiveness $held (Get-RecordHost $c)
             $state = $live.State
             switch ($live.State) {
                 'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
+                'elsewhere' { $age = "  [held ${hrs}h; ON $($live.Host) -- not checkable here; ask on that machine before releasing]" }
                 'occupied' {
                     $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
                     if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
@@ -823,12 +875,17 @@ if ($Release) {
         # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
         # the operator is deciding whether to take someone else's key. Now the recommendation is only
         # made in the one state that can be proven, and the live case says the opposite.
-        $live = Get-HolderLiveness $info.Claim.worktree
+        $live = Get-HolderLiveness $info.Claim.worktree (Get-RecordHost $info.Claim)
         Write-Host ""
         switch ($live.State) {
             'gone' {
                 Write-Host "  HOLDER GONE -- that worktree no longer exists on disk." -ForegroundColor Green
                 Write-Host "  Safe to take over:  claim.ps1 -Release $Release -Force"
+            }
+            'elsewhere' {
+                Write-Host "  HOLDER IS ON $($live.Host) -- not checkable here." -ForegroundColor Yellow
+                Write-Host "  This machine cannot see that PC's worktrees, so a missing path here proves nothing."
+                Write-Host "  Do NOT -Force it from here. Check the holder on $($live.Host), or ask the owner."
             }
             'present' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
@@ -899,6 +956,10 @@ if ($Release) {
         key             = $Release
         released_by     = $holder
         released_branch = $branch
+        # The machine the release ran on, beside the machine the claim was taken on: on a shared root
+        # the two can differ, and a reader needs both to tell a cross-PC takeover from a routine one.
+        host            = $thisHost
+        prior_host      = Get-RecordHost $info.Claim
         # THE ACTOR (BACKLOG #1358), read as a pair with released_by per the header. WHY A RECORD AND
         # NOT A WARNING: a misdirected -Take is refused by the commit gate at the point of use, and
         # nothing anywhere re-reads a release record, so a wrong actor here is never contradicted.
@@ -1002,6 +1063,8 @@ try {
                 # and a claim naming a branch nobody is on is another confidently-wrong coordination fact.
                 branch   = $branch
                 worktree = [string]$info.Claim.worktree
+                # Stamped on refresh too, so a legacy record gains the field the first time it is touched.
+                host     = $thisHost
                 # `claimed` is the identity of the claim and never moves; `refreshed` is what tells a
                 # reader how old the NOTE is, which is the question a stale note makes urgent.
                 claimed   = ConvertTo-Stamp $info.Claim.claimed
@@ -1067,9 +1130,14 @@ try {
     # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
     # offer -Force as a flat third option with no way to tell a dead holder from a live one, so the
     # cheapest way past the gate was also the one that causes the duplicate build it exists to prevent.
-    $live = Get-HolderLiveness $info.Claim.worktree
+    $live = Get-HolderLiveness $info.Claim.worktree (Get-RecordHost $info.Claim)
     Write-Host ""
     switch ($live.State) {
+        'elsewhere' {
+            Write-Host "  HOLDER IS ON $($live.Host) -- not checkable here." -ForegroundColor Yellow
+            Write-Host "  This machine cannot see that PC's worktrees. Do NOT build it in parallel and do NOT"
+            Write-Host "  -Force it from here: coordinate with that session, or pick different work."
+        }
         'gone' {
             Write-Host "  HOLDER GONE -- that worktree no longer exists on disk, so nobody is building this." -ForegroundColor Green
             Write-Host "  Take it over with:"
@@ -1116,6 +1184,8 @@ try {
         note     = if ($Note) { $Note } else { "(no note)" }
         branch   = $branch
         worktree = $holder
+        # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
+        host     = $thisHost
         claimed  = (Get-Date).ToString("o")
     } | ConvertTo-Json -Compress
     # UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes

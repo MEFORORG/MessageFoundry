@@ -201,7 +201,38 @@ if (-not $coord -or -not (Test-Path -LiteralPath $coord)) {
     Emit
 }
 $seatsDir = Join-Path $coord 'seats'
-$lanesDir = Join-Path $coord 'lanes'
+# LANES MAY LIVE ON THE SHARED ROOT (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names the
+# directory. This hook only reads, so a root that does not answer is a one-line note and no verdict,
+# never a block and never a read of a local copy. Without the resolver beside it, the local path is
+# still right when nothing is configured; with a configuration it cannot read, it says so.
+$lanesDir = $null
+$laneFault = ''
+$coordRootScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootScript -PathType Leaf) {
+    try {
+        . $coordRootScript
+        $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'lanes'
+        if ($r.Error) { $laneFault = $r.Error } else { $lanesDir = $r.Path }
+    } catch { $laneFault = "coord-root.ps1 failed: $($_.Exception.Message)" }
+} elseif (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $coord 'root.toml'))) {
+    $laneFault = 'a shared coordination root is configured, but scripts/coord/coord-root.ps1 is missing'
+} else {
+    $lanesDir = Join-Path $coord 'lanes'
+}
+if ($laneFault) {
+    Say "[lane] SKIPPED: the lanes directory did not resolve ($laneFault). NO VERDICT, and this is NOT"
+    Say "  'both lanes are fine' -- nothing was examined."
+    Emit
+}
+$thisHost = [Environment]::MachineName
+# A lane record from ANOTHER machine at this box key is that PC's lane, whose worktree happens to share
+# this path. It says nothing about this lane, so it reads as no record. No `host` field is this machine.
+function Read-LaneRecord([string]$Path) {
+    $rec = Read-Json $Path
+    if ($null -eq $rec -or $rec -is [string]) { return $rec }
+    if ((Test-Has $rec 'host') -and $rec.host -and -not (([string]$rec.host).Trim() -ieq $thisHost)) { return $null }
+    return $rec
+}
 $cwd = (Get-Location).Path
 $leaf = (Split-Path $cwd -Leaf)
 $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
@@ -209,7 +240,7 @@ $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
 if ($leaf -match '^builder') {
     . (Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\mail-key.ps1')
     $bk = ConvertTo-BoxKey -Path $cwd
-    $rec = Read-Json (Join-Path $lanesDir "$bk.json")
+    $rec = Read-LaneRecord (Join-Path $lanesDir "$bk.json")
     $need = ($null -eq $rec) -or ($rec -is [string])
     if (-not $need) {
         $t = if (Test-Has $rec 'turnsSinceStated') { [int]$rec.turnsSinceStated } else { 99 }
@@ -293,7 +324,7 @@ $lanes = @($live | Group-Object worktree | ForEach-Object { $_.Group | Select-Ob
 $unknownBoxes = @($unknown | ForEach-Object { $_.box })
 
 $verdicts = @()
-foreach ($l in $lanes) { $verdicts += Get-LaneVerdict (Read-Json (Join-Path $lanesDir "$($l.box).json")) $l.box }
+foreach ($l in $lanes) { $verdicts += Get-LaneVerdict (Read-LaneRecord (Join-Path $lanesDir "$($l.box).json")) $l.box }
 
 $discovered = $verdicts.Count
 $notGreen = @($verdicts | Where-Object { -not $_.greenable }).Count

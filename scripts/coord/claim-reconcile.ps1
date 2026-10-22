@@ -183,9 +183,44 @@ if ($Apply -and $ClaimsDir) {
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
-$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-$claimsDir = if ($ClaimsDir) { $ClaimsDir } else { Join-Path $common "mefor-coord/claims" }
+# WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
+# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
+# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
+# answer is then this same local path. With the variable or a root.toml present and no resolver to
+# read it, it refuses: a guess would split the fleet into two registries.
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
+function Get-CoordKindDir([string]$From, [string]$Kind) {
+    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
+    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
+    $local = Join-Path "$c".Trim() 'mefor-coord'
+    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
+        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
+    }
+    return @{ Path = (Join-Path $local $Kind); Error = $null }
+}
+$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+
+if ($ClaimsDir) { $claimsDir = $ClaimsDir }
+else {
+    # -Apply releases, so a fallback registry is not an option, and a report over one would read as
+    # the fleet's. Refuse both the same way (docs/COORD-SHARED-ROOT.md, "Offline behaviour").
+    $resolved = Get-CoordKindDir -From $repo -Kind 'claims'
+    if ($resolved.Error) {
+        [Console]::Error.WriteLine("claim-reconcile.ps1: the claim registry could not be resolved, so nothing was scanned or released: $($resolved.Error)")
+        exit 2
+    }
+    $claimsDir = $resolved.Path
+}
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
+
+# No `host` field means this machine: every record written before the field was written here.
+function Get-RecordHost($Record) {
+    $p = $Record.PSObject.Properties['host']
+    if ($null -eq $p -or $null -eq $p.Value) { return '' }
+    return ([string]$p.Value).Trim()
+}
 
 function ConvertTo-Norm([string]$Path) {
     if (-not $Path) { return "" }
@@ -479,6 +514,8 @@ function Test-StillReleasable([object]$Row) {
     try { $c = Get-Content -LiteralPath $file -Raw -EA Stop | ConvertFrom-Json -EA Stop }
     catch { return "the claim file no longer parses" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
+    $h = Get-RecordHost $c
+    if ($h -and -not ($h -ieq $thisHost)) { return "the claim is now held on $h" }
     $fresh = Read-WorktreeRegistry
     $script:registered = $fresh.Registered
     $script:locked = $fresh.Locked
@@ -510,6 +547,15 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
 
     if (-not $holder) {
         $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
+        continue
+    }
+    # A record from ANOTHER machine names a path on that machine's disk. Every test below reads this
+    # disk, so a live claim there would read as gone and deregistered, and -Apply would release it
+    # (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would ship"). Reported, never released.
+    $recHost = Get-RecordHost $c
+    if ($recHost -and -not ($recHost -ieq $thisHost)) {
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "ELSEWHERE"
+            why = "ON $recHost -- not checkable here; reconcile it from that machine" }
         continue
     }
     if (Test-Path -LiteralPath $holder) {
@@ -715,7 +761,7 @@ if ($Apply) {
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE") })
 
 if ($Json) {
     [pscustomobject]@{
