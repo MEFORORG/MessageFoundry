@@ -51,6 +51,8 @@ try {
     if (-not $props['tool_name'] -or [string]$props['tool_name'].Value -cne 'EnterWorktree') { exit 0 }
     $toolInput = if ($props['tool_input']) { $props['tool_input'].Value } else { $null }
     if ($toolInput -isnot [pscustomobject] -or -not $toolInput.PSObject.Properties['path']) { exit 0 }
+    # Only `path` is judged, so an input carrying anything else gets no decision.
+    if (@($toolInput.PSObject.Properties | Where-Object { $_.Name -cne 'path' }).Count) { exit 0 }
     $path = [string]$toolInput.PSObject.Properties['path'].Value
     $sid = if ($props['session_id']) { [string]$props['session_id'].Value } else { '' }
     $cwd = Get-CcxHookPayloadCwd -Payload $hook

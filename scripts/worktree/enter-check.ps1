@@ -343,6 +343,13 @@ function Get-VerifiedGitDir([string]$Repo, [string]$Worktree) {
     # `git worktree add --relative-paths` writes it relative to the admin dir.
     if (-not [System.IO.Path]::IsPathRooted($backTo)) { $backTo = Join-Path $gd $backTo }
     if (-not (Test-SamePath (Resolve-Canonical $backTo) (Resolve-Canonical $dotGit))) { throw 'its admin dir names another worktree' }
+    # Every read through this admin dir takes objects, refs and config from what `commondir`
+    # names, so it must name this repository's own common dir.
+    $cd = Join-Path $gd 'commondir'
+    if (-not (Test-Path -LiteralPath $cd -PathType Leaf)) { throw 'its admin dir has no commondir file' }
+    $cdTo = ([string](Get-Content -LiteralPath $cd -TotalCount 1)).Trim()
+    if (-not [System.IO.Path]::IsPathRooted($cdTo)) { $cdTo = Join-Path $gd $cdTo }
+    if (-not (Test-SamePath (Resolve-Canonical $cdTo) $common)) { throw 'its admin dir names another repository as its common dir' }
     return $gd
 }
 
