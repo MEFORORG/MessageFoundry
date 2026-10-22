@@ -3,8 +3,9 @@
 - **Status:** Accepted (2026-10-21, on build). The owner approved docs/AUTONOMY-PLAN.md, whose
   section 4 requires these controls, on 2026-10-21 (branch `autonomy-plan`, commit `18fbca9c2`).
   The storage choice, the schema and the enforcement split below are this build's design inside
-  that approval; the owner may overrule them at review. **Amended 2026-10-22:** the banner also
-  tells non-Special sessions to load driver and empower (owner approval 2026-10-22).
+  that approval; the owner may overrule them at review. **Amended 2026-10-22:** the `-Banner`
+  hook also tells non-Special sessions to load driver and empower while the switch reads OFF
+  (owner approval 2026-10-22); the ON banner carries no such instruction.
 - **Date:** 2026-10-21
 - **Related:** docs/AUTONOMY-PLAN.md sections 3, 4 and 10 (wave 1); CLAUDE.md section 5 (the cloud
   session rule) and section 11 (SDS-3.6, SDS-3.7); SAIDS section 9 (a rule is not a control until
@@ -90,10 +91,14 @@ cannot start at all prints nothing: in a fresh cloud VM, pwsh does not exist unt
 installs it, so the first session start there shows no banner whatever the switch says. When
 the switch reads OFF, `-Banner` tells every session but a Special seat to load the `driver` and
 then the `empower` skill (owner approval 2026-10-22). A seat nothing has declared yet gets it too,
-and its text tells a Special seat to skip it, because a Special seat declares late. The text is
-the same at every SessionStart source and tells the session to load both even if the conversation,
-or a summary of it, says they were loaded, because a compaction or a clear drops their text. A
-fault on that path prints no instruction.
+and its text tells a Special seat to skip it, because a Special seat declares late. After a
+SessionStart from `compact` or `clear` the text says to load both again, with no skip clause,
+because a compaction may leave a summary saying both were loaded while their text is gone (not
+measured here). From any other source, at least `startup`, `resume` and `fork`, it says to skip a
+skill only if its full text is in context now, so a resume that kept both loads no second copy.
+From every source it says an owner instruction in the conversation to stop using either skill
+outranks it. Those three rules are this build's design inside the approval, and the owner may
+overrule them at review. A fault on that path prints no instruction.
 
 **The owner sets it, and nothing enforces that.** Every seat acts as the one shared GitHub
 identity, which can write repository variables. The tripwire hook records a `gh variable
