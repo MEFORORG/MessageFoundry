@@ -232,6 +232,7 @@ from messagefoundry.api.security import (
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
+    StandingRefusal,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -248,6 +249,7 @@ from messagefoundry.api.security import (
     public_route,
     quiet_deliberate_export_stops,
     recheck_standing,
+    recheck_standing_or_refusal,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
@@ -277,7 +279,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -9806,13 +9808,16 @@ def create_app(
 
         # A nested function rather than an inline call: scripts/security/route_gates.py reads a
         # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
-        async def _reauthorize() -> Identity | None:
-            """The caller as it stands now, or ``None`` to close. With no auth enforced
+        async def _reauthorize() -> Identity | StandingRefusal:
+            """The caller as it stands now, or why to close. With no auth enforced
             (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
-            return await recheck_standing(auth, token, Permission.MONITORING_READ)
+            return await recheck_standing_or_refusal(auth, token, Permission.MONITORING_READ)
 
+        frames = 0
+        stopped: StandingRefusal | None = None
+        cancelled = False
         try:
             await websocket.accept()
             while True:
@@ -9823,7 +9828,12 @@ def create_app(
                 # feed too; a scope change that reached the session without a revoke shapes this
                 # frame.
                 current = await _reauthorize()
-                if current is None:
+                if not isinstance(current, Identity):
+                    # Close first; the stop row waits for the `finally` below, after the slot is
+                    # given back. A slow store then neither holds a refused caller's socket open
+                    # nor keeps its slot from a new monitor socket. The exports write their stop
+                    # row first; this feed differs on purpose, so do not line it up with them.
+                    stopped = current
                     await websocket.close(code=1008)
                     return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
@@ -9850,11 +9860,53 @@ def create_app(
                     rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
+                frames += 1
                 await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             state.ws_count = max(0, getattr(state, "ws_count", 1) - 1)
+            if stopped is not None:
+                # One row per feed the re-check stopped, naming the rule and the frames sent
+                # (BACKLOG #3404). The gate audits its own refusals; without this a feed ended by
+                # an unmet second factor or a missing notification address left no trail. The
+                # write sits here so a close that raised still records it. A lost row is logged at
+                # ERROR, not hidden under the close's error. A cancel waits a bounded time for the
+                # row, and logs it if it does not land (BACKLOG #3157).
+                stop_actor = handshake_identity.username
+                stop_detail = json.dumps({"reason": stopped, "frames": frames})
+                await write_audit_soft(
+                    lambda: _write_through_cancel(
+                        engine_obj.store.record_audit(
+                            "ws_stats.stopped",
+                            actor=stop_actor,
+                            detail=stop_detail,
+                            client=client_ip(websocket),
+                        ),
+                        lambda: _lost_row("ws_stats.stopped", stop_actor, stop_detail),
+                    ),
+                    log=_log,
+                    message=(
+                        "ws_stats.stopped audit row not written. Lost row: actor=%s client=%s"
+                        " reason=%s frames=%d"
+                    ),
+                    # Scrubbed for CodeQL py/log-injection, as the other lost-row lines are.
+                    args=lambda: (
+                        scrub_log_argument(stop_actor),
+                        scrub_log_argument(str(client_ip(websocket))),
+                        stopped,
+                        frames,
+                    ),
+                    # Under a cancel that landed before the write, as during the close, a defect is
+                    # logged with the row rather than raised: a raise here would replace the
+                    # CancelledError the `finally` is passing on, so the task would not end as
+                    # cancelled. Otherwise a defect raises, so a bug is not passed over as a store
+                    # refusal.
+                    defects=() if cancelled else AUDIT_WRITE_DEFECTS,
+                )
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).

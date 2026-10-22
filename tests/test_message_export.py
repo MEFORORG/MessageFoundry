@@ -489,6 +489,49 @@ async def test_a_session_revoked_mid_export_stops_the_stream(
     assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
 
 
+async def test_a_store_fault_on_the_second_read_mid_export_still_records_the_stop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: once the factor check refuses, the re-check reads the session again only to
+    name the reason. A store fault there used to raise out of the stream, which skipped the
+    ``messages_export.stopped`` row. The refusal stands, as it did before that read existed, so the
+    export stops on ``standing_changed`` with its row, and no ERROR record follows."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+    real_identity_for_token = service.identity_for_token
+    armed = False
+
+    async def unmet(token: str | None) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    async def faulting(token: str | None, *, activity: bool = True) -> Any:
+        nonlocal armed
+        if armed:
+            armed = False
+            raise OSError("store connection lost")
+        return await real_identity_for_token(token, activity=activity)
+
+    async def refuse_the_factor() -> None:
+        service.mfa_satisfied = unmet  # type: ignore[method-assign]
+        service.identity_for_token = faulting  # type: ignore[method-assign]
+
+    caplog.set_level(logging.WARNING)
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, refuse_the_factor)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
+    ]
+    assert any("could not read the session again" in rec.getMessage() for rec in caplog.records)
+    assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
+
+
 async def test_the_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
