@@ -616,15 +616,15 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
-def _connect_if_lookup_swallowed(handler: logging.handlers.SysLogHandler) -> None:
-    """Connect again when ``SysLogHandler.__init__`` left no socket.
+def _retry_a_swallowed_lookup(handler: logging.handlers.SysLogHandler) -> None:
+    """Connect again when ``handler`` has no socket, so a lookup failure raises at construction.
 
-    From CPython 3.14.9 that constructor catches a ``socket.gaierror`` from ``createSocket`` and
-    leaves ``socket`` None, deferring the lookup to the first send. Every start check here relies on
-    the constructor raising, so a name that does not resolve would read as a forwarder that started.
-    Calling ``createSocket`` again raises the lookup error at start, for the caller to classify
-    (:func:`is_permanent_connect_error`). A successful ``createSocket`` always sets ``socket``, so
-    on an interpreter that does not catch, this never runs."""
+    CPython 3.14.9 catches a ``socket.gaierror`` from ``createSocket`` in ``SysLogHandler.__init__``
+    and leaves ``socket`` None, deferring the lookup to the first send. A name that does not
+    resolve would then read as a forwarder that started. Before 3.14.9 the error raised from
+    ``__init__``, and this restores that. It is a second lookup, so what raises is that lookup's
+    error, not the one ``__init__`` swallowed. A stdlib ``createSocket`` that succeeds always sets
+    ``socket``, so with the real one the retry runs only after a swallowed error."""
     if getattr(handler, "socket", None) is None:
         handler.createSocket()
 
@@ -675,8 +675,8 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         # equivalent at runtime and honest to the checker.
         kwargs["timeout"] = timeout
         try:
-            super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket()
-            _connect_if_lookup_swallowed(self)
+            super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+            _retry_a_swallowed_lookup(self)
         except OSError as exc:
             # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
@@ -912,9 +912,7 @@ def _build_syslog_handler(
     forward: SyslogForward, *, defer_connect: bool = False
 ) -> logging.handlers.SysLogHandler:
     """A :class:`logging.handlers.SysLogHandler` for ``forward``. For UDP the socket is created but not
-    connected (never fails on a down collector, never blocks on send); a collector name that does not
-    resolve still raises ``socket.gaierror`` here (:func:`_connect_if_lookup_swallowed`). For TCP/TLS
-    the constructor
+    connected (never fails on a down collector, never blocks on send). For TCP/TLS the constructor
     connects (and, for TLS, completes the handshake) and may raise ``OSError`` if the collector is down
     or its certificate can't be verified at startup (:func:`configure_logging` treats that as best-
     effort — ``ssl.SSLError`` is an ``OSError`` subclass), and a runtime socket timeout
@@ -949,11 +947,15 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    udp = logging.handlers.SysLogHandler(
+    handler = logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
     )
-    _connect_if_lookup_swallowed(udp)
-    return udp
+    try:
+        _retry_a_swallowed_lookup(handler)
+    except OSError:
+        handler.close()
+        raise
+    return handler
 
 
 class _ForwardQueueListener(logging.handlers.QueueListener):
