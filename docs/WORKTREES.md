@@ -696,6 +696,61 @@ Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_
 parse the script and fail on any git verb outside a read-only list, with a positive control. They
 also drive it against a temp repository with a fake gh.
 
+## A PR-state cache for read-only panes — `pr_state.py`
+
+One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads
+that file and makes no API call of its own. Every Claude account on a box shares one GitHub token,
+so eleven panes polling for themselves would spend the shared budget eleven times over.
+
+[`scripts/coord/pr_state.py`](../scripts/coord/pr_state.py) does one poll per run and exits. A
+scheduled task runs it every 2 minutes. It writes `<git common dir>/mefor-coord/pr-state.json`, on
+the local root, never the shared one. Measured 2026-10-22 with 13 open PRs: one poll cost 4 GraphQL
+points in two queries, took about 4.4 seconds end to end, and wrote about 18 KB.
+
+**A reader must check `error` and the data's `fetchedAt` before it trusts anything else.** A failed
+poll keeps the last good data and marks it stale. The fields:
+
+| Field | What it holds |
+|---|---|
+| `schemaVersion` | `1`. A reader that sees another number should not guess. |
+| `fetchedAt`, `host` | When this poll ran, UTC, and on which machine. |
+| `error`, `stale` | Why the last poll failed, or null. `stale` is true whenever `error` is set. |
+| `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
+| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. |
+| `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. |
+| `data` | The last good poll, or null if there never was one. |
+| `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
+| `data.truncated` | True when the PR page came back full or GitHub reports more open PRs than it returned. |
+| `data.pullRequests[]` | Per PR: number, title, branch, head SHA, draft, labels, queue entry, when auto-merge was armed, `allChecks` and `required`. |
+| `data.mergeQueue[]` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
+
+Four reading rules, each one a mistake the file is shaped to prevent:
+
+1. `data: null` means unknown. Only `data.pullRequests: []` means GitHub said no PR is open.
+2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
+   no check run yet reads `PENDING` and is named in `required.missing`. It reads `UNKNOWN` when the
+   required list is missing or the head moved between the two queries.
+3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
+   (`mergeStateKnown: false`). That is no state at all.
+4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
+
+It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
+unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
+`lock.ps1` does and never steals it. A held lock means another poll is running, so the run exits.
+A lock older than ten minutes is reported as wedged, with the path to delete by hand.
+
+```powershell
+python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -WhatIf        # show the task, register nothing
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC>             # from a plain terminal
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC> -Uninstall
+```
+
+The task runs the primary checkout's copy under `pythonw.exe`, so no window opens. It runs as you, at
+run level Limited, because gh reads its token from your keyring. It refuses to register or uninstall
+inside Claude Code, and on any machine other than `-ExpectedHost`. Tests:
+[`tests/test_pr_state.py`](../tests/test_pr_state.py).
+
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 
 `prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and

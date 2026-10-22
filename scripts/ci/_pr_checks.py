@@ -20,11 +20,18 @@ not classify this" must never read as "this is green".
 
 from __future__ import annotations
 
-#: Conclusions that count as a failure.
-FAILING = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"})
+#: Conclusions that count as a failure. ``ERROR`` is a StatusContext ``state``; before it was listed a
+#: commit status in ERROR had a verdict nobody classified, and so read as green.
+FAILING = frozenset(
+    {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+)
 
-#: Statuses that mean a check has not settled yet.
-UNSETTLED = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"})
+#: The only verdicts that count as passed. Anything else is FAILING or unsettled.
+PASSING = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
+
+#: Statuses that mean a check has not settled yet. ``EXPECTED`` is a StatusContext ``state`` for a
+#: status that has been asked for and has not reported.
+UNSETTLED = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED", "EXPECTED"})
 
 
 def name_of(node: object) -> str:
@@ -59,6 +66,8 @@ def counts(rollup: object) -> tuple[int, int]:
             unsettled += 1
         elif verdict in FAILING:
             failing += 1
-        elif not verdict and not status:
+        elif verdict not in PASSING:
+            # An allowlist, not a denylist: a verdict nobody listed (STALE today, a new one tomorrow)
+            # is unsettled, never green.
             unsettled += 1
     return (failing, unsettled)
