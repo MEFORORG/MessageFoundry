@@ -258,7 +258,7 @@ design. Reads and builds keep working.
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
    Tools: `scripts/coord/coord-race.ps1` runs the exclusive-create race, one process per PC with a
    shared `-StartAtUtc`, and `coord-race.ps1 -Compare` judges it: exit 3 on a double winner or an
-   empty slot.
+   empty slot, and exit 2 when the two sides did not overlap, so the run proves nothing.
 3. Land the resolver, the `host` field, the host-aware liveness checks and the gate tightening, with
    tests. Behaviour is unchanged, because no root is configured yet.
 4. Land the host-qualified box key: hash `<host>|<path>`, not the path alone, for seat ids,
@@ -276,12 +276,14 @@ design. Reads and builds keep working.
    with this step; nothing in step 3 does it.
    Tools: `scripts/coord/coord-migrate.ps1 -Source <local> -Target <share>` does the copy and the
    stamp in one pass, in place of robocopy. It is a dry run unless `-Apply`. It copies only the
-   shared kinds, skips retired, backup, temp and cache trees, never overwrites, and exits 3 on any
-   conflict or allocation collision.
+   shared kinds, skips retired, backup, temp and cache trees, and never overwrites. It exits 3 on
+   any conflict, allocation collision, or record it could not stamp safely.
 7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
 8. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
    back from a second account.
-9. Rename the old local copies to `*.pre-share` so nothing reads them by accident.
+9. Rename the old local copies to `*.pre-share` so nothing reads them by accident. **Keep the
+   local `alloc/backlog/` in place.** A stale pre-retirement `alloc.ps1` reads only that path, and
+   the tombstone there is what keeps it from issuing a number the vault already holds.
 10. Set up MEFORDEV01 the same way, then verify from it against a seat on ALIENWARE. **First merge
     its own local state**, because it already runs sessions with its own clones: stamp `host =
     MEFORDEV01` on its records, then copy its open claims, unread mail and seats to the share. Check
