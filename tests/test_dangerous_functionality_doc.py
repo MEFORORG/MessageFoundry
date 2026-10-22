@@ -70,6 +70,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import childenv
 from messagefoundry.redaction import json_loads_or_refusal
 from tests.test_threat_model_doc_drift import (
     _ALLOWED_SUBPROCESS_SITES,
@@ -687,26 +688,39 @@ def _cipher_probe_drift(
     return problems
 
 
-def _unbounded_probe_starts(source: str) -> list[str]:
-    """Each ``subprocess.run`` in ``cipher_policy.py`` that does not pass the timeout the page
-    states, or ``["no start"]`` when the scan finds none, so an empty scan cannot read clean."""
-    calls = [
-        node
-        for node in ast.walk(_parse(source))
-        if isinstance(node, ast.Call) and _called_name(node) == "run"
-    ]
-    if not calls:
-        return ["no start"]
-    return [
-        f"the start at line {call.lineno} does not pass timeout=_PROBE_TIMEOUT_S"
+def _passes(call: ast.Call, keyword: str, name: str) -> bool:
+    """Whether ``call`` passes ``keyword=<name>``, ``name`` a bare module-level name."""
+    return any(
+        kw.arg == keyword and isinstance(kw.value, ast.Name) and kw.value.id == name
+        for kw in call.keywords
+    )
+
+
+def _cipher_probe_code_problems(source: str) -> list[str]:
+    """What ``cipher_policy.py``'s starts must do for section 4 to stay true: every subprocess start
+    passes ``timeout=_PROBE_TIMEOUT_S``, and the ``openssl`` environment is built with
+    ``extra_names=_OPENSSL_ENV``. A scan that finds no start reports it, so it cannot read clean."""
+    tree = _parse(source)
+    aliases = _aliases(tree)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    starts = [
+        call
         for call in calls
-        if not any(
-            kw.arg == "timeout"
-            and isinstance(kw.value, ast.Name)
-            and kw.value.id == "_PROBE_TIMEOUT_S"
-            for kw in call.keywords
-        )
+        if (dotted := _dotted(call.func, aliases)) in _SUBPROCESS_FUNCS or dotted in _START_FORMS
     ]
+    if not starts:
+        return ["no start"]
+    problems = [
+        f"the start at line {call.lineno} does not pass timeout=_PROBE_TIMEOUT_S"
+        for call in starts
+        if not _passes(call, "timeout", "_PROBE_TIMEOUT_S")
+    ]
+    if not any(
+        _called_name(call) == "worker_environment" and _passes(call, "extra_names", "_OPENSSL_ENV")
+        for call in calls
+    ):
+        problems.append("no worker_environment(extra_names=_OPENSSL_ENV) call")
+    return problems
 
 
 def test_the_cipher_probe_text_matches_the_code() -> None:
@@ -714,7 +728,7 @@ def test_the_cipher_probe_text_matches_the_code() -> None:
 
     live = (cipher_policy._PROBE_TIMEOUT_S, cipher_policy._OPENSSL_ENV)
     problems = _cipher_probe_drift(_doc_text(), *live)
-    problems += _unbounded_probe_starts(_package_sources()["verify/cipher_policy.py"])
+    problems += _cipher_probe_code_problems(_package_sources()["verify/cipher_policy.py"])
     _assert_no_drift(4, problems)
 
 
@@ -725,42 +739,55 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     seconds, names = cipher_policy._PROBE_TIMEOUT_S, cipher_policy._OPENSSL_ENV
     text = _doc_text()
     assert not _cipher_probe_drift(text, seconds, names)
-    broken = _replace_once(text, _bound_phrase(seconds), _bound_phrase(seconds * 10))
+    # Matched across a line break, as the check reads it, so a re-wrap does not break the control.
+    broken, count = _loose(_bound_phrase(seconds)).subn(_bound_phrase(seconds * 10), text)
+    assert count == 1
     assert _cipher_probe_drift(broken, seconds, names)
     assert _cipher_probe_drift(text, seconds + 1, names)
     assert _cipher_probe_drift(text, seconds, (*names, "OPENSSL_NEW"))
     assert _cipher_probe_drift(text, seconds, names[1:])
 
     source = _package_sources()["verify/cipher_policy.py"]
-    assert not _unbounded_probe_starts(source)
+    assert not _cipher_probe_code_problems(source)
     # One start loses the bound, the other keeps it.
     assert source.count("timeout=_PROBE_TIMEOUT_S") == 2
-    assert _unbounded_probe_starts(source.replace("timeout=_PROBE_TIMEOUT_S", "timeout=5.0", 1))
-    assert _unbounded_probe_starts("x = 1\n") == ["no start"]
+    unbounded = source.replace("timeout=_PROBE_TIMEOUT_S", "timeout=5.0", 1)
+    assert _cipher_probe_code_problems(unbounded)
+    added = source + "\nsubprocess.check_output(['x'])\n"
+    assert _cipher_probe_code_problems(added)
+    no_openssl_names = _replace_once(source, "extra_names=_OPENSSL_ENV", "extra_names=()")
+    assert _cipher_probe_code_problems(no_openssl_names)
+    assert _cipher_probe_code_problems("x = 1\n") == ["no start"]
 
 
-#: The four builders in ``messagefoundry/childenv.py``.
-_BUILDERS = frozenset(
-    {"system_tool_environment", "worker_environment", "hook_environment", "engine_environment"}
-)
-_ENV_LIST_LEAD = "What each start gets, read from the builder it calls."
+#: The builders ``messagefoundry/childenv.py`` exports, read from it so a new one is known here.
+_BUILDERS = frozenset(name for name in childenv.__all__ if name.endswith("_environment"))
+_ENV_LIST_LEAD = "What at least these starts get, read from the builder each calls."
 _ENV_LIST_END = "At least these pass on the environment"
 _TICKED_RE = re.compile(r"`([^`]+)`")
 
 
+def _loose(phrase: str) -> re.Pattern[str]:
+    """``phrase`` with any run of whitespace in it matching any other, so a re-wrap still matches."""
+    return re.compile(r"\s+".join(re.escape(word) for word in phrase.split()))
+
+
 def _env_list_items(text: str) -> list[str]:
     section = _section(text, 4)
-    start, end = section.find(_ENV_LIST_LEAD), section.find(_ENV_LIST_END)
-    assert 0 <= start < end, "section 4 has lost its environment list or the line after it"
-    return section[start:end].split("\n- ")[1:]
+    start, end = _loose(_ENV_LIST_LEAD).search(section), _loose(_ENV_LIST_END).search(section)
+    assert start and end and start.start() < end.start(), (
+        "section 4 has lost its environment list or the line after it"
+    )
+    return section[start.start() : end.start()].split("\n- ")[1:]
 
 
-def _builders_called(source: str) -> set[str]:
-    return {
+@functools.cache
+def _builders_called(source: str) -> frozenset[str]:
+    return frozenset(
         name
         for node in ast.walk(_parse(source))
         if isinstance(node, ast.Call) and (name := _called_name(node)) in _BUILDERS
-    }
+    )
 
 
 def _env_list_drift(text: str, sources: Mapping[str, str]) -> list[str]:

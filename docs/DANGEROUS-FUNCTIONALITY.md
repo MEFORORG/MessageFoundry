@@ -331,12 +331,10 @@ Three argument-list starts are not pinned that way:
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
-environment for the sandbox worker, the disaster-recovery hook and the engine shards. The module
-also builds one for the config-loading child that runs before any shard starts, and for the tray's
-branded relaunch. The list after this paragraph says what each one gets; the module's docstring
-says why that is not an isolation boundary by itself. The tray's relaunch also takes its command line from that module, so it
-starts with `-P` like the engine's Python children. Its environment is the user's whole
-environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
+environment for each start the list after this paragraph names. The list says what each one gets;
+the module's docstring says why that is not an isolation boundary by itself. The tray's branded
+relaunch also takes its command line from that module, so it starts with `-P` like the engine's
+Python children. Autostart starts the first tray
 process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
 the script only from a checkout. Windows hands that process the user's environment unfiltered.
 `-E` makes the interpreter ignore its `PYTHON*` variables, so no `PYTHONPATH` entry reaches that
@@ -346,8 +344,8 @@ isolation (vault BACKLOG #2701). A tray started by hand gets none of the options
 reads the user's `PYTHONPATH`. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path.
 
-What each start gets, read from the builder it calls. Each item names the modules and the
-builders, and a test checks that each module named calls each builder named:
+What at least these starts get, read from the builder each calls. Each item names the modules
+and the builders, and a test checks that each module named calls each builder named:
 
 - The `icacls.exe` starts in `auth/trust_anchors.py` and `store/store.py`, the `sc.exe` starts in
   `service.py` and `service_status.py`, and the `powershell.exe` start in
@@ -365,8 +363,9 @@ builders, and a test checks that each module named calls each builder named:
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
 - The `openssl` start in `verify/cipher_policy.py` gets the platform's start-up names, the
-  interpreter's own variables, and the variables OpenSSL reads to find its configuration,
-  `OPENSSL_CONF`, `OPENSSL_CONF_INCLUDE`, `OPENSSL_MODULES` and `OPENSSL_ENGINES`
+  interpreter's own variables, and the variables OpenSSL reads to find its configuration file,
+  `OPENSSL_CONF` and `OPENSSL_CONF_INCLUDE`, and the provider modules and engines it loads,
+  `OPENSSL_MODULES` and `OPENSSL_ENGINES`
   (`worker_environment`). No other variable reaches it.
 - The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
   disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
@@ -781,7 +780,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | An operator-run measurement script, in the assessment scope like the rest of this folder by owner ruling of 2026-10-05 ([`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2). It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
+| `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope like the rest of this folder by owner ruling of 2026-10-05 ([`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2). It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -1183,8 +1182,10 @@ reads the code and fails when one of these no longer matches it:
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Some things no test checks. They include what a script grants, what holds a site, and sections 1,
-2, 3 and 6. In section 4, no test checks what each builder lets through; that is
-`messagefoundry/childenv.py`'s to say. In section 7, no test checks which table a parse site belongs in, or whether either
+2, 3 and 6. In section 4, no test checks the page's account of what each builder lets through
+against `messagefoundry/childenv.py`; `tests/test_child_process_environment.py` tests the builders
+themselves. Nor does any test check that the environment list names every start, or that a
+module's start uses the builder named rather than another the module also calls. In section 7, no test checks which table a parse site belongs in, or whether either
 hand-read table is complete. In section 11, no test checks the settings a harness-started engine
 is given, the store reset, the listener bind addresses, or which row a parse site belongs in. The
 import-by-name and config-loader checks match the called name, so a call through another name
