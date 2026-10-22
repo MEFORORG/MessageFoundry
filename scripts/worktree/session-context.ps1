@@ -33,6 +33,7 @@
 $ErrorActionPreference = "SilentlyContinue"
 
 $lines = @()
+$busyLines = @()
 $tail = @()
 
 # A claim stamp as UTC, or $null. ConvertFrom-Json has usually coerced the ISO string to a [datetime]
@@ -45,13 +46,21 @@ function ConvertTo-ClaimUtc($Value) {
     try { return [datetimeoffset]::Parse([string]$Value, [cultureinfo]::InvariantCulture).UtcDateTime } catch { return $null }
 }
 
-# One field of a list row, from a peer's record, which may hold any text at any length. Control
-# characters become spaces, so a newline in a note cannot start a line of its own in the model's
-# context. The field is clipped, not the row, so the tags after it ([STATE], [stale ~Nh]) survive.
+# One field of a list row, from a peer's record, which may hold any text at any length. Control and
+# format characters and the Unicode line and paragraph separators (\p{Zl}, \p{Zp}, which are not in
+# \p{C}) become spaces, so a note cannot start a line of its own in the model's context. Surrogates
+# are kept, and a clip never splits a pair, so an emoji survives. A [datetime] that ConvertFrom-Json
+# coerced prints in ISO 8601 ('o'), not the culture's short form; its offset and precision may still
+# differ from what the peer wrote. The field is clipped, not the row, so the tags after it ([STATE],
+# [stale ~Nh]) survive. overlap.ps1 and the mail hooks each keep their own fold of untrusted text;
+# this one does not share theirs, which maps non-ASCII to '?'.
 function Format-Field($Value, [int]$Width) {
-    $s = ("$Value" -replace '\p{C}', ' ').Trim()
+    $text = if ($Value -is [datetime] -or $Value -is [datetimeoffset]) { $Value.ToString('o') } else { "$Value" }
+    $s = ($text -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]', ' ').Trim()
     if ($s.Length -le $Width) { return $s }
-    return $s.Substring(0, $Width - 3) + '...'
+    $cut = $Width - 3
+    if ([char]::IsHighSurrogate($s[$cut - 1])) { $cut-- }
+    return $s.Substring(0, $cut) + '...'
 }
 
 # Into the session's own directory BEFORE any git call. Under SilentlyContinue a dot-source of a
@@ -106,16 +115,13 @@ if ($root) {
             $lines += "  >>> (A trivial one-off read/edit here is fine; anything you'll iterate on gets a worktree.)"
         }
 
-        # HIGH SIGNAL FIRST, AND EVERY LIST CAPPED. The harness injects a hook's output whole only while
-        # it is small; past that it saves the output to a file and injects a short preview of the head.
-        # Measured 2026-10-22 on a box with 471 worktrees and 155 claims: 128,001 bytes, of which the
-        # model saw only the head of the full worktree list, so the peers and claims below never reached
-        # it. So the worktree list is now a count and this session's own row, printed last, and each list
-        # below names the command that shows the rest. tests/test_session_context_presence.py pins the
-        # byte budget.
+        # HIGH SIGNAL FIRST, AND EVERY LIST CAPPED, so the banner reaches the model whole rather than
+        # as a preview of its head. docs/WORKTREES.md (the SessionStart section) holds why and the
+        # measurement. Order: peers, then claims, then what peers are building; each list names the
+        # command that shows the rest.
         $peerCap = 8
         $busyCap = 3
-        $claimCap = 8
+        $claimCap = 6
         $staleHours = 12
 
         # WHO IS ACTUALLY HERE. The worktree count is the set of checkouts, not the set of live
@@ -142,8 +148,9 @@ if ($root) {
                 # against it got an error at best and the wrong tree if the prefix happened to resolve.
                 # The word goes on the ROW, not in a legend, so the column cannot mean one thing in one
                 # row and something else in the next.
-                # The two notes test EVERY peer, not only the rows shown, and print before the rows, so
-                # neither a capped row nor the byte backstop can drop a hazard.
+                # The two notes test EVERY peer, not only the rows shown, and print before the rows, so a
+                # capped row cannot drop a hazard, and the byte backstop, which cuts from the end, reaches
+                # them last.
                 # The surfaces differ in what can reach them, and that changes how you coordinate.
                 if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
                     $lines += "  NOTE: a non-desktop (e.g. VS Code) session is live. It cannot be reached by"
@@ -154,8 +161,11 @@ if ($root) {
                     $lines += "           there can collide with it -- stay in this worktree."
                 }
                 # The peers the notes name come first, so the cap never hides the one they mean.
-                # Sort-Object is stable, so presence.ps1's own order holds within each group.
-                $ranked = @($others | Sort-Object -Stable -Property @{ Expression = { -not $_.IsPrimary } }, @{ Expression = { $_.Surface -eq 'desktop' } })
+                # The index keeps presence.ps1's own order within each group. It is a sort key, not
+                # -Stable, which Windows PowerShell 5.1 does not have.
+                $ranked = @(for ($i = 0; $i -lt $others.Count; $i++) { [pscustomobject]@{ P = $others[$i]; I = $i } }) |
+                    Sort-Object -Property @{ Expression = { -not $_.P.IsPrimary } }, @{ Expression = { $_.P.Surface -eq 'desktop' } }, I |
+                    ForEach-Object { $_.P }
                 foreach ($p in @($ranked | Select-Object -First $peerCap)) {
                     $where = if ($p.IsPrimary) { "the SHARED PRIMARY" } else { Format-Field $p.Worktree 40 }
                     $flag = if ($p.State -ne "LIVE") { "  [$(Format-Field $p.State 20)]" } else { "" }
@@ -178,21 +188,25 @@ if ($root) {
             if (Test-Path $overlap) {
                 $inflight = @()
                 try { $inflight = @(& $overlap -Json | ConvertFrom-Json) } catch { $inflight = @() }
-                $busy = @($inflight | Where-Object { $_.Live -and (@($_.Work).Count -gt 0 -or @($_.Files).Count -gt 0) })
+                # @($null).Count is 1, so a null Work or Files is filtered out before it is counted.
+                $busy = @($inflight | Where-Object { $_.Live -and (@($_.Work | Where-Object { $_ }).Count -gt 0 -or @($_.Files | Where-Object { $_ }).Count -gt 0) })
                 if ($busy.Count -gt 0) {
-                    $lines += ""
-                    $lines += "WHAT THEY ARE BUILDING -- check first, so you don't build it twice:"
+                    # Held back and printed after the claims: a claim has no other surface, so the byte
+                    # backstop, which cuts from the end, should reach this section first.
+                    $busyLines += ""
+                    $busyLines += "WHAT THEY ARE BUILDING -- check first, so you don't build it twice:"
                     foreach ($b in @($busy | Select-Object -First $busyCap)) {
                         # Same id, same banner, same label -- see the note on the roster rows above.
                         #
                         # "beyond yours" is not decoration. overlap.ps1's Files narrows its committed
                         # half against the HEAD of whoever asked, so this count is relative to THIS
                         # session and a bare "changed" would overstate what the peer did.
-                        $lines += "  session $(Format-Field $b.Short 12) [$(Format-Field $b.Branch 50)] -- $(@($b.Files).Count) file(s) changed beyond yours"
-                        if (@($b.Work).Count) { $lines += "      $(Format-Field @($b.Work)[0] 84)" }
+                        $work = @($b.Work | Where-Object { $_ })
+                        $busyLines += "  session $(Format-Field $b.Short 12) [$(Format-Field $b.Branch 50)] -- $(@($b.Files | Where-Object { $_ }).Count) file(s) changed beyond yours"
+                        if ($work.Count) { $busyLines += "      $(Format-Field $work[0] 84)" }
                     }
-                    if ($busy.Count -gt $busyCap) { $lines += "  +$($busy.Count - $busyCap) more" }
-                    $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
+                    if ($busy.Count -gt $busyCap) { $busyLines += "  +$($busy.Count - $busyCap) more" }
+                    $busyLines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
                 }
             }
         }
@@ -225,11 +239,13 @@ if ($root) {
         if ($claimFiles.Count -gt 0) {
             $meNorm = ($root -replace '\\', '/').TrimEnd('/')
             # EVERY claim still holds its key, however old, and nothing else shows a free-text one:
-            # claim_check.py enforces only a numbered item cited in a commit subject. So nothing is
-            # dropped by age. Other sessions' claims get the full rows, the most recently touched first; the
-            # rest are named by key on one clipped line, and this session's own by key on another.
-            # Age reads `refreshed`, which -Take moves, as well as `claimed`, which never moves.
-            # claim.ps1 -List adds each holder's liveness, which age cannot show.
+            # claim_check.py enforces only a numbered item cited in a commit subject. So the header
+            # counts every claim and no age filter hides one, but the space is finite: this session's
+            # own keys print first, then other sessions' claims as rows, most recently touched first,
+            # then as many more keys as one line holds. claim.ps1 -List shows every one, with each
+            # holder's liveness, which age cannot show. Age reads `refreshed`, which a -Take with
+            # -Note on your own claim moves, as well as `claimed`, which never moves.
+            $primaryNorm = if ($commonDir) { (("$commonDir".Trim() -replace '\\', '/').TrimEnd('/') -replace '/\.git$', '') } else { '' }
             $now = [datetime]::UtcNow
             $unreadable = 0
             $rows = @(foreach ($cf in $claimFiles) {
@@ -244,55 +260,67 @@ if ($root) {
                 # An unreadable date is never called stale, as before: it sorts last instead.
                 $age = if ($touched) { ($now - $touched).TotalHours } else { [double]::MaxValue }
                 # ConvertFrom-Json turns a date-shaped key into a [datetime] and prints it in another
-                # shape; the file name is the key as claim.ps1 stored it.
+                # shape. The file name is claim.ps1's folded form of the key (ConvertTo-KeyFile), which
+                # -Take folds to the same file, so it still names the claim.
                 $key = if ($c.key -is [datetime] -or $c.key -is [datetimeoffset]) { $cf.BaseName } else { $c.key }
-                [pscustomobject]@{ Claim = $c; Key = (Format-Field $key 30); Mine = $mine; Here = $here; Age = $age }
+                # A key is an identity a reader must be able to pass back to claim.ps1, so it is
+                # clipped only far past any real one.
+                [pscustomobject]@{ Claim = $c; Key = (Format-Field $key 80); Mine = $mine; Here = $here; Age = $age; Held = $heldNorm }
             })
             $recent = @($rows | Where-Object { $_.Age -lt $staleHours }).Count
             $lines += ""
-            $lines += "Active work claims ($($rows.Count), $recent touched in the last ${staleHours}h) -- do NOT start one held by another session:"
+            $lines += "Active work claims ($($rows.Count), $recent touched in the last ${staleHours}h; all: scripts\coord\claim.ps1 -List) -- do NOT start one another session holds:"
             if ($unreadable -gt 0) { $lines += "  WARNING: $unreadable claim file(s) in $claimDir could not be read, so they are not listed." }
-            $theirs = @($rows | Where-Object { -not $_.Mine } | Sort-Object Age)
+            $mineRows = @($rows | Where-Object { $_.Mine })
+            if ($mineRows.Count -gt 0) {
+                $lines += "  THIS session holds $($mineRows.Count): $(Format-Field (($mineRows | ForEach-Object Key) -join ', ') 160)"
+            }
+            # Key breaks ties, so equal ages (or unreadable dates) order the same in every run.
+            $theirs = @($rows | Where-Object { -not $_.Mine } | Sort-Object -Property Age, Key)
             foreach ($r in @($theirs | Select-Object -First $claimCap)) {
                 $c = $r.Claim
                 # The leaf names the worktree; the full path and the branch are in claim.ps1 -List.
                 # String ops, not Split-Path, which fails quietly on '' or 'D:' under SilentlyContinue.
-                $leaf = Format-Field ((("$($c.worktree)" -replace '\\', '/').TrimEnd('/') -split '/')[-1]) 40
+                $leaf = if ($r.Here -and $primaryNorm -and $r.Held -ieq $primaryNorm) { "the SHARED PRIMARY" } else { Format-Field (($r.Held -split '/')[-1]) 40 }
                 $who = if ($r.Here) { $leaf } else { "$leaf on $(Format-Field (Get-CoordRecordHost $c) 20)" }
                 $stale = if ($r.Age -ge $staleHours -and $r.Age -ne [double]::MaxValue) { " [stale ~$([int]$r.Age)h]" } else { "" }
                 $lines += "  $($r.Key) -- $(Format-Field $c.note 48)  (held by $who)$stale"
             }
             if ($theirs.Count -gt $claimCap) {
-                $lines += "  +$($theirs.Count - $claimCap) more, by key: $(Format-Field ((@($theirs | Select-Object -Skip $claimCap) | ForEach-Object Key) -join ', ') 160)"
+                $lines += "  +$($theirs.Count - $claimCap) more, by key: $(Format-Field ((@($theirs | Select-Object -Skip $claimCap) | ForEach-Object Key) -join ', ') 240)"
             }
-            $mineRows = @($rows | Where-Object { $_.Mine })
-            if ($mineRows.Count -gt 0) {
-                $lines += "  THIS session holds $($mineRows.Count): $(Format-Field (($mineRows | ForEach-Object Key) -join ', ') 160)"
-            }
-            $lines += "  All: scripts\coord\claim.ps1 -List    Claim yours first: claim.ps1 -Take <key> -Note `"<what>`""
         }
+        $lines += $busyLines
 
-        # The checkouts, last and short: a count and this session's own row. `git worktree list` prints
-        # every one, and at 471 of them that list alone pushed everything above out of the preview.
+        # The checkouts, last and short: this session's own row. `git worktree list` prints every one,
+        # and at 471 of them that list alone pushed everything above out of the preview.
         $rootFwd = ($root -replace '\\', '/')
-        # StartsWith, not -like: a path holding `[` or `*` is a wildcard pattern to -like.
-        $ownRow = $wt | Where-Object { ($_ -replace '\\', '/').StartsWith("$rootFwd ", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-        $lines += ""
-        $lines += "Worktrees sharing this .git: $($wt.Count)  (all of them: git worktree list)"
-        # git pads the path column to the longest path of them all, so the padding is squeezed out.
-        if ($ownRow) { $lines += "  yours:  $($ownRow -replace '\s{2,}', '  ')" }
+        $wtFwd = @($wt -replace '\\', '/')
+        # The path, then whitespace, then the commit: a regex, not -like, whose `[` and `*` are
+        # wildcards, and not a bare prefix, which a sibling at "<path> more" would also match.
+        $ownPattern = '^' + [regex]::Escape($rootFwd) + '\s+[0-9a-f]{4,}\b'
+        $ownRow = $wtFwd | Where-Object { $_ -match $ownPattern } | Select-Object -First 1
+        # This section and the rules below go in $tail, which the budget below never cuts.
+        # The header already gives the count and the path, so the row prints only what follows the
+        # path: the commit, the branch and any lock. git pads the path column to the longest path, so
+        # the padding is squeezed out.
+        $tail += ""
+        $own = if ($ownRow) { $ownRow.Substring($rootFwd.Length).Trim() -replace '\s{2,}', '  ' } else { '(not in git worktree list)' }
+        $tail += "Your worktree:  $own  (every worktree: git worktree list)"
 
         # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
-        $siblingCount = @($wt | Where-Object { ($_ -replace '\\', '/').StartsWith("$rootFwd-", [StringComparison]::OrdinalIgnoreCase) }).Count
+        $siblingPrefix = "$rootFwd-"
+        $siblingCount = @($wtFwd | Where-Object { $_.StartsWith($siblingPrefix, [StringComparison]::OrdinalIgnoreCase) }).Count
         if ($siblingCount -ge 1) {
-            $lines += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
-            $lines += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
+            $tail += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
+            $tail += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
         }
 
-        # Fixed and short, so it is held apart from the lists and never cut by the budget below.
         $tail += ""
         $tail += "Coordination rules for parallel sessions (see docs/WORKTREES.md):"
-        $tail += "  - Keep ALL changes on '$branch'; never edit files in a sibling worktree. Use THIS worktree's .venv."
+        $onBranch = if ($branch) { "this worktree's branch ('$branch')" } else { "this worktree (detached HEAD)" }
+        $tail += "  - Keep ALL changes on $onBranch; never edit files in a sibling worktree. Use THIS worktree's .venv."
+        $tail += "  - Claim work before you start it: scripts\coord\claim.ps1 -Take <key> -Note `"<what>`""
         $tail += "  - Project memory (~/.claude/.../memory) is SHARED, last write wins: write it only if the user says this session owns it."
     }
 }
@@ -300,18 +328,38 @@ if ($root) {
 # Two bounds behind the row caps, because row counts alone do not bound bytes. Format-Field clips
 # each field a peer's record supplies, so a long path, branch or task line cannot grow a row. And past
 # the budget the end of the lists goes, with one line saying so; the lists run in priority order,
-# hazards first, and the fixed rules in $tail always print.
-# tests/test_session_context_presence.py reads $byteBudget from this line.
+# hazards first, and the short fixed sections in $tail always print.
+#
+# WHICH LINES SURVIVE MUST NOT DEPEND ON WHERE THE REPO LIVES. Measured 2026-10-22: counting the path
+# as it is, a CI runner's longer temp path cut two list lines that a desktop kept. So the count reads
+# every copy of this worktree's path, and of the primary checkout's, which the claims directory sits
+# under, in either slash form, as a fixed 260 bytes. That keeps the cut the same everywhere, and the
+# real bytes under the budget for any such path of 260 UTF-8 bytes or fewer. A longer one, or another
+# machine-dependent value (git's SHA width, the branch name), can still move it.
+# tests/test_session_context_presence.py reads $byteBudget and $pathReserve from these lines.
 $byteBudget = 4000
-$measure = { param($a) [Text.Encoding]::UTF8.GetByteCount(($a -join "`n")) }
+$pathReserve = 260
+$primaryRoot = if ($commonDir) { ("$commonDir".Trim() -replace '[\\/]\.git[\\/]?$', '') } else { '' }
+# Longest first, so a path that contains another is replaced whole.
+$pathForms = @(foreach ($p in @("$root", $primaryRoot)) { if ($p) { $p -replace '\\', '/'; $p -replace '/', '\' } }) |
+    Select-Object -Unique | Sort-Object -Property Length -Descending
+$reserveToken = 'P' * $pathReserve
+# -ireplace with an escaped pattern, not the three-argument String.Replace, which Windows PowerShell
+# 5.1's .NET Framework does not have.
+$measure = {
+    param($a)
+    $t = $a -join "`n"
+    foreach ($f in $pathForms) { $t = $t -ireplace [regex]::Escape($f), $reserveToken }
+    [Text.Encoding]::UTF8.GetByteCount($t)
+}
 if ((& $measure ($lines + $tail)) -gt $byteBudget) {
-    $closing = "[session-context] cut the last {0} list line(s) to fit the budget. See scripts\coord\presence.ps1 -All, overlap.ps1, claim.ps1 -List, git worktree list"
-    # Room for the rules and the closing line, so the cut banner still ends under the budget.
+    $closing = "[session-context] cut the last {0} list line(s) to fit the budget. Run: scripts\coord\presence.ps1 -All, scripts\coord\claim.ps1 -List, scripts\coord\overlap.ps1"
+    # Room for the fixed sections and the closing line, so the cut banner still ends under the budget.
     $room = $byteBudget - (& $measure $tail) - $closing.Length - 8
     $kept = @()
     $used = 0
     foreach ($l in $lines) {
-        $n = [Text.Encoding]::UTF8.GetByteCount($l) + 1
+        $n = (& $measure @($l)) + 1
         if ($used + $n -gt $room) { break }
         $kept += $l
         $used += $n
