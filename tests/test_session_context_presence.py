@@ -14,6 +14,7 @@ the repo -- these same scripts are live in every sibling session while the suite
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -246,6 +247,7 @@ def test_self_is_excluded_from_the_peer_count(staged: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
+@functools.cache
 def _top(path: Path) -> str:
     """The toplevel exactly as git prints it, which is how the banner prints it."""
     return subprocess.run(
@@ -416,9 +418,14 @@ BYTE_BUDGET = int(_BUDGET_LINE.group(1))
 _PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
 
 
-def _size(out: str) -> int:
-    """The banner's bytes as the script counts them: without the newline Write-Output appends."""
-    return len(out.rstrip("\r\n").encode("utf-8"))
+def _size(out: str, repo: Path) -> int:
+    """The banner's bytes as the script counts them against its budget: without the newline
+    Write-Output appends, and with this worktree's path counted as the token <ROOT>."""
+    return len(_rooted(out, repo).rstrip("\r\n").encode("utf-8"))
+
+
+def _rooted(out: str, repo: Path) -> str:
+    return out.replace(_top(repo), "<ROOT>")
 
 
 def _stamp(hours_ago: float) -> str:
@@ -507,23 +514,27 @@ def _banner(repo: Path, env: dict[str, str]) -> str:
     return proc.stdout
 
 
+def _crowded_peers() -> list[dict[str, object]]:
+    peers = _peer_rows(30)
+    # One hazardous peer, sorted last by presence.ps1, so only the ranking can bring it under the cap.
+    peers[-1] = {**peers[-1], "Surface": "vscode", "Short": "feedface"}
+    return peers
+
+
 @pytest.fixture(scope="module")
 def crowded(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
     """Every list past its cap at real field widths, run once: the tests below read one banner."""
     base = Path(os.path.realpath(tmp_path_factory.mktemp("crowded")))
-    peers = _peer_rows(30)
-    # One hazardous peer, sorted last by presence.ps1, so only the ranking can bring it under the cap.
-    peers[-1] = {**peers[-1], "Surface": "vscode", "Short": "feedface"}
-    repo, env = _crowd(base, peers, _many_claims())
+    repo, env = _crowd(base, _crowded_peers(), _many_claims())
     return repo, _banner(repo, env)
 
 
 def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
     crowded: tuple[Path, str],
 ) -> None:
-    _, out = crowded
-    size = _size(out)
-    print(f"banner bytes: {size} of {BYTE_BUDGET}")
+    repo, out = crowded
+    size = _size(out, repo)
+    print(f"banner bytes, path counted as <ROOT>: {size} of {BYTE_BUDGET}")
 
     # Positive controls first: every list really was past its cap, so the budget below is earned.
     assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
@@ -556,7 +567,8 @@ def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path,
     ).stdout.strip()
     own = [ln for ln in out.splitlines() if ln.strip().startswith("yours:")]
     assert len(own) == 1, out
-    assert _top(repo) in own[0] and head in own[0], own
+    # The row names the commit and branch; the path is the header's, so it is not printed twice.
+    assert head in own[0] and _top(repo) not in own[0], own
 
 
 def test_a_hazardous_peer_past_the_cap_is_ranked_into_view(crowded: tuple[Path, str]) -> None:
@@ -627,7 +639,23 @@ def test_wide_fields_are_clipped_and_the_hazards_still_lead(tmp_path: Path) -> N
     assert rows[0].startswith("session 0badf00d") and rows[0].endswith("[UNVERIFIED]"), rows
     assert all(len(ln) <= 160 for ln in rows), rows
     assert "Coordination rules for parallel sessions" in out, out
-    assert _size(out) <= BYTE_BUDGET, out
+    assert _size(out, repo) <= BYTE_BUDGET, out
+
+
+def test_which_lines_print_does_not_depend_on_where_the_repo_lives(
+    crowded: tuple[Path, str], tmp_path: Path
+) -> None:
+    """Measured on CI: a runner's longer temp path cut two list lines that a desktop kept. The same
+    records 50 characters deeper must print the same banner, path aside."""
+    deep = Path(os.path.realpath(tmp_path)) / ("d" * 50)
+    deep.mkdir()
+    repo, env = _crowd(deep, _crowded_peers(), _many_claims())
+    outs = []
+    for r, out in (crowded, (repo, _banner(repo, env))):
+        # Each fixture repo has its own commit, so its SHA differs too; same length either way.
+        outs.append(re.sub(r"(yours:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, r)))
+    assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
+    assert "cut the last" not in outs[1], outs[1]
 
 
 def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
@@ -645,4 +673,6 @@ def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path)
     assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
     assert "Coordination rules for parallel sessions" in out, out
     assert "this session owns it" in out, out
-    assert _size(out) <= 1500, out
+    # The fixed sections print whole, the worktree count among them.
+    assert "Worktrees sharing this .git: 12" in out, out
+    assert _size(out, repo) <= 1500, out

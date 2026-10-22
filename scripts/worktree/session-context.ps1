@@ -275,21 +275,23 @@ if ($root) {
         # The checkouts, last and short: a count and this session's own row. `git worktree list` prints
         # every one, and at 471 of them that list alone pushed everything above out of the preview.
         $rootFwd = ($root -replace '\\', '/')
+        $wtFwd = @($wt -replace '\\', '/')
         # StartsWith, not -like: a path holding `[` or `*` is a wildcard pattern to -like.
-        $ownRow = $wt | Where-Object { ($_ -replace '\\', '/').StartsWith("$rootFwd ", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-        $lines += ""
-        $lines += "Worktrees sharing this .git: $($wt.Count)  (all of them: git worktree list)"
-        # git pads the path column to the longest path of them all, so the padding is squeezed out.
-        if ($ownRow) { $lines += "  yours:  $($ownRow -replace '\s{2,}', '  ')" }
+        $ownRow = $wtFwd | Where-Object { $_.StartsWith("$rootFwd ", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+        # This section and the rules below go in $tail, which the budget below never cuts.
+        $tail += ""
+        $tail += "Worktrees sharing this .git: $($wt.Count)  (all of them: git worktree list)"
+        # The header already names the path, so the row prints only what follows it: the commit, the
+        # branch and any lock. git pads the path column to the longest path, so padding is squeezed out.
+        if ($ownRow) { $tail += "  yours:  $($ownRow.Substring($rootFwd.Length).Trim() -replace '\s{2,}', '  ')" }
 
         # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
-        $siblingCount = @($wt | Where-Object { ($_ -replace '\\', '/').StartsWith("$rootFwd-", [StringComparison]::OrdinalIgnoreCase) }).Count
+        $siblingCount = @($wtFwd | Where-Object { $_.StartsWith("$rootFwd-", [StringComparison]::OrdinalIgnoreCase) }).Count
         if ($siblingCount -ge 1) {
-            $lines += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
-            $lines += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
+            $tail += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
+            $tail += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
         }
 
-        # Fixed and short, so it is held apart from the lists and never cut by the budget below.
         $tail += ""
         $tail += "Coordination rules for parallel sessions (see docs/WORKTREES.md):"
         $tail += "  - Keep ALL changes on '$branch'; never edit files in a sibling worktree. Use THIS worktree's .venv."
@@ -300,18 +302,28 @@ if ($root) {
 # Two bounds behind the row caps, because row counts alone do not bound bytes. Format-Field clips
 # each field a peer's record supplies, so a long path, branch or task line cannot grow a row. And past
 # the budget the end of the lists goes, with one line saying so; the lists run in priority order,
-# hazards first, and the fixed rules in $tail always print.
+# hazards first, and the short fixed sections in $tail always print.
+#
+# WHICH LINES SURVIVE MUST NOT DEPEND ON WHERE THE REPO LIVES. So the count reads this worktree's
+# path, in either slash form, as the fixed token <ROOT>, however often it prints. Measured 2026-10-22:
+# counting the path itself, a CI runner's longer temp path cut two list lines a desktop kept.
 # tests/test_session_context_presence.py reads $byteBudget from this line.
 $byteBudget = 4000
-$measure = { param($a) [Text.Encoding]::UTF8.GetByteCount(($a -join "`n")) }
+$rootForms = @(if ($root) { "$root"; "$root" -replace '/', '\'; "$root" -replace '\\', '/' }) | Select-Object -Unique
+$measure = {
+    param($a)
+    $t = $a -join "`n"
+    foreach ($f in $rootForms) { $t = $t.Replace($f, '<ROOT>', [StringComparison]::OrdinalIgnoreCase) }
+    [Text.Encoding]::UTF8.GetByteCount($t)
+}
 if ((& $measure ($lines + $tail)) -gt $byteBudget) {
     $closing = "[session-context] cut the last {0} list line(s) to fit the budget. See scripts\coord\presence.ps1 -All, overlap.ps1, claim.ps1 -List, git worktree list"
-    # Room for the rules and the closing line, so the cut banner still ends under the budget.
+    # Room for the fixed sections and the closing line, so the cut banner still ends under the budget.
     $room = $byteBudget - (& $measure $tail) - $closing.Length - 8
     $kept = @()
     $used = 0
     foreach ($l in $lines) {
-        $n = [Text.Encoding]::UTF8.GetByteCount($l) + 1
+        $n = (& $measure @($l)) + 1
         if ($used + $n -gt $room) { break }
         $kept += $l
         $used += $n
