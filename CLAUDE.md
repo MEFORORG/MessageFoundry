@@ -690,8 +690,12 @@ never with mail. The evidence is probe PR
   `pyproject.toml` and re-lock. Never an ad-hoc install (§7). AI-suggested packages are often
   hallucinated.
 - A change you have COMMITTED is recoverable through git, so take it. An untracked file, an
-  uncommitted edit, a force-push and `reset --hard` are not recoverable. What needs the
-  owner is an action git cannot undo. Examples: writing outside the worktree, a DB migration against
+  uncommitted edit, a force-push and `reset --hard` are not recoverable. **Two such acts are yours
+  to take, as class A in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3 (owner approval
+  2026-10-22):** force-pushing your own unshared branch, which only your session has pushed, with no
+  pull request open on it and no other branch built on it; and deleting disposable output your own
+  run made. The tripwire hook (ADR 0211) still records a force-push. What needs the owner is any
+  other action git cannot undo. Examples: writing outside the worktree, a DB migration against
   a real store, a global install. A Builder cannot ask, so it must not take one. If your brief
   requires one, stop, push what is green, and say so in your exit report, which the Manager carries
   into the PR body. Adding a dependency is not in
