@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,10 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture
 def staged(tmp_path: Path) -> Path:
+    return _make_staged(tmp_path)
+
+
+def _make_staged(tmp_path: Path) -> Path:
     """A git repo with 2+ worktrees (so the parallel-session block runs) holding script copies."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -69,7 +74,7 @@ def staged(tmp_path: Path) -> Path:
     return repo
 
 
-def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
+def run_context(repo: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "pwsh",
@@ -84,6 +89,7 @@ def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=180,
         check=False,  # the whole point is that it exits 0 even when presence.ps1 fails
+        env=env,
     )
 
 
@@ -160,7 +166,7 @@ def test_the_session_id_is_labelled_because_the_same_banner_prints_real_shas(
     """BACKLOG #1098: an 8-hex session id printed bare reads as an abbreviated commit SHA.
 
     It reads that way for a measured reason rather than a vague one, and this test measures it: the
-    ``git worktree list`` block a few lines up prints ``<path> <abbreviated sha> [branch]``, so the same
+    banner's own ``git worktree list`` row prints ``<path> <abbreviated sha> [branch]``, so the same
     banner already teaches "8 hex before a bracketed branch = commit SHA". The roster then reused the
     shape for a registry session id, which resolves to no git object at all. A session comparing "is that
     worktree ahead of mine" against it gets an error at best, and the wrong tree if the prefix resolves.
@@ -388,3 +394,140 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
     out = proc.stdout.decode("utf-8", "replace")
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert f"This chat's worktree: {_top(wt)}  (branch: linked)" in out, out
+
+
+# --------------------------------------------------------------------------------------------------
+# The banner must fit the harness's inline injection.
+#
+# Past a size threshold the harness saves a hook's output to a file and injects only a short preview
+# of its head. Measured 2026-10-22 on a box with 471 worktrees and 155 claims, this banner printed
+# 128,001 bytes, and the preview held only the start of the full worktree list: the live peers and
+# the claims, printed after it, never reached the model. The threshold is not documented in this
+# repository, so the budget is 4 KB, and these tests pin it with every list far past its cap.
+# --------------------------------------------------------------------------------------------------
+
+BYTE_BUDGET = 4096
+
+
+def _claim_row(key: str, hours_ago: float, note: str) -> dict[str, str]:
+    claimed = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+    return {
+        "key": key,
+        "note": note,
+        "branch": f"b-{key}",
+        "worktree": f"C:/elsewhere/.claude/worktrees/agent-{key}",
+        "claimed": claimed,
+    }
+
+
+def _peer_rows(count: int, worktree: str = "peer-worktree") -> list[dict[str, object]]:
+    return [
+        {
+            "Short": f"{i:08x}",
+            "Surface": "desktop",
+            "Worktree": f"{worktree}-{i:02d}",
+            "Branch": f"claude/peer-{i:02d}",
+            "IsSelf": False,
+            "IsPrimary": False,
+            "State": "LIVE",
+        }
+        for i in range(count)
+    ]
+
+
+def _crowd(base: Path, peers: list[dict[str, object]]) -> tuple[Path, dict[str, str]]:
+    """Ten more worktrees, the given live peers, and 40 fresh plus 20 stale claims."""
+    repo = _make_staged(base)
+    for i in range(10):
+        _git(repo, "worktree", "add", "-q", "-b", f"extra-{i}", str(base / f"extra-wt-{i:02d}"))
+    fake_presence(repo, peers)
+    shutil.copy(
+        ROOT / "scripts" / "coord" / "coord-root.ps1",
+        repo / "scripts" / "coord" / "coord-root.ps1",
+    )
+    # The resolver's first source, so the test never reads this box's real shared root.
+    coord_root = base / "coord-root"
+    claims = coord_root / "claims"
+    claims.mkdir(parents=True)
+    long_note = (
+        "a Manager batch note that runs well past the eighty characters a row may carry " * 3
+    )
+    for i in range(40):
+        row = _claim_row(f"fresh{i:02d}", hours_ago=i * 0.1, note=long_note)
+        (claims / f"fresh{i:02d}.json").write_text(json.dumps(row), encoding="utf-8")
+    for i in range(20):
+        row = _claim_row(f"stale{i:02d}", hours_ago=24 + i, note="old")
+        (claims / f"stale{i:02d}.json").write_text(json.dumps(row), encoding="utf-8")
+    return repo, {**os.environ, "MEFOR_COORD_ROOT": str(coord_root)}
+
+
+def _banner(repo: Path, env: dict[str, str]) -> str:
+    proc = run_context(repo, env)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+@pytest.fixture(scope="module")
+def crowded(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """Every list past its cap, run once: the three tests below read the same banner."""
+    base = Path(os.path.realpath(tmp_path_factory.mktemp("crowded")))
+    repo, env = _crowd(base, _peer_rows(30))
+    return repo, _banner(repo, env)
+
+
+def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
+    crowded: tuple[Path, str],
+) -> None:
+    _, out = crowded
+    size = len(out.encode("utf-8"))
+    print(f"banner bytes: {size}")
+
+    # Positive controls first: every list really was past its cap, so the budget below is earned.
+    assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "+20 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
+    assert "Active work claims (40 fresh, 20 stale over 12h not shown)" in out, out
+    assert "+30 more fresh" in out, out
+    assert "claim.ps1 -List" in out, out
+    assert "cut the last" not in out, "the row caps alone should fit; the backstop fired"
+
+    assert size < BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
+
+
+def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path, str]) -> None:
+    repo, out = crowded
+    peers = out.index("LIVE sessions in this repo right now")
+    claims = out.index("Active work claims")
+    worktrees = out.index("Worktrees sharing this .git: 12")
+    assert peers < claims < worktrees, out
+
+    # The full list is gone: no sibling worktree path is printed, only this session's own row.
+    assert "extra-wt-" not in out, out
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    own = [ln for ln in out.splitlines() if ln.strip().startswith("yours:")]
+    assert len(own) == 1, out
+    assert _top(repo) in own[0] and head in own[0], own
+
+
+def test_only_fresh_claims_are_listed_newest_first(crowded: tuple[Path, str]) -> None:
+    _, out = crowded
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    keys = [ln.split(" -- ")[0].strip() for ln in rows]
+    assert keys == [f"fresh{i:02d}" for i in range(10)], keys
+    assert all("..." in ln for ln in rows), "the long note was not shortened"
+
+
+def test_rows_too_long_for_the_caps_are_cut_from_the_tail(tmp_path: Path) -> None:
+    """Row counts do not bound bytes. With peer rows far wider than any real one, the backstop
+    keeps the head, where the peers are, and says what it cut."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(30, worktree="w" * 400))
+    out = _banner(repo, env)
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "cut the last" in out and "claim.ps1 -List" in out, out
+    assert len(out.encode("utf-8")) < BYTE_BUDGET, out

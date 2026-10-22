@@ -86,11 +86,19 @@ if ($root) {
             $lines += "  >>> (A trivial one-off read/edit here is fine; anything you'll iterate on gets a worktree.)"
         }
 
-        $lines += ""
-        $lines += "All worktrees sharing this .git/history/remote:"
-        $wt | ForEach-Object { $lines += "  $_" }
+        # HIGH SIGNAL FIRST, AND EVERY LIST CAPPED. The harness injects a hook's output whole only while
+        # it is small; past that it saves the output to a file and injects a short preview of the head.
+        # Measured 2026-10-22 on a box with 471 worktrees and 155 claims: 128,001 bytes, of which the
+        # model saw only the head of the full worktree list, so the peers and claims below never reached
+        # it. So the worktree list is now a count and this session's own row, printed last, and each list
+        # below names the command that shows the rest. tests/test_session_context_presence.py pins the
+        # byte budget.
+        $peerCap = 10
+        $busyCap = 3
+        $claimCap = 10
+        $staleHours = 12
 
-        # WHO IS ACTUALLY HERE. The worktree list above is the set of checkouts, not the set of live
+        # WHO IS ACTUALLY HERE. The worktree count is the set of checkouts, not the set of live
         # sessions -- most worktrees usually have nobody in them, and the one collision that matters
         # (someone editing the shared primary right now) is invisible from it. presence.ps1 is the only
         # roster that spans surfaces: the Desktop app's own session tooling never registers a session it
@@ -108,17 +116,23 @@ if ($root) {
                 $lines += "LIVE sessions in this repo right now ($($others.Count) besides you):"
                 # LABEL THE ID IN EVERY ROW (BACKLOG #1098). Bare, the 8-hex token reads as an
                 # abbreviated commit SHA -- and it reads that way for a concrete reason, not a vague
-                # one: the `git worktree list` block a few lines above puts a REAL abbreviated SHA in
-                # exactly this shape, before a bracketed branch. It is a registry session id, resolves
+                # one: the `git worktree list` row this banner prints for your own worktree puts a REAL
+                # abbreviated SHA in exactly this shape, before a bracketed branch. It is a registry session id, resolves
                 # to no git object, and a session that compared "is that worktree ahead of mine"
                 # against it got an error at best and the wrong tree if the prefix happened to resolve.
                 # The word goes on the ROW, not in a legend, so the column cannot mean one thing in one
                 # row and something else in the next.
-                foreach ($p in $others) {
+                foreach ($p in @($others | Select-Object -First $peerCap)) {
                     $where = if ($p.IsPrimary) { "the SHARED PRIMARY" } else { $p.Worktree }
                     $flag = if ($p.State -ne "LIVE") { "  [$($p.State)]" } else { "" }
                     $lines += "  session $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
                 }
+                $roster = "pwsh -NoProfile -File scripts\coord\presence.ps1 -All"
+                if ($others.Count -gt $peerCap) {
+                    $lines += "  +$($others.Count - $peerCap) more (run: $roster)"
+                }
+                # The two notes below test EVERY peer, not only the rows shown, so a capped row still
+                # raises its hazard.
                 # The surfaces differ in what can reach them, and that changes how you coordinate.
                 if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
                     $lines += "  NOTE: a non-desktop (e.g. VS Code) session is live. It cannot be reached by"
@@ -128,7 +142,7 @@ if ($root) {
                     $lines += "  WARNING: a session is working in the SHARED PRIMARY checkout. Anything you do"
                     $lines += "           there can collide with it -- stay in this worktree."
                 }
-                $lines += "  Full roster:  pwsh -NoProfile -File scripts\coord\presence.ps1 -All"
+                if ($others.Count -le $peerCap) { $lines += "  Full roster:  $roster" }
             }
 
             # WHAT they are building, not just where they are. The roster above prevents you editing
@@ -144,27 +158,19 @@ if ($root) {
                 if ($busy.Count -gt 0) {
                     $lines += ""
                     $lines += "WHAT THEY ARE BUILDING -- check before you start, so you don't build it twice:"
-                    foreach ($b in $busy) {
+                    foreach ($b in @($busy | Select-Object -First $busyCap)) {
                         # Same id, same banner, same label -- see the note on the roster rows above.
                         #
                         # "beyond yours" is not decoration. overlap.ps1's Files narrows its committed
                         # half against the HEAD of whoever asked, so this count is relative to THIS
                         # session and a bare "changed" would overstate what the peer did.
                         $lines += "  session $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed beyond yours"
-                        foreach ($w in @($b.Work | Select-Object -First 3)) { $lines += "      $w" }
+                        if (@($b.Work).Count) { $lines += "      $(@($b.Work)[0])" }
                     }
+                    if ($busy.Count -gt $busyCap) { $lines += "  +$($busy.Count - $busyCap) more" }
                     $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
                 }
             }
-        }
-
-        # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
-        $rootFwd = ($root -replace '\\', '/')
-        $siblingCount = @($wt | Where-Object { ($_ -replace '\\', '/') -like "$rootFwd-*" }).Count
-        if ($siblingCount -ge 1) {
-            $lines += ""
-            $lines += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
-            $lines += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
         }
 
         # BACKLOG #309: what the OTHER sessions are building, before you start building it too. The commit-msg
@@ -194,34 +200,76 @@ if ($root) {
         $claimFiles = @(if ($claimDir) { Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name })
         if ($claimFiles.Count -gt 0) {
             $meNorm = ($root -replace '\\', '/').TrimEnd('/')
-            $lines += ""
-            $lines += "Active work claims ($($claimFiles.Count)) -- do NOT start one held by another session:"
-            foreach ($cf in $claimFiles) {
+            # Only the fresh claims are listed, newest first. A stale one still holds its key, and the
+            # commit-msg claim gate still enforces it; claim.ps1 -List shows every one.
+            $staleCount = 0
+            $now = Get-Date
+            $fresh = @(foreach ($cf in $claimFiles) {
                 try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { continue }
+                # An unreadable date is never called stale, as before: it sorts last instead.
+                $age = [double]::MaxValue
+                try { $age = ($now - [datetime]::Parse($c.claimed)).TotalHours } catch { }
+                if ($age -ne [double]::MaxValue -and $age -ge $staleHours) { $staleCount++; continue }
+                [pscustomobject]@{ Claim = $c; Age = $age }
+            })
+            $lines += ""
+            $lines += "Active work claims ($($fresh.Count) fresh, $staleCount stale over ${staleHours}h not shown) -- do NOT start one held by another session:"
+            foreach ($f in @($fresh | Sort-Object Age | Select-Object -First $claimCap)) {
+                $c = $f.Claim
                 $heldNorm = ($c.worktree -replace '\\', '/').TrimEnd('/')
                 # A claim from another machine names that machine's path, so it is never THIS session.
                 $here = Test-CoordRecordIsHere $c
                 $who = if ($here -and $heldNorm -ieq $meNorm) { "THIS session" } elseif ($here) { $c.worktree } else { "$($c.worktree) on $(Get-CoordRecordHost $c)" }
-                $stale = ""
-                try {
-                    $hrs = ((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
-                    if ($hrs -ge 12) { $stale = "  [stale ~$([int]$hrs)h]" }
-                } catch { }
-                $lines += "  $($c.key) -- $($c.note)"
-                $lines += "      held by $who [$($c.branch)]$stale"
+                $note = "$($c.note)"
+                if ($note.Length -gt 80) { $note = $note.Substring(0, 77) + '...' }
+                $lines += "  $($c.key) -- $note  (held by $who [$($c.branch)])"
             }
+            if ($fresh.Count -gt $claimCap) { $lines += "  +$($fresh.Count - $claimCap) more fresh" }
+            $lines += "  Every claim:  pwsh -NoProfile -File scripts\coord\claim.ps1 -List"
             $lines += "  Claim yours first:  scripts\coord\claim.ps1 -Take <key> -Note `"<what>`""
+        }
+
+        # The checkouts, last and short: a count and this session's own row. `git worktree list` prints
+        # every one, and at 471 of them that list alone pushed everything above out of the preview.
+        $rootFwd = ($root -replace '\\', '/')
+        $ownRow = $wt | Where-Object { ($_ -replace '\\', '/') -like "$rootFwd *" } | Select-Object -First 1
+        $lines += ""
+        $lines += "Worktrees sharing this .git: $($wt.Count)  (all of them: git worktree list)"
+        # git pads the path column to the longest path of them all, so the padding is squeezed out.
+        if ($ownRow) { $lines += "  yours:  $($ownRow -replace '\s{2,}', '  ')" }
+
+        # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
+        $siblingCount = @($wt | Where-Object { ($_ -replace '\\', '/') -like "$rootFwd-*" }).Count
+        if ($siblingCount -ge 1) {
+            $lines += "  [cleanup] $siblingCount sibling worktree(s) exist. Prune the finished (merged + clean) ones:"
+            $lines += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
         }
 
         $lines += ""
         $lines += "Coordination rules for parallel sessions (see docs/WORKTREES.md):"
         $lines += "  - Keep ALL changes on this worktree's branch ('$branch'); never edit files in a sibling worktree."
-        $lines += "  - Use THIS worktree's .venv (.\.venv\Scripts\Activate.ps1), not the main checkout's, or you'll"
-        $lines += "    silently test the wrong code."
-        $lines += "  - The AI project memory (~/.claude/.../memory) is SHARED across all sessions: reads are fine,"
-        $lines += "    but only ONE session should write at a time (last write wins). Do not write project memory"
+        $lines += "  - Use THIS worktree's .venv (.\.venv\Scripts\Activate.ps1), or you silently test the wrong code."
+        $lines += "  - The AI project memory (~/.claude/.../memory) is SHARED, last write wins: do not write it"
         $lines += "    unless the user confirms this session owns memory updates."
     }
 }
 
-($lines -join "`n") | Write-Output
+# The backstop behind the row caps: row counts do not bound bytes, since a long path, branch or task
+# line can still grow a row. The sections run in priority order, so past the budget the tail goes and
+# one line says so; the head, which holds the hazards, always survives.
+$byteBudget = 4000
+$out = ($lines -join "`n")
+if ([Text.Encoding]::UTF8.GetByteCount($out) -gt $byteBudget) {
+    $kept = @()
+    $used = 0
+    foreach ($l in $lines) {
+        $n = [Text.Encoding]::UTF8.GetByteCount($l) + 1
+        # Room for the closing line below, so the cut banner still ends under the budget.
+        if ($used + $n -gt $byteBudget - 200) { break }
+        $kept += $l
+        $used += $n
+    }
+    $kept += "[session-context] cut the last $($lines.Count - $kept.Count) line(s) to fit the budget. Full lists: scripts\coord\presence.ps1 -All, scripts\coord\claim.ps1 -List, git worktree list"
+    $out = ($kept -join "`n")
+}
+$out | Write-Output
