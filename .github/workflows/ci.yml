@@ -3030,7 +3030,8 @@ jobs:
     # on push (both halves of the no-per-merge-run guard live there — see its comment) and on
     # schedule, where the first arm below already covers the run.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: this job installs ODBC Driver 18 from packages.microsoft.com, which publishes no Ubuntu 26.04 repo yet.
+    runs-on: ubuntu-24.04
     # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
     # from cancelling the 2022 leg (and vice-versa). The `changes` path-filter still gates this on PRs, so
@@ -3977,7 +3978,8 @@ jobs:
     # Server functional coverage stays in `sqlserver-store` (nightly + server-DB-PR path-gate). NOT
     # required; ci-gate treats skip as pass.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: this job installs ODBC Driver 18 from packages.microsoft.com, which publishes no Ubuntu 26.04 repo yet.
+    runs-on: ubuntu-24.04
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent. Digest-pinned; why, and how to
     # move a digest, is at the sqlserver-store matrix above.
