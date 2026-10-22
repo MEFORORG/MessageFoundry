@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import shutil
 import subprocess
 import time
@@ -161,7 +160,7 @@ def test_a_declared_seat_lands_on_the_shared_root_and_carries_its_host(
     recs = list((shared / "seats").rglob("sess-shared.json"))
     assert len(recs) == 1, f"no record under the shared root: {proc.stdout} {proc.stderr}"
     rec = json.loads(recs[0].read_text(encoding="utf-8"))
-    assert rec["host"].lower() == platform.node().lower()
+    assert rec["host"].lower() == os.environ.get("COMPUTERNAME", "").lower()
     # The heartbeat follows the registry, and the local root holds no seat at all.
     assert any((shared / "seats" / ".writer-alive").iterdir())
     assert not (_local(repo) / "seats").exists()
@@ -509,3 +508,118 @@ def test_the_wiki_prompt_names_the_shared_root_and_keeps_its_own_state_local(
     # wiki-prompt/ is a LOCAL kind: the cooldown state stays in this clone.
     assert wiki.state_path.is_file()
     assert not (shared / "wiki-prompt").exists()
+
+
+# ------------------------------------------------- another host's claims and allocations at this path
+#
+# On a shared root a claim or allocation names a worktree path on the machine that wrote it. Two PCs
+# can hold trees at the same path string, so a reader matching by path alone would credit this tree
+# with the other PC's records. Each reader below must skip an OTHER-PC record and keep a no-host one.
+
+
+def _plant_claim(shared: Path, key: str, worktree: str, host: str | None) -> None:
+    d = shared / "claims"
+    d.mkdir(parents=True, exist_ok=True)
+    rec: dict[str, Any] = {"key": key, "worktree": worktree, "claimedAt": "2026-10-21T00:00:00Z"}
+    if host is not None:
+        rec["host"] = host
+    (d / f"{key}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def _plant_alloc(shared: Path, number: str, worktree: str, host: str | None) -> None:
+    d = shared / "alloc" / "adr"
+    d.mkdir(parents=True, exist_ok=True)
+    rec: dict[str, Any] = {
+        "number": number,
+        "kind": "adr",
+        "title": f"title {number}",
+        "worktree": worktree,
+        "claimed": "2026-10-21T00:00:00Z",
+    }
+    if host is not None:
+        rec["host"] = host
+    (d / f"{number}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_the_seat_record_counts_only_this_machines_claims_and_allocations(
+    repo: Path, shared: Path
+) -> None:
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    _plant_claim(shared, "k-other", top, OTHER_HOST)
+    _plant_claim(shared, "k-mine", top, None)
+    _plant_alloc(shared, "0007", top, OTHER_HOST)
+    _plant_alloc(shared, "0008", top, None)
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-Declare",
+        "-Seat",
+        "builder",
+        "-Goal",
+        "g",
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-hosts"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    recs = list((shared / "seats").rglob("sess-hosts.json"))
+    assert len(recs) == 1, proc.stdout + proc.stderr
+    rec = json.loads(recs[0].read_text(encoding="utf-8"))
+    assert [c["key"] for c in rec["claims"]] == ["k-mine"], rec["claims"]
+    assert [a["number"] for a in rec["allocations"]] == ["0008"], rec["allocations"]
+
+
+def test_precompact_lists_only_this_machines_ledger_numbers(repo: Path, shared: Path) -> None:
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    _plant_alloc(shared, "0007", top, OTHER_HOST)
+    _plant_alloc(shared, "0008", top, None)
+    out = _reprime(repo, shared)
+    assert "#0008 (adr) title 0008" in out, out
+    assert "#0007" not in out, out
+
+
+# ------------------------------------------------------------------------------------- lane level
+
+
+def _lane_level(repo: Path, root: str | Path | None) -> str:
+    proc = _ps(
+        HOOKS / "lane-level.ps1",
+        repo,
+        env=_env(root),
+        stdin=json.dumps({"hook_event_name": "Stop"}),
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.strip()
+    return str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
+
+
+@pytest.fixture
+def dispatcher_repo(tmp_path: Path) -> Path:
+    # lane-level.ps1 reads the seat registry only for a dispatcher, which it tells by the leaf name.
+    r = tmp_path / "dispatcher-lane"
+    r.mkdir()
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "t"],
+    ):
+        _git(r, *args)
+    _git(r, "commit", "-q", "--allow-empty", "-m", "base")
+    return r
+
+
+def test_lane_level_reads_seats_from_the_shared_root(dispatcher_repo: Path, shared: Path) -> None:
+    for i in range(6):
+        box = f"b-{i:08d}"
+        _plant_record(
+            shared / "seats", box, _record(box=box, session=f"s{i}", worktree="C:/x", host=None)
+        )
+    # Control: with nothing configured the hook reads the local root, which holds no seats.
+    assert "seats\\ is absent" in _lane_level(dispatcher_repo, None)
+    text = _lane_level(dispatcher_repo, shared)
+    assert "INSTRUMENT ERROR" not in text, text
+    assert "coverage: 0 lanes discovered" in text, text
+    assert not (_local(dispatcher_repo) / "seats").exists()
+
+
+def test_lane_level_skips_with_a_note_when_the_root_is_down(dispatcher_repo: Path) -> None:
+    text = _lane_level(dispatcher_repo, DEAD_UNC)
+    assert text.startswith("[lane] SKIPPED: the coordination root did not resolve"), text

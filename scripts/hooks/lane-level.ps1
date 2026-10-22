@@ -57,12 +57,6 @@ function Emit {
     exit 0
 }
 
-function Get-CoordRoot {
-    $c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { return $null }
-    return (Join-Path $c.Trim() 'mefor-coord')
-}
-
 function Read-Json([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     try { return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
@@ -194,37 +188,35 @@ if ($cwdFault) {
     Say "[lane] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. What follows describes $((Get-Location).Path), where this hook runs."
 }
 
-$coord = Get-CoordRoot
-if (-not $coord -or -not (Test-Path -LiteralPath $coord)) {
-    Say '[lane] INSTRUMENT ERROR: the coordination root did not resolve. NO VERDICT BELOW, and this is'
-    Say "  NOT 'both lanes are fine' -- nothing was examined."
-    Emit
-}
-$seatsDir = Join-Path $coord 'seats'
-# LANES MAY LIVE ON THE SHARED ROOT (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names the
-# directory. This hook only reads, so a root that does not answer is a one-line note and no verdict,
-# never a block and never a read of a local copy. Without the resolver beside it, the local path is
-# still right when nothing is configured; with a configuration it cannot read, it says so.
+# SEATS AND LANES BOTH LIVE ON THE SHARED ROOT (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names
+# both directories. It is required, and there is no second copy of its rules here: a local path read
+# while a shared root is configured would show this PC's half of the fleet as all of it. This hook
+# only reads, so a missing resolver or a root that does not answer is a note and no verdict, never a
+# block and never a read of a local copy.
+$seatsDir = $null
 $lanesDir = $null
 $laneFault = ''
 $coordRootScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\coord-root.ps1'
-if (Test-Path -LiteralPath $coordRootScript -PathType Leaf) {
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    $laneFault = 'scripts/coord/coord-root.ps1 is missing'
+} else {
     try {
         . $coordRootScript
-        $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'lanes'
-        if ($r.Error) { $laneFault = $r.Error } else { $lanesDir = $r.Path }
+        $from = (Get-Location).Path
+        $sr = Resolve-CoordDir -From $from -Kind 'seats'
+        if ($sr.Error) { $laneFault = $sr.Error } else { $seatsDir = $sr.Path }
+        if (-not $laneFault) {
+            $lr = Resolve-CoordDir -From $from -Kind 'lanes'
+            if ($lr.Error) { $laneFault = $lr.Error } else { $lanesDir = $lr.Path }
+        }
     } catch { $laneFault = "coord-root.ps1 failed: $($_.Exception.Message)" }
-} elseif (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $coord 'root.toml'))) {
-    $laneFault = 'a shared coordination root is configured, but scripts/coord/coord-root.ps1 is missing'
-} else {
-    $lanesDir = Join-Path $coord 'lanes'
 }
 if ($laneFault) {
-    Say "[lane] SKIPPED: the lanes directory did not resolve ($laneFault). NO VERDICT, and this is NOT"
+    Say "[lane] SKIPPED: the coordination root did not resolve ($laneFault). NO VERDICT, and this is NOT"
     Say "  'both lanes are fine' -- nothing was examined."
     Emit
 }
-$thisHost = [Environment]::MachineName
+$thisHost = Get-CoordHost
 # A lane record from ANOTHER machine at this box key is that PC's lane, whose worktree happens to share
 # this path. It says nothing about this lane, so it reads as no record. No `host` field is this machine.
 function Read-LaneRecord([string]$Path) {

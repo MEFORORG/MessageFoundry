@@ -684,6 +684,29 @@ def test_a_peers_claim_note_is_surfaced_and_the_worktree_name_is_deprecated(
     assert "IGNORE the worktree name" in p.stdout
 
 
+@pytest.mark.parametrize(
+    ("claim_host", "surfaced"),
+    [("OTHER-PC", False), (None, True), (os.environ.get("COMPUTERNAME", "this-pc").lower(), True)],
+    ids=["other-pc", "no-host", "this-host-other-case"],
+)
+def test_a_claim_from_another_machine_at_the_same_path_is_not_this_trees_note(
+    repo: Path, tmp_path: Path, claim_host: str | None, surfaced: bool
+) -> None:
+    """On a shared root a claim's worktree names a path on the machine that took it. The same path
+    string here is a different tree, so another PC's note must not be shown as this peer's intent.
+    No ``host`` is this machine, and the compare ignores case."""
+    sd = tmp_path / "mefor-coord" / "announce"
+    claims = tmp_path / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    rec: dict[str, Any] = {"key": "k", "note": "NOTE FROM SOMEWHERE", "worktree": PEER["Cwd"]}
+    if claim_host is not None:
+        rec["host"] = claim_host
+    (claims / "k.json").write_text(json.dumps(rec), encoding="utf-8")
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "[ANNOUNCE YOURSELF" in p.stdout, p.stdout + p.stderr
+    assert ("claim: NOTE FROM SOMEWHERE" in p.stdout) is surfaced, p.stdout
+
+
 def test_a_missing_claims_directory_is_harmless(repo: Path, tmp_path: Path) -> None:
     """Claims are optional: most peers have none, and reading them must never break the announcement."""
     sd = tmp_path / "state"

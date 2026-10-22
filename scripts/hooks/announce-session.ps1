@@ -171,14 +171,21 @@ function Get-ClaimNotes {
     # 'announce-hook' note still told every joining session "NO PR OPENED -- honouring the #119 merge
     # freeze" hours after both #133 and #119 had merged. Age is the cheap signal that lets a reader
     # discount it. `refreshed` where the holder updated the note, else `claimed`.
+    #
+    # A CLAIM FROM ANOTHER MACHINE IS NOT A NOTE FOR A TREE HERE. On a shared root its worktree names a
+    # path on that machine's disk, so the same path string here is a different tree
+    # (docs/COORD-SHARED-ROOT.md). No `host` means this machine: the field postdates per-PC registries.
     param([string]$ClaimsDir)
     $map = @{}
+    $thisHost = Get-CoordHost
     try {
         if (-not (Test-Path -LiteralPath $ClaimsDir)) { return $map }
         foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
                 $c = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
                 if (-not ($c.worktree -and $c.note)) { continue }
+                $claimHost = if ($c.PSObject.Properties['host'] -and $c.host) { ([string]$c.host).Trim() } else { '' }
+                if ($claimHost -and $claimHost -ine $thisHost) { continue }
                 $hrs = $null
                 # An unparseable or absent stamp leaves $hrs null, and the caller then prints the note
                 # with no age claim at all -- an unknown age must not be rendered as a fresh one.
@@ -881,9 +888,10 @@ try {
         # claims sit beside it, as they always did. A root that does not answer costs the notes only:
         # one line on stderr, and the roster still renders, because this hook must never block a prompt.
         $claimsDir = ''
+        # Loaded on both paths: Get-ClaimNotes needs Get-CoordHost even when -StateDir names the claims.
+        . (Join-Path $PSScriptRoot '..\coord\coord-root.ps1')
         if ($stateDirInjected) { $claimsDir = Join-Path (Split-Path $StateDir -Parent) 'claims' }
         else {
-            . (Join-Path $PSScriptRoot '..\coord\coord-root.ps1')
             $claimsFrom = if ($top) { $top } else { (Get-Location).Path }
             $cr = Resolve-CoordDir -From $claimsFrom -Kind 'claims'
             if ($cr.Error) { try { [Console]::Error.WriteLine("[announce] claim notes skipped: $($cr.Error)") } catch { } }

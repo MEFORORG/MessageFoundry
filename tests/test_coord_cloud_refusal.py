@@ -382,11 +382,10 @@ def test_the_declare_prompt_hook_prints_the_prompt_outside_the_cloud(repo: Path)
     assert "cloud Builder" not in proc.stdout
 
 
-# Every PowerShell copy of the refusal, inlined rather than shared. No helper is loaded by all of
-# them: alloc.ps1, claim.ps1 and the tombstone script dot-source nothing, and about ten fixtures copy
-# alloc.ps1 or claim.ps1 alone, so a new dot-source would break them. There is no shared coord-root
-# resolver either, and one would be the wrong home: -CoordDir, -MailRoot and MEFOR_OWNER_LOG bypass
-# it. The Python copy is held by the behavioural owner_log tests, which need no pwsh.
+# Every PowerShell copy of the refusal, inlined rather than shared. Each runs before its script loads
+# any library, so it holds even where coord-root.ps1 is missing, and coord-root.ps1 would be the
+# wrong home anyway: -CoordDir, -MailRoot and MEFOR_OWNER_LOG bypass it. The Python copy is held by
+# the behavioural owner_log tests, which need no pwsh.
 GUARDED = (
     "coord/seat.ps1",
     "coord/mail.ps1",
@@ -439,11 +438,9 @@ NOT_GUARDED = {
     # a person runs by hand, whose empty answer would look clean, is guarded instead.
     "hooks/claim_check.py": "reader, commit-msg hook",
     "hooks/ledger_check.py": "reader, pre-commit hook",
-    "hooks/lane-level.ps1": "reader",
     "hooks/precompact-reprime.ps1": "reader, project hook",
     "hooks/worktree_gate.ps1": "reader; writes only its own log, outside mefor-coord",
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
-    "worktree/remove.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
     "coord/rescue.ps1": "mention",

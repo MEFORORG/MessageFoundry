@@ -493,6 +493,9 @@ function Get-ClaimsFor {
             if ($j.PSObject.Properties.Name -contains $n) { $holder = [string]$j.$n; break }
         }
         if (-not $holder) { continue }
+        # A claim taken on another machine names a path on THAT machine's disk. The same path string
+        # here is a different tree, so the claim is not this one's (docs/COORD-SHARED-ROOT.md).
+        if (-not (Test-RecordIsHere $j)) { continue }
         $hnorm = $holder.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($hnorm -ne $norm) { continue }
         $at = $null
@@ -522,6 +525,8 @@ function Get-AllocationsFor {
                 if ($j.PSObject.Properties.Name -contains $n) { $aw = [string]$j.$n; break }
             }
             if (-not $aw) { continue }
+            # Same reason as Get-ClaimsFor: another machine's allocation at this path is not this tree's.
+            if (-not (Test-RecordIsHere $j)) { continue }
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
             $at = $null
             foreach ($n in @('claimed', 'allocatedAt', 'at')) {

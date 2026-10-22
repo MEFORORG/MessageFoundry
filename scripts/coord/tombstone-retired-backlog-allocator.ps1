@@ -97,29 +97,22 @@ if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "-GitCommonDir '$GitCommonDi
 $GitCommonDir = $resolved.Trim()
 
 # WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
-# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
-# answer is then this same local path. With the variable or a root.toml present and no resolver to
-# read it, it refuses: a guess would split the fleet into two registries.
+# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
+# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
+# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
-if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
-function Get-CoordKindDir([string]$From, [string]$Kind) {
-    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
-    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
-    $local = Join-Path "$c".Trim() 'mefor-coord'
-    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
-        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
-    }
-    return @{ Path = (Join-Path $local $Kind); Error = $null }
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or written.")
+    exit 4
 }
-$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+. $coordRootScript
+$thisHost = Get-CoordHost
 
 # The allocation registry may live on the shared root, and a tombstone written beside a local copy
 # would lift no allocator that reads the shared one. It refuses rather than fall back, -Check
 # included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
 # -From is the common dir itself: git resolves the same repository from inside it.
-$allocDir = Get-CoordKindDir -From $GitCommonDir -Kind 'alloc'
+$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc'
 if ($allocDir.Error) {
     [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
     exit 4

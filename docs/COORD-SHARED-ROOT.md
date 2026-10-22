@@ -1,6 +1,20 @@
 # Sharing fleet coordination state across two PCs
 
-**Status: APPROVED by the owner, 2026-10-21. Nothing in `scripts/` has changed yet.**
+**Status: APPROVED by the owner, 2026-10-21. Migration steps 3 (resolver, host field, host-aware
+liveness, gate) are BUILT on this branch. No root is configured anywhere, so behaviour is unchanged
+until step 6.**
+
+Known gaps after step 3, at least:
+
+- **Box keys are path-derived.** A seat id, a mailbox and a lane key all hash the worktree path, so
+  two PCs with a worktree at the same path share them. Readers are host-aware, so nothing is judged
+  gone or reaped, and `lane.ps1` refuses to overwrite another host's record. Mail to that key still
+  reaches whichever PC drains first. A host-qualified key is its own change.
+- **The batch skill's `read_batch.py` lives outside this repository** and still builds
+  `<git-common-dir>/mefor-coord/seats`. It should import `scripts/coord/coord_root.py`. That edit is
+  outside the worktree, so it is the owner's.
+- **CLAUDE.md section 5's wiki command** passes `-StateRoot` as the local root. Once a root is
+  configured, it must name the shared root instead. That edit lands with step 6.
 
 Owner answers, 2026-10-21:
 

@@ -1387,8 +1387,9 @@ function Read-OrphanLedger {
 }
 
 # --- Coordination claims stranded by a removal (BACKLOG #345) -------------------------------------
-# A work claim (scripts/coord/claim.ps1) is a JSON file under <git-common-dir>/mefor-coord/claims/. It
-# lives beside the SHARED object store, so it OUTLIVES the worktree that took it. Removing a worktree
+# A work claim (scripts/coord/claim.ps1) is a JSON file in the claims directory coord-root.ps1 names,
+# <git-common-dir>/mefor-coord/claims/ when nothing is configured. It lives outside any one worktree,
+# so it OUTLIVES the worktree that took it. Removing a worktree
 # therefore strands its claims, and `claim.ps1 -Take` hard-blocks on any claim file that exists -- so the
 # key becomes unclaimable by every future session until a human happens to run `-Release <key> -Force`.
 # Nothing surfaced that condition and nothing could: the registry has no way to observe that a holder
@@ -1400,23 +1401,15 @@ function Read-OrphanLedger {
 # gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
 # merely quiet is never touched by this.
 # WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
-# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
-# answer is then this same local path. With the variable or a root.toml present and no resolver to
-# read it, it refuses: a guess would split the fleet into two registries.
+# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
+# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
+# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
 $coordRootScript = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
-if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
-function Get-CoordKindDir([string]$From, [string]$Kind) {
-    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
-    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
-    $local = Join-Path "$c".Trim() 'mefor-coord'
-    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
-        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
-    }
-    return @{ Path = (Join-Path $local $Kind); Error = $null }
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    throw "prune-merged.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was pruned or released."
 }
-$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+. $coordRootScript
+$thisHost = Get-CoordHost
 
 # The registry may sit on the shared root, so coord-root.ps1 names it. A resolver ERROR is recorded
 # and shown, never replaced by a local guess: the run goes on with the claims unread, every
@@ -1424,7 +1417,7 @@ $thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-C
 $claimsError = ''
 $claimsDir = ''
 if ($gitCommonDir) {
-    $resolvedClaims = Get-CoordKindDir -From $RepoRoot -Kind 'claims'
+    $resolvedClaims = Resolve-CoordDir -From $RepoRoot -Kind 'claims'
     if ($resolvedClaims.Error) { $claimsError = [string]$resolvedClaims.Error } else { $claimsDir = $resolvedClaims.Path }
 }
 if ($claimsError) {

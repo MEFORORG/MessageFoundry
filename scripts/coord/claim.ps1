@@ -108,23 +108,16 @@ try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
 
 # WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
-# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
-# answer is then this same local path. With the variable or a root.toml present and no resolver to
-# read it, it refuses: a guess would split the fleet into two registries.
+# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
+# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
+# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
-if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
-function Get-CoordKindDir([string]$From, [string]$Kind) {
-    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
-    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
-    $local = Join-Path "$c".Trim() 'mefor-coord'
-    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
-        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
-    }
-    return @{ Path = (Join-Path $local $Kind); Error = $null }
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("claim.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or recorded.")
+    exit 2
 }
-$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+. $coordRootScript
+$thisHost = Get-CoordHost
 
 # THE MACHINE A RECORD WAS WRITTEN ON (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would
 # ship"). On a shared root a claim taken on another PC names a worktree path that does not exist HERE,
@@ -226,7 +219,7 @@ if ($claimsRoot) {
 # names the root. A resolver error refuses every verb, -List included: a listing of a local fallback
 # would show an empty or stale registry as if it were the fleet's, and -Take or -Release against one
 # would split the fleet into two registries (docs/COORD-SHARED-ROOT.md, "Offline behaviour").
-$claimsDir = Get-CoordKindDir -From $registryRepo -Kind 'claims'
+$claimsDir = Resolve-CoordDir -From $registryRepo -Kind 'claims'
 if ($claimsDir.Error) {
     [Console]::Error.WriteLine("claim.ps1: REFUSED -- the claim registry could not be resolved, so nothing was read or recorded.")
     [Console]::Error.WriteLine("  $($claimsDir.Error)")

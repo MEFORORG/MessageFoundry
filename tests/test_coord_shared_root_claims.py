@@ -197,18 +197,33 @@ def test_an_unanswering_root_refuses_take_and_writes_nowhere(repo: Path, tmp_pat
     assert not missing.exists()
 
 
-def test_a_copy_without_the_resolver_refuses_when_a_root_is_configured(
-    repo: Path, shared: Path
+@pytest.mark.parametrize("configured", [True, False], ids=["root-configured", "nothing-configured"])
+@pytest.mark.parametrize(
+    "script", ["claim.ps1", "alloc.ps1", "claim-reconcile.ps1", "claim-adjudicate.ps1", "lane.ps1"]
+)
+def test_a_copy_without_the_resolver_refuses_loudly(
+    repo: Path, shared: Path, script: str, configured: bool
 ) -> None:
-    """A sandboxed copy may run alone only when nothing is configured; otherwise it cannot know where."""
+    """coord-root.ps1 is the one definition of where. A copy without it refuses, configured or not.
+
+    It used to run at the local path when nothing was configured, which needed a second copy of the
+    "is anything configured" rule in every script. That copy is gone, so the unconfigured case is
+    the one that proves it: a fallback would exit 0 there.
+    """
     (repo / "scripts" / "coord" / "coord-root.ps1").unlink()
-    proc = run(repo, "claim.ps1", "-Take", "k1", root=shared)
+    args = {
+        "claim.ps1": ["-Take", "k1"],
+        "alloc.ps1": ["-Kind", "adr", "-Title", "T", "-NoFetch"],
+        "claim-reconcile.ps1": [],
+        "claim-adjudicate.ps1": [],
+        "lane.ps1": ["-Show"],
+    }[script]
+    proc = run(repo, script, *args, root=shared if configured else None)
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert "coord-root.ps1" in proc.stderr
-    assert not (shared / "claims").exists()
-    # Control: with nothing configured the copy still works, at the old path.
-    assert run(repo, "claim.ps1", "-Take", "k1").returncode == 0
-    assert (local_coord(repo) / "claims" / "k1.json").is_file()
+    assert "REFUSED" in proc.stderr and "coord-root.ps1 is missing" in proc.stderr, proc.stderr
+    assert not any(shared.iterdir()), "it wrote to the shared root"
+    assert not (local_coord(repo) / "claims").exists(), "it fell back to the local registry"
+    assert not (local_coord(repo) / "alloc").exists(), "it fell back to the local registry"
 
 
 def test_an_allocation_lands_under_the_shared_root_and_carries_host(

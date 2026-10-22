@@ -54,29 +54,22 @@ if ($PSCmdlet.ParameterSetName -eq 'State' -and
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 
 # WHERE SHARED COORDINATION STATE LIVES is coord-root.ps1's answer, not this file's
-# (docs/COORD-SHARED-ROOT.md). A copy of this script without that sibling -- a test sandbox copies
-# scripts one at a time -- may still run, but only when nothing is configured, because the resolver's
-# answer is then this same local path. With the variable or a root.toml present and no resolver to
-# read it, it refuses: a guess would split the fleet into two registries.
+# (docs/COORD-SHARED-ROOT.md). It is required, never optional: a copy of this script without it used
+# to re-derive "is anything configured" and fall back to the local path, which was a second resolver,
+# the thing coord-root.ps1 exists to end. Without it this refuses; it does not guess.
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
-if (Test-Path -LiteralPath $coordRootScript) { . $coordRootScript }
-function Get-CoordKindDir([string]$From, [string]$Kind) {
-    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) { return Resolve-CoordDir -From $From -Kind $Kind }
-    $c = (& git -C $From rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { return @{ Path = $null; Error = "git could not name the common dir for '$From'" } }
-    $local = Join-Path "$c".Trim() 'mefor-coord'
-    if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT) -or (Test-Path -LiteralPath (Join-Path $local 'root.toml'))) {
-        return @{ Path = $null; Error = "a shared coordination root is configured, but coord-root.ps1 is not beside $PSCommandPath to resolve it" }
-    }
-    return @{ Path = (Join-Path $local $Kind); Error = $null }
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was written.")
+    exit 2
 }
-$thisHost = if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { Get-CoordHost } else { [Environment]::MachineName }
+. $coordRootScript
+$thisHost = Get-CoordHost
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
 $here = (Get-Location).Path
-$lanesResolved = Get-CoordKindDir -From $here -Kind 'lanes'
-$claimsResolved = Get-CoordKindDir -From $here -Kind 'claims'
+$lanesResolved = Resolve-CoordDir -From $here -Kind 'lanes'
+$claimsResolved = Resolve-CoordDir -From $here -Kind 'claims'
 foreach ($r in @($lanesResolved, $claimsResolved)) {
     if ($r.Error) {
         [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($r.Error)")

@@ -81,6 +81,7 @@ def _checkout(path: Path) -> Path:
     (path / "scripts" / "coord").mkdir(parents=True)
     (path / "scripts" / "hooks").mkdir(parents=True)
     shutil.copy2(_CLAIM, path / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(_CLAIM.parent / "coord-root.ps1", path / "scripts" / "coord" / "coord-root.ps1")
     shutil.copy2(_CHECK, path / "scripts" / "hooks" / "claim_check.py")
     (path / "code.py").write_text("x = 1\n", encoding="utf-8")
     _git("init", "-b", "main", ".", cwd=path)
