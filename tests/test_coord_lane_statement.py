@@ -173,14 +173,11 @@ def test_a_statement_missing_a_number_refuses_instead_of_prompting(
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
 
 
-# -SHOW IS A STRICT READ. A read-only fleet pane polls `lane.ps1 -Show` every minute from many
-# sessions, and the shared root may be a share it cannot write. Before this change -Show ran
-# `New-Item -Force` on `<root>\lanes` and `<root>\lanes\.tmp` on every call, so it created both on a
-# fresh root, and threw on a read-only one. MEASURED 2026-10-22: all four tests below fail against
-# that code. The third passes its first arm, the found record, which is the must-not-fire control.
-
-# TEST-NET-1 (RFC 5737): never routed, so a connect to it can only time out.
-_DEAD_UNC = r"\\192.0.2.1\nothing\mefor-coord"
+# -SHOW IS A STRICT READ: it creates no directory and writes no file on the coordination root. Before
+# this change it ran `New-Item -Force` on `<root>\lanes` and `<root>\lanes\.tmp` on every call, so it
+# created both on a fresh root and threw on one it could not write. MEASURED 2026-10-22: every test
+# below fails against that code. The third passes its first arm, the found record, which is the
+# must-not-fire control.
 
 
 def _tree(top: Path) -> list[str]:
@@ -188,17 +185,29 @@ def _tree(top: Path) -> list[str]:
     return sorted(str(p.relative_to(top)) for p in top.rglob("*"))
 
 
+def _show(repo: Path, root: Path | None = None) -> dict[str, object]:
+    proc = _pwsh(repo, "-Show", root=root)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out: dict[str, object] = json.loads(proc.stdout)
+    return out
+
+
 def test_show_with_no_lanes_dir_creates_nothing_and_says_absent(repo: Path) -> None:
     before = _tree(repo)
     assert any(p.startswith(".git") for p in before), "the instrument must see .git to count"
 
-    proc = _pwsh(repo, "-Show")
+    rec = _show(repo)
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _tree(repo) == before, "lane.ps1 -Show wrote to the repository"
-    rec = json.loads(proc.stdout)
-    assert "no lanes directory" in rec["absent"], rec
+    assert "no lanes directory" in str(rec["absent"]), rec
     assert rec["statedFree"] is None and rec["statedInFlight"] is None
+
+
+def _my_sid() -> str:
+    out = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True
+    ).stdout
+    return out.strip().split(",")[-1].strip('"')
 
 
 def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
@@ -208,51 +217,40 @@ def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
         pytest.skip("the deny ACE is a Windows ACL")
     shared = tmp_path / "read-only-root"
     shared.mkdir()
-    user = os.environ["USERNAME"]
-    # Deny adding a file or a subdirectory on the root itself, not inherited, so cleanup can delete it.
+    # By SID, so a local account with the same name cannot take the ACE. On the root itself, not
+    # inherited, so removing it is enough for cleanup.
+    sid = f"*{_my_sid()}"
     subprocess.run(
-        ["icacls", str(shared), "/deny", f"{user}:(AD,WD)"], check=True, capture_output=True
+        ["icacls", str(shared), "/deny", f"{sid}:(AD,WD)"], check=True, capture_output=True
     )
     try:
         write = _pwsh(repo, "-Free", "1", "-InFlight", "0", root=shared)
-        # The control: the ACE really does stop a write, so a green -Show below is not vacuous.
+        # The control: the ACE is what stops a write, so a green -Show below is not vacuous.
         assert write.returncode != 0, "the deny ACE did not stop a write; the test proves nothing"
+        assert "denied" in write.stderr.lower(), write.stderr
         assert not any(shared.iterdir())
 
-        proc = _pwsh(repo, "-Show", root=shared)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert "no lanes directory" in json.loads(proc.stdout)["absent"]
+        rec = _show(repo, root=shared)
+        assert "no lanes directory" in str(rec["absent"]), rec
         assert not any(shared.iterdir())
     finally:
-        subprocess.run(["icacls", str(shared), "/remove:d", user], check=True, capture_output=True)
+        # check=False: a cleanup failure must not replace the assertion that is failing.
+        subprocess.run(["icacls", str(shared), "/remove:d", sid], capture_output=True)
 
 
 def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_one(
     repo: Path,
 ) -> None:
     assert _pwsh(repo, "-Free", "2", "-InFlight", "1", "-Note", "n").returncode == 0
-    proc = _pwsh(repo, "-Show")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    rec = json.loads(proc.stdout)
+    rec = _show(repo)
     assert "absent" not in rec, rec
     assert rec["statedFree"] == 2 and rec["statedInFlight"] == 1
 
     record = _lane_record(repo)
-    record.write_text("{not json", encoding="utf-8")
-    rec = json.loads(_pwsh(repo, "-Show").stdout)
-    assert "could not be read" in rec["absent"], rec
+    for body, reason in (("{not json", "could not be read"), ("0", "not a JSON object")):
+        record.write_text(body, encoding="utf-8")
+        rec = _show(repo)
+        assert reason in str(rec["absent"]), (body, rec)
+        assert rec["statedFree"] is None, (body, rec)
     record.unlink()
-    rec = json.loads(_pwsh(repo, "-Show").stdout)
-    assert "no lane record at" in rec["absent"], rec
-
-
-def test_show_on_a_dead_share_does_not_write_the_down_cache(repo: Path) -> None:
-    if os.name != "nt":
-        pytest.skip("a UNC root is a Windows path")
-    down = repo / ".git" / "mefor-coord" / "coord-root-down.json"
-    proc = _pwsh(repo, "-Show", root=_DEAD_UNC)
-    assert proc.returncode == 2 and "unreachable" in proc.stderr, proc.stdout + proc.stderr
-    assert not down.exists(), "lane.ps1 -Show wrote the resolver's down cache"
-    # The control: a write call on the same root does record the verdict, so the cache path is right.
-    _pwsh(repo, "-Free", "1", "-InFlight", "0", root=_DEAD_UNC)
-    assert down.is_file()
+    assert "no lane record at" in str(_show(repo)["absent"])

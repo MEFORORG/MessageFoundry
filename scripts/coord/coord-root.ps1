@@ -163,10 +163,7 @@ function Get-CoordUncHost {
 
 function Test-CoordRoot {
     # Returns @{ Ok; Error }. Fast on a dead server; see the header for why.
-    # -NoCacheWrite is for a caller that promises to write nothing, such as `lane.ps1 -Show`. It still
-    # reads a DOWN verdict, so the answer is the same; it only never records one. A dead share then
-    # costs that caller one probe timeout per call, which is the price of a strict read.
-    param([string]$Path, [string]$LocalRoot, [switch]$NoCacheWrite)
+    param([string]$Path, [string]$LocalRoot)
     if (-not $Path) { return @{ Ok = $false; Error = 'no path' } }
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
@@ -189,7 +186,7 @@ function Test-CoordRoot {
         } catch { $reached = $false } finally { $client.Dispose() }
         if (-not $reached) {
             try {
-                if ($down -and -not $NoCacheWrite) {
+                if ($down) {
                     New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
                     [System.IO.File]::WriteAllText($down, (@{ root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
                 }
@@ -208,13 +205,12 @@ function Test-CoordRoot {
 function Resolve-CoordSharedRoot {
     # The shared root itself, probed. Returns @{ Path; Source; Error }. A caller that needs several
     # shared kinds resolves once and joins each kind onto Path, rather than paying one probe per kind.
-    # -NoCacheWrite passes through to Test-CoordRoot, for a read that must write nothing.
-    param([string]$From, [string]$LocalRoot, [switch]$NoCacheWrite)
+    param([string]$From, [string]$LocalRoot)
     $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
     $root = Get-CoordSharedRoot -From $From -LocalRoot $local
     if ($root.Error) { return $root }
     if ($root.Source -ne 'local') {
-        $probe = Test-CoordRoot -Path $root.Path -LocalRoot $local -NoCacheWrite:$NoCacheWrite
+        $probe = Test-CoordRoot -Path $root.Path -LocalRoot $local
         if (-not $probe.Ok) { return @{ Path = $null; Source = $root.Source; Error = $probe.Error } }
     }
     return $root

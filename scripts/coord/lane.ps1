@@ -64,8 +64,7 @@ $thisHost = Get-CoordHost
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-# -Show writes nothing, not even the resolver's down cache: a read-only fleet pane polls it.
-$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path -NoCacheWrite:$Show
+$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2
@@ -128,25 +127,31 @@ if (-not $rec) {
 }
 
 if ($Show) {
-    # -SHOW IS A STRICT READ. A read-only pane polls it every minute from many sessions, and the root
-    # may be a share it cannot write, so it creates no directory and writes no file. With no record it
-    # prints the blank record above plus an `absent` field saying why, so an empty lane never reads as
-    # a stated one. A record that was found prints unchanged, with no `absent` field.
-    # The read above does not keep why it found no record, so the file is parsed once more here; the
-    # common case, a readable record, costs that one read and no Test-Path.
-    $found = $false
-    try { $found = $null -ne (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { }
-    if (-not $found) {
-        $absent = if (-not (Test-Path -LiteralPath $lanesDir -PathType Container)) {
-            "no lanes directory at $lanesDir, so no lane has been recorded on this root"
-        } elseif (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-            "no lane record at $file"
-        } else {
-            "the lane record at $file could not be read"
+    # -SHOW IS A STRICT READ. Its callers may hold only read access to the root, so it creates no
+    # directory and writes no file. (The resolver's down cache is the one exception, and it lives in
+    # this clone's own .git, never on the root.) It prints what ONE read of the record found, so the
+    # record and its `absent` reason cannot come from two reads that a restatement landed between.
+    # The read above keeps no reason, which is why this one stands alone. A found record prints as it
+    # is; otherwise the blank record above prints with `absent` saying why, so an unstated lane never
+    # reads as a stated one.
+    $shown = $null
+    $absent = $null
+    try {
+        $shown = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
+            $absent = "the lane record at $file is not a JSON object"
         }
-        $rec | Add-Member -NotePropertyName absent -NotePropertyValue $absent -Force
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $absent = if (Test-Path -LiteralPath $lanesDir -PathType Container) { "no lane record at $file" }
+                  else { "no lanes directory found at $lanesDir, so this root holds no lane record" }
+    } catch {
+        $absent = "the lane record at $file could not be read: $($_.Exception.Message)"
     }
-    $rec | ConvertTo-Json -Depth 5
+    if ($absent) {
+        $shown = $rec
+        $shown | Add-Member -NotePropertyName absent -NotePropertyValue $absent -Force
+    }
+    $shown | ConvertTo-Json -Depth 5
     exit 0
 }
 
