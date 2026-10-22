@@ -86,7 +86,10 @@ its timeout (10 seconds by default) is ON. `scripts/coord/afk-kill.ps1 -Status` 
 ON. The read runs in its own runspace with its own timeout, so a hung gh cannot outlast the hook's
 timeout and leave no banner, and a fault anywhere in the script prints the ON banner. A hook that
 cannot start at all prints nothing: in a fresh cloud VM, pwsh does not exist until cloud-setup.sh
-installs it, so the first session start there shows no banner whatever the switch says.
+installs it, so the first session start there shows no banner whatever the switch says. When
+the switch reads OFF, `-Banner` instead tells every session except a Special seat to load the
+`driver` and then the `empower` skill (owner approval 2026-10-22); it names the seat from the hook
+input's worktree, and any fault in that path prints nothing.
 
 **The owner sets it, and nothing enforces that.** Every seat acts as the one shared GitHub
 identity, which can write repository variables. The tripwire hook records a `gh variable
