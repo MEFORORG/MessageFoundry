@@ -103,3 +103,95 @@ def test_the_banner_runs_at_every_session_start() -> None:
     assert len(handlers) == 1, handlers
     assert handlers[0]["args"][-1] == "-Banner"
     assert "matcher" not in settings["hooks"]["SessionStart"][0], "every source, not only startup"
+
+
+# While the switch reads OFF, -Banner tells every session but a Special seat to load the driver
+# and empower skills (owner approval 2026-10-22). The seat comes from the worktree the hook input's
+# cwd names, so each run below hands the script a SessionStart payload.
+CLOUD_NAMES = ("anthropic-skills:driver", "anthropic-skills:empower")
+
+
+def _seat_banner(sb: Sandbox, switch: str, seat: str | None, cwd: Path | None = None) -> str:
+    """-Banner's stdout with the switch at ``switch``, in a worktree whose marker holds ``seat``."""
+    sb.set_state(variables={"MEFOR_AFK_KILL": switch})
+    roles = sb.repo / "docs" / "roles"
+    roles.mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "docs" / "roles" / "seats.json", roles / "seats.json")
+    if seat is not None:
+        marker = sb.repo / ".claude" / "seat.local.txt"
+        marker.parent.mkdir(exist_ok=True)
+        marker.write_text(seat, encoding="utf-8")
+    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(cwd or sb.repo)})
+    proc = sb.run(KILL, "-Banner", stdin=payload, KORUS_SEAT="", KORUS_AGENT="")
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _instruction(stdout: str) -> str:
+    """The skill instruction -Banner printed, or '' when it printed none."""
+    if not stdout.strip():
+        return ""
+    context: str = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    return context if "`driver`" in context else ""
+
+
+def test_a_switch_that_reads_on_gives_the_banner_and_no_skill_instruction(sb: Sandbox) -> None:
+    hook = json.loads(_seat_banner(sb, "on", "builder"))
+    assert hook["hookSpecificOutput"]["additionalContext"].startswith("AFK KILL SWITCH IS ON")
+    assert "driver" not in json.dumps(hook) and "empower" not in json.dumps(hook)
+
+
+@pytest.mark.parametrize("seat", ["special", " Special\n", "special1", "adhoc"])
+def test_a_special_seat_gets_no_skill_instruction(sb: Sandbox, seat: str) -> None:
+    assert _seat_banner(sb, "off", seat) == ""
+
+
+@pytest.mark.parametrize("seat", ["builder", "manager", "builder-2", "", None])
+def test_every_other_seat_gets_the_skill_instruction(sb: Sandbox, seat: str | None) -> None:
+    out = _seat_banner(sb, "off", seat)
+    hook = json.loads(out)
+    assert "systemMessage" not in hook
+    assert hook["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    text = _instruction(out)
+    assert text.index("`driver`") < text.index("`empower`")
+    assert "Skill tool" in text
+
+
+def test_the_instruction_names_the_cloud_skill_names(sb: Sandbox) -> None:
+    text = _instruction(_seat_banner(sb, "off", "builder"))
+    assert "CLAUDE_CODE_REMOTE=true" in text
+    assert all(name in text for name in CLOUD_NAMES), text
+
+
+def test_korus_seat_names_the_seat_when_the_marker_does_not(sb: Sandbox) -> None:
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    payload = json.dumps({"cwd": str(sb.repo)})
+    proc = sb.run(KILL, "-Banner", stdin=payload, KORUS_SEAT="special", KORUS_AGENT="")
+    assert proc.returncode == 0 and proc.stdout == "", (proc.stdout, proc.stderr)
+
+
+def test_the_seat_comes_from_the_payload_cwd_not_the_process_cwd(sb: Sandbox) -> None:
+    # Under the desktop app the hook runs in the primary checkout; the payload names the worktree.
+    worktree = sb.repo / "wt"
+    (worktree / ".claude").mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    (worktree / ".claude" / "seat.local.txt").write_text("special", encoding="utf-8")
+    (worktree / "src").mkdir()
+    assert _seat_banner(sb, "off", "builder", cwd=worktree / "src") == ""
+
+
+@pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
+def test_an_unusable_payload_gives_no_skill_instruction(sb: Sandbox, stdin: str) -> None:
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    if stdin == "MISSING":
+        stdin = json.dumps({"cwd": str(sb.repo / "no-such-dir")})
+    proc = sb.run(KILL, "-Banner", stdin=stdin, KORUS_SEAT="", KORUS_AGENT="")
+    assert proc.returncode == 0 and proc.stdout == "", (proc.stdout, proc.stderr)
+
+
+def test_a_seat_file_read_fault_gives_no_instruction_and_keeps_the_banner(sb: Sandbox) -> None:
+    on_before = _seat_banner(sb, "on", None)
+    # A directory where the marker belongs: it exists, and reading it as a file throws.
+    (sb.repo / ".claude" / "seat.local.txt").mkdir(parents=True)
+    assert _seat_banner(sb, "off", None) == ""
+    assert _seat_banner(sb, "on", None) == on_before
