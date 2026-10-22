@@ -49,6 +49,19 @@ PRESENCE_TAIL = (
     " list no other session, so nothing was read."
 )
 SEAT_DECLARE = ("-Declare", "-Seat", "builder", "-Goal", "cloud refusal test")
+# Spooled only, so the control outside the cloud needs no gh.
+DECISION_LOG = (
+    "-Log",
+    "-Item",
+    "1",
+    "-Class",
+    "B",
+    "-Seat",
+    "builder",
+    "-Recommendation",
+    "x",
+    "-NoPost",
+)
 # The report's offline shape: no gh, no fetch, no roots beyond the sandbox clone.
 HYGIENE_OFFLINE = ("-SkipGh", "-SkipFetch", "-NoExtraRoots")
 # Outside the census, which reads the directory's name: this script never names it.
@@ -157,7 +170,12 @@ def _run(
         pytest.param("coord/handoff.ps1", ("-Where",), id="handoff-where"),
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
+        pytest.param("coord/coord-migrate.ps1", (), id="coord-migrate"),
+        pytest.param("coord/coord-race.ps1", ("-Compare",), id="coord-race"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
+        pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
+        pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
+        pytest.param("coord/digest.ps1", (), id="digest"),
         *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
         pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
@@ -194,6 +212,15 @@ def test_mail_send_refuses_before_writing_to_an_explicit_mail_root(
         ),
         pytest.param(
             "worktree/hygiene-report.ps1", HYGIENE_OFFLINE, "-OutDir", id="hygiene-outdir"
+        ),
+        pytest.param(
+            "coord/coord-migrate.ps1", ("-Source", "."), "-Target", id="coord-migrate-target"
+        ),
+        pytest.param(
+            "coord/coord-race.ps1",
+            ("-Tag", "t", "-StartAtUtc", "2026-01-01T00:00:00Z"),
+            "-Dir",
+            id="coord-race-dir",
         ),
     ],
 )
@@ -329,6 +356,7 @@ def test_presence_lists_a_fixture_session_outside_the_cloud(repo: Path, tmp_path
         pytest.param(
             "worktree/hygiene-report.ps1", HYGIENE_OFFLINE, "hygiene", id="hygiene-report"
         ),
+        pytest.param("coord/decision.ps1", DECISION_LOG, "decisions", id="decision-log"),
     ],
 )
 def test_each_writer_writes_outside_the_cloud(
@@ -339,6 +367,17 @@ def test_each_writer_writes_outside_the_cloud(
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     out = _coord_dir(repo) / written
     assert out.is_dir() and any(out.iterdir()), f"{script} wrote nothing under {written}/"
+
+
+@needs_pwsh
+@needs_windows
+def test_the_digest_takes_its_normal_path_outside_the_cloud(repo: Path) -> None:
+    """The control for the digest: a malformed -Rate is refused by its own check, which runs only
+    past the cloud refusal and needs no gh. Its full path is held by tests/test_afk_digest.py."""
+    proc = _run(repo, "coord/digest.ps1", "-Rate", "not-an-id", "agree", cloud=False)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert "is not a decision id" in proc.stderr
+    assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
 
 
 @needs_pwsh
@@ -382,11 +421,10 @@ def test_the_declare_prompt_hook_prints_the_prompt_outside_the_cloud(repo: Path)
     assert "cloud Builder" not in proc.stdout
 
 
-# Every PowerShell copy of the refusal, inlined rather than shared. No helper is loaded by all of
-# them: alloc.ps1, claim.ps1 and the tombstone script dot-source nothing, and about ten fixtures copy
-# alloc.ps1 or claim.ps1 alone, so a new dot-source would break them. There is no shared coord-root
-# resolver either, and one would be the wrong home: -CoordDir, -MailRoot and MEFOR_OWNER_LOG bypass
-# it. The Python copy is held by the behavioural owner_log tests, which need no pwsh.
+# Every PowerShell copy of the refusal, inlined rather than shared. Each runs before its script loads
+# any library, so it holds even where coord-root.ps1 is missing, and coord-root.ps1 would be the
+# wrong home anyway: -CoordDir, -MailRoot and MEFOR_OWNER_LOG bypass it. The Python copy is held by
+# the behavioural owner_log tests, which need no pwsh.
 GUARDED = (
     "coord/seat.ps1",
     "coord/mail.ps1",
@@ -395,7 +433,13 @@ GUARDED = (
     "coord/handoff.ps1",
     "coord/lane.ps1",
     "coord/tombstone-retired-backlog-allocator.ps1",
+    # The shared-root migration tools; their -Source, -Target and -Dir bypass git entirely.
+    "coord/coord-migrate.ps1",
+    "coord/coord-race.ps1",
     "worktree/hygiene-report.ps1",
+    # The AFK-autonomy decision log and its digest (ADR 0211): vault work, which stays local.
+    "coord/decision.ps1",
+    "coord/digest.ps1",
     # The readers, whose empty answer in a VM looks clean.
     "coord/overlap.ps1",
     "coord/claim-adjudicate.ps1",
@@ -429,20 +473,23 @@ NOT_GUARDED = {
     "hooks/mail-watch.ps1": "user-scope hook, retired from the wiring",
     "hooks/wiki-write-prompt.ps1": "user-scope hook",
     "worktree/session-context.ps1": "user-scope hook",
+    # Defines functions only; its two callers, decision.ps1 and digest.ps1, carry the refusal.
+    "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
+    # A dot-sourced library: it names where state lives and writes only its clone-local down-cache.
+    # Every script that calls it carries its own refusal.
+    "coord/coord-root.ps1": "resolver library, clone-local down-cache only",
+    "coord/coord_root.py": "resolver library, clone-local down-cache only",
     # Reads mefor-coord and writes nothing there, or writes only through a guarded script. A reader
     # a person runs by hand, whose empty answer would look clean, is guarded instead.
     "hooks/claim_check.py": "reader, commit-msg hook",
     "hooks/ledger_check.py": "reader, pre-commit hook",
-    "hooks/lane-level.ps1": "reader",
     "hooks/precompact-reprime.ps1": "reader, project hook",
     "hooks/worktree_gate.ps1": "reader; writes only its own log, outside mefor-coord",
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
-    "worktree/remove.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
-    "coord/install-git-hooks.ps1": "mention",
     "coord/rescue.ps1": "mention",
     "coord/unbacked_check.ps1": "mention",
     "worktree/register-hygiene-task.ps1": "mention",

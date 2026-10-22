@@ -20,7 +20,9 @@
       2. A Task/Agent/Workflow dispatch made FROM the primary -- because a subagent inherits the parent's
          cwd, cannot create a worktree of its own, and its denied edits do not reliably surface to the
          parent (measured: the parent's result came back with an EMPTY permission_denials list). Blocking
-         the fan-out costs one second; letting it run costs the whole workflow.
+         the fan-out costs one second; letting it run costs the whole workflow. A Task/Agent call whose
+         subagent_type is exactly web-fetch or claude-code-guide is exempt; the "# Rule 2" comment block
+         below says why and names at least its residuals.
 
     KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
     made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
@@ -67,7 +69,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.18.1"
+$GateVersion = "2026.10.21.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2862,14 +2864,42 @@ What to do instead:
 # ---------------------------------------------------------------------------------------------------
 # Rule 2 -- dispatching a fan-out FROM the primary. Checked first: it is the cheapest place to stop a
 # workflow that would otherwise burn 40 minutes and then report success while having written nothing.
+#
+# EXEMPT: a Task/Agent call whose tool_input has one key spelled exactly "subagent_type" and whose value
+# is a string ORDINALLY equal to "web-fetch" or "claude-code-guide". Ordinal, not -ceq/-cin: PowerShell's
+# culture comparison ignores zero-width, soft-hyphen and NUL characters, so "web-fetch" plus U+200B would
+# match. The key is matched ordinally too, because a PSCustomObject property read is case-insensitive.
+# Owner authorization 2026-10-21, for docs/AUTONOMY-PLAN.md section 6, item 1 (on branch autonomy-plan
+# when this was written; its brief called it 6.1). Those two built-in types carry no shell AND no write tool (WebFetch; Glob/Grep/Read/
+# WebFetch/WebSearch), so inheriting the primary's cwd cannot build or swap anything there, which is the
+# harm this rule exists for. "No shell" alone is not the criterion: statusline-setup has none but has Edit.
+# Everything else stays denied: Explore and Plan have Bash, and a shell write evades rule 1 outright;
+# general-purpose, fork, a missing or non-string type, any other spelling of the two names, and every
+# Workflow. RESIDUALS, at least: the match is on the NAME, not on the tool list, so an agent defined under
+# either name with a shell or a write tool passes too, from any source that can define one (project or
+# user agents, the --agents flag, an SDK host's agents option); and the premise rests on the vendor's
+# current tool lists for these two types, which no test here pins.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("Task", "Agent", "Workflow")) {
+    if ($tool -ne "Workflow") {
+        $typeProps = @($hook.tool_input.PSObject.Properties |
+            Where-Object { [string]::Equals($_.Name, "subagent_type", [StringComparison]::Ordinal) })
+        # Assigned, never `$x = if (...) { ... }`: that form's pipeline output unrolls a one-element JSON
+        # array into its bare string, which would then pass the type check below.
+        $subagentType = $null
+        if ($typeProps.Count -eq 1) { $subagentType = $typeProps[0].Value }
+        if ($subagentType -is [string] -and
+            ([string]::Equals($subagentType, "web-fetch", [StringComparison]::Ordinal) -or
+             [string]::Equals($subagentType, "claude-code-guide", [StringComparison]::Ordinal))) {
+            exit 0
+        }
+    }
     $root = Test-Governed $cwd
     if ($root) {
         $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
-BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
-subagents. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
+BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not make
+this dispatch. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
 not reliably surface back to you -- the fan-out would appear to succeed while writing nothing.
 
 Create a worktree first, then dispatch from it:
@@ -4438,8 +4468,75 @@ turned off and I need you to do it." Do not disable it yourself.
 # blocked trains people to route around it (rule 3's note above records that happening).
 # ---------------------------------------------------------------------------------------------------
 $targetCmp = Get-ComparablePath $target
+# RULE 1b'S SUBJECTS ARE EVERY COORDINATION ROOT, NOT ONLY THE LOCAL ONE (docs/COORD-SHARED-ROOT.md).
+# Seats, mail, claims and allocations may live on a SHARED root, an SMB share both PCs reach. Rule 1 never
+# governed that path (it is not under any primary checkout), so before this the gate let a write tool
+# hand-write claims/<item>.json there: the exact transfer rule 1b refuses locally. So the shared root is a
+# rule 1b subject too, and ONLY rule 1b's: an unarmed write there falls through to the rest of the gate
+# exactly as before, rather than taking the local root's exit-0 exemption. Every verdict this changes
+# moves ALLOW to DENY.
+#
+# READ LEXICALLY, WITH NO NETWORK CALL: $env:MEFOR_COORD_ROOT, then each governed root's
+# .git/mefor-coord/root.toml (scripts/coord/coord-root.ps1 is the resolver; this copy is inline because
+# the gate runs from a user-scope COPY that cannot dot-source the repo). A mapped drive letter whose
+# DisplayRoot is that share is folded onto it too, so the Z: spelling of a UNC root is caught. NOT
+# covered, stated rather than implied: the same server reached by another name (an IP for a hostname,
+# an FQDN), and a junction pointing into the share.
+$coordRoots = [System.Collections.Generic.List[object]]::new()
 foreach ($r in $roots) {
-    $coordRoot = "$($r.Compare)/.git/mefor-coord/"
+    $coordRoots.Add([pscustomobject]@{ Prefix = "$($r.Compare)/.git/mefor-coord/"; Shared = $false })
+}
+$sharedSpellings = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT)) { $sharedSpellings.Add($env:MEFOR_COORD_ROOT.Trim()) }
+foreach ($r in $roots) {
+    $rootToml = Join-Path $r.Display '.git/mefor-coord/root.toml'
+    try {
+        if (Test-Path -LiteralPath $rootToml -PathType Leaf) {
+            foreach ($line in [System.IO.File]::ReadAllLines($rootToml)) {
+                if ($line -match "\A\s*shared_root\s*=\s*'([^']+)'") { $sharedSpellings.Add($Matches[1].Trim()); break }
+            }
+        }
+    } catch { }
+}
+# A shared spelling that EQUALS, CONTAINS or sits INSIDE a governed root is a misconfiguration, never a
+# real share: honoured, it would put every worktree's source files under rule 1b's shape backstop and
+# refuse all code writes with a message about coordination state. It is ignored here; the resolver's
+# own refusal is what reports it.
+foreach ($spelling in $sharedSpellings) {
+    $cmp = Get-ComparablePath $spelling
+    if (-not $cmp) { continue }
+    $overlaps = $false
+    foreach ($r in $roots) {
+        if ($cmp -eq $r.Compare -or
+            $r.Compare.StartsWith("$cmp/", [System.StringComparison]::Ordinal) -or
+            $cmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $overlaps = $true; break }
+    }
+    if (-not $overlaps) { $coordRoots.Add([pscustomobject]@{ Prefix = "$cmp/"; Shared = $true }) }
+}
+$targetSpellings = [System.Collections.Generic.List[string]]::new()
+if ($targetCmp) { $targetSpellings.Add($targetCmp) }
+# The UNC spelling can only match a Shared entry, so with none there is no drive to look up.
+if (@($coordRoots | Where-Object { $_.Shared }).Count -gt 0 -and $targetCmp -match '^([a-z]):/') {
+    try {
+        $drive = Get-PSDrive -Name $Matches[1] -PSProvider FileSystem -ErrorAction Stop
+        if ($drive.DisplayRoot -and $drive.DisplayRoot.StartsWith('\\')) {
+            $unc = Get-ComparablePath ($drive.DisplayRoot.TrimEnd('\') + '\' + $targetCmp.Substring(3))
+            if ($unc) { $targetSpellings.Add($unc) }
+        }
+    } catch { }
+}
+$coordMatch = $null
+foreach ($cr in $coordRoots) {
+    foreach ($tc in $targetSpellings) {
+        if ($tc.StartsWith($cr.Prefix, [System.StringComparison]::Ordinal)) {
+            $coordMatch = [pscustomobject]@{ Root = $cr; Rest = $tc.Substring($cr.Prefix.Length) }
+            break
+        }
+    }
+    if ($coordMatch) { break }
+}
+
+if ($coordMatch) {
     # ORDINAL, EXPLICITLY, on both this match and the denylist's below. The one-argument
     # String.StartsWith overload compares under the CURRENT CULTURE, which SKIPS collation-ignorable
     # characters -- measured on this host, "<root>/.git/mefor-coord`u{200D}/evil".StartsWith("<root>/.git/
@@ -4448,8 +4545,7 @@ foreach ($r in $roots) {
     # and the comment above earns the word "required" only under it. It matters most on rule 1b: a
     # culture-sensitive denylist decides membership of a SECURITY list by collation, which is not a
     # property anyone auditing this file would think to check.
-    if (-not $targetCmp.StartsWith($coordRoot, [System.StringComparison]::Ordinal)) { continue }
-    $rest = $targetCmp.Substring($coordRoot.Length)
+    $rest = $coordMatch.Rest
 
     # CLASSIFY THE FILE THE WRITE LANDS ON, NOT THE SPELLING. `foo.json:bar.md` names an NTFS ALTERNATE
     # DATA STREAM of foo.json, and every classifier below would otherwise read the STREAM's name instead of
@@ -4570,21 +4666,23 @@ foreach ($r in $roots) {
     if (-not $armed -and
         [System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")) {
         $armed = @{
-            What = "a file under .git\mefor-coord\ that is not a handoff document or a delivery receipt," +
+            What = "a file under $(if ($coordMatch.Root.Shared) { 'the shared coordination root' } else { '.git\mefor-coord\' }) that is not a handoff document or a delivery receipt," +
                    " so this gate treats it as machine-read coordination state"
             Fix  = "if you meant to leave a NOTE, name it .md (or .txt); if you meant to append a delivery" +
                    " receipt, that is announce\sent\<session-id>.tsv"
         }
     }
 
-    if (-not $armed) { exit 0 }
+    # The local root's unarmed documents keep rule 1's exemption. The shared root never had one to keep.
+    if (-not $armed -and -not $coordMatch.Root.Shared) { exit 0 }
 
-    Write-Deny -Rule "1b" -Detail $target -Reason @"
-BLOCKED: this writes $($armed.What), which another gate on this machine reads as AUTHORITY ($(Get-SafeForMessage $target)).
+    if ($armed) { Write-Deny -Rule "1b" -Detail $target -Reason @"
+BLOCKED: this writes $($armed.What), which $(if ($coordMatch.Root.Shared) { 'another gate, on this PC or on any other PC sharing this root,' } else { 'another gate on this machine' }) reads as AUTHORITY ($(Get-SafeForMessage $target)).
 
-Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
-exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is
-neither. It lives in the git COMMON dir -- ONE file, shared by every
+$(if ($coordMatch.Root.Shared) { "Handoff documents and delivery receipts on the shared coordination root are allowed, but only by SHAPE:
+a .md or .txt document, or a .tsv receipt. This path is" } else { "Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
+exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is" })
+neither. It lives in $(if ($coordMatch.Root.Shared) { 'the SHARED coordination root, read by every session on every PC' } else { 'the git COMMON dir' }) -- ONE file, shared by every
 worktree at once -- and the gate that reads it decides from a single field, or from the file merely
 existing, so a hand-written copy is indistinguishable from a real one. That is how a write here forges an
 allocation the allocator never issued, transfers a claim whose holder still believes it is theirs, or turns
@@ -4598,7 +4696,7 @@ Do this instead:
 If the state itself is WRONG -- a stale claim, a ratchet left high by an earlier accident -- say so and let
 the user decide, naming the file and the change you want. Do not hand-edit it, and do not route around this
 with a shell command; that only removes the record of which session did it.
-"@
+"@ }
 }
 
 $root = Test-Governed $targetCmp

@@ -132,6 +132,10 @@ def _stale_clone(tmp: Path, stale_source: bytes, *, main_retired: bool = True) -
     _commit(upstream, "stale: the pre-retirement allocator")
     if main_retired:
         shutil.copy2(_HEAD_ALLOC, upstream / "scripts" / "coord" / "alloc.ps1")
+        # Head alloc.ps1 refuses without its resolver, so the retiring commit carries it too.
+        shutil.copy2(
+            _HEAD_ALLOC.parent / "coord-root.ps1", upstream / "scripts" / "coord" / "coord-root.ps1"
+        )
         _commit(upstream, "retire the backlog kind")
 
     clone = tmp / "clone"

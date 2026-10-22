@@ -96,7 +96,24 @@ $resolved = (& git --git-dir=$($GitCommonDir.Trim()) rev-parse --path-format=abs
 if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "-GitCommonDir '$GitCommonDir' is not a git directory." }
 $GitCommonDir = $resolved.Trim()
 
-$registry = Join-Path $GitCommonDir "mefor-coord/alloc/backlog"
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or written.")
+    exit 4
+}
+. $coordRootScript
+$thisHost = Get-CoordHost
+
+# The allocation registry may live on the shared root, and a tombstone written beside a local copy
+# would lift no allocator that reads the shared one. It refuses rather than fall back, -Check
+# included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
+$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
+if ($allocDir.Error) {
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
+    exit 4
+}
+$registry = Join-Path $allocDir.Path "backlog"
 $file = Join-Path $registry "$TombstoneNumber.json"
 
 function Test-IsTombstone([string]$Path) {
@@ -160,6 +177,7 @@ $record = [ordered]@{
         "real number. Allocate backlog numbers in the MessageFoundry-vault clone instead.")
     branch    = ""
     worktree  = ""
+    host      = $thisHost
     claimed   = (Get-Date).ToString("o")
     tombstone = $true
 } | ConvertTo-Json -Compress

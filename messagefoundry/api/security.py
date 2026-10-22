@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any, Literal, get_args
 
 from fastapi import (
     Depends,
@@ -146,8 +146,9 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset(
 # shipped require_mfa that is every new account. The rotation ends every session, so rotating first
 # would pass through "a chosen password, no factor, no session", which anyone who knows the username
 # can lock. So the order is enrol, then rotate, and these paths are open to such a session only; for
-# every other must-change session the set above stands. Passkey registration is deliberately absent:
-# in wave 1 a passkey is not a way past, and the service refuses it as a first factor anyway. Keyed
+# every other must-change session the set above stands. Passkey registration is absent because the
+# JSON plane has no passkey routes; the console's twin (ENROL_FIRST_UI_ROUTES) admits it, since from
+# wave 2 a discoverable passkey is a way past. Keyed
 # on (METHOD, path) for the reason _MFA_EXEMPT_ROUTES gives: GET /me/mfa reads the factor status,
 # and DELETE /me/mfa removes a factor, which a path-only entry would open too.
 _ENROL_FIRST_ROUTES: frozenset[tuple[str, str]] = frozenset(
@@ -1985,8 +1986,8 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # ASVS 6.3.3: an MFA-pending session does not stream either. No exempt set here — every WS route
     # is a data feed, none is part of the enroll/verify escape path. Audited for the same reason as
     # require(): the refusal sits above the permission loop, so nothing else would record it. The
-    # /ws/stats route asks it again before every frame, through recheck_standing; a new WS route
-    # gets that only if it calls recheck_standing too.
+    # /ws/stats route asks it again before every frame, through recheck_standing_or_refusal; a new
+    # WS route gets that only if it calls it too, and records its own stop row (BACKLOG #3404).
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None
@@ -2005,8 +2006,9 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
             return None
     # BACKLOG #195a (ASVS 16.3.2): audit the grant. Under [diagnostics].audit_all_authz — ON by default
     # since BACKLOG #1277 — every satisfied WS route is audited (PHI-view still excluded). THIS RUNS ONCE
-    # PER CONNECTION, NOT PER MESSAGE, so the shipped stats feed writes one row per connect however long
-    # it streams; that is why the flipped default costs nothing measurable here. With the switch off only
+    # PER CONNECTION, NOT PER MESSAGE, so the shipped stats feed writes one grant row per connect however
+    # long it streams, plus one ws_stats.stopped row if its re-check stops it (BACKLOG #3404); that is
+    # why the flipped default costs nothing measurable here. With the switch off only
     # the sensitive set is audited, and /ws/stats requires MONITORING_READ, which is not in it.
     audit_all = _audit_all_authz(websocket.app.state)
     audited = _grant_audit_permission(permissions, audit_all=audit_all)
@@ -2056,6 +2058,65 @@ def quiet_deliberate_export_stops() -> None:
     logging.getLogger("uvicorn.error").addFilter(_EXPORT_STOP_FILTER)
 
 
+#: Why :func:`recheck_standing_or_refusal` refused, as a closed set of slugs an audit row may name
+#: (BACKLOG #3404). Each names a rule, never a value: no token, address or permission set.
+StandingRefusal = Literal[
+    "session_ended",
+    "password_change_due",
+    "mfa_unmet",
+    "notify_email_due",
+    "permission_withdrawn",
+]
+
+
+async def recheck_standing_or_refusal(
+    auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
+) -> Identity | StandingRefusal:
+    """:func:`recheck_standing`, returning the refusal's reason where that returns ``None``.
+
+    For a caller whose stop row names the rule that refused (BACKLOG #3404): the ``/ws/stats`` feed.
+    The standing rules live here, so a new one goes here; :func:`recheck_standing` is this with
+    the reason dropped. They run in the gates' order, the factor before the notification address
+    and the permissions, so a session failing several is named as the gate would name it.
+
+    ``session_ended`` covers every way the token stops resolving, since the lookup does not say
+    which: at least a revoke, a sign-out, an expiry, an idle timeout, a disabled or deleted
+    account, and a session rotation such as a step-up on that session."""
+    identity = await auth.identity_for_token(token, activity=activity)
+    if identity is None:
+        return "session_ended"
+    if identity.must_change_password:
+        return "password_change_due"
+    if not await auth.mfa_satisfied(token):
+        # The factor check loads the session again, and finds none if it ended between the two
+        # reads. Ask once more on this refusal-only path, so that end is not named a lapsed factor.
+        try:
+            ended = await auth.identity_for_token(token, activity=False) is None
+        except AUDIT_WRITE_DEFECTS:
+            raise
+        except store_call_errors() as exc:
+            # The read only picks the reason, and the factor check has already refused, so a store
+            # fault keeps the refusal rather than raising into a caller that would then skip its
+            # stop row (BACKLOG #3404). It names the factor, which is what the check that ran
+            # reported and what the gate names on that check; nothing saw the session end. With
+            # its traceback: ValueError and RuntimeError are also what a bug raises.
+            log.warning(
+                "a standing re-check could not read the session again after the factor check"
+                " refused (%s); the refusal stands, as an unmet factor",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return "mfa_unmet"
+        if ended:
+            return "session_ended"
+        return "mfa_unmet"
+    if identity.must_set_notify_email:
+        return "notify_email_due"
+    if not all(identity.has(permission) for permission in permissions):
+        return "permission_withdrawn"
+    return identity
+
+
 async def recheck_standing(
     auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
 ) -> Identity | None:
@@ -2073,18 +2134,13 @@ async def recheck_standing(
     act has started. It moves no idle clock unless ``activity`` is True: a live feed is passive,
     but a download the caller asked for is that caller's act, and the export passes True now and
     then so a long download does not idle its own session out. It writes no audit row; the caller
-    records the stop. :func:`require`, :func:`authorize_ws` and the
-    console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
-    standing rule goes in all four.
+    records the stop, and a caller whose row names the rule that refused calls
+    :func:`recheck_standing_or_refusal`, which holds the rules. :func:`require`,
+    :func:`authorize_ws` and the console's ``authorize_ui_ws`` ask the same list with audit rows
+    between the steps, so a new standing rule goes in that function and in all three.
 
     Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
     one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
     differs from the scope the export started with."""
-    identity = await auth.identity_for_token(token, activity=activity)
-    if identity is None or identity.must_change_password or identity.must_set_notify_email:
-        return None
-    if not all(identity.has(permission) for permission in permissions):
-        return None
-    if not await auth.mfa_satisfied(token):
-        return None
-    return identity
+    result = await recheck_standing_or_refusal(auth, token, *permissions, activity=activity)
+    return result if isinstance(result, Identity) else None

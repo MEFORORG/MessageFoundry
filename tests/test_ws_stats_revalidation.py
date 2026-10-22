@@ -12,19 +12,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+import json
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+from starlette.websockets import WebSocket
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.api.security import recheck_standing, recheck_standing_or_refusal
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
+from tests._refusal_log_capture import record_texts
 
 PW = "Sup3rSecret!!"
 
@@ -92,8 +98,6 @@ class _WSHarness:
         if kind == "websocket.accept":
             return
         if kind == "websocket.send":
-            import json
-
             self.frames.append(json.loads(message["text"]))  # type: ignore[arg-type]
             return
         if kind == "websocket.close":
@@ -269,6 +273,25 @@ async def test_revoke_before_first_send_yields_no_frames(
     assert harness.close_code == 1008
 
 
+def _during_first_stats(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, act: Callable[[], Awaitable[object]]
+) -> None:
+    """Run ``act`` once, inside the first frame's ``store.stats()`` call: after that frame's
+    re-check and before its send, so that frame goes out and the second frame's re-check sees
+    ``act``'s effect."""
+    real_stats = engine.store.stats
+    calls = 0
+
+    async def stats_then_act() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await act()
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", stats_then_act)
+
+
 async def test_no_frame_follows_a_revocation(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -284,17 +307,9 @@ async def test_no_frame_follows_a_revocation(
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
-    real_stats = engine.store.stats
-    calls = 0
-
-    async def stats_then_revoke() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await service.revoke_sessions_for_user(uid, actor="admin")
-        return await real_stats()
-
-    monkeypatch.setattr(engine.store, "stats", stats_then_revoke)
+    _during_first_stats(
+        monkeypatch, engine, lambda: service.revoke_sessions_for_user(uid, actor="admin")
+    )
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
     await harness.run(timeout=_HARNESS_TIMEOUT)
@@ -315,17 +330,9 @@ async def test_an_administrator_narrowing_closes_the_feed_rather_than_shrinking_
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
-    real_stats = engine.store.stats
-    calls = 0
-
-    async def stats_then_narrow() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await service.set_channel_scope(uid, ["IB_A"], actor="admin")
-        return await real_stats()
-
-    monkeypatch.setattr(engine.store, "stats", stats_then_narrow)
+    _during_first_stats(
+        monkeypatch, engine, lambda: service.set_channel_scope(uid, ["IB_A"], actor="admin")
+    )
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
     await harness.run(timeout=_HARNESS_TIMEOUT)
@@ -337,7 +344,9 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control for the test above: with nothing withdrawn, the per-frame re-check passes and
-    the feed keeps sending. A re-check that refused every caller would pass the revocation test."""
+    the feed keeps sending. A re-check that refused every caller would pass the revocation test.
+    It also records no stop, so a stop row written on every frame, or on every pass of the
+    re-check, cannot pass the stop-row tests below."""
     monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -352,3 +361,464 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    assert await _stop_rows(engine) == []
+
+
+# --- BACKLOG #3404: a refused re-check records one stop row, naming why ----------------------------
+
+
+async def _stop_rows(engine: Engine) -> list[dict[str, object]]:
+    """Every ``ws_stats.stopped`` audit row, oldest first, as actor, client and parsed detail."""
+    return [
+        {"actor": row["actor"], "client": row["client"], **json.loads(row["detail"])}
+        for row in reversed(await engine.store.list_audit(action="ws_stats.stopped", limit=50))
+    ]
+
+
+class _Notifier:
+    """A wired security-notice channel. Wiring one is what makes an account with no notification
+    address owe one (``AuthService.notify_email_required``)."""
+
+    async def notify(self, event: object) -> bool:
+        return True
+
+
+async def _wire_a_notifier(service: AuthService, uid: str) -> None:
+    service.attach_security_notifier(_Notifier())
+
+
+async def _unmeet_the_second_factor(service: AuthService, uid: str) -> None:
+    async def unmet(token: str | None) -> bool:
+        return False
+
+    service.mfa_satisfied = unmet  # type: ignore[method-assign]
+
+
+async def _require_a_password_change(service: AuthService, uid: str) -> None:
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid,
+        password_hash=user.password_hash,
+        must_change_password=True,
+        password_generated=False,
+    )
+
+
+async def _revoke(service: AuthService, uid: str) -> None:
+    await service.revoke_sessions_for_user(uid, actor="admin")
+
+
+@pytest.mark.parametrize(
+    ("act", "reason"),
+    [
+        (_unmeet_the_second_factor, "mfa_unmet"),
+        (_wire_a_notifier, "notify_email_due"),
+        (_require_a_password_change, "password_change_due"),
+        (_revoke, "session_ended"),
+    ],
+    ids=["second-factor", "notification-address", "password-change", "revoked"],
+)
+async def test_a_refused_recheck_records_one_stop_row_naming_why(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    act: Callable[[AuthService, str], Awaitable[None]],
+    reason: str,
+) -> None:
+    """BACKLOG #3404. The per-frame re-check closed the feed with 1008 and recorded nothing, so an
+    unmet second factor or a missing notification address ended a live feed with no trail. The
+    gate's own refusals are audited (``auth.mfa_denied``, ``auth.permission_denied``); the
+    re-check's were not.
+
+    ``act`` runs inside the first frame's ``store.stats()``, as in
+    :func:`test_no_frame_follows_a_revocation`, so exactly one frame goes out and the second
+    frame's re-check refuses. The feed then writes exactly one row, naming the reason and the frames
+    sent. The exact match is what keeps the token, or anything else, out of the row."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    _during_first_stats(monkeypatch, engine, lambda: act(service, uid))
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": reason, "frames": 1}
+    ]
+
+
+async def test_a_refusal_before_the_first_frame_records_a_stop_with_no_frames(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404, the pre-first-send re-check: a refusal between the handshake and the first
+    frame records its stop too, with no frames sent."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    app = create_app(engine, auth=service)
+    real_accept = WebSocket.accept
+
+    async def accept_then_unmeet(self: WebSocket) -> None:
+        await real_accept(self)
+        await _unmeet_the_second_factor(service, uid)
+
+    monkeypatch.setattr(WebSocket, "accept", accept_then_unmeet)
+    harness = _WSHarness(app, token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.frames == []
+    assert harness.close_code == 1008
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": "mfa_unmet", "frames": 0}
+    ]
+
+
+async def test_the_refusal_names_a_permission_the_caller_does_not_hold(engine: Engine) -> None:
+    """BACKLOG #3404, the reason the route cannot reach: a role change revokes the session, so the
+    feed sees ``session_ended``. Asked directly, a permission the caller lacks names its own reason,
+    and :func:`recheck_standing` still answers ``None`` for it and the identity for a live caller."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.USERS_MANAGE)
+        == "permission_withdrawn"
+    )
+    assert await recheck_standing(service, token, Permission.USERS_MANAGE) is None
+    current = await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+    assert isinstance(current, Identity) and current.username == "op"
+    assert await recheck_standing(service, token, Permission.MONITORING_READ) == current
+
+
+async def test_a_lapsed_factor_is_named_before_a_missing_address(engine: Engine) -> None:
+    """BACKLOG #3404: the re-check runs in the gates' order, the factor first, so a session that
+    fails both is named ``mfa_unmet``, as ``authorize_ws`` would audit it ``auth.mfa_denied``. The
+    first assertion is the control: the missing address alone is named."""
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    await _wire_a_notifier(service, uid)
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+        == "notify_email_due"
+    )
+    await _unmeet_the_second_factor(service, uid)
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ) == "mfa_unmet"
+    )
+
+
+async def test_a_session_that_ends_during_the_factor_check_is_named_ended(engine: Engine) -> None:
+    """BACKLOG #3404: the factor check reads the session again. A session that ends between the
+    first resolve and that read fails the factor check, and must still be named ``session_ended``,
+    not a lapsed factor on an account that may just have proved one."""
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    real_mfa_satisfied = service.mfa_satisfied
+
+    async def revoke_then_check(token: str | None) -> bool:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+        return await real_mfa_satisfied(token)
+
+    service.mfa_satisfied = revoke_then_check  # type: ignore[method-assign]
+    assert (
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+        == "session_ended"
+    )
+
+
+def _replace_the_stop_row_write(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: Engine,
+    write: Callable[[], Awaitable[None]],
+) -> None:
+    """Run ``write`` in place of the ``ws_stats.stopped`` row's store write; other rows still land."""
+    real_record_audit = engine.store.record_audit
+
+    async def record_audit(action: str, **kwargs: Any) -> Any:
+        if action == "ws_stats.stopped":
+            return await write()
+        return await real_record_audit(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", record_audit)
+
+
+async def _refuse() -> None:
+    raise RuntimeError("store refused the write")
+
+
+@pytest.mark.parametrize("close_raises", [False, True], ids=["close-lands", "client-gone"])
+async def test_a_failed_stop_row_write_is_logged_and_the_feed_still_closes(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    close_raises: bool,
+) -> None:
+    """BACKLOG #3404: a store that refuses the stop row leaves an ERROR record naming the actor, the
+    client, the reason and the frames, and never the token. ``client-gone`` is the case the first build lost: the close
+    raised too, Starlette turned that into ``WebSocketDisconnect``, and the route's catch of it
+    swallowed the write's error. ``close-lands`` is the control, and pins the 1008 close."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    _replace_the_stop_row_write(monkeypatch, engine, _refuse)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    if close_raises:
+        real_send = harness._send
+
+        async def send_fails_on_close(message: dict[str, object]) -> None:
+            if message["type"] == "websocket.close":
+                raise OSError("client gone")
+            await real_send(message)
+
+        harness._send = send_fails_on_close  # type: ignore[method-assign]
+    # Every level, so the token scan below reads every record, not only the ERROR ones.
+    caplog.set_level(logging.DEBUG)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == (None if close_raises else 1008)
+    assert len(harness.frames) == 1, harness.frames
+    lost = [
+        record
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(lost) == 1, caplog.records
+    assert lost[0].getMessage() == (
+        "ws_stats.stopped audit row not written. Lost row: actor=op client=127.0.0.1"
+        " reason=session_ended frames=1"
+    )
+    assert lost[0].exc_info is not None
+    assert not any(token in text for r in caplog.records for text in record_texts(r))
+
+
+async def test_the_close_does_not_wait_for_the_stop_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404: the feed closes, and gives its slot back, before it writes the stop row. A
+    write that blocks would otherwise hold a refused caller's socket open and keep its slot from a
+    new monitor socket, which the cap answers with 1013."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def blocking_write() -> None:
+        write_started.set()
+        await release_write.wait()
+
+    _replace_the_stop_row_write(monkeypatch, engine, blocking_write)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    try:
+        await asyncio.wait_for(write_started.wait(), _HARNESS_TIMEOUT)
+        assert harness.close_code == 1008
+        assert app.state.ws_count == 0
+        assert not task.done()
+    finally:
+        release_write.set()
+        await task
+
+
+async def test_a_stop_row_cut_short_by_a_cancel_is_logged(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: a cancel, as at shutdown, that lands while the stop row is being written
+    waits a bounded time, then lets the row go on alone. A row that then fails is logged at ERROR.
+    A cancel is no ``Exception``, so without that the row would be lost with no log line."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    monkeypatch.setattr(app_module, "_ROW_CANCEL_WAIT_SECONDS", 0.05)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    write_started = asyncio.Event()
+    fail_write = asyncio.Event()
+
+    async def slow_failing_write() -> None:
+        write_started.set()
+        await fail_write.wait()
+        raise RuntimeError("store refused the write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, slow_failing_write)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    caplog.set_level(logging.ERROR, logger=app_module.__name__)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await asyncio.wait_for(write_started.wait(), _HARNESS_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fail_write.set()
+    await asyncio.wait_for(
+        asyncio.gather(*app_module._UNLANDED_ROW_WRITES, return_exceptions=True), _HARNESS_TIMEOUT
+    )
+    await asyncio.sleep(0)  # the done callback that logs runs on the next turn
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ] == [
+        "an audit row's write did not land after its operation was cancelled. Lost row:"
+        ' action=ws_stats.stopped actor=op detail={"reason": "session_ended", "frames": 1}'
+    ]
+
+
+async def test_a_defect_in_the_stop_row_under_a_cancel_logs_the_row_and_stays_cancelled(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: a cancel that lands during the 1008 close reaches the ``finally`` first, and
+    the stop row's write then raises a defect. The task must still end cancelled, so the defect
+    must not replace the ``CancelledError``; the lost row is logged at ERROR with its traceback,
+    naming the actor, client, reason and frames, never the token. Outside a cancel a defect still
+    raises, as :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` asks."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+
+    async def defect() -> None:
+        raise NotImplementedError("a defect in the stop row's write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, defect)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    closing = asyncio.Event()
+    real_send = harness._send
+
+    async def close_hangs(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.close":
+            closing.set()
+            await asyncio.Event().wait()  # held until the cancel lands here
+        await real_send(message)
+
+    harness._send = close_hangs  # type: ignore[method-assign]
+    caplog.set_level(logging.DEBUG)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await asyncio.wait_for(closing.wait(), _HARNESS_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    lost = [
+        record
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert [record.getMessage() for record in lost] == [
+        "ws_stats.stopped audit row not written. Lost row: actor=op client=127.0.0.1"
+        " reason=session_ended frames=1"
+    ]
+    assert lost[0].exc_info is not None and isinstance(lost[0].exc_info[1], NotImplementedError)
+    assert not any(token in text for r in caplog.records for text in record_texts(r))
+
+
+async def test_a_store_fault_on_the_second_read_still_records_the_stop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: after the factor check refuses, the re-check reads the session again only to
+    tell an ended session from a lapsed factor. A store fault on that read must not raise into the
+    feed, which would skip its stop row; the refusal stands and is named ``mfa_unmet``, what the
+    check that ran reported. The fault is logged with its traceback."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    _during_first_stats(monkeypatch, engine, lambda: _fault_the_read_after_the_factor(service))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    caplog.set_level(logging.WARNING)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": "mfa_unmet", "frames": 1}
+    ]
+    faults = [r for r in caplog.records if "could not read the session again" in r.getMessage()]
+    assert len(faults) == 1 and faults[0].exc_info is not None
+
+
+async def test_a_defect_in_the_stop_row_with_no_cancel_still_raises(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404, the control for the cancel case above: with no cancel in flight, a defect
+    from the stop row's write raises, so a bug is not passed over as a store refusal."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+
+    async def defect() -> None:
+        raise NotImplementedError("a defect in the stop row's write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, defect)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    with pytest.raises(NotImplementedError):
+        await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+
+
+async def test_a_defect_on_the_second_read_is_not_taken_for_a_store_fault(engine: Engine) -> None:
+    """BACKLOG #3404: only a store fault on the read after a refused factor check keeps the
+    refusal. A defect, which ``store_call_errors()`` would otherwise catch as a ``RuntimeError``,
+    raises."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    await _fault_the_read_after_the_factor(service, NotImplementedError("a defect in the read"))
+    with pytest.raises(NotImplementedError):
+        await recheck_standing_or_refusal(service, token, Permission.MONITORING_READ)
+
+
+async def _fault_the_read_after_the_factor(
+    service: AuthService, fault: Exception | None = None
+) -> None:
+    """From now on the factor check refuses, and the session read right after it raises ``fault``,
+    a store fault by default, once per refusal."""
+    real_identity_for_token = service.identity_for_token
+    armed = False
+
+    async def unmet(token: str | None) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    async def faulting(token: str | None, *, activity: bool = True) -> Identity | None:
+        nonlocal armed
+        if armed:
+            armed = False
+            raise OSError("store connection lost") if fault is None else fault
+        return await real_identity_for_token(token, activity=activity)
+
+    service.mfa_satisfied = unmet  # type: ignore[method-assign]
+    service.identity_for_token = faulting  # type: ignore[method-assign]
+
+
+async def test_a_client_that_disconnects_mid_feed_records_no_stop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3404: only a refused re-check writes a stop row. A client that goes away while its
+    session still stands ends the feed through ``WebSocketDisconnect`` and records none, as
+    SECURITY.md says. The first frame lands, so the send that fails is a later one."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    real_send = harness._send
+
+    async def gone_after_one_frame(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.send" and harness.frames:
+            raise OSError("client gone")
+        await real_send(message)
+
+    harness._send = gone_after_one_frame  # type: ignore[method-assign]
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert len(harness.frames) == 1, harness.frames
+    assert harness.close_code is None
+    assert await _stop_rows(engine) == []

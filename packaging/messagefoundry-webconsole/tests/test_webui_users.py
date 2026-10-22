@@ -304,7 +304,8 @@ async def test_stale_stepup_redirects_body_post_to_unlock_form(engine: Engine) -
     # require_mfa=False takes the MFA leg out of require_ui_step_up, so the stale window below is
     # what redirects; without it _boss_client's unenrolled session is refused first with the SAME
     # 303 and the window measured nothing (BACKLOG #1851). Reasoning, and the third new-IP leg that
-    # stays unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # stays unpinned: the docstring of
+    # test_webui_monitoring.py::test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     async with _boss_client(engine, service) as c:
@@ -1503,7 +1504,8 @@ async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) 
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
     # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
-    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # unpinned: the docstring of
+    # test_webui_monitoring.py::test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
@@ -1525,7 +1527,8 @@ async def test_stale_stepup_bounces_all_unlock_form_pages(engine: Engine) -> Non
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
     # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
-    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # unpinned: the docstring of
+    # test_webui_monitoring.py::test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)

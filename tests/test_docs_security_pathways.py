@@ -56,6 +56,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
+from tests._ast_sites import call_sites
 from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -1014,6 +1015,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
+        # BACKLOG #3374: the federated step-up's return, charged on that branch only.
+        "GET /ui/oidc/callback",
         "POST /ui/account/mfa/verify",
         "POST /ui/account/webauthn/verify",  # BACKLOG #3014: the passkey registration finish
         "POST /ui/mfa",
@@ -1563,14 +1566,55 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
             "consults neither lock."
         )
 
-    # 4. The callback charges the sign-in window before it picks the step-up branch.
+    # 4. The callback reads the staged flow's actor before it charges either limiter, then charges
+    # the ceremony budget on a step-up return and the sign-in window otherwise (BACKLOG #3374).
     routes = _console_route_funcs()
     callback = routes["GET /ui/oidc/callback"]
-    charge_at = [i for i, s in enumerate(callback.body) if _called(s, "allow_login_attempt")]
-    branch_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_flow_is_step_up")]
-    assert charge_at and branch_at and charge_at[0] < branch_at[0], (
-        "GET /ui/oidc/callback no longer charges allow_login_attempt before its step-up branch; the "
-        "limiter-split residual in the 6.1.1 section says it does."
+    peek_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_step_up_flow")]
+    charge_at = [
+        i
+        for i, s in enumerate(callback.body)
+        if _called(s, "allow_login_attempt") or _called(s, "allow_reauth_attempt")
+    ]
+    assert peek_at and charge_at and peek_at[0] < charge_at[0], (
+        "GET /ui/oidc/callback no longer reads oidc_step_up_flow before it charges a limiter; the "
+        "limiter split in the 6.1.1 section says it picks the budget from the staged flow."
+    )
+
+    def _any_called(stmts: list[ast.stmt], name: str) -> bool:
+        return any(_called(st, name) for st in stmts)
+
+    splits = [
+        s
+        for s in callback.body
+        if isinstance(s, ast.If)
+        and _any_called(s.body, "allow_reauth_attempt")
+        and not _any_called(s.body, "allow_login_attempt")
+        and _any_called(s.orelse, "allow_login_attempt")
+        and not _any_called(s.orelse, "allow_reauth_attempt")
+    ]
+    assert len(splits) == 1, (
+        "GET /ui/oidc/callback no longer charges exactly one budget per return: the ceremony budget "
+        "on a step-up return, the sign-in window on any other. The 6.1.1 limiter split says it does."
+    )
+    # The budget is charged under the staged flow's user, whatever the peek's result is named.
+    flow_names = {
+        t.id
+        for s in callback.body
+        if isinstance(s, ast.Assign | ast.AnnAssign) and _called(s, "oidc_step_up_flow")
+        for t in (s.targets if isinstance(s, ast.Assign) else [s.target])
+        if isinstance(t, ast.Name)
+    }
+    charges = call_sites(splits[0], "allow_reauth_attempt")
+    staged_user = {f"{name}.user_id" for name in flow_names}
+    keyed_on_staged_user = [
+        bool(c.args) and any(ast.unparse(sub) in staged_user for sub in ast.walk(c.args[0]))
+        for c in charges
+    ]
+    assert flow_names and charges and all(keyed_on_staged_user), (
+        f"the callback charges the ceremony budget under "
+        f"{[ast.unparse(c.args[0]) for c in charges if c.args]}, not a key built from the user "
+        f"oidc_step_up_flow read from the staged flow ({sorted(flow_names)})."
     )
     reauth_oidc = routes["POST /ui/reauth/oidc"]
     assert _called(reauth_oidc, "allow_reauth_attempt") and not _called(
@@ -1683,6 +1727,12 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "which the start leg turns into a **303 redirect",
         "flooding the OIDC start leg (`POST /ui/oidc/start`",
         "limiter 2 (the same routes charge `allow_login_attempt` first)",
+        # BACKLOG #3374: the callback no longer charges the sign-in window on a step-up return.
+        "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
+        "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
+        "and the callback draws the sign-in window, so a flood that fills that window also refuses",
+        "and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window",
+        "which charges the sign-in window as above",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; against the two-lock code it is false or "
@@ -1721,8 +1771,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     for token in ("The sign-in lock has **two** exceptions", "it refuses **no** second-factor leg"):
         assert token in table_a, f"Table A's failures row must state {token!r}."
     for token in (
-        "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
-        "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
+        "**An `oidc` session's step-up draws limiter 3 at both of its legs (BACKLOG #3374).**",
+        "`oidc_step_up_flow` runs ahead of both limiters",
+        "Only a callback whose cookie names no live step-up flow charges limiter 2",
         "Only the second-step lock refuses the code leg.",
         "Three of the four can end a lock that is still live",
         "The successful-login write can end a live **sign-in** lock only",
@@ -2100,11 +2151,15 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     local_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))
     doubling = (
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
-        "account, and the sign-in lock does so only on a local account with TOTP enrolled; every "
-        "other lock keeps `lockout_minutes`"
+        "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
+        "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
+        "or whose value will not compute, still escalates. Every other lock keeps "
+        "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
+        "serial failures only: a race listed under [WebAuthn passkeys]"
     )
     assert doubling in " ".join(local_row[2].split()), (
-        "the Local row's brute-force cell must state which locks double, as lockout_escalates does."
+        "the Local row's brute-force cell must state which locks double, as lockout_escalates "
+        "and lockout_increment's refused-TOTP rule do."
     )
     for token in (
         "**Set this to `administrators`**, which frees only a **local** account that does not "
@@ -2298,16 +2353,15 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             # Items 1-3: a covered account with no TOTP enrols before it rotates.
             with pytest.raises(FactorEnrolmentRequired):
                 await service.change_password(identity, "a-brand-new-chosen-passphrase")
-            # Items 2 and 5: its first factor may not be a passkey.
-            with pytest.raises(FactorEnrolmentRequired):
-                await service.begin_webauthn_registration(
-                    identity, token=out.token, rp_id="localhost", rp_name="t"
-                )
+            # Items 2 and 5 moved in wave 2 (ADR 0197 Amendment A): its first factor may be a
+            # passkey, because the registration requires a discoverable one. The twelfth sweep's
+            # probe pins that order.
             off = AuthService(store, AuthSettings(require_mfa=False))
             assert not await off.must_enrol_before_rotating(identity), (
                 "with require_mfa off the account should rotate first"
             )
-            # Item 6: once TOTP is on, a covered account cannot remove it, passkey or not ...
+            # Item 6: once TOTP is on, a covered account cannot remove it while no DISCOVERABLE
+            # passkey remains; this one is not discoverable ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
             staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
             assert await store.enable_totp(
@@ -2367,21 +2421,24 @@ def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
     assert "ends its own sessions and changes its password from a password-only session" not in (
         binding
     ), "item 2: the factor-binding row says a no-factor account changes its password pending"
-    assert "first factor must be TOTP" in binding
+    assert "first factor must be TOTP or a discoverable passkey" in binding
 
     # 3. A pending no-factor session cannot rotate, in any configuration.
     assert "An account with no factor still changes its password from a pending session" not in doc
     assert "it cannot rotate from a pending session either" in doc
 
-    # 4. A reset passkey-only account also enrols TOTP before it rotates.
+    # 4. A reset passkey-only account rotates only once it holds a way past; from wave 2 a
+    #    discoverable passkey is one (ADR 0197 Amendment A).
     assert "A passkey-only account has to do this on the console" not in doc
-    assert "must also enrol TOTP before it rotates" in doc and "`_has_way_past` counts TOTP" in doc
+    assert "must also enrol TOTP before it rotates" not in doc
+    assert "`_has_way_past` counts TOTP or a passkey recorded as discoverable" in doc
 
-    # 5. CONFIGURATION.md's require_mfa row: TOTP first for a covered local account.
+    # 5. CONFIGURATION.md's require_mfa row: a factor with a way past first for a covered local
+    #    account, TOTP or (wave 2) a discoverable passkey.
     assert "to enrol TOTP or a passkey." not in config, (
         "item 5: the require_mfa row offers a passkey as a covered local account's first factor"
     )
-    assert "enrols **TOTP first**" in _config_row("require_mfa", "bool")
+    assert "enrols **TOTP or a discoverable passkey first**" in _config_row("require_mfa", "bool")
 
     # 6. TOTP removal refuses on its own condition, and the MFA section says so.
     assert "the same refusal, on the same condition, as the passkey removal path" not in doc
@@ -2771,9 +2828,11 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
         "api.security.require no longer asks mfa_satisfied; the docs say the factor is an access gate."
     )
 
-    # 2. The first factor of an account the requirement covers is TOTP. The ninth sweep pins the
-    #    covered local refusal end to end; this adds the arms the docs now also state: a directory
-    #    account and a local account outside the requirement may register a passkey first. A real
+    # 2. Wave 2 (ADR 0197 Amendment A): the first factor of an account the requirement covers is
+    #    TOTP or a passkey, since a registration requires a discoverable credential, so every arm
+    #    passes the begin gate; a covered local account is refused only a passkey its client reports
+    #    is not discoverable, at the finish. A directory account and a local account outside the
+    #    requirement may register a passkey first, as before. A real
     #    service and store, with the account row swapped and the first store read past the gate
     #    raising a sentinel, so "passed the gate" is told from "refused at it" with no WebAuthn extra.
     from messagefoundry.store.store import MessageStore
@@ -2830,14 +2889,14 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
             await store.close()
 
     assert asyncio.run(probe()) == {
-        "covered local, no TOTP": "refused",
+        "covered local, no TOTP": "passed",
         "covered local, TOTP": "passed",
         "local, requirement off": "passed",
         "directory, no TOTP": "passed",
     }, (
         "the first-passkey order changed. docs/REMOTE-CONSOLE.md and docs/BROWSER-SUPPORT.md say a "
-        "covered local account enrols TOTP first and a directory account or a local account outside "
-        "the requirement may register a passkey first."
+        "covered local account enrols TOTP or a discoverable passkey first, and a directory account "
+        "or a local account outside the requirement may register a passkey first."
     )
     # ...and a covered account cannot then drop the TOTP that came first.
     disable = ast.parse(textwrap.dedent(inspect.getsource(AuthService.disable_mfa)))
@@ -3053,7 +3112,8 @@ def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
 
 def test_the_twelfth_sweep_remote_console_sends_a_covered_account_to_totp_first() -> None:
     """docs/REMOTE-CONSOLE.md's X-MFA-Required row said "Enrol TOTP or a passkey". A covered local
-    account's first passkey is refused until it holds TOTP."""
+    account's first factor must be one with a way past the sign-in lock: TOTP, or from ADR 0197
+    Amendment A wave 2 a passkey the browser stores as discoverable, which the row now names."""
     row = _flat(
         next(
             line

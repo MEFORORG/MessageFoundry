@@ -72,6 +72,7 @@ def repo(tmp_path: Path) -> Path:
     git(r, "config", "user.email", "t@example.invalid")
     git(r, "config", "user.name", "t")
     shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(CLAIM.parent / "coord-root.ps1", r / "scripts" / "coord" / "coord-root.ps1")
     shutil.copy2(RECONCILE, r / "scripts" / "coord" / "claim-reconcile.ps1")
     for f in FENCE:
         shutil.copy2(f, r / "scripts" / "coord" / f.name)

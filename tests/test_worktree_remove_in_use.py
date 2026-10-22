@@ -300,6 +300,30 @@ def test_a_tree_git_wrote_to_recently_is_refused_on_both_routes(rig: Rig, route:
     assert not wt.exists()
 
 
+@pytest.mark.parametrize("route", ROUTES)
+def test_a_claim_from_ANOTHER_machine_at_this_path_neither_holds_the_tree_nor_is_reaped(
+    rig: Rig, route: str
+) -> None:
+    """docs/COORD-SHARED-ROOT.md: on a shared registry two PCs can each have a tree at one path.
+
+    A claim recorded on another host names THAT machine's disk, so it is not this tree's: it does not
+    hold the removal, and the removal leaves it exactly as it was. The no-host case, which is this
+    machine's, is the refusal the test above pins."""
+    wt = _sibling(rig, "twin")
+    claim = _claim(rig, "9601", wt)
+    rec = json.loads(claim.read_text(encoding="utf-8"))
+    rec["host"] = "OTHER-PC"
+    claim.write_text(json.dumps(rec), encoding="utf-8")
+    before = claim.read_bytes()
+
+    proc = rig.run(*_target(route, wt))
+
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+    assert claim.read_bytes() == before, "the removal touched another machine's claim"
+    assert "9601" not in _out(proc), "another machine's claim was reported as this tree's"
+
+
 def test_name_does_not_clear_a_sibling_a_live_session_in_a_parent_tree_is_working_in(
     rig: Rig,
 ) -> None:

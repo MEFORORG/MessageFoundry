@@ -245,6 +245,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    TotpUsable,
     UserAuthzRecord,
     UserChange,
     UserRecord,
@@ -272,6 +273,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_verdict,
     existing_roles_only,
     federated_bind,
     federated_unbind,
@@ -279,6 +281,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
+    judge_totp,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -295,6 +298,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
@@ -304,6 +308,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -320,8 +325,8 @@ from messagefoundry.store.store import (
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_disable,
     totp_enable,
+    totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
@@ -2501,7 +2506,13 @@ _SCHEMA: list[str] = [
         public_key NVARCHAR(MAX) NOT NULL, sign_count BIGINT NOT NULL,
         transports NVARCHAR(MAX) NULL, device_type NVARCHAR(32) NOT NULL,
         backed_up BIT NOT NULL DEFAULT 0, label NVARCHAR(100) NOT NULL,
-        aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL)""",
+        aaguid NVARCHAR(64) NULL, created_at FLOAT NOT NULL, last_used_at FLOAT NULL,
+        discoverable BIT NOT NULL DEFAULT 0)""",
+    # ADR 0197 Amendment A, wave 2: COL_LENGTH-gated ADD for a table created before the column. 0 on
+    # an existing row reads "not discoverable", so such a passkey is no way past the sign-in lock --
+    # the closed direction.
+    """IF COL_LENGTH('webauthn_credentials','discoverable') IS NULL
+        ALTER TABLE webauthn_credentials ADD discoverable BIT NOT NULL DEFAULT 0""",
     # BACKLOG #3423: widen a hash column created at NVARCHAR(64) (COL_LENGTH counts bytes, so 128)
     # to hold the "wc1:" scheme tag. A table created before this change carries a SYSTEM-NAMED
     # primary key, which SQL Server will not let a column under it be altered, so the key is looked
@@ -13336,20 +13347,42 @@ class SqlServerStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
         )
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
-        # and a conditional rotation must know whether it matched.
-        return await self._write_user_txn(user_id, change) is not None
+        # and a conditional rotation must know whether it matched. The passkeys the condition reads
+        # are read in the write's own transaction; a removal that commits before the write moves
+        # the record's seal, so the write's compare loses.
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # The account row first, under UPDLOCK, so a concurrent removal waits.
+                if require_way_past:
+                    await self._read_user_record(cur, user_id)
+                change = password_change(
+                    password_hash=password_hash,
+                    password_generated=password_generated,
+                    must_change_password=must_change_password,
+                    require_way_past=require_way_past,
+                    now=now,
+                    passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
+                    sealed=self._row_sealer is not None,
+                    totp_counts=totp_counts,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -13440,10 +13473,42 @@ class SqlServerStore:
         tee_audits((audit,), appended, ts=now)
         return revoked
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
+    async def disable_totp(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
-        await self._write_user_txn(user_id, lambda r: totp_disable(r, now))
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                passkeys: list[WebAuthnCredential] = []
+                if require_way_past:
+                    # The account row first, under UPDLOCK, so a concurrent removal waits.
+                    await self._read_user_record(cur, user_id)
+                    passkeys = await self._account_passkeys(cur, user_id)
+                change = totp_removal(
+                    now,
+                    require_way_past=require_way_past,
+                    passkeys=passkeys,
+                    sealed=self._row_sealer is not None,
+                    totp_counts=totp_counts,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written is not None
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
@@ -13510,14 +13575,53 @@ class SqlServerStore:
         row = await self._fetchone("SELECT TOP (1) 1 AS present FROM webauthn_credentials")
         return row is not None
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
+    async def delete_webauthn_credential(
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
         is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592), and the
-        count is read from ``OUTPUT`` (BACKLOG #2283)."""
-        count = await self._write_passkeys_txn(
-            user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+        count is read from ``OUTPUT`` (BACKLOG #2283). With ``require_way_past``, only while a way
+        past remains after it, judged with the account row held (ADR 0197 Amendment A)."""
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
         )
+        if not require_way_past:
+            count = await self._write_passkeys_txn(
+                user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+            )
+            return count > 0
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._read_user_record(cur, user_id)
+                if current is None or not removal_keeps_way_past(
+                    current,
+                    await self._account_passkeys(cur, user_id),
+                    sealed=self._row_sealer is not None,
+                    drop_passkey=credential_id_hash,
+                    totp_counts=totp_counts,
+                ):
+                    await conn.rollback()
+                    return False
+                count = await self._write_passkeys(
+                    cur,
+                    user_id,
+                    _MSSQL_WEBAUTHN_DELETE_ONE,
+                    (user_id, credential_id_hash),
+                    counted=True,
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
         return count > 0
 
     async def rehash_webauthn_credential(self, user_id: str, old_hash: str, new_hash: str) -> bool:
@@ -13825,6 +13929,7 @@ class SqlServerStore:
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        totp_usable: TotpUsable,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -13833,8 +13938,10 @@ class SqlServerStore:
         The ``UPDLOCK`` SELECT + UPDATE run in one transaction, so concurrent attempts serialize on
         the row rather than each reading the same pre-increment count.
         :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
-        than three; the same locked read carries the ``auth_provider`` and ``totp_enabled`` that
-        decide the escalation (ADR 0197). Returns ``(0, False, 0)`` for an unknown user."""
+        than three; the same locked read carries the ``auth_provider`` that decides the escalation
+        (ADR 0197), and for the SIGN-IN lock the TOTP's refusal is judged by ``totp_usable`` before
+        the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
+        must still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         change = lockout_increment(
@@ -13844,6 +13951,15 @@ class SqlServerStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
+            totp_counts=await escalation_verdict(
+                self.get_user,
+                self.open_totp_secret,
+                user_id,
+                counter,
+                totp_usable=totp_usable,
+                threshold=threshold,
+                now=now,
+            ),
         )
         written = await self._write_user_txn(user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)

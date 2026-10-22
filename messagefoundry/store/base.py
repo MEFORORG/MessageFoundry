@@ -51,6 +51,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import (
     AuditMacFn,
     Cipher,
+    CipherError,
     CipherInfo,
     UnmarkedRefusalHook,
     make_cipher,
@@ -109,6 +110,7 @@ from messagefoundry.store.store import (
     SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
+    TotpUsable,
     UserRecord,
     WebAuthnCredential,
     note_audit_chain_read,
@@ -2210,9 +2212,11 @@ class AuthStore(Protocol):
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
-    # ``require_totp`` makes the write CONDITIONAL on ``totp_enabled`` in the same UPDATE, so an
-    # ``admin_reset_mfa`` that clears TOTP between the caller's check and this write makes it match
-    # no row. Returns whether a row was written; a conditional caller refuses on False.
+    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock, in the same
+    # transaction as the write: TOTP on with a secret, or (wave 2) a passkey recorded as
+    # discoverable, read from the set the account's seal covers. So an ``admin_reset_mfa`` or a
+    # passkey removal that lands between the caller's check and this write makes it match no row.
+    # Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
         user_id: str,
@@ -2220,7 +2224,8 @@ class AuthStore(Protocol):
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2320,7 +2325,7 @@ class AuthStore(Protocol):
     # the secret, a second confirm that enables first, or a second begin that stages another
     # secret, between the caller's read and this write, makes it match no row. ``None`` matches
     # nothing. A caller must refuse on False and never treat MFA as on, the way
-    # ``set_password(require_totp=...)`` callers do.
+    # ``set_password(require_way_past=...)`` callers do.
     async def enable_totp(
         self,
         user_id: str,
@@ -2349,7 +2354,18 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> int | None: ...
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
+    # ``require_way_past`` (ADR 0197 Amendment A, wave 2) makes the removal CONDITIONAL, in the
+    # write's own transaction, on a passkey recorded as discoverable remaining in the set the
+    # account's seal covers, so two concurrent removals cannot both pass a check made before either
+    # wrote. Returns whether a row was written; a conditional caller refuses on False.
+    async def disable_totp(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
 
@@ -2372,7 +2388,21 @@ class AuthStore(Protocol):
 
     async def any_webauthn_credentials(self) -> bool: ...
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool: ...
+    # ``require_way_past`` (ADR 0197 Amendment A, wave 2): delete only while the account keeps a way
+    # past the sign-in lock after the delete (TOTP, or another discoverable passkey), judged in the
+    # delete's own transaction with the account row held. False when refused or when no row matched.
+    # ``totp_usable`` (BACKLOG #3422) is the caller's rule for what an OPENED TOTP secret is
+    # (``TotpState``); the conditional writes count TOTP as a way past unless it is a KNOWN refusal,
+    # so an unknown one counts as the plain enabled-TOTP rule counts it. The same keyword on
+    # ``set_password``.
+    async def delete_webauthn_credential(
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool: ...
 
     async def rehash_webauthn_credential(
         self, user_id: str, old_hash: str, new_hash: str
@@ -2418,10 +2448,12 @@ class AuthStore(Protocol):
     # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
     # UPDATE, SQL Server under UPDLOCK). ``counter`` names which of the two counters the attempt
     # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
-    # reads ``auth_provider`` and ``totp_enabled`` to decide whether the lock escalates
-    # (``store.lockout_escalates``). Returns ``(attempts, just_locked, cycles)``; ``just_locked`` is
-    # decided INSIDE that atomic section and must not be recomputed outside it, where it is only the
-    # stale read again. See ``store.next_lockout_state`` for the policy.
+    # reads ``auth_provider`` for whether the lock escalates (``store.lockout_escalates``); for the
+    # SIGN-IN lock the TOTP's usability is judged before the lock, on a cell the locked row must
+    # still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(attempts, just_locked,
+    # cycles)``; ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
+    # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
+    # policy.
     async def increment_login_failure(
         self,
         user_id: str,
@@ -2430,6 +2462,10 @@ class AuthStore(Protocol):
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        # BACKLOG #3422: the caller's rule for whether an opened TOTP secret is usable. REQUIRED and
+        # never None, so no caller can omit it and lose the refused-TOTP rule: the sign-in lock
+        # keeps its fixed length only where it KNOWS the account's TOTP is refused.
+        totp_usable: TotpUsable,
         now: float | None = None,
     ) -> LockoutIncrement: ...
 
@@ -3410,6 +3446,31 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     first. Cached, because naming a server driver imports it: build it at startup, so the first
     refusal does not run that import on the event loop (vault BACKLOG #3145, #3113)."""
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
+
+
+@cache
+def audit_write_errors() -> tuple[type[Exception], ...]:
+    """What a refused audit write raises, at least on the store backends and key modes named here
+    (BACKLOG #2137, #3403). The auth service's store-refusal audit writes and the API's
+    ``alert_rules_withheld`` row catch this set; at least a few other audit writes catch their own.
+
+    :func:`store_call_errors`: the drivers' own errors, ``RuntimeError`` for the engine's own
+    refusals (the acquire timeout, a keyless audit append), ``OSError`` for a connection lost at the
+    socket, and ``ValueError``, which aiosqlite raises for a closed connection before sqlite3 is
+    reached. ``CipherError``, which a ``vault_transit`` store raises when Transit cannot compute the
+    audit-chain MAC (ADR 0138). And the driver roots that set stops beneath: ``sqlite3.Error``,
+    which takes ``sqlite3.InterfaceError``, and pyodbc's ``Error`` through
+    :func:`store_connect_errors`, which says when pyodbc raises it. So, unlike
+    :func:`store_driver_errors`, this set reads a SQLite interface error as a refusal: an audit
+    write's caller keeps its answer either way, and the row's loss is logged.
+
+    Every class in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` is inside this set, so a
+    caller that passes them as ``defects`` still raises them, because
+    :func:`~messagefoundry.audit_write.write_audit_soft` tries ``defects`` first. Cached, like
+    :func:`store_call_errors`, because naming a server driver imports it: build it at startup."""
+    import sqlite3
+
+    return (CipherError, sqlite3.Error, *store_call_errors(), *store_connect_errors())
 
 
 def store_open_errors() -> tuple[type[Exception], ...]:

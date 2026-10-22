@@ -206,6 +206,7 @@ def dual_repo(tmp_path):
     for relative in (
         "scripts/coord/seat.ps1",
         "scripts/coord/mail-key.ps1",
+        "scripts/coord/coord-root.ps1",
         "scripts/hooks/role-card-inject.ps1",
         "scripts/hooks/precompact-reprime.ps1",
     ):

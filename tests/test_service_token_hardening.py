@@ -685,6 +685,56 @@ def test_the_smoke_leg_grants_every_directory_the_samples_graph_writes() -> None
     )
 
 
+def test_the_smoke_leg_locks_each_key_file_the_engine_judges_in_the_samples_graph() -> None:
+    """Under enforce the engine refuses a connection key file a broad group can read or change
+    (BACKLOG #3402). The leg mints its one key under RUNNER_TEMP, which grants Users read, so it
+    locks and checks that key. This ties it to the key files the engine's preflight would judge in
+    the samples graph, resolved with the values the leg hands the service. A new key file of that
+    kind, or a value that moves this one, then fails here rather than in the merge queue, where run
+    39539448967 failed. It sees at least what ``connection_key_files`` sees: a key whose ``env()``
+    value nothing supplies is skipped there, and the connection's build refuses it at start."""
+    from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.key_file_access import connection_key_files
+    from messagefoundry.config.wiring import load_config
+
+    script = _smoke_step_script("Install the service")
+    # The leg's MEFOR_VALUE_* entries, one per line, with their PowerShell variables left unexpanded.
+    entries = [
+        line.strip().rstrip("`").strip().strip('"')
+        for line in script.splitlines()
+        if line.strip().startswith('"MEFOR_VALUE_')
+    ]
+    assert all("=" in entry for entry in entries), f"a value entry with no '=': {entries}"
+    environ = dict(entry.split("=", 1) for entry in entries)
+    assert environ.get("MEFOR_VALUE_REGISTRY_CLIENT_KEY") == "$key", (
+        f"CONTROL FAILED: the leg's value entries were not read: {sorted(environ)}"
+    )
+    values = load_environment_values(
+        base_dir=_ROOT, dir_name="environments", environment="prod", environ=environ
+    )
+    found = connection_key_files(load_config(_ROOT / "samples" / "config"), values)
+    assert found, "CONTROL FAILED: the samples graph names no connection key file"
+    assert {path for _, path in found} == {"$key"}, (
+        f"the leg locks only $key, and the samples graph names {found}; lock each one in the "
+        "Install the service step"
+    )
+    # In the order the step must run them: the last write of the key, the lock, then the check and
+    # the line that reads its exit code. A lock before the move would be replaced by the moved file.
+    # The grant list is pinned too: no broad group, and read for the service account.
+    needles = (
+        "Move-Item -Force -Path $wrapped -Destination $key",
+        '$clientKeyGrants = @("*S-1-5-18:F", "*S-1-5-32-544:F")',
+        'if ($env:SMOKE_ACCOUNT -ne "localsystem") { $clientKeyGrants += "${grantee}:R" }',
+        "& icacls $key /inheritance:r /grant:r $clientKeyGrants",
+        "from messagefoundry.config.key_file_access import key_file_problem as check",
+        "if ($LASTEXITCODE -ne 0) { throw \"the engine's key-file check refuses the smoke client key",
+    )
+    for needle in needles:
+        assert script.count(needle) == 1, f"the step should run {needle!r} once"
+    positions = [script.index(needle) for needle in needles]
+    assert positions == sorted(positions), f"the step runs these out of order: {needles}"
+
+
 def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
     """The leg must read the registration back, read the running engine's token, and run the probe
     as the service. This checks the commands are in the step's run script; the leg's own result is

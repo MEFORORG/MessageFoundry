@@ -689,3 +689,43 @@ and #3777, filed at the Lander's request on 2026-10-17, ask that the answer be d
 and recorded here. The rule that every answer other than `moved` writes the row, with the answer
 recorded, is the batch 259 Manager's ruling on PR 2392 on 2026-10-17; no owner ruling is recorded
 for it.
+
+## Amendment (2026-10-20) -- discoverable passkeys, a pre-auth ceremony, and the counted cell (ADR 0197 Amendment A wave 2, BACKLOG #3373)
+
+**Status:** Accepted as built, under ADR 0197 Amendment A, which asks for this amendment. Three
+decisions of this ADR change; the rest stand.
+
+1. **Registration requires a discoverable credential.** The creation options carry `residentKey`
+   `required`, the legacy `requireResidentKey`, and the `credProps` extension. Each stored passkey
+   records `discoverable`: the `credProps.rk` the client reports, or the requirement when it reports
+   none, so on a client that does not conform the record can overstate. The column rides the passkey
+   digest when it is set, so the account's seal covers a flip to discoverable, and a passkey stored
+   before the column keeps the digest it was sealed under. **Stated rather than hidden:** an authenticator that
+   cannot store a discoverable credential, such as an older U2F key, can no longer register; its
+   holder keeps TOTP. A passkey registered before this amendment records `discoverable` false and is
+   left as it is.
+2. **A pre-auth assertion ceremony exists.** Section 2's challenge cache is fed only by
+   authenticated sessions. The usernameless sign-in stages its challenge before anyone is
+   authenticated, so it has its own pool, `PreAuthChallengePool`: 4096 entries for 120 s, keyed by
+   the hash of an opaque per-begin handle the console sets as an HttpOnly cookie, never by client
+   address, and a full pool evicts its oldest entry rather than refusing. Its begin leg charges the
+   sign-in limiter first and takes no username; its options carry an empty `allowCredentials`. The
+   sign-in pops the challenge on arrival, whatever the outcome. The assertion must come from one of
+   the named account's own passkeys and verify under its stored key, which is what binds it to that
+   account; its `userHandle` must also be the account's id, a consistency check only, since the
+   client chooses it and the signature does not cover it.
+3. **One assertion failure is now counted.** Decision 1(d) and the docstring of
+   `finish_webauthn_assertion` say assertion failures never feed the lockout, because a signature is
+   not a guessable secret and a flaky authenticator must not lock the account. That stays true of
+   the second-factor leg. On the combined passkey sign-in, an invalid assertion is counted on the
+   sign-in counter, beside the password, whatever the password was. Left uncounted, "right password,
+   invalid assertion" was a silent password oracle (ADR 0197 Amendment A, adversarial review round
+   1). On an account without TOTP a flaky authenticator there costs the owner only the fixed
+   sign-in lock, which this path passes anyway; on one with a TOTP enrolled the sign-in lock
+   escalates unless the engine knows this release refuses that enrolment
+   ([SECURITY.md, WebAuthn passkeys](../SECURITY.md#webauthn-passkeys-wp-14b-adr-0068) states the
+   rule and its races), and a usable TOTP's combined sign-in passes it. A valid assertion beside a wrong password counts on the second-step counter.
+
+**Who decided.** The design is ADR 0197 Amendment A, option N-G, accepted by the batch 121 Manager
+on 2026-09-28 under the owner's "No, fix it" ruling; it is not itself an owner ruling. This
+amendment records the build (BACKLOG #3373).

@@ -69,6 +69,7 @@ async def _enroll(
     *,
     label: str = "test key",
     auth: SoftAuthenticator | None = None,
+    resident_key: bool | None = None,
 ) -> tuple[SoftAuthenticator, str]:
     """Run a full real registration ceremony.
 
@@ -85,7 +86,7 @@ async def _enroll(
     challenge = base64url_to_bytes(opts["challenge"])
     elevation = await service.finish_webauthn_registration(
         identity,
-        auth.create_response(challenge, transports=["usb"]),
+        auth.create_response(challenge, transports=["usb"], resident_key=resident_key),
         label=label,
         token=token,
         rp_id=RP,
@@ -754,12 +755,12 @@ async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
-        # The passkey is registered with the requirement off: under it, wave 1 of ADR 0197
-        # Amendment A refuses a passkey as a covered account's first factor. This builds the
-        # passkey-only state an account can still hold from before the requirement covered it.
+        # The passkey is registered with the requirement off, and its client reports it is NOT
+        # discoverable: so ADR 0068's last-factor refusal is what answers, not ADR 0197 Amendment
+        # A's way-past refusal, which a discoverable passkey meets first (tested below).
         setup = await _service(store, notifier=notifier)
         identity, token, _ = await login_admin(setup)
-        _, token = await _enroll(setup, identity, token)
+        _, token = await _enroll(setup, identity, token, resident_key=False)
         # require_mfa targets local Administrators — the test admin qualifies.
         service = await _service(store, notifier=notifier, require_mfa=True)
         creds = await store.list_webauthn_credentials(identity.user_id)
@@ -924,9 +925,20 @@ async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_rem
 
         real_delete = store.delete_webauthn_credential
 
-        async def racing_delete(user_id: str, credential_id_hash: str) -> bool:
+        async def racing_delete(
+            user_id: str,
+            credential_id_hash: str,
+            *,
+            require_way_past: bool = False,
+            totp_usable: Any = None,
+        ) -> bool:
             await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
-            return await real_delete(user_id, credential_id_hash)
+            return await real_delete(
+                user_id,
+                credential_id_hash,
+                require_way_past=require_way_past,
+                totp_usable=totp_usable,
+            )
 
         store.delete_webauthn_credential = racing_delete  # type: ignore[method-assign]
         assert (

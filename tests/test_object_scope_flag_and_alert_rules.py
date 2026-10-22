@@ -14,18 +14,31 @@ NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import sqlite3
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import httpx
+import pytest
+from starlette.requests import Request
 
+from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertRule, AlertsSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.crypto import CipherError
+from tests.test_audit_write import fake_pyodbc  # noqa: F401
 from tests.test_channel_rbac import _add, _login, _probe, _service, engine  # noqa: F401
 from tests.test_connection_audit_writes import toml_engine  # noqa: F401
+from tests.test_dual_control_reload import _settle_unlanded
 
 _DENIED = {"detail": "not authorized for this connection"}
 
@@ -168,3 +181,177 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
         assert await ids("scoped") == ["all", "mine", "mine-targets-mine"]
         # An unprovisioned operator still sees the rule that names nobody.
         assert await ids("empty") == ["all"]
+
+
+async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3403: a read that withholds at least one rule writes ``alert_rules_withheld``, naming
+    the counts shown and withheld and no rule's contents. A read that withholds nothing writes none,
+    even a channel-scoped one. No read writes ``auth.channel_denied``."""
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "empty", Role.OPERATOR, [])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    # The same scoped caller against rules its scope fully covers withholds nothing.
+    covered = create_app(
+        engine,
+        auth=service,
+        alerts_settings=AlertsSettings(
+            rules=[AlertRule(id="all", connection="*"), AlertRule(id="mine", connection="IB_A")]
+        ),
+    )
+    async with (
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=covered), base_url="http://t"
+        ) as c_covered,
+    ):
+
+        async def withheld_rows(username: str, client: httpx.AsyncClient = c) -> list[Any]:
+            h = await _login(client, username)
+            latest = await engine.store.list_audit(limit=1)
+            last_id = latest[0]["id"] if latest else 0
+            assert (await client.get("/alerts/rules", headers=h)).status_code == 200
+            rows = [r for r in await engine.store.list_audit(limit=50) if r["id"] > last_id]
+            assert not [r for r in rows if r["action"] == "auth.channel_denied"], rows
+            return [r for r in rows if r["action"] == "alert_rules_withheld"]
+
+        total = len(_RULES.rules)
+        for username, shown in (("scoped", 3), ("empty", 1)):
+            rows = await withheld_rows(username)
+            assert len(rows) == 1, rows
+            row = rows[0]
+            assert row["actor"] == username
+            assert row["channel_id"] is None
+            assert json.loads(str(row["detail"])) == {"shown": shown, "withheld": total - shown}
+        assert await withheld_rows("wide") == []
+        assert await withheld_rows("scoped", c_covered) == []
+
+
+async def _read_rules_while_the_row_raises(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> httpx.Response:
+    """``GET /alerts/rules`` as a scoped caller, with the ``alert_rules_withheld`` write raising
+    ``error`` and every other audit write landing."""
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "scoped")
+        real = service.store.record_audit
+
+        async def refuse(action: str, **kwargs: Any) -> None:
+            if action == "alert_rules_withheld":
+                raise error
+            await real(action, **kwargs)
+
+        monkeypatch.setattr(service.store, "record_audit", refuse)
+        return await c.get("/alerts/rules", headers=h)
+
+
+def _assert_answered_and_logged(
+    r: httpx.Response, caplog: pytest.LogCaptureFixture, error: type[Exception]
+) -> None:
+    assert r.status_code == 200, r.text
+    assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
+    [lost] = [rec for rec in caplog.records if "its audit row failed" in rec.getMessage()]
+    assert lost.levelno == logging.ERROR
+    assert f"showed 3 and withheld {len(_RULES.rules) - 3} rules" in lost.getMessage()
+    assert lost.exc_info is not None and isinstance(lost.exc_info[1], error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError,
+        CipherError,
+        sqlite3.InterfaceError,
+        sqlite3.OperationalError,
+        *AUDIT_WRITE_DEFECTS,
+    ],
+)
+async def test_alert_rules_withheld_row_is_fail_soft(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: type[Exception],
+) -> None:
+    """BACKLOG #3403: the row is written fail-soft. A store refusal (``RuntimeError``, or a
+    sqlite3 error, ``InterfaceError`` among them), a cipher fault and a defect in the write all
+    leave the narrowed answer standing and log the loss at ERROR with the row's counts and its
+    traceback. A 500 would tell a scoped caller that hidden rules exist."""
+    r = await _read_rules_while_the_row_raises(engine, monkeypatch, error("refused"))
+    _assert_answered_and_logged(r, caplog, error)
+
+
+@pytest.mark.parametrize("name", ["Error", "InterfaceError", "DatabaseError"])
+async def test_alert_rules_withheld_row_survives_a_pyodbc_fault(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fake_pyodbc: ModuleType,  # noqa: F811
+    name: str,
+) -> None:
+    """BACKLOG #3403: pyodbc raises its ``Error`` root for a SQL Server deadlock victim and its
+    ``InterfaceError`` for a failed re-login. Either one during the row's write still leaves the
+    narrowed answer standing, as main serves the read. pyodbc is optional, so a stand-in module
+    with its error tree takes its place here."""
+    error = cast(type[Exception], getattr(fake_pyodbc, name))
+    r = await _read_rules_while_the_row_raises(engine, monkeypatch, error("40001"))
+    _assert_answered_and_logged(r, caplog, error)
+
+
+async def test_alert_rules_withheld_row_fault_outside_the_catch_set_is_a_500(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3403: the catch set is not every ``Exception``. A fault no store refusal raises,
+    such as a ``TypeError`` from a wrong argument, escapes as a 500 rather than being logged as a
+    lost row."""
+    r = await _read_rules_while_the_row_raises(engine, monkeypatch, TypeError("PROBE: a bug"))
+    assert r.status_code == 500
+
+
+async def test_alert_rules_withheld_row_cancelled_mid_write_is_logged(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3403: a cancel that lands while the row is being written waits a bounded time for
+    it. A row that still does not land is logged at ERROR with its counts, actor and client, and
+    with no rule's contents."""
+    service = await _service(engine)
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held(action: str, **_kw: Any) -> None:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("PROBE: the store is closed")
+
+    monkeypatch.setattr(service.store, "record_audit", held)
+    monkeypatch.setattr(app_module, "_ROW_CANCEL_WAIT_SECONDS", 0.05)
+    request = Request({"type": "http", "app": app, "client": ("10.0.0.9", 5), "headers": []})
+    identity = cast(Identity, SimpleNamespace(username="scoped"))
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        task = asyncio.create_task(app_module._audit_alert_rules_withheld(request, identity, 3, 2))
+        try:
+            await asyncio.wait_for(entered.wait(), 5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()  # the write left running now meets the closed store
+            await _settle_unlanded()
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    message = lost.getMessage()
+    assert "action=alert_rules_withheld actor=scoped" in message
+    assert '"shown": 3' in message and '"withheld": 2' in message
+    assert "client=10.0.0.9" in message
+    assert "IB_" not in message and "OB_X" not in message
