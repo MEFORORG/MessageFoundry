@@ -352,9 +352,7 @@ def required_verdict(
             continue
         speaker = _speaker(matching)
         failing, unsettled = pr_checks.counts([speaker])
-        stale = isinstance(speaker, dict) and (
-            str(speaker.get("conclusion") or "").upper() == pr_checks.STALE
-        )
+        stale = pr_checks.verdict_of(speaker) == pr_checks.STALE
         if failing:
             out["failing"].append(name)
         elif unsettled or stale:
@@ -674,6 +672,12 @@ def failed(
     return doc
 
 
+def _previous(out: Path, repo: str) -> dict[str, Any] | None:
+    """The previous cache, unless it is another repo's: its list and PRs must not carry over."""
+    previous = read_cache(out)
+    return previous if previous is not None and previous.get("repo") == repo else None
+
+
 def read_cache(path: Path) -> dict[str, Any] | None:
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -721,15 +725,7 @@ def acquire_lock(local: Path) -> int | None:
     except OSError as exc:
         raise LockUnavailable(f"cannot open {lock}: {exc!r}") from exc
     try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_op(fd, take=True)
     except OSError as exc:
         os.close(fd)
         if exc.errno in _CONTENTION:
@@ -753,18 +749,23 @@ _CONTENTION = frozenset(
 )
 
 
+def _lock_op(fd: int, *, take: bool) -> None:
+    """Take (non-blocking) or drop the one-byte lock at offset 0."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB if take else fcntl.LOCK_UN)
+
+
 def release_lock(fd: int) -> None:
     """Unlock, then close. The lock file stays; it is never deleted."""
     try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        _lock_op(fd, take=False)
     except OSError as exc:
         _say(f"unlocking failed; closing the handle releases it anyway: {exc!r}")
     try:
@@ -820,12 +821,9 @@ def main(
         _say(str(exc))
         # Written without the lock, because the lock itself is what is broken: no run can hold it,
         # so no run is writing the cache. Readers see why it stopped moving.
-        previous = read_cache(out)
-        if previous is not None and previous.get("repo") != args.repo:
-            previous = None
+        previous = _previous(out, args.repo)
         try:
             doc = failed(args.repo, previous, str(exc), now(), part="lock")
-            doc["nextPollNotBefore"] = (previous or {}).get("nextPollNotBefore")
             write_cache(out, doc)
         except OSError as werr:
             _say(f"could not record the lock failure in the cache either: {werr!r}")
@@ -834,9 +832,7 @@ def main(
         return 0  # another poll is running; it will write the cache
     try:
         start = now()
-        previous = read_cache(out)
-        if previous is not None and previous.get("repo") != args.repo:
-            previous = None  # another repo's list and PRs must not carry over
+        previous = _previous(out, args.repo)
         not_before = parse_iso(previous.get("nextPollNotBefore")) if previous else None
         if not_before is not None and not_before > start + MAX_BACKOFF:
             not_before = None  # stamped by a skewed clock or a copied file; never wait on it

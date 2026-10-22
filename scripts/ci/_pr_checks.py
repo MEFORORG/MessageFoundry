@@ -65,6 +65,13 @@ def in_progress(node: object) -> bool:
     return str(node.get("state") or "").upper() in UNSETTLED
 
 
+def verdict_of(node: object) -> str:
+    """A node's verdict, upper-cased: a CheckRun's ``conclusion``, else a StatusContext's ``state``."""
+    if not isinstance(node, dict):
+        return ""
+    return str(node.get("conclusion") or node.get("state") or "").upper()
+
+
 def counts(rollup: object) -> tuple[int, int]:
     """``(failing, unsettled)`` over a ``statusCheckRollup`` payload.
 
@@ -78,9 +85,7 @@ def counts(rollup: object) -> tuple[int, int]:
         if not isinstance(node, dict):
             unsettled += 1
             continue
-        conclusion = str(node.get("conclusion") or "").upper()
-        state = str(node.get("state") or "").upper()
-        verdict = conclusion or state
+        verdict = verdict_of(node)
         if in_progress(node):
             unsettled += 1
         elif verdict in FAILING:

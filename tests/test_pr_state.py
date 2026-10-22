@@ -677,7 +677,7 @@ def test_an_unexpected_shape_names_its_part_and_keeps_the_budget(
     assert doc["rateLimit"]["remaining"] == 4900 and doc["requiredContexts"] == sorted(REQUIRED)
 
 
-def test_a_truncated_page_still_lists_github_required_names(tmp_path: Path) -> None:
+def test_a_truncated_page_still_lists_github_required_names() -> None:
     extra = {**_run("new-required"), "isRequired": True}
     ctx = {"oid": "oid1", "nodes": [*_green(), extra], "hasNextPage": True}
     verdict = ps.shape_pr(_pr(1), sorted(REQUIRED), ctx)["required"]
