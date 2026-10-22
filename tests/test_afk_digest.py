@@ -12,30 +12,35 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests._fake_gh import COORD, VAULT, Sandbox, make_sandbox, utc_day_with_room
+from tests._fake_gh import (
+    COORD,
+    VAULT,
+    Sandbox,
+    id_day,
+    make_sandbox,
+    utc_day_now,
+    utc_day_with_room,
+)
 
 DIGEST = COORD / "digest.ps1"
 DECISION = COORD / "decision.ps1"
 MARKER = "<!-- mefor-decision v1 -->"
-# A fixed day, passed to every digest run as -Day, so no test reads the wall clock: a run that
-# crosses UTC midnight would otherwise seed one day and have digest.ps1 default to the next.
+# A fixed day, which digest() passes as -Day unless a test names its own, so a seeded test never
+# reads the wall clock: a run that crosses UTC midnight would otherwise seed one day and have
+# digest.ps1 default to the next. A test whose records decision.ps1 mints from the wall clock
+# names its day from the minted id, or from utc_day_with_room().
 TODAY_DATE = date(2026, 6, 15)
 TODAY = TODAY_DATE.isoformat()
 
 
 def days_before(n: int) -> str:
     return (TODAY_DATE - timedelta(days=n)).isoformat()
-
-
-def id_day(decision_id: str) -> str:
-    """The UTC day a decision id carries, as decision.ps1 minted it."""
-    return f"{decision_id[1:5]}-{decision_id[5:7]}-{decision_id[7:9]}"
 
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
@@ -99,7 +104,7 @@ def seed(sb: Sandbox, records: list[dict[str, Any]]) -> None:
 
 
 def digest(sb: Sandbox, *args: str, code: int = 0) -> str:
-    day = () if "-Day" in args else ("-Day", TODAY)
+    day = () if any(a.lower() == "-day" for a in args) else ("-Day", TODAY)
     proc = sb.run(DIGEST, *day, *args)
     assert proc.returncode == code, (proc.stdout, proc.stderr)
     return proc.stdout
@@ -380,9 +385,9 @@ def test_a_reversal_of_an_earlier_days_unrated_sample_stays_hidden(sb: Sandbox) 
 
 def test_with_no_day_the_digest_is_for_the_utc_day_it_runs(sb: Sandbox) -> None:
     """Read either side of the run, so a run that crosses UTC midnight still passes."""
-    before = datetime.now(UTC).date().isoformat()
+    before = utc_day_now()
     proc = sb.run(DIGEST, "-Sample", "0")
-    after = datetime.now(UTC).date().isoformat()
+    after = utc_day_now()
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     day = before if f"digest, {before} (UTC)" in proc.stdout else after
     assert f"# AFK-autonomy digest, {day} (UTC)" in proc.stdout, proc.stdout
@@ -403,10 +408,14 @@ def test_an_unread_vault_marks_the_digest_incomplete(sb: Sandbox) -> None:
 
 def test_end_to_end_a_logged_decision_is_sampled_and_rated(sb: Sandbox) -> None:
     args = ("-Log", "-Item", "7", "-Class", "B", "-Seat", "manager", "-Recommendation", "go")
+    before = utc_day_now()
     logged = sb.run(DECISION, *args, "-Alternative", "stop")
+    after = utc_day_now()
     assert logged.returncode == 0, logged.stderr
     did = logged.stdout.split()[1]
-    # decision.ps1 mints the id from the wall clock, so the digest reads the day the id carries.
+    # The id is dated on the UTC day it was logged, which the default digest day also is; the
+    # digest then reads the id's own day, so a run across UTC midnight still finds it.
+    assert id_day(did) in {before, after}
     out = digest(sb, "-Day", id_day(did), "-Sample", "1")
     assert f"### `{did}`" in out
     assert sb.run(DIGEST, "-Rate", did, "agree").returncode == 0

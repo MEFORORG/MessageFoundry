@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests._fake_gh import COORD, Sandbox, make_sandbox, utc_day_with_room
+from tests._fake_gh import COORD, Sandbox, id_day, make_sandbox, utc_day_now, utc_day_with_room
 
 DECISION = COORD / "decision.ps1"
 
@@ -57,21 +57,25 @@ def _logged_id(stdout: str) -> str:
 
 
 def _list(sb: Sandbox, *args: str) -> list[dict[str, Any]]:
-    # Two days ending the listing's own: a record a test logged just before UTC midnight is still
-    # in the window when the listing runs just after it.
-    proc = sb.run(DECISION, "-List", "-Json", "-Days", "2", *args)
+    # Two days ending the listing's own, unless a test names its window: a record a test logged
+    # just before UTC midnight is still in the window when the listing runs just after it.
+    window = () if any(a.lower() == "-days" for a in args) else ("-Days", "2")
+    proc = sb.run(DECISION, "-List", "-Json", *window, *args)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     rows: list[dict[str, Any]] = json.loads(proc.stdout) if proc.stdout.strip() else []
     return rows
 
 
 def test_log_posts_one_comment_to_the_days_issue_with_the_full_schema(sb: Sandbox) -> None:
+    before = utc_day_now()
     proc = sb.run(DECISION, *B_DECISION)
+    after = utc_day_now()
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert proc.stdout.strip().endswith("posted")
     issues = sb.issues()
     did = _logged_id(proc.stdout)
-    assert [i["title"] for i in issues] == [f"decision-log {did[1:5]}-{did[5:7]}-{did[7:9]}"]
+    assert id_day(did) in {before, after}, "the id is not dated on the UTC day it was logged"
+    assert [i["title"] for i in issues] == [f"decision-log {id_day(did)}"]
     assert issues[0]["labels"] == ["decision-log"]
     (body,) = _comments(sb)
     assert body.startswith("<!-- mefor-decision v1 -->")

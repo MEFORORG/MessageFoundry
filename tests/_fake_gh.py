@@ -35,19 +35,29 @@ VAULT = "MEFORORG/MessageFoundry-vault"
 ENGINE = "MEFORORG/MessageFoundry"
 
 
-def utc_day_with_room(seconds: float = 120.0) -> str:
+def id_day(decision_id: str) -> str:
+    """The UTC day a decision id carries, as _decisionlog.ps1's Get-DecisionIdDay reads it."""
+    return f"{decision_id[1:5]}-{decision_id[5:7]}-{decision_id[7:9]}"
+
+
+def utc_day_now() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+def utc_day_with_room(seconds: float = 30.0) -> str:
     """Today's UTC day, first waiting out midnight if fewer than ``seconds`` of it remain.
 
     decision.ps1 mints a record's id, and so its day, from the wall clock and has no seam for it.
     A test whose script runs must all land on one day calls this first, so the runs that follow
-    it land on the day it returns rather than straddling UTC midnight.
+    it land on the day it returns rather than straddling UTC midnight. The wait, plus the test's
+    own runs, stays inside the 60-second per-test timeout pyproject.toml sets.
     """
     now = datetime.now(UTC)
     midnight = datetime(now.year, now.month, now.day, tzinfo=UTC) + timedelta(days=1)
     left = (midnight - now).total_seconds()
     if left < seconds:
         time.sleep(left + 1)
-    return datetime.now(UTC).date().isoformat()
+    return utc_day_now()
 
 
 def _answer(state: dict[str, Any], argv: list[str]) -> tuple[int, str, str]:
