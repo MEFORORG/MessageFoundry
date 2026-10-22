@@ -2154,6 +2154,41 @@ def test_a_double_dash_does_not_let_a_branch_switch_through_class_A(
     assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
 
 
+@pytest.mark.parametrize(
+    ("tool", "tail"),
+    [
+        ("Bash", "checkout free-branch -- &"),
+        ("PowerShell", "checkout free-branch -- *> $null"),
+        ("PowerShell", "checkout free-branch -- *>&1"),
+    ],
+)
+def test_what_follows_a_double_dash_must_be_a_pathspec(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tool: str, tail: str
+) -> None:
+    """A background `&` and PowerShell's all-stream redirections never reach git, so each of these
+    is `checkout <b> --`, a branch switch. Read as a pathspec, they were allowed as a restore."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine, tool=tool), hijack_repos_file))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'checkout "--detach" free-branch',
+        "switch '--detach' free-branch",
+        # main is live in the primary, and the quoted flag switches off git's guard.
+        'checkout main "--ignore-other-worktrees"',
+    ],
+)
+def test_a_quoted_flag_is_still_a_flag_to_class_A(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """The shell strips the quotes, so git reads each as the bare flag. The destination scan took a
+    quoted flag for the destination, and the flag test did not count it."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
 @pytest.mark.parametrize("tail", ["checkout main --", "switch -- main"])
 def test_a_double_dash_onto_a_branch_live_elsewhere_is_left_to_git(
     hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str

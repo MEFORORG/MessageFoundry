@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.9"
+$GateVersion = "2026.10.21.10"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2808,13 +2808,18 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # StartsWith skipped `<U+00AD>-feat`, a branch, as a flag, and the ordinal one skips
         # `-<U+0301>x`, which origin/main took for the destination. Each candidate is judged below,
         # and the first that would be denied is. The flag test below stays culture: there a match denies.
+        # A QUOTED FLAG IS A FLAG TOO: the shell strips the quotes, so `checkout "--detach" <b>` detaches
+        # onto <b>. Reading the raw token took `--detach` for the destination, which is no branch, and
+        # allowed it. The unquoted reading is ADDED, not swapped in, so no candidate is lost.
         foreach ($cmp in $destCmps) {
-            foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-                if ($tok.StartsWith('-', $cmp)) { continue }
-                $cand = $tok.Trim('"', "'")
-                if ($cand -and -not @($dests | Where-Object {
-                            [string]::Equals($_, $cand, [System.StringComparison]::Ordinal) })) { $dests += $cand }
-                break
+            foreach ($unquote in @($false, $true)) {
+                foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+                    $cand = $tok.Trim('"', "'")
+                    if ($(if ($unquote) { $cand } else { $tok }).StartsWith('-', $cmp)) { continue }
+                    if ($cand -and -not @($dests | Where-Object {
+                                [string]::Equals($_, $cand, [System.StringComparison]::Ordinal) })) { $dests += $cand }
+                    break
+                }
             }
         }
         if ($dests.Count -eq 0) { return }
@@ -2933,9 +2938,12 @@ What to do instead:
     $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
     # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
     # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
-    # so only `--` itself is excused.
+    # so only `--` itself is excused. A QUOTED flag counts: `checkout <b> "--ignore-other-worktrees"`
+    # switches off the guard as the bare one does.
     $hasFlag = @($after -split '\s+' | Where-Object {
-            $_ -and $_.StartsWith('-') -and -not [string]::Equals($_, '--', [System.StringComparison]::Ordinal) }).Count -gt 0
+            $u = $_.Trim('"', "'")
+            $_ -and ($_.StartsWith('-') -or $u.StartsWith('-')) -and
+                -not [string]::Equals($u, '--', [System.StringComparison]::Ordinal) }).Count -gt 0
     $denyDest = $null
     foreach ($dest in $dests) {
         # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
@@ -3154,8 +3162,26 @@ function Test-VerbMovesHeadAs([string]$Verb, [string]$After, [System.StringCompa
         $toks += $t
     }
     $dashDash = [array]::IndexOf($toks, '--')
-    $pathAfter = ($dashDash -ge 0 -and $dashDash -lt ($toks.Count - 1))
-    if ($Verb -ne "reset") { return (-not $pathAfter) }
+    if ($Verb -ne "reset") {
+        # A PATHSPEC MUST FOLLOW THE `--`, not merely a token. A lone `&` backgrounds the command, and
+        # PowerShell's `*>`, `*>>` and `*>&1` redirect every stream; none reaches git, so `checkout <b>
+        # -- &` and `checkout <b> -- *> $null` switch branches. They are dropped for this test only:
+        # reset reads them as positionals below, and dropping them there would allow a reset this
+        # function denies today.
+        if ($dashDash -lt 0) { return $true }
+        $skipTarget = $false
+        for ($i = $dashDash + 1; $i -lt $toks.Count; $i++) {
+            $p = $toks[$i]
+            if ($skipTarget) { $skipTarget = $false; continue }
+            if ([string]::Equals($p, '&', [System.StringComparison]::Ordinal)) { continue }
+            if ($p -match '^\*[<>]') {
+                if ($p -match '^\*[<>]+$') { $skipTarget = $true }
+                continue
+            }
+            return $false
+        }
+        return $true
+    }
     foreach ($t in $toks) {
         # ORDINAL in both readings: a match reads as moving no HEAD, a culture `-eq` read `<U+00AD>--`,
         # a valid branch name, as the `--` separator, and an ordinal Equals matches nothing it does not.
@@ -3196,7 +3222,15 @@ function Get-WorktreeVictimTokens([string]$After) {
     $toks = @(foreach ($m in [regex]::Matches($After, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
             $m.Groups['q'].Value
         })
+    # GIT'S OWN READING FIRST -- the token after `--`, then the ordinal one, which matches git's byte
+    # test -- because the rule denies on the first governed candidate, and its text then describes
+    # the path git acts on rather than a spare.
     $found = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt ($toks.Count - 1); $i++) {
+        if (-not [string]::Equals($toks[$i], '--', [System.StringComparison]::Ordinal)) { continue }
+        if ($toks[$i + 1]) { $found.Add($toks[$i + 1]) }
+        break
+    }
     foreach ($cmp in $victimCmps) {
         foreach ($tok in $toks) {
             if (-not $tok) { continue }
@@ -3204,12 +3238,6 @@ function Get-WorktreeVictimTokens([string]$After) {
             if (-not $found.Contains($tok)) { $found.Add($tok) }
             break
         }
-    }
-    for ($i = 0; $i -lt ($toks.Count - 1); $i++) {
-        if (-not [string]::Equals($toks[$i], '--', [System.StringComparison]::Ordinal)) { continue }
-        $next = $toks[$i + 1]
-        if ($next -and -not $found.Contains($next)) { $found.Add($next) }
-        break
     }
     return $found.ToArray()
 }
@@ -3802,7 +3830,9 @@ What to do instead:
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
-        # First positional (non-flag) token after the subcommand is the worktree being acted on, read
+        # The worktree acted on is a positional token after the subcommand, and
+        # Get-WorktreeVictimTokens returns EVERY reading of which one: the token after `--`, and the
+        # first non-flag token under each comparison. Each is judged below. The tokens are read
         # QUOTE-AWARE (BACKLOG #1064, defect A). This was `$after -split '\s+'` followed by
         # `.Trim('"', "'")` -- a tokeniser that never reads the quotes it strips. A quoted path
         # containing a SPACE became two tokens, the first was taken, `git -C` failed on the truncated
