@@ -45,14 +45,50 @@ quiet() {
     return 1
 }
 
+# At VM boot another process can hold an apt or dpkg lock: on 2026-10-21 a bare `dpkg -i` lost to
+# pid 280 and pwsh never installed. So the install waits out a held lock instead of failing, from
+# ONE budget shared by its apt-get calls, because per-call waits could add up past the hook's
+# timeout in .claude/settings.json (see the venv note below for what a timeout costs).
+lock_wait=120
+
+# Seconds left before the deadline $1, a value of $SECONDS; never negative.
+lock_left() {
+    local left=$(($1 - SECONDS))
+    echo $((left > 0 ? left : 0))
+}
+
+# apt-get, waiting out a held lock for whatever the budget has left. DPkg::Lock::Timeout covers
+# dpkg's locks; apt is not relied on to wait for the package-lists lock (`update`) or the archives
+# lock (`install`), so a run whose output names a held lock is retried until the deadline. Any
+# other failure returns at once. LC_ALL=C keeps that message in the English the grep matches, and
+# stdin is closed because the hook's stdin carries the SessionStart JSON, not answers for dpkg.
+apt_wait() {
+    local deadline=$1 out rc
+    shift
+    while :; do
+        out="$(DEBIAN_FRONTEND=noninteractive LC_ALL=C apt-get -o DPkg::Lock::Timeout="$(lock_left "$deadline")" "$@" </dev/null 2>&1)"
+        rc=$?
+        if [ "$rc" = 0 ] || ! grep -q 'Could not get lock' <<<"$out" || [ "$(lock_left "$deadline")" = 0 ]; then
+            break
+        fi
+        sleep 2
+    done
+    printf '%s\n' "$out"
+    return "$rc"
+}
+
 install_pwsh() {
-    local deb
+    local deb deadline=$((SECONDS + lock_wait))
     deb="$(mktemp --suffix=.deb)"
-    # packages.microsoft.com is on the cloud environment's default Trusted allowlist.
-    curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -o "$deb" &&
-        dpkg -i "$deb" &&
-        apt-get update -qq &&
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq powershell
+    # packages.microsoft.com is on the cloud environment's default Trusted allowlist. The .deb goes
+    # through apt-get, not dpkg -i, because dpkg cannot wait for its lock; apt-get reads an argument
+    # as a file only when it contains a slash, and mktemp's path is absolute. --reinstall keeps
+    # dpkg -i's re-laying of an already-installed copy. curl is time-bounded like the lock waits.
+    curl -fsSL --connect-timeout 20 --max-time 60 -o "$deb" \
+        https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb &&
+        apt_wait "$deadline" install -y -qq --reinstall "$deb" &&
+        apt_wait "$deadline" update -qq &&
+        apt_wait "$deadline" install -y -qq powershell
     local rc=$?
     rm -f "$deb"
     return $rc

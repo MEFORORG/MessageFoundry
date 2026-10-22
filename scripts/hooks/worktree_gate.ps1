@@ -20,7 +20,9 @@
       2. A Task/Agent/Workflow dispatch made FROM the primary -- because a subagent inherits the parent's
          cwd, cannot create a worktree of its own, and its denied edits do not reliably surface to the
          parent (measured: the parent's result came back with an EMPTY permission_denials list). Blocking
-         the fan-out costs one second; letting it run costs the whole workflow.
+         the fan-out costs one second; letting it run costs the whole workflow. A Task/Agent call whose
+         subagent_type is exactly web-fetch or claude-code-guide is exempt; the "# Rule 2" comment block
+         below says why and names at least its residuals.
 
     KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
     made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
@@ -67,7 +69,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.18.1"
+$GateVersion = "2026.10.21.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2862,14 +2864,42 @@ What to do instead:
 # ---------------------------------------------------------------------------------------------------
 # Rule 2 -- dispatching a fan-out FROM the primary. Checked first: it is the cheapest place to stop a
 # workflow that would otherwise burn 40 minutes and then report success while having written nothing.
+#
+# EXEMPT: a Task/Agent call whose tool_input has one key spelled exactly "subagent_type" and whose value
+# is a string ORDINALLY equal to "web-fetch" or "claude-code-guide". Ordinal, not -ceq/-cin: PowerShell's
+# culture comparison ignores zero-width, soft-hyphen and NUL characters, so "web-fetch" plus U+200B would
+# match. The key is matched ordinally too, because a PSCustomObject property read is case-insensitive.
+# Owner authorization 2026-10-21, for docs/AUTONOMY-PLAN.md section 6, item 1 (on branch autonomy-plan
+# when this was written; its brief called it 6.1). Those two built-in types carry no shell AND no write tool (WebFetch; Glob/Grep/Read/
+# WebFetch/WebSearch), so inheriting the primary's cwd cannot build or swap anything there, which is the
+# harm this rule exists for. "No shell" alone is not the criterion: statusline-setup has none but has Edit.
+# Everything else stays denied: Explore and Plan have Bash, and a shell write evades rule 1 outright;
+# general-purpose, fork, a missing or non-string type, any other spelling of the two names, and every
+# Workflow. RESIDUALS, at least: the match is on the NAME, not on the tool list, so an agent defined under
+# either name with a shell or a write tool passes too, from any source that can define one (project or
+# user agents, the --agents flag, an SDK host's agents option); and the premise rests on the vendor's
+# current tool lists for these two types, which no test here pins.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("Task", "Agent", "Workflow")) {
+    if ($tool -ne "Workflow") {
+        $typeProps = @($hook.tool_input.PSObject.Properties |
+            Where-Object { [string]::Equals($_.Name, "subagent_type", [StringComparison]::Ordinal) })
+        # Assigned, never `$x = if (...) { ... }`: that form's pipeline output unrolls a one-element JSON
+        # array into its bare string, which would then pass the type check below.
+        $subagentType = $null
+        if ($typeProps.Count -eq 1) { $subagentType = $typeProps[0].Value }
+        if ($subagentType -is [string] -and
+            ([string]::Equals($subagentType, "web-fetch", [StringComparison]::Ordinal) -or
+             [string]::Equals($subagentType, "claude-code-guide", [StringComparison]::Ordinal))) {
+            exit 0
+        }
+    }
     $root = Test-Governed $cwd
     if ($root) {
         $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
-BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
-subagents. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
+BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not make
+this dispatch. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
 not reliably surface back to you -- the fan-out would appear to succeed while writing nothing.
 
 Create a worktree first, then dispatch from it:

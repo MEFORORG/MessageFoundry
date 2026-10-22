@@ -1883,9 +1883,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is
     # discarded and never compared. ``check_credential_generation`` (Manager decision 2026-09-29)
     # draws one temporary credential from the CSPRNG through the same generator the engine issues
-    # with, to prove the policy leaves one to issue; the value is discarded.
+    # with, to prove the policy leaves one to issue; the value is discarded. Wave 2 (BACKLOG #3373):
+    # the census hashes an account's passkey set (``passkey_digest``, SHA-256) to compare it with the
+    # digest the account's seal covers, so a passkey row flipped outside the store is not counted.
     "messagefoundry/verify/checks.py": frozenset(
-        {"csprng:via messagefoundry.auth.service", "mac:via messagefoundry.auth.service"}
+        {
+            "csprng:via messagefoundry.auth.service",
+            "hash:via messagefoundry.auth.service",
+            "mac:via messagefoundry.auth.service",
+        }
     ),
     # Vault BACKLOG #2764: the issued step-up continuations are keyed by the session token's SHA-256
     # (hash_token), so the table never holds a raw token. A lookup key, not a credential check.

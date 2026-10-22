@@ -35,7 +35,12 @@ from messagefoundry.auth.ldap import (
     LdapReferralError,
     LdapUnansweredError,
 )
-from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService, DirectoryRefusal
+from messagefoundry.auth.service import (
+    DIRECTORY_UNCONFIRMED,
+    AuthService,
+    DirectoryRefusal,
+    _opened_totp_state,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -307,6 +312,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         threshold=1,
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
+        totp_usable=_opened_totp_state,
     )
 
 

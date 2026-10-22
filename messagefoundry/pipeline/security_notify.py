@@ -227,6 +227,14 @@ _SECOND_STEP_FACTOR = {
         "Your authenticator code was right and the password was wrong.",
         _LOCAL_REMEDY + "replace your authenticator",
     ),
+    # ADR 0197 Amendment A, wave 2: the combined passkey sign-in counts only "wrong password, valid
+    # passkey" on this counter, so the passkey is the factor that was right.
+    "passkey": (
+        "Your passkey was right and the password was wrong.",
+        _LOCAL_REMEDY + "remove that passkey from your account; if it is your only way past a "
+        "sign-in lock, enrol an authenticator app or another passkey first, or ask your "
+        "administrator to reset your second factors",
+    ),
     "first_step": (
         "The first sign-in step succeeded and the authenticator code was wrong.",
         _LOCAL_REMEDY + "change your password",
@@ -259,6 +267,18 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
             lines.append(
                 "You can sign in now by entering your password and your authenticator code "
                 "together on the sign-in form."
+            )
+        if event.detail.get("totp_state") == "unknown":
+            lines.append(
+                "The engine could not check your authenticator app just now, so it cannot say "
+                "whether your code will be accepted. If it is refused once, do not keep retrying, "
+                "since each refusal counts toward a further lock: use the passkey sign-in below if "
+                "you have one, or ask your administrator."
+            )
+        if event.detail.get("combined_passkey_sign_in"):
+            lines.append(
+                "You can sign in now by entering your password and choosing 'Sign in with password "
+                "and passkey' on the sign-in form."
             )
         return description, lines, None
     if lock == "second_step":

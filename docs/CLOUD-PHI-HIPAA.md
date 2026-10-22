@@ -168,7 +168,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
   For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy (Topology B).
 - **API cert rotation needs a pod restart** (uvicorn builds the TLS context once; MLLP certs hot-reload on
-  `/config/reload`). Plan a rolling restart for API-cert renewal.
+  `/config/reload`, except a key the shipped manifests' `copy-tls` copies, which needs a new pod too:
+  [`docker/README.md`](../docker/README.md), *Cert rotation*). Plan a rolling restart for API-cert renewal.
 - **DB-tier HA is the managed service's job.** MessageFoundry rides the shared store connection; its
   availability follows the DB tier's (Multi-AZ / replication / Always On). Back up + restore-test the DB.
 
