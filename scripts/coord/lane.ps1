@@ -148,8 +148,18 @@ if ($Show) {
         $absent = "the lane record at $file could not be read: $($_.Exception.Message)"
     }
     if ($absent) {
-        $shown = $rec
-        $shown | Add-Member -NotePropertyName absent -NotePropertyValue $absent -Force
+        # A FRESH blank record, never $rec: $rec may hold what the earlier read found, so a restatement
+        # between the two reads would print a stated level beside an `absent` reason. The fields
+        # match the blank record above; fold the two together once that read keeps its reason.
+        $shown = [pscustomobject]@{
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            statedFree = $null; statedInFlight = $null; statedUtc = $null
+            statedBySessionId = $null; statedNote = ''
+            tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
+            tipNow = ''; claimHashNow = ''; lastTurnUtc = $null
+            promptedUtc = $null; promptCount = 0; askedByDispatcherUtc = $null
+            absent = $absent
+        }
     }
     $shown | ConvertTo-Json -Depth 5
     exit 0

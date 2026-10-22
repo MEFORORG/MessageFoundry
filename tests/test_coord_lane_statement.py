@@ -59,22 +59,32 @@ from tests._no_prompt import run_holding_stdin_open
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane.ps1"
 
 
-def _pwsh(
-    repo: Path, *args: str, root: Path | str | None = None
-) -> subprocess.CompletedProcess[str]:
-    """Run lane.ps1 in ``repo``. ``root`` sets MEFOR_COORD_ROOT; otherwise an inherited one is
-    dropped, so the throwaway repo's own local root is the one in use."""
+def _env(root: Path | str | None = None) -> dict[str, str]:
+    """The suite's environment with MEFOR_COORD_ROOT dropped, so the throwaway repo's own local root
+    is the one in use, or set to ``root`` when one is given."""
     env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
     if root is not None:
         env["MEFOR_COORD_ROOT"] = str(root)
+    return env
+
+
+def _pwsh(
+    repo: Path, *args: str, root: Path | str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run lane.ps1 in ``repo``, under ``_env(root)``."""
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT), *args],
         capture_output=True,
         text=True,
+        # A pwsh child of Python writes the console's OEM code page, not UTF-8, and no single codec
+        # matches every box. The asserts look only for ASCII text, so a non-ASCII byte (a path or a
+        # localized message) becomes U+FFFD rather than a UnicodeDecodeError hiding the result.
         encoding="utf-8",
+        errors="replace",
         cwd=repo,
-        env=env,
-        timeout=60,
+        env=_env(root),
+        # Under pyproject's 60 s pytest-timeout, so a hung pwsh fails this test by name.
+        timeout=45,
     )
 
 
@@ -166,7 +176,9 @@ def test_a_statement_missing_a_number_refuses_instead_of_prompting(
     repo: Path, args: tuple[str, ...]
 ) -> None:
     """Vault BACKLOG #3627: the default ``State`` set bound without both numbers. Red pre-fix."""
-    rc, err = run_holding_stdin_open(["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args], cwd=repo)
+    rc, err = run_holding_stdin_open(
+        ["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args], cwd=repo, env=_env()
+    )
     assert rc != 0, "a statement without both numbers must be refused, not written"
     assert "-Free" in err and "-InFlight" in err, err
     # Refused means NOTHING written: the lanes directory is created on the write path.
@@ -254,3 +266,29 @@ def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_
         assert rec["statedFree"] is None, (body, rec)
     record.unlink()
     assert "no lane record at" in str(_show(repo)["absent"])
+
+
+_BLANK_KEYS = {
+    "v", "boxKey", "worktree", "capacity", "statedFree", "statedInFlight", "statedUtc",
+    "statedBySessionId", "statedNote", "tipAtStated", "claimHashAtStated", "turnsSinceStated",
+    "tipNow", "claimHashNow", "lastTurnUtc", "promptedUtc", "promptCount", "askedByDispatcherUtc",
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("body", ["1", '"x"', "true", "[1, 2]"])
+def test_show_never_reuses_the_earlier_read_when_its_own_read_fails(repo: Path, body: str) -> None:
+    """-Show's fallback must be a FRESH blank record, never what the earlier read kept.
+
+    A restatement landing between the two reads is a race, so this stages the same split by
+    construction instead. A truthy non-object is KEPT by the earlier read (`if (-not $rec)` leaves it)
+    and REJECTED by -Show's own read, which is the earlier-read-succeeded, -Show-read-failed case.
+    Reusing $rec printed that value with an `absent` reason beside it. MEASURED 2026-10-22: every
+    case fails at 73d6668cd and passes with the fresh blank record.
+    """
+    assert _pwsh(repo, "-Free", "2", "-InFlight", "1").returncode == 0
+    record = _lane_record(repo)
+    record.write_text(body, encoding="utf-8")
+    rec = _show(repo)
+    assert "not a JSON object" in str(rec["absent"]), rec
+    assert set(rec) == _BLANK_KEYS | {"absent"}, rec
+    assert rec["statedFree"] is None and rec["statedInFlight"] is None, rec
