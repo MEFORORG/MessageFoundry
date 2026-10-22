@@ -15,7 +15,16 @@ from typing import Any
 
 import pytest
 
-from tests._fake_gh import COORD, Sandbox, id_day, make_sandbox, utc_day_now, utc_day_with_room
+from tests._fake_gh import (
+    COORD,
+    GUARDED_TIMEOUT_S,
+    Sandbox,
+    id_day,
+    make_sandbox,
+    utc_day_now,
+    utc_day_with_room,
+    with_default,
+)
 
 DECISION = COORD / "decision.ps1"
 
@@ -59,8 +68,7 @@ def _logged_id(stdout: str) -> str:
 def _list(sb: Sandbox, *args: str) -> list[dict[str, Any]]:
     # Two days ending the listing's own, unless a test names its window: a record a test logged
     # just before UTC midnight is still in the window when the listing runs just after it.
-    window = () if any(a.lower() == "-days" for a in args) else ("-Days", "2")
-    proc = sb.run(DECISION, "-List", "-Json", *window, *args)
+    proc = sb.run(DECISION, "-List", "-Json", *with_default(args, "-Days", "2"))
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     rows: list[dict[str, Any]] = json.loads(proc.stdout) if proc.stdout.strip() else []
     return rows
@@ -93,6 +101,7 @@ def test_log_posts_one_comment_to_the_days_issue_with_the_full_schema(sb: Sandbo
     assert sb.spool() == [], "a posted record stayed in the spool"
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_a_second_record_reuses_the_days_issue_from_the_local_cache(sb: Sandbox) -> None:
     utc_day_with_room()  # both records must land on one day's issue
     assert sb.run(DECISION, *B_DECISION).returncode == 0
@@ -105,6 +114,7 @@ def test_a_second_record_reuses_the_days_issue_from_the_local_cache(sb: Sandbox)
     assert methods == ["POST"], sb.calls[before:]
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_a_cached_issue_that_is_gone_is_listed_again_on_the_next_flush(sb: Sandbox) -> None:
     day = utc_day_with_room()  # the second record must land on the day the cache names
     assert sb.run(DECISION, *B_DECISION).returncode == 0
@@ -181,10 +191,13 @@ def test_a_record_posted_twice_lists_once(sb: Sandbox) -> None:
     assert len(_list(sb)) == 1
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_list_says_incomplete_when_the_vault_cannot_be_read(sb: Sandbox) -> None:
+    # The one listing with the default window, today only, so the record must be logged today.
+    utc_day_with_room()
     assert sb.run(DECISION, *B_DECISION, "-NoPost").returncode == 0
     sb.set_state(fail=True)
-    proc = sb.run(DECISION, "-List", "-Days", "2")
+    proc = sb.run(DECISION, "-List")
     assert proc.returncode == 4, (proc.stdout, proc.stderr)
     assert "INCOMPLETE" in proc.stderr
     assert "[spooled, not posted]" in proc.stdout

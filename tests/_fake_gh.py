@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,22 +36,34 @@ VAULT = "MEFORORG/MessageFoundry-vault"
 ENGINE = "MEFORORG/MessageFoundry"
 
 
+# _decisionlog.ps1's Get-DecisionIdDay pattern: a decision id carries its UTC day.
+_DECISION_ID = re.compile(r"d(\d{4})(\d{2})(\d{2})T\d{9}-[0-9a-f]{6}")
+
+# The room utc_day_with_room() keeps before UTC midnight, and the per-test timeout a test that
+# calls it must carry: the wait can reach MIDNIGHT_ROOM_S + 1 seconds, and the runs after it get
+# the rest, where a Windows tooling leg has been measured starving one pwsh launch past 45 s.
+MIDNIGHT_ROOM_S = 120.0
+GUARDED_TIMEOUT_S = 360
+
+
 def id_day(decision_id: str) -> str:
-    """The UTC day a decision id carries, as _decisionlog.ps1's Get-DecisionIdDay reads it."""
-    return f"{decision_id[1:5]}-{decision_id[5:7]}-{decision_id[7:9]}"
+    """The UTC day a decision id carries; refuses a string that is not a decision id."""
+    m = _DECISION_ID.fullmatch(decision_id)
+    assert m is not None, f"not a decision id: {decision_id!r}"
+    return "-".join(m.groups())
 
 
 def utc_day_now() -> str:
     return datetime.now(UTC).date().isoformat()
 
 
-def utc_day_with_room(seconds: float = 30.0) -> str:
+def utc_day_with_room(seconds: float = MIDNIGHT_ROOM_S) -> str:
     """Today's UTC day, first waiting out midnight if fewer than ``seconds`` of it remain.
 
     decision.ps1 mints a record's id, and so its day, from the wall clock and has no seam for it.
     A test whose script runs must all land on one day calls this first, so the runs that follow
-    it land on the day it returns rather than straddling UTC midnight. The wait, plus the test's
-    own runs, stays inside the 60-second per-test timeout pyproject.toml sets.
+    it land on the day it returns rather than straddling UTC midnight. The wait outlasts the
+    60-second per-test timeout, so a caller carries ``@pytest.mark.timeout(GUARDED_TIMEOUT_S)``.
     """
     now = datetime.now(UTC)
     midnight = datetime(now.year, now.month, now.day, tzinfo=UTC) + timedelta(days=1)
@@ -58,6 +71,16 @@ def utc_day_with_room(seconds: float = 30.0) -> str:
     if left < seconds:
         time.sleep(left + 1)
     return utc_day_now()
+
+
+def with_default(args: tuple[str, ...], name: str, value: str) -> tuple[str, ...]:
+    """``args`` led by ``name value``, unless the test names that parameter itself.
+
+    Matched as PowerShell binds a full name: any case, bare or as ``-Name:value``.
+    """
+    lower = name.lower()
+    named = any(a.lower() == lower or a.lower().startswith(lower + ":") for a in args)
+    return args if named else (name, value, *args)
 
 
 def _answer(state: dict[str, Any], argv: list[str]) -> tuple[int, str, str]:
