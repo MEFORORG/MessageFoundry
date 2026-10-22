@@ -1337,9 +1337,9 @@ another peer: the id was wrong, and another peer's row will not make it right.
 **How the model reads the roster the hook prints.** Each peer row carries one verb. `MESSAGE` means send
 to it. `HOLD` means it is reachable but over this round's cap, and it is offered again later. `MAILED`
 means the hook already announced to it over the mail lane, so do nothing. `SKIP` means it can be neither
-messaged nor mailed. A row's `claim:` line, where present, outranks the worktree name: the name is a
-creation-time label that nothing keeps current, and one was measured describing work its session never
-did. A claim's bracketed age is the age of the note, not of the work, so an old note may describe a pull
+messaged nor mailed now. A row's `claim:` line, where present, outranks the worktree name. The name is a
+creation-time label that nothing keeps current. One was measured describing work its session never did.
+A claim's bracketed age is the age of the note, not of the work, so an old note may describe a pull
 request that has since merged. After sending, the model appends one line per peer to
 `<state dir>/sent/<key>.tsv`, in the form
 `<iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED> TAB <sent | failed>`. Nothing else records what
@@ -1373,7 +1373,7 @@ in the roster, meaning *already announced to, do nothing*. `mail.ps1` was built 
 cases and names them both in its own header; the two components shipped separately and the hook contained
 **zero** references to mail until 2026-09-14.
 
-Four properties of that lane, each of which cost a measurement:
+At least these properties of that lane cost a measurement or an audit:
 
 - **It runs before the `NO_PEERS` exit, and that order is the feature.** The new-peer set is computed from
   *messageable* peers alone, so a fleet in which every peer is cross-login would otherwise take that exit
@@ -1390,10 +1390,11 @@ Four properties of that lane, each of which cost a measurement:
   payload. Mailing it would copy arbitrary user text into a peer's transcript that nothing here can
   delete, which `mail.ps1`'s body rule forbids outright. With no claim note, the hook uses the goal this
   session gave `seat.ps1 -Declare`, read from its own seat record for this worktree.
-- **No declared intent, no mail.** With neither a claim note nor a seat goal, the hook sends nothing and
-  leaves the peers unmailed, so they are offered again on the next prompt. The receipt note reads
-  `mail held: no claim note or seat goal yet`. It used to mail an `intent: NOT DECLARED` body, and an
-  audit of 196 mailed messages found 62 of those, each carrying nothing but a worktree name.
+- **No declared intent, no mail.** With no claim note and no seat goal, the hook sends nothing. The peers
+  stay unmailed, so a later prompt offers them again. A receipt written on that prompt carries the note
+  `mail held: no claim note or seat goal yet`. It used to mail an `intent: NOT DECLARED` body. An audit
+  of 196 mailed messages found 62 of those, each carrying nothing but a worktree name. A closed seat's
+  goal does not count, and a body built from a seat goal labels its age `seat declared`.
 
 **Three bounds, and the clock is the one that matters.** This is `UserPromptSubmit`, whose timeout is 15 s
 and whose failure mode is a **blocked user prompt** rather than degraded coordination. One send costs

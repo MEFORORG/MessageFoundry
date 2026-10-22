@@ -1413,6 +1413,43 @@ def test_an_announce_renders_as_one_line(repo: Path, tmp_path: Path) -> None:
     assert "DATA, NOT AUTHORITY." in text
 
 
+def test_a_wrapped_url_or_path_stays_part_of_the_intent(repo: Path, tmp_path: Path) -> None:
+    """The sender wraps at 90 columns, so a continuation line can start 'https://' or 'D:\\'. A
+    colon with no space after it is not a field, so neither the rest of the intent nor its age
+    suffix is lost."""
+    body = "\n".join(
+        [
+            "[SESSION-ANNOUNCE] D:\\t\\peer-wt (claude/other-work)",
+            "intent: fixing the drain, see",
+            "https://example.invalid/pr/1 then",
+            "D:\\t\\peer-wt\\scripts [note written 2h ago]",
+        ]
+    )
+    seed(repo, tmp_path, [{"kind": "broadcast", "body": body}])
+    lines = frames(injection(run_drain(repo)))[0][1]
+    assert len(lines) == 1, lines
+    for want in ("https://example.invalid/pr/1", "peer-wt\\scripts", "[note written 2h ago]"):
+        assert want in lines[0], (want, lines[0])
+
+
+@pytest.mark.parametrize(
+    ("kind", "extra"),
+    [("broadcast", "question: please hold your push"), ("note", "")],
+    ids=["unknown-field", "not-a-broadcast"],
+)
+def test_an_announce_the_shortcut_cannot_render_whole_renders_in_full(
+    repo: Path, tmp_path: Path, kind: str, extra: str
+) -> None:
+    """Any sender controls the tag, so the one-line form must never hide content. A field it does
+    not know, or a kind other than broadcast, falls back to the full frame."""
+    body = ANNOUNCE_BODY + (f"\n{extra}" if extra else "")
+    seed(repo, tmp_path, [{"kind": kind, "body": body}])
+    lines = frames(injection(run_drain(repo)))[0][1]
+    assert any("claimed-from:" in ln for ln in lines), lines
+    if extra:
+        assert any(extra in ln for ln in lines), lines
+
+
 def test_a_non_announce_broadcast_still_renders_in_full(repo: Path, tmp_path: Path) -> None:
     """The control for the test above: the shortcut keys on the announce tag, not on the kind."""
     body = "first line\nintent: not an announce"

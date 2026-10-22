@@ -1532,19 +1532,24 @@ def test_the_seat_goal_is_the_intent_when_there_is_no_claim_note(
     )
     intent = [ln for ln in body_lines(log) if ln.startswith("intent: ")]
     assert intent and "WIRING THE SEAT GOAL" in intent[0], body_lines(log)
-    assert "[seat goal set " in intent[0], intent
+    assert "[seat declared " in intent[0], intent
 
 
 @pytest.mark.parametrize(
     "change",
-    [{"sessionId": "99999999-0000-0000-0000-000000000000"}, {"worktree": "D:\\t\\elsewhere"}],
-    ids=["another-session", "another-worktree"],
+    [
+        {"sessionId": "99999999-0000-0000-0000-000000000000"},
+        {"worktree": "D:\\t\\elsewhere"},
+        {"lifecycle": "closed"},
+    ],
+    ids=["another-session", "another-worktree", "closed-seat"],
 )
 def test_a_seat_record_that_is_not_this_sessions_is_not_its_intent(
     repo: Path, tmp_path: Path, change: dict[str, str]
 ) -> None:
     """One session id can own records in several boxes, because a subagent shares its parent's id.
-    Only the record naming this session AND this worktree is this session's goal."""
+    Only the open record naming this session AND this worktree is this session's goal; a closed
+    seat's goal is finished work."""
     sd = tmp_path / "state"
     rec = declare_self(sd, repo)
     rec.write_text(
