@@ -739,10 +739,12 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
 `lock.ps1` does. A held lock means another poll is running, so the run exits. It steals in one
-case only (owner ruling 2026-10-22): the lock names this host and a pid Windows says is not running.
-A kill at the task's time limit, a logoff or a shutdown leaves that shape. The steal is an atomic
-rename, and a run deletes the lock only while it still carries its own line. Only the lock holder
-writes the cache. So a lock that stays wedged shows up as an ageing `fetchedAt`, never as `error`.
+case only (owner ruling 2026-10-22). The lock must name this host, and a pid that is not running or
+that started after the lock was written. A kill at the task's time limit, a logoff or a shutdown
+leaves that shape. The steal re-reads the lock under a second, short mutex, and a run deletes the
+lock only while it still carries its own line. Only the lock holder writes the cache. So a lock
+that stays wedged shows up as an ageing `fetchedAt`, never as `error`. A run that cannot create the
+lock at all exits 4, so the task's last result shows it.
 
 ```powershell
 python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file

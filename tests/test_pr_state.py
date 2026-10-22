@@ -573,3 +573,58 @@ def test_required_list_is_the_union_of_protection_and_rulesets(tmp_path: Path) -
     assert doc["requiredContexts"] == sorted(REQUIRED)
     # GitHub said there are none: the one case where an empty list is the right answer.
     assert doc["data"]["pullRequests"] == []
+
+
+# --- Review round 1 of the 2026-10-22 brief. ---------------------------------------------------------
+
+
+def test_a_second_stealer_backs_off_while_the_steal_mutex_is_held(tmp_path: Path) -> None:
+    (tmp_path / "locks").mkdir()
+    lock = tmp_path / "locks" / "pr-state.lock"
+    dead = f"pid={never_live_pid()} host={ps.coord_root.host()} at=dead"
+    lock.write_text(dead, encoding="utf-8")
+    (tmp_path / "locks" / "pr-state.steal.lock").write_text("", encoding="utf-8")
+    assert ps.steal_dead_lock(tmp_path, dead) is False
+    assert lock.read_text(encoding="utf-8") == dead
+    (tmp_path / "locks" / "pr-state.steal.lock").unlink()
+    assert ps.steal_dead_lock(tmp_path, dead) is True
+    assert not lock.exists() and not (tmp_path / "locks" / "pr-state.steal.lock").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the pid check is Windows-only")
+def test_a_reused_pid_reads_as_gone() -> None:
+    # This process is alive, but it started long after a lock stamped in 2000 could have been written.
+    here = ps.coord_root.host()
+    assert ps._holder_is_gone(f"pid={os.getpid()} host={here} at=2000-01-01T00:00:00+00:00")
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    assert not ps._holder_is_gone(f"pid={os.getpid()} host={here} at={future}")
+
+
+def test_a_future_backoff_stamp_is_not_obeyed(tmp_path: Path) -> None:
+    _main(tmp_path, FakeGh([], {}, fail="boom"))
+    path = tmp_path / "pr-state.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["nextPollNotBefore"] = "2026-11-30T00:00:00Z"  # a skewed clock wrote this
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=5))
+    assert rc == 0 and gh.calls and doc["error"] is None
+
+
+def test_an_unwritable_locks_directory_is_a_failing_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(src: object, dst: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(ps.os, "link", refuse)
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
+    assert rc == 4 and gh.calls == []
+
+
+def test_unknown_checkrun_status_reads_as_running(tmp_path: Path) -> None:
+    odd = {**_run("test", "", "SOMETHING_NEW"), "startedAt": "2026-10-22T10:00:00Z"}
+    newer = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), odd, newer]}))
+    assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]

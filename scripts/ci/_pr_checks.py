@@ -46,12 +46,17 @@ def name_of(node: object) -> str:
 
 
 def in_progress(node: object) -> bool:
-    """True while a node's ``status`` (CheckRun) or ``state`` (StatusContext) says it is running."""
+    """True while a node may still be running.
+
+    A CheckRun (it carries ``status``) runs until its status is COMPLETED: an allowlist, so a status
+    nobody listed reads as running, as clear_stale_ci_red.newest_by_name reads it. A StatusContext
+    runs while its ``state`` is PENDING or EXPECTED.
+    """
     if not isinstance(node, dict):
         return False
-    status = str(node.get("status") or "").upper()
-    state = str(node.get("state") or "").upper()
-    return status in UNSETTLED or state in UNSETTLED
+    if node.get("status") is not None:
+        return str(node["status"]).upper() != "COMPLETED"
+    return str(node.get("state") or "").upper() in UNSETTLED
 
 
 def counts(rollup: object) -> tuple[int, int]:

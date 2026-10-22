@@ -99,13 +99,15 @@ if (-not $Python) {
     if ($cmd) { $Python = $cmd.Source }
 }
 $pythonExists = [bool]$Python -and (Test-Path -LiteralPath $Python -PathType Leaf)
+# The task store keeps the path as given, and a relative one cannot start from the task's directory.
+if ($pythonExists) { $Python = (Resolve-Path -LiteralPath $Python).ProviderPath }
 # A venv or worktree interpreter dies with its directory, and the task would then fail with nothing
 # saying so. pythonw reports nothing either, so check the version through its python.exe sibling.
 $pythonProblem = $null
 if ($pythonExists -and (Split-Path -Leaf $Python) -ne 'pythonw.exe') {
     $pythonProblem = "$Python is not pythonw.exe; any other interpreter opens a window every run"
 } elseif ($pythonExists) {
-    $full = [System.IO.Path]::GetFullPath($Python)
+    $full = $Python
     if ($full -match '[\\/](\.venv|venv|\.claude[\\/]worktrees)[\\/]') {
         $pythonProblem = "$full is inside a venv or worktree; pass -Python with an installed interpreter's pythonw.exe"
     } else {
@@ -165,6 +167,7 @@ if ($preview) {
 # --- register (idempotent: -Force replaces an existing definition) --------------------------------
 if (-not $pythonExists) { Stop-Install "no pythonw.exe found; pass -Python <path to pythonw.exe>." }
 if ($pythonProblem) { Stop-Install $pythonProblem }
+if (-not $ghExists) { Stop-Install 'gh is not on PATH; every poll would fail. Install gh or fix PATH first.' }
 if (-not $pollerExists) {
     Stop-Install "pr_state.py is not in the primary checkout: $poller. Bring the primary to origin/main first."
 }

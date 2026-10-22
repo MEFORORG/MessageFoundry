@@ -23,10 +23,11 @@ poll, and that window flash again. So this takes the same lock the same way: it 
 ``mefor-coord/locks/pr-state.lock`` and writes the same ``pid= host= at=`` line. A PowerShell caller
 running ``Enter-CoordLock -Name pr-state`` excludes this poller and is excluded by it. A held lock
 means skip. Unlike lock.ps1 it removes one shape of lock (owner ruling 2026-10-22): this host's,
-naming a pid Windows says is not running, which a kill at the task's time limit or a logoff leaves.
-The steal is an atomic rename, so two pollers cannot both win it, and a run deletes the lock only
-while it still carries its own line. Nothing writes the cache without holding the lock, so a lock
-that stays wedged shows as an ageing ``fetchedAt``.
+naming a pid that is not running or was reused after the lock was written. A kill at the task's
+time limit, a logoff or a shutdown leaves that shape. The steal re-reads the lock under a second,
+short mutex, so two stealers never interleave, and a run deletes the lock only while it still
+carries its own line. Nothing writes the cache without holding the lock, so a lock that stays
+wedged shows as an ageing ``fetchedAt``.
 
 A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``data`` block is kept with
 its own ``fetchedAt``, ``stale`` is true and ``error`` names the failure. With no previous data,
@@ -82,6 +83,8 @@ STALE_LOCK_SECONDS = 900
 GH_TIMEOUT_SECONDS = 30
 #: A rate-limit failure with no resetAt to wait for waits this long instead of the short back-off.
 RATE_LIMIT_FALLBACK_SECONDS = 900
+#: No legitimate back-off is longer: the cap, or an hour's wait for a rate-limit reset.
+MAX_BACKOFF = timedelta(seconds=max(FAIL_MAX_DELAY, 3600) + 60)
 START_SLACK = timedelta(seconds=15)
 
 _HERE = Path(__file__).resolve().parent
@@ -458,6 +461,8 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
     required_at = prev.get("requiredContextsFetchedAt")
     required_error: str | None = None
     fetched = parse_iso(required_at)
+    if fetched is not None and fetched > now:
+        fetched = None  # a future stamp is a skewed clock, so refresh rather than trust it
     if (
         required is None
         or fetched is None
@@ -641,27 +646,31 @@ def write_cache(path: Path, doc: dict[str, Any]) -> None:
             time.sleep(0.1)
 
 
+#: What acquire_lock returns as the holder when the create was refused and no lock file exists.
+CREATE_REFUSED = "(create refused and no lock file: the locks directory may be unwritable)"
+
+
 def acquire_lock(local: Path) -> tuple[str | None, str | None]:
     """``(own line, None)`` when taken; ``(None, holder)`` when held. lock.ps1's protocol, no retry.
 
-    The own line is what release_lock checks before it deletes anything.
+    The line is written to a temp file and hard-linked into place, so the lock appears with its
+    line already in it: a kill can never leave an empty lock nobody could judge. The own line is
+    what release_lock checks before it deletes anything.
     """
     lock = lock_path(local)
     lock.parent.mkdir(parents=True, exist_ok=True)
+    line = f"pid={os.getpid()} host={coord_root.host()} at={datetime.now(UTC).isoformat()}"
+    tmp = lock.with_name(f"{lock.name}.{os.getpid()}.new")
+    tmp.write_text(line, encoding="utf-8")
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.link(tmp, lock)
     except FileExistsError:
         return None, _read_holder(lock)
     except PermissionError:
-        # Windows refuses a create over a file a releaser is still deleting. That is a holder in
-        # the middle of leaving, so it reads as held. An unwritable directory reads the same way
-        # once; the task's result code and an ageing fetchedAt then say so.
-        return None, "(create refused; a release is in progress or the directory is unwritable)"
-    line = f"pid={os.getpid()} host={coord_root.host()} at={datetime.now(UTC).isoformat()}"
-    try:
-        os.write(fd, line.encode())
+        # Windows refuses a create over a file a releaser is still deleting: a holder leaving.
+        return None, _read_holder(lock) if lock.exists() else CREATE_REFUSED
     finally:
-        os.close(fd)
+        tmp.unlink(missing_ok=True)
     return line, None
 
 
@@ -672,42 +681,63 @@ def _read_holder(lock: Path) -> str:
         return "(unreadable)"
 
 
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        # A reader holding the file open on Windows; never let cleanup mask the real outcome.
+        _say(f"could not remove {path}: {exc!r}")
+
+
 def release_lock(local: Path, own: str) -> None:
     """Delete the lock only while it still carries this run's own line; never another poller's."""
     lock = lock_path(local)
     if _read_holder(lock) == own:
-        lock.unlink(missing_ok=True)
+        _unlink_quietly(lock)
 
 
 def steal_dead_lock(local: Path, judged: str) -> bool:
-    """Move a dead holder's lock aside by atomic rename; True when this run moved exactly that lock.
+    """Remove a dead holder's lock; True when this run removed exactly the line it judged dead.
 
-    Two runs that both judged the holder dead race on the rename, and only one succeeds. If what was
-    moved is not the line that was judged dead, a live poller took the lock in between, so it is put
-    back: rename refuses an existing target, so this never overwrites a newer lock.
+    The judge-then-remove pair runs under a second, microseconds-long mutex, so two stealers never
+    interleave. Inside it the lock is re-read: it can change only by being released, since a new
+    lock cannot be created over an existing one. A steal mutex older than a minute is itself the
+    leftover of a kill, and is cleared.
     """
     lock = lock_path(local)
-    aside = lock.with_name(f"{lock.name}.dead.{os.getpid()}")
+    mutex = lock.with_name(f"{LOCK_NAME}.steal.lock")
     try:
-        os.rename(lock, aside)
-    except OSError:
-        return False  # another run moved it first, or it is gone
-    if _read_holder(aside) != judged:
+        fd = os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except (FileExistsError, PermissionError):
         try:
-            os.rename(aside, lock)
+            if time.time() - mutex.stat().st_mtime > 60:
+                _unlink_quietly(mutex)
         except OSError:
-            _say(f"moved a live pr-state lock aside and could not put it back: {aside}")
+            pass
         return False
-    aside.unlink(missing_ok=True)
-    return True
+    os.close(fd)
+    try:
+        if _read_holder(lock) != judged:
+            return False  # released, or retaken, since it was judged
+        aside = lock.with_name(f"{lock.name}.dead.{os.getpid()}")
+        try:
+            os.rename(lock, aside)
+        except OSError:
+            return False
+        _unlink_quietly(aside)
+        return True
+    finally:
+        _unlink_quietly(mutex)
 
 
 def _holder_is_gone(holder: str) -> bool:
-    """True only when the lock names THIS host and a pid Windows says is not running.
+    """True only when the lock names THIS host and its pid is provably not the process that wrote it.
 
-    lock.ps1 never steals because no liveness signal is reliable in general. Here the holder is
-    always this poller, it writes its pid and host, and the one answer trusted is "no such process"
-    on this machine. A live pid, a reused pid, another host or anything unparsable reads as alive.
+    The line may come from this poller or from an ``Enter-CoordLock -Name pr-state`` caller; both
+    write ``pid= host= at=``. Two answers count as gone: Windows says no such process, or the
+    process with that pid started AFTER the lock's ``at=`` stamp, so the pid was reused (after a
+    reboot, say). Another host, an unparsable line, or a process that could have written the line
+    reads as alive.
     """
     fields = dict(part.split("=", 1) for part in holder.split() if "=" in part)
     if fields.get("host", "").casefold() != coord_root.host().casefold():
@@ -716,8 +746,9 @@ def _holder_is_gone(holder: str) -> bool:
         pid = int(fields.get("pid", ""))
     except ValueError:
         return False
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not 0 < pid <= 0xFFFFFFFF:
         return False
+    locked_at = parse_iso(fields.get("at"))
     import ctypes
     from ctypes import wintypes
 
@@ -726,20 +757,33 @@ def _holder_is_gone(holder: str) -> bool:
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    ft = ctypes.POINTER(wintypes.FILETIME)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ft, ft, ft, ft]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
-    if not 0 < pid <= 0xFFFFFFFF:
-        return False
     handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if handle:
-        try:
-            code = wintypes.DWORD()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return code.value != 259  # STILL_ACTIVE
+    if not handle:
+        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: no such process
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
             return False
-        finally:
-            kernel32.CloseHandle(handle)
-    return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: no such process
+        if code.value != 259:  # not STILL_ACTIVE
+            return True
+        if locked_at is None:
+            return False
+        created, ex, kern, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(ex), ctypes.byref(kern), ctypes.byref(user)
+        ):
+            return False
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime  # 100 ns since 1601
+        started = datetime(1601, 1, 1, tzinfo=UTC) + timedelta(microseconds=ticks // 10)
+        # A margin for clock granularity: only a start clearly after the stamp is a reuse.
+        return started > locked_at + timedelta(seconds=5)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def lock_path(local: Path) -> Path:
@@ -796,6 +840,9 @@ def main(
         if steal_dead_lock(local, holder):
             _say(f"removed the pr-state lock of a process that no longer runs: {holder}")
         own, holder = acquire_lock(local)
+    if own is None and holder == CREATE_REFUSED:
+        _say(f"cannot create {lock_path(local)}: {holder}")
+        return 4  # a non-zero task result, so an unwritable directory is not a silent success
     if own is None:
         age = lock_age_seconds(local)
         if age is not None and age > STALE_LOCK_SECONDS:
@@ -812,6 +859,8 @@ def main(
         if previous is not None and previous.get("repo") != args.repo:
             previous = None  # another repo's list and PRs must not carry over
         not_before = parse_iso(previous.get("nextPollNotBefore")) if previous else None
+        if not_before is not None and not_before > start + MAX_BACKOFF:
+            not_before = None  # stamped by a skewed clock or a copied file; never wait on it
         # The slack absorbs interpreter start-up jitter, so a retry due now is not skipped a round.
         if not args.force and not_before is not None and start + START_SLACK < not_before:
             return 0  # backing off; the cache already says until when
