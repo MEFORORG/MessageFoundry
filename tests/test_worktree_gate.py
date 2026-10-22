@@ -1722,6 +1722,12 @@ def _host_premises() -> tuple[str, str]:
         text=True,
         timeout=GATE_TIMEOUT_S,
     )
+    # A failed probe must not read as a host property: an empty stdout would otherwise skip every
+    # control below as "not ICU's", and the suite would stay green with nothing discriminating.
+    assert proc.returncode == 0, f"the premise probe failed: {proc.returncode} {proc.stderr!r}"
+    assert re.fullmatch(r"(True|False) \d+", proc.stdout.strip()), (
+        f"the premise probe printed {proc.stdout!r}, not '<bool> <code page>'"
+    )
     culture, _, page = proc.stdout.strip().partition(" ")
     culture_why = (
         "" if culture == "True" else f"culture comparison here is not ICU's ({proc.stdout!r})"
@@ -1767,6 +1773,7 @@ def lookalike_repo(tmp_path: Path) -> LookalikeRepo:
     return LookalikeRepo(primary=primary, wt1=wt1, lookalike=lookalike, repos=repos)
 
 
+@_two_launch_budget
 def test_a_head_move_into_a_lookalike_of_the_session_s_own_worktree_is_denied(
     tmp_path: Path, lookalike_repo: LookalikeRepo
 ) -> None:
@@ -1796,6 +1803,7 @@ _GOVERNED_ORDINAL_ONLY = (
 )
 
 
+@_two_launch_budget
 def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_primary(
     tmp_path: Path,
 ) -> None:
@@ -1832,6 +1840,7 @@ def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_prim
     assert run_gate(payload, repos, culture_3b) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
     tmp_path: Path,
 ) -> None:
@@ -1863,6 +1872,7 @@ def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
     assert run_gate(payload, repos, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
     tmp_path: Path, lookalike_repo: LookalikeRepo
 ) -> None:
@@ -1882,6 +1892,7 @@ def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
     assert own in assert_denied(run_gate(payload, repo.repos, control))
 
 
+@_two_launch_budget
 def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primary(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1903,6 +1914,7 @@ def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primar
     assert cannot not in assert_denied(run_gate(payload, repos_file, control))
 
 
+@_two_launch_budget
 def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1921,17 +1933,28 @@ def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
     assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 @pytest.mark.parametrize(
-    ("head", "dest", "comparison"),
+    ("head", "dest", "comparison", "culture"),
     [
         # The other worktree is on `dest` minus the soft hyphen: the no-op bail read them as one.
-        ("feat", f"fe{SOFT_HYPHEN}at", "[string]::Equals($dest, $head, " + _ORD + ")"),
+        (
+            "feat",
+            f"fe{SOFT_HYPHEN}at",
+            "[string]::Equals($dest, $head, " + _ORD + ")",
+            "$dest -eq $head",
+        ),
         # The primary has `main` checked out: the checked-out-anywhere bail read them as one.
-        ("feature", f"ma{SOFT_HYPHEN}in", "[string]::Equals([string]$_, $destLine, " + _ORD + ")"),
+        (
+            "feature",
+            f"ma{SOFT_HYPHEN}in",
+            "[string]::Equals([string]$_, $destLine, " + _ORD + ")",
+            "[string]$_ -eq $destLine",
+        ),
     ],
 )
 def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
-    tmp_path: Path, head: str, dest: str, comparison: str
+    tmp_path: Path, head: str, dest: str, comparison: str, culture: str
 ) -> None:
     """Rule 3b class A's two bails compare branch names, and a match allows. A culture comparison
     ignores the soft hyphen, so another session's worktree was switched onto a different branch."""
@@ -1949,16 +1972,16 @@ def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
     payload = bash(f'git -C "{victim}" checkout {dest}', cwd=mine)
 
     assert_denied(run_gate(payload, repos))
-    culture = comparison.replace("[string]::Equals(", "").replace(", " + _ORD + ")", "")
     control = _rebuilt_gate(
         tmp_path / "gate_culture_branch.ps1",
         comparison,
-        culture.replace(", ", " -eq "),
+        culture,
         "a class A branch comparison moved",
     )
     assert run_gate(payload, repos, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1976,6 +1999,7 @@ def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
     assert run_gate(payload, repos_file, control) is None, "the ordinal-only control denied too"
 
 
+@_two_launch_budget
 def test_an_extension_that_only_collates_as_a_document_is_denied(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
@@ -1992,6 +2016,7 @@ def test_an_extension_that_only_collates_as_a_document_is_denied(
     assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
     tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2013,6 +2038,7 @@ def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
     tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2033,6 +2059,7 @@ def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
 
 
+@_two_launch_budget
 def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
     tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2051,5 +2078,29 @@ def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
         f"        if (-not $t.StartsWith('-', {_ORD})) {{ return $true }}",
         "        if (-not $t.StartsWith('-')) { return $true }",
         "Test-VerbMovesHead's flag test moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+@_two_launch_budget
+def test_a_reset_target_spelled_like_the_separator_still_moves_the_primary_s_head(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Test-VerbMovesHead's separator test. A culture `-eq` read the reset target `<U+00AD>--`, a
+    valid branch name, as `--`, so the reset was classed as moving no HEAD and
+    `--git-dir=<primary>/.git` from outside was allowed."""
+    _require_culture_premise()
+    ref = f"{SOFT_HYPHEN}--"
+    subprocess.run(["git", "branch", ref], cwd=hijack_repo.primary, check=True, capture_output=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" reset {ref}', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_separator.ps1",
+        f"if ([string]::Equals($t, '--', {_ORD})) {{ return $false }}",
+        "if ($t -eq '--') { return $false }",
+        "Test-VerbMovesHead's separator test moved",
     )
     assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"

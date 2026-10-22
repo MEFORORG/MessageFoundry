@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.6"
+$GateVersion = "2026.10.21.7"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2510,7 +2510,9 @@ $rehome
 # ordinal, so without this half it would read a linked worktree at `<primary><U+200B>` as a linked
 # worktree. THE HALF STAYS ANYWAY, because this function also answers rules 1 and 3: without it, a write
 # into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
-# 2026-10-21). Some comparisons elsewhere are ordinal now, where a match allows and ordinal therefore
+# 2026-10-21). That is NOT a claim that those denies protect the primary: `<primary><U+200B>` is a
+# different directory on NTFS and ext4. Dropping them would loosen the gate, which a change made for
+# ordinal comparison must not do, so whether they earn their place is left open here. Some comparisons elsewhere are ordinal now, where a match allows and ordinal therefore
 # denies at least as much. Culture comparisons remain, at least the deny-on-match ones such as rule 3d's
 # governed test, rule 3c's `-eq` and class A's flag test, and sites nobody has audited. This is not a
 # census.
@@ -3093,7 +3095,9 @@ function Test-VerbMovesHead([string]$Verb, [string]$After) {
     $pathAfter = ($dashDash -ge 0 -and $dashDash -lt ($toks.Count - 1))
     if ($Verb -ne "reset") { return (-not $pathAfter) }
     foreach ($t in $toks) {
-        if ($t -eq '--') { return $false }
+        # ORDINAL too: a match reads as moving no HEAD, and a culture `-eq` read `<U+00AD>--`, a
+        # valid branch name, as the `--` separator.
+        if ([string]::Equals($t, '--', [System.StringComparison]::Ordinal)) { return $false }
         if (-not $t.StartsWith('-', [System.StringComparison]::Ordinal)) { return $true }
     }
     return $false
@@ -4615,7 +4619,7 @@ foreach ($r in $roots) {
     # be a stream separator. Strip from there and judge the base: a registry keeps its real extension and
     # denies, while a stream on a genuine document stays a document.
     #
-    # THE COLON IS ONE MEMBER OF A SET, AND THREE LAYERS COVER THE SET -- record which does what, because
+    # THE COLON IS ONE MEMBER OF A SET, AND FOUR LAYERS COVER THE SET -- record which does what, because
     # they fail independently and this line is only one of them. Win32 maps MANY spellings onto ONE file:
     # measured on this box, `OFF.`, `OFF` with a trailing space, `OFF::$DATA` and `OFF:x.md` each create the
     # single file `OFF`, and announce-session.ps1 arms its kill switch on that file's existence alone.
@@ -4635,6 +4639,11 @@ foreach ($r in $roots) {
     #   a stream named like a doc      THIS LINE, and only this line. `OFF:x.md` is the one spelling that
     #                                  flips to ALLOW when the strip is removed, because GetExtension then
     #                                  reports `.md` and the backstop waves it through.
+    #   a colon the searches disagree on  THE DISAGREEMENT TEST ($streamUnclear) below, and only it. The
+    #                                  ordinal search finds a colon before a combining mark that the
+    #                                  culture search misses, so `handoff/x.md:<U+0301>y` strips to a
+    #                                  document and the backstop below would ALLOW it. The culture search
+    #                                  left it whole and it was denied, so the disagreement denies it.
     #
     # The split was MEASURED by reverting each layer, not reasoned about, and the first draft of this comment
     # got it wrong in the safe-looking direction: it credited the strip with the `::$DATA` cases, which it
