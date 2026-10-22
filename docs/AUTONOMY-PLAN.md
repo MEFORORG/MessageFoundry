@@ -8,6 +8,10 @@ Status: **APPROVED by the owner on 2026-10-21**, as written, through an AskUserQ
 3. **Vault in the cloud:** "Keep vault local (Recommended)". Only engine Builders run in the cloud.
 4. **Sampling:** "Yes, ~10 min/day (Recommended)". The owner rates a daily blind sample in the digest.
 
+**Owner rulings of 2026-10-22, verbatim.** The plan text is unchanged; these are the approvals that CLAUDE.md section 5, `docs/WORKTREES.md`, SAIDS 0.12 and SDS 2.10 cite.
+1. **The wave 2 rule edits**, in a Manager session's own chat: "I approve the wave 2 rule edits: CLAUDE.md section 5 (delegated decisions count as my ruling for the Lander; force-push of your own unshared branch and deleting your own disposable output are allowed; driver and empower are the default), WORKTREES.md (remove.ps1 -Force on your own worktree for cache-only refusals), SAIDS sections 6.2, 6.6, 7, 8, 9, A.4, A.6 and the executive summary, SDS A.6, and a pointer line on each role card except Special's. Apply them."
+2. **Delegation**, given in a Lander session's chat and repeated to a Manager session; korus `roles/COMMON.md` carries it: "when I answer a specific question with /driver or /empower, that delegates that question to the seat that asked it, including questions the empower rules reserve to me. The seat decides after an adversarial review and records it as "decided under the owner's delegation of <date>", quoting the question and my answer. Treat that record as my ruling, and a merge may rest on it. Still mine in person: signing or re-signing the register, money, credentials, and irreversible acts."
+
 ## 1. Goal
 
 Sessions run as if the owner is away. They proceed on their own judgment, and they bring the owner only what is genuinely the owner's. Speed comes from removing owner round-trips, not from removing reviews or gates. Autonomy is earned and measured: a decision class stays autonomous only while its outcomes stay good, and every session reverts to asking the moment they do not.
