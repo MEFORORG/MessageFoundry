@@ -6,22 +6,25 @@
     verdict in the owner's permission prompt (ADR 0212).
 
 .DESCRIPTION
-    The owner is shown "Allow Claude to use EnterWorktree?" each time a session enters a worktree.
-    This hook runs the check and puts its verdict in that prompt, so the owner sees it before
-    answering.
+    The harness asks "Allow Claude to use EnterWorktree?" when a session enters a worktree outside
+    `.claude/worktrees/`, unless the session runs under bypassPermissions. This hook runs the check
+    and puts its verdict in that prompt, so the owner sees it before answering. Where the harness
+    would not prompt, it says nothing, so it never adds a prompt.
 
     IT NEVER ALLOWS AND NEVER DENIES. Its one decision is `ask`, whose reason the harness shows the
-    user in the permission prompt. This script and the check run from the session's own editable
-    tree, so the session could change what they print; an `allow` from them would be the session
-    approving itself. ADR 0212 records why an allow is deferred until it comes from an installed
-    copy outside every session-writable tree.
+    user in the permission prompt. This script and the check run from `${CLAUDE_PROJECT_DIR}`, a
+    tree sessions can edit (the session's own, or, for a desktop-app worktree session, the shared
+    primary checkout), so a session could change what they print; an `allow` from them would be a
+    session approving itself. ADR 0212 records why an allow is deferred until it comes from an
+    installed copy outside every session-writable tree.
 
     On SAFE: `ask`, with a reason that starts `enter-check: SAFE`. On UNSAFE: `ask`, with a reason
     that starts `enter-check: UNSAFE` and gives the first reasons, folded onto one line and
-    bounded. On anything else -- this machine's OFF file, a missing or failing check, a verdict it
-    does not recognise, or an input naming no `path` (EnterWorktree with `name` creates a new
-    worktree, which this hook does not judge) -- it returns NO decision, and the normal prompt
-    shows unannotated.
+    bounded. On anything else it returns NO decision, and the prompt, if any, shows unannotated:
+    this machine's OFF file, a missing or failing check, a verdict it does not recognise, a path
+    under `.claude/worktrees/`, a `permission_mode` of bypassPermissions or none, or an input
+    naming no `path` (EnterWorktree with `name` creates a new worktree, which this hook does not
+    judge).
 
     TO SILENCE IT: per machine with the OFF file, or permanently, as scripts/worktree/enter-check.ps1's
     header says (ADR 0212 records the same two).
@@ -70,6 +73,17 @@ try {
     $cwd = Get-CcxHookPayloadCwd -Payload $hook
     if ([string]::IsNullOrWhiteSpace($path) -or -not $cwd.Cwd) { exit 0 }
 
+    # Annotate only a prompt the harness shows anyway; an `ask` anywhere else ADDS a prompt, and
+    # in a run nobody answers, a prompt is a refusal. docs/SESSION-DRIFT-CONTROLS.md records the
+    # harness's rule: it asks for a path outside `.claude/worktrees/`, by design not inside it, and
+    # never under bypassPermissions. A mode the input does not name is not assumed to prompt.
+    $mode = if ($props['permission_mode']) { [string]$props['permission_mode'].Value } else { '' }
+    if (-not $mode -or $mode -ceq 'bypassPermissions') { exit 0 }
+    $segs = @($path.Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    for ($i = 0; $i + 1 -lt $segs.Count; $i++) {
+        if ($segs[$i] -ieq '.claude' -and $segs[$i + 1] -ieq 'worktrees') { exit 0 }
+    }
+
     $transcript = if ($props['transcript_path']) { [string]$props['transcript_path'].Value } else { '' }
     $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd.Cwd; TranscriptPath = $transcript }
     if ($FleetRepos) { $check['FleetRepos'] = $FleetRepos }
@@ -86,8 +100,9 @@ try {
         exit 0
     }
     if ($code -eq 1 -and $verdict -ceq 'UNSAFE') {
-        # At most three reasons of at most 160 characters each, so the reason stays one short line.
-        $why = @($lines | Select-Object -Skip 1 -First 3 | ForEach-Object { Get-PromptText ([string]$_) 160 } | Where-Object { $_ }) -join '; '
+        # At most three reasons of at most 300 characters each: the check's reasons lead with
+        # absolute paths, and a tighter cap cut off the part that says why.
+        $why = @($lines | Select-Object -Skip 1 -First 3 | ForEach-Object { Get-PromptText ([string]$_) 300 } | Where-Object { $_ }) -join '; '
         if (-not $why) { $why = 'no reason printed' }
         Write-Ask "enter-check: UNSAFE -- $why (ADR 0212)"
         exit 0
