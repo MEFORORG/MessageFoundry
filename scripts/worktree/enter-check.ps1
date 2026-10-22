@@ -19,7 +19,8 @@
 
       a. The path canonicalises: full path, every junction and symlink along it resolved to its
          final target, every segment present on disk under the name given (so an 8.3 short name
-         is refused, not expanded). A `\\?\`, `\\.\` or UNC path is refused outright.
+         is refused, not expanded). A `\\?\`, `\\.\`, UNC, drive-relative (`C:x`) or
+         root-relative (`\x`) path is refused outright.
       b. It is a LINKED worktree (never the primary) listed by `git worktree list --porcelain -z`
          of one of the fleet repositories (-FleetRepos), compared canonical to canonical.
       c. It is under THIS session's own scratchpad, by segments:
@@ -30,17 +31,22 @@
          Rule 4 of scripts/hooks/worktree_gate.ps1 exists because relocating out of the primary
          re-files the chat transcript, so that case keeps its prompt. Two reads, because a `cd`
          moves the cwd: -SessionCwd, where the session is now, and the project directory of
-         -TranscriptPath, which the harness names after the directory the session launched in.
+         -TranscriptPath, which is where the transcript is filed. Only an exact match with a
+         primary's slug counts (a slug maps a separator and a `-` alike), so a session launched
+         in a primary's SUBDIRECTORY is caught only while its cwd stays in that primary. The
+         transcript's own records are not read: a desktop-app worktree session records the
+         primary as its first `cwd` while its transcript is filed under the worktree's slug.
       e. The worktree is not locked, its `.git` file names its own admin dir under the
          repository's `worktrees/` (and that dir names it back), and that dir shows no rebase,
          merge, cherry-pick, revert, sequencer or bisect in progress.
-      f. Its HEAD tree's `.claude`, `.mcp.json`, `scripts/hooks` and `scripts/coord` have the same
-         object ids as `origin/main`'s (an absent path must be absent on both sides): the tracked
-         settings run hook code from the last two. In its working tree, no index entry under
-         them is flagged assume-unchanged or skip-worktree, nothing under them is modified or
-         untracked, and nothing under `.claude` or `.mcp.json` is ignored either. A branch, or a
-         file left in the working tree such as `.claude/settings.local.json`, could otherwise
-         carry its own hooks or permissions.
+      f. Its HEAD is a commit of the remote's `main`: an ancestor of, or equal to, the commit
+         `git ls-remote origin refs/heads/main` names, never a local ref, which any session can
+         move. So every tracked file, settings, hook code and instructions alike, is one that
+         merged. Its working tree matches HEAD byte for byte: every tracked file's on-disk hash
+         equals its HEAD blob (a stat-cache read alone can be fooled), no index entry is flagged
+         assume-unchanged or skip-worktree, nothing is modified or untracked, and no ignored file
+         sits where the harness reads settings or instructions (`.claude`, `.mcp.json`,
+         `CLAUDE.md`, `CLAUDE.local.md`, at any depth). The tree holds no symlink or submodule.
       g. scripts/coord/afk-kill.ps1 -Status prints OFF. Any other output, an error or a timeout
          is a failure.
       h. No local disable file exists at <git common dir of the engine>/mefor-coord/enter-check/OFF.
@@ -77,6 +83,7 @@ param(
     [string]$TempRoot = $(@(if ($IsWindows) { $env:TEMP; $env:TMP } else { $env:TMPDIR; $env:TMP; $env:TEMP }
             [System.IO.Path]::GetTempPath()) | Where-Object { $_ } | Select-Object -First 1),
     [string]$TranscriptPath,
+    [ValidateRange(1, 120)][int]$RemoteTimeoutSeconds = 20,
     [ValidateRange(1, 120)][int]$KillSwitchTimeoutSeconds = 20
 )
 
@@ -115,7 +122,7 @@ $gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
 
 function Start-Child {
     # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
-    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit)
+    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText)
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
@@ -124,10 +131,14 @@ function Start-Child {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
     if ($StripGit) { foreach ($v in $gitEnvStrip) { [void]$psi.Environment.Remove($v) } }
     $p = [System.Diagnostics.Process]::Start($psi)
+    # Readers first, so a child that answers as it reads cannot fill its pipe and stall the write.
+    $child = [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() }
+    if ($StdinText) { $p.StandardInput.Write($StdinText) }
     $p.StandardInput.Close()
-    [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() }
+    $child
 }
 
 function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
@@ -155,9 +166,10 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
 # Resolved at first use, inside a check, so a machine with no git fails that check.
 $gitExe = $null
 
-function Invoke-Git([string]$Repo, [string[]]$GitArgs) {
+function Invoke-Git([string]$Repo, [string[]]$GitArgs, [string]$StdinText, [int]$TimeoutSeconds = 15) {
     if (-not $script:gitExe) { $script:gitExe = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
-    Wait-Child (Start-Child -Exe $gitExe -StripGit -ArgList (@('-C', $Repo, '-c', 'core.fsmonitor=false', '--no-optional-locks') + $GitArgs)) -TimeoutSeconds 15
+    $argv = @('-C', $Repo, '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=off', '--no-optional-locks') + $GitArgs
+    Wait-Child (Start-Child -Exe $gitExe -StripGit -ArgList $argv -StdinText $StdinText) -TimeoutSeconds $TimeoutSeconds
 }
 
 
@@ -193,6 +205,9 @@ function Resolve-Canonical([string]$Raw) {
     #>
     if ([string]::IsNullOrWhiteSpace($Raw)) { throw 'no path given' }
     if ($Raw -match '^[\\/]{2}') { throw 'a \\?\, \\.\ or UNC path is refused' }
+    # `C:x` and `\x` are rooted but not fully qualified: they resolve against this process's
+    # current drive or directory, which need not be the session's.
+    if (-not [System.IO.Path]::IsPathFullyQualified($Raw)) { throw 'a path that is not fully qualified is refused' }
     $full = [System.IO.Path]::GetFullPath($Raw)
     for ($hop = 0; $hop -lt 40; $hop++) {
         $split = Split-PathSegments $full
@@ -204,6 +219,7 @@ function Resolve-Canonical([string]$Raw) {
         for ($i = 0; $i -lt $segs.Count; $i++) {
             $seg = $segs[$i]
             if ($seg.IndexOfAny([char[]]'*?<>"') -ge 0) { throw 'a path segment holds a wildcard character' }
+            if ($IsWindows -and $seg.Contains(':')) { throw 'a path segment holds a colon (an alternate data stream)' }
             $item = Find-Segment $cur $seg
             $cur = $item.FullName
             if ($null -ne $item.LinkTarget) {
@@ -285,16 +301,20 @@ function Get-VerifiedGitDir([string]$Repo, [string]$Worktree) {
     $back = Join-Path $gd 'gitdir'
     if (-not (Test-Path -LiteralPath $back -PathType Leaf)) { throw 'its admin dir has no gitdir file' }
     $backTo = ([string](Get-Content -LiteralPath $back -TotalCount 1)).Trim()
+    # `git worktree add --relative-paths` writes it relative to the admin dir.
+    if (-not [System.IO.Path]::IsPathRooted($backTo)) { $backTo = Join-Path $gd $backTo }
     if (-not (Test-SamePath (Resolve-Canonical $backTo) (Resolve-Canonical $dotGit))) { throw 'its admin dir names another worktree' }
     return $gd
 }
 
-function Get-ObjectId([string]$Repo, [string]$Spec) {
-    # The object id, or '' when the path is absent at that revision. Anything else throws.
-    $r = Invoke-Git $Repo @('rev-parse', '--verify', '--quiet', '--end-of-options', $Spec)
-    if ($r.Code -eq 0) { return $r.Out.Trim() }
-    if ($r.Code -eq 1 -and -not $r.Out.Trim()) { return '' }
-    throw "git rev-parse could not read $Spec (exit $($r.Code))"
+function Get-PrimaryHolding([string]$Canon, $Lists) {
+    # The fleet repositories whose primary checkout holds $Canon, not through a linked worktree.
+    foreach ($l in $Lists) {
+        $primary = @($l.Blocks | Where-Object { $_.Primary })[0]
+        if (-not $primary.Canon) { throw "the primary of $($l.Repo) does not canonicalise" }
+        if ((Test-AtOrUnder $Canon $primary.Canon) -and
+            -not @($l.Blocks | Where-Object { -not $_.Primary -and $_.Canon -and (Test-AtOrUnder $Canon $_.Canon) })) { $l.Repo }
+    }
 }
 
 try {
@@ -311,6 +331,7 @@ try {
     $target = $null
     $lists = @()
     $match = $null
+    $verifiedGitDir = $null
 
     # a. Canonical target.
     try {
@@ -375,32 +396,28 @@ try {
             $at = [Array]::LastIndexOf([string[]]$tSegs, 'projects')
             if ($at -lt 0 -or $at + 2 -ge $tSegs.Count) { throw 'the transcript path names no project directory' }
             $launchSlug = $tSegs[$at + 1]
-            $inPrimary = @(foreach ($l in $lists) {
+            $inPrimary = @(
+                Get-PrimaryHolding $cwdCanon $lists | ForEach-Object { "$_ (the cwd)" }
+                foreach ($l in $lists) {
                     $primary = @($l.Blocks | Where-Object { $_.Primary })[0]
-                    if (-not $primary.Canon) { throw "the primary of $($l.Repo) does not canonicalise" }
-                    $linked = @($l.Blocks | Where-Object { -not $_.Primary -and $_.Canon })
-                    if ((Test-AtOrUnder $cwdCanon $primary.Canon) -and -not @($linked | Where-Object { Test-AtOrUnder $cwdCanon $_.Canon })) {
-                        "$($l.Repo) (the cwd)"
-                    }
-                    # A slug maps both a separator and a '-' to '-', so only an exact match is read
-                    # as a launch at the primary's root. A launch in a primary's subdirectory is
-                    # caught by the cwd half only while the session stays there.
                     if (@((Get-Slug $primary.Canon), (Get-Slug $primary.Path)) | Where-Object { [string]::Equals($launchSlug, $_, $nameCmp) }) {
-                        "$($l.Repo) (where it launched)"
+                        "$($l.Repo) (the transcript's project directory)"
                     }
                 })
             if ($inPrimary) { Add-Failure 'd' "the session is in the primary checkout of $($inPrimary -join ', '); relocating from there re-files the transcript, so the prompt stays" }
             else { [void]$passed.Add('d') }
         }
-        catch { Add-Failure 'd' "the session's cwd $SessionCwd could not be checked: $($_.Exception.Message)" }
+        catch { Add-Failure 'd' "where the session is or was launched could not be checked: $($_.Exception.Message)" }
     }
 
     # e. Not locked, and no operation in progress.
     if ($match) {
         try {
+            # Verified first, and kept for f whatever else e finds.
+            $gitDir = Get-VerifiedGitDir $match.Repo $target
+            $verifiedGitDir = $gitDir
             if ($match.Block.Locked) { Add-Failure 'e' "$target is locked" }
             else {
-                $gitDir = Get-VerifiedGitDir $match.Repo $target
                 $busy = @('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer', 'BISECT_LOG', 'BISECT_START' |
                         Where-Object { Test-Path -LiteralPath (Join-Path $gitDir $_) })
                 if ($busy) { Add-Failure 'e' "$target has an operation in progress ($($busy -join ', '))" }
@@ -410,37 +427,68 @@ try {
         catch { Add-Failure 'e' "the worktree state could not be read: $($_.Exception.Message)" }
     }
 
-    # f. Branch provenance of the settings and the hook code they run, committed and on disk.
+    # f. HEAD is a merged commit of the remote's main, and the working tree is HEAD, byte for byte.
     if ($match) {
         try {
             $repo = $match.Repo
             $head = $match.Block.Head
             if ($head -cnotmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') { throw 'the worktree has no HEAD commit' }
-            if (-not (Get-ObjectId $repo 'origin/main^{commit}')) { throw "$repo has no origin/main" }
-            $settingsPaths = @('.claude', '.mcp.json')
-            $codePaths = @('scripts/hooks', 'scripts/coord')
-            $differs = @(foreach ($p in $settingsPaths + $codePaths) {
-                    if ((Get-ObjectId $repo "${head}:$p") -cne (Get-ObjectId $repo "origin/main:$p")) { $p }
-                })
-            # Run against the verified admin dir, never whatever the worktree's own .git names.
-            $wt = @("--git-dir=$(Get-VerifiedGitDir $repo $target)", "--work-tree=$target")
+            if (-not $verifiedGitDir) { throw 'its admin dir was not verified (check e)' }
+            $ls = Invoke-Git $repo @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') -TimeoutSeconds $RemoteTimeoutSeconds
+            if ($ls.Code -ne 0) { throw "git ls-remote origin refs/heads/main failed (exit $($ls.Code))" }
+            $remoteMain = @($ls.Out.Split("`n") | Where-Object { $_ -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})\trefs/heads/main$' } | ForEach-Object { $_.Split("`t")[0] })
+            if ($remoteMain.Count -ne 1) { throw 'the remote names no single main commit' }
+            if ((Invoke-Git $repo @('cat-file', '-e', "$($remoteMain[0])^{commit}")).Code -ne 0) {
+                throw "the remote's main is not in this clone yet; fetch origin first"
+            }
+            $anc = Invoke-Git $repo @('merge-base', '--is-ancestor', $head, $remoteMain[0])
+            if ($anc.Code -gt 1) { throw "git merge-base failed (exit $($anc.Code))" }
+
+            # Against the verified admin dir, never whatever the worktree's own .git names.
+            $wt = @("--git-dir=$verifiedGitDir", "--work-tree=$target")
+            $tree = Invoke-Git $target ($wt + @('ls-tree', '-r', '-z', 'HEAD'))
+            if ($tree.Code -ne 0) { throw "git ls-tree failed (exit $($tree.Code))" }
+            $paths = [System.Collections.Generic.List[string]]::new()
+            $blobs = [System.Collections.Generic.List[string]]::new()
+            $odd = 0
+            foreach ($e in $tree.Out.Split([char]0, [System.StringSplitOptions]::RemoveEmptyEntries)) {
+                $meta, $p = $e -split "`t", 2
+                $mode, $type, $id = $meta.Split(' ')
+                if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains("`n")) { $odd++; continue }
+                $paths.Add($p); $blobs.Add($id)
+            }
+            # One process hashes every tracked file as it sits on disk, through the same filters
+            # git applies, so a line-ending conversion is not a difference and a forged stat is.
+            $bytesDiffer = 0
+            if ($paths.Count) {
+                $h = Invoke-Git $target ($wt + @('hash-object', '--stdin-paths')) -StdinText (($paths -join "`n") + "`n") -TimeoutSeconds 60
+                if ($h.Code -ne 0) { throw "git hash-object failed (exit $($h.Code)); a tracked file may be missing" }
+                $ids = @($h.Out.Split("`n", [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
+                if ($ids.Count -ne $paths.Count) { throw 'git hash-object answered for a different number of files' }
+                for ($i = 0; $i -lt $ids.Count; $i++) { if ($ids[$i] -cne $blobs[$i]) { $bytesDiffer++ } }
+            }
             # `ls-files -v` tags a normal entry H; assume-unchanged is lowercase and skip-worktree S,
             # and git status reports neither kind of entry as modified.
-            $ls = Invoke-Git $target ($wt + @('ls-files', '-v', '-z', '--') + $settingsPaths + $codePaths)
-            if ($ls.Code -ne 0) { throw "git ls-files failed (exit $($ls.Code))" }
-            $flagged = @($ls.Out.Split([char]0) | Where-Object { $_ -and -not $_.StartsWith('H ') })
-            $st1 = Invoke-Git $target ($wt + @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--') + $settingsPaths)
-            $st2 = Invoke-Git $target ($wt + @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--') + $codePaths)
+            $flags = Invoke-Git $target ($wt + @('ls-files', '-v', '-z'))
+            if ($flags.Code -ne 0) { throw "git ls-files failed (exit $($flags.Code))" }
+            $flagged = @($flags.Out.Split([char]0) | Where-Object { $_ -and -not $_.StartsWith('H ') })
+            $st1 = Invoke-Git $target ($wt + @('status', '--porcelain=v1', '-z', '--untracked-files=all'))
+            # ls-files, not status: status names a whole ignored directory such as `.venv/` against
+            # any pathspec, while ls-files names each ignored file and filters it by the pathspec.
+            $st2 = Invoke-Git $target ($wt + @('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--',
+                    ':(glob)**/.claude/**', ':(glob)**/.mcp.json', ':(glob)**/CLAUDE.md', ':(glob)**/CLAUDE.local.md'))
             if ($st1.Code -ne 0 -or $st2.Code -ne 0) { throw 'git status failed' }
             $stray = @(($st1.Out + [char]0 + $st2.Out).Split([char]0) | Where-Object { $_ })
-            if ($differs) { Add-Failure 'f' "the worktree's HEAD differs from origin/main in $($differs -join ', '), so its branch could carry its own hooks" }
-            elseif ($flagged) { Add-Failure 'f' "$($flagged.Count) index entries under the settings or hook paths are flagged assume-unchanged or skip-worktree" }
-            elseif ($stray) { Add-Failure 'f' "the worktree has changed, untracked or ignored files under the settings or hook paths ($($stray.Count) entries)" }
+
+            if ($anc.Code -ne 0) { Add-Failure 'f' "the worktree's HEAD is not a commit of the remote's main, so its branch could carry its own hooks or instructions" }
+            elseif ($odd) { Add-Failure 'f' "the worktree's HEAD holds $odd symlink, submodule or unreadable entries" }
+            elseif ($bytesDiffer) { Add-Failure 'f' "$bytesDiffer tracked files on disk differ from HEAD" }
+            elseif ($flagged) { Add-Failure 'f' "$($flagged.Count) index entries are flagged assume-unchanged or skip-worktree" }
+            elseif ($stray) { Add-Failure 'f' "the worktree has changed, untracked, or ignored settings or instruction files ($($stray.Count) entries)" }
             else { [void]$passed.Add('f') }
         }
         catch { Add-Failure 'f' "branch provenance could not be checked: $($_.Exception.Message)" }
     }
-
     # g. The AFK kill switch reads OFF.
     try {
         if ($null -eq $killSwitch) { throw "it did not start ($killSwitchFault)" }
@@ -457,7 +505,8 @@ try {
         $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
         if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
         $off = Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF'
-        if (Test-Path -LiteralPath $off) { Add-Failure 'h' "this machine has turned the check off: $off exists" }
+        # The reason reaches the session, so it does not say which file to delete.
+        if (Test-Path -LiteralPath $off) { Add-Failure 'h' 'this machine has turned the check off with its local OFF file' }
         else { [void]$passed.Add('h') }
     }
     catch { Add-Failure 'h' "the local disable file could not be checked: $($_.Exception.Message)" }
