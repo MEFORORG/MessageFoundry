@@ -9,8 +9,7 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 
 The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
 you exit. **As a Manager's subagent, you do not open the PR.** Your Manager does, and it usually puts several Builders'
-branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
-`docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager. You never edit
+branches into one PR (owner ruling 2026-09-23). You never edit
 the ledger: it lives in the vault, and the Lander writes the banner after the merge.
 
 Your brief comes from a Manager. Usually you are a subagent inside its process, so your final
@@ -104,5 +103,7 @@ working tree:
 Read the korus `roles/COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
 disagree about this repository.
 
-This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
-belongs in a dated note, never here.
+Apply the driver and empower rules by default; load both skills at session start (off while
+`MEFOR_AFK_KILL` is on). See CLAUDE.md section 5.
+
+Live state -- lane counts, throttles, item numbers -- belongs in a dated note, never here.
