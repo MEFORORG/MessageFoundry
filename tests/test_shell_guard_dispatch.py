@@ -127,9 +127,11 @@ def _dispatch(guards: list[Path], raw: str, *, burst: bool = False) -> str:
 
 def _skeleton_matches(got: object, expected: object) -> bool:
     """``got`` and ``expected`` have the same shape and values, except that a string of ``got``
-    holding non-ASCII text matches any ``expected`` string with the same ASCII runs in the same
-    order. A standalone guard wrote that text in the console's page, which may best-fit or replace
-    each such character, so the characters cannot be compared and the ASCII around them can."""
+    holding non-ASCII text matches an ``expected`` string with the same ASCII runs in the same
+    order, each non-ASCII run standing for 1 to 4 characters per character. A standalone guard
+    wrote that text in the console's page, which may best-fit or replace each such character, and
+    this process decodes those bytes in its own locale, so the characters cannot be compared and
+    the ASCII around them can."""
     if isinstance(got, dict):
         return (
             isinstance(expected, dict)
@@ -143,8 +145,10 @@ def _skeleton_matches(got: object, expected: object) -> bool:
             and all(_skeleton_matches(g, e) for g, e in zip(got, expected, strict=True))
         )
     if isinstance(got, str) and not got.isascii():
-        runs = re.split(r"[^\x00-\x7f]+", got)
-        pattern = ".+?".join(re.escape(run) for run in runs)
+        pattern = "".join(
+            re.escape(part) if part.isascii() else f".{{1,{4 * len(part)}}}"
+            for part in re.split(r"([^\x00-\x7f]+)", got)
+        )
         return isinstance(expected, str) and re.fullmatch(pattern, expected, re.DOTALL) is not None
     return got == expected
 
@@ -157,10 +161,10 @@ def _same_decision(got: str, expected: str) -> bool:
     ASCII, so the standalone side being ASCII says nothing. Where it does carry such text, the
     dispatcher's stdout must be ASCII, both sides must parse, and they must match as
     _skeleton_matches says."""
-    if got == expected:
-        return True
     if not got.isascii():
         return False
+    if got == expected:
+        return True
     try:
         g, e = json.loads(got), json.loads(expected)
     except json.JSONDecodeError:
@@ -185,12 +189,15 @@ _BEST_FIT = '{"r":"find /proc/' + _E + "t" + _E + '"}'
         ('{"r":"find /proc/\\u00e9t\\u00e9"}', _BEST_FIT, True),
         # Another guard's reason around the same character is not the same decision.
         ('{"r":"find /proc/\\u00e9t\\u00e9"}', '{"r":"scan /proc/ete"}', False),
+        # Nor is a reason with a clause where one character was.
+        ('{"r":"a\\u00e9b"}', '{"r":"a, and something else entirely, b"}', False),
         # A context-only answer against a deny: no KeyError, just a mismatch.
         ('{"c":"x\\u00e9"}', '{"r":"xe"}', False),
         # No non-ASCII text in the decision: byte for byte.
         ('{"r": "a"}', '{"r":"a"}', False),
-        # The dispatcher's stdout must be ASCII.
+        # The dispatcher's stdout must be ASCII, even where it equals the standalone bytes.
         (_BEST_FIT, _BEST_FIT.replace(_E, "e"), False),
+        (_BEST_FIT, _BEST_FIT, False),
     ],
 )
 def test_same_decision_reads_the_dispatcher_s_decoded_text(
@@ -1158,33 +1165,58 @@ def test_the_payload_and_the_decision_are_utf8_whatever_the_console_code_page(
         )
     probe = _guard(tmp_path, "encoding.ps1", _ENCODING_PROBE)
     raw = json.dumps(bash(_ENCODED_COMMAND), ensure_ascii=False).encode("utf-8")
-    with single_spawn():
-        proc = subprocess.run(
-            f'chcp {codepage} >nul && chcp && pwsh -NoProfile -NonInteractive -File "{DISPATCHER}"'
-            f' "{probe}"',
-            shell=True,
-            input=raw,
-            capture_output=True,
-            timeout=120,
-            env={**os.environ, **_HERMETIC},
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
-    # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
-    if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
-        restored = kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1])
-        pytest.fail(
-            f"chcp {codepage} reached pytest's shared console, {shared} -> {after}; "
-            + (
-                "it was put back"
-                if restored
-                else f"putting it back FAILED, {ctypes.get_last_error()}"
+
+    def in_console(dispatcher: Path) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
+        with single_spawn():
+            proc = subprocess.run(
+                f"chcp {codepage} >nul && chcp && pwsh -NoProfile -NonInteractive -File "
+                f'"{dispatcher}" "{probe}"',
+                shell=True,
+                input=raw,
+                capture_output=True,
+                timeout=120,
+                env={**os.environ, **_HERMETIC},
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        )
-    page, _, decision = proc.stdout.partition(b"\n")
-    # A word match, not a suffix: a localized chcp may end its line with a period.
-    if not re.search(rf"\b{codepage}\b".encode(), page):
-        pytest.skip(f"this host's console did not take cp{codepage}: {proc.stdout!r}")
+        after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+        # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
+        if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
+            restored = kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1])
+            pytest.fail(
+                f"chcp {codepage} reached pytest's shared console, {shared} -> {after}; "
+                + (
+                    "it was put back"
+                    if restored
+                    else f"putting it back FAILED, {ctypes.get_last_error()}"
+                )
+            )
+        page, _, decision = proc.stdout.partition(b"\n")
+        # A word match, not a suffix: a localized chcp may end its line with a period.
+        if not re.search(rf"\b{codepage}\b".encode(), page):
+            pytest.skip(f"this host's console did not take cp{codepage}: {proc.stdout!r}")
+        return proc, decision
+
+    # The CONTROL: the dispatcher's old read through [Console]::In, and no escaping. Unless it gets
+    # the deny wrong, the page never reached pwsh and the pass below would prove nothing.
+    old = _dispatcher_copy(
+        tmp_path / "dispatch_console_reader.ps1",
+        (_PAYLOAD_READ, "$ShellGuardPayload = [Console]::In.ReadToEnd()"),
+        (_ESCAPE, "$Json"),
+    )
+    old_proc, old_decision = in_console(old)
+    try:
+        old_parsed = json.loads(old_decision.decode("utf-8")) if old_decision.strip() else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        old_parsed = None
+    old_right = (
+        old_proc.returncode == 0
+        and old_parsed is not None
+        and old_parsed.get("hookSpecificOutput", {}).get("permissionDecisionReason")
+        == "whole " + _ENCODED_COMMAND
+    )
+    assert not old_right, f"the old reader got cp{codepage} right, so this measures nothing"
+
+    proc, decision = in_console(DISPATCHER)
     err = proc.stderr.decode(f"cp{codepage}", errors="replace")
     assert proc.returncode == 0, f"the probe failed, so the payload did not parse: {err}"
     assert decision.strip(), f"the probe saw a mangled payload and allowed: {err}"
@@ -1201,6 +1233,10 @@ _PAYLOAD_READ = (
     "$ShellGuardPayload = [System.IO.StreamReader]::new(\n"
     "        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()"
 )
+#: ConvertTo-ShellGuardAscii's body, which the encoding test's control replaces with its input.
+_ESCAPE = (
+    "[regex]::Replace($Json, '[^\\x00-\\x7F]', { param($m) '\\u{0:x4}' -f [int][char]$m.Value })"
+)
 _READ_FAILURE = (
     '    [Console]::Error.WriteLine("shell-guard-dispatch: could not read the hook input, so no '
     'guard ran: $($_.Exception.Message)")\n'
@@ -1211,7 +1247,7 @@ _READ_FAILURE = (
 def _dispatcher_copy(dst: Path, *pairs: tuple[str, str]) -> Path:
     """The dispatcher with each (old, new) pair applied. Each rewrite is asserted to have happened,
     or the copy would be the dispatcher itself and the test would pass for the wrong reason."""
-    src = DISPATCHER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    src = DISPATCHER.read_text(encoding="utf-8")
     for old, new in pairs:
         assert src.count(old) == 1, f"the dispatcher's text moved: {old!r}"
         src = src.replace(old, new)
@@ -1219,6 +1255,7 @@ def _dispatcher_copy(dst: Path, *pairs: tuple[str, str]) -> Path:
     return dst
 
 
+@pytest.mark.timeout(300)
 def test_a_payload_read_that_throws_is_a_visible_hook_error(tmp_path: Path) -> None:
     """No guard ran, so the dispatcher says so on stderr and exits 1, the non-blocking hook error.
     The control is the catch as it stood before, which exited 0 with nothing on stderr: an allow

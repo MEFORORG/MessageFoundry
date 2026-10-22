@@ -109,8 +109,9 @@ param(
 )
 
 $ShellGuardStdout = [Console]::Out
-# Read-CcxHookInput in _hookinput.ps1 decodes the same bytes the same way, but it is bounded at
-# 2000 ms and returns '' on a failure; this read is unbounded, and a failure exits 1. A caller that
+# Read-CcxHookInput in _hookinput.ps1 decodes the same bytes the same way, but it is bounded in
+# time and returns '' on a failure or when stdin is not redirected; this read is unbounded, and a
+# failure exits 1. A caller that
 # leaves stdin open therefore holds this file until the hook times out, which lets the command run.
 # It is not dot-sourced here because scoping is dynamic, so its functions would be visible to every
 # guard.
@@ -126,8 +127,8 @@ try {
 function ConvertTo-ShellGuardAscii([string]$Json) {
     # A decision this file writes parsed as JSON, so a non-ASCII character in it normally sits
     # inside a string, where \uXXXX names the same character. Escaped, the bytes are the same in
-    # every code page, so the console's output page cannot break a deny the way it once broke the
-    # input. ConvertFrom-Json is lenient, so such a character can also sit outside a string; the
+    # every ASCII-compatible code page, at least the OEM and ANSI pages, so the console's output
+    # page cannot break a deny the way it once broke the input. ConvertFrom-Json is lenient, so such a character can also sit outside a string; the
     # escape there is no more valid JSON than the character was. Whether Claude Code accepts either
     # form there is not measured.
     [regex]::Replace($Json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
