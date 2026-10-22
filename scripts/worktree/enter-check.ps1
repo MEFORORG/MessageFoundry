@@ -26,7 +26,8 @@
       c. It is under THIS session's own scratchpad, by segments:
          <temp>\claude\<one project segment>\<SessionId>\scratchpad\<at least one more>.
          `.claude/worktrees/` is never allowed: another session's subagent trees live there, and
-         nothing here can tell whose they are.
+         nothing here can tell whose they are. The path given must already be canonical: one
+         through a link is refused, because the session can repoint its own link afterwards.
       d. The session neither is nor was launched in the primary checkout of a fleet repository.
          Rule 4 of scripts/hooks/worktree_gate.ps1 exists because relocating out of the primary
          re-files the chat transcript, so that case keeps its prompt. Two reads, because a `cd`
@@ -40,13 +41,20 @@
          repository's `worktrees/` (and that dir names it back), and that dir shows no rebase,
          merge, cherry-pick, revert, sequencer or bisect in progress.
       f. Its HEAD is a commit of the remote's `main`: an ancestor of, or equal to, the commit
-         `git ls-remote origin refs/heads/main` names, never a local ref, which any session can
-         move. So every tracked file, settings, hook code and instructions alike, is one that
-         merged. Its working tree matches HEAD byte for byte: every tracked file's on-disk hash
-         equals its HEAD blob (a stat-cache read alone can be fooled), no index entry is flagged
-         assume-unchanged or skip-worktree, nothing is modified or untracked, and no ignored file
-         sits where the harness reads settings or instructions (`.claude`, `.mcp.json`,
-         `CLAUDE.md`, `CLAUDE.local.md`, at any depth). The tree holds no symlink or submodule.
+         `git ls-remote <pinned URL> refs/heads/main` names (-FleetRemotes), read with no
+         repository and no user or system config. Never a local ref, and never `origin`: both
+         live in the clone's shared state, which any session can write. So every tracked file,
+         settings, hook code and instructions alike, is one that merged. The same shared state
+         may not stand in for an object either: replace refs and the commit-graph are off, an
+         `info/grafts` file fails f, and the HEAD the verified admin dir names must be the one
+         git listed, before and after the reads. Its working tree matches HEAD byte for byte:
+         no tracked path carries a filter, ident or working-tree-encoding attribute, every
+         tracked file's on-disk hash equals its HEAD blob (a stat-cache read alone can be
+         fooled), no index entry is flagged assume-unchanged or skip-worktree, nothing is
+         modified or untracked, and no ignored file sits where the harness reads settings or
+         instructions (`.claude`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`, at any depth and
+         in any case). Ignored means ignored by the tree's own `.gitignore` files, never by
+         `info/exclude` or `core.excludesFile`. The tree holds no symlink or submodule.
       g. scripts/coord/afk-kill.ps1 -Status prints OFF. Any other output, an error or a timeout
          is a failure.
       h. No local disable file exists at <git common dir of the engine>/mefor-coord/enter-check/OFF.
@@ -65,6 +73,10 @@
     The fleet repositories. The FIRST is the engine, whose git common dir holds the OFF file. The
     hook passes none, so the defaults apply; tests pass their own.
 
+.PARAMETER FleetRemotes
+    Each fleet repository's remote URL, paired with -FleetRepos by position. Check f reads main
+    from this URL, never from the clone's `origin`. A repository with no URL here fails f.
+
 .PARAMETER TempRoot
     The directory that holds `claude\<project>\<session>\scratchpad`. Defaults to the temp
     directory in the order Node's os.tmpdir() reads it (TEMP, then TMP, on Windows; TMPDIR, TMP,
@@ -80,6 +92,7 @@ param(
     [string]$SessionId,
     [string]$SessionCwd = (Get-Location).ProviderPath,
     [string[]]$FleetRepos = @('D:/Code/MessageFoundry', 'D:/Code/MessageFoundry-vault', 'D:/Code/korus'),
+    [string[]]$FleetRemotes = @('https://github.com/MEFORORG/MessageFoundry.git', 'https://github.com/MEFORORG/MessageFoundry-vault.git', 'https://github.com/MEFORORG/korus.git'),
     [string]$TempRoot = $(@(if ($IsWindows) { $env:TEMP; $env:TMP } else { $env:TMPDIR; $env:TMP; $env:TEMP }
             [System.IO.Path]::GetTempPath()) | Where-Object { $_ } | Select-Object -First 1),
     [string]$TranscriptPath,
@@ -118,11 +131,12 @@ function Add-Failure([string]$Check, [string]$Why) { $failures.Add("$Check. $Why
 
 # Inherited git variables would redirect `git -C` at another repository than the one named.
 $gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM')
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+    'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')
 
 function Start-Child {
     # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
-    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText)
+    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText, [hashtable]$SetEnv)
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
@@ -133,6 +147,7 @@ function Start-Child {
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
     if ($StripGit) { foreach ($v in $gitEnvStrip) { [void]$psi.Environment.Remove($v) } }
+    if ($SetEnv) { foreach ($k in $SetEnv.Keys) { $psi.Environment[$k] = [string]$SetEnv[$k] } }
     $p = [System.Diagnostics.Process]::Start($psi)
     # Readers first, so a child that answers as it reads cannot fill its pipe and stall the write.
     $child = [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() }
@@ -168,8 +183,32 @@ $gitExe = $null
 
 function Invoke-Git([string]$Repo, [string[]]$GitArgs, [string]$StdinText, [int]$TimeoutSeconds = 15) {
     if (-not $script:gitExe) { $script:gitExe = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
-    $argv = @('-C', $Repo, '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=off', '--no-optional-locks') + $GitArgs
+    # The clone's shared state is writable by every session, so none of it may stand in for an
+    # object: a replace ref swaps a commit's content and a commit-graph can lie about parents.
+    # The untracked cache sits in the index, which the worktree's owner writes.
+    $argv = @('-C', $Repo, '--no-replace-objects', '-c', 'core.commitGraph=false', '-c', 'core.untrackedCache=false',
+        '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=off', '--no-optional-locks') + $GitArgs
     Wait-Child (Start-Child -Exe $gitExe -StripGit -ArgList $argv -StdinText $StdinText) -TimeoutSeconds $TimeoutSeconds
+}
+
+function Get-RemoteMain([string]$Url, [int]$TimeoutSeconds) {
+    # The commit the pinned URL's main names, read with no repository and no user or system
+    # config: `origin`, `url.*.insteadOf`, `core.sshCommand` and a ProgramData config are all
+    # writable by a session, and each could point the read at a remote the session controls.
+    if (-not $script:gitExe) { $script:gitExe = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    $isolated = @{
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL   = $(if ($IsWindows) { 'NUL' } else { '/dev/null' })
+        GIT_DIR             = (Join-Path ([System.IO.Path]::GetTempPath()) "enter-check-no-repo-$([guid]::NewGuid().ToString('N'))")
+        GIT_TERMINAL_PROMPT = '0'
+        GCM_INTERACTIVE     = 'never'
+    }
+    $argv = @('-c', 'credential.helper=', '-c', 'credential.helper=manager', 'ls-remote', '--exit-code', $Url, 'refs/heads/main')
+    $ls = Wait-Child (Start-Child -Exe $gitExe -StripGit -SetEnv $isolated -ArgList $argv) -TimeoutSeconds $TimeoutSeconds
+    if ($ls.Code -ne 0) { throw "git ls-remote of the pinned remote failed (exit $($ls.Code))" }
+    $ids = @($ls.Out.Split("`n") | Where-Object { $_ -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})\trefs/heads/main$' } | ForEach-Object { $_.Split("`t")[0] })
+    if ($ids.Count -ne 1) { throw 'the remote names no single main commit' }
+    return $ids[0]
 }
 
 
@@ -329,6 +368,7 @@ try {
     catch { $killSwitchFault = $_.Exception.Message }
 
     $target = $null
+    $rawFull = $null
     $lists = @()
     $match = $null
     $verifiedGitDir = $null
@@ -342,6 +382,8 @@ try {
             $raw = Join-Path $SessionCwd $raw
         }
         $target = Resolve-Canonical $raw
+        # Kept for c: the harness keeps the path it was given, not the target judged here.
+        $rawFull = [System.IO.Path]::GetFullPath($raw).TrimEnd('\', '/')
         [void]$passed.Add('a')
     }
     catch { Add-Failure 'a' "the path $Path does not canonicalise: $($_.Exception.Message)" }
@@ -349,9 +391,12 @@ try {
     # Every fleet repository's worktree list, for b and d. A repository not on this machine holds
     # no worktree and no primary, so it is skipped; one that is here and will not list throws.
     try {
-        $lists = @(foreach ($repo in $FleetRepos) {
+        $lists = @(for ($ri = 0; $ri -lt @($FleetRepos).Count; $ri++) {
+                $repo = $FleetRepos[$ri]
                 if (Test-Path -LiteralPath $repo -PathType Container) {
-                    [pscustomobject]@{ Repo = $repo; Blocks = @(Get-WorktreeList $repo) }
+                    # Its pinned remote, paired by position; none is a failure at f.
+                    $remote = if ($ri -lt @($FleetRemotes).Count) { $FleetRemotes[$ri] } else { '' }
+                    [pscustomobject]@{ Repo = $repo; Remote = $remote; Blocks = @(Get-WorktreeList $repo) }
                 }
             })
     }
@@ -361,7 +406,7 @@ try {
     $unresolved = @(if ($null -ne $lists) { foreach ($l in $lists) { foreach ($b in $l.Blocks) { if ($b.CanonError) { $b.Path } } } })
     if ($unresolved) { Add-Failure 'b' "$($unresolved.Count) listed worktree(s) exist but do not canonicalise, first $($unresolved[0])"; $lists = $null }
     if ($target -and $null -ne $lists) {
-        $hits = @(foreach ($l in $lists) { foreach ($b in $l.Blocks) { if (Test-SamePath $b.Canon $target) { [pscustomobject]@{ Repo = $l.Repo; Block = $b } } } })
+        $hits = @(foreach ($l in $lists) { foreach ($b in $l.Blocks) { if (Test-SamePath $b.Canon $target) { [pscustomobject]@{ Repo = $l.Repo; Remote = $l.Remote; Block = $b } } } })
         if ($hits.Count -eq 0) { Add-Failure 'b' "$target is not a worktree listed by any fleet repository" }
         elseif ($hits.Count -gt 1) { Add-Failure 'b' "$target is listed $($hits.Count) times across the fleet repositories" }
         elseif ($hits[0].Block.Primary) { Add-Failure 'b' "$target is the primary checkout of $($hits[0].Repo), not a linked worktree" }
@@ -379,7 +424,12 @@ try {
             $n = (Split-PathSegments $tempCanon).Segs.Count
             $own = (Test-AtOrUnder $target $tempCanon) -and ($t.Segs.Count -ge $n + 5)
             $own = $own -and ($t.Segs[$n] -ceq 'claude') -and ($t.Segs[$n + 2] -ceq $SessionId) -and ($t.Segs[$n + 3] -ceq 'scratchpad')
-            if ($own) { [void]$passed.Add('c') }
+            # A link the session owns can be repointed after this check, and the path the harness
+            # keeps then names another tree. So the path given must already be the canonical one.
+            if ($own -and -not (Test-SamePath $rawFull $target)) {
+                Add-Failure 'c' "the path given passes through a link to $target; give the target itself"
+            }
+            elseif ($own) { [void]$passed.Add('c') }
             else { Add-Failure 'c' "$target is not under $tempCanon/claude/<project>/$SessionId/scratchpad/, this session's own scratchpad" }
         }
         catch { Add-Failure 'c' "ownership could not be checked: $($_.Exception.Message)" }
@@ -434,19 +484,28 @@ try {
             $head = $match.Block.Head
             if ($head -cnotmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') { throw 'the worktree has no HEAD commit' }
             if (-not $verifiedGitDir) { throw 'its admin dir was not verified (check e)' }
-            $ls = Invoke-Git $repo @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') -TimeoutSeconds $RemoteTimeoutSeconds
-            if ($ls.Code -ne 0) { throw "git ls-remote origin refs/heads/main failed (exit $($ls.Code))" }
-            $remoteMain = @($ls.Out.Split("`n") | Where-Object { $_ -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})\trefs/heads/main$' } | ForEach-Object { $_.Split("`t")[0] })
-            if ($remoteMain.Count -ne 1) { throw 'the remote names no single main commit' }
-            if ((Invoke-Git $repo @('cat-file', '-e', "$($remoteMain[0])^{commit}")).Code -ne 0) {
-                throw "the remote's main is not in this clone yet; fetch origin first"
-            }
-            $anc = Invoke-Git $repo @('merge-base', '--is-ancestor', $head, $remoteMain[0])
-            if ($anc.Code -gt 1) { throw "git merge-base failed (exit $($anc.Code))" }
-
+            if (-not $match.Remote) { throw "no pinned remote is named for $repo" }
             # Against the verified admin dir, never whatever the worktree's own .git names.
             $wt = @("--git-dir=$verifiedGitDir", "--work-tree=$target")
-            $tree = Invoke-Git $target ($wt + @('ls-tree', '-r', '-z', 'HEAD'))
+            # The listing's HEAD came from whichever admin dir git listed at this path; everything
+            # below reads the verified one. They must be the same commit, and stay it to the end.
+            $headNow = {
+                $r = Invoke-Git $target ($wt + @('rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'))
+                if ($r.Code -ne 0) { throw "git rev-parse HEAD failed (exit $($r.Code))" }
+                $r.Out.Trim()
+            }
+            if ((& $headNow) -cne $head) { throw "the verified admin dir's HEAD is not the commit git lists for the worktree" }
+            # A graft file rewrites a commit's parents for merge-base, and --no-replace-objects does not turn it off.
+            $common = Split-Path -Parent (Split-Path -Parent $verifiedGitDir)
+            if (Test-Path -LiteralPath (Join-Path $common 'info/grafts')) { throw 'the clone has an info/grafts file, which rewrites ancestry' }
+            $remoteMain = Get-RemoteMain $match.Remote $RemoteTimeoutSeconds
+            if ((Invoke-Git $repo @('cat-file', '-e', "$remoteMain^{commit}")).Code -ne 0) {
+                throw "the remote's main is not in this clone yet; fetch origin first"
+            }
+            $anc = Invoke-Git $repo @('merge-base', '--is-ancestor', $head, $remoteMain)
+            if ($anc.Code -gt 1) { throw "git merge-base failed (exit $($anc.Code))" }
+
+            $tree = Invoke-Git $target ($wt + @('ls-tree', '-r', '-z', '--end-of-options', $head))
             if ($tree.Code -ne 0) { throw "git ls-tree failed (exit $($tree.Code))" }
             $paths = [System.Collections.Generic.List[string]]::new()
             $blobs = [System.Collections.Generic.List[string]]::new()
@@ -457,7 +516,18 @@ try {
                 if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains("`n")) { $odd++; continue }
                 $paths.Add($p); $blobs.Add($id)
             }
-            # One process hashes every tracked file as it sits on disk, through the same filters
+            # A filter, ident or working-tree-encoding attribute converts content between disk and
+            # blob, and its rules can come from the clone's shared .git/info/attributes and config.
+            # A filter also runs a command. So no tracked path may carry one; read before any hash.
+            $converted = 0
+            if ($paths.Count) {
+                $ca = Invoke-Git $target ($wt + @('check-attr', '-z', '--stdin', 'filter', 'ident', 'working-tree-encoding')) -StdinText (($paths -join [char]0) + [char]0) -TimeoutSeconds 60
+                if ($ca.Code -ne 0) { throw "git check-attr failed (exit $($ca.Code))" }
+                $triples = $ca.Out.Split([char]0)
+                for ($i = 0; $i + 2 -lt $triples.Count; $i += 3) { if ($triples[$i + 2] -cne 'unspecified') { $converted++ } }
+            }
+            if ($converted) { throw "$converted tracked-path attributes set a filter, ident or working-tree-encoding" }
+            # One process hashes every tracked file as it sits on disk, through the eol conversion
             # git applies, so a line-ending conversion is not a difference and a forged stat is.
             $bytesDiffer = 0
             if ($paths.Count) {
@@ -473,12 +543,17 @@ try {
             if ($flags.Code -ne 0) { throw "git ls-files failed (exit $($flags.Code))" }
             $flagged = @($flags.Out.Split([char]0) | Where-Object { $_ -and -not $_.StartsWith('H ') })
             $st1 = Invoke-Git $target ($wt + @('status', '--porcelain=v1', '-z', '--untracked-files=all'))
+            # Untracked files the tree's own .gitignore files do not ignore. Not --exclude-standard:
+            # that adds the clone's info/exclude and core.excludesFile, which any session can write.
+            $st3 = Invoke-Git $target ($wt + @('ls-files', '-z', '--others', '--exclude-per-directory=.gitignore'))
             # ls-files, not status: status names a whole ignored directory such as `.venv/` against
             # any pathspec, while ls-files names each ignored file and filters it by the pathspec.
-            $st2 = Invoke-Git $target ($wt + @('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--',
-                    ':(glob)**/.claude/**', ':(glob)**/.mcp.json', ':(glob)**/CLAUDE.md', ':(glob)**/CLAUDE.local.md'))
-            if ($st1.Code -ne 0 -or $st2.Code -ne 0) { throw 'git status failed' }
-            $stray = @(($st1.Out + [char]0 + $st2.Out).Split([char]0) | Where-Object { $_ })
+            # icase, because NTFS opens CLAUDE.md for a file named claude.md.
+            $st2 = Invoke-Git $target ($wt + @('ls-files', '-z', '--others', '--ignored', '--exclude-per-directory=.gitignore', '--',
+                    ':(glob,icase)**/.claude/**', ':(glob,icase)**/.mcp.json', ':(glob,icase)**/CLAUDE.md', ':(glob,icase)**/CLAUDE.local.md'))
+            if ($st1.Code -ne 0 -or $st2.Code -ne 0 -or $st3.Code -ne 0) { throw 'git status failed' }
+            $stray = @(($st1.Out + [char]0 + $st2.Out + [char]0 + $st3.Out).Split([char]0) | Where-Object { $_ })
+            if ((& $headNow) -cne $head) { throw 'the worktree moved to another commit while it was checked' }
 
             if ($anc.Code -ne 0) { Add-Failure 'f' "the worktree's HEAD is not a commit of the remote's main, so its branch could carry its own hooks or instructions" }
             elseif ($odd) { Add-Failure 'f' "the worktree's HEAD holds $odd symlink, submodule or unreadable entries" }

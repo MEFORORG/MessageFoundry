@@ -22,12 +22,13 @@
     TO DISABLE IT: fleet-wide, per machine, or permanently, as scripts/worktree/enter-check.ps1's
     header says (ADR 0212 records the same three).
 
-    -FleetRepos and -TempRoot are passed through to enter-check.ps1 for tests. The settings entry
+    -FleetRepos, -FleetRemotes and -TempRoot are passed through to enter-check.ps1 for tests. The settings entry
     passes neither, so the defaults apply; whoever can edit that entry's arguments can already
     edit the permission rules beside it.
 #>
 param(
     [string[]]$FleetRepos,
+    [string[]]$FleetRemotes,
     [string]$TempRoot
 )
 
@@ -58,6 +59,7 @@ try {
     $transcript = if ($props['transcript_path']) { [string]$props['transcript_path'].Value } else { '' }
     $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd.Cwd; TranscriptPath = $transcript }
     if ($FleetRepos) { $check['FleetRepos'] = $FleetRepos }
+    if ($FleetRemotes) { $check['FleetRemotes'] = $FleetRemotes }
     if ($TempRoot) { $check['TempRoot'] = $TempRoot }
     $lines = @(& (Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree/enter-check.ps1') @check 2>$null)
     $code = $LASTEXITCODE
