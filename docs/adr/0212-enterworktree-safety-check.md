@@ -27,13 +27,14 @@ the session's own, and that the move does not re-file the chat transcript.
 It prints `SAFE` or `UNSAFE` and the reasons, and exits 0 for SAFE and 1 for UNSAFE. The verdict
 starts false and is set by one statement at the end, and only when each of the six checks
 recorded its own pass by name. A check that throws, times out, or is skipped because an earlier
-one failed records no pass. The whole run is bounded by `-BudgetSeconds` (40 by default), which
-caps every child process's own timeout, so the hook finishes inside its 60-second settings
-timeout. Every line it prints is folded through `Get-SafeForMessage`, parsed out of
+one failed records no pass. Every child process is bounded by `-BudgetSeconds` (40 by default)
+as well as its own timeout, which keeps the children inside the hook's 60-second settings
+timeout. The in-process reads, path canonicalisation and `Test-Path`, are not bounded, so a
+stalled volume runs into that settings timeout. Every line it prints is folded through `Get-SafeForMessage`, parsed out of
 `worktree_gate.ps1` at run time rather than copied, because a path and a git message are
 attacker-choosable text.
 
-The verdict is advice. The check runs from the session's own tree, so the session can change
+The verdict is advice. The check runs from a tree sessions can edit, so a session can change
 what it prints.
 
 SAFE requires all of these:
@@ -47,15 +48,22 @@ SAFE requires all of these:
 | e | The worktree is not locked. Its `.git` file names its own admin dir under the repository's `worktrees/`, and that dir names it back, so a repointed `.git` cannot choose the state e and f read. That dir shows no rebase, merge, cherry-pick, revert, sequencer or bisect in progress. |
 | f | Its HEAD is a commit of the remote's `main`: an ancestor of, or equal to, the commit `git ls-remote <pinned URL> refs/heads/main` names, read with no repository and no user or system config. Neither a local ref nor `origin` is the anchor: any session can move `origin/main` or shadow it with a branch or tag of that name, and can repoint `origin` (or add a `url.*.insteadOf`) in the clone's shared config. So every tracked file, settings, hook code and instructions alike, is one that merged. The clone's shared state may not stand in for an object either: replace refs and the commit-graph are turned off, an `info/grafts` file fails f, and the HEAD the verified admin dir names must be the commit git listed for the worktree, before and after the reads. Its working tree is HEAD byte for byte: no tracked path carries a `filter`, `ident` or `working-tree-encoding` attribute, whose rules `.git/info/attributes` and the shared config can set (a clean filter made an edited file hash as its HEAD blob, measured); every tracked file's on-disk hash equals its HEAD blob, because `git status` trusts a stat cache that a same-size edit with restored timestamps fools (measured); no index entry is flagged assume-unchanged or skip-worktree; nothing is modified or untracked; no ignored file sits under `.claude` or is a `.mcp.json`, `CLAUDE.md` or `CLAUDE.local.md`, at any depth and in any case; ignored means ignored by the tree's own `.gitignore` files, never by `info/exclude` or `core.excludesFile`; and the tree holds no symlink or submodule. The remote's `main` must already be fetched. |
 When `<engine git common dir>/mefor-coord/enter-check/OFF` exists, the check runs none of these,
-prints `OFF`, and exits 2.
+prints `OFF`, and exits 2. It reads that file before anything else, the sanitiser included. A read
+that fails means only that the machine is not silenced, and costs no reason line.
 
 ### 2. A PreToolUse hook, `scripts/hooks/enter-worktree-check.ps1`
 
 Wired in `.claude/settings.json` under matcher `EnterWorktree`, as an added entry. It reads the
 hook input as UTF-8 bytes through `_hookinput.ps1`. With a `tool_name` other than
 `EnterWorktree`, no `path` (a new worktree by `name`), any `tool_input` field besides `path`, or
-no `cwd`, it says nothing. Otherwise it runs the check, passing `session_id`, `cwd` and
-`transcript_path`.
+no `cwd`, it says nothing.
+
+It annotates only a prompt the harness shows anyway, because an `ask` anywhere else adds a
+prompt, and in a run nobody answers, a prompt is a refusal. `docs/SESSION-DRIFT-CONTROLS.md`
+records the harness's rule: it asks for a path outside `.claude/worktrees/`, deliberately not for
+one inside it, and never under `bypassPermissions`. So for a path with a `.claude/worktrees`
+segment pair, a `permission_mode` of `bypassPermissions`, or no `permission_mode`, the hook says
+nothing. Otherwise it runs the check, passing `session_id`, `cwd` and `transcript_path`.
 
 **It never returns `allow`, and never `deny`.** On SAFE it returns `permissionDecision: ask` with a
 `permissionDecisionReason` that starts `enter-check: SAFE` and says in one line what passed. On
@@ -91,9 +99,12 @@ check's run time and a child process.
 - **Auto-allow is deferred.** It may return only when the allow comes from an installed copy of
   the hook and the check outside every session-writable tree, and only if the owner wants it.
   The third review pass found at least ten ways a SAFE verdict could still name an unsafe
-  worktree. Nine remain open, and each is a reason the verdict is advice:
-  1. The hook and the check run from `${CLAUDE_PROJECT_DIR}`, the session's own tree, so a plain
-     edit there changes the verdict. This is the root one.
+  worktree. At least nine remain open, and the list below is the ones that review found, not a
+  complete set. Each is a reason the verdict is advice:
+  1. The hook and the check run from `${CLAUDE_PROJECT_DIR}`, a tree sessions can edit: the
+     session's own, or, for a desktop-app worktree session, the shared primary checkout
+     (`scripts/hooks/_hookinput.ps1` records the measurement). A plain edit there changes the
+     verdict. This is the root one.
   2. Check f trusts the clone's shared object database. A forged loose object, pack or
      multi-pack-index can stand in for a merged commit's trees.
   3. Check f accepts any ancestor of main, including old commits with fewer deny rules and guard
@@ -111,9 +122,9 @@ check's run time and a child process.
 
   The tenth, a relative `-Path` joined to the session's cwd, is closed: check a refuses any path
   that is not fully qualified.
-- The hooks reference says `ask` prompts the user, so where a permission rule or mode would
-  otherwise have let a path-bearing EnterWorktree through, the hook can bring a prompt back. That
-  case is not measured. With no `path`, nothing changes.
+- The hook adds no prompt where the harness's recorded rule shows none. If that rule changes,
+  the hook's own copy of it goes stale; that is not measured here. With no `path`, nothing
+  changes.
 - The check costs a few seconds per EnterWorktree call with a path, most of it `git ls-remote`
   and hashing the tree. With no network, f fails and the prompt reads UNSAFE.
 - Only a worktree at an untouched commit of `main` reads SAFE. A worktree on a branch, one a
