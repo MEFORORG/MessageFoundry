@@ -275,18 +275,40 @@ def test_a_lane_level_lands_under_the_shared_root(repo: Path, shared: Path) -> N
     assert not (local_coord(repo) / "lanes").exists()
 
 
-def test_a_lane_record_of_another_machine_is_not_overwritten(repo: Path, shared: Path) -> None:
-    assert run(repo, "lane.ps1", "-Free", "1", "-InFlight", "2", root=shared).returncode == 0
-    (record,) = list((shared / "lanes").glob("*.json"))
-    rec = json.loads(record.read_text(encoding="utf-8-sig"))
-    rec["host"] = OTHER
-    record.write_text(json.dumps(rec), encoding="utf-8")
-    before = record.read_bytes()
+def _box_key(path: Path, host: str) -> str:
+    """The box key from the real mail-key.ps1, for any host."""
+    lib = COORD / "mail-key.ps1"
+    script = f". '{lib}'; ConvertTo-BoxKey -Path $env:BK_PATH -HostName $env:BK_HOST"
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+        env=dict(os.environ, BK_PATH=str(path), BK_HOST=host),
+    ).stdout.strip()
+
+
+def test_another_machines_lane_at_the_same_path_is_its_own_file(repo: Path, shared: Path) -> None:
+    # The box key hashes the host as well as the path (docs/COORD-SHARED-ROOT.md, step 4), so the
+    # other PC's lane at this path has its own file, and a write here neither refuses nor touches it.
+    lanes = shared / "lanes"
+    lanes.mkdir()
+    theirs = lanes / f"{_box_key(repo, OTHER)}.json"
+    theirs.write_text(
+        json.dumps({"v": 1, "host": OTHER, "worktree": str(repo), "statedFree": 2}),
+        encoding="utf-8",
+    )
+    before = theirs.read_bytes()
 
     proc = run(repo, "lane.ps1", "-Free", "0", "-InFlight", "3", root=shared)
-    assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert OTHER in proc.stderr
-    assert record.read_bytes() == before
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert theirs.read_bytes() == before
+    mine = json.loads(
+        (lanes / f"{_box_key(repo, this_host())}.json").read_text(encoding="utf-8-sig")
+    )
+    assert mine["statedFree"] == 0
+    assert mine["host"].casefold() == this_host().casefold()
 
 
 def test_the_owner_log_follows_the_shared_root(

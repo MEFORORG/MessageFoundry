@@ -862,6 +862,10 @@ try {
     # move win" is three chances for one to drift back to a check that cannot tell a winner from a loser.
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
     $key = ConvertTo-BoxKey -Path $cwd
+    # The box key hashes the host as well as the path (docs/COORD-SHARED-ROOT.md, step 4). Mail queued
+    # under the old path-only key is moved into this box first, so it is read rather than stranded. That
+    # is the one read of the legacy box; nothing writes to it.
+    $null = Move-LegacyInbox -Root $root -Key $key -LegacyKey (ConvertTo-LegacyBoxKey -Path $cwd)
 
     # VALIDATE BEFORE YOU BUILD. The session id is hook-payload input -- any process running under this
     # account can produce one -- and a shown-marker path is built out of it, so it goes through the same

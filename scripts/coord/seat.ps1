@@ -8,6 +8,9 @@
 .DESCRIPTION
     One record per (worktree, session), at
     <shared root>/seats/<boxKey>/<sessionKey>.json
+    The box key hashes this host as well as the worktree path (mail-key.ps1), so the same path on two
+    PCs is two seats. Records written before that change sit under ConvertTo-LegacyBoxKey; this
+    writer reads one there as its prior and writes only the new key.
 
     THE SHARED ROOT IS coord-root.ps1's ANSWER, NOT <git-common-dir>/mefor-coord BY HAND. With nothing
     configured the two are the same directory. With MEFOR_COORD_ROOT or root.toml set, the registry
@@ -923,10 +926,21 @@ try {
 
     # Read the prior record so -Declare and -Close amend rather than truncate, and so `writes` and
     # the declared half survive a -Record that knows nothing about them.
+    #
+    # THE BOX KEY HASHES THE HOST TOO (docs/COORD-SHARED-ROOT.md, step 4). A session that began before
+    # that change has its record under the old path-only key, so when the new path holds nothing the
+    # prior is read from there, once, and the record is then written ONLY under the new key. A legacy
+    # record from another host shares this path but is that PC's seat, so it is never adopted.
     $prior = $null
-    if (Test-Path -LiteralPath $recPath) {
-        try { $prior = Get-Content -LiteralPath $recPath -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+    $priorPath = $recPath
+    if (-not (Test-Path -LiteralPath $recPath)) {
+        $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+        if (Test-Path -LiteralPath $legacyPath) { $priorPath = $legacyPath }
+    }
+    if (Test-Path -LiteralPath $priorPath) {
+        try { $prior = Get-Content -LiteralPath $priorPath -Raw -EA Stop | ConvertFrom-Json -EA Stop }
         catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
+        if ($prior -and $priorPath -ne $recPath -and -not (Test-CoordRecordIsHere $prior)) { $prior = $null }
     }
 
     function Prior([string]$Name, $Default) {

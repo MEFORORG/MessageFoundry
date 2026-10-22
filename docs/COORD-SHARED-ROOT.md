@@ -1,15 +1,11 @@
 # Sharing fleet coordination state across two PCs
 
 **Status: APPROVED by the owner, 2026-10-21. Migration step 3 (resolver, host field, host-aware
-liveness, gate) are BUILT on this branch. No root is configured anywhere, so behaviour is unchanged
-until step 7.**
+liveness, gate) and step 4 (the host-qualified box key) are BUILT. No root is configured anywhere,
+so the shared-root behaviour is unchanged until step 7.**
 
-Known gaps after step 3, at least:
+Known gaps after step 4, at least:
 
-- **Box keys are path-derived.** A seat id, a mailbox and a lane key all hash the worktree path, so
-  two PCs with a worktree at the same path share them. Readers are host-aware, so nothing is judged
-  gone or reaped, and `lane.ps1` refuses to overwrite another host's record. Mail to that key still
-  reaches whichever PC drains first. A host-qualified key is its own change.
 - **The batch skill's `read_batch.py` lives outside this repository** and still builds
   `<git-common-dir>/mefor-coord/seats`. It should import `scripts/coord/coord_root.py`. That edit is
   outside the worktree, so it is the owner's.
@@ -258,10 +254,17 @@ design. Reads and builds keep working.
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
 3. Land the resolver, the `host` field, the host-aware liveness checks and the gate tightening, with
    tests. Behaviour is unchanged, because no root is configured yet.
-4. Land the host-qualified box key: hash `<host>|<path>`, not the path alone, for seat ids,
-   mailboxes and lane files, keeping one read of the old key for records with no `host`. Until it
-   lands, two PCs with a worktree at the same path share one seat id and one mailbox. This is a
-   precondition of step 7, and a separate change, because it moves both ends of the mail contract.
+4. **BUILT.** Land the host-qualified box key: hash `<HOST>|<path>`, not the path alone, for seat
+   ids, mailboxes and lane files. `ConvertTo-BoxKey` in `scripts/coord/mail-key.ps1` does this, and
+   `ConvertTo-LegacyBoxKey` is the one definition of the old key, for readers only. The drain moves
+   the old box's inbox into the new box before it reads, `seat.ps1` takes its prior record from the
+   old box once, and `fleet.ps1` marks an old-box record superseded by a newer one in the new box.
+   Writers write only the new key, except a send to a seat id published before the change, which
+   names the old box. A lane level is not carried over, because it is restated within minutes.
+   `lane.ps1` no longer refuses another host's record, since the key now keeps the two apart.
+   **Roll out by updating the primary checkout soon after the merge.** The mail hooks run from it,
+   so until it carries this change a drain there reads only the old box, and mail a new sender
+   queued in the new box waits.
    Also before step 7: the rename-retry change for writers and readers of shared kinds, and the
    CreateNew race rerun with one process on each PC (see *What MEFORDEV01 measured*).
 5. Pick a quiet window. Announce it on the old mail lane.

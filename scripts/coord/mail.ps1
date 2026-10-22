@@ -50,6 +50,11 @@
     ConvertTo-BoxKey of the SAME worktree root the drain keys a box on, so it IS the mailbox key. It
     is accepted only when the shared seat registry holds a record under that name, which is this
     form's equivalent of the existing-directory gate on a path.
+    THE KEY HASHES THE HOST TOO (docs/COORD-SHARED-ROOT.md, step 4), so a worktree at the same path on
+    two PCs has two seat ids and two mailboxes. A path target is keyed for THIS PC, because a path is
+    only an address on the PC that holds it; reach another PC's seat by its seat id. A seat id written
+    before the change is the old path-only key. It is still accepted, and mail sent to it lands in the
+    legacy box, which the recipient's drain moves into its own box.
     A cwd is matched case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
     an extension of the primary checkout's path, so a prefix match resolves any peer to some arbitrary
     worktree. VS Code also records a lowercase drive letter where the Desktop app records an uppercase
@@ -668,6 +673,9 @@ if ($List) {
 # -Status (default): this worktree's own box.
 $here = (Get-Location).Path
 $key = ConvertTo-BoxKey -Path $here
+# The box under the old path-only key, read only: the next drain moves its inbox into $key.
+$legacyKey = ConvertTo-LegacyBoxKey -Path $here
+$legacyInbox = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'inbox').Count
 $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
@@ -707,6 +715,7 @@ if ($Json) {
             Claiming = $claiming.Count; Stranded = $stranded.Count
             Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
+            LegacyKey = $legacyKey; LegacyInbox = $legacyInbox
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output
     exit 0
@@ -729,6 +738,10 @@ Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not fi
 Write-Host "Expired:       $($expired.Count) swept past their TTL. NOBODY WAS TOLD -- expiry is silent to"
 Write-Host "               the sender and to the recipient, so a non-zero count here is the only place"
 Write-Host "               a message that died unread is named after the turn that swept it."
+if ($legacyInbox -gt 0) {
+    Write-Host "Legacy box:    $legacyInbox waiting under the old path-only key $legacyKey. The next drain"
+    Write-Host "               moves them into this box."
+}
 Write-Host "As of:         $([DateTime]::UtcNow.ToString('o'))"
 
 if ($stranded.Count -gt 0) {

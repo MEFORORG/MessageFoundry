@@ -396,10 +396,18 @@ foreach ($r in $records) {
     $ageH = Get-AgeHours $rec.asOf
 
     # SUPERSEDED: a newer record in the same box, or a later record naming this one as predecessor.
+    # A record under the OLD path-only key is also superseded by a newer one in the box the same
+    # worktree and host now key to (docs/COORD-SHARED-ROOT.md, step 4). seat.ps1 carries a session
+    # across that change by writing the new box only, so the legacy record stops moving and would
+    # otherwise read as a second, interrupted seat.
+    $successorBox = $null
+    if ($wt -and $r.Box -ceq (ConvertTo-LegacyBoxKey -Path $wt)) {
+        $successorBox = ConvertTo-BoxKey -Path $wt -HostName (Get-CoordRecordHost $rec)
+    }
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
-        if ($o.Box -ne $r.Box) { continue }
+        if ($o.Box -ne $r.Box -and $o.Box -cne $successorBox) { continue }
         $oAge = Get-AgeHours $o.Rec.asOf
         if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
     }

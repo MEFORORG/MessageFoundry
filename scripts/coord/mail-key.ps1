@@ -10,6 +10,7 @@
 
         . "$PSScriptRoot\mail-key.ps1"
         $key = ConvertTo-BoxKey -Path $cwd
+        $old = ConvertTo-LegacyBoxKey -Path $cwd   # READERS ONLY; see that function
 
     ONE COPY ON PURPOSE, for the same reason session-registry.ps1 states for the liveness fence. The
     sender (scripts/coord/mail.ps1) and the drain (scripts/hooks/mail-drain.ps1) must compute the SAME
@@ -27,8 +28,8 @@
 
     INJECTIVITY IS THE POINT OF THE HASH. A readable slug alone is not enough: two different worktree
     paths can sanitise to the same slug, and the failure mode is one worktree silently reading
-    another's mail. The hash is computed over the NORMALISED path and is what carries injectivity. The
-    slug exists only so a human can tell boxes apart in a directory listing.
+    another's mail. The hash is computed over the host and the NORMALISED path and is what carries
+    injectivity. The slug exists only so a human can tell boxes apart in a directory listing.
 
     THE MESSAGE ID IS ALSO A SHARED CONTRACT, AND IT FAILS THE SAME WAY THE BOX KEY DOES. The drain
     treats the ON-DISK NAME as the message's identity -- the JSON 'id' field inside a message is body
@@ -45,17 +46,53 @@
 #>
 
 function ConvertTo-BoxKey {
+    # THE KEY HASHES THE HOST AS WELL AS THE PATH (docs/COORD-SHARED-ROOT.md, migration step 4). On a
+    # shared root two PCs can each hold a worktree at the same path, and a path-only key gave them one
+    # seat id, one mailbox and one lane file. The hash input is '<HOST>|<normalised path>', with the
+    # host upper-cased because Windows machine names are case-insensitive. The slug is unchanged, so
+    # a directory listing still reads the same.
+    #
+    # -HostName exists for a reader that must name ANOTHER PC's box, and for tests. A writer passes
+    # nothing and gets this machine.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [string]$HostName)
+    if (-not $HostName -or -not $HostName.Trim()) { $HostName = Get-BoxKeyHost }
+    $norm = ConvertTo-BoxKeyPath -Path $Path
+    return (Format-BoxKey -Norm $norm -HashInput ($HostName.Trim().ToUpperInvariant() + '|' + $norm))
+}
+
+function ConvertTo-LegacyBoxKey {
+    # THE PATH-ONLY KEY, FOR READING ONLY. Every seat record, mailbox and lane file written before the
+    # host joined the key sits under this name. A reader looks here too so nothing already written
+    # goes unread; NO WRITER MAY CALL THIS. A new record under the legacy key is the collision step 4
+    # removed. This is the one definition of the old key.
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
+    $norm = ConvertTo-BoxKeyPath -Path $Path
+    return (Format-BoxKey -Norm $norm -HashInput $norm)
+}
 
-    $norm = $Path.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
+function Get-BoxKeyHost {
+    # coord-root.ps1's Get-CoordHost when it is loaded, which is the one host rule. Some callers and
+    # test sandboxes dot-source this file alone, and the fallback is the same value that function
+    # returns today.
+    if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { return [string](Get-CoordHost) }
+    return [Environment]::MachineName
+}
 
+function ConvertTo-BoxKeyPath {
+    param([Parameter(Mandatory)][string]$Path)
+    return ($Path.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\')
+}
+
+function Format-BoxKey {
+    param([Parameter(Mandatory)][string]$Norm, [Parameter(Mandatory)][string]$HashInput)
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($norm)) }
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($HashInput)) }
     finally { $sha.Dispose() }
     $short = -join ($bytes[0..3] | ForEach-Object { $_.ToString('x2') })
 
-    $slug = (Split-Path $norm -Leaf) -replace '[^a-zA-Z0-9._-]', '-'
+    $slug = (Split-Path $Norm -Leaf) -replace '[^a-zA-Z0-9._-]', '-'
     if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40) }
     if (-not $slug) { $slug = 'root' }
 

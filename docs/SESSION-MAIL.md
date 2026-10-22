@@ -156,9 +156,9 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
 - `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
   registry holds a readable record for it. **Use this for a seat on another PC**: its worktree path
-  does not exist here, so the path form cannot reach it. **Not yet handled:** a seat id is derived
-  from the worktree path, so two PCs with a worktree at the SAME path share one seat id and one
-  mailbox, and mail to it reaches whichever PC drains first.
+  does not exist here, so the path form cannot reach it. A seat id hashes the host as well as the
+  path, so two PCs with a worktree at the same path have two seat ids and two mailboxes. A path
+  target is keyed for this PC.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
 - `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
@@ -210,8 +210,15 @@ one from both ends.
 
 **Injectivity comes from the hash, not the slug.** The key is `<readable-slug>-<hash>`. Two different
 worktree paths can sanitise to the same slug, and the failure mode of a slug-only key is one worktree
-reading another's mail. The hash is computed over the normalised path and carries the injectivity; the
-slug exists only so a human can tell boxes apart in a directory listing.
+reading another's mail. The hash is computed over `<HOST>|<normalised path>` and carries the
+injectivity; the slug exists only so a human can tell boxes apart in a directory listing.
+
+**The host is part of the key.** On a shared root two PCs can each hold a worktree at the same path, and
+a path-only key gave them one mailbox ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md), migration step
+4). Mail queued before that change sits under the old path-only key, which `ConvertTo-LegacyBoxKey`
+names. The drain moves that box's inbox into the new box before it reads, the watcher wakes on it, and
+`-Status` counts it. Nothing writes a new message under the old key, except a send to a seat id that
+was published before the change, because that id names the old box.
 
 **One definition, dot-sourced by both ends.** The sender and the drain must compute the same key from
 the same path or mail is written to a box nobody reads -- and that failure is silent on both ends: the

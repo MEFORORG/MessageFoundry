@@ -369,3 +369,38 @@ function New-ClaimAttempt {
     }
     return $last
 }
+
+function Move-LegacyInbox {
+    # Moves mail waiting in the LEGACY box (ConvertTo-LegacyBoxKey) into this worktree's box, so a
+    # message queued before the host joined the key is still read. Returns the number moved.
+    #
+    # ONLY inbox/, and only names this channel minted. claiming/ belongs to a drain that may still be
+    # running, and stranded/, seen/ and expired/ stay where mail.ps1 -List reports them. Shown-markers
+    # are not carried: a moved message may be shown once more, and a duplicate display is the side of
+    # this channel's one tradeoff it accepts. Each move goes through Move-Claimed under the file's own
+    # token, so the name is kept and a drain that takes the file first simply has it.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$LegacyKey
+    )
+    if ($LegacyKey -ceq $Key) { return 0 }
+    $src = Join-Path $Root "box/$LegacyKey/inbox"
+    if (-not [System.IO.Directory]::Exists($src)) { return 0 }
+    $names = @()
+    try { $names = @([System.IO.Directory]::EnumerateFiles($src) | ForEach-Object { [System.IO.Path]::GetFileName($_) }) }
+    catch { return 0 }
+    $dst = Join-Path $Root "box/$Key/inbox"
+    $moved = 0
+    foreach ($n in $names) {
+        $p = Split-MailFileName -Name $n
+        if (-not $p) { continue }
+        try {
+            [System.IO.Directory]::CreateDirectory($dst) | Out-Null
+            $r = Move-Claimed -Source (Join-Path $src $n) -DestinationDir $dst -Stem $p.Stem -Token $p.Token
+            if ($r.Won) { $moved++ }
+        } catch { }
+    }
+    return $moved
+}
