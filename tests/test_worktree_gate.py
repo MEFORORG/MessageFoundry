@@ -2154,6 +2154,21 @@ def test_a_double_dash_does_not_let_a_branch_switch_through_class_A(
     assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
 
 
+@pytest.mark.parametrize("tail", ["checkout main --", "switch -- main"])
+def test_a_double_dash_onto_a_branch_live_elsewhere_is_left_to_git(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """`main` is checked out in the primary, so git refuses these itself. `--` switches off no
+    guard, so it is not a flag that stops class A deferring to git; denying would print a
+    `new.ps1 -Branch main` that dies with "already checked out"."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+    refused = subprocess.run(
+        ["git", "-C", str(hijack_repo.victim), *tail.split()], capture_output=True, text=True
+    )
+    assert refused.returncode != 0 and "already" in refused.stderr, refused.stderr
+
+
 def test_a_double_dash_with_a_pathspec_after_it_is_still_a_restore(
     hijack_repo: HijackRepo, hijack_repos_file: Path
 ) -> None:
@@ -2191,25 +2206,33 @@ def test_a_repository_token_switch_after_a_double_dash_moves_the_primary_s_head(
     assert_denied(run_gate(payload, hijack_repos_file))
 
 
+#: Directory names that begin with a dash. `-x` is a flag to both readings, so only the token-after-
+#: `--` rule names it; `-<U+0301>` is a flag to the ordinal reading only.
+_DASH_LEADS = ["-x", f"-{COMBINING_ACUTE}"]
+
+
+@pytest.mark.parametrize("lead", _DASH_LEADS, ids=["plain-dash", "dash-then-combining-mark"])
 @pytest.mark.parametrize(
     "spelling",
     ['-- "{lead}/../../{victim}"', '--force -- "{lead}/../../{victim}"'],
     ids=["separator", "flag-then-separator"],
 )
 def test_the_token_after_a_double_dash_is_the_victim_whatever_it_starts_with(
-    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str
+    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str, lead: str
 ) -> None:
     """Rule 3d's victim scan skipped `-<U+0301>/../../<victim>` as a flag, found no victim, and
-    allowed a removal git performs: after `--` it reads the token as a path."""
-    lead = f"-{COMBINING_ACUTE}"
+    allowed a removal git performs: after `--` it reads the token as a path. The `-x` row was allowed
+    on origin/main too, and is the one that fails without the token-after-`--` rule on an ICU host."""
     (hijack_repo.mine / lead).mkdir()
     cmd = "git worktree remove " + spelling.format(lead=lead, victim=hijack_repo.victim.name)
     assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
 
 
-def test_git_removes_the_worktree_named_after_a_double_dash(hijack_repo: HijackRepo) -> None:
-    """Why the row above is a real removal, not a refused command."""
-    lead = f"-{COMBINING_ACUTE}"
+@pytest.mark.parametrize("lead", _DASH_LEADS, ids=["plain-dash", "dash-then-combining-mark"])
+def test_git_removes_the_worktree_named_after_a_double_dash(
+    hijack_repo: HijackRepo, lead: str
+) -> None:
+    """Why the rows above are real removals, not refused commands."""
     (hijack_repo.mine / lead).mkdir()
     subprocess.run(
         ["git", "worktree", "remove", "--", f"{lead}/../../{hijack_repo.victim.name}"],

@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.8"
+$GateVersion = "2026.10.21.9"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2526,11 +2526,12 @@ $rehome
 # ORDINAL IS NOT "AT LEAST AS STRICT" FOR A PREFIX. Where a match ALLOWS, an ordinal Equals denies at
 # least as much as the culture `-eq`, because only identical strings match it, and identical strings
 # match the culture `-eq` too. An ordinal StartsWith gives no such guarantee: it matches `-<U+0301>x`
-# against `-`, and the culture one does not. So where a prefix test decides what is skipped -- the
-# exemption here, class A's destination scan, rule 3d's victim scan, Test-VerbMovesHead's flag and
-# comment tests -- the gate takes both readings and denies if either denies. Culture comparisons remain
-# elsewhere, at least the deny-on-match ones such as rule 3d's governed test, rule 3c's `-eq` and class
-# A's flag test, and sites nobody has audited. This is not a census.
+# against `-`, and the culture one does not. So the gate takes both readings, and denies if either
+# denies, at least at the exemption here, class A's destination scan, rule 3d's victim scan and
+# Test-VerbMovesHead's flag and comment tests. Other prefix tests still take one reading, at least
+# rule 1b's ordinal coordination-root match and rule 3's cd-fallback lookahead, which this change did
+# not touch and did not audit. Culture comparisons remain too, at least the deny-on-match ones such as
+# rule 3d's governed test, rule 3c's `-eq` and class A's flag test. This is not a census.
 function ConvertTo-ComposedForm([string]$Text) {
     # Text that is not valid UTF-16, such as a lone surrogate, throws. Its raw form is compared then,
     # which exempts nothing the culture half does not.
@@ -2930,7 +2931,11 @@ What to do instead:
     }
 
     $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
-    $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
+    # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
+    # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
+    # so only `--` itself is excused.
+    $hasFlag = @($after -split '\s+' | Where-Object {
+            $_ -and $_.StartsWith('-') -and -not [string]::Equals($_, '--', [System.StringComparison]::Ordinal) }).Count -gt 0
     $denyDest = $null
     foreach ($dest in $dests) {
         # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
@@ -4332,10 +4337,11 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             # a path separator, whitespace, a quote, `;` `&` `|` `)`, a bare trailing dot, or end-of-string
             # -- clears both lookaheads and still matches, so no real primary tree-swap slips through.
             #
-            # THIRD lookahead (BACKLOG #308): honour the SAME `.claude/worktrees/` exemption that
-            # Test-Governed already applies. A linked worktree living UNDER the primary is not the
-            # primary -- a git verb there swaps only its own tree -- but a path separator clears both
-            # lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
+            # THIRD lookahead (BACKLOG #308): honour the `.claude/worktrees/` subpath that Test-Governed
+            # exempts. It is a raw ordinal regex, NOT the same test: it also exempts
+            # `.claude/worktrees/<U+0301>x`, which Test-Governed governs. A linked worktree living
+            # UNDER the primary is not the primary -- a git verb there swaps only its own tree -- but a
+            # path separator clears both lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
             # exactly where the Claude Code harness puts a worktree (both layouts, and which mechanism
             # makes each: the WHICH MECHANISM MADE THIS WORKTREE block above), so `cd <own worktree> &&
             # git rebase ...` -- the
