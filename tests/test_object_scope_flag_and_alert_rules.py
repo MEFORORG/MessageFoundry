@@ -14,22 +14,29 @@ NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
+from starlette.requests import Request
 
+from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertRule, AlertsSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.crypto import CipherError
 from tests.test_channel_rbac import _add, _login, _probe, _service, engine  # noqa: F401
 from tests.test_connection_audit_writes import toml_engine  # noqa: F401
+from tests.test_dual_control_reload import _settle_unlanded
 
 _DENIED = {"detail": "not authorized for this connection"}
 
@@ -221,20 +228,17 @@ async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
         assert await withheld_rows("scoped", c_covered) == []
 
 
-@pytest.mark.parametrize(
-    ("error", "status"),
-    [(RuntimeError, 200), *((defect, 500) for defect in AUDIT_WRITE_DEFECTS)],
-)
-async def test_alert_rules_withheld_row_is_fail_soft_for_a_store_refusal_only(
+@pytest.mark.parametrize("error", [RuntimeError, CipherError, *AUDIT_WRITE_DEFECTS])
+async def test_alert_rules_withheld_row_is_fail_soft(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     error: type[Exception],
-    status: int,
 ) -> None:
-    """BACKLOG #3403: the row is written fail-soft. A store refusal (``RuntimeError``) leaves the
-    narrowed answer standing and logs the loss with the row's counts, rather than a 500. A defect
-    in the write is a bug, so it escapes and the read fails, and nothing logs it as a lost row."""
+    """BACKLOG #3403: the row is written fail-soft. A store refusal (``RuntimeError``), a cipher
+    fault and a defect in the write all leave the narrowed answer standing and log the loss at ERROR
+    with the row's counts and its traceback. A 500 would tell a scoped caller that hidden rules
+    exist."""
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     app = create_app(engine, auth=service, alerts_settings=_RULES)
@@ -250,10 +254,49 @@ async def test_alert_rules_withheld_row_is_fail_soft_for_a_store_refusal_only(
 
         monkeypatch.setattr(service.store, "record_audit", refuse)
         r = await c.get("/alerts/rules", headers=h)
-    assert r.status_code == status, r.text
-    if status == 200:
-        assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
-        assert f"showed 3 and withheld {len(_RULES.rules) - 3} rules" in caplog.text
-        assert "its audit row failed" in caplog.text
-    else:
-        assert "its audit row failed" not in caplog.text
+    assert r.status_code == 200, r.text
+    assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
+    [lost] = [rec for rec in caplog.records if "its audit row failed" in rec.getMessage()]
+    assert lost.levelno == logging.ERROR
+    assert f"showed 3 and withheld {len(_RULES.rules) - 3} rules" in lost.getMessage()
+    assert lost.exc_info is not None and isinstance(lost.exc_info[1], error)
+
+
+async def test_alert_rules_withheld_row_cancelled_mid_write_is_logged(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3403: a cancel that lands while the row is being written waits a bounded time for
+    it. A row that still does not land is logged at ERROR with its counts, actor and client, and
+    with no rule's contents."""
+    service = await _service(engine)
+    app = create_app(engine, auth=service, alerts_settings=_RULES)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held(action: str, **_kw: Any) -> None:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("PROBE: the store is closed")
+
+    monkeypatch.setattr(service.store, "record_audit", held)
+    monkeypatch.setattr(app_module, "_ROW_CANCEL_WAIT_SECONDS", 0.05)
+    request = Request({"type": "http", "app": app, "client": ("10.0.0.9", 5), "headers": []})
+    identity = cast(Identity, SimpleNamespace(username="scoped"))
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        task = asyncio.create_task(app_module._audit_alert_rules_withheld(request, identity, 3, 2))
+        try:
+            await asyncio.wait_for(entered.wait(), 5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()  # the write left running now meets the closed store
+            await _settle_unlanded()
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    message = lost.getMessage()
+    assert "action=alert_rules_withheld actor=scoped" in message
+    assert '"shown": 3' in message and '"withheld": 2' in message
+    assert "client=10.0.0.9" in message
+    assert "IB_" not in message and "OB_X" not in message

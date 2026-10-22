@@ -2008,11 +2008,14 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
-> contents. The write is best-effort: when the store refuses it, the read still answers and the
-> lost row is logged at ERROR. So a missing row does not prove nothing was withheld. Each
-> withholding read writes its own row. The `summary_access` coalescer is the PHI-summary census,
-> and this read discloses no PHI. The console's alerts page does not poll, which
-> `test_ui_object_scope.py` pins; a page that polled would need the row coalesced. Why it is not
+> contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
+> one a defect in the write loses, and one a cancel cuts off are each logged at ERROR, and the
+> read still answers. So a missing row does not prove nothing was withheld. The row is not
+> coalesced. On the JSON route, every request already writes a grant row by default, so this adds
+> at most one row per request. The console's alerts page does not poll, which
+> `test_ui_object_scope.py` pins; a page that polled would need the row coalesced. What the row
+> still lets a scoped caller learn is small. The latency of one extra write can show that some rule
+> was withheld, never which or how many. A store refusal or a defect gives no 500. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
 > `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.

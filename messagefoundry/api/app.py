@@ -277,7 +277,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+from messagefoundry.audit_write import write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -3479,13 +3479,16 @@ async def _audit_alert_rules_withheld(
     denial count, so routine alerts-page loads could raise a denial-burst alert.
 
     Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
-    refusal is logged rather than turning the answered read into a 500. The catch set is the same
-    as ``_audit_write_errors`` in ``auth/service.py``, and a defect in
-    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` is raised, not logged as a refusal, so
-    a bug in the write answers 500 rather than passing as a refused row. Why
-    the row is not coalesced is in docs/SECURITY.md. The row goes through the auth service's store,
-    the one its own audit rows use: only a channel-scoped caller withholds a rule, such a caller
-    exists only when that service is attached, and the engine may not be."""
+    refusal, and a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` too, is
+    logged at ERROR with its traceback, and the narrowed answer still returns. A fault outside the
+    catch set below still escapes. The catch set is the same as
+    ``_audit_write_errors`` in ``auth/service.py``. A cancel that lands during the write waits a
+    bounded time for the row, and a row that still does not land is logged at ERROR with its counts
+    (:func:`_write_through_cancel`). Why the row is not coalesced is in docs/SECURITY.md.
+
+    The row goes through the auth service's store, the one its own audit rows use: only a
+    channel-scoped caller withholds a rule, such a caller exists only when that service is attached,
+    and the engine may not be."""
     auth = get_auth(request)
     actor = identity.username
     if auth is None:
@@ -3499,23 +3502,26 @@ async def _audit_alert_rules_withheld(
         return
     store = auth.store
     client = client_ip(request)
+    detail = json.dumps({"shown": shown, "withheld": withheld})
+    shown_client = scrub_log_argument(client or "-")
     await write_audit_soft(
-        lambda: store.record_audit(
-            "alert_rules_withheld",
-            actor=actor,
-            detail=json.dumps({"shown": shown, "withheld": withheld}),
-            client=client,
+        lambda: _write_through_cancel(
+            store.record_audit("alert_rules_withheld", actor=actor, detail=detail, client=client),
+            lambda: f"{_lost_row('alert_rules_withheld', actor, detail)} client={shown_client}",
         ),
         log=_log,
-        message="GET /alerts/rules showed %d and withheld %d rules from %s at %s, but its audit "
-        "row failed",
+        # Not the route: the console's alerts page reads the rules through this handler too.
+        message="a read of the alert rules showed %d and withheld %d rules from %s at %s, but its "
+        "audit row failed",
         args=lambda: (
             shown,
             withheld,
             scrub_log_argument(actor),
-            scrub_log_argument(client or "-"),
+            shown_client,
         ),
-        defects=AUDIT_WRITE_DEFECTS,
+        # (), as write_audit_soft's docstring asks where a raise would replace the answer the
+        # caller owes. A 500 here would also tell a scoped caller that hidden rules exist.
+        defects=(),
         errors=(CipherError, *store_call_errors()),
     )
 
@@ -8909,8 +8915,9 @@ def create_app(
                 for r in rules
             ],
         )
-        # After the answer is built, so a failed build writes no row. The console renders after
-        # this returns, so the row records what was withheld, not that a page was seen.
+        # After the answer is built, so a fault building it writes no row. Serialization through
+        # response_model runs later, so a fault there still leaves the row. The console renders
+        # after this returns, so the row records what was withheld, not that a page was seen.
         withheld = len(alerts.rules) - len(rules)
         if withheld:
             await _audit_alert_rules_withheld(request, _user, len(rules), withheld)

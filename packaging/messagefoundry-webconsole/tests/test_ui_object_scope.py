@@ -68,7 +68,8 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
         await cookie_login(c, "op")
         r = await c.get("/ui/alerts")
         assert r.status_code == 200
-        assert "IB_MINE" in r.text and "IB_THEIRS" not in r.text
+        scoped_page = r.text
+        assert "IB_MINE" in scoped_page and "IB_THEIRS" not in scoped_page
     # BACKLOG #3403: the console load writes the JSON handler's count-only row, and only for the
     # caller it withheld a rule from.
     withheld = await engine.store.list_audit(action="alert_rules_withheld")
@@ -76,8 +77,9 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
         ("op", {"shown": 1, "withheld": 1})
     ]
     # docs/SECURITY.md writes one row per load, not coalesced, because this page does not poll. A
-    # poll hook here would write a row per tick, so it must coalesce the row first.
-    assert "data-poll" not in page and "data-mf-fragment" not in page
+    # poll hook here would write a row per tick, so it must coalesce the row first. The scoped
+    # caller's page is the one that writes the row, so it is the page read here.
+    assert "data-poll" not in scoped_page and "data-mf-fragment" not in scoped_page
 
 
 async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
