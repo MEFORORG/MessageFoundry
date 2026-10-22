@@ -661,39 +661,46 @@ def test_code_drift_is_reported() -> None:
     assert _start_drift(text, _start_sites(sources))
 
 
-def _cipher_probe_bound_drift(text: str, live_seconds: float) -> list[str]:
-    """Section 4 must state the host cipher probes' timeout as the code sets it (vault BACKLOG
-    #3804 item 5). Before this, the bound was a doc-side literal that nothing read."""
-    rendered = f"bounded at {live_seconds:g} s (`_PROBE_TIMEOUT_S`)"
+def _bound_phrase(seconds: float) -> str:
+    return f"bounded at {seconds:g} s"
+
+
+def _cipher_probe_drift(
+    text: str, live_seconds: float, openssl_names: tuple[str, ...]
+) -> list[str]:
+    """Section 4 must state the host cipher probes' timeout as the code sets it, and each variable
+    the ``openssl`` probe passes on top of its allowlist (vault BACKLOG #3804 items 3 and 5).
+    Before this, both were doc-side text that nothing read."""
     # Whitespace is collapsed, so a re-wrap of the paragraph does not read as drift.
     section = " ".join(_section(text, 4).split())
-    if rendered not in section:
-        return [f"section 4 does not state {rendered!r}, the value of cipher_policy's timeout"]
-    return []
+    rendered = f"{_bound_phrase(live_seconds)} (`_PROBE_TIMEOUT_S`)"
+    problems = [] if rendered in section else [f"section 4 does not state {rendered!r}"]
+    problems += [
+        f"section 4 does not name `{name}`, which the openssl probe passes"
+        for name in openssl_names
+        if f"`{name}`" not in section
+    ]
+    return problems
 
 
-def test_the_cipher_probe_bound_matches_the_code() -> None:
+def test_the_cipher_probe_text_matches_the_code() -> None:
     from messagefoundry.verify import cipher_policy
 
-    problems = _cipher_probe_bound_drift(_doc_text(), cipher_policy._PROBE_TIMEOUT_S)
-    assert not problems, (
-        "docs/DANGEROUS-FUNCTIONALITY.md section 4 has drifted from the code:\n  "
-        + "\n  ".join(problems)
-    )
+    live = (cipher_policy._PROBE_TIMEOUT_S, cipher_policy._OPENSSL_ENV)
+    _assert_no_drift(4, _cipher_probe_drift(_doc_text(), *live))
 
 
-def test_cipher_probe_bound_drift_is_reported() -> None:
+def test_cipher_probe_text_drift_is_reported() -> None:
     """Break the page, then the code, in memory, and each must be reported."""
     from messagefoundry.verify import cipher_policy
 
-    live = cipher_policy._PROBE_TIMEOUT_S
+    seconds, names = cipher_policy._PROBE_TIMEOUT_S, cipher_policy._OPENSSL_ENV
     text = _doc_text()
-    assert not _cipher_probe_bound_drift(text, live)
-    stated = f"bounded at {live:g} s"
-    assert _cipher_probe_bound_drift(
-        _replace_once(text, stated, f"bounded at {live * 10:g} s"), live
-    )
-    assert _cipher_probe_bound_drift(text, live + 1)
+    assert not _cipher_probe_drift(text, seconds, names)
+    broken = _replace_once(text, _bound_phrase(seconds), _bound_phrase(seconds * 10))
+    assert _cipher_probe_drift(broken, seconds, names)
+    assert _cipher_probe_drift(text, seconds + 1, names)
+    assert _cipher_probe_drift(text, seconds, (*names, "OPENSSL_NEW"))
 
 
 def test_the_scans_read_the_toolkit() -> None:
