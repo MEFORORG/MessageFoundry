@@ -19,6 +19,13 @@
     stdin is replaced with a fresh reader over the payload this file read once, and stdout with a
     buffer. `exit` inside a guard ends that guard's script, not this process (measured).
 
+    THE PAYLOAD IS READ AS UTF-8 BYTES, NOT THROUGH [Console]::In. That reader decodes with the
+    console code page, which a hook child does not choose: started from a cp437 console it read
+    U+00E9 as two characters, and on a double-byte page (cp932, cp936, cp950) a lead byte swallows
+    the next `\`, so a valid payload stops parsing. Every guard sees this file's decoding, so the
+    defect reached all of them. This file reads stdin to the end, so a guard that reads the
+    process's own stdin handle finds it at end of file and must take [Console]::In instead.
+
     ***SCOPE IS ISOLATED; THE PROCESS IS NOT.*** At least these are shared by every guard in the
     run, and none of the guards wired today touches them: the current location, environment
     variables, the Console encodings (setting [Console]::OutputEncoding rebuilds Console.Out, so
@@ -97,7 +104,8 @@ param(
 
 $ShellGuardStdout = [Console]::Out
 try {
-    $ShellGuardPayload = [Console]::In.ReadToEnd()
+    $ShellGuardPayload = [System.IO.StreamReader]::new(
+        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
 } catch {
     exit 0
 }

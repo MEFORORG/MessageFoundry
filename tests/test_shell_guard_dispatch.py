@@ -15,11 +15,14 @@ first deny winning, and that one guard's scope, failure or absence cannot change
 from __future__ import annotations
 
 import atexit
+import ctypes
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Sequence
@@ -1026,3 +1029,69 @@ def test_the_gate_gets_a_large_payload_whole_and_a_failed_feed_blocks(tmp_path: 
     command = _Entry(world).command
     feed = command.index('exec {h}<<< "$in" || exit 1')
     assert feed < command.index('pwsh -NoProfile -File "$g" <&"$h"')
+
+
+# ================================================================== the payload's encoding
+
+
+#: Denies only when the command arrives whole: U+00E9 as one character, and U+200B followed by the
+#: backslash a cp932 lead byte would swallow. A mangled or unparseable payload is no deny.
+_ENCODING_PROBE = (
+    "$c = ([Console]::In.ReadToEnd() | ConvertFrom-Json).tool_input.command\n"
+    "$want = 'ls Other' + [char]0x200B + '\\x' + [char]0xE9\n"
+    "if ($c -ceq $want) { " + _DENY % "whole" + " }"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="console code pages are a Windows concept")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("codepage", [437, 932])
+def test_every_guard_gets_the_payload_as_utf8_whatever_the_console_code_page(
+    tmp_path: Path, codepage: int
+) -> None:
+    """Claude Code writes UTF-8. Read through [Console]::In, this file decoded it with the console
+    code page and handed every guard the result: under cp437 U+00E9 arrived as two characters, and
+    under cp932 the backslash after U+200B was swallowed and the payload stopped parsing.
+
+    The dispatcher runs in a console of its own, so chcp reaches nothing pytest shares;
+    tests/test_coord_alloc_floor.py has the incident. A bare chcp reports the page first, so a host
+    that cannot take it skips rather than passing for the wrong reason. The cp437 case discriminates
+    only from a console whose page is not already UTF-8, which chcp guarantees here."""
+    if sys.platform != "win32":  # the skipif above already skips; this line tells mypy
+        pytest.skip("Windows only")
+    probe = _guard(tmp_path, "encoding.ps1", _ENCODING_PROBE)
+    command = "ls Other" + chr(0x200B) + "\\x" + chr(0xE9)
+    raw = json.dumps(bash(command), ensure_ascii=False).encode("utf-8")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    with single_spawn():
+        proc = subprocess.run(
+            f'chcp {codepage} >nul && chcp && pwsh -NoProfile -NonInteractive -File "{DISPATCHER}"'
+            f' "{probe}"',
+            shell=True,
+            input=raw,
+            capture_output=True,
+            timeout=120,
+            env={**os.environ, **_HERMETIC},
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
+    if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
+        restored = kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1])
+        pytest.fail(
+            f"chcp {codepage} reached pytest's shared console, {shared} -> {after}; "
+            + (
+                "it was put back"
+                if restored
+                else f"putting it back FAILED, {ctypes.get_last_error()}"
+            )
+        )
+    out = proc.stdout.decode(f"cp{codepage}", errors="replace")
+    page, _, decision = out.partition("\n")
+    # A word match, not a suffix: a localized chcp may end its line with a period.
+    if not re.search(rf"\b{codepage}\b", page):
+        pytest.skip(f"this host's console did not take cp{codepage}: {out!r}")
+    err = proc.stderr.decode(f"cp{codepage}", errors="replace")
+    assert proc.returncode == 0, f"the probe failed, so the payload did not parse: {err}"
+    assert assert_denied(_decision(decision)) == "whole", f"the probe saw a mangled payload: {err}"
