@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.4"
+$GateVersion = "2026.10.21.5"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2510,8 +2510,9 @@ $rehome
 # ordinal, so without this half it would read a linked worktree at `<primary><U+200B>` as a linked
 # worktree. THE HALF STAYS ANYWAY, because this function also answers rules 1 and 3: without it, a write
 # into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
-# 2026-10-21). Path comparisons elsewhere in this file are ordinal where ordinal denies at least as much;
-# the ones that keep a culture half say why beside them.
+# 2026-10-21). At least the path comparisons in rules 3b and 3d, Get-SessionRoot and the remedy text are
+# ordinal now. Culture comparisons remain elsewhere, at least rule 3c's `-eq`, Get-RootCommonDirCmp and
+# rule 1a's `-in`; the first two say why beside them.
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
     $ord = [System.StringComparison]::Ordinal
@@ -2893,7 +2894,10 @@ What to do instead:
     & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
     if ($LASTEXITCODE -ne 0) { return }
     $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
-    if ($dest -eq $head) { return }
+    # ORDINAL, here and in the checked-out-nowhere test below, because a match ALLOWS: a culture
+    # comparison read the branch `fe<U+00AD>at` as the HEAD `feat`, and `ma<U+00AD>in` as the
+    # primary's `main`, and let the switch onto another branch through.
+    if ([string]::Equals($dest, $head, [System.StringComparison]::Ordinal)) { return }
 
     # And only a branch that is checked out NOWHERE. The deny text below asserts exactly that ("git
     # allowed it because '$dest' was not checked out anywhere") -- an assertion this rule never actually
@@ -2919,7 +2923,9 @@ What to do instead:
     # is a needless deny on `git checkout --quiet main`, whose remediation line is then the imperfect
     # one; that is strictly better than a missed hijack, and unlike a flag list it does not decay.
     $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
-    if (-not $hasFlag -and ($list -contains ("branch refs/heads/" + $dest))) { return }
+    $destLine = "branch refs/heads/" + $dest
+    if (-not $hasFlag -and @($list | Where-Object {
+            [string]::Equals([string]$_, $destLine, [System.StringComparison]::Ordinal) }).Count -gt 0) { return }
 
     $destSlug = ConvertTo-WorktreeSlug $dest
     # EVERY interpolation below goes through one of the two helpers, and which one depends ONLY on
@@ -4637,7 +4643,10 @@ foreach ($r in $roots) {
     # This is "what turns off the thing I am deferring to" applied to GetExtension. The question came from a
     # sibling session that had just found `--ignore-other-worktrees` disabling the git guard its own rule
     # deferred to; the same question against this rule's classifier produced the spelling above.
-    $colon = $rest.IndexOf(':')
+    # The [char] overload, which is ordinal. The string overload is culture, and a colon followed by
+    # a combining mark is not found by it, so `announce/OFF:<U+0301>x.md` kept its stream suffix and
+    # read as a document (measured 2026-10-21).
+    $colon = $rest.IndexOf([char]':')
     if ($colon -ge 0) { $rest = $rest.Substring(0, $colon) }
 
     # Name is matched as the WHOLE remainder or as a prefix ending in a separator, so `alloc` catches

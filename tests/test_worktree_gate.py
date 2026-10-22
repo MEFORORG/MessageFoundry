@@ -15,6 +15,7 @@ on the deny/allow decision, so the contract under test is the one Claude Code ac
 from __future__ import annotations
 
 import ctypes
+import functools
 import json
 import re
 import shutil
@@ -355,8 +356,8 @@ def test_a_combining_mark_after_the_root_does_not_hide_a_write_into_the_primary(
 def test_a_lookalike_of_the_primary_itself_stays_governed(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
-    """The culture half of the governed test, kept on purpose: rule 3b's culture -eq reads a linked
-    worktree at this path as the primary and leaves it to rule 3, so rule 3 must still govern it."""
+    """The culture half of the governed test, kept on purpose: rules 1 and 3 answer through it, and
+    without it a write into a lookalike of the primary, denied today, would be allowed."""
     lookalike = tmp_path / (primary.name + "\u200b") / "src" / "app.py"
     assert_denied(run_gate(edit(lookalike, cwd=primary), repos_file))
 
@@ -1184,6 +1185,7 @@ def test_a_deny_quoting_a_non_ascii_primary_reaches_claude_code_whole(
         "the deny's escaping moved; fix this control rather than deleting it",
     )
     out = _gate_stdout_in_console(control, raw, allowlist, codepage)
+    assert out, "the unescaped control allowed, so it says nothing about the output"
     try:
         reason = json.loads(out.decode("utf-8"))["hookSpecificOutput"]["permissionDecisionReason"]
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1696,6 +1698,39 @@ COMBINING_ACUTE = chr(0x301)
 _ORD = "[System.StringComparison]::Ordinal"
 
 
+@functools.cache
+def _lookalike_premise() -> str:
+    """Why the git-backed lookalike tests cannot discriminate on this host, or "" when they can.
+
+    Both halves are measured. The culture comparison must ignore a soft hyphen (ICU does; invariant
+    globalization does not). And pwsh must read git's output as UTF-8: it decodes it with
+    [Console]::OutputEncoding, so under cp437 a non-ASCII path git reports arrives garbled, the
+    lookalike is never seen, and the gate under test and its control agree. That second case is a
+    defect of its own in the gate, not a premise this branch fixes."""
+    probe = (
+        "$s=('a'+[char]0xAD+'b') -eq 'ab'; "
+        'Write-Output "$s $([Console]::OutputEncoding.CodePage)"'
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+        capture_output=True,
+        text=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    culture, _, page = proc.stdout.strip().partition(" ")
+    if culture != "True":
+        return f"culture comparison on this host does not ignore a soft hyphen ({proc.stdout!r})"
+    if page != "65001":
+        return f"pwsh decodes git's output with code page {page}, not UTF-8"
+    return ""
+
+
+def _require_lookalike_premise() -> None:
+    why = _lookalike_premise()
+    if why:
+        pytest.skip(why)
+
+
 class LookalikeRepo(NamedTuple):
     """A governed primary with two linked worktrees whose paths differ only by a soft hyphen."""
 
@@ -1724,6 +1759,7 @@ def test_a_head_move_into_a_lookalike_of_the_session_s_own_worktree_is_denied(
 ) -> None:
     """Rule 3b's own-worktree test. The culture `-eq` read the lookalike, another session's
     worktree, as this session's own, and allowed `reset --hard` into it."""
+    _require_lookalike_premise()
     repo = lookalike_repo
     payload = bash(f'git -C "{repo.lookalike}" reset --hard main', cwd=repo.wt1)
     reason = assert_denied(run_gate(payload, repo.repos))
@@ -1755,6 +1791,7 @@ def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_prim
     test is reached only without that half, so both controls drop it: rule 3b with its culture `-eq`
     read the lookalike as the primary, left it to rule 3, and the move was allowed; ordinal, it is a
     linked worktree, and the move is denied."""
+    _require_lookalike_premise()
     primary = tmp_path / "GateRepo"
     primary.mkdir()
     git = _committed_repo(primary)
@@ -1788,6 +1825,7 @@ def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
     """Rule 3d's governed test. A repository inside the governed root whose directory name starts
     with a combining mark has a common dir the culture StartsWith does not see under the root, so
     `git worktree remove` of its linked worktree was allowed. The ordinal half sees it."""
+    _require_lookalike_premise()
     root = tmp_path / "Governed"
     nested = root / f"{COMBINING_ACUTE}x"
     nested.mkdir(parents=True)
@@ -1817,6 +1855,7 @@ def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
 ) -> None:
     """Rule 3d's self test, which picks the text only: both deny. The culture `-eq` told the session
     the lookalike was the worktree it is running in."""
+    _require_lookalike_premise()
     repo = lookalike_repo
     payload = bash(f'git worktree move "{repo.lookalike}" ../elsewhere', cwd=repo.wt1)
     own = "THE WORKTREE THIS SESSION IS RUNNING IN"
@@ -1848,3 +1887,57 @@ def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primar
         "Get-SessionRoot's comparison moved",
     )
     assert cannot not in assert_denied(run_gate(payload, repos_file, control))
+
+
+def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Rule 1b's stream strip. The culture IndexOf did not find a colon followed by a combining mark,
+    so `announce/OFF:<U+0301>x.md` kept its suffix, read as a document, and was allowed; NTFS would
+    then create announce/OFF and arm the repo-wide kill switch."""
+    payload = edit(_coord(primary, f"announce/OFF:{COMBINING_ACUTE}x.md"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_colon.ps1",
+        "$colon = $rest.IndexOf([char]':')",
+        "$colon = $rest.IndexOf(':')",
+        "rule 1b's stream strip moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
+
+
+@pytest.mark.parametrize(
+    ("head", "dest", "comparison"),
+    [
+        # The other worktree is on `dest` minus the soft hyphen: the no-op bail read them as one.
+        ("feat", f"fe{SOFT_HYPHEN}at", "[string]::Equals($dest, $head, " + _ORD + ")"),
+        # The primary has `main` checked out: the checked-out-anywhere bail read them as one.
+        ("feature", f"ma{SOFT_HYPHEN}in", "[string]::Equals([string]$_, $destLine, " + _ORD + ")"),
+    ],
+)
+def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
+    tmp_path: Path, head: str, dest: str, comparison: str
+) -> None:
+    """Rule 3b class A's two bails compare branch names, and a match allows. A culture comparison
+    ignores the soft hyphen, so another session's worktree was switched onto a different branch."""
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    victim = tmp_path / "GateRepo-victim"
+    git("worktree", "add", "-q", "-b", head, str(victim))
+    git("branch", dest)
+    mine = tmp_path / "GateRepo-mine"
+    git("worktree", "add", "-q", "-b", "mine-branch", str(mine))
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    payload = bash(f'git -C "{victim}" checkout {dest}', cwd=mine)
+
+    assert_denied(run_gate(payload, repos))
+    culture = comparison.replace("[string]::Equals(", "").replace(", " + _ORD + ")", "")
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_branch.ps1",
+        comparison,
+        culture.replace(", ", " -eq "),
+        "a class A branch comparison moved",
+    )
+    assert run_gate(payload, repos, control) is None, "the culture control denied too"
