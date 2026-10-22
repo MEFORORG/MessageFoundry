@@ -88,7 +88,9 @@ timeout and leave no banner, and a fault in the read prints the ON banner. A hoo
 cannot start at all prints nothing: in a fresh cloud VM, pwsh does not exist until cloud-setup.sh
 installs it, so the first session start there shows no banner whatever the switch says. When
 the switch reads OFF, `-Banner` tells every session but a Special seat to load the `driver` and
-then the `empower` skill (owner approval 2026-10-22). A fault on that path prints no instruction.
+then the `empower` skill (owner approval 2026-10-22). A seat nothing has declared yet gets it too,
+and its text tells a Special seat to skip it, because a Special seat declares late. A fault on
+that path prints no instruction.
 
 **The owner sets it, and nothing enforces that.** Every seat acts as the one shared GitHub
 identity, which can write repository variables. The tripwire hook records a `gh variable
