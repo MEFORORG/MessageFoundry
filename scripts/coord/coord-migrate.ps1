@@ -12,14 +12,17 @@
     other PC's disk, read as HOLDER GONE, and could be reaped. So every copied JSON record that has
     no `host` field gets `host = <SourceHost>` on the way over. A record that has one keeps it.
 
-    A RECORD IT CANNOT STAMP SAFELY IS NOT CLEAN. At least these are copied as they are, listed under
+    A RECORD IT CANNOT STAMP SAFELY IS HELD BACK. At least these are never copied, are listed under
     UNSTAMPED, and make the run exit 3: a `.json` file that is not a readable JSON object; a `host`
     that is present but null or blank, which the readers also take to mean "this machine"; and a host
     key in another case, such as `Host`, where adding `host` would give the record two keys that
-    ConvertFrom-Json refuses to read. Each needs a person, not a guess.
+    ConvertFrom-Json refuses to read. On the share, each would read as "this machine" on every PC.
+    Each needs a person, not a guess.
 
-    THE WIKI INBOX IS COPIED BUT NEVER STAMPED. No reader judges a wiki event by host, and korus's
-    compile compares an inbox event's bytes with its landed copy, so a stamped event would halt it.
+    ONLY THE KINDS A READER JUDGES BY HOST ARE STAMPED: seats, mail, claims, alloc and lanes
+    ($StampKinds below). The rest are copied byte for byte, because a byte comparison reads them.
+    korus's compile compares a wiki inbox event with its landed copy, and a seat record pins its
+    handoff's size and sha256.
 
     WHAT IT COPIES. Only the shared kinds coord-root.ps1 names ($script:CoordSharedKinds), each from
     <Source>/<kind> to <Target>/<kind>. At least these are never copied, at any depth: `_retired-*`,
@@ -34,7 +37,8 @@
     file that appears on the target between the check and the write is a conflict too.
 
     LEDGERS AND SINGLETONS ARE NOT MERGED. Both PCs hold at least these under the same name:
-    claims/.history, owner-log/*, seats/.pool-epoch, seats/.writer-alive/* and wiki/query-log/*. One
+    claims/.history, owner-log/*, seats/.pool-epoch, seats/.writer-alive/*, seats/.writer-errors.txt,
+    alloc/<kind>/.floor-highwater and wiki/query-log/*. One
     absent from the target is copied. One present with other content is listed under NOT MERGED and
     left alone, without counting as a conflict, so routine noise does not bury a real double claim.
     Appending one ledger to the other is a person's job.
@@ -47,8 +51,10 @@
     alloc/backlog in place after the migration: a stale pre-retirement allocator reads only that path.
 
     THE WRONG HOST IS CAUGHT WHEN IT CAN BE. Without -SourceHost the stamp is this machine. If any
-    record in -Source already names a different host, -Source is probably another PC's copy, so the
-    run lists those hosts under FOREIGN HOSTS and exits 3. Pass -SourceHost to say which PC wrote it.
+    record in -Source already names a host other than the stamp, -Source is probably another PC's
+    copy, or -SourceHost is mistyped. The run then lists those hosts under FOREIGN HOSTS, WRITES
+    NOTHING even with -Apply, and exits 3. A wrong stamp cannot be repaired by a second run, because
+    this never overwrites. Every file is planned before any is written, so the hold covers them all.
 
     TIMES. Each copy keeps its source's last-write time, as `robocopy /COPY:DT` would, because seat
     liveness reads it.
@@ -83,7 +89,8 @@
       2  bad arguments: a missing or non-directory -Source, a -Target that is missing, unreachable or
          not a directory, or nested roots. Nothing was read past the arguments.
       3  at least one CONFLICT, COLLISION, UNSTAMPED record or FOREIGN HOST. With -Apply every other
-         file was still copied. Also the cloud-session refusal, which prints only its one stderr line.
+         file was still copied, except after a FOREIGN HOST, which holds back every write. Also the
+         cloud-session refusal, which prints only its one stderr line.
       4  coord-root.ps1 is missing, so the shared kinds cannot be named.
 
 .EXAMPLE
@@ -168,8 +175,12 @@ function Get-SkipReason([string]$Name) {
 function Test-LedgerPath([string]$RelFull) {
     # The files both PCs hold under one name; see LEDGERS AND SINGLETONS in the header.
     return ($RelFull -ceq 'claims/.history' -or $RelFull -like 'owner-log/*' -or $RelFull -ceq 'seats/.pool-epoch' -or
-        $RelFull -like 'seats/.writer-alive/*' -or $RelFull -like 'wiki/query-log/*')
+        $RelFull -like 'seats/.writer-alive/*' -or $RelFull -ceq 'seats/.writer-errors.txt' -or
+        $RelFull -like 'alloc/*/.floor-highwater' -or $RelFull -like 'wiki/query-log/*')
 }
+
+# The kinds whose readers judge a record by host; see ONLY THE KINDS in the header.
+$StampKinds = @('seats', 'mail', 'claims', 'alloc', 'lanes')
 
 $utf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
 $JsonKind = [System.Text.Json.JsonValueKind]
@@ -262,6 +273,7 @@ $unstamped = [System.Collections.Generic.List[object]]::new()
 $foreign = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $backlog = [ordered]@{ records = 0; tombstones = 0; included = [bool]$IncludeRetiredBacklog }
 $verbatim = @{ Bytes = $null; Stamped = $false; HostKept = $false; KeptHost = $null; Unstamped = $null }
+$pending = [System.Collections.Generic.List[object]]::new()
 
 foreach ($kind in $script:CoordSharedKinds) {
     $row = [ordered]@{ kind = $kind; copy = 0; stamped = 0; hostKept = 0; present = 0; skipped = 0; conflicts = 0; collisions = 0; notMerged = 0 }
@@ -299,8 +311,13 @@ foreach ($kind in $script:CoordSharedKinds) {
         }
         $plan = $verbatim.Clone()
         $plan.Bytes = $raw
-        if ($rel -like '*.json' -and $kind -ne 'wiki') { $plan = Get-PlannedBytes $raw }
-        if ($plan.KeptHost -and -not $stampGiven -and $plan.KeptHost -ine $stampHost) { [void]$foreign.Add($plan.KeptHost) }
+        if ($rel -like '*.json' -and $StampKinds -contains $kind) { $plan = Get-PlannedBytes $raw }
+        if ($plan.KeptHost -and $plan.KeptHost -ine $stampHost) { [void]$foreign.Add($plan.KeptHost) }
+        if ($plan.Unstamped) {
+            # Held back, never copied: on the share it would read as "this machine" on every PC.
+            $unstamped.Add([pscustomobject]@{ path = $relFull; reason = $plan.Unstamped })
+            continue
+        }
 
         if (Test-Path -LiteralPath $dstFile) {
             try { $have = [System.IO.File]::ReadAllBytes($dstFile) } catch {
@@ -316,32 +333,39 @@ foreach ($kind in $script:CoordSharedKinds) {
             continue
         }
 
-        if ($Apply) {
-            $tmp = "$dstFile.migrate-$([guid]::NewGuid().ToString('N')).tmp"
-            try {
-                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dstFile) | Out-Null
-                [System.IO.File]::WriteAllBytes($tmp, [byte[]]$plan.Bytes)
-                [System.IO.File]::SetLastWriteTimeUtc($tmp, [System.IO.File]::GetLastWriteTimeUtc($srcFile))
-                # No overwrite: a file that appeared since the check above fails the move, and is a conflict.
-                [System.IO.File]::Move($tmp, $dstFile, $false)
-            } catch {
-                $ex = Get-InnerException $_
-                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-                # ERROR_FILE_EXISTS (80) or ERROR_ALREADY_EXISTS (183), from the error itself: a
-                # second look at the share could answer from a stale client cache.
-                if ($ex -is [System.IO.IOException] -and (($ex.HResult -band 0xFFFF) -in 80, 183)) {
-                    $row.conflicts++; $conflicts.Add($relFull)
-                } else {
-                    $errors.Add("${relFull}: could not be written: $($ex.Message)")
-                }
-                continue
-            }
-        }
-        $row.copy++
-        if ($plan.Stamped) { $row.stamped++ }
-        if ($plan.HostKept) { $row.hostKept++ }
-        if ($plan.Unstamped) { $unstamped.Add([pscustomobject]@{ path = $relFull; reason = $plan.Unstamped }) }
+        $pending.Add(@{ Row = $row; RelFull = $relFull; Src = $srcFile; Dst = $dstFile; Plan = $plan })
     }
+}
+
+# Every file is planned before any is written, so a FOREIGN HOST holds back the whole run: a wrong
+# stamp, once on the share, cannot be repaired by a second run that never overwrites.
+$held = [bool]($Apply -and $foreign.Count)
+foreach ($p in $pending) {
+    $row = $p.Row
+    if ($Apply -and -not $held) {
+        $tmp = "$($p.Dst).migrate-$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p.Dst) | Out-Null
+            [System.IO.File]::WriteAllBytes($tmp, [byte[]]$p.Plan.Bytes)
+            [System.IO.File]::SetLastWriteTimeUtc($tmp, [System.IO.File]::GetLastWriteTimeUtc($p.Src))
+            # No overwrite: a file that appeared since the check above fails the move, and is a conflict.
+            [System.IO.File]::Move($tmp, $p.Dst, $false)
+        } catch {
+            $ex = Get-InnerException $_
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            # ERROR_FILE_EXISTS (80) or ERROR_ALREADY_EXISTS (183), from the error itself: a second
+            # look at the share could answer from a stale client cache.
+            if ($ex -is [System.IO.IOException] -and (($ex.HResult -band 0xFFFF) -in 80, 183)) {
+                $row.conflicts++; $conflicts.Add($p.RelFull)
+            } else {
+                $errors.Add("$($p.RelFull): could not be written: $($ex.Message)")
+            }
+            continue
+        }
+    }
+    $row.copy++
+    if ($p.Plan.Stamped) { $row.stamped++ }
+    if ($p.Plan.HostKept) { $row.hostKept++ }
 }
 
 $dirty = $conflicts.Count -or $collisions.Count -or $unstamped.Count -or $foreign.Count
@@ -350,7 +374,7 @@ $mode = if ($Apply) { 'apply' } else { 'dry-run' }
 
 if ($Json) {
     [ordered]@{
-        mode = $mode; source = $srcRoot; target = $dstRoot; sourceHost = $stampHost
+        mode = $mode; source = $srcRoot; target = $dstRoot; sourceHost = $stampHost; held = $held
         kinds = @($kinds); conflicts = @($conflicts); collisions = @($collisions); notMerged = @($notMerged)
         unstamped = @($unstamped); foreignHosts = @($foreign); retiredBacklog = $backlog
         skipped = @($skippedAll); errors = @($errors); exit = $exit
@@ -359,13 +383,15 @@ if ($Json) {
 }
 
 function Write-List([string]$Heading, $Items) {
-    if (-not @($Items).Count) { return }
+    # Filtered: an empty pipeline binds as $null, and @($null).Count is 1.
+    $list = @($Items | Where-Object { $null -ne $_ })
+    if (-not $list.Count) { return }
     Write-Host ''
-    Write-Host "$Heading ($(@($Items).Count)):"
-    foreach ($i in $Items) { Write-Host "  $i" }
+    Write-Host "$Heading ($($list.Count)):"
+    foreach ($i in $list) { Write-Host "  $i" }
 }
 
-$verb = if ($Apply) { 'copied' } else { 'would copy' }
+$verb = if ($Apply -and -not $held) { 'copied' } else { 'would copy' }
 Write-Host "coord-migrate ($mode): $srcRoot -> $dstRoot, stamping host = $stampHost"
 Write-Host ''
 $fmt = '{0,-10} {1,10} {2,8} {3,9} {4,8} {5,8} {6,9} {7,10} {8,10}'
@@ -378,10 +404,14 @@ $bl = if ($IncludeRetiredBacklog) { 'included in the counts above' } else { 'NOT
 Write-Host "RETIRED BACKLOG ALLOCATIONS (alloc/backlog): $($backlog.records) record(s), $($backlog.tombstones) tombstone(s) -- $bl."
 Write-List 'COLLISIONS -- the same number issued on both sides, for the owner to rule on' $collisions
 Write-List 'CONFLICTS -- a different file of the same name is already on the target, left alone' $conflicts
-Write-List 'UNSTAMPED -- copied as it is, and still read as "this machine" on every PC; fix by hand' ($unstamped | ForEach-Object { "$($_.path): $($_.reason)" })
-Write-List "FOREIGN HOSTS -- records in -Source name these hosts, not $stampHost; pass -SourceHost" $foreign
+Write-List 'UNSTAMPED -- held back, because it would read as "this machine" on every PC; fix by hand' @($unstamped | ForEach-Object { "$($_.path): $($_.reason)" })
+Write-List "FOREIGN HOSTS -- records in -Source name these hosts, not $stampHost; check -SourceHost" $foreign
 Write-List 'NOT MERGED -- a ledger or singleton both sides hold; the target copy was kept' $notMerged
 Write-List 'ERRORS' $errors
+if ($held) {
+    Write-Host ''
+    Write-Host 'HELD: nothing was written, because of the FOREIGN HOSTS above.'
+}
 if (-not $Apply) {
     Write-Host ''
     Write-Host 'Dry run: nothing was written. Pass -Apply to copy.'

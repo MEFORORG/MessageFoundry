@@ -64,7 +64,7 @@ def _source(tmp_path: Path) -> Path:
     """A small coordination directory with every class of file the tool must sort."""
     src = tmp_path / "src"
     _write(src / "seats" / "a-1.json", '{"seat": "builder", "at": "2026-10-21T10:00:00Z"}')
-    _write(src / "seats" / "b-2.json", '{"seat": "manager", "host": "OTHERPC"}')
+    _write(src / "seats" / "b-2.json", '{"seat": "manager", "host": "srcpc"}')
     _write(src / "claims" / "1234.json", '{"holder": "x"}')
     _write(src / "claims" / ".history", '{"released": "1"}\n')
     _write(src / "alloc" / "adr" / "0211.json", '{"title": "t"}')
@@ -73,6 +73,7 @@ def _source(tmp_path: Path) -> Path:
     _write(src / "mail" / "inbox" / "m1.json", "{}")
     _write(src / "mail" / "tmp" / "half.json", '{"x"')
     _write(src / "wiki" / "inbox" / "e1.json", '{"id": "e1"}')
+    _write(src / "handoffs" / "box" / "state.json", '{"next": "x"}')
     _write(src / "owner-log" / "OWNER-ITEMS.md", "| row |\n")
     # Never copied: retired, backup, cache and local trees.
     _write(src / "_retired-2026-08-22" / "seats" / "old.json", "{}")
@@ -152,12 +153,12 @@ def test_apply_copies_and_stamps_only_an_absent_host(tmp_path: Path) -> None:
         encoding="utf-8"
     )
     # A present host is kept, never overwritten by the stamp.
-    assert _read(dst / "seats" / "b-2.json")["host"] == "OTHERPC"
+    assert _read(dst / "seats" / "b-2.json")["host"] == "srcpc"
     assert _read(dst / "mail" / "inbox" / "m1.json") == {"host": STAMP}
-    # The wiki inbox is copied byte for byte: korus compile compares an event with its landed copy.
-    assert (dst / "wiki" / "inbox" / "e1.json").read_bytes() == (
-        src / "wiki" / "inbox" / "e1.json"
-    ).read_bytes()
+    # Wiki events and handoffs are copied byte for byte: korus compile compares an event with its
+    # landed copy, and a seat record pins its handoff's size and sha256.
+    for rel in ("wiki/inbox/e1.json", "handoffs/box/state.json"):
+        assert (dst / rel).read_bytes() == (src / rel).read_bytes(), rel
     assert (dst / "claims" / ".history").read_text(encoding="utf-8") == '{"released": "1"}\n'
     assert (dst / "owner-log" / "OWNER-ITEMS.md").is_file()
     seats = _kind(summary, "seats")
@@ -186,7 +187,7 @@ def test_apply_copies_and_stamps_only_an_absent_host(tmp_path: Path) -> None:
 def test_a_record_that_cannot_be_stamped_safely_is_not_clean(
     tmp_path: Path, body: str, reason: str
 ) -> None:
-    """Each of these still reads as "this machine" on every PC, so the run must say so."""
+    """Each of these would read as "this machine" on every PC, so it is held back, and said so."""
     src = tmp_path / "src"
     _write(src / "claims" / "9.json", body)
     dst = _dst(tmp_path)
@@ -194,18 +195,23 @@ def test_a_record_that_cannot_be_stamped_safely_is_not_clean(
     assert proc.returncode == 3, (proc.stdout, proc.stderr)
     [entry] = summary["unstamped"]
     assert entry["path"] == "claims/9.json" and reason in entry["reason"]
-    assert (dst / "claims" / "9.json").read_text(encoding="utf-8") == body
+    assert not (dst / "claims" / "9.json").exists()
 
 
 def test_a_foreign_host_without_source_host_is_not_clean(tmp_path: Path) -> None:
     """Without -SourceHost the stamp is this machine; a source naming another host is suspect."""
     src = _source(tmp_path)
+    _write(src / "claims" / "77.json", '{"holder": "y", "host": "OTHERPC"}')
     dst = _dst(tmp_path)
-    proc, summary = _migrate(src, dst, host=None)
+    # -Apply writes nothing at all: a wrong stamp on the share could never be repaired.
+    proc, summary = _migrate(src, dst, "-Apply", host=None)
     assert proc.returncode == 3, (proc.stdout, proc.stderr)
-    assert summary["foreignHosts"] == ["OTHERPC"]
-    proc2, _ = _migrate(src, dst, host="OTHERPC")
-    assert proc2.returncode == 0, (proc2.stdout, proc2.stderr)
+    assert "OTHERPC" in summary["foreignHosts"] and summary["held"] is True
+    assert list(dst.iterdir()) == []
+    # A mistyped -SourceHost is caught the same way.
+    proc2, typo = _migrate(src, dst, host="OTHERPC1")
+    assert proc2.returncode == 3, (proc2.stdout, proc2.stderr)
+    assert sorted(typo["foreignHosts"]) == ["OTHERPC", "srcpc"]
 
 
 def test_retired_backup_cache_temp_and_local_trees_are_skipped(tmp_path: Path) -> None:
@@ -306,15 +312,28 @@ def test_the_cloud_refusal_comes_before_any_write(tmp_path: Path) -> None:
     assert list(race.iterdir()) == []
 
 
-def _result(d: Path, tag: str, won: list[int], slots: int, start: str = "", end: str = "") -> None:
+T0 = "2026-10-21T10:00:00.000Z"
+
+
+def _result(
+    d: Path,
+    tag: str,
+    won: list[int],
+    slots: int,
+    start: str = T0,
+    end: str = "2026-10-21T10:00:02.000Z",
+    errors: int = 0,
+) -> None:
     body = {
         "tag": tag,
         "host": tag,
         "slots": slots,
+        "gapMs": 20,
         "won": won,
-        "errors": [],
-        "startedAtUtc": start or "2026-10-21T10:00:00.000Z",
-        "finishedAtUtc": end or "2026-10-21T10:00:02.000Z",
+        "errors": [{"slot": 1, "error": "denied"}] * errors,
+        "startAtUtc": T0,
+        "startedAtUtc": start,
+        "finishedAtUtc": end,
     }
     (d / f"result-{tag}.json").write_text(json.dumps(body), encoding="utf-8")
 
@@ -348,7 +367,18 @@ def test_compare_gives_no_verdict_on_a_run_that_was_not_a_race(tmp_path: Path) -
     proc, summary = _compare(d)
     assert proc.returncode == 2, (proc.stdout, proc.stderr)
     text = " ".join(summary["invalid"])
-    assert "won no slot" in text and "do not overlap" in text
+    assert "won no slot" in text and "do not overlap" in text and "ms late" in text
+
+
+def test_compare_gives_no_verdict_when_an_error_explains_an_empty_slot(tmp_path: Path) -> None:
+    """Access denied on a slot leaves it empty; that is not a failure of exclusive create."""
+    d = _dst(tmp_path, "race")
+    (d / "slot-1").write_text("A", encoding="utf-8")
+    _result(d, "A", [1], 2)
+    _result(d, "B", [], 2, errors=1)
+    proc, summary = _compare(d)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert summary["emptySlots"] == [2]
 
 
 def test_compare_needs_two_results(tmp_path: Path) -> None:

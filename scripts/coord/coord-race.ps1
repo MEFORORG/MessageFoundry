@@ -24,9 +24,10 @@
 
     COMPARE MODE (-Compare). Reads every result-*.json in -Dir and reports, per slot: a DOUBLE WINNER
     (two results claim it), an EMPTY SLOT (no result claims it), and a MISMATCH (the slot file's
-    content is not the tag that claims it). It also checks that the run was a race at all: every side
-    raced the same slot count, none recorded an error, the time windows overlap, and every side won
-    at least one slot. A run that fails those proves nothing either way.
+    content is not the tag that claims it). It also checks that the run was a race at all. At least:
+    every side had the same start time and slot count, none started more than max(GapMs, 20) ms
+    late by its own clock, none recorded an error, the time windows overlap, and every side won at
+    least one slot. A run that fails those proves nothing either way.
 
     NEVER POINT THIS AT A LIVE REGISTRY. -Dir is a probe directory of its own, made fresh per run.
     Running it on the share is the owner's call (migration step 2).
@@ -61,9 +62,10 @@
       1  race: at least one slot failed for a reason other than "it exists", such as access denied.
          The result file still records it.
       2  bad arguments, a stale slot or result in -Dir, or (compare) fewer than two result files, or
-         a run that was not a valid race.
-      3  compare: a double winner, an empty slot or a content mismatch. Wins over 2. Also the
-         cloud-session refusal, which prints only its one stderr line.
+         a run that was not a valid race, or pwsh older than 7.5.
+      3  compare: a double winner; or an empty slot or a content mismatch when no side recorded an
+         error, since an error explains both. Wins over 2. Also the cloud-session refusal, which
+         prints only its one stderr line.
 
 .EXAMPLE
     # On each PC, the same time, a different tag:
@@ -112,6 +114,8 @@ if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { Stop-Usage "-Dir '
 $slotPattern = [regex]'\Aslot-(\d+)\z'
 
 if ($Compare) {
+    # -DateKind below arrived in pwsh 7.5; on 7.4 every result would read as unreadable JSON.
+    if ($PSVersionTable.PSVersion -lt [version]'7.5') { Stop-Usage "-Compare needs pwsh 7.5 or later; this is $($PSVersionTable.PSVersion)." }
     $results = @(Get-ChildItem -LiteralPath $Dir -Filter 'result-*.json' -File)
     if ($results.Count -lt 2) { Stop-Usage "found $($results.Count) result file(s) in '$Dir'; a race needs two." }
     $claims = @{}
@@ -132,7 +136,8 @@ if ($Compare) {
         }
         $sides.Add([ordered]@{
                 tag = $tagName; host = [string]$r.host; slots = [int]$r.slots; won = $won.Count; errors = @($r.errors).Count
-                startedAtUtc = [string]$r.startedAtUtc; finishedAtUtc = [string]$r.finishedAtUtc
+                startAtUtc = [string]$r.startAtUtc; startedAtUtc = [string]$r.startedAtUtc; finishedAtUtc = [string]$r.finishedAtUtc
+                gapMs = [int]$r.gapMs
             })
     }
     # The slot files too: one with no claimant is as wrong as a claimed slot with no file.
@@ -161,19 +166,31 @@ if ($Compare) {
         if ($s.errors) { $invalid.Add("$($s.tag) recorded $($s.errors) error(s)") }
         if ($s.won -eq 0) { $invalid.Add("$($s.tag) won no slot, so the two may never have overlapped") }
     }
+    if (@($sides | ForEach-Object { $_.startAtUtc } | Sort-Object -Unique).Count -gt 1) { $invalid.Add('the sides were given different start times') }
     $starts = @(); $ends = @()
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $utc = [Globalization.DateTimeStyles]::AssumeUniversal
     foreach ($s in $sides) {
-        $a = [DateTimeOffset]::MinValue; $b = [DateTimeOffset]::MinValue
-        $ok = [DateTimeOffset]::TryParse($s.startedAtUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$a) -and
-            [DateTimeOffset]::TryParse($s.finishedAtUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$b)
+        $a = [DateTimeOffset]::MinValue; $b = [DateTimeOffset]::MinValue; $t = [DateTimeOffset]::MinValue
+        $ok = [DateTimeOffset]::TryParse($s.startedAtUtc, $inv, $utc, [ref]$a) -and [DateTimeOffset]::TryParse($s.finishedAtUtc, $inv, $utc, [ref]$b)
         if (-not $ok) { $invalid.Add("$($s.tag) has no readable start and finish time"); continue }
         $starts += $a; $ends += $b
+        # A late side runs straight through every gate already past, and those slots are not raced.
+        # Measured on that side's own clock, so skew between the PCs does not enter.
+        $limit = [Math]::Max($s.gapMs, 20)
+        if ([DateTimeOffset]::TryParse($s.startAtUtc, $inv, $utc, [ref]$t) -and ($a - $t).TotalMilliseconds -gt $limit) {
+            $invalid.Add("$($s.tag) started $([int]($a - $t).TotalMilliseconds) ms late, past the $limit ms limit")
+        }
     }
     if ($starts.Count -eq $sides.Count -and @($starts | Sort-Object)[-1] -ge @($ends | Sort-Object)[0]) {
         $invalid.Add('the time windows do not overlap: one side finished before another started')
     }
 
-    $exit = if ($double.Count -or $empty.Count -or $mismatch.Count) { 3 } elseif ($invalid.Count) { 2 } else { 0 }
+    # A double winner is a FAIL whatever else happened. An empty slot or a mismatch is one only when
+    # no side recorded an error: an access-denied or a dropped session explains both, and then
+    # exclusive create was never tested.
+    $sideErrors = @($sides | Where-Object { $_.errors }).Count
+    $exit = if ($double.Count -or (($empty.Count -or $mismatch.Count) -and -not $sideErrors)) { 3 } elseif ($invalid.Count -or $empty.Count -or $mismatch.Count) { 2 } else { 0 }
     if ($Json) {
         [ordered]@{
             dir = $Dir; slots = $maxSlots; sides = @($sides)
@@ -257,9 +274,10 @@ for ($n = 1; $n -le $Slots; $n++) {
     }
     # Won. A failed write after that is this side's I/O error, never a loss: the slot is ours.
     $won.Add($n)
-    try { $fs.Write($tagBytes, 0, $tagBytes.Length) } catch {
+    # Flush inside the try: Write only fills a buffer, so the real write happens at the flush.
+    try { $fs.Write($tagBytes, 0, $tagBytes.Length); $fs.Flush() } catch {
         $errors.Add([ordered]@{ slot = $n; error = "won, but the tag write failed: $((Get-InnerException $_).Message)" })
-    } finally { $fs.Dispose() }
+    } finally { try { $fs.Dispose() } catch { } }
 }
 $finishedAt = [DateTime]::UtcNow
 
@@ -268,7 +286,12 @@ $result = [ordered]@{
     startAtUtc = $start.UtcDateTime.ToString('o'); startedAtUtc = $startedAt.ToString('o'); finishedAtUtc = $finishedAt.ToString('o')
     won = @($won); lost = $lost; errors = @($errors)
 } | ConvertTo-Json -Depth 4
-$fsr = [System.IO.File]::Open($resultFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+try {
+    $fsr = [System.IO.File]::Open($resultFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+} catch {
+    # Most likely a second side whose tag differs only in case: the file system folds them together.
+    Stop-Usage "could not create $resultFile, so this side's result is lost: $((Get-InnerException $_).Message). Is another side's tag the same name in a different case?"
+}
 try {
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($result)
     $fsr.Write($bytes, 0, $bytes.Length)
