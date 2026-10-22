@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -79,7 +80,9 @@ def test_a_hung_read_reads_on_inside_its_timeout(sb: Sandbox) -> None:
     assert time.monotonic() - start < 6
 
 
-def test_the_banner_is_loud_when_on_and_silent_when_off(sb: Sandbox) -> None:
+def test_the_banner_is_loud_when_on_and_silent_when_off_with_no_hook_input(sb: Sandbox) -> None:
+    # With no hook input there is no worktree to name a seat, so OFF prints nothing. With one, OFF
+    # prints the skill instruction; the tests below cover that.
     sb.set_state(variables={"MEFOR_AFK_KILL": "on"})
     on = sb.run(KILL, "-Banner")
     assert on.returncode == 0, on.stderr
@@ -106,25 +109,56 @@ def test_the_banner_runs_at_every_session_start() -> None:
 
 
 # While the switch reads OFF, -Banner tells every session but a Special seat to load the driver
-# and empower skills (owner approval 2026-10-22). The seat comes from the worktree the hook input's
-# cwd names, so each run below hands the script a SessionStart payload.
+# and empower skills (owner approval 2026-10-22). The seat comes from the worktree the hook input
+# names, so each run below hands the script a SessionStart payload.
 CLOUD_NAMES = ("anthropic-skills:driver", "anthropic-skills:empower")
 
 
-def _seat_banner(sb: Sandbox, switch: str, seat: str | None, cwd: Path | None = None) -> str:
-    """-Banner's stdout with the switch at ``switch``, in a worktree whose marker holds ``seat``."""
+def _mark(root: Path, seat: str) -> None:
+    marker = root / ".claude" / "seat.local.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(seat, encoding="utf-8")
+
+
+def _linked_worktree(sb: Sandbox, name: str = "wt") -> Path:
+    """A linked worktree of the sandbox repository, as git lays one out: _hookinput.ps1 reads it."""
+    gitdir = sb.repo / ".git" / "worktrees" / name
+    gitdir.mkdir(parents=True)
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    root = sb.repo.parent / name
+    root.mkdir()
+    (root / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    return root
+
+
+def _seat_run(
+    sb: Sandbox,
+    switch: str,
+    seat: str | None,
+    cwd: Path | None = None,
+    source: str = "startup",
+    **env: str,
+) -> subprocess.CompletedProcess[str]:
+    """-Banner with the switch at ``switch``, in a worktree whose marker holds ``seat``."""
     sb.set_state(variables={"MEFOR_AFK_KILL": switch})
     roles = sb.repo / "docs" / "roles"
     roles.mkdir(parents=True, exist_ok=True)
     shutil.copy(ROOT / "docs" / "roles" / "seats.json", roles / "seats.json")
     if seat is not None:
-        marker = sb.repo / ".claude" / "seat.local.txt"
-        marker.parent.mkdir(exist_ok=True)
-        marker.write_text(seat, encoding="utf-8")
-    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(cwd or sb.repo)})
-    proc = sb.run(KILL, "-Banner", stdin=payload, KORUS_SEAT="", KORUS_AGENT="")
+        _mark(sb.repo, seat)
+    payload = {"hook_event_name": "SessionStart", "source": source, "cwd": str(cwd or sb.repo)}
+    proc = sb.run(
+        KILL, "-Banner", stdin=json.dumps(payload), **{"KORUS_SEAT": "", "KORUS_AGENT": "", **env}
+    )
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout
+    return proc
+
+
+def _seat_banner(
+    sb: Sandbox, switch: str, seat: str | None, cwd: Path | None = None, **env: str
+) -> str:
+    return _seat_run(sb, switch, seat, cwd, **env).stdout
 
 
 def _instruction(stdout: str) -> str:
@@ -164,20 +198,32 @@ def test_the_instruction_names_the_cloud_skill_names(sb: Sandbox) -> None:
 
 
 def test_korus_seat_names_the_seat_when_the_marker_does_not(sb: Sandbox) -> None:
-    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
-    payload = json.dumps({"cwd": str(sb.repo)})
-    proc = sb.run(KILL, "-Banner", stdin=payload, KORUS_SEAT="special", KORUS_AGENT="")
-    assert proc.returncode == 0 and proc.stdout == "", (proc.stdout, proc.stderr)
+    assert _seat_banner(sb, "off", None, KORUS_SEAT="special") == ""
 
 
-def test_the_seat_comes_from_the_payload_cwd_not_the_process_cwd(sb: Sandbox) -> None:
+def test_the_marker_outranks_korus_seat(sb: Sandbox) -> None:
+    assert _instruction(_seat_banner(sb, "off", "builder", KORUS_SEAT="special"))
+
+
+def test_a_codex_session_gets_no_skill_instruction(sb: Sandbox) -> None:
+    assert _seat_banner(sb, "off", "builder", KORUS_AGENT="codex") == ""
+
+
+def test_the_seat_comes_from_the_payload_worktree_not_the_process_cwd(sb: Sandbox) -> None:
     # Under the desktop app the hook runs in the primary checkout; the payload names the worktree.
-    worktree = sb.repo / "wt"
-    (worktree / ".claude").mkdir(parents=True)
-    (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
-    (worktree / ".claude" / "seat.local.txt").write_text("special", encoding="utf-8")
-    (worktree / "src").mkdir()
-    assert _seat_banner(sb, "off", "builder", cwd=worktree / "src") == ""
+    # The linked worktree holds no roster, so its seat is read against the script's own.
+    wt = _linked_worktree(sb)
+    _mark(wt, "builder")
+    (wt / "src").mkdir()
+    assert _instruction(_seat_banner(sb, "off", "special", cwd=wt / "src"))
+
+
+def test_a_compact_after_a_cd_never_answers_for_the_sibling(sb: Sandbox) -> None:
+    # No pin records that the session started in the sibling, so its cwd is refused, said aloud.
+    wt = _linked_worktree(sb)
+    _mark(wt, "builder")
+    proc = _seat_run(sb, "off", "special", cwd=wt, source="compact")
+    assert proc.stdout == "" and "no skill instruction" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
@@ -189,9 +235,21 @@ def test_an_unusable_payload_gives_no_skill_instruction(sb: Sandbox, stdin: str)
     assert proc.returncode == 0 and proc.stdout == "", (proc.stdout, proc.stderr)
 
 
+def test_a_roster_with_no_alias_map_gives_no_instruction_and_says_so(sb: Sandbox) -> None:
+    roles = sb.repo / "docs" / "roles"
+    roles.mkdir(parents=True)
+    (roles / "seats.json").write_text(json.dumps({"live": ["builder"]}), encoding="utf-8")
+    _mark(sb.repo, "builder")
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(sb.repo)})
+    proc = sb.run(KILL, "-Banner", stdin=payload, KORUS_SEAT="", KORUS_AGENT="")
+    assert proc.stdout == "" and "no skill instruction" in proc.stderr, proc.stderr
+
+
 def test_a_seat_file_read_fault_gives_no_instruction_and_keeps_the_banner(sb: Sandbox) -> None:
     on_before = _seat_banner(sb, "on", None)
     # A directory where the marker belongs: it exists, and reading it as a file throws.
     (sb.repo / ".claude" / "seat.local.txt").mkdir(parents=True)
-    assert _seat_banner(sb, "off", None) == ""
+    off = _seat_run(sb, "off", None)
+    assert off.stdout == "" and "no skill instruction" in off.stderr, off.stderr
     assert _seat_banner(sb, "on", None) == on_before

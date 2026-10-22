@@ -27,14 +27,15 @@
     VM before cloud-setup.sh installs pwsh) prints nothing; that gap is outside this script.
 
     WHEN THE SWITCH READS OFF, -Banner tells the session to load the driver and empower skills,
-    unless the seat is Special (owner approval 2026-10-22). The seat comes from the worktree the
-    hook input's `cwd` names, as role-card-inject.ps1 resolves it: `.claude/seat.local.txt`, then
-    $env:KORUS_SEAT, and an undeclared seat gets the instruction. Every fault on this path prints
-    nothing, so it fails toward no instruction rather than a wrong one, and it never runs while the
-    switch reads ON.
+    unless the seat is Special (owner approval 2026-10-22). The worktree is the one
+    scripts/hooks/_hookinput.ps1 resolves from the hook input, read-only, so a `cd` before a
+    compact or clear never names a sibling's. The seat is that worktree's `.claude/seat.local.txt`,
+    then $env:KORUS_SEAT; an alias of Special is Special, and an undeclared seat gets the
+    instruction. Every fault on this path prints no instruction and one stderr line, so it fails
+    toward no instruction rather than a wrong one. It never runs while the switch reads ON.
 
-    It reads no coordination state and writes nothing, so it runs in a cloud session too, where the
-    kill switch must hold as well.
+    It writes nothing. Of local state it reads only the seat marker, the roster and the session pin
+    _hookinput.ps1 reads, so it runs in a cloud session too, where the kill switch must hold as well.
 #>
 param(
     [switch]$Status,
@@ -105,22 +106,17 @@ function ConvertTo-JsonText([string]$Text) {
 
 function Test-SkillInstructionDue {
     # True only when this session's seat is known not to be Special. Anything it cannot establish
-    # is $false or a throw, and the caller reads both as no instruction.
+    # throws, and the caller reads that as no instruction.
     if ($env:KORUS_AGENT -eq 'codex') { return $false }  # the Skill tool is Claude Code's
-    if (-not [Console]::IsInputRedirected) { return $false }
-    # As UTF-8 bytes, as role-card-inject.ps1 reads it, so a non-ASCII cwd survives.
-    $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
-    $hookInput = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
-    # The payload's cwd, never this process's: under the desktop app the hook runs in the PRIMARY
-    # checkout, whose marker names another session's seat (role-card-inject.ps1, WHICH WORKTREE).
-    $dir = [string]$hookInput.cwd
-    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return $false }
-    $root = (Resolve-Path -LiteralPath $dir).ProviderPath
-    while (-not (Test-Path -LiteralPath (Join-Path $root '.git'))) {
-        $parent = Split-Path -Parent $root
-        if (-not $parent -or $parent -eq $root) { return $false }
-        $root = $parent
+    . (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
+    # The payload's worktree, never this process's: under the desktop app the hook runs in the
+    # PRIMARY checkout, whose marker names another session's seat.
+    $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
+    if (-not $s.Root) {
+        $why = if ($s.Reason) { $s.Reason } else { 'the hook input names no worktree' }
+        throw $why
     }
+    $root = $s.Root
     $raw = $null
     $marker = Join-Path $root '.claude/seat.local.txt'
     if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
@@ -139,13 +135,17 @@ function Test-SkillInstructionDue {
 }
 
 if (-not $sw.On) {
-    try { $due = Test-SkillInstructionDue } catch { $due = $false }
+    try { $due = Test-SkillInstructionDue }
+    catch {
+        # Said aloud, so a schema or payload change that silences every seat is not mistaken for Special.
+        [Console]::Error.WriteLine("afk-kill.ps1: no skill instruction, because $($_.Exception.Message)")
+        $due = $false
+    }
     if ($due -eq $true) {
-        $text = 'The owner instructs every session but a Special seat, while the AFK kill switch reads ' +
-            'off: before your first other action, load the `driver` skill and then the `empower` skill ' +
-            'with the Skill tool. In a cloud session (CLAUDE_CODE_REMOTE=true) they may be named ' +
-            '`anthropic-skills:driver` and `anthropic-skills:empower`. If either is not available, ' +
-            'say so in one line and continue.'
+        $text = 'Before your first other action, load the `driver` skill and then the `empower` skill ' +
+            'with the Skill tool, as the owner instructs every non-Special seat. In a cloud session ' +
+            '(CLAUDE_CODE_REMOTE=true) they may be named `anthropic-skills:driver` and ' +
+            '`anthropic-skills:empower`. If either is not available, say so in one line and continue.'
         Write-Output ('{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"' + (ConvertTo-JsonText $text) + '"}}')
     }
     exit 0
