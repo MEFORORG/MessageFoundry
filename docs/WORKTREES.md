@@ -714,14 +714,14 @@ poll keeps the last good data and marks it stale. The fields:
 |---|---|
 | `schemaVersion` | `1`. A reader that sees another number should not guess. |
 | `fetchedAt`, `host` | When this poll ran, UTC, and on which machine. |
-| `error`, `stale` | Why the last poll failed, or null. `stale` is true whenever `error` is set. |
+| `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
 | `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
 | `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. |
 | `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. |
 | `data` | The last good poll, or null if there never was one. |
 | `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
-| `data.truncated` | True when the PR page came back full or GitHub reports more open PRs than it returned. |
-| `data.pullRequests[]` | Per PR: number, title, branch, head SHA, draft, labels, queue entry, when auto-merge was armed, `allChecks` (with `forHead`) and `required`. |
+| `data.truncated` | True when the PR page came back full, or GitHub reports more open PRs than it sent. |
+| `data.pullRequests[]` | Per PR: number, title, base and head branch, head SHA, draft, labels, queue entry, auto-merge time, `allChecks` (with `forHead`) and `required`. |
 | `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
 
 Four reading rules, each one a mistake the file is shaped to prevent:
@@ -729,20 +729,20 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
    said no PR is open.
 2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
-   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has at least four
-   causes, and `required.reason` names the one that fired: no required list, no context reply for
-   the PR, the head moving between the two queries, or a truncated context page.
+   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has at least five
+   causes, and `required.reason` names the one that fired. They are a base other than `main`, no
+   required list, no context reply, a head that moved between the queries, and a truncated page.
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
    (`mergeStateKnown: false`). That is no state at all.
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
 
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
-`lock.ps1` does and never steals it. A held lock means another poll is running, so the run exits.
-One exception to never stealing: when the lock names this host and a pid Windows says is not
-running, the poller removes it. A kill at the task's time limit, a logoff or a shutdown leaves that
-shape. Any other lock older than fifteen minutes is reported in the cache's `error`, with the path to
-delete by hand, and is left alone.
+`lock.ps1` does. A held lock means another poll is running, so the run exits. It steals in one
+case only (owner ruling 2026-10-22): the lock names this host and a pid Windows says is not running.
+A kill at the task's time limit, a logoff or a shutdown leaves that shape. The steal is an atomic
+rename, and a run deletes the lock only while it still carries its own line. Only the lock holder
+writes the cache. So a lock that stays wedged shows up as an ageing `fetchedAt`, never as `error`.
 
 ```powershell
 python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file

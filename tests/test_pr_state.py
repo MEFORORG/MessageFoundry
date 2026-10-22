@@ -42,10 +42,13 @@ REQUIRED = ["CI gate", "cla", "test"]
 NOW = datetime(2026, 10, 22, 12, 0, 0, tzinfo=UTC)
 
 
-def _pr(number: int, *, mergeable: str = "MERGEABLE", merge_state: str = "CLEAN") -> dict[str, Any]:
+def _pr(
+    number: int, *, mergeable: str = "MERGEABLE", merge_state: str = "CLEAN", base: str = "main"
+) -> dict[str, Any]:
     return {
         "number": number,
         "title": f"pr {number}",
+        "baseRefName": base,
         "headRefName": f"b{number}",
         "headRefOid": f"oid{number}",
         "isDraft": False,
@@ -308,20 +311,103 @@ def test_graphql_errors_fail_the_poll_and_wait_for_reset(tmp_path: Path) -> None
     assert doc["nextPollNotBefore"] == "2026-10-22T12:45:00Z"
 
 
-def test_wedged_lock_is_reported_in_the_cache(tmp_path: Path) -> None:
+def test_wedged_lock_leaves_the_cache_alone(tmp_path: Path) -> None:
+    """Only the lock holder writes the cache. A wedged lock shows as an ageing fetchedAt."""
     _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    before = (tmp_path / "pr-state.json").read_bytes()
     lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text("pid=1 host=X at=then", encoding="utf-8")
+    lock.write_text("pid=1 host=SOME-OTHER-PC at=then", encoding="utf-8")
     old = lock.stat().st_mtime - ps.STALE_LOCK_SECONDS - 60
     os.utime(lock, (old, old))
     gh = FakeGh([_pr(1)], {1: _green()})
-    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=20))
+    rc, _ = _main(tmp_path, gh, NOW + timedelta(minutes=20))
     assert rc == 3 and gh.calls == []
-    assert doc["error"] and "NOT stealing" in doc["error"] and doc["stale"] is True
-    assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
-    assert lock.exists()
-    # No API call was made, so no back-off: the first run after the lock is cleared polls.
-    assert doc["nextPollNotBefore"] is None and doc["consecutiveFailures"] == 0
+    assert (tmp_path / "pr-state.json").read_bytes() == before
+    assert lock.read_text(encoding="utf-8") == "pid=1 host=SOME-OTHER-PC at=then"
+
+
+# --- Controls for the 2026-10-22 brief. Each fails on 9cc98a971. -----------------------------------
+
+
+def test_completed_stale_run_does_not_outrank_a_newer_success(tmp_path: Path) -> None:
+    stale = {**_run("test", "STALE"), "startedAt": "2026-10-22T10:00:00Z"}
+    newer = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), stale, newer]}))
+    assert doc["data"]["pullRequests"][0]["required"]["state"] == "SUCCESS"
+
+
+def test_in_progress_run_still_outranks_a_newer_finished_one(tmp_path: Path) -> None:
+    running = {**_run("test", "", "IN_PROGRESS"), "startedAt": "2026-10-22T10:00:00Z"}
+    newer = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), running, newer]}))
+    assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
+
+
+def test_truncated_page_never_reads_red(tmp_path: Path) -> None:
+    """Page one holds an old FAILURE; a newer SUCCESS may sit on page two."""
+    ctx = {"oid": "oid1", "nodes": [*_green()[:2], _run("test", "FAILURE")], "hasNextPage": True}
+    verdict = ps.shape_pr(_pr(1), sorted(REQUIRED), ctx)["required"]
+    assert verdict["state"] == "UNKNOWN" and verdict["failing"] == []
+
+
+def test_pr_on_another_base_is_not_judged_by_mains_list(tmp_path: Path) -> None:
+    red = [*_green()[:2], _run("test", "FAILURE")]
+    _, doc = _main(tmp_path, FakeGh([_pr(1, base="release/1.0")], {1: red}))
+    required = doc["data"]["pullRequests"][0]["required"]
+    assert required["state"] == "UNKNOWN" and "release/1.0" in required["reason"]
+
+
+def test_release_never_deletes_another_pollers_lock(tmp_path: Path) -> None:
+    lock = tmp_path / "locks" / "pr-state.lock"
+    other = "pid=999999 host=SOME-OTHER-PC at=now"
+    fake = FakeGh([_pr(1)], {1: _green()})
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        lock.write_text(other, encoding="utf-8")  # another poller's lock replaced ours mid-poll
+        return fake(args, stdin)
+
+    rc, _ = _main(tmp_path, gh)
+    assert rc == 0
+    assert lock.read_text(encoding="utf-8") == other
+
+
+def test_steal_does_not_take_a_lock_that_changed_after_it_was_judged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "locks").mkdir()
+    lock = tmp_path / "locks" / "pr-state.lock"
+    lock.write_text(f"pid=999999 host={ps.coord_root.host()} at=dead", encoding="utf-8")
+    live = "pid=1 host=SOME-OTHER-PC at=live"
+
+    def judged_dead_then_raced(holder: str) -> bool:
+        lock.write_text(live, encoding="utf-8")  # a second poller stole and re-locked first
+        return True
+
+    monkeypatch.setattr(ps, "_holder_is_gone", judged_dead_then_raced)
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
+    assert rc == 0 and gh.calls == []
+    assert lock.read_text(encoding="utf-8") == live
+    assert list((tmp_path / "locks").iterdir()) == [lock]
+
+
+def test_failed_part_is_recorded(tmp_path: Path) -> None:
+    reply = {"data": None, "errors": [{"message": "Something went wrong"}]}
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        if args[1] == "graphql" and stdin and "p1:" in stdin:
+            raise ps.GhError("gh api graphql exited 1", json.dumps(reply))
+        return FakeGh([_pr(1)], {1: _green()})(args, stdin)
+
+    rc, doc = _main(tmp_path, gh)
+    assert rc == 1 and doc["errorPart"] == "contexts PRs 1-1"
+
+
+def test_rate_limit_without_reset_waits_the_fixed_long_wait(tmp_path: Path) -> None:
+    rc, doc = _main(tmp_path, FakeGh([], {}, fail="HTTP 403: API rate limit exceeded"))
+    assert rc == 1
+    expected = NOW + timedelta(seconds=ps.RATE_LIMIT_FALLBACK_SECONDS)
+    assert doc["nextPollNotBefore"] == ps.iso(expected)
 
 
 def test_another_repos_cache_is_not_carried_over(tmp_path: Path) -> None:
@@ -335,7 +421,7 @@ def test_backoff_skips_without_calling_gh(tmp_path: Path) -> None:
     _main(tmp_path, FakeGh([], {}, fail="boom"))  # nextPollNotBefore = NOW + 2 min
     gh = FakeGh([_pr(1)], {1: _green()})
     rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=1))
-    assert rc == 0 and gh.calls == [] and doc["error"] == "boom"
+    assert rc == 0 and gh.calls == [] and doc["error"] == "main: boom"
     rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=1), "--force")
     assert rc == 0 and doc["error"] is None
 
