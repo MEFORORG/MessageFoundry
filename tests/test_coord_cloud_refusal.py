@@ -170,6 +170,8 @@ def _run(
         pytest.param("coord/handoff.ps1", ("-Where",), id="handoff-where"),
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
+        pytest.param("coord/coord-migrate.ps1", (), id="coord-migrate"),
+        pytest.param("coord/coord-race.ps1", ("-Compare",), id="coord-race"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
         pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
         pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
@@ -210,6 +212,15 @@ def test_mail_send_refuses_before_writing_to_an_explicit_mail_root(
         ),
         pytest.param(
             "worktree/hygiene-report.ps1", HYGIENE_OFFLINE, "-OutDir", id="hygiene-outdir"
+        ),
+        pytest.param(
+            "coord/coord-migrate.ps1", ("-Source", "."), "-Target", id="coord-migrate-target"
+        ),
+        pytest.param(
+            "coord/coord-race.ps1",
+            ("-Tag", "t", "-StartAtUtc", "2026-01-01T00:00:00Z"),
+            "-Dir",
+            id="coord-race-dir",
         ),
     ],
 )
@@ -422,6 +433,9 @@ GUARDED = (
     "coord/handoff.ps1",
     "coord/lane.ps1",
     "coord/tombstone-retired-backlog-allocator.ps1",
+    # The shared-root migration tools; their -Source, -Target and -Dir bypass git entirely.
+    "coord/coord-migrate.ps1",
+    "coord/coord-race.ps1",
     "worktree/hygiene-report.ps1",
     # The AFK-autonomy decision log and its digest (ADR 0211): vault work, which stays local.
     "coord/decision.ps1",
