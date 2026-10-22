@@ -29,7 +29,8 @@ A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``dat
 its own ``fetchedAt``, ``stale`` is true and ``error`` names the failure. With no previous data,
 ``data`` is null. An empty ``pullRequests`` list means GitHub said there are none, and nothing else.
 
-Stdlib only. It loads ``coord_root.py`` and ``_pr_checks.py`` by path, so it runs from any interpreter.
+Stdlib only. It loads ``coord_root.py``, ``_pr_checks.py`` and ``required_contexts.py`` by path, so
+it runs from any 3.11+ interpreter.
 """
 
 from __future__ import annotations
@@ -54,7 +55,9 @@ LOCK_NAME = "pr-state"
 #: The open-PR page size. A page that comes back this full may be truncated, and the cache says so.
 PR_PAGE = 100
 #: PRs per aliased required-context query. Each alias asks for up to CONTEXT_PAGE contexts.
-CONTEXT_CHUNK = 40
+#: check_stalled_prs.py measured one full-rollup query over 67 PRs failing with 502/504, so keep
+#: each query well under that.
+CONTEXT_CHUNK = 20
 CONTEXT_PAGE = 100
 #: How often the live required-context list is re-read. It changes when branch protection does.
 REQUIRED_REFRESH_SECONDS = 3600
@@ -67,9 +70,10 @@ RATE_FLOOR = 300
 #: Failure back-off: the schedule's 2 minutes, doubled per consecutive failure, capped.
 FAIL_BASE_DELAY = 120
 FAIL_MAX_DELAY = 1800
-#: A poll holds the lock for seconds, and the task's time limit is minutes. Older than this is wedged.
-STALE_LOCK_SECONDS = 600
-GH_TIMEOUT_SECONDS = 60
+#: A poll holds the lock for seconds. The worst case is about 8 gh calls at GH_TIMEOUT_SECONDS each,
+#: under the task's 10-minute limit, so a lock older than this one's holder is dead.
+STALE_LOCK_SECONDS = 900
+GH_TIMEOUT_SECONDS = 30
 
 _HERE = Path(__file__).resolve().parent
 
@@ -95,7 +99,10 @@ Gh = Callable[[list[str], str | None], str]
 
 
 class GhError(RuntimeError):
-    pass
+    def __init__(self, message: str, stdout: str = "") -> None:
+        super().__init__(message)
+        # gh exits 1 on a GraphQL reply that carries errors, with the reply on stdout.
+        self.stdout = stdout
 
 
 class PollError(RuntimeError):
@@ -125,7 +132,10 @@ def run_gh(args: list[str], stdin: str | None = None) -> str:
         raise GhError(f"gh {' '.join(args[:2])}: {exc}") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise GhError(f"gh {' '.join(args[:2])} exited {proc.returncode}: {' '.join(detail)[:400]}")
+        raise GhError(
+            f"gh {' '.join(args[:2])} exited {proc.returncode}: {' '.join(detail)[:400]}",
+            proc.stdout or "",
+        )
     return proc.stdout
 
 
@@ -201,9 +211,14 @@ def contexts_query(numbers: list[int]) -> str:
 
 def graphql(gh: Gh, query: str, variables: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """``(repository, rateLimit)``. Any GraphQL error fails the whole poll: partial data is not written."""
-    raw = gh(
-        ["api", "graphql", "--input", "-"], json.dumps({"query": query, "variables": variables})
-    )
+    body = json.dumps({"query": query, "variables": variables})
+    try:
+        raw = gh(["api", "graphql", "--input", "-"], body)
+    except GhError as exc:
+        # gh exits non-zero when the reply carries `errors`; read that reply for its resetAt.
+        if '"errors"' not in exc.stdout:
+            raise
+        raw = exc.stdout
     try:
         doc = json.loads(raw)
     except ValueError as exc:
@@ -234,8 +249,8 @@ def fetch_required(gh: Gh, repo: str) -> list[str]:
         rules = json.loads(gh(["api", f"repos/{repo}/rules/branches/main"], None))
         found = required_contexts.branch_protection_contexts(branch)
         found += required_contexts.ruleset_contexts(rules)
-    except (ValueError, RuntimeError) as exc:
-        raise PollError(f"required contexts unreadable: {exc}") from exc
+    except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
+        raise PollError(f"required contexts unreadable: {exc!r}") from exc
     return sorted(set(found))
 
 
@@ -273,6 +288,7 @@ def required_verdict(
         "pending": [],
         "missing": [],
         "unknown": [],
+        "requiredByGithubNotInList": [],
         "reason": None,
     }
     if required is None:
@@ -286,6 +302,8 @@ def required_verdict(
         return out
     nodes = [n for n in contexts.get("nodes", []) if n is not None]
     more = bool(contexts.get("hasNextPage"))
+    # Worst run wins when one name has several runs on the head (two events, a rerun). That can show
+    # red where GitHub would accept a later pass; it never shows green where a run is red.
     for name in required:
         matching = [n for n in nodes if pr_checks.name_of(n) == name]
         if not matching:
@@ -348,6 +366,9 @@ def shape_pr(
         "allChecks": {
             # ALL checks, required or not. Current red for merging is `required`, below.
             "state": rollup.get("state") if rollup else None,
+            # False when the main query's last commit is not the PR head; the counts then describe
+            # another commit.
+            "forHead": bool(commit.get("oid")) and commit.get("oid") == pr.get("headRefOid"),
             "total": contexts.get("totalCount"),
             "checkRuns": _counts_by_state(contexts.get("checkRunCountsByState")),
             "statusContexts": _counts_by_state(contexts.get("statusContextCountsByState")),
@@ -426,8 +447,11 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
 
     mq = repo_doc.get("mergeQueue")
     queue: list[dict[str, Any]] | None = None
+    queue_truncated = False
     if isinstance(mq, dict):
         queue = []
+        entries = mq.get("entries")
+        queue_total = entries.get("totalCount") if isinstance(entries, dict) else None
         for e in _nodes(mq.get("entries")):
             if not isinstance(e, dict):
                 continue
@@ -440,6 +464,7 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
                     "number": pr.get("number") if isinstance(pr, dict) else None,
                 }
             )
+        queue_truncated = isinstance(queue_total, int) and queue_total > len(queue)
 
     last = rates[-1]
     remaining = last.get("remaining")
@@ -465,6 +490,7 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
                 "truncated": truncated,
                 "pullRequests": [shape_pr(p, required, ctx.get(p.get("number", -1))) for p in prs],
                 "mergeQueue": queue,
+                "mergeQueueTruncated": queue_truncated,
             },
         }
     )
@@ -560,7 +586,8 @@ def acquire_lock(local: Path) -> tuple[Path | None, str | None]:
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+    except (FileExistsError, PermissionError):
+        # PermissionError: Windows refuses a create over a file a releaser is deleting. Held.
         try:
             holder = lock.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
@@ -608,10 +635,15 @@ def main(
     ap.add_argument(
         "--force", action="store_true", help="ignore nextPollNotBefore (the lock still holds)"
     )
+    ap.add_argument(
+        "--coord-dir",
+        type=Path,
+        help="the local mefor-coord directory; the task passes it so no git process (and window) starts",
+    )
     args = ap.parse_args(argv)
 
     if local is None:
-        local = coord_root.local_root(_HERE)
+        local = args.coord_dir if args.coord_dir is not None else coord_root.local_root(_HERE)
     if local is None:
         _say("git could not name the common dir; nothing written")
         return 2
@@ -621,15 +653,24 @@ def main(
     if lock is None:
         age = lock_age_seconds(local)
         if age is not None and age > STALE_LOCK_SECONDS:
-            _say(
+            why = (
                 f"the pr-state lock has been held {int(age)} s by {holder}. NOT stealing it. If that "
                 f"process is gone, delete {lock_path(local)} by hand."
             )
+            _say(why)
+            # Written without the lock, which is safe only because a holder this old is past the
+            # task's time limit. Under pythonw nobody sees stderr; the cache is where a pane looks.
+            previous = read_cache(out)
+            if previous is not None and previous.get("repo") != args.repo:
+                previous = None
+            write_cache(out, failed(args.repo, previous, why, now()))
             return 3
         return 0  # another poll is running; it will write the cache
     try:
         start = now()
         previous = read_cache(out)
+        if previous is not None and previous.get("repo") != args.repo:
+            previous = None  # another repo's list and PRs must not carry over
         not_before = parse_iso(previous.get("nextPollNotBefore")) if previous else None
         if not args.force and not_before is not None and start < not_before:
             return 0  # backing off; the cache already says until when

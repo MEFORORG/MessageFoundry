@@ -18,12 +18,12 @@
 
     IT RUNS AS YOU, INTERACTIVELY, AT RUN LEVEL LIMITED. gh reads its token from your keyring, which
     SYSTEM cannot see. It runs whether or not a Claude session is open; it needs you logged on to
-    Windows. It runs under pythonw.exe, so no window opens, on battery too, and stops after five
+    Windows. It runs under pythonw.exe, so no window opens, on battery too, and stops after ten
     minutes. A second start while one runs is ignored, and pr_state.py's own lock covers the rest.
 
     IT REFUSES TO REGISTER OR UNINSTALL INSIDE CLAUDE CODE. The task runs, unattended every 2
     minutes, a script from the primary checkout that any session can edit. The owner does both from a
-    plain terminal. -WhatIf and -Json change nothing and are allowed anywhere.
+    plain terminal. -WhatIf, and -Json without -Uninstall, change nothing and are allowed anywhere.
 
     THE HOST CHECK. -ExpectedHost names the machine this must run on. Registering or removing a task
     on the wrong PC is the mistake the check exists for, so both refuse without it. One poller per PC
@@ -67,7 +67,7 @@ if (-not $preview -and -not $ExpectedHost) {
     Stop-Install "pass -ExpectedHost <this machine's name> to register or remove the task. This machine is $([Environment]::MachineName)."
 }
 if (-not $preview -and $env:CLAUDECODE -eq '1') {
-    Stop-Install 'refusing to change the task store inside Claude Code: the task would run, unattended, a script any session can edit. Run this from a plain terminal. (-WhatIf and -Json change nothing and are allowed.)'
+    Stop-Install 'refusing to change the task store inside Claude Code: the task would run, unattended, a script any session can edit. Run this from a plain terminal. (-WhatIf, and -Json without -Uninstall, change nothing and are allowed.)'
 }
 if (-not $IsWindows) { Stop-Install 'Windows only: this manages a Windows scheduled task.' }
 
@@ -99,20 +99,36 @@ if (-not $Python) {
     if ($cmd) { $Python = $cmd.Source }
 }
 $pythonExists = [bool]$Python -and (Test-Path -LiteralPath $Python -PathType Leaf)
+# A venv or worktree interpreter dies with its directory, and the task would then fail with nothing
+# saying so. pythonw reports nothing either, so check the version through its python.exe sibling.
+$pythonProblem = $null
+if ($pythonExists) {
+    $full = [System.IO.Path]::GetFullPath($Python)
+    if ($full -match '[\\/](\.venv|venv|\.claude[\\/]worktrees)[\\/]') {
+        $pythonProblem = "$full is inside a venv or worktree; pass -Python with an installed interpreter's pythonw.exe"
+    } else {
+        $sibling = Join-Path (Split-Path -Parent $full) 'python.exe'
+        $ok = if (Test-Path -LiteralPath $sibling -PathType Leaf) { (& $sibling -c 'import sys; print(sys.version_info >= (3, 11))' 2>$null) } else { $null }
+        if ("$ok".Trim() -ne 'True') { $pythonProblem = "could not confirm Python 3.11+ for $full (via $sibling)" }
+    }
+}
 $ghExists = [bool](Get-Command gh -CommandType Application -ErrorAction SilentlyContinue)
 
 $runLevel = 'Limited'
 $logonType = 'Interactive'
-$timeLimitMinutes = 5
+$timeLimitMinutes = 10
 $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
-$argument = "`"$poller`""
-$cache = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord/pr-state.json'
+$coordDir = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord'
+$cache = Join-Path $coordDir 'pr-state.json'
+# --coord-dir spares the poller a git process, which would open a console window under pythonw.
+$argument = "`"$poller`" --coord-dir `"$coordDir`""
 
 $plan = [ordered]@{
     taskName = $TaskName
     host = [Environment]::MachineName
     executable = $Python
     executableExists = $pythonExists
+    executableProblem = $pythonProblem
     argument = $argument
     workingDirectory = $primary
     poller = $poller
@@ -136,6 +152,7 @@ if ($preview) {
         Write-Output "  in:     $primary"
         Write-Output "  writes: $cache"
         if (-not $pythonExists) { Write-Output "  MISSING: pythonw.exe (pass -Python)" }
+        elseif ($pythonProblem) { Write-Output "  PROBLEM: $pythonProblem" }
         if (-not $pollerExists) { Write-Output "  MISSING: $poller (the change has not reached the primary checkout)" }
         if (-not $ghExists) { Write-Output "  MISSING: gh on PATH" }
     }
@@ -144,6 +161,7 @@ if ($preview) {
 
 # --- register (idempotent: -Force replaces an existing definition) --------------------------------
 if (-not $pythonExists) { Stop-Install "no pythonw.exe found; pass -Python <path to pythonw.exe>." }
+if ($pythonProblem) { Stop-Install $pythonProblem }
 if (-not $pollerExists) {
     Stop-Install "pr_state.py is not in the primary checkout: $poller. Bring the primary to origin/main first."
 }

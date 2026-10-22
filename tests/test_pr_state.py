@@ -85,7 +85,7 @@ def _run(name: str, conclusion: str = "SUCCESS", status: str = "COMPLETED") -> d
 
 
 class FakeGh:
-    """Answers the three calls the poller makes. ``contexts`` maps PR number to its context nodes."""
+    """Answers the REST and GraphQL calls the poller makes. ``contexts`` maps PR number to its context nodes."""
 
     def __init__(
         self,
@@ -290,14 +290,42 @@ def test_error_path_never_writes_an_empty_list(tmp_path: Path) -> None:
     assert doc["data"] is None, doc["data"]
 
 
-def test_graphql_errors_fail_the_poll(tmp_path: Path) -> None:
+def test_graphql_errors_fail_the_poll_and_wait_for_reset(tmp_path: Path) -> None:
+    # Real gh exits 1 on a reply carrying `errors` and leaves the reply on stdout.
+    reply = {
+        "data": {"rateLimit": {"cost": 1, "remaining": 0, "resetAt": "2026-10-22T12:45:00Z"}},
+        "errors": [{"message": "API rate limit exceeded"}],
+    }
+
     def gh(args: list[str], stdin: str | None) -> str:
-        if args[1].startswith("repos/"):
-            return json.dumps({"contexts": REQUIRED})
-        return json.dumps({"data": None, "errors": [{"message": "API rate limit exceeded"}]})
+        if args[1] == "graphql":
+            raise ps.GhError("gh api graphql exited 1: rate limit", json.dumps(reply))
+        return FakeGh([], {})(args, stdin)
 
     rc, doc = _main(tmp_path, gh)
     assert rc == 1 and "rate limit" in doc["error"] and doc["data"] is None
+    assert doc["nextPollNotBefore"] == "2026-10-22T12:45:00Z"
+
+
+def test_wedged_lock_is_reported_in_the_cache(tmp_path: Path) -> None:
+    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    lock = tmp_path / "locks" / "pr-state.lock"
+    lock.write_text("pid=1 host=X at=then", encoding="utf-8")
+    old = lock.stat().st_mtime - ps.STALE_LOCK_SECONDS - 60
+    os.utime(lock, (old, old))
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=20))
+    assert rc == 3 and gh.calls == []
+    assert doc["error"] and "NOT stealing" in doc["error"] and doc["stale"] is True
+    assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
+    assert lock.exists()
+
+
+def test_another_repos_cache_is_not_carried_over(tmp_path: Path) -> None:
+    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    rc, doc = _main(tmp_path, FakeGh([], {}, fail="HTTP 502"), NOW, "--repo", "o/other")
+    assert rc == 1 and doc["repo"] == "o/other"
+    assert doc["data"] is None and doc["requiredContexts"] is None
 
 
 def test_backoff_skips_without_calling_gh(tmp_path: Path) -> None:
@@ -384,6 +412,7 @@ def test_installer_plan_registers_nothing() -> None:
     assert plan["runLevel"] == "Limited" and plan["logonType"] == "Interactive"
     assert plan["poller"].replace("\\", "/").endswith("scripts/coord/pr_state.py")
     assert plan["cache"].replace("\\", "/").endswith("mefor-coord/pr-state.json")
+    assert "--coord-dir" in plan["argument"]
 
 
 @_NEEDS_PWSH

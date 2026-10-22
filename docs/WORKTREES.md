@@ -721,8 +721,8 @@ poll keeps the last good data and marks it stale. The fields:
 | `data` | The last good poll, or null if there never was one. |
 | `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
 | `data.truncated` | True when the PR page came back full or GitHub reports more open PRs than it returned. |
-| `data.pullRequests[]` | Per PR: number, title, branch, head SHA, draft, labels, queue entry, when auto-merge was armed, `allChecks` and `required`. |
-| `data.mergeQueue[]` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
+| `data.pullRequests[]` | Per PR: number, title, branch, head SHA, draft, labels, queue entry, when auto-merge was armed, `allChecks` (with `forHead`) and `required`. |
+| `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
 
 Four reading rules, each one a mistake the file is shaped to prevent:
 
@@ -737,7 +737,9 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
 `lock.ps1` does and never steals it. A held lock means another poll is running, so the run exits.
-A lock older than ten minutes is reported as wedged, with the path to delete by hand.
+A lock older than fifteen minutes outlives the task's ten-minute limit, so its holder is dead. The
+poller then writes that into the cache's `error`, with the path to delete by hand, and still does
+not steal the lock.
 
 ```powershell
 python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file
