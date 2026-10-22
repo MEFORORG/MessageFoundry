@@ -1630,8 +1630,8 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     (BACKLOG #2275). A view FAIL does not skip the FALSE check, because the pattern is well-formed
     and its hits still mean something.
 
-    A ``mutation_path`` the corpus would never read, such as PowerShell outside the operator
-    directory, asks no view question and is named ``unread-path``: a reintroduction there is
+    A ``mutation_path`` naming a file the corpus would never read, such as PowerShell outside the
+    operator directory, asks no view question and is named ``unread-path``: a reintroduction there is
     invisible to the FALSE check, and nothing else would say so. Each message names the view the
     claim was judged against, code-only for Python and comment-blanking for operator PowerShell.
     """
@@ -1659,8 +1659,10 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             lands_in_view = ps_landing or mutation_rel.as_posix() in viewed_paths
             # A file the corpus never reads gets no view: no view question about it can be answered,
             # and the FALSE check below never sees that file, so the gap is named rather than silent.
-            # mutation_path names a file; a path with no suffix, such as a root, is not judged here.
-            unread = bool(mutation_rel.suffix) and not _corpus_reads(mutation_rel)
+            # mutation_path names a file. An existing directory is not judged here, and a `..`
+            # segment is unread whatever it lexically starts with.
+            unread = bool(mutation_rel.parts) and not (root / mutation_rel).is_dir()
+            unread = unread and (".." in mutation_rel.parts or not _corpus_reads(mutation_rel))
             if unread and not raw_inert:
                 findings.advise(
                     "unread-path",
@@ -1678,7 +1680,7 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             # its view or is unread.
             asks_view = not unread and not mutation_rel.name.endswith(_SCRIPT_SUFFIXES)
             view, files = (
-                ("comment-blanking", f"{_OPERATOR_POWERSHELL_DIR}/ PowerShell")
+                ("comment-blanking", _POWERSHELL_LABEL)
                 if ps_landing
                 else ("code-only", _CODE_ONLY_LABEL)
             )
@@ -1751,12 +1753,26 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             elif not seen_view:
                 # Raw, the control speaks, and the control corpus is never narrowed. But every
                 # sighting is text the pattern cannot read, so it must not pass as proof silently.
+                # Every raw sighting is in a viewed file, so name the views that hid it.
+                hid_in_powershell = {
+                    _is_powershell(PurePosixPath(seen_as))
+                    for raw_text, seen_as in zip(raw_texts, viewed, strict=True)
+                    if seen_as is not None and control_rx.search(raw_text)
+                }
+                hidden = " or in ".join(
+                    (
+                        f"{_POWERSHELL_LABEL} comments, which the comment-blanking view hides"
+                        if is_ps
+                        else f"{_CODE_ONLY_LABEL} comments or string contents, which the code-only "
+                        "view hides"
+                    )
+                    for is_ps in sorted(hid_in_powershell)
+                )
                 findings.advise(
                     "view-blind",
                     f"{c.id}: absence claim's positive control {a.positive_control!r} is sighted "
-                    f"only in {_CODE_ONLY_LABEL} comments or string contents, or "
-                    f"{_OPERATOR_POWERSHELL_DIR}/ PowerShell comments, which the views hide from "
-                    f"{a.pattern!r}, so the sighting proves nothing about that search",
+                    f"only in {hidden} from {a.pattern!r}, so the sighting proves nothing about "
+                    "that search",
                 )
             hits = _grep_count(a.pattern, pattern_texts)
             if hits:
@@ -1805,7 +1821,12 @@ def _python_sources(root: Path) -> list[Path]:
     for pkg in _PYTHON_ROOTS:
         base = root / pkg
         if base.is_dir():
-            out.extend(p for p in base.rglob("*.py") if _is_python_source(_rel(root, p)))
+            # Case-insensitive on every platform, as the rule is, so the two agree on Linux too.
+            out.extend(
+                p
+                for p in base.rglob("*.py", case_sensitive=False)
+                if _is_python_source(_rel(root, p))
+            )
     return out
 
 
@@ -1815,13 +1836,16 @@ def _rel(root: Path, p: Path) -> PurePosixPath:
 
 #: The directory of operator-run PowerShell. Owner ruling R3 (2026-10-02) puts the operator-run
 #: scripts in the assessed scope: ``scripts/service/`` and any script the operator documentation
-#: tells a deployer to run. Owner ruling R1 (2026-10-05) keeps ``measure-store-access.ps1`` in it
-#: too, so every script in the directory is read. ``docs/ASVS-ASSESSMENT-METHOD.md`` section 2
+#: tells a deployer to run. Owner ruling R1 (2026-10-05) puts ``measure-store-access.ps1`` in it,
+#: replacing a reading of R3 that left it out, so every script in the directory is read. ``docs/ASVS-ASSESSMENT-METHOD.md`` section 2
 #: states that scope. Every other ``.ps1`` under ``scripts/`` is coordination, worktree, hook or
 #: development tooling, which R3 puts out, so it is not read. That is a reading of today's tree and
 #: nothing enforces it: an operator-run ``.ps1`` added outside this directory is unread until it is
 #: named here. A claim whose ``mutation_path`` names one is named ``unread-path``, not judged silently.
 _OPERATOR_POWERSHELL_DIR: Final[str] = "scripts/service"
+
+#: The operator PowerShell, as a reader sees it named in a finding.
+_POWERSHELL_LABEL: Final[str] = f"{_OPERATOR_POWERSHELL_DIR}/ PowerShell"
 
 #: Matched case-insensitively, as the crypto gate's PowerShell arm matches them.
 _POWERSHELL_SUFFIXES: Final[tuple[str, ...]] = (".ps1", ".psm1")
@@ -1968,7 +1992,7 @@ def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | Non
     """
     if _is_powershell(rel):
         return _powershell_code_only(text), None
-    if rel.suffix.lower() == ".py" and rel.parts and rel.parts[0] in _CODE_ONLY_ROOTS:
+    if _is_python_source(rel) and rel.parts[0] in _CODE_ONLY_ROOTS:
         return _code_only_view(text)
     return None
 
@@ -3583,7 +3607,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  plus {sum(n for _, n in others)} advisory(ies) that are NOT line drift "
                 f"({named}), counted apart: one anchor can raise three, and neither a scratch-tree "
-                "advisory nor an absence claim's view advisory is about an anchor at all.",
+                "advisory nor an absence claim's view or unread-path advisory is about an anchor at all.",
                 file=sys.stderr,
             )
     for p in findings.problems:

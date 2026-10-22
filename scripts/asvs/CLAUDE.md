@@ -3,7 +3,9 @@
 Moved verbatim from the root `CLAUDE.md` §12 on 2026-10-07. A nested `CLAUDE.md` loads when Claude
 reads files under this directory, so the vocabulary reaches the verifier's own work without costing
 context in every other session. The root file keeps the "never say vault cell" rule and the
-`--status` command. Only the one link target changed, so it resolves from here.
+`--status` command. Only the one link target changed, so it resolves from here. The VOCABULARY and
+CONTENT bullet was reworded on 2026-10-22 to follow korus `roles/COMMON.md`, and is no longer
+verbatim.
 
 - **ASVS vocabulary: the SUBJECT is the engine, and the record lives elsewhere — never let the storage
   location name the thing.** An **ASVS cell** is one requirement's graded row (verdict + reasoning +

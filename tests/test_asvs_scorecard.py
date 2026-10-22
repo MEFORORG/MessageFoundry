@@ -1220,18 +1220,21 @@ def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path
     [
         (".", "view-inert"),
         ("./", "view-inert"),
+        # An existing directory is not judged unread.
+        ("scripts", "view-inert"),
         ("scripts/absent.py", "view-inert"),
         # A file the corpus would never read asks no view question and is named instead.
-        ("scripts", "view-inert"),
         ("tests/test_x.py", "unread-path"),
         ("samples/config/x.py", "unread-path"),
+        ("docker/Dockerfile", "unread-path"),
+        ("messagefoundry/../tests/x.py", "unread-path"),
     ],
 )
 def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
     tmp_path: Path, mutation_path: str, kind: str
 ) -> None:
     """Only a file the corpus read through the view counts; nothing else may crash."""
-    root = _absence_tree(tmp_path, {})
+    root = _absence_tree(tmp_path, {"scripts/keep.py": "y = 2\n"})
     f = _absence_findings(root, *_SAMESITE, mutation_path=mutation_path)
     assert f.problems == []
     assert f.advisory_kinds == {kind: 1}
@@ -1444,7 +1447,7 @@ def test_absence_powershell_landing_names_the_comment_blanking_view(tmp_path: Pa
     assert len(f.problems) == 1, f.problems
     assert f"once the comment-blanking view '{_SERVICE_PS}'" in f.problems[0], f.problems
     assert "code-only" not in f.problems[0], f.problems
-    # The control is sighted only in a Python view, so the PowerShell search finds nothing.
+    # The control is sighted only in shipped Python, read raw, so no PowerShell view holds it.
     f = _absence_findings(root, *_PS_CERT, control="Control", mutation_path=_SERVICE_PS)
     assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
     assert (
@@ -1459,12 +1462,31 @@ def test_absence_powershell_landing_names_the_comment_blanking_view(tmp_path: Pa
     ), f.problems
 
 
+def test_absence_view_blind_names_the_view_that_hid_the_control(tmp_path: Path) -> None:
+    """A control hidden by the PowerShell view says so; the Python wording is unchanged."""
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "# ZqControl\n$x = 1\n"})
+    f = _absence_findings(root, "clamd", "import clamd", control="ZqControl")
+    assert f.advisory_kinds == {"view-blind": 1}, f.advisories
+    assert (
+        "only in scripts/service/ PowerShell comments, which the comment-blanking"
+        in (f.advisories[0])
+    )
+    assert "string contents" not in f.advisories[0], f.advisories
+    root = _absence_tree(tmp_path / "py", {"scripts/tool.py": "# ZqControl\nx = 1\n"})
+    f = _absence_findings(root, "clamd", "import clamd", control="ZqControl")
+    assert (
+        "only in scripts/ comments or string contents, which the code-only view hides from "
+        "'clamd', so the sighting proves nothing about that search" in f.advisories[0]
+    ), f.advisories
+
+
 @pytest.mark.parametrize(
     ("rel", "read"),
     [
         ("messagefoundry/a.py", True),
         ("harness/x/b.py", True),
         ("scripts/coord/c.py", True),
+        ("scripts/Tool.PY", True),
         ("messagefoundry/__pycache__/a.py", False),
         ("tests/test_a.py", False),
         ("tee/a.py", False),
@@ -1493,11 +1515,18 @@ def test_corpus_reads_answers_by_the_walks_rules(tmp_path: Path, rel: str, read:
 
 
 def test_corpus_reads_agrees_with_the_walk_over_the_real_tree() -> None:
-    """Every file the corpus reads in this repository is one the one-path rule says it reads."""
+    """Both ways, over every tracked file: the one-path rule reads exactly what the walk reads."""
     repo = Path(__file__).resolve().parents[1]
     walked = [p.relative_to(repo).as_posix() for p in scorecard_module._absence_sources(repo)]
     assert walked
     assert [r for r in walked if not scorecard_module._corpus_reads(PurePosixPath(r))] == []
+    tracked = (
+        subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, check=True)
+        .stdout.decode("utf-8")
+        .split("\0")
+    )
+    said = {r for r in tracked if r and scorecard_module._corpus_reads(PurePosixPath(r))}
+    assert said == set(walked) & set(tracked), said ^ (set(walked) & set(tracked))
     # Owner ruling R1 (2026-10-05): the store-access measurement is operator PowerShell, and read.
     assert "scripts/service/measure-store-access.ps1" in walked
 
