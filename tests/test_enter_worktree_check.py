@@ -376,6 +376,15 @@ def test_an_operation_in_progress_is_unsafe(fleet: Fleet, marker: str) -> None:
     assert_unsafe(fleet.check(wt), "e")
 
 
+def test_an_admin_dir_naming_another_common_dir_is_unsafe(fleet: Fleet) -> None:
+    """Every f read through the admin dir uses the repository its `commondir` names."""
+    wt = fleet.own_wt()
+    copy = fleet.base / "copied-common.git"
+    shutil.copytree(fleet.engine / ".git", copy)
+    (fleet.git_dir(wt) / "commondir").write_text(f"{copy}\n", encoding="utf-8")
+    assert_unsafe(fleet.check(wt), "e")
+
+
 def test_a_repointed_dot_git_file_is_unsafe(fleet: Fleet) -> None:
     """A `.git` file naming a copied admin dir would let e and f read state the worktree chose."""
     wt = fleet.own_wt()
@@ -799,6 +808,12 @@ def test_the_hook_gives_no_decision_when_the_kill_switch_is_on(fleet: Fleet) -> 
 )
 def test_the_hook_is_silent_without_a_path(fleet: Fleet, stdin: str) -> None:
     assert _decision(fleet.hook(stdin)) is None
+
+
+def test_the_hook_is_silent_when_the_input_carries_more_than_a_path(fleet: Fleet) -> None:
+    payload = _payload(fleet, fleet.own_wt())
+    payload["tool_input"] = {**payload["tool_input"], "name": "other"}  # type: ignore[dict-item]
+    assert _decision(fleet.hook(payload)) is None
 
 
 def test_the_hook_is_silent_for_another_tool(fleet: Fleet) -> None:
