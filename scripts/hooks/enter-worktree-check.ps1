@@ -19,11 +19,8 @@
     scripts/hooks/worktree_gate.ps1, when installed, denies under its rule 4, and that is intended.
     This hook does not change the workspace-trust prompt either.
 
-    TO DISABLE IT (the full list is in enter-check.ps1's header and ADR 0212):
-      * fleet-wide: set the repository variable MEFOR_AFK_KILL to anything but `off`;
-      * this machine only:
-            New-Item -ItemType File -Force -Path "$(git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir)/mefor-coord/enter-check/OFF"
-      * permanently: remove the EnterWorktree entry from .claude/settings.json.
+    TO DISABLE IT: fleet-wide, per machine, or permanently, as scripts/worktree/enter-check.ps1's
+    header says (ADR 0212 records the same three).
 
     -FleetRepos and -TempRoot are passed through to enter-check.ps1 for tests. The settings entry
     passes neither, so the defaults apply; whoever can edit that entry's arguments can already
@@ -49,6 +46,8 @@ try {
     $hook = $text | ConvertFrom-Json -ErrorAction Stop
     if ($hook -isnot [pscustomobject]) { exit 0 }
     $props = $hook.PSObject.Properties
+    # The allow is for this one tool, whatever matcher a settings file wires the hook under.
+    if (-not $props['tool_name'] -or [string]$props['tool_name'].Value -cne 'EnterWorktree') { exit 0 }
     $toolInput = if ($props['tool_input']) { $props['tool_input'].Value } else { $null }
     if ($toolInput -isnot [pscustomobject] -or -not $toolInput.PSObject.Properties['path']) { exit 0 }
     $path = [string]$toolInput.PSObject.Properties['path'].Value
@@ -56,7 +55,8 @@ try {
     $cwd = Get-CcxHookPayloadCwd -Payload $hook
     if ([string]::IsNullOrWhiteSpace($path) -or -not $cwd.Cwd) { exit 0 }
 
-    $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd.Cwd }
+    $transcript = if ($props['transcript_path']) { [string]$props['transcript_path'].Value } else { '' }
+    $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd.Cwd; TranscriptPath = $transcript }
     if ($FleetRepos) { $check['FleetRepos'] = $FleetRepos }
     if ($TempRoot) { $check['TempRoot'] = $TempRoot }
     $lines = @(& (Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree/enter-check.ps1') @check 2>$null)
