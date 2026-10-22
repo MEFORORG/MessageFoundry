@@ -1699,17 +1699,22 @@ _ORD = "[System.StringComparison]::Ordinal"
 
 
 @functools.cache
-def _lookalike_premise() -> str:
-    """Why the git-backed lookalike tests cannot discriminate on this host, or "" when they can.
+def _host_premises() -> tuple[str, str]:
+    """Why the culture controls, and the git-backed lookalike tests, cannot discriminate on this host:
+    (culture reason, git-output reason), each "" when the premise holds. One pwsh launch measures both.
 
-    Both halves are measured. The culture comparison must ignore a soft hyphen (ICU does; invariant
-    globalization does not). And pwsh must read git's output as UTF-8: it decodes it with
-    [Console]::OutputEncoding, so under cp437 a non-ASCII path git reports arrives garbled, the
-    lookalike is never seen, and the gate under test and its control agree. That second case is a
-    defect of its own in the gate, not a premise this branch fixes."""
+    The controls need the culture comparison to ignore a soft hyphen and a zero-width space, to miss
+    a colon or a prefix before a combining mark, and to read `.m<U+00AD>d` as `.md`, as ICU does and
+    invariant globalization does not. The git-backed tests also need pwsh to read git's output as
+    UTF-8: it decodes it with [Console]::OutputEncoding, so under cp437 a non-ASCII path git reports
+    arrives garbled, the lookalike is never seen, and the gate and its control agree. That is a defect
+    of its own in the gate, not a premise this branch fixes."""
     probe = (
-        "$s=('a'+[char]0xAD+'b') -eq 'ab'; "
-        'Write-Output "$s $([Console]::OutputEncoding.CodePage)"'
+        "$shy=[char]0xAD; $zw=[char]0x200B; $cm=[char]0x301; "
+        "$ok=(('a'+$shy+'b') -eq 'ab') -and (('a'+$zw+'b') -eq 'ab') -and "
+        "(-not ('c:/r/'+$cm+'a').StartsWith('c:/r/')) -and (('x:'+$cm+'y').IndexOf(':') -eq -1) -and "
+        "(('.m'+$shy+'d') -in @('.md')) -and (($shy+'-x').StartsWith('-')); "
+        'Write-Output "$ok $([Console]::OutputEncoding.CodePage)"'
     )
     proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
@@ -1718,17 +1723,25 @@ def _lookalike_premise() -> str:
         timeout=GATE_TIMEOUT_S,
     )
     culture, _, page = proc.stdout.strip().partition(" ")
-    if culture != "True":
-        return f"culture comparison on this host does not ignore a soft hyphen ({proc.stdout!r})"
-    if page != "65001":
-        return f"pwsh decodes git's output with code page {page}, not UTF-8"
-    return ""
+    culture_why = (
+        "" if culture == "True" else f"culture comparison here is not ICU's ({proc.stdout!r})"
+    )
+    page_why = (
+        "" if page == "65001" else f"pwsh decodes git's output with code page {page}, not UTF-8"
+    )
+    return culture_why, page_why
+
+
+def _require_culture_premise() -> None:
+    why = _host_premises()[0]
+    if why:
+        pytest.skip(why)
 
 
 def _require_lookalike_premise() -> None:
-    why = _lookalike_premise()
-    if why:
-        pytest.skip(why)
+    culture_why, page_why = _host_premises()
+    if culture_why or page_why:
+        pytest.skip(culture_why or page_why)
 
 
 class LookalikeRepo(NamedTuple):
@@ -1875,6 +1888,7 @@ def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primar
     """Get-SessionRoot picks the text only: EnterWorktree is denied either way. The culture `-eq`
     read a directory at `<primary><U+200B>`, which is no worktree of it, as the primary, and handed
     the reader a command in that checkout."""
+    _require_culture_premise()
     cwd = tmp_path / f"{primary.name}{ZWSP}"
     cwd.mkdir()
     payload = enter_worktree(cwd)
@@ -1895,6 +1909,7 @@ def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
     """Rule 1b's stream strip. The culture IndexOf did not find a colon followed by a combining mark,
     so `announce/OFF:<U+0301>x.md` kept its suffix, read as a document, and was allowed; NTFS would
     then create announce/OFF and arm the repo-wide kill switch."""
+    _require_culture_premise()
     payload = edit(_coord(primary, f"announce/OFF:{COMBINING_ACUTE}x.md"), cwd=primary)
     assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
     control = _rebuilt_gate(
@@ -1920,6 +1935,7 @@ def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
 ) -> None:
     """Rule 3b class A's two bails compare branch names, and a match allows. A culture comparison
     ignores the soft hyphen, so another session's worktree was switched onto a different branch."""
+    _require_culture_premise()
     primary = tmp_path / "GateRepo"
     primary.mkdir()
     git = _committed_repo(primary)
@@ -1941,3 +1957,99 @@ def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
         "a class A branch comparison moved",
     )
     assert run_gate(payload, repos, control) is None, "the culture control denied too"
+
+
+def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The ordinal colon search alone would strip `handoff/x.md:<U+0301>y` to a document and allow
+    it; the culture search missed that colon, so it was denied. Where the two disagree, it denies."""
+    _require_culture_premise()
+    payload = edit(_coord(primary, f"handoff/x.md:{COMBINING_ACUTE}y"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_ordinal_only_colon.ps1",
+        "$streamUnclear = $colon -ne $rest.IndexOf(':')",
+        "$streamUnclear = $false",
+        "rule 1b's disagreement test moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the ordinal-only control denied too"
+
+
+def test_an_extension_that_only_collates_as_a_document_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Rule 1b's shape backstop. The culture `-notin` read `.m<U+00AD>d` as `.md` and exempted it."""
+    _require_culture_premise()
+    payload = edit(_coord(primary, f"announce/x.m{SOFT_HYPHEN}d"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_extension.ps1",
+        '[array]::IndexOf([string[]]@(".md", ".txt", ".tsv"), [System.IO.Path]::GetExtension($rest)) -lt 0',
+        '[System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")',
+        "rule 1b's shape backstop moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
+
+
+def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Rule 3b class A's destination scanner. A culture StartsWith skipped `<U+00AD>-feat` as a flag,
+    found no destination, and allowed the switch of another session's worktree."""
+    _require_culture_premise()
+    branch = f"{SOFT_HYPHEN}-feat"
+    subprocess.run(
+        ["git", "branch", branch], cwd=hijack_repo.primary, check=True, capture_output=True
+    )
+    payload = bash(f'git -C "{hijack_repo.victim}" checkout {branch}', cwd=hijack_repo.mine)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_dest.ps1",
+        f"            if ($tok.StartsWith('-', {_ORD})) {{ continue }}\n            $dest",
+        "            if ($tok.StartsWith('-')) { continue }\n            $dest",
+        "class A's destination scanner moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Rule 3d's victim scan. A culture StartsWith skipped a path beginning with a soft hyphen and
+    then '-', so no victim was found and `git worktree remove` of another session's tree was
+    allowed."""
+    _require_culture_premise()
+    (hijack_repo.mine / f"{SOFT_HYPHEN}-").mkdir()
+    victim = f"{SOFT_HYPHEN}-/../../{hijack_repo.victim.name}"
+    payload = bash(f'git worktree remove "{victim}"', cwd=hijack_repo.mine)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_victim.ps1",
+        f"            if ($tok.StartsWith('-', {_ORD})) {{ continue }}\n            $victimRaw",
+        "            if ($tok.StartsWith('-')) { continue }\n            $victimRaw",
+        "rule 3d's victim scan moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Test-VerbMovesHead. A culture StartsWith read the reset target `<U+00AD>-x` as a flag, so the
+    reset was classed as moving no HEAD and `--git-dir=<primary>/.git` from outside was allowed."""
+    _require_culture_premise()
+    ref = f"{SOFT_HYPHEN}-x"
+    subprocess.run(["git", "branch", ref], cwd=hijack_repo.primary, check=True, capture_output=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" reset {ref}', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_moves_head.ps1",
+        f"        if (-not $t.StartsWith('-', {_ORD})) {{ return $true }}",
+        "        if (-not $t.StartsWith('-')) { return $true }",
+        "Test-VerbMovesHead's flag test moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"

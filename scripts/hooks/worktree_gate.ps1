@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.5"
+$GateVersion = "2026.10.21.6"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2510,9 +2510,10 @@ $rehome
 # ordinal, so without this half it would read a linked worktree at `<primary><U+200B>` as a linked
 # worktree. THE HALF STAYS ANYWAY, because this function also answers rules 1 and 3: without it, a write
 # into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
-# 2026-10-21). At least the path comparisons in rules 3b and 3d, Get-SessionRoot and the remedy text are
-# ordinal now. Culture comparisons remain elsewhere, at least rule 3c's `-eq`, Get-RootCommonDirCmp and
-# rule 1a's `-in`; the first two say why beside them.
+# 2026-10-21). Some comparisons elsewhere are ordinal now, where a match allows and ordinal therefore
+# denies at least as much. Culture comparisons remain, at least the deny-on-match ones such as rule 3d's
+# governed test, rule 3c's `-eq` and class A's flag test, and sites nobody has audited. This is not a
+# census.
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
     $ord = [System.StringComparison]::Ordinal
@@ -2773,7 +2774,10 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
 
         # The destination ref = first positional (non-flag) token after the verb.
         foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-            if ($tok.StartsWith('-')) { continue }
+            # ORDINAL: a skip here ends in an allow, and a culture StartsWith skipped a leading soft
+            # hyphen, reading the branch `<U+00AD>-feat` as a flag. The flag test below stays culture:
+            # there a match denies.
+            if ($tok.StartsWith('-', [System.StringComparison]::Ordinal)) { continue }
             $dest = $tok.Trim('"', "'")
             break
         }
@@ -3075,7 +3079,9 @@ function Test-VerbMovesHead([string]$Verb, [string]$After) {
     foreach ($t in @($after -split '\s+')) {
         if (-not $t) { continue }
         if ($skipNext) { $skipNext = $false; continue }
-        if ($t.StartsWith('#')) { break }
+        # ORDINAL, here and below: a comment or a flag reads as not moving HEAD, which withholds the
+        # repository token from rule 3, and a culture StartsWith skips a leading soft hyphen.
+        if ($t.StartsWith('#', [System.StringComparison]::Ordinal)) { break }
         if ($t -match '^(\d*|&)[<>]') {
             # A bare operator (`>`, `2>`, `>>`) takes the NEXT token as its target.
             if ($t -match '^(\d*|&)[<>]+&?$') { $skipNext = $true }
@@ -3088,7 +3094,7 @@ function Test-VerbMovesHead([string]$Verb, [string]$After) {
     if ($Verb -ne "reset") { return (-not $pathAfter) }
     foreach ($t in $toks) {
         if ($t -eq '--') { return $false }
-        if (-not $t.StartsWith('-')) { return $true }
+        if (-not $t.StartsWith('-', [System.StringComparison]::Ordinal)) { return $true }
     }
     return $false
 }
@@ -3715,7 +3721,9 @@ What to do instead:
         foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
             $tok = $m.Groups['q'].Value
             if (-not $tok) { continue }
-            if ($tok.StartsWith('-')) { continue }
+            # ORDINAL: a skipped token is no victim, and no victim allows. A culture StartsWith skipped
+            # a path beginning with a soft hyphen and then '-'.
+            if ($tok.StartsWith('-', [System.StringComparison]::Ordinal)) { continue }
             $victimRaw = $tok
             break
         }
@@ -4647,6 +4655,10 @@ foreach ($r in $roots) {
     # a combining mark is not found by it, so `announce/OFF:<U+0301>x.md` kept its stream suffix and
     # read as a document (measured 2026-10-21).
     $colon = $rest.IndexOf([char]':')
+    # WHERE THE TWO SEARCHES DISAGREE, THE BACKSTOP DENIES. Ordinal alone would also strip the colon in
+    # `handoff/x.md:<U+0301>y`, which the culture search missed and the backstop therefore denied, and
+    # read it as `.md`. Denying every remainder they disagree on keeps both denies.
+    $streamUnclear = $colon -ne $rest.IndexOf(':')
     if ($colon -ge 0) { $rest = $rest.Substring(0, $colon) }
 
     # Name is matched as the WHOLE remainder or as a prefix ending in a separator, so `alloc` catches
@@ -4707,8 +4719,10 @@ foreach ($r in $roots) {
     # -- all 9 logged coord denies are `.md` or `.tsv` -- and it means the NEXT registry added here is denied
     # the day it appears rather than the day somebody remembers to update a list. Add it to the list anyway,
     # for the precise remedy; the shape rule is what holds until then.
-    if (-not $armed -and
-        [System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")) {
+    # ORDINAL membership (Array.IndexOf): a match exempts, and the culture `-notin` read `.m<U+00AD>d`
+    # as `.md`.
+    if (-not $armed -and ($streamUnclear -or
+        [array]::IndexOf([string[]]@(".md", ".txt", ".tsv"), [System.IO.Path]::GetExtension($rest)) -lt 0)) {
         $armed = @{
             What = "a file under .git\mefor-coord\ that is not a handoff document or a delivery receipt," +
                    " so this gate treats it as machine-read coordination state"
