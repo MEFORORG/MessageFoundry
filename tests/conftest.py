@@ -166,6 +166,13 @@ _publish_slot_var("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 # of the refusal set the variable themselves, per subprocess.
 os.environ.pop("CLAUDE_CODE_REMOTE", None)
 
+# NOR DOES IT INHERIT THE SHARED COORDINATION ROOT. An owner shell or session that sets
+# MEFOR_COORD_ROOT points every coordination script at the live cross-PC store
+# (docs/COORD-SHARED-ROOT.md). Inherited, a test that declares a seat or takes a claim in a temp repo
+# would write it there instead, where every other session reads it. Tests of the variable set it
+# themselves, per test.
+os.environ.pop("MEFOR_COORD_ROOT", None)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _force_aad_bind_when_requested() -> Iterator[None]:

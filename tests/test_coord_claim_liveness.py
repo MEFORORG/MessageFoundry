@@ -60,6 +60,7 @@ def repo(tmp_path: Path) -> Path:
     # claim.ps1 anchors on its own location now (BACKLOG #1060), so the copy IS the sandbox, and a
     # linked worktree of this fixture carries its own -- which is what `peer_holding` relies on.
     shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
+    shutil.copy2(CLAIM.parent / "coord-root.ps1", r / "scripts" / "coord" / "coord-root.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")

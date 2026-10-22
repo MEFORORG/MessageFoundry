@@ -29,11 +29,13 @@ worse than no gate. `git commit --no-verify` is the escape hatch; the --ci run i
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
@@ -301,21 +303,78 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
     return text
 
 
+# WHERE SHARED COORDINATION STATE LIVES is scripts/coord/coord_root.py, loaded by path: a sibling
+# coord_root.py first (a copy of this gate sitting beside one), then ../coord/coord_root.py (the repo).
+# None loading leaves the ADR-ownership arm refusing, never reading a guessed local path.
+_COORD_ROOT_CANDIDATES = (
+    Path(__file__).resolve().with_name("coord_root.py"),
+    Path(__file__).resolve().parent.parent / "coord" / "coord_root.py",
+)
+
+
+def _coord_root() -> ModuleType | None:
+    """``coord_root.py``, loaded by path, or None when no candidate loads."""
+    for candidate in _COORD_ROOT_CANDIDATES:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("_mefor_coord_root", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before it runs, because its dataclass looks its own module up while it is defined.
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except (OSError, SyntaxError, ImportError):
+            sys.modules.pop(spec.name, None)
+            continue
+        return mod
+    return None
+
+
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
         self.base = base
         self.repo = Path(git("rev-parse", "--path-format=absolute", "--show-toplevel").strip())
-        common = git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
         # The registry lives beside the SHARED object store, so every worktree of this repo sees the same
-        # allocations — and a different clone gets its own, automatically.
-        self.alloc = Path(common) / "mefor-coord" / "alloc"
+        # allocations — and a different clone gets its own, automatically. Unless a shared root is
+        # configured (docs/COORD-SHARED-ROOT.md), when every clone on every PC sees ONE registry there.
+        # Only the ownership arm reads it, so it resolves on first use: a commit adding no ADR, and CI,
+        # where that arm never runs, probe nothing. An error is kept, not replaced by a local guess:
+        # the ownership arm refuses and names it.
+        self._alloc_resolved = False
+        self._alloc: Path | None = None
+        self._alloc_error: str | None = None
+        self._coord: ModuleType | None = None
         self.failures: list[str] = []
         # Per-run memos. Every entry is derived from a REF, and refs do not move inside one run of a
         # pre-commit hook -- so a repeat lookup is pure waste, and each one costs git subprocesses.
         # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
+
+    def _resolve_alloc(self) -> None:
+        if self._alloc_resolved:
+            return
+        self._alloc_resolved = True
+        self._coord = _coord_root()
+        if self._coord is None:
+            tried = ", ".join(str(c) for c in _COORD_ROOT_CANDIDATES)
+            self._alloc_error = f"coord_root.py could not be loaded (tried {tried})"
+            return
+        resolved = self._coord.resolve("alloc", str(self.repo))
+        self._alloc, self._alloc_error = resolved.path, resolved.error
+
+    @property
+    def alloc(self) -> Path | None:
+        self._resolve_alloc()
+        return self._alloc
+
+    @property
+    def alloc_error(self) -> str | None:
+        self._resolve_alloc()
+        return self._alloc_error
 
     # -- tree access ---------------------------------------------------------------------------------
     #
@@ -510,9 +569,17 @@ class Ledger:
         owner-ruled recovery in docs/LEDGER-GATE.md -- recreate a worktree at the recorded path --
         remains valid and is now the second resort rather than the only one.
         """
+        if self.alloc is None:
+            return False
         try:
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            return False
+        # ANOTHER MACHINE'S NUMBER IS NEVER THIS TREE'S, on either key. Its path names that PC's disk,
+        # and two PCs can check out one branch name, so neither arm below is exclusive across PCs.
+        # A resolved registry implies a loaded resolver, so _coord is set whenever alloc is.
+        coord = self._coord
+        if not isinstance(claim, dict) or coord is None or not coord.record_is_here(claim):
             return False
         mine = str(self.repo).replace("\\", "/").casefold()
         theirs = str(claim.get("worktree", "")).replace("\\", "/").casefold()
@@ -555,16 +622,22 @@ class Ledger:
         remedy block is precisely what that defect forged.
         """
         allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
+        # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
+        # is the right one.
+        if self.alloc is None:
+            return allocate
         try:
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            # No record at all: nobody holds it, so allocating is the only move and the ONLY case
-            # where it is the right one.
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
-        if worktree:
+        coord = self._coord
+        if worktree and coord is not None and not coord.record_is_here(claim):
+            where = _safe_for_message(coord.record_host(claim))
+            lines.append(f"    1. commit from the worktree that holds it, ON {where}:  {worktree}")
+        elif worktree:
             lines.append(f"    1. commit from the worktree that holds it:  {worktree}")
         if branch:
             lines.append(f"    2. or check that branch out and commit there: {branch}")
@@ -598,6 +671,15 @@ class Ledger:
         the registry. Dropping the recover-first advice on this branch would have re-introduced the
         BACKLOG #1414 number-burn through the door opened to close it.
         """
+        if self.alloc is None:
+            # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
+            return (
+                f"ADR {number} cannot be checked -- the allocation registry did not resolve",
+                f"{_safe_for_message(self.alloc_error)}. The gate refuses rather than read a local "
+                "copy that another PC's allocations never reach (docs/COORD-SHARED-ROOT.md).",
+                "retry when the shared coordination root answers, or check MEFOR_COORD_ROOT and\n"
+                "      mefor-coord/root.toml",
+            )
         where = self.alloc / "adr" / (number + ".json")
         remedy = self.ownership_remedy("adr", number)
         if seen.truncated:

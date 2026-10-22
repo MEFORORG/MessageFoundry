@@ -72,10 +72,12 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import os
 import shutil
-import subprocess
 import sys
+from pathlib import Path
+from types import ModuleType
 
 COLUMNS = ["ts", "item", "event", "actor", "counterparty", "summary", "ruling", "blocks", "target"]
 
@@ -133,22 +135,35 @@ def ledger_path() -> str:
     env = os.environ.get("MEFOR_OWNER_LOG")
     if env:
         return env
-    git = shutil.which("git")
-    if not git:
+    if not shutil.which("git"):
         sys.stderr.write("  FATAL: git not on PATH, and MEFOR_OWNER_LOG is unset.\n")
         raise SystemExit(2)
-    # Fixed argument vector, absolute interpreter, no shell, no caller-supplied input.
-    out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, absolute git, no shell
-        [git, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if out.returncode != 0:
-        sys.stderr.write("  FATAL: not in a git repo, and MEFOR_OWNER_LOG is unset.\n")
+    # The owner log is fleet-wide, so the sibling resolver names its directory and may put it on the
+    # shared root (docs/COORD-SHARED-ROOT.md). An error refuses: an item written into a local copy
+    # while the share is down is an item the other PC's seats never see, which is the silence this
+    # ledger exists to end. With nothing configured the answer is the old path exactly.
+    resolved = _coord_root().resolve("owner-log")
+    if resolved.error is not None or resolved.path is None:
+        sys.stderr.write(
+            "  FATAL: the owner log could not be located, and MEFOR_OWNER_LOG is unset: "
+            f"{resolved.error}\n"
+        )
         raise SystemExit(2)
-    common = out.stdout.strip()
-    return os.path.join(common, "mefor-coord", "owner-log", "OWNER-ITEMS.md")
+    return os.path.join(str(resolved.path), "OWNER-ITEMS.md")
+
+
+def _coord_root() -> ModuleType:
+    """``scripts/coord/coord_root.py``, loaded by path: this file runs as a script, not a package."""
+    here = Path(__file__).resolve().with_name("coord_root.py")
+    spec = importlib.util.spec_from_file_location("_mefor_coord_root", here)
+    if spec is None or spec.loader is None or not here.is_file():
+        sys.stderr.write(f"  FATAL: {here} is missing, so the owner log cannot be located.\n")
+        raise SystemExit(2)
+    mod = importlib.util.module_from_spec(spec)
+    # Registered before it runs, because its dataclass looks its own module up while it is defined.
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def now() -> str:

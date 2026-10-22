@@ -233,8 +233,14 @@ $script:TaskStores = @(
     if ($TasksDir) { $TasksDir }
     else { @(Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot) | ForEach-Object { Join-Path $_ 'tasks' } }
 )
-# The seat layer, spelled the way fleet.ps1, handoff.ps1 and lane-level.ps1 already spell it.
-$script:SeatsDir = Join-Path $common 'mefor-coord\seats'
+# The seat layer. seats/ is a SHARED kind, so it comes from coord-root.ps1 (docs/COORD-SHARED-ROOT.md),
+# and it is resolved LAZILY in Get-SeatIndex: this script runs under the PreToolUse collision gate, and
+# a probe of a dead share must be paid only by a walk that actually asks a seat. The caches below are
+# LOCAL kinds and keep their paths. $script:SeatsDir stays $null until then; an override set before
+# that point (a test) is used as given.
+. "$PSScriptRoot\coord-root.ps1"
+$script:SeatsDir = $null
+$script:SeatsFrom = if ($Repo) { $Repo } else { (Get-Location).Path }
 
 # EVERY COUNT THIS SCRIPT PRINTS ABOUT THE WORK SIGNAL, in one place, so no line can claim a number
 # the walk did not produce. Carried through the cache too -- a cached map that re-derived these would
@@ -400,6 +406,16 @@ $script:SeatIndex = $null
 function Get-SeatIndex {
     if ($null -ne $script:SeatIndex) { return $script:SeatIndex }
     $script:SeatIndex = @{}
+    if (-not $script:SeatsDir) {
+        $r = Resolve-CoordDir -From $script:SeatsFrom -Kind 'seats'
+        if ($r.Error) {
+            # A read that must not block a tool call: skip the seat half of the work signal with one
+            # line on stderr, never stdout, which callers parse. The census then reads 0 seat records.
+            [Console]::Error.WriteLine("overlap.ps1: seat declarations skipped, the shared seat registry did not resolve: $($r.Error)")
+            return $script:SeatIndex
+        }
+        $script:SeatsDir = $r.Path
+    }
     foreach ($f in @(Get-ChildItem -LiteralPath $script:SeatsDir -Recurse -Filter *.json -EA SilentlyContinue)) {
         # One malformed record must never take the walk down; a record caught mid-write has this shape.
         try { $r = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }

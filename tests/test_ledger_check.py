@@ -511,7 +511,15 @@ def test_the_history_walk_is_BOUNDED_and_the_bound_is_reported(repo: Path) -> No
     write(repo, "docs/adr/0002-second.md", "# 0002 — Second\n\nThe decision.\n")
     restore_the_index_row(repo)
     git(repo, "add", "-A")
-    patched = repo / "ledger_check_bounded.py"
+    # Placed where the real gate sits, so it loads the resolver from ../coord/ exactly as that does.
+    hooks = repo / "scripts" / "hooks"
+    coord = repo / "scripts" / "coord"
+    hooks.mkdir(parents=True, exist_ok=True)
+    coord.mkdir(parents=True, exist_ok=True)
+    (coord / "coord_root.py").write_bytes(
+        (CHECK.parent.parent / "coord" / "coord_root.py").read_bytes()
+    )
+    patched = hooks / "ledger_check_bounded.py"
     patched.write_text(
         re.sub(r"^RESTORE_HISTORY_DEPTH = \d+$", "RESTORE_HISTORY_DEPTH = 1", source, flags=re.M),
         encoding="utf-8",

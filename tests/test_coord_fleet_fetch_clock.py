@@ -128,7 +128,7 @@ def make_clone(source: Path, dest: Path) -> Path:
     git(dest, "config", "user.email", "t@example.invalid")
     git(dest, "config", "user.name", "t")
     (dest / "scripts" / "coord").mkdir(parents=True)
-    for name in ("fleet.ps1", "mail-key.ps1", "session-registry.ps1"):
+    for name in ("fleet.ps1", "mail-key.ps1", "session-registry.ps1", "coord-root.ps1"):
         shutil.copy2(COORD / name, dest / "scripts" / "coord" / name)
     return dest
 

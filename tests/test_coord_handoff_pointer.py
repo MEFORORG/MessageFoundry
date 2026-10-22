@@ -75,7 +75,7 @@ def repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
     git(r, "config", "user.email", "t@example.invalid")
     git(r, "config", "user.name", "t")
-    for name in ("seat.ps1", "fleet.ps1", "mail-key.ps1", "session-registry.ps1"):
+    for name in ("seat.ps1", "fleet.ps1", "mail-key.ps1", "session-registry.ps1", "coord-root.ps1"):
         shutil.copy2(COORD / name, r / "scripts" / "coord" / name)
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
