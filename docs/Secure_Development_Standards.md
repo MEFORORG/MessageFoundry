@@ -743,8 +743,8 @@ rule it departs from by identifier**, so the departure and the requirement canno
   say which. Revisit when a second maintainer joins.
   **AI sessions also decide reversible judgment calls without asking the owner** (owner approvals
   2026-10-21 and 2026-10-22). A routine plan is one: it no longer waits for the owner's go, which
-  is kept for a plan that holds an owner-reserved item. Each such decision is logged and, for now,
-  acted on only after an adversarial review affirms it. Neither the log nor the review is
+  is kept for a plan that holds an owner-reserved item. Each such decision is to be logged and, for
+  now, acted on only after an adversarial review affirms it. Neither the log nor the review is
   enforced, and some of the controls planned around them are designed, not built. The owner's
   ruling on a question may be a seat's record of the owner's `/driver` or `/empower` answer to it.
   The companion standard's sections 6.2 and 6.6 and its A.6 entry *Autonomous class B decisions*
