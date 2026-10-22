@@ -21,9 +21,10 @@ a ``pwsh -WindowStyle Hidden`` task still flashes a console every two minutes.
 WHY THE LOCK IS lock.ps1's PROTOCOL, NOT A CALL TO IT. Calling lock.ps1 would mean a pwsh process per
 poll, and that window flash again. So this takes the same lock the same way: it exclusively creates
 ``mefor-coord/locks/pr-state.lock`` and writes the same ``pid= host= at=`` line. A PowerShell caller
-running ``Enter-CoordLock -Name pr-state`` excludes this poller and is excluded by it. Like lock.ps1 it
-never steals: a held lock means skip. A lock older than ``STALE_LOCK_SECONDS`` is reported as wedged,
-with the manual override, because nothing can prove its holder is gone.
+running ``Enter-CoordLock -Name pr-state`` excludes this poller and is excluded by it. A held lock
+means skip. Unlike lock.ps1 it removes one shape of lock: this host's, naming a pid Windows says is
+not running (``_holder_is_gone``), which is what a kill at the task's time limit or a logoff leaves.
+Any other lock older than ``STALE_LOCK_SECONDS`` is reported as wedged, with the manual override.
 
 A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``data`` block is kept with
 its own ``fetchedAt``, ``stale`` is true and ``error`` names the failure. With no previous data,
@@ -71,9 +72,11 @@ RATE_FLOOR = 300
 FAIL_BASE_DELAY = 120
 FAIL_MAX_DELAY = 1800
 #: A poll holds the lock for seconds. The worst case is about 8 gh calls at GH_TIMEOUT_SECONDS each,
-#: under the task's 10-minute limit, so a lock older than this one's holder is dead.
+#: under the task's 10-minute limit (install-pr-state-task.ps1 $timeLimitMinutes; keep this above
+#: it). A by-hand run has no limit, so a pid check, not this age, is what recovers a lock.
 STALE_LOCK_SECONDS = 900
 GH_TIMEOUT_SECONDS = 30
+START_SLACK = timedelta(seconds=15)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -157,7 +160,7 @@ MAIN_QUERY = """
 query($owner: String!, $name: String!, $limit: Int!) {
   rateLimit { cost remaining resetAt limit }
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
+    pullRequests(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: DESC}) {
       totalCount
       pageInfo { hasNextPage }
       nodes {
@@ -194,8 +197,8 @@ def contexts_query(numbers: list[int]) -> str:
             f"p{n}: pullRequest(number: {n}) {{ commits(last: 1) {{ nodes {{ commit {{ oid "
             f"statusCheckRollup {{ contexts(first: {CONTEXT_PAGE}) {{ pageInfo {{ hasNextPage }} nodes {{ "
             f"__typename "
-            f"... on CheckRun {{ name status conclusion isRequired(pullRequestNumber: {n}) }} "
-            f"... on StatusContext {{ context state isRequired(pullRequestNumber: {n}) }} "
+            f"... on CheckRun {{ name status conclusion startedAt isRequired(pullRequestNumber: {n}) }} "
+            f"... on StatusContext {{ context state createdAt isRequired(pullRequestNumber: {n}) }} "
             f"}} }} }} }} }} }} }}"
         )
     body = "\n    ".join(parts)
@@ -246,7 +249,10 @@ def fetch_required(gh: Gh, repo: str) -> list[str]:
     """
     try:
         branch = json.loads(gh(["api", f"repos/{repo}/branches/main"], None))
-        rules = json.loads(gh(["api", f"repos/{repo}/rules/branches/main"], None))
+        pages = json.loads(
+            gh(["api", "--paginate", "--slurp", f"repos/{repo}/rules/branches/main"], None)
+        )
+        rules = [rule for page in pages for rule in page]
         found = required_contexts.branch_protection_contexts(branch)
         found += required_contexts.ruleset_contexts(rules)
     except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
@@ -302,24 +308,26 @@ def required_verdict(
         return out
     nodes = [n for n in contexts.get("nodes", []) if n is not None]
     more = bool(contexts.get("hasNextPage"))
-    # Worst run wins when one name has several runs on the head (two events, a rerun). That can show
-    # red where GitHub would accept a later pass; it never shows green where a run is red.
-    for name in required:
-        matching = [n for n in nodes if pr_checks.name_of(n) == name]
-        if not matching:
-            # Absent from a truncated page proves nothing; absent from a complete one is pending.
-            out["unknown" if more else "missing"].append(name)
-            continue
-        failing, unsettled = pr_checks.counts(matching)
-        if failing:
-            out["failing"].append(name)
-        elif unsettled:
-            out["pending"].append(name)
     req = set(required)
     flagged = {
         pr_checks.name_of(n) for n in nodes if isinstance(n, dict) and n.get("isRequired") is True
     }
     out["requiredByGithubNotInList"] = sorted(flagged - req)
+    # A check GitHub calls required counts even when the cached list does not name it yet.
+    for name in sorted(req | flagged):
+        matching = [n for n in nodes if pr_checks.name_of(n) == name]
+        if not matching:
+            # Absent from a truncated page proves nothing; absent from a complete one is pending.
+            out["unknown" if more else "missing"].append(name)
+            continue
+        failing, unsettled = pr_checks.counts([_speaker(matching)])
+        if failing:
+            out["failing"].append(name)
+        elif unsettled:
+            out["pending"].append(name)
+        elif more:
+            # A later page may hold a newer or still-running run of this name.
+            out["unknown"].append(name)
     if out["failing"]:
         out["state"] = "FAILURE"
     elif out["pending"] or out["missing"]:
@@ -329,6 +337,22 @@ def required_verdict(
     else:
         out["state"] = "SUCCESS"
     return out
+
+
+def _speaker(runs: list[Any]) -> Any:
+    """The run that speaks for one name: clear_stale_ci_red.newest_by_name's rule, on GraphQL fields.
+
+    An unsettled run beats a settled one outright; a head can carry two concurrent runs of a name
+    and the earlier-started one can finish last. Otherwise the latest start wins, and a run with no
+    timestamp loses. List order is never used.
+    """
+
+    def key(run: Any) -> tuple[int, str]:
+        unsettled = pr_checks.counts([run])[1] > 0
+        stamp = (run.get("startedAt") or run.get("createdAt")) if isinstance(run, dict) else None
+        return (1 if unsettled else 0, str(stamp or ""))
+
+    return max(runs, key=key)
 
 
 def _known(value: object) -> str | None:
@@ -556,7 +580,10 @@ def failed(
 def read_cache(path: Path) -> dict[str, Any] | None:
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        _say(f"previous cache {path} unreadable, starting fresh: {exc!r}")
         return None
     if not isinstance(doc, dict) or doc.get("schemaVersion") != SCHEMA_VERSION:
         return None
@@ -586,7 +613,9 @@ def acquire_lock(local: Path) -> tuple[Path | None, str | None]:
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except (FileExistsError, PermissionError):
+    except (FileExistsError, PermissionError) as exc:
+        if isinstance(exc, PermissionError) and not lock.exists():
+            raise  # an unwritable locks directory, not a holder
         # PermissionError: Windows refuses a create over a file a releaser is deleting. Held.
         try:
             holder = lock.read_text(encoding="utf-8", errors="replace").strip()
@@ -599,6 +628,37 @@ def acquire_lock(local: Path) -> tuple[Path | None, str | None]:
     finally:
         os.close(fd)
     return lock, None
+
+
+def _holder_is_gone(holder: str) -> bool:
+    """True only when the lock names THIS host and a pid Windows says is not running.
+
+    lock.ps1 never steals because no liveness signal is reliable in general. Here the holder is
+    always this poller, it writes its pid and host, and the one answer trusted is "no such process"
+    on this machine. A live pid, a reused pid, another host or anything unparsable reads as alive.
+    """
+    fields = dict(part.split("=", 1) for part in holder.split() if "=" in part)
+    if fields.get("host", "").casefold() != coord_root.host().casefold():
+        return False
+    try:
+        pid = int(fields.get("pid", ""))
+    except ValueError:
+        return False
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value != 259  # STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: no such process
 
 
 def lock_path(local: Path) -> Path:
@@ -650,6 +710,11 @@ def main(
     out: Path = args.out if args.out is not None else local / CACHE_NAME
 
     lock, holder = acquire_lock(local)
+    if lock is None and holder is not None and _holder_is_gone(holder):
+        # A kill (task time limit, logoff, shutdown) skipped the finally below. Its pid is gone.
+        _say(f"removing the pr-state lock of a process that no longer runs: {holder}")
+        lock_path(local).unlink(missing_ok=True)
+        lock, holder = acquire_lock(local)
     if lock is None:
         age = lock_age_seconds(local)
         if age is not None and age > STALE_LOCK_SECONDS:
@@ -663,7 +728,11 @@ def main(
             previous = read_cache(out)
             if previous is not None and previous.get("repo") != args.repo:
                 previous = None
-            write_cache(out, failed(args.repo, previous, why, now()))
+            doc = failed(args.repo, previous, why, now())
+            # No API call was made, so no back-off: the run after the lock is cleared polls.
+            doc["nextPollNotBefore"] = (previous or {}).get("nextPollNotBefore")
+            doc["consecutiveFailures"] = (previous or {}).get("consecutiveFailures", 0)
+            write_cache(out, doc)
             return 3
         return 0  # another poll is running; it will write the cache
     try:
@@ -672,7 +741,8 @@ def main(
         if previous is not None and previous.get("repo") != args.repo:
             previous = None  # another repo's list and PRs must not carry over
         not_before = parse_iso(previous.get("nextPollNotBefore")) if previous else None
-        if not args.force and not_before is not None and start < not_before:
+        # The slack absorbs interpreter start-up jitter, so a retry due now is not skipped a round.
+        if not args.force and not_before is not None and start + START_SLACK < not_before:
             return 0  # backing off; the cache already says until when
         try:
             doc = poll(gh, args.repo, previous, start)

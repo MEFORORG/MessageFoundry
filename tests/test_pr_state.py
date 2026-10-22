@@ -80,7 +80,7 @@ def _run(name: str, conclusion: str = "SUCCESS", status: str = "COMPLETED") -> d
         "name": name,
         "status": status,
         "conclusion": conclusion,
-        "isRequired": True,
+        "isRequired": name in REQUIRED,
     }
 
 
@@ -113,13 +113,14 @@ class FakeGh:
             "limit": 5000,
             "resetAt": "2026-10-22T12:40:00Z",
         }
-        if args[1].endswith("/rules/branches/main"):
+        if args[-1].endswith("/rules/branches/main"):
             rule = {
                 "type": "required_status_checks",
                 "parameters": {"required_status_checks": [{"context": "cla"}]},
             }
-            return json.dumps([rule])
-        if args[1].startswith("repos/"):
+            assert "--paginate" in args and "--slurp" in args
+            return json.dumps([[rule]])
+        if args[-1].startswith("repos/"):
             protection = {
                 "required_status_checks": {"contexts": ["CI gate", "test"], "strict": True}
             }
@@ -319,6 +320,8 @@ def test_wedged_lock_is_reported_in_the_cache(tmp_path: Path) -> None:
     assert doc["error"] and "NOT stealing" in doc["error"] and doc["stale"] is True
     assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
     assert lock.exists()
+    # No API call was made, so no back-off: the first run after the lock is cleared polls.
+    assert doc["nextPollNotBefore"] is None and doc["consecutiveFailures"] == 0
 
 
 def test_another_repos_cache_is_not_carried_over(tmp_path: Path) -> None:
@@ -362,16 +365,16 @@ def test_required_list_is_reused_within_the_hour(tmp_path: Path) -> None:
     _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
     gh = FakeGh([_pr(1)], {1: _green()})
     _main(tmp_path, gh, NOW + timedelta(minutes=30))
-    assert not any(c[1].startswith("repos/") for c in gh.calls)
+    assert not any(c[-1].startswith("repos/") for c in gh.calls)
     gh = FakeGh([_pr(1)], {1: _green()})
     _, doc = _main(tmp_path, gh, NOW + timedelta(minutes=61))
-    assert any(c[1].startswith("repos/") for c in gh.calls)
+    assert any(c[-1].startswith("repos/") for c in gh.calls)
     assert doc["requiredContextsFetchedAt"] == "2026-10-22T13:01:00Z"
 
 
 def test_no_required_list_reads_unknown_not_green(tmp_path: Path) -> None:
     def gh(args: list[str], stdin: str | None) -> str:
-        if args[1].startswith("repos/"):
+        if args[-1].startswith("repos/"):
             raise ps.GhError("HTTP 403")
         return FakeGh([_pr(1)], {1: _green()})(args, stdin)
 
@@ -422,9 +425,52 @@ def test_installer_host_breaker_and_session_refusal() -> None:
     assert wrong.returncode != 0 and "STOP" in said and "nothing ran" in said
     no_host = _installer(env={"CLAUDECODE": "1"})
     assert no_host.returncode == 2 and "-ExpectedHost" in no_host.stderr
-    here = platform.node().split(".")[0].upper()
-    in_session = _installer("-ExpectedHost", here, env={"CLAUDECODE": "1"})
+    here = os.environ.get("COMPUTERNAME") or platform.node().split(".")[0].upper()
+    # A decoy name and an interpreter that cannot exist: if the session refusal ever regresses, this
+    # still registers nothing on the developer's machine.
+    decoy = ["-TaskName", "MEFOR-PR-State-TEST-DECOY", "-Python", r"C:\no\such\pythonw.exe"]
+    in_session = _installer("-ExpectedHost", here, *decoy, env={"CLAUDECODE": "1"})
     assert in_session.returncode == 2 and "inside Claude Code" in in_session.stderr
+
+
+def test_rerun_green_speaks_for_the_name(tmp_path: Path) -> None:
+    failed_first = {**_run("test", "FAILURE"), "startedAt": "2026-10-22T10:00:00Z"}
+    green_later = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    contexts = [_run("CI gate"), _run("cla"), green_later, failed_first]
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}))
+    assert doc["data"]["pullRequests"][0]["required"]["state"] == "SUCCESS"
+
+
+def test_github_required_check_missing_from_list_still_counts(tmp_path: Path) -> None:
+    extra = {**_run("new-required", "FAILURE"), "isRequired": True}
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [*_green(), extra]}))
+    required = doc["data"]["pullRequests"][0]["required"]
+    assert required["state"] == "FAILURE" and required["failing"] == ["new-required"]
+    assert required["requiredByGithubNotInList"] == ["new-required"]
+
+
+def test_truncated_context_page_never_reads_green(tmp_path: Path) -> None:
+    pr = _pr(1)
+    ctx = {"oid": "oid1", "nodes": _green(), "hasNextPage": True}
+    verdict = ps.shape_pr(pr, sorted(REQUIRED), ctx)["required"]
+    assert verdict["state"] == "UNKNOWN" and sorted(verdict["unknown"]) == sorted(REQUIRED)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the pid check is Windows-only")
+def test_lock_of_a_dead_pid_on_this_host_is_recovered(tmp_path: Path) -> None:
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (tmp_path / "locks").mkdir()
+    lock = tmp_path / "locks" / "pr-state.lock"
+    lock.write_text(f"pid={dead.pid} host={ps.coord_root.host()} at=then", encoding="utf-8")
+    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    assert rc == 0 and doc["error"] is None and not lock.exists()
+
+
+def test_live_or_foreign_holder_is_not_recovered() -> None:
+    assert ps._holder_is_gone(f"pid={os.getpid()} host={ps.coord_root.host()} at=x") is False
+    assert ps._holder_is_gone("pid=1 host=SOME-OTHER-PC at=x") is False
+    assert ps._holder_is_gone(f"pid=notanumber host={ps.coord_root.host()}") is False
 
 
 def test_unlisted_verdict_is_pending_not_green(tmp_path: Path) -> None:

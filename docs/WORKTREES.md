@@ -726,10 +726,12 @@ poll keeps the last good data and marks it stale. The fields:
 
 Four reading rules, each one a mistake the file is shaped to prevent:
 
-1. `data: null` means unknown. Only `data.pullRequests: []` means GitHub said no PR is open.
+1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
+   said no PR is open.
 2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
-   no check run yet reads `PENDING` and is named in `required.missing`. It reads `UNKNOWN` when the
-   required list is missing or the head moved between the two queries.
+   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has at least four
+   causes, and `required.reason` names the one that fired: no required list, no context reply for
+   the PR, the head moving between the two queries, or a truncated context page.
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
    (`mergeStateKnown: false`). That is no state at all.
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
@@ -737,9 +739,10 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
 `lock.ps1` does and never steals it. A held lock means another poll is running, so the run exits.
-A lock older than fifteen minutes outlives the task's ten-minute limit, so its holder is dead. The
-poller then writes that into the cache's `error`, with the path to delete by hand, and still does
-not steal the lock.
+One exception to never stealing: when the lock names this host and a pid Windows says is not
+running, the poller removes it. A kill at the task's time limit, a logoff or a shutdown leaves that
+shape. Any other lock older than fifteen minutes is reported in the cache's `error`, with the path to
+delete by hand, and is left alone.
 
 ```powershell
 python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file

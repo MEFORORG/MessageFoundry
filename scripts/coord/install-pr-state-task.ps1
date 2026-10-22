@@ -102,7 +102,9 @@ $pythonExists = [bool]$Python -and (Test-Path -LiteralPath $Python -PathType Lea
 # A venv or worktree interpreter dies with its directory, and the task would then fail with nothing
 # saying so. pythonw reports nothing either, so check the version through its python.exe sibling.
 $pythonProblem = $null
-if ($pythonExists) {
+if ($pythonExists -and (Split-Path -Leaf $Python) -ne 'pythonw.exe') {
+    $pythonProblem = "$Python is not pythonw.exe; any other interpreter opens a window every run"
+} elseif ($pythonExists) {
     $full = [System.IO.Path]::GetFullPath($Python)
     if ($full -match '[\\/](\.venv|venv|\.claude[\\/]worktrees)[\\/]') {
         $pythonProblem = "$full is inside a venv or worktree; pass -Python with an installed interpreter's pythonw.exe"
@@ -116,6 +118,7 @@ $ghExists = [bool](Get-Command gh -CommandType Application -ErrorAction Silently
 
 $runLevel = 'Limited'
 $logonType = 'Interactive'
+# Keep under pr_state.py's STALE_LOCK_SECONDS (15 min).
 $timeLimitMinutes = 10
 $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
 $coordDir = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord'
