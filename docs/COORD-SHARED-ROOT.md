@@ -68,9 +68,40 @@ that worked was a PR comment. Two lessons for the design:
 | Mapping | `net use` shows Z: in this logon; `HKCU:\Network\Z` returned nothing | `Get-ItemProperty` |
 | Neighbours | The share already holds unrelated files, at least one whose name suggests exported keys | `Get-ChildItem Z:\` |
 
-Not measured, and left open on purpose: whether an elevated shell or a service sees Z:, and atomic
-create and rename on the share. No probe file was written to Z:, because writing outside the
-worktree needs the owner. Migration step 2 below measures both before anything moves.
+Not measured from ALIENWARE, on purpose: whether an elevated shell or a service sees Z:, and atomic
+create and rename on the share. No probe file was written to Z: from this PC, because writing
+outside the worktree needs the owner. MEFORDEV01 measured both, below.
+
+## What MEFORDEV01 measured (2026-10-21)
+
+A session on MEFORDEV01 ran the probe the owner asked for. Its report is
+`Z:\mefor-coord-probe\MEFORDEV01-2026-10-21.md`.
+
+| Fact | Reading |
+|---|---|
+| User and paths | Same Windows user as ALIENWARE. The profile's `Code` folder is a junction to `D:\Code`, so every common dir is on D:. Worktrees there report `D:\Code\...` paths. |
+| Mapping | Z: is `\\192.168.4.21\Shared`, by IP, persistent. `EnableLinkedConnections` is not set, so an elevated shell does not see Z:. That confirms the UNC-path rule. |
+| Host | `Nucbox01` resolves by mDNS (`Nucbox01.local`) and by reverse lookup. TCP 445 answers. ALIENWARE and MEFORHV01 answer neither ping nor 445 from MEFORDEV01, which does not matter: both PCs talk only to Nucbox01. |
+| Tools | git 2.55.0, gh 2.102.0, pwsh 7.6.7, Python 3.14.7, uv 0.13.1. All seven account slots are signed in; four run a desktop instance. |
+| Power | Sleep on AC is never. |
+| Latency | 1 to 3 ms per round on Z:. The share was faster than a local temp folder. |
+| **CreateNew race** | Two processes, 100 slots: 51 and 49 wins, **no double winners and no empty rounds.** Exclusive create holds on this share, from one client. |
+| **Rename over a file being read** | **Not safe.** 2 of 50 `File.Move(..., $true)` calls failed with "Access is denied", and 56 of about 2,500 reads failed with a sharing violation. No reader saw partial content. |
+| Local state | MEFORDEV01's own `mefor-coord` holds about 25,000 files: 4,634 under `seats/`, 2,834 under `mail/`, 880 under `alloc/`, 153 under `claims/`, plus large retired and backup trees. |
+
+What this changes:
+
+1. **Writers that replace a file by rename need a retry, and readers must treat a sharing
+   violation as "retry", never as "missing" or "torn".** At least `seat.ps1` (its temp-then-rename
+   record write) and `lane.ps1` do this on shared kinds; `claim.ps1`'s refresh already retries.
+   This is a new precondition of step 7.
+2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
+   it again with one process on each PC before step 7, because the two clients' caches are the
+   part no single-client test sees.
+3. **Merging MEFORDEV01 is a large step, not a footnote.** It copies live folders only, never the
+   retired or backup trees. Each of its 880 allocation records gets checked against the share.
+4. **Map by name, with a DHCP reservation for Nucbox01.** An IP mapping breaks silently if the
+   address changes. `root.toml` should name `\\Nucbox01\Shared\mefor-coord`.
 
 ## Why not the drive letter
 
@@ -226,6 +257,8 @@ design. Reads and builds keep working.
    mailboxes and lane files, keeping one read of the old key for records with no `host`. Until it
    lands, two PCs with a worktree at the same path share one seat id and one mailbox. This is a
    precondition of step 7, and a separate change, because it moves both ends of the mail contract.
+   Also before step 7: the rename-retry change for writers and readers of shared kinds, and the
+   CreateNew race rerun with one process on each PC (see *What MEFORDEV01 measured*).
 5. Pick a quiet window. Announce it on the old mail lane.
 6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
    `robocopy /E /COPY:DT`. Leave the originals in place. **Then stamp `host = ALIENWARE` on every
