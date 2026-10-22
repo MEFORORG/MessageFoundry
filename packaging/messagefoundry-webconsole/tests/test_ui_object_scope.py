@@ -10,6 +10,8 @@ tests check that it does. ``tests/test_object_scope_flag_and_alert_rules.py`` co
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
 
@@ -67,6 +69,15 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
         r = await c.get("/ui/alerts")
         assert r.status_code == 200
         assert "IB_MINE" in r.text and "IB_THEIRS" not in r.text
+    # BACKLOG #3403: the console load writes the JSON handler's count-only row, and only for the
+    # caller it withheld a rule from.
+    withheld = await engine.store.list_audit(action="alert_rules_withheld")
+    assert [(row["actor"], json.loads(str(row["detail"]))) for row in withheld] == [
+        ("op", {"shown": 1, "withheld": 1})
+    ]
+    # docs/SECURITY.md writes one row per load, not coalesced, because this page does not poll. A
+    # poll hook here would write a row per tick, so it must coalesce the row first.
+    assert "data-poll" not in page and "data-mf-fragment" not in page
 
 
 async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(

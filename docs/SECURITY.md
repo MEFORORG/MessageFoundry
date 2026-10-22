@@ -2009,7 +2009,10 @@ the same permission set on the same method reds CI until it is listed here.
 > scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
 > contents. The write is best-effort: when the store refuses it, the read still answers and the
-> lost row is logged at ERROR. So a missing row does not prove nothing was withheld. Why it is not
+> lost row is logged at ERROR. So a missing row does not prove nothing was withheld. Each
+> withholding read writes its own row. The `summary_access` coalescer is the PHI-summary census,
+> and this read discloses no PHI. The console's alerts page does not poll, which
+> `test_ui_object_scope.py` pins; a page that polled would need the row coalesced. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
 > `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
@@ -5967,7 +5970,9 @@ on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
-and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
+and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row.
+`GET /alerts/rules` is an exception: it writes `alert_rules_withheld` when it withholds a rule
+(BACKLOG #3403). PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
 

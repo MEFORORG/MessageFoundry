@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -220,27 +221,39 @@ async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
         assert await withheld_rows("scoped", c_covered) == []
 
 
-async def test_alert_rules_read_survives_a_refused_withheld_row(
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [(RuntimeError, 200), *((defect, 500) for defect in AUDIT_WRITE_DEFECTS)],
+)
+async def test_alert_rules_withheld_row_is_fail_soft_for_a_store_refusal_only(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: type[Exception],
+    status: int,
 ) -> None:
-    """BACKLOG #3403: the row is written fail-soft. A store that refuses it leaves the narrowed
-    answer standing and logs the loss, rather than turning the read into a 500."""
+    """BACKLOG #3403: the row is written fail-soft. A store refusal (``RuntimeError``) leaves the
+    narrowed answer standing and logs the loss with the row's counts, rather than a 500. A defect
+    in the write is a bug, so it escapes and the read fails, and nothing logs it as a lost row."""
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     app = create_app(engine, auth=service, alerts_settings=_RULES)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "scoped")
         real = service.store.record_audit
 
         async def refuse(action: str, **kwargs: Any) -> None:
             if action == "alert_rules_withheld":
-                raise RuntimeError("store refused")
+                raise error("refused")
             await real(action, **kwargs)
 
         monkeypatch.setattr(service.store, "record_audit", refuse)
         r = await c.get("/alerts/rules", headers=h)
-    assert r.status_code == 200, r.text
-    assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
-    assert "its audit row failed" in caplog.text
+    assert r.status_code == status, r.text
+    if status == 200:
+        assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
+        assert f"showed 3 and withheld {len(_RULES.rules) - 3} rules" in caplog.text
+        assert "its audit row failed" in caplog.text
+    else:
+        assert "its audit row failed" not in caplog.text

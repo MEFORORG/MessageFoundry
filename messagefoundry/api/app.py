@@ -277,7 +277,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -3479,32 +3479,43 @@ async def _audit_alert_rules_withheld(
     denial count, so routine alerts-page loads could raise a denial-burst alert.
 
     Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
-    refusal is logged rather than turning the answered read into a 500. Only a store refusal is
-    caught; any other fault is a bug and escapes. ``defects=()`` because a defect class such as
-    ``sqlite3.ProgrammingError`` is not in ``errors`` and escapes anyway. The row goes through the
-    auth service's store, the one its own audit rows use: only a channel-scoped caller withholds a
-    rule, such a caller exists only when that service is attached, and the engine may not be."""
+    refusal is logged rather than turning the answered read into a 500. The catch set is the same
+    as ``_audit_write_errors`` in ``auth/service.py``, and a defect in
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` is raised, not logged as a refusal, so
+    a bug in the write answers 500 rather than passing as a refused row. Why
+    the row is not coalesced is in docs/SECURITY.md. The row goes through the auth service's store,
+    the one its own audit rows use: only a channel-scoped caller withholds a rule, such a caller
+    exists only when that service is attached, and the engine may not be."""
     auth = get_auth(request)
     actor = identity.username
     if auth is None:
         _log.error(
-            "GET /alerts/rules withheld %d rules from %s with no auth service to audit it",
+            "GET /alerts/rules showed %d and withheld %d rules from %s with no auth service to "
+            "audit it",
+            shown,
             withheld,
             scrub_log_argument(actor),
         )
         return
     store = auth.store
+    client = client_ip(request)
     await write_audit_soft(
         lambda: store.record_audit(
             "alert_rules_withheld",
             actor=actor,
             detail=json.dumps({"shown": shown, "withheld": withheld}),
-            client=client_ip(request),
+            client=client,
         ),
         log=_log,
-        message="GET /alerts/rules withheld %d rules from %s, but its audit row failed",
-        args=lambda: (withheld, scrub_log_argument(actor)),
-        defects=(),
+        message="GET /alerts/rules showed %d and withheld %d rules from %s at %s, but its audit "
+        "row failed",
+        args=lambda: (
+            shown,
+            withheld,
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+        ),
+        defects=AUDIT_WRITE_DEFECTS,
         errors=(CipherError, *store_call_errors()),
     )
 
@@ -8898,7 +8909,8 @@ def create_app(
                 for r in rules
             ],
         )
-        # After the answer is built, so the row never counts as shown a rule a failed read did not.
+        # After the answer is built, so a failed build writes no row. The console renders after
+        # this returns, so the row records what was withheld, not that a page was seen.
         withheld = len(alerts.rules) - len(rules)
         if withheld:
             await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
