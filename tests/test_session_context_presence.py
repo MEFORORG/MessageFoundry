@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -406,27 +407,37 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
 # repository, so the budget is 4 KB, and these tests pin it with every list far past its cap.
 # --------------------------------------------------------------------------------------------------
 
-BYTE_BUDGET = 4096
+# The script's own budget, read from the line that sets it, so the fact is stated once.
+_BUDGET_LINE = re.search(r"^\$byteBudget = (\d+)$", CONTEXT.read_text(encoding="utf-8"), re.M)
+assert _BUDGET_LINE, "session-context.ps1 no longer sets $byteBudget on a line of its own"
+BYTE_BUDGET = int(_BUDGET_LINE.group(1))
+
+# A roster or in-flight row: the label, then the 8-hex registry id.
+_PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
+
+
+def _stamp(hours_ago: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
 
 
 def _claim_row(key: str, hours_ago: float, note: str) -> dict[str, str]:
-    claimed = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+    # Full-length fields, as the real registry holds them, so the budget is tested at real widths.
     return {
         "key": key,
         "note": note,
-        "branch": f"b-{key}",
-        "worktree": f"C:/elsewhere/.claude/worktrees/agent-{key}",
-        "claimed": claimed,
+        "branch": f"claude/worktree-agent-{key}-a4cab2d83e0b3be2f",
+        "worktree": f"D:/Code/MessageFoundry/.claude/worktrees/agent-{key}-a4cab2d83e0b3be2f",
+        "claimed": _stamp(hours_ago),
     }
 
 
-def _peer_rows(count: int, worktree: str = "peer-worktree") -> list[dict[str, object]]:
+def _peer_rows(count: int, worktree: str = "agent-a4cab2d83e0b3be2f") -> list[dict[str, object]]:
     return [
         {
             "Short": f"{i:08x}",
             "Surface": "desktop",
             "Worktree": f"{worktree}-{i:02d}",
-            "Branch": f"claude/peer-{i:02d}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
             "IsSelf": False,
             "IsPrimary": False,
             "State": "LIVE",
@@ -435,30 +446,54 @@ def _peer_rows(count: int, worktree: str = "peer-worktree") -> list[dict[str, ob
     ]
 
 
-def _crowd(base: Path, peers: list[dict[str, object]]) -> tuple[Path, dict[str, str]]:
-    """Ten more worktrees, the given live peers, and 40 fresh plus 20 stale claims."""
+def fake_overlap(repo: Path, count: int) -> None:
+    """Stand in for overlap.ps1 -Json: live sessions, each with work and changed files."""
+    rows = [
+        {
+            "Short": f"b{i:07x}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
+            "Live": True,
+            "Work": [f"task {i}: " + "a long task subject from the peer's own list " * 3, "second"],
+            "Files": ["a.py", "b.py"],
+        }
+        for i in range(count)
+    ]
+    payload = json.dumps(rows).replace("'", "''")
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text(
+        f"Write-Output '{payload}'\n", encoding="utf-8"
+    )
+
+
+def _crowd(
+    base: Path, peers: list[dict[str, object]], claims: dict[str, dict[str, str] | str]
+) -> tuple[Path, dict[str, str]]:
+    """Ten more worktrees, the given live peers, five busy sessions, and the given claim files."""
     repo = _make_staged(base)
     for i in range(10):
         _git(repo, "worktree", "add", "-q", "-b", f"extra-{i}", str(base / f"extra-wt-{i:02d}"))
     fake_presence(repo, peers)
+    fake_overlap(repo, 5)
     shutil.copy(
         ROOT / "scripts" / "coord" / "coord-root.ps1",
         repo / "scripts" / "coord" / "coord-root.ps1",
     )
     # The resolver's first source, so the test never reads this box's real shared root.
     coord_root = base / "coord-root"
-    claims = coord_root / "claims"
-    claims.mkdir(parents=True)
-    long_note = (
-        "a Manager batch note that runs well past the eighty characters a row may carry " * 3
-    )
-    for i in range(40):
-        row = _claim_row(f"fresh{i:02d}", hours_ago=i * 0.1, note=long_note)
-        (claims / f"fresh{i:02d}.json").write_text(json.dumps(row), encoding="utf-8")
-    for i in range(20):
-        row = _claim_row(f"stale{i:02d}", hours_ago=24 + i, note="old")
-        (claims / f"stale{i:02d}.json").write_text(json.dumps(row), encoding="utf-8")
+    (coord_root / "claims").mkdir(parents=True)
+    for name, row in claims.items():
+        text = row if isinstance(row, str) else json.dumps(row)
+        (coord_root / "claims" / f"{name}.json").write_text(text, encoding="utf-8")
     return repo, {**os.environ, "MEFOR_COORD_ROOT": str(coord_root)}
+
+
+def _many_claims() -> dict[str, dict[str, str] | str]:
+    note = "a Manager batch note that runs well past the sixty characters a row may carry " * 3
+    claims: dict[str, dict[str, str] | str] = {}
+    for i in range(40):
+        claims[f"fresh{i:02d}"] = _claim_row(f"fresh{i:02d}", hours_ago=i * 0.1, note=note)
+    for i in range(20):
+        claims[f"stale{i:02d}"] = _claim_row(f"stale{i:02d}", hours_ago=24 + i, note="old")
+    return claims
 
 
 def _banner(repo: Path, env: dict[str, str]) -> str:
@@ -469,9 +504,12 @@ def _banner(repo: Path, env: dict[str, str]) -> str:
 
 @pytest.fixture(scope="module")
 def crowded(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
-    """Every list past its cap, run once: the three tests below read the same banner."""
+    """Every list past its cap at real field widths, run once: the tests below read one banner."""
     base = Path(os.path.realpath(tmp_path_factory.mktemp("crowded")))
-    repo, env = _crowd(base, _peer_rows(30))
+    peers = _peer_rows(30)
+    # One hazardous peer, sorted last by presence.ps1, so only the ranking can bring it under the cap.
+    peers[-1] = {**peers[-1], "Surface": "vscode", "Short": "feedface"}
+    repo, env = _crowd(base, peers, _many_claims())
     return repo, _banner(repo, env)
 
 
@@ -480,16 +518,18 @@ def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
 ) -> None:
     _, out = crowded
     size = len(out.encode("utf-8"))
-    print(f"banner bytes: {size}")
+    print(f"banner bytes: {size} of {BYTE_BUDGET}")
 
     # Positive controls first: every list really was past its cap, so the budget below is earned.
     assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
     assert "LIVE sessions in this repo right now (30 besides you)" in out, out
-    assert "+20 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
-    assert "Active work claims (40 fresh, 20 stale over 12h not shown)" in out, out
-    assert "+30 more fresh" in out, out
-    assert "claim.ps1 -List" in out, out
-    assert "cut the last" not in out, "the row caps alone should fit; the backstop fired"
+    assert "+22 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
+    assert "WHAT THEY ARE BUILDING" in out and "  +2 more" in out, out
+    assert "Active work claims (60, 40 touched in the last 12h)" in out, out
+    assert "+52 more" in out and "claim.ps1 -List" in out, out
+    # The row caps alone fit, so every section, the rules last, reaches the model.
+    assert "cut the last" not in out, out
+    assert "Coordination rules for parallel sessions" in out, out
 
     assert size < BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
 
@@ -514,20 +554,58 @@ def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path,
     assert _top(repo) in own[0] and head in own[0], own
 
 
-def test_only_fresh_claims_are_listed_newest_first(crowded: tuple[Path, str]) -> None:
+def test_a_hazardous_peer_past_the_cap_is_ranked_into_view(crowded: tuple[Path, str]) -> None:
+    """The NOTE tests every peer; the ranking makes sure it names one the reader can see."""
+    _, out = crowded
+    assert "NOTE: a non-desktop (e.g. VS Code) session is live" in out, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session feedface  vscode"), rows
+    # Each busy session shows one task line, not its whole list.
+    assert "second" not in out, out
+
+
+def test_claims_list_newest_first_and_never_drop_by_age(crowded: tuple[Path, str]) -> None:
     _, out = crowded
     rows = [ln for ln in out.splitlines() if "(held by" in ln]
     keys = [ln.split(" -- ")[0].strip() for ln in rows]
-    assert keys == [f"fresh{i:02d}" for i in range(10)], keys
+    assert keys == [f"fresh{i:02d}" for i in range(8)], keys
     assert all("..." in ln for ln in rows), "the long note was not shortened"
 
 
-def test_rows_too_long_for_the_caps_are_cut_from_the_tail(tmp_path: Path) -> None:
-    """Row counts do not bound bytes. With peer rows far wider than any real one, the backstop
-    keeps the head, where the peers are, and says what it cut."""
+def test_an_old_claim_is_listed_tagged_stale_and_a_refresh_counts(tmp_path: Path) -> None:
+    """A claim holds its key however old it is, and -Take moves `refreshed`, never `claimed`."""
     base = Path(os.path.realpath(tmp_path))
-    repo, env = _crowd(base, _peer_rows(30, worktree="w" * 400))
+    refreshed = {
+        **_claim_row("refreshed", hours_ago=30, note="still building"),
+        "refreshed": _stamp(1),
+    }
+    repo, env = _crowd(
+        base,
+        _peer_rows(1),
+        {
+            "old": _claim_row("old", hours_ago=30, note="free-text key, nobody else shows it"),
+            "refreshed": refreshed,
+            "broken": "{ not json",
+        },
+    )
     out = _banner(repo, env)
-    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "Active work claims (2, 1 touched in the last 12h)" in out, out
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    assert [ln.split(" -- ")[0].strip() for ln in rows] == ["refreshed", "old"], rows
+    assert "[stale ~30h]" in rows[1] and "stale" not in rows[0], rows
+    assert "WARNING: 1 claim file(s)" in out, out
+
+
+def test_rows_too_wide_for_the_caps_are_clipped_and_cut_from_the_tail(tmp_path: Path) -> None:
+    """Row counts do not bound bytes. With peer rows far wider than any real one, each line is
+    clipped, the head where the hazards are survives, and the cut says what to run instead."""
+    base = Path(os.path.realpath(tmp_path))
+    peers = _peer_rows(30, worktree="w" * 400)
+    peers[-1] = {**peers[-1], "IsPrimary": True}
+    repo, env = _crowd(base, peers, _many_claims())
+    out = _banner(repo, env)
+    assert "WARNING: a session is working in the SHARED PRIMARY checkout" in out, out
+    rows = [ln for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows and all(len(ln) <= 160 for ln in rows), rows
     assert "cut the last" in out and "claim.ps1 -List" in out, out
     assert len(out.encode("utf-8")) < BYTE_BUDGET, out

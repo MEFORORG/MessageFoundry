@@ -987,13 +987,19 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 You don't have to brief each new chat by hand. A `SessionStart` hook
 ([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
-into every new Claude Code window. It always prints the project's Ultracode working-default
-reminder, and **when 2+ worktrees
-share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
-full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
-working-default line.
+into every new Claude Code window. **When 2+ worktrees share this `.git`** it prints the
+parallel-session block: which worktree/branch this chat owns, the live peers, what they are building,
+the work claims, a worktree count with this chat's own row, and the shared-memory write rule above.
+With a single worktree it prints nothing.
 
-**Who is actually live — `presence.ps1`.** The worktree list above is the set of *checkouts*, not the
+The block is kept small on purpose. Past a size threshold the harness saves a hook's output to a file
+and injects only a short preview of its head. The threshold is not documented in this repository, so
+the script holds itself to the byte budget its `$byteBudget` line sets: the high-signal sections print first, each list is
+capped with a line naming the command that shows the rest, and past the budget the tail is cut with a
+line saying so. On 2026-10-22, with 471 worktrees and 155 claims, the old full worktree list made the
+banner 128,001 bytes, and the peers and claims never reached the model.
+
+**Who is actually live — `presence.ps1`.** The worktree count is the set of *checkouts*, not the
 set of *sessions*: most worktrees usually have nobody in them, and the collision that matters — someone
 editing the shared primary right now — is invisible from it. The banner therefore also lists **live
 sessions**, from [../scripts/coord/presence.ps1](../scripts/coord/presence.ps1). Run it directly any time:
