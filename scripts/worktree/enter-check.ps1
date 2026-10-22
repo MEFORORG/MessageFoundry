@@ -2,25 +2,28 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Is it safe for this session to enter the worktree at -Path without asking the owner? (ADR 0212)
+    Does the worktree at -Path look safe for this session to enter? An advisory verdict (ADR 0212).
 
 .DESCRIPTION
-    Read-only. Prints `SAFE` or `UNSAFE` as its first stdout line, then the reasons, one per line.
-    Exits 0 for SAFE and 1 for anything else. scripts/hooks/enter-worktree-check.ps1 runs it before
-    an EnterWorktree call and auto-allows the call only on SAFE; on UNSAFE the owner's normal
-    permission prompt shows, as it did before this check existed.
+    Read-only. Prints `SAFE` or `UNSAFE` as its first stdout line, then the reasons, one per line,
+    and exits 0 for SAFE and 1 for UNSAFE. When this machine's OFF file exists it prints `OFF`,
+    runs no check, and exits 2. scripts/hooks/enter-worktree-check.ps1 runs it before an
+    EnterWorktree call and shows the verdict in the owner's permission prompt.
+
+    THE VERDICT IS ADVICE, NEVER A PERMISSION. This script runs from the session's own editable
+    tree, so the session could change what it prints; nothing may allow a call on its word.
 
     IT FAILS CLOSED. The verdict starts false and is set only by the last statement of the checks,
-    and only when every one of the eight checks below recorded its own pass. A check that throws,
-    times out, or is skipped because an earlier one failed records no pass, so it can only ever
-    cost a prompt, never grant one.
+    and only when every one of the six checks below recorded its own pass. A check that throws,
+    times out, or is skipped because an earlier one failed records no pass. The whole run is
+    bounded by -BudgetSeconds, so the hook finishes inside its settings timeout.
 
     SAFE requires ALL of:
 
       a. The path canonicalises: full path, every junction and symlink along it resolved to its
          final target, every segment present on disk under the name given (so an 8.3 short name
-         is refused, not expanded). A `\\?\`, `\\.\`, UNC, drive-relative (`C:x`) or
-         root-relative (`\x`) path is refused outright.
+         is refused, not expanded). A `\\?\`, `\\.\`, UNC, relative, drive-relative (`C:x`) or
+         root-relative (`\x`) path is refused outright, never joined to a directory.
       b. It is a LINKED worktree (never the primary) listed by `git worktree list --porcelain -z`
          of one of the fleet repositories (-FleetRepos), compared canonical to canonical.
       c. It is under THIS session's own scratchpad, by segments:
@@ -55,19 +58,20 @@
          instructions (`.claude`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`, at any depth and
          in any case). Ignored means ignored by the tree's own `.gitignore` files, never by
          `info/exclude` or `core.excludesFile`. The tree holds no symlink or submodule.
-      g. scripts/coord/afk-kill.ps1 -Status prints OFF. Any other output, an error or a timeout
-         is a failure.
-      h. No local disable file exists at <git common dir of the engine>/mefor-coord/enter-check/OFF.
 
     Every line printed goes through Get-SafeForMessage, loaded from worktree_gate.ps1's own
     definition (parsed, never copied), because a path or a git message is attacker-choosable text.
 
-    TO DISABLE IT (ADR 0212):
-      * fleet-wide: set the repository variable MEFOR_AFK_KILL to anything but `off` (check g);
-      * this machine only: create the OFF file (check h):
+    TO SILENCE IT (ADR 0212):
+      * this machine only: create the OFF file, which the hook reads as no verdict at all:
             New-Item -ItemType File -Force -Path "$(git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir)/mefor-coord/enter-check/OFF"
         and delete that file to turn it back on;
       * permanently: remove the EnterWorktree entry from .claude/settings.json.
+
+.PARAMETER BudgetSeconds
+    The bound on the whole run. Every child process is killed at its own timeout or at this
+    budget, whichever comes first, and none starts once it is spent. 40 s plus pwsh's start-up
+    stays under the 60 s timeout the settings entry gives the hook.
 
 .PARAMETER FleetRepos
     The fleet repositories. The FIRST is the engine, whose git common dir holds the OFF file. The
@@ -97,10 +101,11 @@ param(
             [System.IO.Path]::GetTempPath()) | Where-Object { $_ } | Select-Object -First 1),
     [string]$TranscriptPath,
     [ValidateRange(1, 120)][int]$RemoteTimeoutSeconds = 20,
-    [ValidateRange(1, 120)][int]$KillSwitchTimeoutSeconds = 20
+    [ValidateRange(1, 45)][int]$BudgetSeconds = 40
 )
 
 $safe = $false
+$budgetEnd = [DateTime]::UtcNow.AddSeconds($BudgetSeconds)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -137,6 +142,7 @@ $gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
 function Start-Child {
     # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
     param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText, [hashtable]$SetEnv)
+    if ([DateTime]::UtcNow -ge $script:budgetEnd) { throw "the check's $BudgetSeconds s budget is spent" }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
@@ -150,27 +156,39 @@ function Start-Child {
     if ($SetEnv) { foreach ($k in $SetEnv.Keys) { $psi.Environment[$k] = [string]$SetEnv[$k] } }
     $p = [System.Diagnostics.Process]::Start($psi)
     # Readers first, so a child that answers as it reads cannot fill its pipe and stall the write.
-    $child = [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() }
-    if ($StdinText) { $p.StandardInput.Write($StdinText) }
-    $p.StandardInput.Close()
+    $child = [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync(); Write = $null }
+    # The input is written asynchronously and waited on inside Wait-Child's bound: a child that
+    # never reads it would otherwise block a plain write here, outside any timeout, once the pipe fills.
+    if ($StdinText) { $child.Write = $p.StandardInput.WriteAsync($StdinText) }
+    else { $p.StandardInput.Close() }
     $child
 }
 
 function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
-    # The child's exit code and output. A child still running at the bound is killed and this throws.
+    # The child's exit code and output. A child still running at its bound, or at the run's
+    # budget, is killed and this throws.
     $p = $Child.Process
     try {
-        # The output is read to its end too, inside the same bound: a grandchild left running (a
-        # hung gh behind afk-kill.ps1) holds the pipe open after the child itself has exited.
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-        $exited = $p.WaitForExit($TimeoutSeconds * 1000)
-        $left = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-        if (-not $exited -or -not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($Child.Out, $Child.Err), $left)) {
-            try { $p.Kill($true) } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
-            throw "$($Child.Name) did not finish within $TimeoutSeconds s"
+        if ($script:budgetEnd -lt $deadline) { $deadline = $script:budgetEnd }
+        $left = { [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds) }
+        $done = $true
+        if ($Child.Write) {
+            $done = $Child.Write.Wait((& $left))
+            if ($done) { $p.StandardInput.Close() }
         }
+        # The output is read to its end too, inside the same bound: a grandchild left running
+        # holds the pipe open after the child itself has exited.
+        $done = $done -and $p.WaitForExit((& $left)) -and
+        [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($Child.Out, $Child.Err), (& $left))
+        if (-not $done) { throw "$($Child.Name) did not finish within $TimeoutSeconds s or the check's $BudgetSeconds s budget" }
         $p.WaitForExit()
         return [pscustomobject]@{ Code = $p.ExitCode; Out = $Child.Out.Result; Err = $Child.Err.Result }
+    }
+    catch {
+        # Whatever stopped the wait, a timeout or a failed write, the child does not outlive it.
+        try { if (-not $p.HasExited) { $p.Kill($true) } } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
+        throw
     }
     finally { $p.Dispose() }
 }
@@ -364,15 +382,19 @@ function Get-PrimaryHolding([string]$Canon, $Lists) {
 }
 
 try {
-    # Started first and read at check g: the read is a child pwsh and a network call, and nothing
-    # before g depends on it.
-    $killSwitch = $null
-    $killSwitchFault = ''
+    # This machine's OFF file silences the check: read first, so a silenced run costs one git call.
+    # A read that fails is a failure, never silence, so the owner still sees a verdict.
     try {
-        $kill = Join-Path (Split-Path -Parent $PSScriptRoot) 'coord/afk-kill.ps1'
-        $killSwitch = Start-Child -Exe ([Environment]::ProcessPath) -ArgList @('-NoProfile', '-NonInteractive', '-File', $kill, '-Status')
+        if (-not $FleetRepos) { throw 'no engine repository named' }
+        $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
+        if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
+        if (Test-Path -LiteralPath (Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF')) {
+            Write-Output 'OFF'
+            Write-Output '  this machine has turned the check off with its local OFF file'
+            exit 2
+        }
     }
-    catch { $killSwitchFault = $_.Exception.Message }
+    catch { Add-Failure 'off' "the local OFF file could not be checked: $($_.Exception.Message)" }
 
     $target = $null
     $rawFull = $null
@@ -383,14 +405,11 @@ try {
     # a. Canonical target.
     try {
         if ([string]::IsNullOrWhiteSpace($Path)) { throw 'no -Path given' }
-        $raw = $Path
-        if (-not [System.IO.Path]::IsPathRooted($raw)) {
-            if ([string]::IsNullOrWhiteSpace($SessionCwd)) { throw 'a relative -Path with no -SessionCwd' }
-            $raw = Join-Path $SessionCwd $raw
-        }
-        $target = Resolve-Canonical $raw
+        # Never joined to a directory: which one the harness resolves a relative path against is
+        # not something this check can see, so Resolve-Canonical refuses any path not fully qualified.
+        $target = Resolve-Canonical $Path
         # Kept for c: the harness keeps the path it was given, not the target judged here.
-        $rawFull = [System.IO.Path]::GetFullPath($raw).TrimEnd('\', '/')
+        $rawFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
         [void]$passed.Add('a')
     }
     catch { Add-Failure 'a' "the path $Path does not canonicalise: $($_.Exception.Message)" }
@@ -571,30 +590,9 @@ try {
         }
         catch { Add-Failure 'f' "branch provenance could not be checked: $($_.Exception.Message)" }
     }
-    # g. The AFK kill switch reads OFF.
-    try {
-        if ($null -eq $killSwitch) { throw "it did not start ($killSwitchFault)" }
-        $k = Wait-Child $killSwitch -TimeoutSeconds $KillSwitchTimeoutSeconds
-        $word = $k.Out.Trim()
-        if ($k.Code -eq 0 -and $word -ceq 'OFF') { [void]$passed.Add('g') }
-        else { Add-Failure 'g' "the AFK kill switch does not read OFF (it printed '$word', exit $($k.Code)); only the owner sets it" }
-    }
-    catch { Add-Failure 'g' "the AFK kill switch could not be read: $($_.Exception.Message)" }
-
-    # h. No local disable file.
-    try {
-        if (-not $FleetRepos) { throw 'no engine repository named' }
-        $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
-        if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
-        $off = Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF'
-        # The reason reaches the session, so it does not say which file to delete.
-        if (Test-Path -LiteralPath $off) { Add-Failure 'h' 'this machine has turned the check off with its local OFF file' }
-        else { [void]$passed.Add('h') }
-    }
-    catch { Add-Failure 'h' "the local disable file could not be checked: $($_.Exception.Message)" }
 
     # The only statement that sets the verdict: every check passed, by name, and none failed.
-    $safe = ($failures.Count -eq 0) -and ((@($passed) | Sort-Object) -join '') -ceq 'abcdefgh'
+    $safe = ($failures.Count -eq 0) -and ((@($passed) | Sort-Object) -join '') -ceq 'abcdef'
 }
 catch {
     Add-Failure '-' "the check stopped on an error: $($_.Exception.Message)"
@@ -602,7 +600,7 @@ catch {
 
 if ($safe) {
     Write-Output 'SAFE'
-    Write-Output (Get-SafeForMessage "  all eight checks passed for $target")
+    Write-Output (Get-SafeForMessage "  all six checks passed for $target")
     exit 0
 }
 Write-Output 'UNSAFE'
