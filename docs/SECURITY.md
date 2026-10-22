@@ -2011,7 +2011,8 @@ the same permission set on the same method reds CI until it is listed here.
 > contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
 > or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row
 > a cancel cuts off is logged at ERROR too, but the cancelled read does not answer. The catch set
-> is `CipherError` plus `store_call_errors()`, and any other fault still escapes as a 500. So a
+> is `audit_write_errors()` in `messagefoundry/store/base.py`, the one the auth service's audit
+> writes share, and any other fault still escapes as a 500. So a
 > missing row does not prove nothing was withheld. The row is not coalesced. With the default
 > `audit_all_authorization_decisions`, every JSON request already writes a grant row, so this
 > adds at most one row per request. With that switch off, this row is the only one such a read

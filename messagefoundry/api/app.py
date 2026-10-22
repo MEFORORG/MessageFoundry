@@ -456,7 +456,12 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
-from messagefoundry.store.base import ResendError, Store, build_store_cipher, store_call_errors
+from messagefoundry.store.base import (
+    ResendError,
+    Store,
+    audit_write_errors,
+    build_store_cipher,
+)
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
@@ -470,7 +475,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import CipherError, audit_body_digests
+from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
@@ -3481,8 +3486,8 @@ async def _audit_alert_rules_withheld(
     Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
     refusal, and a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` too, is
     logged at ERROR with its traceback, and the narrowed answer still returns. A fault outside the
-    catch set below still escapes. The catch set is the same as
-    ``_audit_write_errors`` in ``auth/service.py``. A cancel that lands during the write waits a
+    catch set, :func:`~messagefoundry.store.base.audit_write_errors`, still escapes as a 500. The
+    auth service's own audit writes catch the same set. A cancel that lands during the write waits a
     bounded time for the row, and a row that still does not land is logged at ERROR with its counts
     (:func:`_write_through_cancel`). Why the row is not coalesced is in docs/SECURITY.md.
 
@@ -3524,7 +3529,7 @@ async def _audit_alert_rules_withheld(
         # (), as write_audit_soft's docstring asks where a raise would replace the answer the
         # caller owes. A 500 here would also tell a scoped caller that hidden rules exist.
         defects=(),
-        errors=(CipherError, *store_call_errors()),
+        errors=audit_write_errors(),
     )
 
 

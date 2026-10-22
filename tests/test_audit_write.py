@@ -11,9 +11,10 @@ import ast
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable
+import sys
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -26,6 +27,7 @@ from messagefoundry.api import tls as tls_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.config.fingerprint import ConfigDirMissing
+from messagefoundry.store.base import audit_write_errors, store_call_errors
 from tests._ast_sites import call_sites, parse_source
 
 _LOG = logging.getLogger("tests.audit_write")
@@ -265,3 +267,61 @@ def test_the_soft_write_messages_survive_the_console_and_redaction() -> None:
     for message in messages:
         assert message.encode("cp1252", "replace").decode("cp1252") == message, message
         assert redaction.redact(message) == message, message
+
+
+class _PyodbcError(Exception):
+    """A stand-in for pyodbc's ``Error`` root, for a venv without pyodbc."""
+
+
+class _PyodbcDatabaseError(_PyodbcError):
+    pass
+
+
+class _PyodbcInterfaceError(_PyodbcError):
+    """Beside ``DatabaseError``, not under it, as in pyodbc: a failed login (28000)."""
+
+
+@pytest.fixture
+def fake_pyodbc(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
+    """A stand-in ``pyodbc`` module with pyodbc's error tree, imported the way the store's guarded
+    imports read it. The cached catch sets are cleared on the way in and out, so each is rebuilt
+    once against the stand-in and once without it."""
+    module = ModuleType("pyodbc")
+    module.Error = _PyodbcError  # type: ignore[attr-defined]
+    module.DatabaseError = _PyodbcDatabaseError  # type: ignore[attr-defined]
+    module.InterfaceError = _PyodbcInterfaceError  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyodbc", module)
+    audit_write_errors.cache_clear()
+    store_call_errors.cache_clear()
+    yield module
+    audit_write_errors.cache_clear()
+    store_call_errors.cache_clear()
+
+
+def test_the_audit_write_catch_set_takes_the_driver_roots(fake_pyodbc: ModuleType) -> None:
+    """BACKLOG #3403: the shared catch set reaches the driver roots ``store_call_errors`` stops
+    beneath. ``sqlite3.InterfaceError`` is not a ``DatabaseError``, and pyodbc raises its ``Error``
+    root for a deadlock victim and its ``InterfaceError`` for a failed re-login. CONTROL: the
+    narrower set really misses them, so the widening is what catches them."""
+    caught = audit_write_errors()
+    narrow = store_call_errors()
+    for exc in (sqlite3.InterfaceError(), _PyodbcError("40001"), _PyodbcInterfaceError("28000")):
+        assert isinstance(exc, caught), exc
+        assert not isinstance(exc, narrow), exc
+    assert not isinstance(TypeError(), caught)
+
+
+def test_every_audit_write_defect_is_inside_the_catch_set() -> None:
+    """A defect a caller re-raises must be one the catch set would otherwise take, or passing
+    ``defects=AUDIT_WRITE_DEFECTS`` would change nothing and a defect class could drop out of view
+    unnoticed. ``write_audit_soft`` tries ``defects`` first, so these still raise."""
+    for defect in AUDIT_WRITE_DEFECTS:
+        assert issubclass(defect, audit_write_errors()), defect
+
+
+def test_the_auth_service_and_the_alert_rules_row_share_one_catch_set() -> None:
+    """BACKLOG #3403: no private copy of the audit-write catch set survives beside the shared one."""
+    for name in ("auth/service.py", "api/app.py"):
+        text = (_ENGINE / name).read_text(encoding="utf-8")
+        assert "def _audit_write_errors" not in text, name
+        assert "audit_write_errors()" in text, name
