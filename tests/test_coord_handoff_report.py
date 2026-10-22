@@ -39,7 +39,14 @@ from tests._no_prompt import run_holding_stdin_open
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
-LIB = ("handoff.ps1", "box-activity.ps1", "session-registry.ps1", "occupancy.ps1", "mail-key.ps1")
+LIB = (
+    "handoff.ps1",
+    "box-activity.ps1",
+    "session-registry.ps1",
+    "occupancy.ps1",
+    "mail-key.ps1",
+    "coord-root.ps1",
+)
 TIMEOUT = 120
 
 pytestmark = pytest.mark.skipif(

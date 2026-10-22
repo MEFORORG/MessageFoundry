@@ -416,6 +416,10 @@ try {
     #
     # NOTE: the DIRECTORY name 'mefor-coord' has nothing to do with the installer's hook MARKER string.
     # Test-IsOurs only ever scans hook command text.
+    # announce/ is a LOCAL kind (per-session receipts for a per-PC lane), so it keeps its path. The
+    # claim notes read below are a SHARED kind; whether -StateDir was injected decides where they come
+    # from, so it is recorded before the default fills it in.
+    $stateDirInjected = [bool]$StateDir
     if (-not $StateDir) { $StateDir = Join-Path $cd 'mefor-coord/announce' }
     $script:StateDir = $StateDir
 
@@ -872,7 +876,20 @@ try {
 
         # HOISTED ABOVE SECTION 16b, which needs both to build a mail body. They were computed inside
         # section 18 (the stdout build), which section 16b can exit before reaching.
-        $claims = Get-ClaimNotes (Join-Path (Split-Path $StateDir -Parent) 'claims')
+        # claims/ is a SHARED kind (docs/COORD-SHARED-ROOT.md), so it comes from coord-root.ps1 and not
+        # from beside the LOCAL announce/ directory. An injected -StateDir is a test fixture whose
+        # claims sit beside it, as they always did. A root that does not answer costs the notes only:
+        # one line on stderr, and the roster still renders, because this hook must never block a prompt.
+        $claimsDir = ''
+        if ($stateDirInjected) { $claimsDir = Join-Path (Split-Path $StateDir -Parent) 'claims' }
+        else {
+            . (Join-Path $PSScriptRoot '..\coord\coord-root.ps1')
+            $claimsFrom = if ($top) { $top } else { (Get-Location).Path }
+            $cr = Resolve-CoordDir -From $claimsFrom -Kind 'claims'
+            if ($cr.Error) { try { [Console]::Error.WriteLine("[announce] claim notes skipped: $($cr.Error)") } catch { } }
+            else { $claimsDir = $cr.Path }
+        }
+        $claims = if ($claimsDir) { Get-ClaimNotes $claimsDir } else { @{} }
         $branch = (& git branch --show-current 2>$null)
         if ($branch) { $branch = $branch.Trim() }
 

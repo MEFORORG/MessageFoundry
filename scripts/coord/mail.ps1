@@ -25,7 +25,11 @@
     not an error), so there is nothing to build on there.
 
     WHERE IT LIVES, AND WHY THAT SATISFIES THE PUBLIC-REPO RULE BY LOCATION.
-    <git-common-dir>/mefor-coord/mail/ -- inside .git, shared by every worktree of this repo. Nothing
+    <shared root>/mail/, where the shared root is coord-root.ps1's answer. With nothing configured that
+    is <git-common-dir>/mefor-coord/mail/ -- inside .git, shared by every worktree of this repo. With
+    MEFOR_COORD_ROOT or root.toml set it is a share both PCs read (docs/COORD-SHARED-ROOT.md), and a
+    root that does not answer REFUSES every verb here rather than falling back to a local queue the
+    other PC never drains. Under .git, nothing
     under .git can be placed in a commit by any git command, and mefor-coord is not a ref namespace, so
     `push --mirror` cannot carry it either. Worktree paths and branch names are therefore written in
     PLAIN TEXT here, deliberately: the leak constraint is already satisfied by location, and hashing
@@ -40,6 +44,12 @@
         addressed to an id can be stranded by a keystroke. Session id is kept as an optional FILTER on a
         message, not as the box key.
       - the worktree is what the work is attached to, and it is what a sender actually knows.
+    A SEAT ID IS ALSO ACCEPTED, because a worktree path is per-PC. Measured 2026-10-21: a Manager on
+    the second PC published its worktree path (on D:) and its seat id, and neither resolved here. The
+    seat id is the seat record's directory name, and seat.ps1 names that directory with the SAME
+    ConvertTo-BoxKey of the SAME worktree root the drain keys a box on, so it IS the mailbox key. It
+    is accepted only when the shared seat registry holds a record under that name, which is this
+    form's equivalent of the existing-directory gate on a path.
     A cwd is matched case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
     an extension of the primary checkout's path, so a prefix match resolves any peer to some arbitrary
     worktree. VS Code also records a lowercase drive letter where the Desktop app records an uppercase
@@ -101,7 +111,8 @@ param(
     # a caller whose stdin stays open and silent (the Bash tool) waits forever. Measured 2026-10-13/14:
     # four sends hung. The one box checked got nothing. The refusal is right after this param block.
     [Parameter(ParameterSetName = 'Send')][switch]$Send,
-    # Recipient worktree. A path (matched case-insensitively and exactly), or "all" to broadcast to
+    # Recipient worktree. A path (matched case-insensitively and exactly), a seat id from the shared
+    # seat registry (e.g. autonomy-plan-62022e2c, for a seat on another PC), or "all" to broadcast to
     # every live peer in this repo. Defaults to nothing: refusing to guess is the point.
     [Parameter(ParameterSetName = 'Send')][string]$To,
     [Parameter(ParameterSetName = 'Send')][string]$Body,
@@ -149,6 +160,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
 
 # --- Location ------------------------------------------------------------------------------------
 
+# Where the queue lives. One definition, shared by every coordination script; see its header.
+. "$PSScriptRoot\coord-root.ps1"
+
 function Get-MailRoot {
     param([string]$Override)
     if ($Override) { return $Override }
@@ -156,7 +170,47 @@ function Get-MailRoot {
     if ($LASTEXITCODE -ne 0 -or -not $c) {
         throw "Not inside a git worktree: refusing to guess where the mail queue lives."
     }
-    return (Join-Path $c.Trim() "mefor-coord/mail")
+    # mail/ is a SHARED kind. On Error this refuses and never falls back to the local root: a send
+    # queued there would sit in a box the other PC's drain never reads, under a "Queued" line.
+    $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'mail'
+    if ($r.Error) {
+        throw "REFUSED: the shared mail root did not resolve, so nothing was read or sent: $($r.Error)"
+    }
+    return $r.Path
+}
+
+function Get-SeatsDirForMail {
+    # The seat registry a seat-id recipient is looked up in. Under -MailRoot (the test fixture) it is
+    # the sibling seats/ directory, which is where the resolver puts it beside a real mail root.
+    param([string]$MailRootUsed, [string]$Override)
+    if ($Override) { return (Join-Path (Split-Path -Parent $MailRootUsed) 'seats') }
+    $r = Resolve-CoordDir -From (Get-Location).Path -Kind 'seats'
+    if ($r.Error) {
+        throw "REFUSED: the shared seat registry did not resolve, so a seat id cannot be looked up: $($r.Error)"
+    }
+    return $r.Path
+}
+
+function Resolve-SeatRecipient {
+    # A seat id -> the mailbox it names, or $null when the registry holds no such seat. Returns the
+    # newest readable record's worktree and host for the message's `to` block, as recorded facts.
+    #
+    # The id shape is ConvertTo-BoxKey's output: a lowercase slug, a dash, eight hex. Anything else
+    # cannot be a box key, so it is never looked up -- a bare worktree NAME must keep failing loudly.
+    param([string]$Id, [string]$SeatsDir)
+    if ($Id -cnotmatch '\A[a-z0-9._-]+-[0-9a-f]{8}\z' -or $Id.StartsWith('.')) { return $null }
+    $dir = Join-Path $SeatsDir $Id
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $best = $null
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -EA SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending)) {
+        try { $best = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop; break } catch { }
+    }
+    # A directory with no readable record is not evidence a seat exists; refuse rather than mint.
+    if ($null -eq $best) { return $null }
+    $wt = if ($best.PSObject.Properties.Name -contains 'worktree') { [string]$best.worktree } else { '' }
+    $h = if ($best.PSObject.Properties.Name -contains 'host') { [string]$best.host } else { '' }
+    return [pscustomobject]@{ Key = $Id; Worktree = $wt; Host = $h }
 }
 
 # The worktree -> box key function. ONE definition, shared with the drain hook: if the two ends
@@ -363,9 +417,12 @@ if ($Send) {
             "neither of them models, so clearing both is not a guarantee of an intact render. " +
             "(A courtesy like the byte check above, NOT a control: mail-drain.ps1 holds the cap that binds.)")
     }
-    if (-not $To) { throw "-To is required (a worktree path). Refusing to guess a recipient." }
+    if (-not $To) { throw "-To is required (a worktree path or a seat id). Refusing to guess a recipient." }
 
     $targets = @()
+    # Seat-id recipients, kept apart from $targets because they are gated by the registry, not by
+    # the existing-directory test below: a seat on another PC has no directory here by construction.
+    $seatTargets = @()
     if ($To -ieq 'all') {
         # Broadcast: every live peer in this repo EXCEPT this one. Uses the shared roster so there is
         # exactly one notion of "who is here" -- see scripts/coord/presence.ps1.
@@ -427,11 +484,19 @@ if ($Send) {
             exit 0
         }
     }
-    else {
-        if (-not (Test-Path -LiteralPath $To -PathType Container)) {
-            throw "Recipient worktree does not exist: $To"
-        }
+    elseif (Test-Path -LiteralPath $To -PathType Container) {
         $targets = @((Resolve-Path -LiteralPath $To).Path)
+    }
+    else {
+        # Not a directory here. It may be a seat id for a seat on another PC; see ADDRESSING.
+        $seat = $null
+        if (-not [System.IO.Path]::IsPathRooted($To)) {
+            $seat = Resolve-SeatRecipient -Id $To -SeatsDir (Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot)
+        }
+        if (-not $seat) {
+            throw "Recipient worktree does not exist, and '$To' is not a seat id in the shared seat registry: $To"
+        }
+        $seatTargets = @($seat)
     }
 
     # NO TARGET BECOMES A BOX KEY UNTIL IT IS AN ABSOLUTE, EXISTING DIRECTORY.
@@ -496,16 +561,24 @@ if ($Send) {
     # move that did not happen is reported instead of assumed -- a broadcast that aborted on target 1
     # would hide targets 2..N, and one that swallowed the failure would put the defect back at the
     # reporting layer. Every target gets its own row and its own status.
+    # One row per recipient. A path is keyed through ConvertTo-BoxKey; a seat id already IS the key.
+    $rows = @()
+    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path $t); Cwd = $t } }
+    foreach ($s in $seatTargets) {
+        $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
+        $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
+        $rows += [pscustomobject]@{ To = $label; Key = $s.Key; Cwd = $cwd }
+    }
+
     $written = @()
-    foreach ($t in $targets) {
-        $key = ConvertTo-BoxKey -Path $t
-        $msg = New-Message -Body $Body -ToCwd $t -ToSessionId $ToSessionId -Kind $Kind -TtlMinutes $TtlMinutes
+    foreach ($r in $rows) {
+        $msg = New-Message -Body $Body -ToCwd $r.Cwd -ToSessionId $ToSessionId -Kind $Kind -TtlMinutes $TtlMinutes
         try {
-            $p = Write-Message -Root $root -Key $key -Message $msg
-            $written += [pscustomobject]@{ To = $t; Key = $key; Id = $msg.id; File = $p; Status = 'queued'; Error = '' }
+            $p = Write-Message -Root $root -Key $r.Key -Message $msg
+            $written += [pscustomobject]@{ To = $r.To; Key = $r.Key; Id = $msg.id; File = $p; Status = 'queued'; Error = '' }
         }
         catch {
-            $written += [pscustomobject]@{ To = $t; Key = $key; Id = $msg.id; File = ''; Status = 'failed'; Error = $_.ToString() }
+            $written += [pscustomobject]@{ To = $r.To; Key = $r.Key; Id = $msg.id; File = ''; Status = 'failed'; Error = $_.ToString() }
         }
     }
 

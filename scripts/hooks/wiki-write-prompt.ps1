@@ -29,7 +29,10 @@
     history from before the hook saw it, and is skipped rather than counted.
 
     STATE AND LOG live under <coord>/wiki-prompt/, where <coord> is <git common dir>/mefor-coord. The
-    wiki scripts own <coord>/wiki/, so nothing here writes under it. Each prompt that FIRES appends
+    wiki scripts own wiki/ under the SHARED root, which coord-root.ps1 names and which is <coord> when
+    nothing is configured; nothing here writes under it. So the printed commands pass the SHARED root
+    as -StateRoot, because the wiki inbox is a shared kind (docs/COORD-SHARED-ROOT.md), while this
+    hook's own wiki-prompt/ state stays local. Each prompt that FIRES appends
     one JSON line to log-<yyyy-MM>.jsonl, so prompts can be compared with writes and with the wiki's
     own query log.
 
@@ -238,7 +241,7 @@ function Test-QueryTakesSeat([string]$Korus) {
     catch { return $false }
 }
 
-function Get-Reason([string]$Coord, [string]$Seat) {
+function Get-Reason([string]$Coord, [string]$Seat, [string]$StateRoot) {
     $resolved = Resolve-Korus $Coord
     $korus = '<korus checkout>'
     # Unknown seat: leave -Seat off, and write.ps1 resolves it or says how to declare one.
@@ -259,7 +262,9 @@ function Get-Reason([string]$Coord, [string]$Seat) {
     if ($env:MEFOR_KORUS_CHECKOUT -and (-not $resolved -or $resolved.source -ne 'MEFOR_KORUS_CHECKOUT')) {
         $korusLine += ' MEFOR_KORUS_CHECKOUT is set but names no checkout with scripts/wiki/write.ps1, so it was ignored.'
     }
-    $coordArg = $Coord.Replace('\', '/')
+    # The korus checkout is found from the LOCAL root, which sits inside the primary checkout; the
+    # wiki inbox is the SHARED root. They are the same directory until a shared root is configured.
+    $coordArg = $(if ($StateRoot) { $StateRoot } else { $Coord }).Replace('\', '/')
     $lines = @(
         '[fleet wiki] Write prompt. A lesson nobody writes down is lost when this session ends.'
         'Record AT MOST ONE event, and only a lesson, gotcha, decision or correction that will still be true next month.'
@@ -386,7 +391,25 @@ try {
         # Everything the prompt needs is built BEFORE the state records it. A failure here then
         # costs neither the cooldown nor a false line in the log.
         $seat = Get-Seat $cwd
-        $out = [ordered]@{ decision = 'block'; reason = (Get-Reason -Coord $coord -Seat $seat) } |
+        # Named, not probed: this only prints a command, and a probe of a dead share would cost every
+        # firing Stop a timeout for nothing. A root that cannot even be NAMED gets a placeholder and a
+        # line saying so, never the local path: a note written there is one the other PC never reads.
+        # The prompt still goes out, because a memory prompt must not depend on the share.
+        $stateRoot = $coord
+        $rootNote = ''
+        $coordRootLib = Join-Path $PSScriptRoot '..\coord\coord-root.ps1'
+        if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
+            . $coordRootLib
+            $sr = Get-CoordSharedRoot -From $cwd
+            if ($sr.Error) {
+                $stateRoot = '<shared coordination root>'
+                $rootNote = "The shared coordination root did not resolve ($($sr.Error)), so -StateRoot above is a placeholder. Fix root.toml or MEFOR_COORD_ROOT first."
+            }
+            else { $stateRoot = $sr.Path }
+        }
+        $reason = Get-Reason -Coord $coord -Seat $seat -StateRoot $stateRoot
+        if ($rootNote) { $reason += "`n$rootNote" }
+        $out = [ordered]@{ decision = 'block'; reason = $reason } |
             ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii
         $logLine = [ordered]@{
             utc        = $now.ToString('o')

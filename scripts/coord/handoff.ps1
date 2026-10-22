@@ -46,6 +46,13 @@
     refusal that names its reason, 2 is a failure while writing, and 3 is the refusal in a Claude
     Code cloud session.
 
+    WHERE "THE HANDOFFS DIRECTORY" IS. handoffs/ and seats/ are SHARED kinds, so both come from
+    coord-root.ps1 and sit on the shared root, with _retired-<date>/ beside them so a retirement is a
+    move within one volume that the other PC can still see. With nothing configured that root is
+    <git-common-dir>/mefor-coord, as before. A shared root that does not answer makes every verb exit
+    2 naming the cause, and nothing falls back to a local copy: a handoff written there is invisible
+    to the PC a seat may be resumed on (docs/COORD-SHARED-ROOT.md).
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\handoff.ps1 -Report
 
@@ -106,22 +113,32 @@ if ($missing) {
 
 . "$PSScriptRoot\mail-key.ps1"
 . "$PSScriptRoot\box-activity.ps1"
+. "$PSScriptRoot\coord-root.ps1"
 
 # ------------------------------------------------------------------------------------------------
 # Location.
 # ------------------------------------------------------------------------------------------------
 
-function Resolve-CoordDir {
+# NOT named Resolve-CoordDir: coord-root.ps1 defines that, and a second function of the same name
+# here would silently replace it for everything below.
+function Get-HandoffCoordRoot {
     param([string]$Override)
     if ($Override) { return $Override }
     $common = & git @( if ($RepoHint) { @('-C', $RepoHint) } else { @() } ) rev-parse --path-format=absolute --git-common-dir 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $common) {
         throw "Not inside a git worktree: refusing to guess where the coordination state lives."
     }
-    return (Join-Path $common.Trim() 'mefor-coord')
+    # The parent of the shared handoffs/ directory is the shared root itself, which also holds seats/.
+    $from = if ($RepoHint) { $RepoHint } else { (Get-Location).Path }
+    $r = Resolve-CoordDir -From $from -Kind 'handoffs'
+    if ($r.Error) {
+        Write-Output "FAILED: the shared coordination root did not resolve, so nothing was read, moved or written: $($r.Error)"
+        exit 2
+    }
+    return (Split-Path -Parent $r.Path)
 }
 
-$coord = Resolve-CoordDir -Override $CoordDir
+$coord = Get-HandoffCoordRoot -Override $CoordDir
 $handoffs = Join-Path $coord 'handoffs'
 $seatsDir = Join-Path $coord 'seats'
 

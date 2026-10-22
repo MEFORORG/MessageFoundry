@@ -137,13 +137,15 @@ if ($hookCwd -and (Test-Path -LiteralPath $hookCwd -PathType Container)) {
 # difference between a fix and a hunt, and fleet.ps1's Get-AgeHours records the same measurement.
 $rootsLib = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\config-roots.ps1'
 if (Test-Path -LiteralPath $rootsLib) { . $rootsLib }
+# Same contract: definitions only. seats/ and alloc/ are SHARED kinds and come from it.
+$coordRootLib = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\coord-root.ps1'
+if (Test-Path -LiteralPath $coordRootLib) { . $coordRootLib }
 
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
     $common = $common.Trim()
     $coord = Join-Path $common 'mefor-coord'
-    if (-not (Test-Path -LiteralPath $coord)) { exit 0 }
 
     $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
     if (-not $top) { exit 0 }
@@ -151,6 +153,24 @@ try {
     $topNorm = ($top -replace '/', '\').TrimEnd('\')
 
     $lines = @()
+
+    # seats/ and alloc/ live on the SHARED root (docs/COORD-SHARED-ROOT.md). One probe answers both,
+    # since the resolver puts every shared kind on one root. A root that does not answer drops only
+    # those two blocks, with a line saying so; the branch and dirty-tree lines below still print,
+    # because a reprime that vanished whole would read as "nothing to restore".
+    $sharedRoot = $coord
+    $sharedError = ''
+    if (Get-Command Resolve-CoordDir -ErrorAction SilentlyContinue) {
+        $sr = Resolve-CoordDir -From $top -Kind 'seats'
+        if ($sr.Error) { $sharedError = [string]$sr.Error; $sharedRoot = $null }
+        else { $sharedRoot = Split-Path -Parent $sr.Path }
+    }
+    $thisHost = [Environment]::MachineName
+    # Nothing to restore when neither root holds any state. Checked AFTER the shared root is known,
+    # because on a shared root the local one may never have been created. A root that did not answer
+    # is not "nothing": that case goes on to say so below.
+    if (-not $sharedError -and -not (Test-Path -LiteralPath $coord) -and
+        -not ($sharedRoot -and (Test-Path -LiteralPath $sharedRoot))) { exit 0 }
 
     # Read the branch BEFORE the declaration block: it is the discriminator that decides whether a
     # record found by path actually belongs to this session, not just a fact reported at the end.
@@ -161,10 +181,11 @@ try {
     # Newest record for THIS worktree that actually carries a goal. Records are per-episode, so a
     # box can hold many and only some are declared; taking the newest DECLARED one is what restores
     # intent rather than the most recent heartbeat.
-    $seatsDir = Join-Path $coord 'seats'
+    $seatsDir = if ($sharedRoot) { Join-Path $sharedRoot 'seats' } else { $null }
+    # codex-seats/ is not a shared kind; it stays on the local root.
     if ($env:KORUS_AGENT -eq 'codex') { $seatsDir = Join-Path $coord 'codex-seats' }
     $declared = $null
-    if (Test-Path -LiteralPath $seatsDir) {
+    if ($seatsDir -and (Test-Path -LiteralPath $seatsDir)) {
         $cands = Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter '*.json' -File -EA SilentlyContinue |
                  Sort-Object LastWriteTimeUtc -Descending
         foreach ($f in $cands) {
@@ -172,6 +193,9 @@ try {
             $wt = [string]$j.worktree
             if (-not $wt) { continue }
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
+            # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
+            # one's. A record with no host predates the field and is this PC's.
+            if ($j.PSObject.Properties['host'] -and $j.host -and ([string]$j.host -ine $thisHost)) { continue }
             # A Codex restart may not inherit the goal of a Claude session in this tree.
             if ($env:KORUS_AGENT -eq 'codex') {
                 if (-not $env:KORUS_SESSION_ID) { continue }
@@ -228,6 +252,8 @@ try {
             if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $($declared.outOfScope)" }
             if ($declaredDisplay) { $lines += "declared at $declaredDisplay$age" }
         }
+    } elseif ($sharedError -and -not $seatsDir) {
+        $lines += "SEAT: not restored. The shared seat registry did not answer ($sharedError)."
     } else {
         $lines += "SEAT: not declared. Nothing on disk carries a goal for this worktree, so this is the"
         $lines += "'never asked or never answered' case, NOT a goal lost to compaction. Declare one:"
@@ -237,9 +263,10 @@ try {
     # ---- ledger numbers this worktree holds ------------------------------------------------
     # This is the fact with a permanent cost attached. An allocated-but-unfiled number burns if the
     # worktree is removed, and after a compaction nobody in the session remembers holding one.
-    $allocDir = Join-Path $coord 'alloc'
+    $allocDir = if ($sharedRoot) { Join-Path $sharedRoot 'alloc' } else { $null }
     $held = @()
-    if (Test-Path -LiteralPath $allocDir) {
+    if ($sharedError) { $lines += ''; $lines += "LEDGER NUMBERS: not checked, the shared root did not answer." }
+    if ($allocDir -and (Test-Path -LiteralPath $allocDir)) {
         foreach ($f in (Get-ChildItem -LiteralPath $allocDir -Recurse -Filter '*.json' -File -EA SilentlyContinue)) {
             try { $a = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
             $aw = [string]$a.worktree
