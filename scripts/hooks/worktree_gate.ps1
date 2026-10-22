@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.3"
+$GateVersion = "2026.10.21.4"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -131,7 +131,10 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
             permissionDecisionReason = (Protect-CommandLines $Reason)
         }
     }
-    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    # ASCII, EVERY NON-ASCII CHARACTER AS \uXXXX. [Console]::Out encodes with the console's output
+    # page and Claude Code reads UTF-8: under cp932 a reason quoting U+30BD carried the bytes 83 5C, a
+    # stray `\` in a JSON string, so the deny no longer parsed and decided nothing.
+    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6 -EscapeHandling EscapeNonAscii))
     exit 0
 }
 

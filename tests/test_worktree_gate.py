@@ -1000,11 +1000,9 @@ def console_reader_gate(tmp_path: Path) -> Path:
     )
 
 
-def _run_gate_in_console(
-    gate: Path, raw: bytes, repos_file: Path, codepage: int
-) -> dict[str, Any] | None:
-    """Run ``gate`` on raw stdin bytes in a console of its own set to ``codepage``. Returns the deny
-    object, or None for allow, as ``run_gate`` does.
+def _gate_stdout_in_console(gate: Path, raw: bytes, repos_file: Path, codepage: int) -> bytes:
+    """Run ``gate`` on raw stdin bytes in a console of its own set to ``codepage``. Returns the
+    gate's stdout bytes, empty for allow.
 
     The console is private (CREATE_NO_WINDOW), because chcp sets the page of a whole console and
     pytest's is shared with its xdist siblings; tests/test_coord_alloc_floor.py has the incident. A
@@ -1057,13 +1055,23 @@ def _run_gate_in_console(
                 else f"putting it back FAILED, {ctypes.get_last_error()}"
             )
         )
-    out = stdout.decode(f"cp{codepage}", errors="replace")
-    page, _, decision = out.partition("\n")
+    page, _, decision = stdout.partition(b"\n")
     # A word match, not a suffix: a localized chcp may end its line with a period.
-    if not re.search(rf"\b{codepage}\b", page):
-        pytest.skip(f"this host's console did not take cp{codepage}: {out!r}")
-    assert proc.returncode == 0, out + stderr.decode(f"cp{codepage}", errors="replace")
-    return json.loads(decision) if decision.strip() else None
+    if not re.search(rf"\b{codepage}\b".encode(), page):
+        pytest.skip(f"this host's console did not take cp{codepage}: {stdout!r}")
+    assert proc.returncode == 0, stdout + stderr
+    return decision.strip()
+
+
+def _run_gate_in_console(
+    gate: Path, raw: bytes, repos_file: Path, codepage: int
+) -> dict[str, Any] | None:
+    """``_gate_stdout_in_console``, read as Claude Code reads it: UTF-8. The decision must be ASCII,
+    so no output page can change it. Returns the deny object, or None for allow, as ``run_gate``
+    does."""
+    decision = _gate_stdout_in_console(gate, raw, repos_file, codepage)
+    assert decision.isascii(), f"the decision is not ASCII under cp{codepage}: {decision!r}"
+    return json.loads(decision.decode("utf-8")) if decision else None
 
 
 def _raw(payload: dict[str, Any]) -> bytes:
@@ -1149,6 +1157,35 @@ def test_a_stdin_read_that_throws_is_denied_not_retried(tmp_path: Path, repos_fi
     other = tmp_path / "Other" / "x.py"
     assert run_gate(edit(other, other.parent), repos_file) is None
     assert "could not parse" in assert_denied(run_gate(edit(other, other.parent), repos_file, gate))
+
+
+KATAKANA_SO = chr(0x30BD)  # cp932 writes it as 83 5C, and the 5C is a backslash
+
+
+@_windows_only
+@_two_launch_budget
+@pytest.mark.parametrize("codepage", [437, 932])
+def test_a_deny_quoting_a_non_ascii_primary_reaches_claude_code_whole(
+    tmp_path: Path, codepage: int
+) -> None:
+    """The deny quotes the primary, and Claude Code reads it as UTF-8. Written in the console's
+    output page, cp932 put a stray backslash in the JSON and the deny did not parse, so it decided
+    nothing; cp437 wrote '?' in place of the name. The control is the gate without the escaping."""
+    allowlist, raw = _governed_non_ascii(tmp_path, KATAKANA_SO)
+    name = f"Repo-{KATAKANA_SO}"
+    assert name in assert_denied(_run_gate_in_console(GATE, raw, allowlist, codepage))
+    control = _rebuilt_gate(
+        tmp_path / "worktree_gate_page_output.ps1",
+        " -EscapeHandling EscapeNonAscii",
+        "",
+        "the deny's escaping moved; fix this control rather than deleting it",
+    )
+    out = _gate_stdout_in_console(control, raw, allowlist, codepage)
+    try:
+        reason = json.loads(out.decode("utf-8"))["hookSpecificOutput"]["permissionDecisionReason"]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reason = ""
+    assert name not in reason, "the unescaped control reached Claude Code whole; no discrimination"
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
