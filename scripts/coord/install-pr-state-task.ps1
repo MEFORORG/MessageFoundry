@@ -21,9 +21,15 @@
     Windows. It runs under pythonw.exe, so no window opens, on battery too, and stops after ten
     minutes. A second start while one runs is ignored, and pr_state.py's own lock covers the rest.
 
-    IT REFUSES TO REGISTER OR UNINSTALL INSIDE CLAUDE CODE. The task runs, unattended every 2
-    minutes, a script from the primary checkout that any session can edit. The owner does both from a
-    plain terminal. -WhatIf, and -Json without -Uninstall, change nothing and are allowed anywhere.
+    WHAT THE TASK TRUSTS. Every 2 minutes, as you and with your gh token, it runs whatever
+    pr_state.py, coord_root.py, _pr_checks.py and required_contexts.py are in the primary checkout.
+    That is the same trust the checkout's .claude/settings.json hooks already get. Nothing here
+    checks those files before they run. pythonw runs with -I, so PYTHON* variables, the user site
+    directory and the working directory add no code of their own.
+
+    The CLAUDECODE check only decides who registers or removes the task: the owner, from a plain
+    terminal. It does not protect what the task runs. -WhatIf, and -Json without -Uninstall, change
+    nothing and are allowed anywhere.
 
     THE HOST CHECK. -ExpectedHost names the machine this must run on. Registering or removing a task
     on the wrong PC is the mistake the check exists for, so both refuse without it. One poller per PC
@@ -67,7 +73,7 @@ if (-not $preview -and -not $ExpectedHost) {
     Stop-Install "pass -ExpectedHost <this machine's name> to register or remove the task. This machine is $([Environment]::MachineName)."
 }
 if (-not $preview -and $env:CLAUDECODE -eq '1') {
-    Stop-Install 'refusing to change the task store inside Claude Code: the task would run, unattended, a script any session can edit. Run this from a plain terminal. (-WhatIf, and -Json without -Uninstall, change nothing and are allowed.)'
+    Stop-Install 'refusing to change the task store inside Claude Code: registering or removing this task is the owner''s act. Run this from a plain terminal. (-WhatIf, and -Json without -Uninstall, change nothing and are allowed.)'
 }
 if (-not $IsWindows) { Stop-Install 'Windows only: this manages a Windows scheduled task.' }
 
@@ -126,7 +132,7 @@ $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:U
 $coordDir = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord'
 $cache = Join-Path $coordDir 'pr-state.json'
 # --coord-dir spares the poller a git process, which would open a console window under pythonw.
-$argument = "`"$poller`" --coord-dir `"$coordDir`""
+$argument = "-I `"$poller`" --coord-dir `"$coordDir`""
 
 $plan = [ordered]@{
     taskName = $TaskName

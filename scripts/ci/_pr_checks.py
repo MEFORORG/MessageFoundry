@@ -3,10 +3,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One reading of a pull request's ``statusCheckRollup``, shared by the checks that need it.
 
-WHY THIS IS STILL ITS OWN MODULE ON ONE CALLER. It was split out when two scripts read the rollup:
+WHY THIS IS ITS OWN MODULE. It was split out when two scripts read the rollup:
 ``check_stalled_prs.py`` asked "is this green and unable to merge", ``check_unread_prs.py`` asked "is
-this green and unread". The second was deleted on 2026-09-13 (BACKLOG #1490), a week after the owner
-ruled its signal off, so the first was the only caller until ``scripts/coord/pr_state.py`` started reading it too. The split is kept because what it owns
+this green and unread". The second was deleted on 2026-09-13 (BACKLOG #1490). Today the callers are
+``check_stalled_prs.py`` and ``scripts/coord/pr_state.py``. What the module owns
 is GitHub's rollup vocabulary, which is GitHub's to change and not ours, and the next reader that
 needs it would otherwise start a second copy free to drift -- silently, in the one direction that
 matters, since a conclusion string nobody classified reads as green. ``tests/_workflow_contexts.py``
@@ -26,12 +26,17 @@ FAILING = frozenset(
     {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
 )
 
-#: The only verdicts that count as passed. Anything else is FAILING or unsettled.
+#: The only verdicts that count as passed. Anything else is FAILING, STALE or unsettled.
 PASSING = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
-#: Statuses that mean a check has not settled yet. ``EXPECTED`` is a StatusContext ``state`` for a
-#: status that has been asked for and has not reported.
-UNSETTLED = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED", "EXPECTED"})
+#: A CheckRun conclusion GitHub gives a run it abandoned after 14 days. counts() reads it as neither
+#: failing nor unsettled, as it always has, so an optional stale run never hides a stalled PR from
+#: check_stalled_prs. A caller asking "is this REQUIRED check green" must treat it as not green.
+STALE = "STALE"
+
+#: StatusContext ``state`` values that mean it has not reported. ``EXPECTED`` is a status that has
+#: been asked for. CheckRuns need no list: in_progress() reads any status but COMPLETED as running.
+UNSETTLED = frozenset({"PENDING", "EXPECTED"})
 
 
 def name_of(node: object) -> str:
@@ -49,8 +54,9 @@ def in_progress(node: object) -> bool:
     """True while a node may still be running.
 
     A CheckRun (it carries ``status``) runs until its status is COMPLETED: an allowlist, so a status
-    nobody listed reads as running, as clear_stale_ci_red.newest_by_name reads it. A StatusContext
-    runs while its ``state`` is PENDING or EXPECTED.
+    nobody listed (QUEUED, IN_PROGRESS, WAITING, REQUESTED, PENDING, a new one) reads as running, as
+    clear_stale_ci_red.newest_by_name reads it. A StatusContext runs while its ``state`` is in
+    UNSETTLED.
     """
     if not isinstance(node, dict):
         return False
@@ -79,8 +85,7 @@ def counts(rollup: object) -> tuple[int, int]:
             unsettled += 1
         elif verdict in FAILING:
             failing += 1
-        elif verdict not in PASSING:
-            # An allowlist, not a denylist: a verdict nobody listed (STALE today, a new one tomorrow)
-            # is unsettled, never green.
+        elif verdict not in PASSING and verdict != STALE:
+            # An allowlist, not a denylist: a verdict nobody listed is unsettled, never green.
             unsettled += 1
     return (failing, unsettled)

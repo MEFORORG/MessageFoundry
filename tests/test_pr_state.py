@@ -8,6 +8,7 @@ These drive the REAL ``main()`` against canned gh replies, with no network. The 
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -22,8 +23,6 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-
-from tests._dead_pid import never_live_pid
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "coord" / "pr_state.py"
@@ -334,18 +333,23 @@ def test_pr_on_another_base_is_not_judged_by_mains_list(tmp_path: Path) -> None:
     assert required["state"] == "UNKNOWN" and "release/1.0" in required["reason"]
 
 
-def test_release_never_deletes_another_pollers_lock(tmp_path: Path) -> None:
-    lock = tmp_path / "locks" / "pr-state.lock"
-    other = f"pid={never_live_pid()} host=SOME-OTHER-PC at=now"
+def test_the_lock_is_held_during_the_poll_and_free_after(tmp_path: Path) -> None:
     fake = FakeGh([_pr(1)], {1: _green()})
+    seen: list[int | None] = []
 
     def gh(args: list[str], stdin: str | None) -> str:
-        lock.write_text(other, encoding="utf-8")  # another poller's lock replaced ours mid-poll
+        fd = ps.acquire_lock(tmp_path)  # a second handle, as another poller would try
+        seen.append(fd)
+        if fd is not None:
+            ps.release_lock(fd)
         return fake(args, stdin)
 
     rc, _ = _main(tmp_path, gh)
-    assert rc == 0
-    assert lock.read_text(encoding="utf-8") == other
+    assert rc == 0 and seen and all(fd is None for fd in seen)
+    after = ps.acquire_lock(tmp_path)
+    assert after is not None
+    ps.release_lock(after)
+    assert ps.lock_path(tmp_path).exists()  # the file stays; only the lock comes and goes
 
 
 def test_failed_part_is_recorded(tmp_path: Path) -> None:
@@ -458,7 +462,7 @@ def test_installer_plan_registers_nothing() -> None:
     assert plan["runLevel"] == "Limited" and plan["logonType"] == "Interactive"
     assert plan["poller"].replace("\\", "/").endswith("scripts/coord/pr_state.py")
     assert plan["cache"].replace("\\", "/").endswith("mefor-coord/pr-state.json")
-    assert "--coord-dir" in plan["argument"]
+    assert "--coord-dir" in plan["argument"] and plan["argument"].startswith("-I ")
 
 
 @_NEEDS_PWSH
@@ -581,10 +585,11 @@ def test_an_unusable_lock_directory_is_a_failing_result(tmp_path: Path) -> None:
 
 
 def test_a_same_named_run_github_does_not_require_cannot_speak(tmp_path: Path) -> None:
+    """CONTROL (fails on 3eb3bbc19, which read SUCCESS): the counted run may not exist yet."""
     other_app = {**_run("test"), "isRequired": False}
     _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), other_app]}))
     required = doc["data"]["pullRequests"][0]["required"]
-    assert required["state"] == "SUCCESS"  # "test" is not required on this PR, per GitHub
+    assert required["state"] == "UNKNOWN" and required["unknown"] == ["test"]
     required_run = {**_run("test", "", "QUEUED"), "isRequired": True}
     _, doc = _main(
         tmp_path,
@@ -618,3 +623,69 @@ def test_a_failure_keeps_what_the_poll_learned(tmp_path: Path) -> None:
     assert doc["rateLimit"]["remaining"] == 0
     assert doc["requiredContexts"] == sorted(REQUIRED)
     assert doc["requiredContextsFetchedAt"] == "2026-10-22T12:00:00Z"
+
+
+# --- The third fix brief of 2026-10-22 ------------------------------------------------------------
+
+
+def test_a_lock_error_that_is_not_contention_is_exit_4_with_the_error_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CONTROL (fails on 3eb3bbc19, which read every OSError as "held" and exited 0)."""
+    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+
+    def broken(*args: object) -> None:
+        raise OSError(errno.EIO, "I/O error")
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        monkeypatch.setattr(msvcrt, "locking", broken)
+    else:
+        import fcntl
+
+        monkeypatch.setattr(fcntl, "flock", broken)
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=2))
+    assert rc == 4 and gh.calls == []
+    assert doc["error"] and "cannot lock" in doc["error"] and doc["errorPart"] == "lock"
+    assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
+
+
+def test_a_contexts_failure_keeps_the_main_querys_budget(tmp_path: Path) -> None:
+    def gh(args: list[str], stdin: str | None) -> str:
+        if args[1] == "graphql" and stdin and "p1:" in stdin:
+            raise ps.GhError("gh api graphql exited 1: HTTP 502")
+        return FakeGh([_pr(1)], {1: _green()}, remaining=ps.RATE_FLOOR - 1)(args, stdin)
+
+    rc, doc = _main(tmp_path, gh)
+    assert rc == 1 and doc["errorPart"].startswith("contexts")
+    assert doc["rateLimit"]["remaining"] == ps.RATE_FLOOR - 1
+    assert doc["nextPollNotBefore"] == "2026-10-22T12:40:00Z"  # the reset, not the 2-minute retry
+
+
+def test_an_unexpected_shape_names_its_part_and_keeps_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def odd_reply(*args: object) -> None:
+        raise KeyError("a field the contexts reply did not carry")
+
+    monkeypatch.setattr(ps, "fetch_contexts", odd_reply)
+    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    assert rc == 1 and doc["errorPart"] == "contexts"
+    assert "unexpected reply shape" in doc["error"]
+    assert doc["rateLimit"]["remaining"] == 4900 and doc["requiredContexts"] == sorted(REQUIRED)
+
+
+def test_a_truncated_page_still_lists_github_required_names(tmp_path: Path) -> None:
+    extra = {**_run("new-required"), "isRequired": True}
+    ctx = {"oid": "oid1", "nodes": [*_green(), extra], "hasNextPage": True}
+    verdict = ps.shape_pr(_pr(1), sorted(REQUIRED), ctx)["required"]
+    assert verdict["requiredByGithubNotInList"] == ["new-required"]
+    assert "new-required" in verdict["unknown"]
+
+
+def test_a_stale_required_run_is_not_green(tmp_path: Path) -> None:
+    contexts = [_run("CI gate"), _run("cla"), _run("test", "STALE")]
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}))
+    assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]

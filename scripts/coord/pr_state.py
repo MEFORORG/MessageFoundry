@@ -36,6 +36,7 @@ it runs from any 3.11+ interpreter.
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.util
 import json
 import os
@@ -108,6 +109,7 @@ class GhError(RuntimeError):
         # gh exits 1 on a GraphQL reply that carries errors, with the reply on stdout.
         self.stdout = stdout
         self.fresh: dict[str, Any] | None = None
+        self.part: str | None = None
 
 
 class PollError(RuntimeError):
@@ -325,18 +327,18 @@ def required_verdict(
     if head_oid and contexts.get("oid") and contexts["oid"] != head_oid:
         out["reason"] = "head moved between the two queries"
         return out
-    if contexts.get("hasNextPage"):
-        # A later page may hold a newer run of any name, so no name on a partial page is proven
-        # red or green.
-        out["reason"] = "context page truncated; no required verdict from a partial page"
-        out["unknown"] = sorted(set(required))
-        return out
     nodes = [n for n in contexts.get("nodes", []) if n is not None]
     req = set(required)
     flagged = {
         pr_checks.name_of(n) for n in nodes if isinstance(n, dict) and n.get("isRequired") is True
     }
     out["requiredByGithubNotInList"] = sorted(flagged - req)
+    if contexts.get("hasNextPage"):
+        # A later page may hold a newer run of any name, so no name on a partial page is proven
+        # red or green.
+        out["reason"] = "context page truncated; no required verdict from a partial page"
+        out["unknown"] = sorted(req | flagged)
+        return out
     # A check GitHub calls required counts even when the cached list does not name it yet.
     for name in sorted(req | flagged):
         named = [n for n in nodes if pr_checks.name_of(n) == name]
@@ -344,19 +346,26 @@ def required_verdict(
         # rule does not count (False) cannot speak for the context.
         matching = [n for n in named if not (isinstance(n, dict) and n.get("isRequired") is False)]
         if not matching:
-            if named:
-                continue  # every run of this name is one GitHub does not require here
-            out["missing"].append(name)  # the page is complete, so absent means not yet run
+            # Runs of this name exist, but GitHub counts none of them for this PR. The run it would
+            # count (another app's, say) may not exist yet, so this proves nothing either way.
+            out["unknown" if named else "missing"].append(name)
             continue
-        failing, unsettled = pr_checks.counts([_speaker(matching)])
+        speaker = _speaker(matching)
+        failing, unsettled = pr_checks.counts([speaker])
+        stale = isinstance(speaker, dict) and (
+            str(speaker.get("conclusion") or "").upper() == pr_checks.STALE
+        )
         if failing:
             out["failing"].append(name)
-        elif unsettled:
+        elif unsettled or stale:
+            # counts() reads STALE as settled; for a REQUIRED check it is not green.
             out["pending"].append(name)
     if out["failing"]:
         out["state"] = "FAILURE"
     elif out["pending"] or out["missing"]:
         out["state"] = "PENDING"
+    elif out["unknown"]:
+        out["reason"] = "runs exist only from checks GitHub does not count as required here"
     else:
         out["state"] = "SUCCESS"
     return out
@@ -478,17 +487,29 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
             # A stale list beats none; it is labelled with its own age. No list leaves every PR UNKNOWN.
             required_error = str(exc)
 
+    progress: dict[str, Any] = {"part": "pulls", "rate": None}
     try:
-        return _poll_rest(gh, repo, owner, name, now, required, required_at, required_error)
+        return _poll_rest(
+            gh, repo, owner, name, now, required, required_at, required_error, progress
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as shape:
+        # A reply shape this code did not expect, recorded against the request that returned it.
+        err: PollError | GhError = PollError(
+            f"unexpected reply shape: {shape!r}", part=progress["part"]
+        )
     except (PollError, GhError) as exc:
-        learned = {
-            "requiredContexts": required,
-            "requiredContextsFetchedAt": required_at if required is not None else None,
-            "requiredContextsError": required_error,
-        }
-        fresh = getattr(exc, "fresh", None) or {}
-        exc.fresh = {**learned, **fresh}
-        raise
+        err = exc
+    learned: dict[str, Any] = {
+        "requiredContexts": required,
+        "requiredContextsFetchedAt": required_at if required is not None else None,
+        "requiredContextsError": required_error,
+    }
+    if progress["rate"]:
+        learned["rateLimit"] = progress["rate"]  # the main query succeeded; its budget is current
+    if err.part is None:
+        err.part = progress["part"]
+    err.fresh = {**learned, **(err.fresh or {})}
+    raise err
 
 
 def _poll_rest(
@@ -500,10 +521,13 @@ def _poll_rest(
     required: list[str] | None,
     required_at: Any,
     required_error: str | None,
+    progress: dict[str, Any],
 ) -> dict[str, Any]:
     repo_doc, rate = graphql(
         gh, MAIN_QUERY, {"owner": owner, "name": name, "limit": PR_PAGE}, "pulls"
     )
+    progress["rate"] = {**rate, "queries": 1} if rate else None
+    progress["part"] = "contexts"
     conn = repo_doc.get("pullRequests") if isinstance(repo_doc.get("pullRequests"), dict) else None
     if conn is None or not isinstance(conn.get("nodes"), list):
         raise PollError("reply has no pullRequests.nodes", part="pulls")
@@ -622,6 +646,11 @@ def failed(
         if reset is None or reset <= now:
             reset = now + timedelta(seconds=RATE_LIMIT_FALLBACK_SECONDS)
         not_before = max(not_before, reset)
+    rate = (fresh or {}).get("rateLimit")
+    if isinstance(rate, dict):
+        low = parse_iso(_rate_backoff(rate.get("remaining"), rate.get("resetAt"), now))
+        if low is not None:
+            not_before = max(not_before, low)
     data = prev.get("data") if isinstance(prev.get("data"), dict) else None
     doc = _base(repo, now)
     doc.update(
@@ -701,14 +730,43 @@ def acquire_lock(local: Path) -> int | None:
             import fcntl
 
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as exc:
         os.close(fd)
-        return None
+        if exc.errno in _CONTENTION:
+            return None  # another process holds it
+        raise LockUnavailable(f"cannot lock {lock}: {exc!r}") from exc
     return fd
 
 
+#: The errnos that mean "another process holds the lock". msvcrt.locking reports EACCES or
+#: EDEADLOCK; flock reports EWOULDBLOCK (EAGAIN). Any other error is a broken lock, not a holder.
+_CONTENTION = frozenset(
+    e
+    for e in (
+        errno.EACCES,
+        getattr(errno, "EDEADLOCK", None),
+        errno.EDEADLK,
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+    )
+    if e is not None
+)
+
+
 def release_lock(fd: int) -> None:
-    """Close the handle, which releases the lock. The lock file stays; it is never deleted."""
+    """Unlock, then close. The lock file stays; it is never deleted."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as exc:
+        _say(f"unlocking failed; closing the handle releases it anyway: {exc!r}")
     try:
         os.close(fd)
     except OSError as exc:
@@ -760,7 +818,18 @@ def main(
         fd = acquire_lock(local)
     except LockUnavailable as exc:
         _say(str(exc))
-        return 4  # a non-zero task result, so an unusable lock directory is not a silent success
+        # Written without the lock, because the lock itself is what is broken: no run can hold it,
+        # so no run is writing the cache. Readers see why it stopped moving.
+        previous = read_cache(out)
+        if previous is not None and previous.get("repo") != args.repo:
+            previous = None
+        try:
+            doc = failed(args.repo, previous, str(exc), now(), part="lock")
+            doc["nextPollNotBefore"] = (previous or {}).get("nextPollNotBefore")
+            write_cache(out, doc)
+        except OSError as werr:
+            _say(f"could not record the lock failure in the cache either: {werr!r}")
+        return 4  # a non-zero task result, so a broken lock is not a silent success
     if fd is None:
         return 0  # another poll is running; it will write the cache
     try:
@@ -787,8 +856,8 @@ def main(
                 fresh=getattr(exc, "fresh", None),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
-            # A reply shape this code did not expect. Recorded, so the cache does not go silently old.
-            doc = failed(args.repo, previous, f"unexpected reply shape: {exc!r}", start)
+            # poll() converts reply-shape errors itself; this is a last guard around the rest.
+            doc = failed(args.repo, previous, f"unexpected error: {exc!r}", start, part="poller")
         write_cache(out, doc)
         if doc["error"]:
             _say(f"poll failed, last good data kept: {doc['error']}")

@@ -713,15 +713,17 @@ poll keeps the last good data and marks it stale. The fields:
 | Field | What it holds |
 |---|---|
 | `schemaVersion` | `1`. A reader that sees another number should not guess. |
-| `fetchedAt`, `host` | When this poll ran, UTC, and on which machine. |
+| `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
 | `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
 | `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
 | `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. |
 | `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. |
 | `data` | The last good poll, or null if there never was one. |
 | `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
+| `data.openPullRequestCount` | GitHub's count of open PRs, which can exceed the list when it is truncated. |
 | `data.truncated` | True when the PR page came back full, or GitHub reports more open PRs than it sent. |
 | `data.pullRequests[]` | Per PR: number, title, base and head branch, head SHA, draft, labels, queue entry, auto-merge time, `allChecks` (with `forHead`) and `required`. |
+| `...mergeable`, `...mergeStateStatus`, `...mergeStateKnown` | GitHub's merge answers per PR, null while GitHub has not computed them. |
 | `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
 
 Four reading rules, each one a mistake the file is shaped to prevent:
@@ -750,9 +752,12 @@ pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <thi
 pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC> -Uninstall
 ```
 
-The task runs the primary checkout's copy under `pythonw.exe`, so no window opens. It runs as you, at
-run level Limited, because gh reads its token from your keyring. It refuses to register or uninstall
-inside Claude Code, and on any machine other than `-ExpectedHost`. Tests:
+The task runs `pythonw.exe -I` on the primary checkout's copy, so no window opens. It runs as you, at
+run level Limited, because gh reads its token from your keyring. Every 2 minutes it runs whatever
+`pr_state.py`, `coord_root.py`, `_pr_checks.py` and `required_contexts.py` the primary checkout holds,
+with your token. That is the same trust the checkout's `.claude/settings.json` hooks already get,
+and nothing checks those files first. The installer refuses inside Claude Code and on any machine
+other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
 [`tests/test_pr_state.py`](../tests/test_pr_state.py).
 
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
