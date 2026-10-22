@@ -266,13 +266,31 @@ def test_each_installer_step_guards_its_pipes(workflow: str, job_id: str, step_n
 
 
 @pytest.mark.parametrize(("workflow", "job_id", "step_name"), _GUARDED)
+def test_each_installer_job_stays_on_ubuntu_2404(
+    workflow: str, job_id: str, step_name: str
+) -> None:
+    """These jobs stay on ``ubuntu-24.04`` until the install step can verify a newer release.
+
+    On an ``ubuntu-latest`` runner that resolved to Ubuntu 26.04, the step failed at apt against
+    packages.microsoft.com. The reason is recorded once, at ci.yml's ``sqlserver-store`` job. Two
+    of the three jobs never run on an ordinary PR, so a sweep back to ``ubuntu-latest`` would go
+    green there and break only in the merge queue or the nightly run.
+    """
+    runs_on = _job(workflow, job_id).get("runs-on")
+    assert runs_on == "ubuntu-24.04", (
+        f"{workflow}:{job_id} runs on {runs_on!r}, but its {step_name!r} step fails on Ubuntu 26.04. "
+        "Read the comment at ci.yml's sqlserver-store job before moving this label."
+    )
+
+
+@pytest.mark.parametrize(("workflow", "job_id", "step_name"), _GUARDED)
 def test_no_installer_step_acquires_pipefail_by_switching_shells(
     workflow: str, job_id: str, step_name: str
 ) -> None:
     """The guard belongs in the run body, not in a declared shell.
 
-    NOT because a declared shell would be wrong here. All three of these jobs are ``ubuntu-latest``
-    with no Windows leg to surprise, and ci.yml deliberately sets ``defaults.run.shell: bash`` on
+    NOT because a declared shell would be wrong here. All three of these jobs are Linux-only
+    (``ubuntu-24.04``, pinned by ``test_each_installer_job_stays_on_ubuntu_2404``) with no Windows leg to surprise, and ci.yml deliberately sets ``defaults.run.shell: bash`` on
     other jobs (ci.yml:98, "available on all runners ... one set of commands"). Reading this pin as
     a general rule against that would be wrong.
 

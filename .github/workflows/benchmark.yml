@@ -331,7 +331,7 @@ jobs:
 
   baseline-sqlserver:
     name: baseline (sqlserver)
-    # ubuntu-24.04, not ubuntu-latest: this job installs ODBC Driver 18 from packages.microsoft.com, which publishes no Ubuntu 26.04 repo yet.
+    # ubuntu-24.04 for the ODBC install from packages.microsoft.com; why is at ci.yml's sqlserver-store job.
     runs-on: ubuntu-24.04
     services:
       mssql:

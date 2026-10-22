@@ -3030,7 +3030,14 @@ jobs:
     # on push (both halves of the no-per-merge-run guard live there — see its comment) and on
     # schedule, where the first arm below already covers the run.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true'
-    # ubuntu-24.04, not ubuntu-latest: this job installs ODBC Driver 18 from packages.microsoft.com, which publishes no Ubuntu 26.04 repo yet.
+    # ubuntu-24.04, NOT ubuntu-latest, which now resolves to Ubuntu 26.04 on some runners. There the
+    # ODBC install step below fails at apt against packages.microsoft.com (403 / "no longer signed";
+    # merge-group job 119911749652). The prod.list it fetches names signed-by the image's own
+    # /usr/share/keyrings/microsoft-prod.gpg, so the key the step downloads is never read, and a dev-box
+    # probe on 2026-10-22 found the 26.04 repo signed by a newer key than the step fetches. Unpin once
+    # that step installs the keyring for the runner's own release. The other two ODBC-installing jobs
+    # (load-test-sqlserver here, baseline-sqlserver in benchmark.yml) point here, and
+    # tests/test_ci_odbc_installer_pipefail.py holds all three on this label.
     runs-on: ubuntu-24.04
     # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
@@ -3978,7 +3985,7 @@ jobs:
     # Server functional coverage stays in `sqlserver-store` (nightly + server-DB-PR path-gate). NOT
     # required; ci-gate treats skip as pass.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    # ubuntu-24.04, not ubuntu-latest: this job installs ODBC Driver 18 from packages.microsoft.com, which publishes no Ubuntu 26.04 repo yet.
+    # ubuntu-24.04 for the ODBC install from packages.microsoft.com; why is at sqlserver-store above.
     runs-on: ubuntu-24.04
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent. Digest-pinned; why, and how to
