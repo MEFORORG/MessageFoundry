@@ -216,6 +216,12 @@ def test_an_extra_project_segment_is_unsafe(fleet: Fleet) -> None:
     assert_unsafe(fleet.check(wt), "c")
 
 
+def test_the_own_session_id_deeper_in_another_scratchpad_is_unsafe(fleet: Fleet) -> None:
+    """The id must sit at its one position; a `-like "*<id>*"` match would take this path."""
+    wt = fleet.add_worktree(fleet.scratch(OTHER_SID) / SID / "eng-main")
+    assert_unsafe(fleet.check(wt), "c")
+
+
 def test_a_claude_worktrees_tree_is_unsafe(fleet: Fleet) -> None:
     wt = fleet.add_worktree(fleet.engine / ".claude" / "worktrees" / "agent-x")
     assert_unsafe(fleet.check(wt), "c")
@@ -237,6 +243,12 @@ def test_a_link_inside_the_own_scratchpad_to_another_worktree_is_unsafe(fleet: F
     assert_unsafe(proc, "c")
     # The link resolved to its target, which IS a fleet worktree: only ownership refused it.
     assert "b." not in [ln.strip()[:2] for ln in proc.stdout.splitlines()[1:]], proc.stdout
+
+
+def test_a_non_uuid_session_id_is_unsafe_even_where_its_directory_exists(fleet: Fleet) -> None:
+    """The segment matches here, so only the session-id shape check refuses it."""
+    wt = fleet.add_worktree(fleet.scratch("not-a-session") / "eng-main")
+    assert_unsafe(fleet.check(wt, sid="not-a-session"), "c")
 
 
 @pytest.mark.parametrize("sid", ["", "..", "proj", SID.upper() + "x"])
@@ -330,7 +342,7 @@ def test_an_exception_mid_check_is_unsafe(fleet: Fleet) -> None:
     broken.mkdir()
     proc = fleet.check(wt, fleet=broken)
     assert_unsafe(proc, "b")
-    assert "could not be read" in proc.stdout
+    assert "worktree list could not be read" in proc.stdout
 
 
 def test_no_sanitiser_is_unsafe_with_a_fixed_reason(fleet: Fleet) -> None:
