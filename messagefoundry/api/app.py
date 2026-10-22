@@ -3503,11 +3503,13 @@ async def _audit_alert_rules_withheld(
     store = auth.store
     client = client_ip(request)
     detail = json.dumps({"shown": shown, "withheld": withheld})
-    shown_client = scrub_log_argument(client or "-")
     await write_audit_soft(
         lambda: _write_through_cancel(
             store.record_audit("alert_rules_withheld", actor=actor, detail=detail, client=client),
-            lambda: f"{_lost_row('alert_rules_withheld', actor, detail)} client={shown_client}",
+            lambda: (
+                f"{_lost_row('alert_rules_withheld', actor, detail)} "
+                f"client={scrub_log_argument(client or '-')}"
+            ),
         ),
         log=_log,
         # Not the route: the console's alerts page reads the rules through this handler too.
@@ -3517,7 +3519,7 @@ async def _audit_alert_rules_withheld(
             shown,
             withheld,
             scrub_log_argument(actor),
-            shown_client,
+            scrub_log_argument(client or "-"),
         ),
         # (), as write_audit_soft's docstring asks where a raise would replace the answer the
         # caller owes. A 500 here would also tell a scoped caller that hidden rules exist.
