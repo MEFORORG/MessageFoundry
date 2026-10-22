@@ -648,8 +648,10 @@ never with mail. The evidence is probe PR
   bare first word, with no punctuation after it. For example: `xhigh Review this branch's diff
   against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.` The period form,
   `xhigh.`, does not parse as a level. In two trials the skill then ran at the previous call's
-  level (measured 2026-10-13). In your QA line, give the level you passed and quote the tag the
-  skill printed; korus `roles/BUILDER.md` *4e* has the format.
+  level (measured 2026-10-13). Add a fresh `round-<hex>` nonce right after the level, never before
+  it. Read the tag from the fork's transcript with korus `scripts/quality/review_tag.py`, never
+  from memory or the skill's prose. korus `roles/BUILDER.md` *4e*, read at `origin/main`, gives the
+  QA-line fields, including what to write when the tool finds nothing or refuses.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
