@@ -87,11 +87,19 @@ A session on MEFORDEV01 ran the probe the owner asked for. Its report is
 
 What this changes:
 
-1. **Writers that replace a file by rename need a retry, and readers must treat a sharing
-   violation as "retry", never as "missing" or "torn".** At least `seat.ps1` (its temp-then-rename
-   record write), `lane.ps1` and `handoff.ps1 -Replace` do this on shared kinds; `claim.ps1`'s
-   refresh already retries.
-   This is a new precondition of step 7.
+1. **BUILT. Writers that replace a file by rename need a retry, and readers must treat a sharing
+   violation as "retry", never as "missing" or "torn".** `coord-root.ps1` holds the one helper:
+   `Move-CoordFileReplace` renames in one step and retries a sharing violation or access denied, and
+   `Read-CoordText` retries a sharing violation. Each tries 8 times, sleeping 25 ms and doubling to a
+   250 ms cap, about 1.1 s in all. A missing file is never retried, and when the tries run out the
+   original error surfaces. The writers on shared kinds use it, at least `seat.ps1`, `lane.ps1`,
+   `handoff.ps1` and `claim.ps1`'s refresh. `seat.ps1` and `lane.ps1` had used `Move-Item -Force`,
+   which deletes before it renames, so a reader could find the record missing. The readers of seat,
+   claim, allocation, lane, handoff and mail records use `Read-CoordText`. The Python twin,
+   `read_text` in `coord_root.py`, serves the claim and ledger gates, which only read. Python's
+   `open()` reports a sharing violation as a bare `PermissionError(13)`, so on Windows the twin
+   retries any `PermissionError`. `tests/test_coord_smb_retry.py` holds each against a second
+   process holding the file with no sharing, with a plain-call control that must fail.
 2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
    it again with one process on each PC before step 7, because the two clients' caches are the
    part no single-client test sees.
@@ -270,8 +278,9 @@ design. Reads and builds keep working.
    **Copy mail and lanes to the share under host-qualified keys only** (steps 6 and 10). An old box
    copied there would be read by every PC with a worktree at that path. Move each old inbox into
    its new box first; the drain does exactly that for its own tree.
-   Also before step 7: the rename-retry change for writers and readers of shared kinds, and the
-   CreateNew race rerun with one process on each PC (see *What MEFORDEV01 measured*).
+   Also before step 7: the CreateNew race rerun with one process on each PC (see *What MEFORDEV01
+   measured*). The rename-retry change for writers and readers of shared kinds is BUILT (same
+   section, item 1).
 5. Pick a quiet window. Announce it on the old mail lane.
 6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
    `robocopy /E /COPY:DT`. Leave the originals in place. **Then stamp `host = ALIENWARE` on every
