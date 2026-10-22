@@ -1541,8 +1541,9 @@ def test_the_seat_goal_is_the_intent_when_there_is_no_claim_note(
         {"sessionId": "99999999-0000-0000-0000-000000000000"},
         {"worktree": "D:\\t\\elsewhere"},
         {"lifecycle": "closed"},
+        {"goal": "   "},
     ],
-    ids=["another-session", "another-worktree", "closed-seat"],
+    ids=["another-session", "another-worktree", "closed-seat", "blank-goal"],
 )
 def test_a_seat_record_that_is_not_this_sessions_is_not_its_intent(
     repo: Path, tmp_path: Path, change: dict[str, str]
@@ -1552,18 +1553,22 @@ def test_a_seat_record_that_is_not_this_sessions_is_not_its_intent(
     seat's goal is finished work."""
     sd = tmp_path / "state"
     rec = declare_self(sd, repo)
-    rec.write_text(
-        json.dumps({**json.loads(rec.read_text(encoding="utf-8")), **change}), encoding="utf-8"
-    )
+    good = rec.read_text(encoding="utf-8")
+    rec.write_text(json.dumps({**json.loads(good), **change}), encoding="utf-8")
     stub, log = mail_stub(tmp_path)
-    run(
-        repo,
-        tmp_path=tmp_path,
-        state_dir=sd,
-        rows=[SELF_ROW, PEER, ACCT],
-        extra=("-MailScript", str(stub)),
-    )
+    args: dict[str, Any] = {
+        "tmp_path": tmp_path,
+        "state_dir": sd,
+        "rows": [SELF_ROW, PEER, ACCT],
+        "extra": ("-MailScript", str(stub)),
+    }
+    run(repo, **args)
     assert sends(log) == [], f"another record's goal was mailed as this session's: {sends(log)!r}"
+    # The positive arm in the same fixture: the unaltered record IS found, so the absence above is
+    # the field under test and not a lookup that never finds anything.
+    rec.write_text(good, encoding="utf-8")
+    run(repo, **args)
+    assert sends(log) == [ACCT["Cwd"]], f"the intact record was not found: {sends(log)!r}"
 
 
 def test_the_body_never_carries_the_users_prompt(repo: Path, tmp_path: Path) -> None:

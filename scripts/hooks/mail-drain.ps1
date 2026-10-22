@@ -440,7 +440,7 @@ $BODY_PREFIX_BYTES = $BODY_PREFIX.Length
 # The paste backstop's one pattern, shared by Format-Body and Format-AnnounceLine. Two copies would
 # let a segment added to one slip past the other.
 $HL7_SEGMENT_START = '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|'
-# The one-line render of an announce, before the on-disk pointer is appended.
+# The longest one-line announce render. A longer one renders in full through Format-Body instead.
 $MAX_ANNOUNCE_CHARS = 400
 
 function Measure-BodyBytes {
@@ -534,15 +534,15 @@ function Format-Body {
 
 function Format-AnnounceLine {
     # A [SESSION-ANNOUNCE] BROADCAST RENDERS AS ONE LINE. An audit of 196 mailed messages found 85
-    # were announces, each about 600 bytes framed, and the reader needs four facts from one: who,
-    # which branch, what they intend, what they touch, and when it was sent. The `via:` line is the
-    # sender's envelope and is dropped.
+    # were announces, each about 600 bytes framed, and the reader needs five facts from one: who,
+    # which branch, what they intend, what they touch, and when it was sent. Two lines are dropped:
+    # the tag line, whose worktree and branch repeat the from fields, and a final `via:` envelope line.
     #
     # NOTHING ELSE IS DROPPED. $null means "render it in full through Format-Body", and the shortcut
-    # returns $null for anything it cannot render whole: a kind other than broadcast, a field it does
-    # not know, a line the line cap already cut, a summary longer than $MAX_ANNOUNCE_CHARS, or a line
-    # Format-Body would withhold. So the HL7 backstop and the truncation markers are never bypassed,
-    # and a sender cannot use the tag to hide the rest of a body.
+    # returns $null for at least: a kind other than broadcast, extra text on the tag line, a field it
+    # does not know or that repeats, text after `via:`, a line the line cap already cut, a summary
+    # longer than $MAX_ANNOUNCE_CHARS, and a line Format-Body would withhold. So the HL7 backstop and
+    # the truncation markers are never bypassed, and the tag cannot hide the rest of a body.
     #
     # This is the second place a body becomes lines, beside Format-Body. The line is message content,
     # so it carries $BODY_PREFIX, and every field went through Get-Fold. Only the frame delimiters
@@ -550,18 +550,25 @@ function Format-AnnounceLine {
     param([string[]]$Lines, [string]$Kind, [bool]$LineCapped, [string]$FromCwd, [string]$FromBranch, [string]$Sent)
     if ($Kind -ne 'broadcast' -or $LineCapped) { return $null }
     if (-not $Lines -or -not ([string]$Lines[0]).StartsWith('[SESSION-ANNOUNCE]')) { return $null }
+    # The header must be exactly the hook's '<tag> <worktree> (<branch>)', which repeats the from
+    # fields. Any other text on it is content this line would not show.
+    if ([string]$Lines[0] -cnotmatch '\A\[SESSION-ANNOUNCE\] \S+ \(\S*\)\z') { return $null }
     foreach ($l in $Lines) { if ($l -cmatch $HL7_SEGMENT_START) { return $null } }
     # Get-CleanLines has trimmed every line, so a wrapped field's continuation lines arrive as bare
     # text. A known key followed by ': ' starts a field. Any other 'word: ' line is a field this
     # shortcut does not know, so the message renders in full. A wrapped 'https://...' or 'D:\...'
     # has no space after its colon, so it stays a continuation.
+    # A repeated field would overwrite the first copy, and `via:` must be the last line, because its
+    # text is dropped and anything after it would be dropped with it.
     $f = @{ intent = ''; touching = ''; via = '' }
+    $seen = @{}
     $cur = ''
     foreach ($l in @($Lines | Select-Object -Skip 1)) {
         if (-not $l) { continue }
+        if ($cur -eq 'via') { return $null }
         if ($l -cmatch '\A([a-z][a-z-]*):(?:\z| (.*)\z)') {
-            if (-not $f.ContainsKey($Matches[1])) { return $null }
-            $cur = $Matches[1]; $f[$cur] = [string]$Matches[2]; continue
+            if (-not $f.ContainsKey($Matches[1]) -or $seen.ContainsKey($Matches[1])) { return $null }
+            $cur = $Matches[1]; $seen[$cur] = $true; $f[$cur] = [string]$Matches[2]; continue
         }
         if (-not $cur) { return $null }
         $f[$cur] = "$($f[$cur]) $l"

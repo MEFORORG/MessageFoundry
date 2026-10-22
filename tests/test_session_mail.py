@@ -1432,22 +1432,29 @@ def test_a_wrapped_url_or_path_stays_part_of_the_intent(repo: Path, tmp_path: Pa
         assert want in lines[0], (want, lines[0])
 
 
+_ANN_HEAD, _ANN_INTENT = ANNOUNCE_BODY.split("\n")[0], "intent: hi"
+
+
 @pytest.mark.parametrize(
-    ("kind", "extra"),
-    [("broadcast", "question: please hold your push"), ("note", "")],
-    ids=["unknown-field", "not-a-broadcast"],
+    ("kind", "body", "hidden"),
+    [
+        ("broadcast", ANNOUNCE_BODY + "\nquestion: please hold your push", "please hold your push"),
+        ("note", ANNOUNCE_BODY, "REBUILDING THE INGEST PATH"),
+        ("broadcast", "[SESSION-ANNOUNCE] force-pushing main; hold merges", "hold merges"),
+        ("broadcast", f"{_ANN_HEAD}\nintent: FIRST THING\nintent: second", "FIRST THING"),
+        ("broadcast", f"{_ANN_HEAD}\n{_ANN_INTENT}\nvia: envelope\nplease hold", "please hold"),
+    ],
+    ids=["unknown-field", "not-a-broadcast", "text-on-tag-line", "repeated-field", "after-via"],
 )
 def test_an_announce_the_shortcut_cannot_render_whole_renders_in_full(
-    repo: Path, tmp_path: Path, kind: str, extra: str
+    repo: Path, tmp_path: Path, kind: str, body: str, hidden: str
 ) -> None:
-    """Any sender controls the tag, so the one-line form must never hide content. A field it does
-    not know, or a kind other than broadcast, falls back to the full frame."""
-    body = ANNOUNCE_BODY + (f"\n{extra}" if extra else "")
+    """Any sender controls the tag, so the one-line form must never hide content. Each case is a
+    body the one-line parser would lose text from; each must fall back to the full frame."""
     seed(repo, tmp_path, [{"kind": kind, "body": body}])
     lines = frames(injection(run_drain(repo)))[0][1]
     assert any("claimed-from:" in ln for ln in lines), lines
-    if extra:
-        assert any(extra in ln for ln in lines), lines
+    assert any(hidden in ln for ln in lines), lines
 
 
 def test_a_non_announce_broadcast_still_renders_in_full(repo: Path, tmp_path: Path) -> None:
