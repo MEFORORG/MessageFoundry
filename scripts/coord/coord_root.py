@@ -267,3 +267,43 @@ def record_is_here(record: object) -> bool:
     """True when a record is this machine's to judge: it names no host, or names this one."""
     recorded = record_host(record)
     return not recorded or recorded.casefold() == host().casefold()
+
+
+# The SMB read retry, the same numbers as Read-CoordText in coord-root.ps1, whose header says why it
+# exists. Python only reads shared records, so the rename half of that helper has no twin here.
+RETRY_TRIES = 8
+RETRY_FIRST_SECONDS = 0.025
+RETRY_MAX_SLEEP_SECONDS = 0.25
+# ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+_SHARING_WINERRORS = frozenset({32, 33})
+
+
+def sharing_violation(exc: OSError) -> bool:
+    """True for what a Windows sharing or lock violation can look like. Never for a missing file.
+
+    Measured 2026-10-21: ``open()`` goes through the C runtime, which reports a sharing violation as a
+    bare ``PermissionError(13)`` with no ``winerror``. That is indistinguishable from a real access
+    denial, so on Windows both are retried; a real denial costs one bounded wait, then raises as before.
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _SHARING_WINERRORS
+    return os.name == "nt" and isinstance(exc, PermissionError)
+
+
+def read_text(path: str | os.PathLike[str], encoding: str = "utf-8") -> str:
+    """A file's text, retrying a sharing violation briefly.
+
+    A missing file raises FileNotFoundError at once. When the tries run out, the last sharing
+    violation propagates, so a caller never reads one as "missing" or "torn" without trying first.
+    """
+    sleep = RETRY_FIRST_SECONDS
+    for attempt in range(1, RETRY_TRIES + 1):
+        try:
+            return Path(path).read_text(encoding=encoding)
+        except OSError as exc:
+            if attempt >= RETRY_TRIES or not sharing_violation(exc):
+                raise
+        time.sleep(sleep)
+        sleep = min(sleep * 2, RETRY_MAX_SLEEP_SECONDS)
+    raise AssertionError("unreachable")  # pragma: no cover - the last attempt returns or raises

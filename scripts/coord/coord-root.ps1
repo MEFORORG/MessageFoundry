@@ -37,7 +37,16 @@
       1. NO top-level param() block.
       2. NO assignment to a preference variable.
       3. NO I/O and NO pipeline output at load time.
-      4. NEVER THROWS from a function. Errors come back in the result's Error field.
+      4. NEVER THROWS from a resolver function. Errors come back in the result's Error field. The two
+         file helpers below are the one exception, by design: each stands in for a .NET call that
+         throws, so after its retries it rethrows that call's own exception for the caller's catch.
+
+    SMB SHARING VIOLATIONS. Measured on the share 2026-10-21: replacing a file by rename while another
+    process read it failed 2 of 50 times with "Access to the path is denied.", and 56 of about 2,500
+    reads failed with a sharing violation. Both clear in milliseconds. Move-CoordFileReplace and
+    Read-CoordText retry exactly those, briefly and boundedly; a missing file is never retried. A
+    writer must not use `Move-Item -Force` instead: it is delete-then-rename, so a reader can find the
+    name missing in between.
     Its Python twin is scripts/coord/coord_root.py; tests/test_coord_root.py holds both to one answer.
 
 .EXAMPLE
@@ -54,6 +63,14 @@ $script:CoordRootFile = 'root.toml'
 $script:CoordDownFile = 'coord-root-down.json'
 $script:CoordDownTtlSeconds = 60
 $script:CoordProbeTimeoutMs = 1500
+
+# The SMB retry: 8 tries, sleeping 25 ms and doubling, each sleep capped at 250 ms, so about 1.1 s in
+# all. The Python twin carries the same numbers.
+$script:CoordRetryTries = 8
+$script:CoordRetryFirstMs = 25
+$script:CoordRetryMaxSleepMs = 250
+# ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION, as HRESULTs.
+$script:CoordSharingHResults = @([int]0x80070020, [int]0x80070021)
 
 # A TOML literal string, and nothing else, on a `shared_root` key. An optional trailing comment.
 # ASCII space and tab only, never \s: .NET's \s and Python's differ on \x1c-\x1f and \x85, and the twins
@@ -266,4 +283,69 @@ function Test-CoordRecordIsHere {
     param($Record)
     $h = Get-CoordRecordHost $Record
     return (-not $h) -or ($h -ieq (Get-CoordHost))
+}
+
+function Get-CoordInnerException {
+    # PowerShell wraps an exception a .NET method throws in a MethodInvocationException.
+    param($Exception)
+    if ($Exception -is [System.Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
+        return $Exception.InnerException
+    }
+    return $Exception
+}
+
+function Test-CoordTransientIoError {
+    # True for the errors an SMB share raises while another process holds the file: a sharing or lock
+    # violation, and (for a rename only) access denied. A missing file or directory is never transient.
+    param($Exception, [switch]$AllowAccessDenied)
+    $e = Get-CoordInnerException $Exception
+    if ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) { return $false }
+    if ($AllowAccessDenied -and $e -is [System.UnauthorizedAccessException]) { return $true }
+    return ($e -is [System.IO.IOException] -and $script:CoordSharingHResults -contains $e.HResult)
+}
+
+function Invoke-CoordIoRetry {
+    # Runs $Action, retrying the transient errors above with a short bounded backoff. When the tries run
+    # out, or the error is not transient, it rethrows the .NET exception itself, so a caller's typed
+    # catch still matches.
+    param([scriptblock]$Action, [switch]$AllowAccessDenied)
+    $sleep = $script:CoordRetryFirstMs
+    for ($try = 1; ; $try++) {
+        try { return (& $Action) } catch {
+            $ex = Get-CoordInnerException $_.Exception
+            if ($try -ge $script:CoordRetryTries -or -not (Test-CoordTransientIoError $ex -AllowAccessDenied:$AllowAccessDenied)) { throw $ex }
+        }
+        Start-Sleep -Milliseconds $sleep
+        $sleep = [Math]::Min($sleep * 2, $script:CoordRetryMaxSleepMs)
+    }
+}
+
+function ConvertTo-CoordFullPath {
+    # .NET resolves a relative path against the process cwd, not against PowerShell's location.
+    param([string]$Path)
+    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
+    return (Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path)
+}
+
+function Move-CoordFileReplace {
+    # Renames $Source onto $Destination in one step, retrying a sharing violation or access denied.
+    # -NoOverwrite keeps an existing destination and throws IOException, which is never retried.
+    param([string]$Source, [string]$Destination, [switch]$NoOverwrite)
+    $src = ConvertTo-CoordFullPath $Source
+    $dst = ConvertTo-CoordFullPath $Destination
+    $overwrite = -not $NoOverwrite
+    Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
+}
+
+function Read-CoordText {
+    # A file's whole text, retrying a sharing violation. A missing file throws FileNotFoundException at
+    # once, so a caller's "missing" path is unchanged. An empty file emits nothing, exactly as
+    # `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as it did before.
+    # -Encoding defaults to UTF-8 with byte-order-mark detection, as ReadAllText does.
+    param([string]$Path, [System.Text.Encoding]$Encoding)
+    $full = ConvertTo-CoordFullPath $Path
+    $enc = if ($Encoding) { $Encoding } else { [System.Text.Encoding]::UTF8 }
+    $text = Invoke-CoordIoRetry -Action { [System.IO.File]::ReadAllText($full, $enc) }
+    if ($text.Length -eq 0) { return }
+    return $text
 }
