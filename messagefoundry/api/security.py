@@ -2090,7 +2090,24 @@ async def recheck_standing_or_refusal(
     if not await auth.mfa_satisfied(token):
         # The factor check loads the session again, and finds none if it ended between the two
         # reads. Ask once more on this refusal-only path, so that end is not named a lapsed factor.
-        if await auth.identity_for_token(token, activity=False) is None:
+        try:
+            ended = await auth.identity_for_token(token, activity=False) is None
+        except AUDIT_WRITE_DEFECTS:
+            raise
+        except store_call_errors() as exc:
+            # The read only picks the reason, and the factor check has already refused, so a store
+            # fault keeps the refusal rather than raising into a caller that would then skip its
+            # stop row (BACKLOG #3404). It names the factor, which is what the check that ran
+            # reported and what the gate names on that check; nothing saw the session end. With
+            # its traceback: ValueError and RuntimeError are also what a bug raises.
+            log.warning(
+                "a standing re-check could not read the session again after the factor check"
+                " refused (%s); it names the factor",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return "mfa_unmet"
+        if ended:
             return "session_ended"
         return "mfa_unmet"
     if identity.must_set_notify_email:

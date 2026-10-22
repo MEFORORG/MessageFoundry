@@ -9817,6 +9817,7 @@ def create_app(
 
         frames = 0
         stopped: StandingRefusal | None = None
+        cancelled = False
         try:
             await websocket.accept()
             while True:
@@ -9863,6 +9864,9 @@ def create_app(
                 await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             state.ws_count = max(0, getattr(state, "ws_count", 1) - 1)
             if stopped is not None:
@@ -9896,7 +9900,12 @@ def create_app(
                         stopped,
                         frames,
                     ),
-                    defects=AUDIT_WRITE_DEFECTS,
+                    # Under a cancel that landed before the write, as during the close, a defect is
+                    # logged with the row rather than raised: a raise here would replace the
+                    # CancelledError the `finally` is passing on, so the task would not end as
+                    # cancelled. Otherwise a defect raises, so a bug is not passed over as a store
+                    # refusal.
+                    defects=() if cancelled else AUDIT_WRITE_DEFECTS,
                 )
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------

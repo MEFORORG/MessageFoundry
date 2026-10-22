@@ -671,6 +671,99 @@ async def test_a_stop_row_cut_short_by_a_cancel_is_logged(
     ]
 
 
+async def test_a_defect_in_the_stop_row_under_a_cancel_logs_the_row_and_stays_cancelled(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: a cancel that lands during the 1008 close reaches the ``finally`` first, and
+    the stop row's write then raises a defect. The task must still end cancelled, so the defect
+    must not replace the ``CancelledError``; the lost row is logged at ERROR with its traceback,
+    naming the actor, client, reason and frames, never the token. Outside a cancel a defect still
+    raises, as :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` asks."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+
+    async def defect() -> None:
+        raise NotImplementedError("a defect in the stop row's write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, defect)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    closing = asyncio.Event()
+    real_send = harness._send
+
+    async def close_hangs(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.close":
+            closing.set()
+            await asyncio.Event().wait()  # held until the cancel lands here
+        await real_send(message)
+
+    harness._send = close_hangs  # type: ignore[method-assign]
+    caplog.set_level(logging.DEBUG)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await asyncio.wait_for(closing.wait(), _HARNESS_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    lost = [
+        record
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert [record.getMessage() for record in lost] == [
+        "ws_stats.stopped audit row not written. Lost row: actor=op client=127.0.0.1"
+        " reason=session_ended frames=1"
+    ]
+    assert lost[0].exc_info is not None and isinstance(lost[0].exc_info[1], NotImplementedError)
+    assert not any(token in text for r in caplog.records for text in record_texts(r))
+
+
+async def test_a_store_fault_on_the_second_read_still_records_the_stop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: after the factor check refuses, the re-check reads the session again only to
+    tell an ended session from a lapsed factor. A store fault on that read must not raise into the
+    feed, which would skip its stop row; the refusal stands and is named ``mfa_unmet``, what the
+    check that ran reported. The fault is logged with its traceback."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    _during_first_stats(monkeypatch, engine, lambda: _fault_the_read_after_the_factor(service))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    caplog.set_level(logging.WARNING)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert await _stop_rows(engine) == [
+        {"actor": "op", "client": "127.0.0.1", "reason": "mfa_unmet", "frames": 1}
+    ]
+    faults = [r for r in caplog.records if "could not read the session again" in r.getMessage()]
+    assert len(faults) == 1 and faults[0].exc_info is not None
+
+
+async def _fault_the_read_after_the_factor(service: AuthService) -> None:
+    """From now on the factor check refuses, and the session read right after it raises a store
+    fault once per refusal."""
+    real_identity_for_token = service.identity_for_token
+    armed = False
+
+    async def unmet(token: str | None) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    async def faulting(token: str | None, *, activity: bool = True) -> Identity | None:
+        nonlocal armed
+        if armed:
+            armed = False
+            raise OSError("store connection lost")
+        return await real_identity_for_token(token, activity=activity)
+
+    service.mfa_satisfied = unmet  # type: ignore[method-assign]
+    service.identity_for_token = faulting  # type: ignore[method-assign]
+
+
 async def test_a_client_that_disconnects_mid_feed_records_no_stop(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
