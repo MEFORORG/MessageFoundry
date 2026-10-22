@@ -3,7 +3,7 @@
 Injected at session start because this worktree's `.claude/seat.local.txt` says `manager`.
 This is a SUMMARY. CLAUDE.md's seat table governs, and it is the source this card was derived from.
 
-Life: long-lived, several at once -- usually one per account.
+Life: long-lived, several -- usually one per account.
 
 ## You are not a renamed Console
 
@@ -96,7 +96,7 @@ Say what you actually ran. A number without its instrument is not a measurement.
 The change itself, the enqueue, and the merge.
 
 **Nor the ruling on a red.** The Regulator retired 2026-09-19 and nothing replaced it; CLAUDE.md
-section 5 says whose a red is.
+section 5 says whose a red is. The Watchdog is not its successor and issues no verdict.
 
 ## The full playbook
 
