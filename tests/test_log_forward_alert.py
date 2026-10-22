@@ -5,15 +5,18 @@
 
 Three layers, each tested where it lives: the in-memory reading
 (:func:`~messagefoundry.logging_setup.forwarder_status`), the watch that turns a reading into an
-alert, and the status model. No test opens a socket or resolves a name.
+alert, and the status model. No test resolves a name, and one opens a loopback socket.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import logging.handlers
 import queue
 import socket
+import ssl
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ from messagefoundry.logging_setup import (
     _ForwardQueueHandler,
     _ForwardQueueListener,
     _TimeoutSysLogHandler,
+    _TlsSysLogHandler,
     configure_logging,
     forwarder_status,
 )
@@ -146,6 +150,132 @@ def test_a_forwarder_that_fails_at_start_reads_not_installed(
     # A fixed word, never the exception text or the host.
     dumped = info.model_dump_json()
     assert "collector" not in dumped and "no such name" not in dumped
+
+
+def _swallow_a_lookup_error_in_the_constructor(
+    monkeypatch: pytest.MonkeyPatch, errno: int, *, then: list[Any] | None = None
+) -> list[object]:
+    """Make ``SysLogHandler.__init__`` swallow a ``socket.gaierror`` from ``createSocket``, as
+    CPython 3.14.9's does (see ``logging_setup._connect_if_lookup_swallowed``), and make name lookups
+    fail with a fresh ``gaierror`` carrying ``errno``. With ``then``, only the first lookup fails and
+    later ones answer ``then``. The running interpreter's own constructor and ``createSocket`` still
+    run; only the catch and the lookup are added. Returns the hosts looked up, in order."""
+    real_init = logging.handlers.SysLogHandler.__init__
+    lookups: list[object] = []
+
+    def _init_swallowing_gaierror(
+        self: logging.handlers.SysLogHandler, *args: Any, **kwargs: Any
+    ) -> None:
+        create = type(self).createSocket
+
+        def _create_swallowing_gaierror() -> None:
+            with contextlib.suppress(socket.gaierror):
+                create(self)
+
+        self.createSocket = _create_swallowing_gaierror  # type: ignore[method-assign]
+        try:
+            real_init(self, *args, **kwargs)
+        finally:
+            del self.createSocket
+
+    def _getaddrinfo(host: object, *args: Any, **kwargs: Any) -> Any:
+        lookups.append(host)
+        if then is not None and len(lookups) > 1:
+            return then
+        raise socket.gaierror(errno, "lookup failed")
+
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "__init__", _init_swallowing_gaierror)
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    return lookups
+
+
+#: 11001 is how Windows reports a name that does not exist, EAI_NONAME how POSIX does; EAI_AGAIN is
+#: a lookup to try again.
+_LOOKUP_ERRORS = [
+    (11001, "permanent"),
+    (socket.EAI_NONAME, "permanent"),
+    (socket.EAI_AGAIN, "transient"),
+]
+
+
+@pytest.mark.parametrize("protocol", ["udp", "tcp"])
+@pytest.mark.parametrize(("errno", "word"), _LOOKUP_ERRORS)
+def test_a_lookup_failure_at_start_reads_not_installed_on_a_constructor_that_swallows_it(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, errno: int, word: str
+) -> None:
+    """On a constructor that swallows the lookup error, a name that does not resolve must still
+    read as a failed start, classified as before, on both the stdlib (UDP) and our (TCP) handler."""
+    lookups = _swallow_a_lookup_error_in_the_constructor(monkeypatch, errno)
+    # Control: the simulated constructor really swallows the error, or this test proves nothing.
+    plain = logging.handlers.SysLogHandler(address=("collector.invalid", 6514))
+    assert getattr(plain, "socket", "unset") is None
+    plain.close()
+    lookups.clear()
+    forward = SyslogForward(host="collector.invalid", port=6514, protocol=protocol)
+    assert configure_logging("INFO", forward=forward) is False
+    # Two lookups: the one the constructor swallowed, then the retry that raised.
+    assert lookups == ["collector.invalid", "collector.invalid"]
+    status = forwarder_status()
+    assert (status.configured, status.installed, status.start_failure) == (True, False, word)
+    assert status.state == "not_installed"
+
+
+@pytest.mark.parametrize("tls", [False, True])
+@pytest.mark.parametrize(("errno", "word"), _LOOKUP_ERRORS)
+def test_a_spooled_start_on_a_constructor_that_swallows_the_lookup_error(
+    monkeypatch: pytest.MonkeyPatch, tls: bool, errno: int, word: str
+) -> None:
+    """The arm ``serve`` ships: a spool behind the handler (``defer_connect``). A name that does not
+    exist is still refused; a lookup to try again is absorbed into ``startup_error``."""
+    lookups = _swallow_a_lookup_error_in_the_constructor(monkeypatch, errno)
+    kwargs: dict[str, Any] = {
+        "address": ("collector.invalid", 6514),
+        "socktype": socket.SOCK_STREAM,
+        "timeout": 1.0,
+        "defer_connect": True,
+    }
+    if tls:
+        kwargs |= {"ssl_context": ssl.create_default_context(), "server_hostname": "x.invalid"}
+    cls = _TlsSysLogHandler if tls else _TimeoutSysLogHandler
+    if word == "permanent":
+        with pytest.raises(socket.gaierror) as raised:
+            cls(**kwargs)
+        assert raised.value.errno == errno
+    else:
+        handler = cls(**kwargs)
+        try:
+            assert isinstance(handler.startup_error, socket.gaierror)
+            assert handler.startup_error.errno == errno
+            assert handler.socket is None
+        finally:
+            handler.close()
+    assert len(lookups) == 2  # the swallowed lookup reached this subclass, then the retry
+
+
+def test_a_lookup_that_answers_on_the_retry_connects_with_the_timeout_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry's success arm goes through our ``createSocket``, so the socket carries the bounded
+    timeout. It connects to a loopback listener; the name is answered by the fake lookup."""
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        port = server.getsockname()[1]
+        answer = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))]
+        lookups = _swallow_a_lookup_error_in_the_constructor(
+            monkeypatch, socket.EAI_AGAIN, then=answer
+        )
+        handler = _TimeoutSysLogHandler(
+            address=("collector.invalid", port),
+            socktype=socket.SOCK_STREAM,
+            timeout=1.0,
+            defer_connect=True,
+        )
+        try:
+            assert len(lookups) == 2
+            assert handler.startup_error is None
+            assert handler.socket is not None
+            assert handler.socket.gettimeout() == 1.0
+        finally:
+            handler.close()
 
 
 def test_a_later_configure_without_a_forwarder_clears_the_failure(

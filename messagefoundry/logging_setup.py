@@ -616,6 +616,19 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
+def _connect_if_lookup_swallowed(handler: logging.handlers.SysLogHandler) -> None:
+    """Connect again when ``SysLogHandler.__init__`` left no socket.
+
+    From CPython 3.14.9 that constructor catches a ``socket.gaierror`` from ``createSocket`` and
+    leaves ``socket`` None, deferring the lookup to the first send. Every start check here relies on
+    the constructor raising, so a name that does not resolve would read as a forwarder that started.
+    Calling ``createSocket`` again raises the lookup error at start, for the caller to classify
+    (:func:`is_permanent_connect_error`). A successful ``createSocket`` always sets ``socket``, so
+    on an interpreter that does not catch, this never runs."""
+    if getattr(handler, "socket", None) is None:
+        handler.createSocket()
+
+
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
     any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't park the calling
@@ -662,7 +675,8 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         # equivalent at runtime and honest to the checker.
         kwargs["timeout"] = timeout
         try:
-            super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+            super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket()
+            _connect_if_lookup_swallowed(self)
         except OSError as exc:
             # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
@@ -898,7 +912,9 @@ def _build_syslog_handler(
     forward: SyslogForward, *, defer_connect: bool = False
 ) -> logging.handlers.SysLogHandler:
     """A :class:`logging.handlers.SysLogHandler` for ``forward``. For UDP the socket is created but not
-    connected (never fails on a down collector, never blocks on send). For TCP/TLS the constructor
+    connected (never fails on a down collector, never blocks on send); a collector name that does not
+    resolve still raises ``socket.gaierror`` here (:func:`_connect_if_lookup_swallowed`). For TCP/TLS
+    the constructor
     connects (and, for TLS, completes the handshake) and may raise ``OSError`` if the collector is down
     or its certificate can't be verified at startup (:func:`configure_logging` treats that as best-
     effort — ``ssl.SSLError`` is an ``OSError`` subclass), and a runtime socket timeout
@@ -933,9 +949,11 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    return logging.handlers.SysLogHandler(
+    udp = logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
     )
+    _connect_if_lookup_swallowed(udp)
+    return udp
 
 
 class _ForwardQueueListener(logging.handlers.QueueListener):
