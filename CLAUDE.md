@@ -652,10 +652,11 @@ never with mail. The evidence is probe PR
   `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,
   never before it. The tag is the skill's `<level> effort -> ...` line. Read it with korus
   `scripts/quality/review_tag.py`, run by path from your engine worktree, with `--target` set to
-  the nonce. The tool reads the reviewer fork's transcript. Where no fork exists, it exits 3, and
-  4e says what to write then. Never take a fork's tag from memory or the skill's prose. In your QA
-  line, give the level you passed, and quote the tag verbatim with the note 4e requires. korus
-  `roles/BUILDER.md` *4e*, read at `origin/main`, gives the QA line's full format.
+  the nonce. The tool reads the reviewer fork's transcript. Its exit code decides the Tag field,
+  including the inline case; 4e's exit table says how. Never take a fork's tag from memory or the
+  skill's prose. In your QA line, give the level you passed, and quote the tag verbatim with the
+  note 4e requires. korus `roles/BUILDER.md` *4e*, read at `origin/main`, gives the QA line's full
+  format.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
