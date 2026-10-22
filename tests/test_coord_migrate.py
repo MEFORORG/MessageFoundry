@@ -25,6 +25,7 @@ MIGRATE = ROOT / "scripts" / "coord" / "coord-migrate.ps1"
 RACE = ROOT / "scripts" / "coord" / "coord-race.ps1"
 TIMEOUT = 120
 STAMP = "SRCPC"
+REFUSAL = "refused in a Claude Code cloud session"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or os.name != "nt",
@@ -32,15 +33,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_REMOTE"}
+def _env(*, cloud: bool = False) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_REMOTE"}
+    if cloud:
+        env["CLAUDE_CODE_REMOTE"] = "true"
+    return env
 
 
-def _pwsh(script: Path, *args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _pwsh(
+    script: Path, *args: str, cwd: Path, cloud: bool = False
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script), *args],
         cwd=str(cwd),
-        env=_env(),
+        env=_env(cloud=cloud),
         input="",
         capture_output=True,
         text=True,
@@ -60,12 +66,13 @@ def _source(tmp_path: Path) -> Path:
     _write(src / "seats" / "a-1.json", '{"seat": "builder", "at": "2026-10-21T10:00:00Z"}')
     _write(src / "seats" / "b-2.json", '{"seat": "manager", "host": "OTHERPC"}')
     _write(src / "claims" / "1234.json", '{"holder": "x"}')
-    _write(src / "claims" / ".history" / "log.txt", "line\n")
+    _write(src / "claims" / ".history", '{"released": "1"}\n')
     _write(src / "alloc" / "adr" / "0211.json", '{"title": "t"}')
     _write(src / "alloc" / "backlog" / "1770.json", '{"title": "old"}')
     _write(src / "alloc" / "backlog" / "1000000.json", '{"tombstone": true, "worktree": ""}')
     _write(src / "mail" / "inbox" / "m1.json", "{}")
     _write(src / "mail" / "tmp" / "half.json", '{"x"')
+    _write(src / "wiki" / "inbox" / "e1.json", '{"id": "e1"}')
     _write(src / "owner-log" / "OWNER-ITEMS.md", "| row |\n")
     # Never copied: retired, backup, cache and local trees.
     _write(src / "_retired-2026-08-22" / "seats" / "old.json", "{}")
@@ -77,18 +84,19 @@ def _source(tmp_path: Path) -> Path:
     return src
 
 
-def _migrate(src: Path, dst: Path, *extra: str) -> tuple[subprocess.CompletedProcess[str], Any]:
+def _dst(tmp_path: Path, name: str = "dst") -> Path:
+    """Migration step 1 creates the target; the tool refuses one that does not exist."""
+    d = tmp_path / name
+    d.mkdir()
+    return d
+
+
+def _migrate(
+    src: Path, dst: Path, *extra: str, host: str | None = STAMP
+) -> tuple[subprocess.CompletedProcess[str], Any]:
+    stamp = ("-SourceHost", host) if host else ()
     proc = _pwsh(
-        MIGRATE,
-        "-Source",
-        str(src),
-        "-Target",
-        str(dst),
-        "-SourceHost",
-        STAMP,
-        "-Json",
-        *extra,
-        cwd=src.parent,
+        MIGRATE, "-Source", str(src), "-Target", str(dst), *stamp, "-Json", *extra, cwd=src.parent
     )
     return proc, json.loads(proc.stdout) if proc.stdout.strip() else None
 
@@ -98,34 +106,59 @@ def _kind(summary: Any, kind: str) -> dict[str, int]:
     return row
 
 
+def _read(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     src = _source(tmp_path)
-    dst = tmp_path / "dst"
+    dst = _dst(tmp_path)
     proc, summary = _migrate(src, dst)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert summary["mode"] == "dry-run"
-    assert not dst.exists()
+    assert list(dst.iterdir()) == []
     assert _kind(summary, "seats")["copy"] == 2
+
+
+def test_a_missing_target_is_refused(tmp_path: Path) -> None:
+    """A dry run against nothing would report no collisions, which reads as clean."""
+    src = _source(tmp_path)
+    proc, _ = _migrate(src, tmp_path / "typo")
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert not (tmp_path / "typo").exists()
+
+
+def test_relative_paths_resolve_against_the_working_directory(tmp_path: Path) -> None:
+    _source(tmp_path)
+    dst = _dst(tmp_path)
+    args = ("-Source", "src", "-Target", "dst", "-SourceHost", STAMP, "-Apply")
+    proc = _pwsh(MIGRATE, *args, cwd=tmp_path)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert (dst / "seats" / "a-1.json").is_file()
 
 
 def test_apply_copies_and_stamps_only_an_absent_host(tmp_path: Path) -> None:
     src = _source(tmp_path)
-    dst = tmp_path / "dst"
+    dst = _dst(tmp_path)
     proc, summary = _migrate(src, dst, "-Apply")
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
-    a = json.loads((dst / "seats" / "a-1.json").read_text(encoding="utf-8"))
-    assert a == {"host": STAMP, "seat": "builder", "at": "2026-10-21T10:00:00Z"}
+    assert _read(dst / "seats" / "a-1.json") == {
+        "host": STAMP,
+        "seat": "builder",
+        "at": "2026-10-21T10:00:00Z",
+    }
     # The date string survives as written: the stamp is a text insert, not a re-serialisation.
     assert '"at": "2026-10-21T10:00:00Z"' in (dst / "seats" / "a-1.json").read_text(
         encoding="utf-8"
     )
     # A present host is kept, never overwritten by the stamp.
-    b = json.loads((dst / "seats" / "b-2.json").read_text(encoding="utf-8"))
-    assert b["host"] == "OTHERPC"
-    assert json.loads((dst / "mail" / "inbox" / "m1.json").read_text(encoding="utf-8")) == {
-        "host": STAMP
-    }
-    assert (dst / "claims" / ".history" / "log.txt").read_text(encoding="utf-8") == "line\n"
+    assert _read(dst / "seats" / "b-2.json")["host"] == "OTHERPC"
+    assert _read(dst / "mail" / "inbox" / "m1.json") == {"host": STAMP}
+    # The wiki inbox is copied byte for byte: korus compile compares an event with its landed copy.
+    assert (dst / "wiki" / "inbox" / "e1.json").read_bytes() == (
+        src / "wiki" / "inbox" / "e1.json"
+    ).read_bytes()
+    assert (dst / "claims" / ".history").read_text(encoding="utf-8") == '{"released": "1"}\n'
     assert (dst / "owner-log" / "OWNER-ITEMS.md").is_file()
     seats = _kind(summary, "seats")
     assert (seats["copy"], seats["stamped"], seats["hostKept"]) == (2, 1, 1)
@@ -141,9 +174,43 @@ def test_apply_copies_and_stamps_only_an_absent_host(tmp_path: Path) -> None:
     assert _kind(again, "seats")["present"] == 2
 
 
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        pytest.param('{"holder": "x", "host": null}', "null or blank", id="null-host"),
+        pytest.param('{"holder": "x", "host": "  "}', "null or blank", id="blank-host"),
+        pytest.param('{"holder": "x", "Host": "PC"}', "another case", id="cased-host"),
+        pytest.param('{"holder": "x",}', "readable", id="unreadable"),
+    ],
+)
+def test_a_record_that_cannot_be_stamped_safely_is_not_clean(
+    tmp_path: Path, body: str, reason: str
+) -> None:
+    """Each of these still reads as "this machine" on every PC, so the run must say so."""
+    src = tmp_path / "src"
+    _write(src / "claims" / "9.json", body)
+    dst = _dst(tmp_path)
+    proc, summary = _migrate(src, dst, "-Apply")
+    assert proc.returncode == 3, (proc.stdout, proc.stderr)
+    [entry] = summary["unstamped"]
+    assert entry["path"] == "claims/9.json" and reason in entry["reason"]
+    assert (dst / "claims" / "9.json").read_text(encoding="utf-8") == body
+
+
+def test_a_foreign_host_without_source_host_is_not_clean(tmp_path: Path) -> None:
+    """Without -SourceHost the stamp is this machine; a source naming another host is suspect."""
+    src = _source(tmp_path)
+    dst = _dst(tmp_path)
+    proc, summary = _migrate(src, dst, host=None)
+    assert proc.returncode == 3, (proc.stdout, proc.stderr)
+    assert summary["foreignHosts"] == ["OTHERPC"]
+    proc2, _ = _migrate(src, dst, host="OTHERPC")
+    assert proc2.returncode == 0, (proc2.stdout, proc2.stderr)
+
+
 def test_retired_backup_cache_temp_and_local_trees_are_skipped(tmp_path: Path) -> None:
     src = _source(tmp_path)
-    dst = tmp_path / "dst"
+    dst = _dst(tmp_path)
     proc, summary = _migrate(src, dst, "-Apply")
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     for gone in (
@@ -164,29 +231,35 @@ def test_retired_backup_cache_temp_and_local_trees_are_skipped(tmp_path: Path) -
 
 def test_retired_backlog_has_its_own_heading_and_is_not_copied(tmp_path: Path) -> None:
     src = _source(tmp_path)
-    dst = tmp_path / "dst"
+    dst = _dst(tmp_path)
     proc, summary = _migrate(src, dst, "-Apply")
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert summary["retiredBacklog"] == {"records": 2, "tombstones": 1, "included": False}
     assert not (dst / "alloc" / "backlog").exists()
     assert (dst / "alloc" / "adr" / "0211.json").is_file()
-    text = _pwsh(MIGRATE, "-Source", str(src), "-Target", str(tmp_path / "d2"), cwd=tmp_path)
+    d2 = _dst(tmp_path, "d2")
+    text = _pwsh(MIGRATE, "-Source", str(src), "-Target", str(d2), cwd=tmp_path)
     assert "RETIRED BACKLOG ALLOCATIONS (alloc/backlog): 2 record(s), 1 tombstone(s)" in text.stdout
-    proc3, _ = _migrate(src, tmp_path / "d3", "-Apply", "-IncludeRetiredBacklog")
+    d3 = _dst(tmp_path, "d3")
+    proc3, _ = _migrate(src, d3, "-Apply", "-IncludeRetiredBacklog")
     assert proc3.returncode == 0, (proc3.stdout, proc3.stderr)
-    assert (tmp_path / "d3" / "alloc" / "backlog" / "1000000.json").is_file()
+    assert (d3 / "alloc" / "backlog" / "1000000.json").is_file()
 
 
 def test_conflict_and_adr_collision_are_reported_and_never_overwritten(tmp_path: Path) -> None:
     src = _source(tmp_path)
-    dst = tmp_path / "dst"
+    dst = _dst(tmp_path)
     _write(dst / "claims" / "1234.json", '{"holder": "someone else", "host": "OTHERPC"}')
     _write(dst / "alloc" / "adr" / "0211.json", '{"title": "another ADR", "host": "OTHERPC"}')
-    before = {p: p.read_bytes() for p in dst.rglob("*.json")}
+    # Ledgers both PCs hold are NOT MERGED, and do not count as conflicts.
+    _write(dst / "claims" / ".history", '{"released": "2"}\n')
+    _write(dst / "owner-log" / "OWNER-ITEMS.md", "| other row |\n")
+    before = {p: p.read_bytes() for p in dst.rglob("*") if p.is_file()}
     proc, summary = _migrate(src, dst, "-Apply")
     assert proc.returncode == 3, (proc.stdout, proc.stderr)
     assert summary["conflicts"] == ["claims/1234.json"]
     assert summary["collisions"] == ["alloc/adr/0211.json"]
+    assert sorted(summary["notMerged"]) == ["claims/.history", "owner-log/OWNER-ITEMS.md"]
     assert {p: p.read_bytes() for p in before} == before
     # Everything else still copied.
     assert (dst / "seats" / "a-1.json").is_file()
@@ -194,6 +267,7 @@ def test_conflict_and_adr_collision_are_reported_and_never_overwritten(tmp_path:
     assert text.returncode == 3
     assert "COLLISIONS" in text.stdout and "alloc/adr/0211.json" in text.stdout
     assert "CONFLICTS" in text.stdout and "claims/1234.json" in text.stdout
+    assert "NOT MERGED" in text.stdout
 
 
 def test_nested_roots_are_refused(tmp_path: Path) -> None:
@@ -211,8 +285,37 @@ def test_a_bare_call_refuses_rather_than_prompting(tmp_path: Path, script: Path)
     assert "needs -" in err
 
 
-def _result(d: Path, tag: str, won: list[int], slots: int) -> None:
-    body = {"tag": tag, "host": tag, "slots": slots, "won": won, "errors": [], "startedAtUtc": ""}
+def _soon(seconds: float) -> str:
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def test_the_cloud_refusal_comes_before_any_write(tmp_path: Path) -> None:
+    """Arguments that would copy, and would race, outside the cloud: so a refusal moved below the
+    work would be caught. The controls are the apply and race tests above and below."""
+    src = _source(tmp_path)
+    dst = _dst(tmp_path)
+    proc = _pwsh(
+        MIGRATE, "-Source", str(src), "-Target", str(dst), "-Apply", cwd=tmp_path, cloud=True
+    )
+    assert proc.returncode == 3 and REFUSAL in proc.stderr, (proc.stdout, proc.stderr)
+    assert list(dst.iterdir()) == []
+    race = _dst(tmp_path, "race")
+    args = ("-Dir", str(race), "-Tag", "A", "-StartAtUtc", _soon(1), "-Slots", "3")
+    proc2 = _pwsh(RACE, *args, cwd=tmp_path, cloud=True)
+    assert proc2.returncode == 3 and REFUSAL in proc2.stderr, (proc2.stdout, proc2.stderr)
+    assert list(race.iterdir()) == []
+
+
+def _result(d: Path, tag: str, won: list[int], slots: int, start: str = "", end: str = "") -> None:
+    body = {
+        "tag": tag,
+        "host": tag,
+        "slots": slots,
+        "won": won,
+        "errors": [],
+        "startedAtUtc": start or "2026-10-21T10:00:00.000Z",
+        "finishedAtUtc": end or "2026-10-21T10:00:02.000Z",
+    }
     (d / f"result-{tag}.json").write_text(json.dumps(body), encoding="utf-8")
 
 
@@ -222,8 +325,7 @@ def _compare(d: Path) -> tuple[subprocess.CompletedProcess[str], Any]:
 
 
 def test_compare_flags_a_planted_double_winner_and_an_empty_slot(tmp_path: Path) -> None:
-    d = tmp_path / "race"
-    d.mkdir()
+    d = _dst(tmp_path, "race")
     for n, tag in ((1, "A"), (2, "B"), (3, "A")):
         (d / f"slot-{n}").write_text(tag, encoding="utf-8")
     # Slot 1 claimed by both; slot 4 by nobody; slot 3 claimed by B but holding A.
@@ -236,18 +338,36 @@ def test_compare_flags_a_planted_double_winner_and_an_empty_slot(tmp_path: Path)
     assert [x["slot"] for x in summary["mismatches"]] == [3]
 
 
+def test_compare_gives_no_verdict_on_a_run_that_was_not_a_race(tmp_path: Path) -> None:
+    """Clean slots, but B started after A finished and won nothing: that proves nothing."""
+    d = _dst(tmp_path, "race")
+    for n in (1, 2):
+        (d / f"slot-{n}").write_text("A", encoding="utf-8")
+    _result(d, "A", [1, 2], 2, "2026-10-21T10:00:00.000Z", "2026-10-21T10:00:01.000Z")
+    _result(d, "B", [], 2, "2026-10-21T10:00:05.000Z", "2026-10-21T10:00:06.000Z")
+    proc, summary = _compare(d)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    text = " ".join(summary["invalid"])
+    assert "won no slot" in text and "do not overlap" in text
+
+
 def test_compare_needs_two_results(tmp_path: Path) -> None:
-    d = tmp_path / "race"
-    d.mkdir()
+    d = _dst(tmp_path, "race")
     _result(d, "A", [1], 1)
     proc = _pwsh(RACE, "-Compare", "-Dir", str(d), cwd=d)
     assert proc.returncode == 2, (proc.stdout, proc.stderr)
 
 
+def test_a_start_time_in_the_past_is_refused(tmp_path: Path) -> None:
+    d = _dst(tmp_path, "race")
+    proc = _pwsh(RACE, "-Dir", str(d), "-Tag", "A", "-StartAtUtc", _soon(-60), cwd=d)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert list(d.iterdir()) == []
+
+
 def test_two_real_processes_race_clean(tmp_path: Path) -> None:
-    d = tmp_path / "race"
-    d.mkdir()
-    start = (datetime.now(UTC) + timedelta(seconds=8)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    d = _dst(tmp_path, "race")
+    start = _soon(8)
     procs = [
         subprocess.Popen(
             [
@@ -280,7 +400,9 @@ def test_two_real_processes_race_clean(tmp_path: Path) -> None:
     proc, summary = _compare(d)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert summary["doubleWinners"] == [] and summary["emptySlots"] == []
+    assert summary["invalid"] == []
     assert sum(s["won"] for s in summary["sides"]) == 50
     # A rerun in the same directory is refused: a stale slot would read as a loss for both sides.
-    again = _pwsh(RACE, "-Dir", str(d), "-Tag", "P3", "-StartAtUtc", start, cwd=d)
+    again = _pwsh(RACE, "-Dir", str(d), "-Tag", "P3", "-StartAtUtc", _soon(30), cwd=d)
     assert again.returncode == 2, (again.stdout, again.stderr)
+    assert "slot file" in again.stderr
