@@ -68,5 +68,9 @@ working tree:
 Read the korus `roles/COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
 disagree about this repository.
 
+Apply the driver and empower rules by default; load both skills at session start. While
+`MEFOR_AFK_KILL` is not `off`, empower is off and the driver rules still apply. See CLAUDE.md
+section 5.
+
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note, never here.
