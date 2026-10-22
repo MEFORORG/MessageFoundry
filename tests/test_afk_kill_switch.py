@@ -108,9 +108,8 @@ def test_the_banner_runs_at_every_session_start() -> None:
     assert "matcher" not in settings["hooks"]["SessionStart"][0], "every source, not only startup"
 
 
-# While the switch reads OFF, -Banner tells every session but a Special seat to load the driver
-# and empower skills (owner approval 2026-10-22). The seat comes from the worktree the hook input
-# names, so each run below hands the script a SessionStart payload.
+# While the switch reads OFF, -Banner may print the skill instruction ADR 0211 describes. The seat
+# comes from the worktree the hook input names, so each run below hands the script a payload.
 CLOUD_NAMES = ("anthropic-skills:driver", "anthropic-skills:empower")
 
 
@@ -177,7 +176,9 @@ def test_a_switch_that_reads_on_gives_the_banner_and_no_skill_instruction(sb: Sa
 
 @pytest.mark.parametrize("seat", ["special", " Special\n", "special1", "adhoc"])
 def test_a_special_seat_gets_no_skill_instruction(sb: Sandbox, seat: str) -> None:
-    assert _seat_banner(sb, "off", seat) == ""
+    # stderr too: a fault also prints no instruction, but says so there.
+    proc = _seat_run(sb, "off", seat)
+    assert (proc.stdout, proc.stderr) == ("", "")
 
 
 @pytest.mark.parametrize("seat", ["builder", "manager", "builder-2", "", None])
@@ -197,8 +198,16 @@ def test_the_instruction_names_the_cloud_skill_names(sb: Sandbox) -> None:
     assert all(name in text for name in CLOUD_NAMES), text
 
 
+def test_the_instruction_tells_a_late_special_and_a_loaded_session_to_skip_it(sb: Sandbox) -> None:
+    # A Special seat declares late, so an undeclared one is told here; a resume already holds both.
+    text = _instruction(_seat_banner(sb, "off", None))
+    assert "A Special seat skips this" in text
+    assert "already loaded" in text
+
+
 def test_korus_seat_names_the_seat_when_the_marker_does_not(sb: Sandbox) -> None:
-    assert _seat_banner(sb, "off", None, KORUS_SEAT="special") == ""
+    proc = _seat_run(sb, "off", None, KORUS_SEAT="special")
+    assert (proc.stdout, proc.stderr) == ("", "")
 
 
 def test_the_marker_outranks_korus_seat(sb: Sandbox) -> None:
@@ -218,12 +227,25 @@ def test_the_seat_comes_from_the_payload_worktree_not_the_process_cwd(sb: Sandbo
     assert _instruction(_seat_banner(sb, "off", "special", cwd=wt / "src"))
 
 
-def test_a_compact_after_a_cd_never_answers_for_the_sibling(sb: Sandbox) -> None:
-    # No pin records that the session started in the sibling, so its cwd is refused, said aloud.
+@pytest.mark.parametrize("source", ["clear", "compact"])
+def test_a_clear_or_compact_answers_for_the_worktree_its_cwd_names(
+    sb: Sandbox, source: str
+) -> None:
+    # As role-card-inject.ps1 does, so the two hooks name one seat. A /clear mints a session id no
+    # pin knows, and a pin-based read would refuse this desktop-app worktree after every /clear.
     wt = _linked_worktree(sb)
     _mark(wt, "builder")
-    proc = _seat_run(sb, "off", "special", cwd=wt, source="compact")
-    assert proc.stdout == "" and "no skill instruction" in proc.stderr, proc.stderr
+    assert _instruction(_seat_run(sb, "off", "special", cwd=wt, source=source).stdout)
+    _mark(wt, "special")
+    proc = _seat_run(sb, "off", "builder", cwd=wt, source=source)
+    assert (proc.stdout, proc.stderr) == ("", "")
+
+
+def test_a_cwd_inside_no_checkout_gives_no_instruction_and_says_so(sb: Sandbox) -> None:
+    outside = sb.repo.parent / "no-checkout"
+    outside.mkdir()
+    proc = _seat_run(sb, "off", "builder", cwd=outside)
+    assert proc.stdout == "" and "inside no checkout" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])

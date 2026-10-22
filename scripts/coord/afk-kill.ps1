@@ -26,16 +26,15 @@
     broken read can never block a session from starting. A hook that cannot start at all (a cloud
     VM before cloud-setup.sh installs pwsh) prints nothing; that gap is outside this script.
 
-    WHEN THE SWITCH READS OFF, -Banner tells the session to load the driver and empower skills,
-    unless the seat is Special (owner approval 2026-10-22). The worktree is the one
-    scripts/hooks/_hookinput.ps1 resolves from the hook input, read-only, so a `cd` before a
-    compact or clear never names a sibling's. The seat is that worktree's `.claude/seat.local.txt`,
-    then $env:KORUS_SEAT; an alias of Special is Special, and an undeclared seat gets the
-    instruction. Every fault on this path prints no instruction and one stderr line, so it fails
-    toward no instruction rather than a wrong one. It never runs while the switch reads ON.
+    WHEN THE SWITCH READS OFF, -Banner may print the skill instruction ADR 0211 describes. Who gets
+    it is stated there. The seat is read the way scripts/hooks/role-card-inject.ps1 reads it: the
+    worktree the hook input's `cwd` sits in, its `.claude/seat.local.txt`, then $env:KORUS_SEAT,
+    then the roster's aliases. A fault on this path prints no instruction, so it fails toward no
+    instruction rather than a wrong one. It never runs while the switch reads ON.
 
-    It writes nothing. Of local state it reads only the seat marker, the roster and the session pin
-    _hookinput.ps1 reads, so it runs in a cloud session too, where the kill switch must hold as well.
+    It writes nothing. Of local state it reads at least the seat marker, the roster and the `.git`
+    entries above the hook input's `cwd`, and no coordination state, so it runs in a cloud session
+    too, where the kill switch must hold as well.
 #>
 param(
     [switch]$Status,
@@ -110,13 +109,18 @@ function Test-SkillInstructionDue {
     if ($env:KORUS_AGENT -eq 'codex') { return $false }  # the Skill tool is Claude Code's
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
     # The payload's worktree, never this process's: under the desktop app the hook runs in the
-    # PRIMARY checkout, whose marker names another session's seat.
-    $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
-    if (-not $s.Root) {
-        $why = if ($s.Reason) { $s.Reason } else { 'the hook input names no worktree' }
-        throw $why
-    }
-    $root = $s.Root
+    # PRIMARY checkout, whose marker names another session's seat. Walked up from the `cwd` as
+    # role-card-inject.ps1 walks it, NOT through Resolve-CcxHookSession's pin: the two hooks must
+    # name one seat at one SessionStart, or a session holds a Special card beside an instruction
+    # for non-Special seats. The pin would also refuse every /clear in a desktop-app worktree, the
+    # one source whose session has just lost both skills.
+    $text = Read-CcxHookInput
+    if ($script:CcxHookInputTimedOut) { throw 'the hook input was still open when the read stopped waiting' }
+    $p = Get-CcxHookPayloadCwd -Text $text
+    if ($p.Reason) { throw $p.Reason }
+    if (-not $p.Named) { throw 'the hook input names no cwd' }
+    $root = Get-CcxWorktreeRoot $p.Cwd
+    if (-not $root) { throw "the hook input's cwd $($p.Cwd) is inside no checkout" }
     $raw = $null
     $marker = Join-Path $root '.claude/seat.local.txt'
     if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
@@ -137,7 +141,9 @@ function Test-SkillInstructionDue {
 if (-not $sw.On) {
     try { $due = Test-SkillInstructionDue }
     catch {
-        # Said aloud, so a schema or payload change that silences every seat is not mistaken for Special.
+        # On stderr for whoever runs the hook by hand or reads the hook debug log. Claude Code does
+        # not show a hook's stderr at exit 0, so this is a diagnostic, not an alarm, and the tests
+        # are what catch a change that silences every seat.
         [Console]::Error.WriteLine("afk-kill.ps1: no skill instruction, because $($_.Exception.Message)")
         $due = $false
     }
@@ -145,7 +151,9 @@ if (-not $sw.On) {
         $text = 'Before your first other action, load the `driver` skill and then the `empower` skill ' +
             'with the Skill tool, as the owner instructs every non-Special seat. In a cloud session ' +
             '(CLAUDE_CODE_REMOTE=true) they may be named `anthropic-skills:driver` and ' +
-            '`anthropic-skills:empower`. If either is not available, say so in one line and continue.'
+            '`anthropic-skills:empower`. If either is not available, say so in one line and continue. ' +
+            'Skip any skill already loaded in this conversation. A Special seat skips this, including ' +
+            'one the owner names as Special in its first message.'
         Write-Output ('{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"' + (ConvertTo-JsonText $text) + '"}}')
     }
     exit 0
