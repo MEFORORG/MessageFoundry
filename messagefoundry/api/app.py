@@ -9868,15 +9868,21 @@ def create_app(
             if stopped is not None:
                 # One row per feed the re-check stopped, naming the rule and the frames sent
                 # (BACKLOG #3404). The gate audits its own refusals; without this a feed ended by
-                # an unmet second factor or a missing notification address left no trail. Written
-                # here, so a close that raised because the client was already gone still records
-                # it, and a lost row is logged at ERROR rather than hidden under that close's error.
+                # an unmet second factor or a missing notification address left no trail. The
+                # write sits here so a close that raised still records it. A lost row is logged at
+                # ERROR, not hidden under the close's error. A cancel waits a bounded time for the
+                # row, and logs it if it does not land (BACKLOG #3157).
+                stop_actor = handshake_identity.username
+                stop_detail = json.dumps({"reason": stopped, "frames": frames})
                 await write_audit_soft(
-                    lambda: engine_obj.store.record_audit(
-                        "ws_stats.stopped",
-                        actor=handshake_identity.username,
-                        detail=json.dumps({"reason": stopped, "frames": frames}),
-                        client=client_ip(websocket),
+                    lambda: _write_through_cancel(
+                        engine_obj.store.record_audit(
+                            "ws_stats.stopped",
+                            actor=stop_actor,
+                            detail=stop_detail,
+                            client=client_ip(websocket),
+                        ),
+                        lambda: _lost_row("ws_stats.stopped", stop_actor, stop_detail),
                     ),
                     log=_log,
                     message=(
@@ -9885,7 +9891,7 @@ def create_app(
                     ),
                     # Scrubbed for CodeQL py/log-injection, as the other lost-row lines are.
                     args=lambda: (
-                        scrub_log_argument(handshake_identity.username),
+                        scrub_log_argument(stop_actor),
                         scrub_log_argument(str(client_ip(websocket))),
                         stopped,
                         frames,

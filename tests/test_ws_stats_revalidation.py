@@ -577,7 +577,8 @@ async def test_a_failed_stop_row_write_is_logged_and_the_feed_still_closes(
             await real_send(message)
 
         harness._send = send_fails_on_close  # type: ignore[method-assign]
-    caplog.set_level(logging.ERROR, logger=app_module.__name__)
+    # Every level, so the token scan below reads every record, not only the ERROR ones.
+    caplog.set_level(logging.DEBUG)
     await harness.run(timeout=_HARNESS_TIMEOUT)
     assert harness.close_code == (None if close_raises else 1008)
     assert len(harness.frames) == 1, harness.frames
@@ -625,6 +626,49 @@ async def test_the_close_does_not_wait_for_the_stop_row(
     finally:
         release_write.set()
         await task
+
+
+async def test_a_stop_row_cut_short_by_a_cancel_is_logged(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3404: a cancel, as at shutdown, that lands while the stop row is being written
+    waits a bounded time, then lets the row go on alone. A row that then fails is logged at ERROR.
+    A cancel is no ``Exception``, so without that the row would be lost with no log line."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    monkeypatch.setattr(app_module, "_ROW_CANCEL_WAIT_SECONDS", 0.05)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    write_started = asyncio.Event()
+    fail_write = asyncio.Event()
+
+    async def slow_failing_write() -> None:
+        write_started.set()
+        await fail_write.wait()
+        raise RuntimeError("store refused the write")
+
+    _replace_the_stop_row_write(monkeypatch, engine, slow_failing_write)
+    _during_first_stats(monkeypatch, engine, lambda: _revoke(service, uid))
+    harness = _WSHarness(create_app(engine, auth=service), token)
+    caplog.set_level(logging.ERROR, logger=app_module.__name__)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await asyncio.wait_for(write_started.wait(), _HARNESS_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fail_write.set()
+    await asyncio.wait_for(
+        asyncio.gather(*app_module._UNLANDED_ROW_WRITES, return_exceptions=True), _HARNESS_TIMEOUT
+    )
+    await asyncio.sleep(0)  # the done callback that logs runs on the next turn
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == app_module.__name__ and record.levelno == logging.ERROR
+    ] == [
+        "an audit row's write did not land after its operation was cancelled. Lost row:"
+        ' action=ws_stats.stopped actor=op detail={"reason": "session_ended", "frames": 1}'
+    ]
 
 
 async def test_a_client_that_disconnects_mid_feed_records_no_stop(

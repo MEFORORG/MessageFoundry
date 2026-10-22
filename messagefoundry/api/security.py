@@ -2006,8 +2006,9 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
             return None
     # BACKLOG #195a (ASVS 16.3.2): audit the grant. Under [diagnostics].audit_all_authz — ON by default
     # since BACKLOG #1277 — every satisfied WS route is audited (PHI-view still excluded). THIS RUNS ONCE
-    # PER CONNECTION, NOT PER MESSAGE, so the shipped stats feed writes one row per connect however long
-    # it streams; that is why the flipped default costs nothing measurable here. With the switch off only
+    # PER CONNECTION, NOT PER MESSAGE, so the shipped stats feed writes one grant row per connect however
+    # long it streams, plus one ws_stats.stopped row if its re-check stops it (BACKLOG #3404); that is
+    # why the flipped default costs nothing measurable here. With the switch off only
     # the sensitive set is audited, and /ws/stats requires MONITORING_READ, which is not in it.
     audit_all = _audit_all_authz(websocket.app.state)
     audited = _grant_audit_permission(permissions, audit_all=audit_all)
