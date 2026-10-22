@@ -243,6 +243,13 @@ def test_the_removal_is_no_longer_handed_to_the_user_where_a_route_exists(
         assert "a session may run it" in reason
         assert "IF THE SCRIPT REFUSES, STOP" in reason
         assert "final for a session" in reason
+        # The owner's 2026-10-22 exception is named, and named as bounded: own tree, caches only,
+        # and the conditions live in WORKTREES.md rather than in a command the text prints.
+        folded = " ".join(reason.split())
+        assert "on this session's own tree" in folded, reason
+        assert "lists only regenerable cache directories" in folded, reason
+        assert 'docs\\WORKTREES.md, "Remove one"' in folded, reason
+        assert "Otherwise -Force is the user's switch" in folded, reason
 
 
 @pytest.mark.parametrize("verb", ["remove", "move"])

@@ -69,7 +69,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.1"
+$GateVersion = "2026.10.22.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -3888,7 +3888,9 @@ THERE IS NO CHECKED ROUTE FOR THIS TREE YET.
     directory and never the branch. Run exactly this line, with no other switch:
         $removeCmd
   * IF THE SCRIPT REFUSES, STOP. Tell the user what it refused and why, in its own words. A refusal
-    is final for a session: -Force is the user's switch, and so is any other route.
+    is final for a session, save one case: on this session's own tree, a refusal that lists only
+    regenerable cache directories may be re-run once with -Force, under the three conditions in
+    docs\WORKTREES.md, "Remove one". Otherwise -Force is the user's switch, and so is any other route.
 "@
         }
         elseif ($isSibling -and -not $isManaged) {
@@ -3917,7 +3919,8 @@ THERE IS NO CHECKED ROUTE FOR THIS TREE YET.
 session ends." The removal runs from OUTSIDE this tree, by the user or by a session
     standing somewhere else. It checks the tree first and removes the directory, never the branch:
         $removeCmd
-    Whoever runs it adds no other switch. If it refuses, that is final for a session.
+    Whoever runs it adds no other switch. If it refuses, that is final for a session, save the
+    cache-only case for a session's own tree in docs\WORKTREES.md, "Remove one".
 "@
         }
         elseif ($isSibling) {

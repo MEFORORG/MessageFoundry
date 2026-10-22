@@ -118,7 +118,9 @@ for the checkouts named in its allowlist:
    removal to the user. Owner instruction that day, in session: *"let's change the gate so that
    sessions can run these but still have the protection this was designed for"*. What is refused did
    not change. `-Force` stays the user's switch, and the text prints no `-Force` command. A refusal
-   from the script is final for a session. (Vault BACKLOG #1017.)
+   from the script is final for a session, save a cache-only refusal on the session's own tree,
+   which [WORKTREES.md](WORKTREES.md) section "Remove one" bounds (owner approval 2026-10-22).
+   (Vault BACKLOG #1017.)
 
    Some cases get no command. A tree under `.claude/worktrees` gets none, because the occupancy
    check cannot see a subagent there. The primary checkout gets none, because nothing removes it.
