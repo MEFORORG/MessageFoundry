@@ -22,10 +22,14 @@ Measured on uvicorn 0.54.0 and httptools 0.8.0. This suite pins httptools, and
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import tomllib
+from asyncio import proactor_events
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import httptools
 import pytest
@@ -33,8 +37,11 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from messagefoundry.api import create_app
-from messagefoundry.api.protocol_headers import floored_http_protocol_class
+from messagefoundry.api import create_app, protocol_headers
+from messagefoundry.api.protocol_headers import (
+    floored_http_protocol_class,
+    pinned_http_protocol_base,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_header_floor_wire import _ROOT, _served
@@ -47,7 +54,10 @@ _POST = b"POST /health HTTP/1.1\r\nHost: localhost\r\n"
 #: uvicorn's body for the 400 it writes itself when its parser refuses a request.
 _PARSER_400_BODY = b"Invalid HTTP request received."
 
-#: Ambiguous or malformed framing that llhttp refuses before the app runs.
+#: Ambiguous or malformed framing that llhttp refuses with one 400. Most shapes fail in the head,
+#: before the app runs. The two chunk shapes fail in the body, after uvicorn has started the app
+#: at the end of the head; the app may already be answering, and nothing it writes goes out after
+#: the 400 (``test_nothing_follows_the_parser_400_when_a_late_write_could_still_go_out``).
 _REFUSED: dict[str, bytes] = {
     "content-length with transfer-encoding": _POST
     + b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
@@ -181,6 +191,161 @@ async def test_the_api_refuses_ambiguous_request_framing(engine: Engine) -> None
             if statuses != [400] or not raw.endswith(_PARSER_400_BODY):
                 misses.append(f"{shape}: {raw!r}")
     assert not misses, "\n".join(misses)
+
+
+#: Requests whose 400 comes after the app has started: llhttp fails in the body. The pipelined case
+#: is a well-framed chunked request, answered from its head, with the refused one behind it. Its
+#: answer comes from a cycle that ``protocol.cycle`` no longer names, since the refused request's
+#: cycle replaced it.
+_LATE_ANSWERS: dict[str, bytes] = {
+    "chunk size not hex digits": _REFUSED["chunk size not hex digits"],
+    "chunk lines ended by bare LF": _REFUSED["chunk lines ended by bare LF"],
+    "a pipelined chunked request ahead of a refused one": _POST
+    + b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    + _REFUSED["chunk size not hex digits"],
+}
+#: What uvicorn's own protocol puts on the wire for each of them when the transport lets a write
+#: made after ``close()`` go out: its 400, then the app's late 411.
+_LATE_STATUSES = [400, 411]
+#: How long the selector stand-in below keeps a closed transport writable.
+_SELECTOR_LATE_CLOSE_S = 0.5
+
+
+def _proactor_close_as_in_cpython_3_14_9(self: Any) -> None:
+    """CPython 3.14.9's ``_ProactorBasePipeTransport.close``, run beside the installed release's
+    ``_loop_writing``. The connection is marked lost only when no write is pending. So a write
+    made after ``close()`` while the 400 is still in flight is sent. Earlier releases marked it lost
+    at once and dropped that write. This matches 3.14.9 only while the 400 is still pending, which
+    is the window the late 411 lands in."""
+    if self._closing:
+        return
+    self._closing = True
+    if not self._buffer and self._write_fut is None:
+        self._conn_lost += 1
+        self._loop.call_soon(self._call_connection_lost, None)
+    if self._read_fut is not None:
+        self._read_fut.cancel()
+        self._read_fut = None
+
+
+def _selector_close_with_the_400_unsent(self: Any) -> None:
+    """``_SelectorTransport.close`` as it behaves when the 400 did not go out in one send: the
+    connection stays writable until the buffer drains. Held open for a fixed time instead, since
+    a loopback send of a short 400 always completes at once."""
+    if self._closing:
+        return
+    self._closing = True
+    self._loop._remove_reader(self._sock_fd)
+
+    def finish() -> None:
+        # A reset may have closed it meanwhile, or the write handler may have, once buffered bytes
+        # drained on a closing transport (that path clears _sock without bumping _conn_lost). With
+        # bytes still buffered, the write handler closes it once they drain.
+        if self._conn_lost or self._sock is None or self._buffer:
+            return
+        self._conn_lost += 1
+        self._loop._remove_writer(self._sock_fd)
+        self._call_connection_lost(None)
+
+    self._loop.call_later(_SELECTOR_LATE_CLOSE_S, finish)
+
+
+def _let_a_write_after_close_go_out(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Make the running loop's socket transports send a write made after ``close()``, on any
+    CPython: the proactor the way 3.14.9 does, the selector the way it does for a 400 that did not
+    fit in one send. Returns how long a close may still be pending once the test is done."""
+    # By dotted name: typeshed does not declare the selector's private base transport.
+    if isinstance(asyncio.get_running_loop(), proactor_events.BaseProactorEventLoop):
+        monkeypatch.setattr(
+            "asyncio.proactor_events._ProactorBasePipeTransport.close",
+            _proactor_close_as_in_cpython_3_14_9,
+        )
+        return 0.0
+    monkeypatch.setattr(
+        "asyncio.selector_events._SelectorTransport.close", _selector_close_with_the_400_unsent
+    )
+    return _SELECTOR_LATE_CLOSE_S
+
+
+async def test_nothing_follows_the_parser_400_when_a_late_write_could_still_go_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The response-desync shape CPython 3.14.9 exposed. The app answers a refused request from
+    its head, with a chunked body's 411. llhttp then fails on the body, and uvicorn writes its 400
+    with ``connection: close``. A transport that still sends a write made after ``close()`` put
+    the app's answer on the wire behind that 400. The floor marks the cycles disconnected, so
+    exactly one 400 goes out.
+
+    The control is uvicorn's own protocol under the same patch. It must show the late answer, or
+    the patch reproduced nothing in this run and the floored leg proves nothing."""
+    pending_close = _let_a_write_after_close_go_out(monkeypatch)
+    async with _served(create_app(engine), http=pinned_http_protocol_base()) as port:
+        for shape, request in _LATE_ANSWERS.items():
+            statuses, raw = await _answers(port, request)
+            assert statuses == _LATE_STATUSES, f"control reproduced nothing, {shape}: {raw!r}"
+    misses = []
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        for shape, request in _LATE_ANSWERS.items():
+            statuses, raw = await _answers(port, request)
+            if statuses != [400] or not raw.endswith(_PARSER_400_BODY):
+                misses.append(f"{shape}: {raw!r}")
+    # Let the stand-in's delayed closes run here, not inside the next test on the shared loop.
+    await asyncio.sleep(pending_close)
+    assert not misses, "\n".join(misses)
+
+
+class _Cycle:
+    """Just the cycle fields the 400 step reads and sets."""
+
+    def __init__(self, *, complete: bool = False) -> None:
+        self.response_complete = complete
+        self.disconnected = False
+        self.message_event = asyncio.Event()
+
+
+class _BrokenCycle:
+    @property
+    def response_complete(self) -> bool:
+        raise RuntimeError("torn down")
+
+
+def test_one_broken_cycle_does_not_leave_the_others_unmarked(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    open_cycle, done = _Cycle(), _Cycle(complete=True)
+    protocol_headers._end_the_open_cycles([_BrokenCycle(), open_cycle, done])
+    assert open_cycle.disconnected and open_cycle.message_event.is_set()
+    # A completed response stays as it was; only its waiters are woken.
+    assert not done.disconnected and done.message_event.is_set()
+    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1 and "http-400: cycle end" in hits[0] and "RuntimeError" in hits[0], hits
+
+
+def test_a_cycle_that_cannot_be_recorded_degrades(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    protocol_headers._remember_the_cycle(SimpleNamespace(), object())  # object() takes no weakref
+    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1 and "http-400: cycle record" in hits[0], hits
+
+
+def test_a_400_writer_that_raises_still_ends_the_open_cycles() -> None:
+    class _RaisingBase:
+        def send_400_response(self, msg: str) -> None:
+            raise RuntimeError("writer failed")
+
+    floored = protocol_headers._build_floored_http(_RaisingBase)
+    protocol: Any = floored()
+    protocol.transport = SimpleNamespace()
+    cycle = _Cycle()
+    protocol_headers._remember_the_cycle(protocol, cycle)
+    with pytest.raises(RuntimeError, match="writer failed"):
+        protocol.send_400_response("Invalid HTTP request received.")
+    assert cycle.disconnected and cycle.message_event.is_set()
 
 
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
