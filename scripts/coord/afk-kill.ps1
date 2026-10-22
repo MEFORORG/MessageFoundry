@@ -148,12 +148,16 @@ if (-not $sw.On) {
         $due = $false
     }
     if ($due -eq $true) {
+        # One text for every SessionStart source, with no "skip what is loaded" clause: after a
+        # compact or a /clear the summary may say both were loaded although their text is gone, and
+        # a resumed conversation may itself have been compacted. A redundant load costs one call.
         $text = 'Before your first other action, load the `driver` skill and then the `empower` skill ' +
             'with the Skill tool, as the owner instructs every non-Special seat. In a cloud session ' +
             '(CLAUDE_CODE_REMOTE=true) they may be named `anthropic-skills:driver` and ' +
             '`anthropic-skills:empower`. If either is not available, say so in one line and continue. ' +
-            'Skip any skill already loaded in this conversation. A Special seat skips this, including ' +
-            'one the owner names as Special in its first message.'
+            'Load both even if this conversation, or a summary of it, says they were loaded: a ' +
+            'compaction or a /clear drops their text, so load them again. A Special seat skips this, ' +
+            'including one the owner names as Special in its first message.'
         Write-Output ('{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"' + (ConvertTo-JsonText $text) + '"}}')
     }
     exit 0

@@ -198,11 +198,25 @@ def test_the_instruction_names_the_cloud_skill_names(sb: Sandbox) -> None:
     assert all(name in text for name in CLOUD_NAMES), text
 
 
-def test_the_instruction_tells_a_late_special_and_a_loaded_session_to_skip_it(sb: Sandbox) -> None:
-    # A Special seat declares late, so an undeclared one is told here; a resume already holds both.
+def test_the_instruction_tells_a_late_special_to_skip_it(sb: Sandbox) -> None:
+    # A Special seat declares late, so an undeclared one is told here.
     text = _instruction(_seat_banner(sb, "off", None))
     assert "A Special seat skips this" in text
-    assert "already loaded" in text
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "compact", "clear", ""])
+def test_every_source_is_told_to_load_both_again_and_never_to_skip_a_loaded_one(
+    sb: Sandbox, source: str
+) -> None:
+    # After a compact or a /clear the summary may say both skills were loaded although their text
+    # is gone, and a resumed conversation may itself have been compacted, so no source may carry a
+    # clause that lets the session skip a skill it believes it holds.
+    text = _instruction(_seat_run(sb, "off", "builder", source=source).stdout)
+    assert text, source
+    assert "Load both even if this conversation, or a summary of it, says they were loaded" in text
+    assert "load them again" in text
+    lowered = text.lower()
+    assert "skip any skill" not in lowered and "already loaded" not in lowered, text
 
 
 def test_korus_seat_names_the_seat_when_the_marker_does_not(sb: Sandbox) -> None:
