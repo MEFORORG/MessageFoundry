@@ -145,6 +145,23 @@
             "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling, filesystem scans and AFK tripwires"
           }
         ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/enter-worktree-check.ps1"
+            ],
+            "timeout": 60,
+            "statusMessage": "Checking whether this worktree is safe to enter without asking"
+          }
+        ]
       }
     ],
     "PreCompact": [
