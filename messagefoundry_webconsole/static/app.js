@@ -581,6 +581,73 @@
     });
   });
 
+  // ADR 0197 Amendment A, wave 2: the combined passkey sign-in on the login page. The begin leg is a
+  // same-origin POST that stages a usernameless challenge (its handle comes back as an HttpOnly
+  // cookie); the browser offers its discoverable passkeys for this site; the assertion then rides
+  // the sign-in form beside the username and password, and the form is submitted as usual.
+  feature("[data-mf-passkey-sign-in]", function (button) {
+    var status = statusNode(button);
+    if (!window.PublicKeyCredential) {
+      button.disabled = true;
+      status.set("This browser does not support passkeys.");
+      return;
+    }
+    button.addEventListener("click", async function () {
+      var form = button.form;
+      var user = form && form.querySelector("input[name=username]");
+      var pw = form && form.querySelector("input[name=password]");
+      var field = form && form.querySelector("input[name=passkey_assertion]");
+      if (!form || !field || !user || !pw || !user.value || !pw.value) {
+        status.set("Enter your username and password, then use your passkey.");
+        return;
+      }
+      button.disabled = true;
+      status.set("Follow your browser's prompt…");
+      try {
+        var begin = await fetch(button.getAttribute("data-mf-passkey-sign-in"), {
+          method: "POST",
+          credentials: "same-origin",
+          redirect: "manual",
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+        });
+        if (!begin.ok) {
+          status.set(
+            begin.status === 429
+              ? "Too many attempts — wait a moment and try again."
+              : "Passkey sign-in is not available right now."
+          );
+          button.disabled = false;
+          return;
+        }
+        var options = (await begin.json()).options;
+        options.challenge = b64urlToBytes(options.challenge);
+        (options.allowCredentials || []).forEach(function (c) {
+          c.id = b64urlToBytes(c.id);
+        });
+        var cred = await navigator.credentials.get({ publicKey: options });
+        field.value = JSON.stringify({
+          id: cred.id,
+          rawId: bytesToB64url(cred.rawId),
+          type: cred.type,
+          clientExtensionResults: cred.getClientExtensionResults(),
+          response: {
+            clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+            authenticatorData: bytesToB64url(cred.response.authenticatorData),
+            signature: bytesToB64url(cred.response.signature),
+            userHandle: cred.response.userHandle && bytesToB64url(cred.response.userHandle),
+          },
+        });
+        status.set("Passkey ready — signing in…");
+        form.submit();
+        return;
+      } catch (e) {
+        status.set("Passkey prompt was cancelled or failed.");
+      }
+      button.disabled = false;
+    });
+  });
+
   // --- Adjustable tables: click-to-sort + drag-to-resize columns, remembered per table -----------
   // Enhances every server-rendered grid table (data-mf-table, emitted by _html.rows_table). Pure DOM
   // APIs only — never innerHTML from cell data (CSP script-src 'self'; cells are already server-escaped;

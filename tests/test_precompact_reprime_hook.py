@@ -393,7 +393,13 @@ def test_a_missing_shared_library_costs_the_age_and_not_the_reprime(
     planted = tmp_path / "scripts" / "hooks" / HOOK.name
     planted.parent.mkdir(parents=True)
     shutil.copy2(HOOK, planted)
-    assert not (tmp_path / "scripts" / "coord").exists(), "the library must be unreachable"
+    # The resolver comes along, so this arm still measures what it was written for: the UTC helper's
+    # absence. A missing resolver is a different, deliberate skip (docs/COORD-SHARED-ROOT.md).
+    (tmp_path / "scripts" / "coord").mkdir()
+    shutil.copy2(HOOK.parents[1] / "coord" / "coord-root.ps1", tmp_path / "scripts" / "coord")
+    assert not (tmp_path / "scripts" / "coord" / "config-roots.ps1").exists(), (
+        "the library must be unreachable"
+    )
 
     _declaration(repo, goal="survive a missing library")
     out = run_hook(repo, _COMPACT_RESTART, script=planted)

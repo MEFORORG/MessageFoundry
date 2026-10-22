@@ -85,6 +85,19 @@
           },
           {
             "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/coord/afk-kill.ps1",
+              "-Banner"
+            ],
+            "timeout": 20,
+            "statusMessage": "Reading the AFK kill switch"
+          },
+          {
+            "type": "command",
             "shell": "bash",
             "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; bash \"${CLAUDE_PROJECT_DIR}/scripts/hooks/cloud-setup.sh\"",
             "timeout": 300,
@@ -125,10 +138,11 @@
               "--user-hook=worktree_gate",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-api-burn.ps1",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1"
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/afk-tripwire.ps1"
             ],
-            "timeout": 60,
-            "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling and filesystem scans"
+            "timeout": 75,
+            "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling, filesystem scans and AFK tripwires"
           }
         ]
       }

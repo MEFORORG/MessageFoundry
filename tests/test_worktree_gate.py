@@ -610,29 +610,84 @@ def test_a_crafted_target_cannot_forge_an_instruction_in_the_deny_text(
 # --------------------------------------------------------------------------- rule 2: dispatch
 
 
+_NO_TYPE = object()
+
+
+def dispatch(
+    cwd: Path, tool: str, subagent_type: object = _NO_TYPE, key: str = "subagent_type"
+) -> dict[str, Any]:
+    tool_input: dict[str, Any] = {"prompt": "go"}
+    if subagent_type is not _NO_TYPE:
+        tool_input[key] = subagent_type
+    return {"session_id": "s-1", "cwd": str(cwd), "tool_name": tool, "tool_input": tool_input}
+
+
 @pytest.mark.parametrize("tool", ["Task", "Agent", "Workflow"])
 def test_dispatch_from_the_primary_is_denied(primary: Path, repos_file: Path, tool: str) -> None:
     """A subagent inherits this cwd, cannot make itself a worktree, and its denied edits do not reliably
-    surface to the parent -- so the fan-out is stopped at the cheapest possible point."""
-    payload = {
-        "session_id": "s-1",
-        "cwd": str(primary),
-        "tool_name": tool,
-        "tool_input": {"prompt": "go"},
-    }
-    reason = assert_denied(run_gate(payload, repos_file))
+    surface to the parent -- so the fan-out is stopped at the cheapest possible point. These payloads
+    carry no subagent_type, so they are also the missing-type case of the exemption below."""
+    reason = assert_denied(run_gate(dispatch(primary, tool), repos_file))
     assert "subagent" in reason.lower()
 
 
+@pytest.mark.parametrize(
+    ("tool", "subagent_type"),
+    [
+        ("Agent", "web-fetch"),
+        ("Agent", "claude-code-guide"),
+        ("Task", "web-fetch"),
+        ("Task", "claude-code-guide"),
+    ],
+)
+def test_exempt_subagent_types_may_dispatch_from_the_primary(
+    primary: Path, repos_file: Path, tool: str, subagent_type: str
+) -> None:
+    """docs/AUTONOMY-PLAN.md section 6, item 1 (owner authorization 2026-10-21): these two built-in types
+    carry no shell and no write tool, so inheriting the primary's cwd cannot build or swap anything."""
+    assert run_gate(dispatch(primary, tool, subagent_type), repos_file) is None
+
+
+@pytest.mark.parametrize(
+    ("tool", "subagent_type"),
+    [
+        ("Agent", "Explore"),  # has Bash: a shell write evades rule 1
+        ("Agent", "Plan"),
+        # No shell, but has Edit: "no shell" alone is not the criterion.
+        ("Agent", "statusline-setup"),
+        ("Agent", "general-purpose"),
+        ("Agent", "fork"),
+        ("Agent", "explore"),
+        ("Agent", "Web-Fetch"),  # the match is case-sensitive
+        ("Agent", " web-fetch"),  # and exact: no trimming
+        # The match is ORDINAL: PowerShell's culture comparison ignores these characters, so -ceq/-cin
+        # would let each through.
+        ("Agent", "web-fetch\u200b"),
+        ("Agent", "web\u00ad-fetch"),
+        ("Agent", "claude-code\u200d-guide"),
+        ("Agent", ["web-fetch"]),  # a non-string must not be cast into a match
+        ("Agent", None),  # an explicit JSON null
+        ("Workflow", "web-fetch"),  # the exemption is for Agent/Task only
+    ],
+)
+def test_other_dispatches_from_the_primary_stay_denied(
+    primary: Path, repos_file: Path, tool: str, subagent_type: object
+) -> None:
+    reason = assert_denied(run_gate(dispatch(primary, tool, subagent_type), repos_file))
+    assert "subagent" in reason.lower()
+
+
+def test_a_wrong_case_subagent_type_key_is_not_read(primary: Path, repos_file: Path) -> None:
+    """A PSCustomObject property read ignores case, so the KEY must be matched ordinally too: the Agent
+    tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash. This covers a
+    lone wrong-case key only. A payload carrying both spellings makes ConvertFrom-Json throw, and the
+    gate's parse fails open for every rule; that predates this exemption."""
+    payload = dispatch(primary, "Agent", "web-fetch", key="SUBAGENT_TYPE")
+    assert_denied(run_gate(payload, repos_file))
+
+
 def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -> None:
-    worktree = tmp_path / "Repo-alerts"
-    payload = {
-        "session_id": "s-1",
-        "cwd": str(worktree),
-        "tool_name": "Task",
-        "tool_input": {"prompt": "go"},
-    }
-    assert run_gate(payload, repos_file) is None
+    assert run_gate(dispatch(tmp_path / "Repo-alerts", "Task"), repos_file) is None
 
 
 # --------------------------------------------------------------------------- rule 4: EnterWorktree
@@ -1283,3 +1338,53 @@ def test_a_HEAD_move_in_an_isolated_builders_own_nested_tree_is_allowed(
         capture_output=True,
     )
     assert run_gate(bash("git merge main", cwd=own), hijack_repos_file) is None
+
+
+# ------------------------------------------- rule 1b on the SHARED coordination root
+# docs/COORD-SHARED-ROOT.md moves seats, mail, claims and allocations onto a share both PCs reach. Rule 1
+# never governed that path, so without this a write tool could hand-write claims/<item>.json there: the
+# transfer rule 1b refuses locally. The control (nothing configured -> ALLOW) is what shows the new
+# check is the thing that fires, rather than some older rule.
+
+
+@pytest.fixture
+def shared_root(tmp_path: Path) -> Path:
+    d = tmp_path / "share" / "mefor-coord"
+    d.mkdir(parents=True)
+    return d
+
+
+@pytest.mark.parametrize("rest", ["claims/1032.json", "alloc/adr/0200.json", "seats/wt-1/s1.json"])
+def test_shared_root_registries_are_denied_when_named_by_env(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    target = shared_root / rest
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    assert run_gate(edit(target, cwd=worktree), repos_file) is None  # control: ungoverned before
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    reason = assert_denied(run_gate(edit(target, cwd=worktree), repos_file))
+    assert "SHARED coordination root" in reason
+    assert "new.ps1" not in reason
+
+
+def test_shared_root_named_by_root_toml_is_governed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    local = primary / ".git" / "mefor-coord"
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '{shared_root}'\n", encoding="utf-8")
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert_denied(run_gate(edit(shared_root / "claims" / "7.json", cwd=worktree), repos_file))
+
+
+def test_a_document_on_the_shared_root_is_still_allowed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert (
+        run_gate(edit(shared_root / "handoffs" / "RESUME-HERE.md", cwd=worktree), repos_file)
+        is None
+    )

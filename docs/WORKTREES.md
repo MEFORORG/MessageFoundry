@@ -1546,7 +1546,10 @@ registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.js
 1. a **`Write`/`Edit`/`MultiEdit`/`NotebookEdit` whose target path is inside the primary's working tree**;
 2. a **`Task`/`Agent`/`Workflow` dispatch made from the primary** — a subagent inherits the parent's cwd,
    can't create a worktree for itself, and its blocked edits don't reliably surface back to the parent, so
-   a fan-out from the primary would *appear* to succeed while writing nothing.
+   a fan-out from the primary would *appear* to succeed while writing nothing. Only an `Agent`/`Task` call
+   whose `subagent_type` is exactly `web-fetch` or `claude-code-guide`, built-in types with neither a
+   shell nor a write tool, passes. The comment block above `Rule 2 --` in the gate says why and names the
+   residuals.
 3. an **`EnterWorktree` tool call**, which relocates a **live** session into a worktree — that re-files the
    session's chat transcript under the worktree's slug, so the conversation drops out of the session list of
    the window it was born in (nothing is deleted; the window just stops looking there). Open a **fresh**
@@ -1562,7 +1565,8 @@ blocked.
 >
 > Weigh it with rules 2 and 3 together before you activate. Rule 2 denies a fan-out **from** the primary and
 > rule 3 denies relocating **into** a worktree, so with both live a primary-resident session has **no
-> in-session path to a subagent at all** — it must be *started* in a worktree. That is the safe pattern, but
+> in-session path to a subagent that can build** (rule 2 passes only `web-fetch` and `claude-code-guide`)
+> — it must be *started* in a worktree. That is the safe pattern, but
 > it is a hard stop rather than a nudge, and it makes workflow-by-default impossible from the directory
 > sessions naturally open in.
 >

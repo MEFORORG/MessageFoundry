@@ -1883,9 +1883,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is
     # discarded and never compared. ``check_credential_generation`` (Manager decision 2026-09-29)
     # draws one temporary credential from the CSPRNG through the same generator the engine issues
-    # with, to prove the policy leaves one to issue; the value is discarded.
+    # with, to prove the policy leaves one to issue; the value is discarded. Wave 2 (BACKLOG #3373):
+    # the census hashes an account's passkey set (``passkey_digest``, SHA-256) to compare it with the
+    # digest the account's seal covers, so a passkey row flipped outside the store is not counted.
     "messagefoundry/verify/checks.py": frozenset(
-        {"csprng:via messagefoundry.auth.service", "mac:via messagefoundry.auth.service"}
+        {
+            "csprng:via messagefoundry.auth.service",
+            "hash:via messagefoundry.auth.service",
+            "mac:via messagefoundry.auth.service",
+        }
     ),
     # Vault BACKLOG #2764: the issued step-up continuations are keyed by the session token's SHA-256
     # (hash_token), so the table never holds a raw token. A lookup key, not a credential check.
@@ -2655,6 +2661,22 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
     # session id or a notice key.
     "scripts/hooks/_hookinput.ps1": frozenset({"hash:SHA256"}),
+    # Three CSPRNG bytes as the suffix of a decision record id, after its millisecond UTC stamp, so
+    # two records written in the same millisecond are unlikely to collide (24 bits, so not
+    # impossible). A collision costs at least a record: the log's reader keys records by id, and
+    # the spool's final move refuses to overwrite. An identifier, not a secret or a token: nothing
+    # is authorized by knowing an id.
+    "scripts/coord/_decisionlog.ps1": frozenset({"csprng:RandomNumberGenerator"}),
+    # --- The AFK digest (ADR 0211 section 5): an audit draw, not an identifier. No secret. ---
+    # The CSPRNG orders the day's Class B decisions to draw the owner's blind-rating sample, which
+    # feeds a calibration audit of the seats' judgment, so the draw should not be predictable in
+    # advance. It is not a control against a session: the draw is saved to a local file any session
+    # on the machine can read, delete or rewrite, and the ADR says who rates is a rule, not a
+    # control. The SHA-256 of "<id>|<option>" fixes the order a sampled decision's options are shown
+    # in, so the number the owner rates maps back to an option. It hides the recommendation from
+    # the digest's reader only; the decision record itself names the recommendation, and any
+    # session can read the record.
+    "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
 }
 
 

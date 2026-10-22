@@ -38,7 +38,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
 
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
-PW = "a-strong-test-passphrase"
+PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms: satisfies the ASVS policy (WP-3)
 
 #: Set ``extensions={HEADERLESS_UI_REQUEST: True}`` on one request to send it as a program would,
 #: with no fetch metadata at all. ``conftest.py`` otherwise gives a state-changing /ui request the
@@ -188,13 +188,14 @@ async def bearer(client: httpx.AsyncClient, username: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def seed_message(engine: Engine) -> str:
-    """One delivered-shaped message in the store, so a filter has something to include or exclude."""
+async def seed_message(engine: Engine, raw: str = ADT, control_id: str = "MSG1") -> str:
+    """One delivered-shaped message in the store, so a filter has something to include or exclude.
+    ``raw`` and ``control_id`` default to the synthetic ``ADT``; pass another body to seed it."""
     return await engine.store.enqueue_message(
         channel_id="ch1",
-        raw=ADT,
-        deliveries=[("archive", ADT)],
-        control_id="MSG1",
+        raw=raw,
+        deliveries=[("archive", raw)],
+        control_id=control_id,
         message_type="ADT^A01",
         source_type="file",
     )

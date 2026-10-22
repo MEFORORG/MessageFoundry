@@ -77,6 +77,7 @@ def _checkout(path: Path, adrs: dict[str, str]) -> Path:
     (path / "scripts" / "coord").mkdir(parents=True)
     (path / "docs" / "adr").mkdir(parents=True)
     shutil.copy2(_ALLOC, path / "scripts" / "coord" / "alloc.ps1")
+    shutil.copy2(_ALLOC.parent / "coord-root.ps1", path / "scripts" / "coord" / "coord-root.ps1")
     for name, body in adrs.items():
         (path / "docs" / "adr" / name).write_text(body, encoding="utf-8")
     (path / "docs" / "BACKLOG.md").write_text(

@@ -52,6 +52,7 @@ def _checkout(path: Path) -> Path:
     (path / "scripts" / "coord").mkdir(parents=True)
     (path / "docs" / "adr").mkdir(parents=True)
     shutil.copy2(_ALLOC, path / "scripts" / "coord" / "alloc.ps1")
+    shutil.copy2(_ALLOC.parent / "coord-root.ps1", path / "scripts" / "coord" / "coord-root.ps1")
     (path / "docs" / "adr" / "0001-first.md").write_text("# First\n", encoding="utf-8")
     _git("init", "-b", "main", ".", cwd=path)
     _git("config", "user.email", "t@e.com", cwd=path)

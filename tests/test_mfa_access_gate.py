@@ -838,12 +838,13 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
             assert row is not None and row.totp_enabled and not row.password_generated
 
 
-async def test_a_passkey_does_not_open_the_rotation_gate_and_cannot_be_the_first_factor(
+async def test_a_passkey_that_is_not_discoverable_does_not_open_the_rotation_gate(
     engine: Engine,
 ) -> None:
-    """ADR 0197 Amendment A, AC-A3, wave 1: a passkey is a second factor but not a way past the
-    sign-in lock, so an account holding only a passkey is still refused the rotation, and a covered
-    account with no TOTP is refused a passkey registration."""
+    """ADR 0197 Amendment A, AC-A3: a passkey not recorded as discoverable is a second factor but
+    not a way past the sign-in lock, so an account holding only such a passkey is still refused the
+    rotation. From wave 2 a passkey registration may START, because its options require a
+    discoverable credential; the finish refuses one its client reports is not (test_webauthn.py)."""
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     await _add(service, "pk")
     await _add_passkey(service, "pk")
@@ -858,10 +859,6 @@ async def test_a_passkey_does_not_open_the_rotation_gate_and_cannot_be_the_first
 
     with pytest.raises(FactorEnrolmentRequired):
         await service.change_password(out.identity, PW2)
-    with pytest.raises(FactorEnrolmentRequired):
-        await service.begin_webauthn_registration(
-            out.identity, token=out.token, rp_id="t", rp_name="t"
-        )
 
 
 async def test_an_account_with_no_must_change_flag_is_gated_on_the_json_plane(

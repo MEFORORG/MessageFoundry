@@ -118,8 +118,24 @@ try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
-$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-$claimsDir = if ($ClaimsDir) { $ClaimsDir } else { Join-Path $common "mefor-coord/claims" }
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("claim-adjudicate.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was scanned.")
+    exit 2
+}
+. $coordRootScript
+
+if ($ClaimsDir) { $claimsDir = $ClaimsDir }
+else {
+    # A read-only report, but a report over a fallback registry would read as the fleet's. Say why and stop.
+    $resolved = Resolve-CoordDir -From $repo -Kind 'claims'
+    if ($resolved.Error) {
+        [Console]::Error.WriteLine("claim-adjudicate.ps1: the claim registry could not be resolved, so nothing was scanned: $($resolved.Error)")
+        exit 2
+    }
+    $claimsDir = $resolved.Path
+}
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
 
 function ConvertTo-Norm([string]$Path) {
@@ -294,7 +310,21 @@ foreach ($f in $files) {
     $branch = [string]$c.branch
     $note = [string]$c.note
 
-    $exists = $holder -and (Test-Path -LiteralPath $holder)
+    # A record from ANOTHER machine names a path on that machine's disk, so Test-Path here says
+    # nothing about it (docs/COORD-SHARED-ROOT.md). It reads as held, never as gone or stranded. No
+    # `host` field means this machine: every record written before the field was written here.
+    if (-not (Test-CoordRecordIsHere $c)) {
+        $recHost = Get-CoordRecordHost $c
+        if (-not $IncludeHeld) {
+            $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
+                item = ""; banner = ""; citations = @(); verdict = "ELSEWHERE"
+                why = "ON $recHost -- not checkable here; adjudicate it from that machine" }
+            continue
+        }
+        # -IncludeHeld adjudicates against the banner alone, which no machine's disk decides.
+        $exists = $true
+    }
+    else { $exists = $holder -and (Test-Path -LiteralPath $holder) }
     if ($exists -and -not $IncludeHeld) {
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = ""; banner = ""; citations = @(); verdict = "HELD"
@@ -387,6 +417,7 @@ if ($Json) {
             blocking   = @($rows | Where-Object verdict -eq 'BLOCKING').Count
             noitem     = @($rows | Where-Object verdict -eq 'NO-ITEM').Count
             held       = @($rows | Where-Object verdict -eq 'HELD').Count
+            elsewhere  = @($rows | Where-Object verdict -eq 'ELSEWHERE').Count
             other      = @($rows | Where-Object { $_.verdict -in @('UNREADABLE', 'STRANDED-REGISTERED') }).Count
         }
         claims    = $rows
@@ -411,12 +442,14 @@ $blk = @($rows | Where-Object verdict -eq 'BLOCKING')
 $nit = @($rows | Where-Object verdict -eq 'NO-ITEM')
 $oth = @($rows | Where-Object { $_.verdict -in @('UNREADABLE', 'STRANDED-REGISTERED') })
 $hld = @($rows | Where-Object verdict -eq 'HELD')
+$els = @($rows | Where-Object verdict -eq 'ELSEWHERE')
 
 Write-Host "SUPERSEDED  $($sup.Count)   -- origin/main already protects the item; the claim adds nothing and can go" -ForegroundColor Green
 Write-Host "BLOCKING    $($blk.Count)   -- nothing on origin/main protects the item, so the key is stuck: unclaimable AND unbuilt" -ForegroundColor Yellow
 Write-Host "NO-ITEM     $($nit.Count)   -- key is outside the backlog namespace; this instrument does not reach it"
 if ($oth.Count) { Write-Host "OTHER       $($oth.Count)   -- unreadable, or a half-finished removal prune-merged.ps1 owns" }
 if ($hld.Count) { Write-Host "HELD        $($hld.Count)   -- holder exists; not adjudicated" }
+if ($els.Count) { Write-Host "ELSEWHERE   $($els.Count)   -- held on another machine; not checkable here, not adjudicated" }
 Write-Host ""
 
 if ($sup.Count) {

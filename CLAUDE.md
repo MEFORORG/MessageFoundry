@@ -680,6 +680,28 @@ never with mail. The evidence is probe PR
   into the PR body. Adding a dependency is not in
   this class: follow §7, edit `pyproject.toml` and re-lock. Parameterize SQL; catch exceptions
   specifically (§6).
+- **A command or script that would do harm on the wrong machine carries a circuit breaker (owner
+  ruling 2026-10-21),** including one handed to the owner or written into a file. A `hostname;`
+  prefix alone does not count: it shows the mistake only after the command has run. A pasted
+  command puts its whole body in an `else` that runs nothing elsewhere:
+
+      if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { ... }
+
+  A script checks its host first, right after any `param()`. A script with pipeline blocks checks
+  inside `begin {}`, added if it has none. Never wrap a script's body in an `else`: a `param()` block
+  inside one is not parsed as one. The scoped `Stop` makes the throw hold even when the caller
+  silences errors, and a caller can still catch it:
+
+      if ([Environment]::MachineName -ne '<HOST>') { & { $ErrorActionPreference = 'Stop'; throw "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } }
+
+  The check does not stop code that runs before it, such as a `param()` default or `ValidateScript`.
+  Nor does it stop a `clean {}` block, which runs after the throw. Keep machine-bound work out of
+  such code. Read the host from `[Environment]::MachineName`, not `$env:COMPUTERNAME`, which is
+  inherited and can be overwritten. On Windows, `<HOST>` is the NetBIOS name
+  `[Environment]::MachineName` prints there, at most 15 characters. No form uses `exit` or
+  `return`; `exit` closes the owner's PowerShell window when the text runs there. The
+  `MachineName` read, the ban on `exit` and `return`, and the scoped-`Stop` script form are Manager
+  decisions of 2026-10-21, from engine PR 2469.
 
 ---
 
@@ -864,9 +886,9 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   store), and conflating them causes real errors.
 - **ASVS vocabulary lives in [`scripts/asvs/CLAUDE.md`](scripts/asvs/CLAUDE.md).** Never say "vault
   cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor", and keep that apart
-  from *verifier drift*. The vocabulary is public; cell ids, coverage and gaps stay vaulted, and so
-  does any map pairing cell ids with paths. Quote a number the tool prints only with the ref pair it
-  prints beside it. The current score:
+  from *verifier drift*. The vocabulary is public; what of the scorecard may appear in a public
+  place is ruled in that file, and the content stays vaulted. Quote a number the tool prints only
+  in a private place, with the ref pair it prints beside it. The current score:
 
   ```
   python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status

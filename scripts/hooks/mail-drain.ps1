@@ -762,6 +762,8 @@ try {
     # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
     # anchor; say nothing and go.
     $common = & git -C $cwd rev-parse --path-format=absolute --git-common-dir 2>$null
+    # The directory git answered for, so the shared-root lookup below asks the same repository.
+    $coordFrom = $cwd
     if ($LASTEXITCODE -ne 0 -or -not $common) {
         # A FAILED PROBE IS NOT PROOF OF "NOT A REPO", so three things must hold before the anchor is
         # honoured. Each one closes a measured way a REAL worktree fails this probe, and the whole
@@ -781,11 +783,36 @@ try {
         if ($LASTEXITCODE -ne 0) { exit 0 }
         $common = & git -C $AnchorRepo rev-parse --path-format=absolute --git-common-dir 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+        $coordFrom = $AnchorRepo
+    }
+    # mail/ is a SHARED kind, so the queue is coord-root.ps1's answer (docs/COORD-SHARED-ROOT.md); with
+    # nothing configured it is <common>/mefor-coord/mail, as before. The box KEY is unchanged: it is
+    # still this session's own cwd, so the same box is read on whichever root holds it.
+    #
+    # A ROOT THAT DOES NOT ANSWER IS NOT AN EMPTY BOX, AND THIS HOOK MUST NOT HANG OR BLOCK. The
+    # resolver answers a dead share in one bounded probe and caches the verdict, and on Error the drain
+    # reads nothing and says so ONCE in a line -- as context at SessionStart, on stderr at Stop, because
+    # output at Stop re-wakes the model. It never falls back to the local queue: mail sent from the
+    # other PC is not there, so a local read would render "no mail" for mail that exists.
+    $localCoordRoot = Join-Path $common.Trim() 'mefor-coord'
+    # A missing resolver is the same skip as a dead root: never a read of a local copy of a shared kind.
+    $coordRootLib = "$PSScriptRoot\..\coord\coord-root.ps1"
+    $mr = @{ Path = $null; Error = "$coordRootLib is missing" }
+    if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
+        . $coordRootLib
+        $mr = Resolve-CoordSharedRoot -From $coordFrom -LocalRoot $localCoordRoot
+    }
+    if ($mr.Error) {
+        $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
+            "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
+        if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
+        else { Write-Injection -Event $eventName -Text $note }
+        exit 0
     }
     # The coordination root is named in its own variable because the receipt sweep's citation guard
-    # reads the coordination tree OUTSIDE mail/. Deriving it back out of $root with Split-Path would
-    # be a second spelling of the same path; two Join-Paths is one.
-    $coordRoot = Join-Path $common.Trim() 'mefor-coord'
+    # reads the coordination tree OUTSIDE mail/. On a shared root that is the share (seats/, handoffs/)
+    # AND the local tree, which still holds anything written before the move; see Get-CitedStems.
+    $coordRoot = $mr.Path
     $root = Join-Path $coordRoot 'mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
@@ -1082,7 +1109,23 @@ try {
             # tree, 2026-09-17 -- so a drain with nothing to sweep must not pay for it, and that is the
             # only reason the two passes exist.
             $citedStems = $null
-            try { $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX }
+            try {
+                if ([System.IO.Path]::GetFullPath($coordRoot).TrimEnd('\', '/') -ieq [System.IO.Path]::GetFullPath($localCoordRoot).TrimEnd('\', '/')) {
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
+                } else {
+                    # Both trees, when the shared root is not the local one. A citation in either
+                    # protects a receipt; a walk of only one would delete a receipt the other still
+                    # quotes. The share is walked WHOLE, minus its mail/, exactly as the local tree was
+                    # before the move: handoff documents land at the root and under handoff/ as well as
+                    # handoffs/, and a walk narrowed to named kinds deletes receipts cited elsewhere.
+                    # The local walk skips the local mail/ tree, whose own names would otherwise read
+                    # as citations.
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
+                    if (Test-Path -LiteralPath $localCoordRoot -PathType Container) {
+                        $citedStems.UnionWith((Get-CitedStems -CoordRoot $localCoordRoot -MailRoot (Join-Path $localCoordRoot 'mail') -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
+                    }
+                }
+            }
             catch { $citedStems = $null; $sweepFailed = $true }
             if ($null -eq $citedStems) { $receiptSweepSkipped = $true }
             else {

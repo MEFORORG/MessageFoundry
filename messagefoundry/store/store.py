@@ -2157,6 +2157,13 @@ class WebAuthnCredential:
     deliberately excluded from the store cipher and the id-keyed rekey loops). ``sign_count`` is a
     WebAuthn uint32 (0 is legitimate and permanent for synced passkeys); ``rp_id`` is pinned at
     mint time so an origin migration renders the row visibly unusable, never silently failing.
+
+    ``discoverable`` (ADR 0197 Amendment A, wave 2) records that the passkey was registered as a
+    discoverable credential: the ``credProps.rk`` the client reported, or the ``residentKey``
+    requirement the registration sent when it reported none. Only such a passkey can answer the
+    usernameless sign-in, so only it is a way past the sign-in lock. False on a row written before
+    the column existed, the closed direction. The account's seal covers it through the passkey
+    digest, so a row flipped outside the store fails the set.
     """
 
     credential_id_hash: str
@@ -2172,6 +2179,7 @@ class WebAuthnCredential:
     aaguid: str | None
     created_at: float
     last_used_at: float | None = None
+    discoverable: bool = False
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
@@ -2190,6 +2198,7 @@ class WebAuthnCredential:
             aaguid=d.get("aaguid"),
             created_at=float(d["created_at"]),
             last_used_at=_opt_float(d.get("last_used_at")),
+            discoverable=bool(d.get("discoverable", False)),
         )
 
 
@@ -2402,6 +2411,11 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
             if f.name in PASSKEY_DIGEST_EXCLUDED:
                 continue
             value = getattr(cred, f.name)
+            # ADR 0197 Amendment A, wave 2: ``discoverable`` enters the digest only when set. A row
+            # flipped to discoverable outside the store still fails its digest, and a passkey
+            # written before the column, which reads False, keeps the digest it was sealed under.
+            if f.name == "discoverable" and not value:
+                continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
@@ -2494,8 +2508,8 @@ _USER_ROLE_INSERT: Final = (
 _WEBAUTHN_INSERT: Final = (
     "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-    " aaguid, created_at, last_used_at)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " aaguid, created_at, last_used_at, discoverable)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
@@ -2545,6 +2559,7 @@ def webauthn_insert_params(cred: WebAuthnCredential) -> tuple[object, ...]:
         cred.aaguid,
         cred.created_at,
         cred.last_used_at,
+        bool(cred.discoverable),
     )
 
 
@@ -2640,13 +2655,278 @@ def lockout_clear(r: UserAuthzRecord, *, reset_cycles: bool, now: float) -> User
     return out.changed(lock_cycles=0, second_step_lock_cycles=0) if reset_cycles else out
 
 
+def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
+    """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
+    under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
+    #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
+    statement of the per-passkey rule: the store's conditional writes, the census, the service's
+    gates, the sign-in path and the lock notice all ask it."""
+    if not cred.discoverable:
+        return False
+    # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
+    # the store module takes no import-time dependency on the auth package.
+    from messagefoundry.auth.tokens import (
+        CREDENTIAL_ID_HASH_SCHEME,
+        CredentialHashSchemeError,
+        credential_id_hash_scheme,
+    )
+
+    try:
+        return credential_id_hash_scheme(cred.credential_id_hash) == CREDENTIAL_ID_HASH_SCHEME
+    except CredentialHashSchemeError:
+        return False
+
+
+def discoverable_way_past(
+    passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
+) -> bool:
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
+    half of
+    :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
+    match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
+    written or flipped outside the store must not count. The census asks it too."""
+    if sealed and passkey_digest(passkeys) != cred_digest:
+        return False
+    return any(passkey_is_way_past(c) for c in passkeys)
+
+
+#: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
+#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
+#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
+#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+TotpState = Literal["usable", "refused", "unknown"]
+
+#: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
+#: census rule. The store holds no TOTP logic, so the service passes it to the writes that ask.
+TotpUsable = Callable[[str | None], TotpState]
+
+#: Whether a record's TOTP counts as a way past, evaluated on the record a write read.
+TotpCounts = Callable[[UserAuthzRecord], bool]
+
+
+def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None:
+    """Refuse a conditional way-past write that brought no TOTP rule: without one an enrolment the
+    engine cannot compute with would count as a way past, which is the failure this rule exists to
+    stop (BACKLOG #3422). Raises :class:`ValueError`; every backend calls it first."""
+    if require_way_past and usable is None:
+        raise ValueError("a conditional way-past write needs totp_usable")
+
+
+#: When each account's TOTP cell was last logged as not opening (monotonic seconds), so a gate
+#: asked on every request logs an account at most once per :data:`_UNOPENED_TOTP_LOG_EVERY`
+#: rather than once per request, and a fault that recurs later is logged again. Account ids only.
+_UNOPENED_TOTP_LOGGED: dict[str, float] = {}
+_UNOPENED_TOTP_LOG_EVERY = 3600.0
+
+
+def log_unopened_totp(user_id: str) -> None:
+    """WARN, at most once an hour per account, that a TOTP cell did not open while judging a way
+    past the sign-in lock: a store-key fault or a cipher service that did not answer. The account id
+    only, never the cell or anything it holds."""
+    now = time.monotonic()
+    last = _UNOPENED_TOTP_LOGGED.get(user_id)
+    if last is not None and now - last < _UNOPENED_TOTP_LOG_EVERY:
+        return
+    _UNOPENED_TOTP_LOGGED[user_id] = now
+    log.warning(
+        "a TOTP cell did not open while judging a way past the sign-in lock (account %s): a store "
+        "key or cipher service fault; until it opens the TOTP is judged unknown and every gate "
+        "applies the plain enabled-TOTP rule to it",
+        user_id,
+    )
+
+
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable | None,
+    user: UserRecord | None,
+) -> TotpCounts | None:
+    """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
+    :func:`removal_keeps_way_past`, :func:`totp_removal` and :func:`lockout_increment`.
+
+    ``user`` is the account as read BEFORE the write takes its lock, so the cell is opened with
+    ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
+    with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
+    holding SQLite's writer lock or a row lock across it would stall every other write. Under the
+    lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each caller says
+    what a moved cell means for it. A cell that does not open is ``"unknown"``
+    (:func:`log_unopened_totp`), never a refusal. ``None`` for no ``usable``."""
+    if usable is None:
+        return None
+    rule = usable
+    cell = (
+        None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
+    )
+    state: TotpState = "refused"  # no cell: no TOTP to count
+    if user is not None and cell is not None:
+
+        def judge(user_id: str, stored: str) -> TotpState:
+            return rule(opener(user_id, stored))
+
+        try:
+            state = await asyncio.to_thread(judge, user.id, cell)
+        except CipherError:
+            log_unopened_totp(user.id)
+            state = "unknown"
+        if state not in ("usable", "refused", "unknown"):
+            # A bool rule (the old shape) would read False as "not refused", which fails open.
+            raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
+
+    return TotpJudgement(cell=cell, state=state)
+
+
+async def escalation_verdict(
+    get_user: Callable[[str], Awaitable[UserRecord | None]],
+    opener: Callable[[str, str | None], str | None],
+    user_id: str,
+    counter: LockoutCounter,
+    *,
+    totp_usable: TotpUsable,
+    threshold: int,
+    now: float,
+) -> TotpCounts | None:
+    """The TOTP verdict a SIGN-IN failure's escalation needs (BACKLOG #3422), judged with no lock
+    held (:func:`judge_totp`) on a local account with TOTP on whose sign-in lock is not already
+    live and can arm, and only where the pre-lock read says THIS failure sets a lock that the
+    verdict could shorten: the count reaches ``threshold`` and the lock is not the first of its
+    cycle count, since a first lock has the base length either way. So a wrong password below the
+    threshold costs no cipher call HERE. Other paths still open the cell per request, at least the
+    combined sign-in's code check and the lock notice.
+    Everywhere else ``None``, and no cell is opened; :func:`lockout_increment` then applies the
+    plain ``totp_enabled`` rule to the locked row, so a pre-read that a racing write made stale
+    (a parallel burst whose crossing failure read a lower count) escalates as before that rule
+    rather than skipping an escalation. The one copy every backend calls."""
+    if totp_usable is None:  # typed never None; refused loudly for a caller typed ``Any``
+        raise TypeError("increment_login_failure needs totp_usable, never None")
+    if counter != "sign_in":
+        return None
+    pre = await get_user(user_id)
+    if (
+        pre is None
+        or pre.auth_provider != "local"
+        or not pre.totp_enabled
+        or pre.password_generated
+        or pre.sign_in_locked(now)
+    ):
+        return None
+    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
+    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
+    if reaches < threshold or pre.lock_cycles < 1:
+        return None
+    return await judge_totp(opener, totp_usable, pre)
+
+
+@dataclass(frozen=True)
+class TotpJudgement:
+    """A :data:`TotpCounts` from :func:`judge_totp`: the cell it judged and what it found. Called
+    on the record a write locked, it says whether that row's TOTP counts as a way past: a usable or
+    an UNKNOWN one does, as the plain ``totp_enabled`` rule would count it, and only a KNOWN
+    refusal does not. A cell that moved since the judgement counts for nothing, the closed
+    direction for a gate that needs a way past to proceed."""
+
+    cell: str | None
+    state: TotpState
+
+    def __call__(self, current: UserAuthzRecord) -> bool:
+        return self.state != "refused" and current.row.totp_enabled and not self.moved(current)
+
+    def refuses(self, current: UserAuthzRecord) -> bool:
+        """Whether this is a KNOWN refusal of the TOTP the locked row still holds."""
+        return self.state == "refused" and current.row.totp_enabled and not self.moved(current)
+
+    def moved(self, current: UserAuthzRecord) -> bool:
+        """Whether the locked row's TOTP is not the one judged: enabled or replaced meanwhile."""
+        held = current.row.totp_secret if current.row.totp_enabled else None
+        return held != self.cell
+
+
+def _totp_is_way_past(record: UserAuthzRecord, totp_counts: TotpCounts | None) -> bool:
+    """Whether ``record``'s TOTP is a way past: what ``totp_counts`` (the caller's rule, BACKLOG
+    #3422) says of it. With no rule it counts for nothing, so a caller that forgot one fails closed
+    rather than letting an enrolment the engine cannot compute with count."""
+    return totp_counts is not None and totp_counts(record)
+
+
+def holds_way_past(
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+    *,
+    sealed: bool,
+    totp_counts: TotpCounts | None = None,
+) -> bool:
+    """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
+    a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
+    discoverable (wave 2).
+    ``passkeys`` is the account's set, read in the same transaction as the write that asks
+    (:func:`discoverable_way_past` says how it is trusted)."""
+    if _totp_is_way_past(record, totp_counts):
+        return True
+    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
+
+
+def removal_keeps_way_past(
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+    *,
+    sealed: bool,
+    drop_totp: bool = False,
+    drop_passkey: str | None = None,
+    totp_counts: TotpCounts | None = None,
+) -> bool:
+    """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
+    passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
+    ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
+    trusts it, so a set that fails its digest leaves nothing. TOTP counts as
+    :func:`_totp_is_way_past` says."""
+    row = record.row
+    if not drop_totp and _totp_is_way_past(record, totp_counts):
+        return True
+    remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
+    trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
+    return trusted and any(passkey_is_way_past(c) for c in remaining)
+
+
+def totp_removal(
+    now: float,
+    *,
+    require_way_past: bool,
+    passkeys: Sequence[WebAuthnCredential] = (),
+    sealed: bool = False,
+    totp_counts: TotpCounts | None = None,
+) -> UserChange:
+    """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
+    when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
+    plain ``totp_enabled`` rule counts it) and no discoverable passkey would remain
+    (:func:`removal_keeps_way_past`). Only a KNOWN refusal may go, and a TOTP enabled or replaced
+    between the judgement and this write is declined."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if require_way_past:
+            # A TOTP enabled or replaced since it was judged is declined, never counted as nothing:
+            # for a removal, nothing is the open direction (a fresh usable TOTP would be wiped).
+            if isinstance(totp_counts, TotpJudgement) and totp_counts.moved(r):
+                return None
+            if _totp_is_way_past(r, totp_counts) and not removal_keeps_way_past(
+                r, passkeys, sealed=sealed, drop_totp=True
+            ):
+                return None
+        return totp_disable(r, now)
+
+    return apply
+
+
 def password_change(
     *,
     password_hash: str,
     password_generated: bool,
     must_change_password: bool,
-    require_totp: bool,
+    require_way_past: bool,
     now: float,
+    passkeys: Sequence[WebAuthnCredential] = (),
+    sealed: bool = False,
+    totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2663,13 +2943,16 @@ def password_change(
     caller passing False has just authenticated the holder. Do not add a second writer of the
     column, and never set it back to NULL after creation.
 
-    With ``require_totp`` (ADR 0197 Amendment A) the write happens only while TOTP is on with a
-    secret, so an ``admin_reset_mfa`` landing first makes it write nothing. TOTP with no secret is
-    no way past the lock, hence the second test."""
+    With ``require_way_past`` (ADR 0197 Amendment A) the write happens only while the account
+    holds a way past the sign-in lock (:func:`holds_way_past`, over ``passkeys`` read in the same
+    transaction), so an ``admin_reset_mfa`` or a passkey removal landing first makes it write
+    nothing."""
     when = float(now)
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if require_totp and not (r.row.totp_enabled and r.row.totp_secret is not None):
+        if require_way_past and not holds_way_past(
+            r, passkeys, sealed=sealed, totp_counts=totp_counts
+        ):
             return None
         claimed = r.row.password_claimed_at
         if not must_change_password and claimed is None:
@@ -2699,9 +2982,14 @@ def lockout_increment(
     max_lockout_seconds: float,
     now: float,
     out: list[LockoutIncrement],
+    totp_counts: TotpCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
-    (:func:`next_lockout_state`). The answer is appended to ``out``."""
+    (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates as
+    the plain ``totp_enabled`` rule says on the locked row, EXCEPT where ``totp_counts`` holds a
+    KNOWN refusal of that exact cell (BACKLOG #3422): an enrolment this release refuses gives the
+    owner no way past, so its lock keeps the fixed length. An unknown verdict, a cell that moved,
+    and no verdict at all leave the plain rule standing."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
@@ -2714,7 +3002,14 @@ def lockout_increment(
             lockout_seconds=lockout_seconds,
             max_lockout_seconds=max_lockout_seconds,
             escalate=lockout_escalates(
-                counter, auth_provider=r.row.auth_provider, totp_enabled=r.row.totp_enabled
+                counter,
+                auth_provider=r.row.auth_provider,
+                totp_enabled=r.row.totp_enabled
+                and not (
+                    counter == "sign_in"
+                    and isinstance(totp_counts, TotpJudgement)
+                    and totp_counts.refuses(r)
+                ),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
@@ -6631,12 +6926,18 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with TOTP enrolled, because only that owner can use the
-      combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
-      account with TOTP enrolled included: it has no combined sign-in to get past its lock.
+    * the SIGN-IN lock on a local account with a TOTP enrolled, because that owner can use
+      the combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
+      account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
+      account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
+      too, and still keeps the fixed length: escalating would need the passkey set inside this
+      atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
 
-    Read by every backend inside its atomic increment, from ``auth_provider`` and ``totp_enabled``
-    on the row it locked, so the decision and the count come from one read."""
+    Read by every backend inside its atomic increment, from ``auth_provider`` on the row it locked.
+    For the SIGN-IN lock ``totp_enabled`` is the row's flag, cleared only by a KNOWN refusal of the
+    TOTP (BACKLOG #3422) judged before the lock on a cell the locked row still holds
+    (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
+    all leave the flag standing, as before that rule. The count itself stays atomic."""
     if auth_provider != "local":
         return False
     return counter == "second_step" or totp_enabled
@@ -7424,7 +7725,8 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
                                                -- backends (NVARCHAR/VARCHAR(100)) AND at the service
     aaguid             TEXT,
     created_at         REAL NOT NULL,
-    last_used_at       REAL
+    last_used_at       REAL,
+    discoverable       INTEGER NOT NULL DEFAULT 0  -- ADR 0197 Amendment A wave 2: registered as a discoverable credential
 );
 CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label);
@@ -9345,6 +9647,16 @@ class MessageStore:
         if "seal" not in approval_cols:
             await db.execute(
                 "ALTER TABLE pending_approvals ADD COLUMN seal TEXT NOT NULL DEFAULT ''"
+            )
+        # ADR 0197 Amendment A, wave 2: whether a passkey was registered as a discoverable
+        # credential. 0 on an existing row reads "not discoverable", so a passkey registered before
+        # the column is no way past the sign-in lock -- the closed direction. No backfill: nothing
+        # recorded it until now.
+        cur = await db.execute("PRAGMA table_info(webauthn_credentials)")
+        passkey_cols = {row["name"] for row in await cur.fetchall()}
+        if passkey_cols and "discoverable" not in passkey_cols:
+            await db.execute(
+                "ALTER TABLE webauthn_credentials ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 0"
             )
         await MessageStore._migrate_outbox_to_queue(db)
 
@@ -15249,18 +15561,30 @@ class MessageStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_totp: bool = False,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        change = password_change(
-            password_hash=password_hash,
-            password_generated=password_generated,
-            must_change_password=must_change_password,
-            require_totp=require_totp,
-            now=now,
+        require_totp_rule(require_way_past, totp_usable)
+        # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
         )
         async with _writer_guard(self._db, self._lock):
+            # The passkeys the condition reads are read under the same writer lock as the write.
+            change = password_change(
+                password_hash=password_hash,
+                password_generated=password_generated,
+                must_change_password=must_change_password,
+                require_way_past=require_way_past,
+                now=now,
+                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                sealed=self._row_sealer is not None,
+                totp_counts=totp_counts,
+            )
             written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
@@ -15416,15 +15740,39 @@ class MessageStore:
         tee_audits((audit,), appended, ts=now)
         return int(revoked.rowcount)
 
-    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
-        """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
+    async def disable_totp(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
+        """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
+        ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
+        discoverable passkey remains, read under the same writer lock (:func:`totp_removal`).
+        Returns whether a row was written."""
         now = time.time() if now is None else now
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with _writer_guard(self._db, self._lock):
             # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
-            await self._write_user(user_id, lambda r: totp_disable(r, now))
+            change = totp_removal(
+                now,
+                require_way_past=require_way_past,
+                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                sealed=self._row_sealer is not None,
+                totp_counts=totp_counts,
+            )
+            written = await self._write_user(user_id, change)
             await self._commit()
+        return written is not None
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         """The user's remaining single-use recovery-code hashes (argon2id), or ``[]``."""
@@ -15508,11 +15856,36 @@ class MessageStore:
             cur = await db.execute("SELECT 1 FROM webauthn_credentials LIMIT 1")
             return (await cur.fetchone()) is not None
 
-    async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
+    async def delete_webauthn_credential(
+        self,
+        user_id: str,
+        credential_id_hash: str,
+        *,
+        require_way_past: bool = False,
+        totp_usable: TotpUsable | None = None,
+    ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
-        account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
+        With ``require_way_past``, only while a way past remains after it, judged under the same
+        writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
+        require_totp_rule(require_way_past, totp_usable)
+        totp_counts = (
+            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
+            if require_way_past
+            else None
+        )
         async with _writer_guard(self._db, self._lock):
+            if require_way_past:
+                current = await self._read_user_record(user_id)
+                if current is None or not removal_keeps_way_past(
+                    current,
+                    await self._account_passkeys(user_id),
+                    sealed=self._row_sealer is not None,
+                    drop_passkey=credential_id_hash,
+                    totp_counts=totp_counts,
+                ):
+                    return False
             count = await self._write_passkeys(
                 user_id, _WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash)
             )
@@ -15752,6 +16125,7 @@ class MessageStore:
         threshold: int,
         lockout_seconds: float,
         max_lockout_seconds: float,
+        totp_usable: TotpUsable,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -15760,8 +16134,11 @@ class MessageStore:
         The re-read + compute + write run under one ``self._lock``, the way ``consume_totp_step``
         does, so two concurrent wrong credentials cannot both read the same pre-increment count and
         lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
-        this has to be one call rather than three; :func:`lockout_escalates` decides the escalation
-        from ``auth_provider`` and ``totp_enabled`` read in the SAME locked ``SELECT``.
+        this has to be one call rather than three. :func:`lockout_escalates` decides the escalation
+        from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
+        TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
+        later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
+        BACKLOG #3422). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
@@ -15774,6 +16151,15 @@ class MessageStore:
             max_lockout_seconds=max_lockout_seconds,
             now=now,
             out=out,
+            totp_counts=await escalation_verdict(
+                self.get_user,
+                self.open_totp_secret,
+                user_id,
+                counter,
+                totp_usable=totp_usable,
+                threshold=threshold,
+                now=now,
+            ),
         )
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, change)

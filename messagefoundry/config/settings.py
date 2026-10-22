@@ -5109,17 +5109,20 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #287 (ASVS 2.4.2): a dual-control release refused for arriving before the
         # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, which no connection can be named.
         "approval_too_early",
-        # BACKLOG #315: a release by an approver account changed after the request, and an
-        # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
-        # sign-in's role sync, and since vault BACKLOG #3141 by a directory reconcile pass (both
-        # granted_by `<directory>`).
+        # BACKLOG #315: the first is a release by an approver account changed after the request,
+        # keyed `approval:<id>`. Since BACKLOG #2125 it is also the resolution of an interrupted
+        # release by such an account, keyed `approval:<id>:resolve`. The second is an Administrator
+        # grant through the console API. Since vault BACKLOG #2610 a directory sign-in's role sync
+        # raises it too, and since vault BACKLOG #3141 a directory reconcile pass (both granted_by
+        # `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
         # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed
         # `user:<username>`, which no connection can be named.
         "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
-        # `approval:<id>`, which no connection can be named. Since vault BACKLOG #2254 also an
+        # `approval:<id>`, which no connection can be named. A resolution's lost provenance row is
+        # keyed `approval:<id>:resolve` (vault BACKLOG #3438). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:

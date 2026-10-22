@@ -14,9 +14,14 @@ SQL Server under ``UPDLOCK``.
 counter counts wrong passwords from a caller who has proved nothing. The second-step counter counts
 failures from a caller who has already proved one factor. Each carries its own lock and its own cycle
 count, and each lock doubles per cycle up to a ceiling only where the ADR says the owner has a way
-past it: the second-step lock on a local account, and the sign-in lock on a local account with TOTP
-enrolled. Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
-``auth_provider`` and ``totp_enabled`` read in the same locked ``SELECT`` as the count.
+past it: the second-step lock on a local account, and the sign-in lock on a local account with a
+TOTP enrolled, unless the caller's ``totp_usable`` rule KNOWS the enrolment is refused. A TOTP it
+cannot judge escalates, and so does a refused one whose judgement is missing (the race arms
+below). Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
+``auth_provider`` read in the same locked ``SELECT`` as the count and, for the sign-in lock, a
+refusal judged by the caller's rule before the lock, only for a failure whose pre-lock read says it
+would set a later-cycle lock, on a cell the locked row must still hold (BACKLOG #3422). The rule is a required
+argument, so no call omits it.
 
 **Three separate SQL bodies implement one security policy, which is what this module is for.** One
 shared body, invoked from all three suites, makes "the backends agree" an assertion rather than a
@@ -47,6 +52,17 @@ webauthn nor the harness extra.
 from __future__ import annotations
 
 from typing import Any
+
+import pytest
+
+from messagefoundry.auth.service import _opened_totp_state
+from messagefoundry.auth.tokens import credential_id_hash
+
+#: Discoverable passkeys stored under today's credential-id hash scheme (BACKLOG #3423): only such a
+#: row is a way past the sign-in lock, since only it can sign in.
+_PK_RESIDENT = credential_id_hash(b"rot-pk-resident")
+_PK_AGAIN = credential_id_hash(b"rot-pk-again")
+_RF_RESIDENT = credential_id_hash(b"rot-rf-resident")
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
@@ -84,6 +100,8 @@ async def _fail(
         lockout_seconds=lockout_seconds,
         max_lockout_seconds=MAX_LOCKOUT_SECONDS,
         now=now,
+        # The service's rule (BACKLOG #3422), a required argument.
+        totp_usable=_opened_totp_state,
     )
     return (result.attempts, result.just_locked, result.cycles)
 
@@ -106,6 +124,15 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_counters_stay_apart_and_clear(store)
     await _assert_generated_credential(store)
     await _assert_conditional_rotation(store)
+    await _assert_conditional_rotation_on_a_passkey(store)
+    await _assert_refused_totp_is_no_way_past(store)
+    await _assert_refused_totp_keeps_the_fixed_sign_in_lock(store)
+    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store, "outage")
+    await _assert_an_unknown_totp_behaves_as_an_enabled_one(store, "keyless")
+    await _assert_a_stale_pre_read_still_escalates(store)
+    for race in ("enabled", "replaced", "rekeyed"):
+        await _assert_no_verdict_falls_back_to_the_enabled_rule(store, race)
+    await _assert_a_wrong_password_below_the_threshold_opens_no_cell(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -397,6 +424,386 @@ async def _assert_generated_credential(store: Any) -> None:
         await store.delete_user(user_id)
 
 
+async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
+    """ADR 0197 Amendment A, wave 2: a passkey recorded as discoverable is a way past, so the
+    conditional rotation lands on an account holding one and no TOTP; a passkey that is not
+    discoverable is not, so the write matches no row. And removing the discoverable passkey between
+    the caller's check and the write refuses it, because the passkeys are read in the write's own
+    transaction."""
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="rot-pk1",
+        username="rot-pk-alice",
+        auth_provider="local",
+        password_hash="h-issued",
+        must_change_password=True,
+        password_generated=True,
+        now=1.0,
+    )
+
+    async def rotate() -> bool:
+        return bool(
+            await store.set_password(
+                "rot-pk1",
+                password_hash="h-chosen",
+                password_generated=False,
+                must_change_password=False,
+                require_way_past=True,
+                totp_usable=_opened_totp_state,
+            )
+        )
+
+    await store.add_webauthn_credential(_cred("rot-pk1", "plain", id_hash="rot-pk-plain"))
+    assert not await rotate(), "a passkey that is not discoverable opened the rotation"
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.password_hash == "h-issued" and user.password_generated
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "resident", id_hash=_PK_RESIDENT, created_at=2.0, discoverable=True)
+    )
+    # The caller "checks" here and sees it ... then the holder removes it before the write.
+    assert await store.delete_webauthn_credential("rot-pk1", _PK_RESIDENT)
+    assert not await rotate(), "the rotation landed after the discoverable passkey was removed"
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "resident", id_hash=_PK_RESIDENT, created_at=3.0, discoverable=True)
+    )
+    assert await rotate(), "a discoverable passkey did not open the rotation"
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.password_hash == "h-chosen" and not user.password_generated
+
+    # The conditional removals (AC-A3a): the last discoverable passkey goes only while TOTP stands,
+    # and TOTP goes only while a discoverable passkey stands, each judged in its own write.
+    assert not await store.delete_webauthn_credential(
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
+    ), "the last way past was deleted"
+    assert await store.get_webauthn_credential(_PK_RESIDENT) is not None
+    assert await store.delete_webauthn_credential(
+        "rot-pk1", "rot-pk-plain", require_way_past=True, totp_usable=_opened_totp_state
+    )
+    staged_cell = await store.set_totp_secret("rot-pk1", secret="JBSWY3DPEHPK3PXP", now=5.0)
+    assert await store.enable_totp(
+        "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
+    )
+    assert await store.delete_webauthn_credential(
+        "rot-pk1", _PK_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
+    ), "TOTP stands, so the passkey may go"
+    assert not await store.disable_totp(
+        "rot-pk1", now=6.0, require_way_past=True, totp_usable=_opened_totp_state
+    ), "TOTP went with no discoverable passkey left"
+    user = await store.get_user("rot-pk1")
+    assert user is not None and user.totp_enabled
+    await store.add_webauthn_credential(
+        _cred("rot-pk1", "again", id_hash=_PK_AGAIN, created_at=7.0, discoverable=True)
+    )
+    assert await store.disable_totp(
+        "rot-pk1", now=8.0, require_way_past=True, totp_usable=_opened_totp_state
+    )
+    user = await store.get_user("rot-pk1")
+    assert user is not None and not user.totp_enabled
+    await store.delete_all_webauthn_credentials("rot-pk1")
+    await store.delete_user("rot-pk1")
+
+
+async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any, kind: str) -> None:
+    """BACKLOG #3422, on every backend: a TOTP the store cannot judge is UNKNOWN, and every store
+    decision then follows the plain ``totp_enabled`` rule, never the refused-TOTP one. ``kind`` is
+    ``"outage"``, a stub cipher raising ``CipherError`` as a Transit outage does, or ``"keyless"``,
+    an open that hands the stored ciphertext back unchanged, as a store opened without its key
+    does. The sign-in lock still escalates; the TOTP cannot be removed while only a passkey that is
+    not discoverable would remain; and that passkey may go, because the TOTP still counts. Each
+    decision opened the stubbed cell, so the stub, not a skipped judgement, is what was measured."""
+    from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
+    from tests._webauthn_store_contract import _cred
+
+    uid = f"lock-uk-{kind}"
+    await store.create_user(
+        user_id=uid,
+        username=f"lock-uk-{kind}-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
+    plain = credential_id_hash(f"lock-uk-{kind}-plain".encode())
+    await store.add_webauthn_credential(_cred(uid, "plain", id_hash=plain))
+    opened: list[str] = []
+
+    def unjudgeable(user_id: str, _cell: str | None) -> str | None:
+        opened.append(user_id)
+        if kind == "outage":
+            raise CipherError("the cipher service did not answer")
+        return MARKER_PREFIX + "v2:opaque-ciphertext"
+
+    store.open_totp_secret = unjudgeable
+    try:
+        first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+        second = await _lock_cycle(store, uid, start=first + 1.0, counter="sign_in")
+        assert opened, "the escalation judged nothing, so the stub measured nothing"
+        assert second - (first + 1.0 + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+            f"an unknown ({kind}) TOTP lost the sign-in lock's escalation"
+        )
+        opened.clear()
+        assert not await store.disable_totp(
+            uid, now=50_000.0, require_way_past=True, totp_usable=_opened_totp_state
+        ), f"an unknown ({kind}) TOTP was removed beside a passkey that is not discoverable"
+        assert opened, "the removal judged nothing"
+        user = await store.get_user(uid)
+        assert user is not None and user.totp_enabled
+        opened.clear()
+        assert await store.delete_webauthn_credential(
+            uid, plain, require_way_past=True, totp_usable=_opened_totp_state
+        ), f"an unknown ({kind}) TOTP did not count as the account's way past"
+        assert opened, "the passkey removal judged nothing"
+    finally:
+        del store.open_totp_secret
+    await store.disable_totp(uid, now=60_000.0)
+    await store.delete_user(uid)
+
+
+async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
+    """The escalation verdict is judged on a read taken before the write's lock. When that read is
+    stale (here it shows a live lock that a racing ``clear_lockout`` already lifted), no verdict is
+    judged, and the locked write falls back to the plain ``totp_enabled`` rule on the row it holds:
+    it escalates, as before BACKLOG #3422, rather than skipping the escalation."""
+    import dataclasses
+
+    await store.create_user(
+        user_id="lock-st1",
+        username="lock-st-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret("lock-st1", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(
+        "lock-st1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+    )
+    first = await _lock_cycle(store, "lock-st1", start=10_000.0, counter="sign_in")
+    real_get_user = store.get_user
+
+    async def stale(user_id: str) -> Any:
+        user = await real_get_user(user_id)
+        return None if user is None else dataclasses.replace(user, locked_until=1e12)
+
+    store.get_user = stale
+    try:
+        for i in range(THRESHOLD):
+            await _fail(store, "lock-st1", now=first + 1.0 + i, counter="sign_in")
+    finally:
+        del store.get_user
+    user = await store.get_user("lock-st1")
+    assert user is not None and user.locked_until is not None
+    second = float(user.locked_until)
+    assert second - (first + 1.0 + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+        "a stale pre-read skipped the sign-in lock's escalation"
+    )
+    await store.disable_totp("lock-st1", now=60_000.0)
+    await store.delete_user("lock-st1")
+
+
+#: Two enrolments whose marker this release refuses (SHA1), with different secrets so their cells
+#: differ on a keyless store too.
+_REFUSED_A = "totp1:SHA1:6:30:JBSWY3DPEHPK3PXP"
+_REFUSED_B = "totp1:SHA1:6:30:KRSXG5CTMVRXEZLU"
+
+
+async def _assert_no_verdict_falls_back_to_the_enabled_rule(store: Any, race: str) -> None:
+    """Finding 25, each trigger that needs no burst, on every backend. The verdict is judged on a
+    read taken before the write's lock, and a write that lands between the two leaves the locked
+    row holding a TOTP nobody judged. Each time the locked row holds a REFUSED enrolment, so only
+    the fallback to the plain ``totp_enabled`` rule escalates, which is what the store did before
+    BACKLOG #3422:
+
+    * ``"enabled"``: TOTP was off at the read (``totp_enable`` leaves the count standing), so
+      :func:`escalation_verdict` judged nothing;
+    * ``"replaced"``: the enrolment was removed and enrolled again with another secret, so the cell
+      the verdict holds is not the locked row's (:meth:`TotpJudgement.moved`);
+    * ``"rekeyed"``: the read saw the cell as it was under an earlier store key. Simulated by a read
+      that carries another cell, opened by a stub to a refused enrolment."""
+    import dataclasses
+
+    uid = f"lock-nv-{race}"
+    await store.create_user(
+        user_id=uid,
+        username=f"lock-nv-{race}-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+
+    async def enrol(secret: str, now: float) -> None:
+        cell = await store.set_totp_secret(uid, secret=secret, now=now)
+        assert await store.enable_totp(
+            uid, expected_secret_cell=cell, recovery_code_hashes=[], now=now
+        )
+
+    if race != "enabled":
+        await enrol(_REFUSED_A, 1.0)
+    first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+    start = first + 1.0
+    for i in range(THRESHOLD - 1):
+        await _fail(store, uid, now=start + i)
+    real_get_user = store.get_user
+    real_open = store.open_totp_secret
+
+    async def racing(user_id: str) -> Any:
+        pre = await real_get_user(user_id)
+        store.__dict__.pop("get_user", None)  # only the crossing failure's read races
+        if race == "enabled":
+            await enrol(_REFUSED_A, start)
+        elif race == "replaced":
+            assert await store.disable_totp(uid, now=start)
+            await enrol(_REFUSED_B, start)
+        else:
+            assert pre is not None and pre.row is not None
+            pre = dataclasses.replace(
+                pre, row=dataclasses.replace(pre.row, totp_secret="cell-under-an-earlier-key")
+            )
+        return pre
+
+    store.get_user = racing
+    if race == "rekeyed":
+        # Bound before the read, as the backend reads the opener when it calls the verdict.
+        store.open_totp_secret = lambda _u, _c: _REFUSED_A
+    try:
+        await _fail(store, uid, now=start + THRESHOLD - 1)
+    finally:
+        store.__dict__.pop("get_user", None)
+        store.__dict__.pop("open_totp_secret", None)
+    assert store.open_totp_secret == real_open
+    user = await store.get_user(uid)
+    assert user is not None and user.locked_until is not None and user.totp_enabled
+    assert user.locked_until - (start + THRESHOLD - 1) == 2 * LOCKOUT_SECONDS, (
+        f"a TOTP nobody judged ({race}) skipped the sign-in lock's escalation"
+    )
+    await store.disable_totp(uid, now=99_999.0)
+    await store.delete_user(uid)
+
+
+async def _assert_a_wrong_password_below_the_threshold_opens_no_cell(store: Any) -> None:
+    """The cost bound on every backend: the escalation verdict opens the TOTP cell (a Transit
+    decrypt) only for the failure that sets a lock the verdict could shorten. A wrong password
+    below the threshold opens nothing, nor does the crossing failure of the first cycle, whose lock
+    has the base length either way; the crossing failure of a later cycle opens the cell once."""
+    uid = "lock-cost1"
+    await store.create_user(
+        user_id=uid,
+        username="lock-cost-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
+    real_open = store.open_totp_secret
+    opened: list[str] = []
+
+    def spy(user_id: str, stored: str | None) -> str | None:
+        opened.append(user_id)
+        return real_open(user_id, stored)
+
+    store.open_totp_secret = spy
+    try:
+        first = await _lock_cycle(store, uid, start=10_000.0, counter="sign_in")
+        assert opened == [], "the first cycle opened the TOTP cell"
+        start = first + 1.0
+        for i in range(THRESHOLD - 1):
+            await _fail(store, uid, now=start + i)
+        assert opened == [], "a wrong password below the threshold opened the TOTP cell"
+        await _fail(store, uid, now=start + THRESHOLD - 1)
+        assert opened == [uid], opened
+    finally:
+        del store.open_totp_secret
+    await store.disable_totp(uid, now=99_999.0)
+    await store.delete_user(uid)
+
+
+async def _assert_refused_totp_keeps_the_fixed_sign_in_lock(store: Any) -> None:
+    """BACKLOG #3422 beside ADR 0197, on every backend: the sign-in lock escalates only where the
+    owner has a way past it, and a TOTP enrolment this release refuses is none, so its account keeps
+    the fixed lock on the second cycle. Judged by the caller's rule on the locked row's cell."""
+    await store.create_user(
+        user_id="lock-rf1",
+        username="lock-rf-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    cell = await store.set_totp_secret(
+        "lock-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=1.0
+    )
+    assert await store.enable_totp(
+        "lock-rf1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+    )
+    first = await _lock_cycle(store, "lock-rf1", start=10_000.0, counter="sign_in")
+    second = await _lock_cycle(store, "lock-rf1", start=first + 1.0, counter="sign_in")
+    assert second - (first + 1.0 + THRESHOLD - 1) == LOCKOUT_SECONDS, (
+        "the sign-in lock escalated beside a refused TOTP"
+    )
+    await store.disable_totp("lock-rf1", now=99_999.0)
+    await store.delete_user("lock-rf1")
+
+
+async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
+    """BACKLOG #3422 beside ADR 0197 Amendment A wave 2, on every backend: the conditional writes
+    count TOTP as a way past only through the caller's rule (``totp_usable``), so an enrolment this
+    release refuses does not free the last discoverable passkey, and does not open the rotation. A
+    conditional write that brings no rule is refused outright, never answered by the old test."""
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="rot-rf1",
+        username="rot-rf-alice",
+        auth_provider="local",
+        password_hash="h-issued",
+        must_change_password=True,
+        password_generated=False,
+        now=1.0,
+    )
+    cell = await store.set_totp_secret(
+        "rot-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=2.0
+    )
+    assert await store.enable_totp(
+        "rot-rf1", expected_secret_cell=cell, recovery_code_hashes=[], now=2.0
+    )
+    await store.add_webauthn_credential(
+        _cred("rot-rf1", "resident", id_hash=_RF_RESIDENT, created_at=3.0, discoverable=True)
+    )
+    with pytest.raises(ValueError):
+        await store.delete_webauthn_credential("rot-rf1", _RF_RESIDENT, require_way_past=True)
+    assert not await store.delete_webauthn_credential(
+        "rot-rf1", _RF_RESIDENT, require_way_past=True, totp_usable=_opened_totp_state
+    ), "a refused TOTP freed the last discoverable passkey"
+    assert await store.get_webauthn_credential(_RF_RESIDENT) is not None
+    await store.delete_all_webauthn_credentials("rot-rf1")
+    with pytest.raises(ValueError):
+        await store.set_password(
+            "rot-rf1",
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=True,
+        )
+    assert not await store.set_password(
+        "rot-rf1",
+        password_hash="h-chosen",
+        password_generated=False,
+        must_change_password=False,
+        require_way_past=True,
+        totp_usable=_opened_totp_state,
+    ), "a refused TOTP opened the rotation"
+    user = await store.get_user("rot-rf1")
+    assert user is not None and user.password_hash == "h-issued"
+    await store.disable_totp("rot-rf1", now=4.0)
+    await store.delete_user("rot-rf1")
+
+
 async def _assert_conditional_rotation(store: Any) -> None:
     """ADR 0197 Amendment A, N-B2 part 4: a rotation that requires TOTP carries the condition in its
     own UPDATE, so TOTP cleared between the caller's check and the write makes the write match no
@@ -416,7 +823,8 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None
@@ -440,7 +848,8 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
@@ -454,7 +863,8 @@ async def _assert_conditional_rotation(store: Any) -> None:
         password_hash="h-chosen",
         password_generated=False,
         must_change_password=False,
-        require_totp=True,
+        require_way_past=True,
+        totp_usable=_opened_totp_state,
     )
     user = await store.get_user("rot-u1")
     assert user is not None

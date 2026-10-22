@@ -58,7 +58,9 @@ for the checkouts named in its allowlist:
    cwd, cannot create a worktree for itself, and — measured — its blocked edits do **not** reliably surface
    back to the parent: the parent's result came back with an empty `permission_denials` list. A fan-out
    from the primary would therefore appear to succeed while writing nothing. Stopping the dispatch costs
-   one second; letting it run costs the whole workflow.
+   one second; letting it run costs the whole workflow. Only an `Agent`/`Task` call whose `subagent_type`
+   is exactly `web-fetch` or `claude-code-guide`, built-in types with neither a shell nor a write tool,
+   passes. The comment block above `Rule 2 --` in the gate says why and names the residuals.
 
 3. **A git command that swaps the primary's working tree** — `checkout`, `switch`, `reset`, `restore`,
    `stash`, `clean`, `rebase`, `merge`, `cherry-pick`, `revert`, `am`, `apply`.
@@ -150,7 +152,7 @@ prompt to fall back on:
 |---|---|
 | Session in the primary edits a file **in the primary** | **Denied.** File unchanged; the session escalated to the user. |
 | Same session (still cwd = primary) edits a file **in a worktree**, absolute path | **Allowed.** Write landed. |
-| Session in the primary **dispatches a subagent** | **Denied.** |
+| Session in the primary **dispatches a subagent** | **Denied.** Measured before the rule 2 exemption in item 2 above; a `web-fetch` or `claude-code-guide` dispatch now passes, and that live run has not been repeated. |
 
 ## Rescuing work already in the primary
 

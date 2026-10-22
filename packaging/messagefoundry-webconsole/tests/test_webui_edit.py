@@ -415,7 +415,7 @@ async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Eng
     # what redirects; without it this unenrolled session is refused first with the SAME 303 and the
     # same Location, and the window measured nothing (BACKLOG #1851). Reasoning, and the third
     # new-IP leg that stays unpinned: the docstring of
-    # test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # test_webui_monitoring.py::test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
