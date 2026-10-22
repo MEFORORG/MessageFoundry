@@ -611,6 +611,15 @@ never with mail. The evidence is probe PR
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
   rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  **A delegated decision counts as that ruling (owner ruling 2026-10-22).** When the owner answers
+  a seat's specific question with `/driver` or `/empower`, that seat decides the question after an
+  adversarial review, including a question the empower rules reserve to the owner. A record
+  *"decided by <seat> under the owner's delegation of <date>"* counts as the owner's ruling, and a
+  merge may rest on it, when it quotes the question, the options offered and the owner's answer, and
+  gives the time of that answer. A record missing any of those does not count. Four acts stay the
+  owner's in person, whatever the answer: signing or re-signing the register, money, credentials,
+  and irreversible acts. Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates
+  that specific question*, carries the same ruling in the owner's words.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
