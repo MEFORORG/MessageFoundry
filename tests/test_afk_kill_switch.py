@@ -204,19 +204,61 @@ def test_the_instruction_tells_a_late_special_to_skip_it(sb: Sandbox) -> None:
     assert "A Special seat skips this" in text
 
 
-@pytest.mark.parametrize("source", ["startup", "resume", "compact", "clear", ""])
-def test_every_source_is_told_to_load_both_again_and_never_to_skip_a_loaded_one(
-    sb: Sandbox, source: str
-) -> None:
-    # After a compact or a /clear the summary may say both skills were loaded although their text
-    # is gone, and a resumed conversation may itself have been compacted, so no source may carry a
-    # clause that lets the session skip a skill it believes it holds.
+RESTART_SOURCES = ("compact", "clear")
+OTHER_SOURCES = ("startup", "resume", "fork", "", "Startup")
+FULL_TEXT_SKIP = (
+    "Skip a skill only if its full text is in your context now; a summary saying it was loaded "
+    "does not count."
+)
+
+
+def _source_text(sb: Sandbox, source: str) -> str:
     text = _instruction(_seat_run(sb, "off", "builder", source=source).stdout)
     assert text, source
-    assert "Load both even if this conversation, or a summary of it, says they were loaded" in text
-    assert "load them again" in text
-    lowered = text.lower()
-    assert "skip any skill" not in lowered and "already loaded" not in lowered, text
+    return text
+
+
+def _without_the_special_sentence(text: str) -> str:
+    special = "A Special seat skips this"
+    assert special in text, text
+    return text[: text.index(special)]
+
+
+@pytest.mark.parametrize("source", [*RESTART_SOURCES, " Compact "])
+def test_a_compact_or_clear_is_told_to_load_both_again_with_no_skip_clause(
+    sb: Sandbox, source: str
+) -> None:
+    text = _source_text(sb, source)
+    assert "so load both again" in text
+    # Any skip wording at all, bar the Special seat's, would let a session that reads a summary
+    # saying it holds both skills keep going without them.
+    assert "skip" not in _without_the_special_sentence(text).lower(), text
+
+
+@pytest.mark.parametrize("source", OTHER_SOURCES)
+def test_any_other_source_skips_a_skill_only_on_its_full_text(sb: Sandbox, source: str) -> None:
+    text = _source_text(sb, source)
+    assert FULL_TEXT_SKIP in text
+    assert "again" not in text, text
+
+
+def test_the_text_differs_by_source_only_in_the_reload_sentence(sb: Sandbox) -> None:
+    texts = {source: _source_text(sb, source) for source in (*RESTART_SOURCES, *OTHER_SOURCES)}
+    assert len({texts[s] for s in RESTART_SOURCES}) == 1, texts
+    assert len({texts[s] for s in OTHER_SOURCES}) == 1, texts
+
+    def outside(text: str, sentence: str) -> str:
+        return text[: text.index(sentence)] + text[text.index("An owner instruction") :]
+
+    restart, other = texts["compact"], texts["startup"]
+    assert restart != other
+    assert outside(restart, "This session restarted") == outside(other, FULL_TEXT_SKIP)
+
+
+def test_an_owner_instruction_in_the_conversation_outranks_the_hook(sb: Sandbox) -> None:
+    for source in ("compact", "resume"):
+        text = _source_text(sb, source)
+        assert "An owner instruction in this conversation to stop using either skill" in text
 
 
 def test_korus_seat_names_the_seat_when_the_marker_does_not(sb: Sandbox) -> None:

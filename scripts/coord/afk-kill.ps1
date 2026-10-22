@@ -103,10 +103,11 @@ function ConvertTo-JsonText([string]$Text) {
     return ($Text -replace '[\x00-\x1f]', ' ').Replace('\', '\\').Replace('"', '\"')
 }
 
-function Test-SkillInstructionDue {
-    # True only when this session's seat is known not to be Special. Anything it cannot establish
-    # throws, and the caller reads that as no instruction.
-    if ($env:KORUS_AGENT -eq 'codex') { return $false }  # the Skill tool is Claude Code's
+function Get-SkillInstructionSource {
+    # The hook input's SessionStart source ('' when it names none) only when this session's seat is
+    # known not to be Special, else $null. Anything it cannot establish throws, and the caller
+    # reads that as no instruction.
+    if ($env:KORUS_AGENT -eq 'codex') { return $null }  # the Skill tool is Claude Code's
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
     # The payload's worktree, never this process's: under the desktop app the hook runs in the
     # PRIMARY checkout, whose marker names another session's seat. Walked up from the `cwd` as
@@ -116,18 +117,22 @@ function Test-SkillInstructionDue {
     # one source whose session has just lost both skills.
     $text = Read-CcxHookInput
     if ($script:CcxHookInputTimedOut) { throw 'the hook input was still open when the read stopped waiting' }
-    $p = Get-CcxHookPayloadCwd -Text $text
+    $payload = $null
+    if (-not [string]::IsNullOrWhiteSpace($text)) { $payload = $text | ConvertFrom-Json -ErrorAction Stop }
+    $p = Get-CcxHookPayloadCwd -Payload $payload
     if ($p.Reason) { throw $p.Reason }
     if (-not $p.Named) { throw 'the hook input names no cwd' }
     $root = Get-CcxWorktreeRoot $p.Cwd
     if (-not $root) { throw "the hook input's cwd $($p.Cwd) is inside no checkout" }
+    $source = ''
+    if ($payload.PSObject.Properties['source']) { $source = ([string]$payload.source).Trim().ToLowerInvariant() }
     $raw = $null
     $marker = Join-Path $root '.claude/seat.local.txt'
     if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
     if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $env:KORUS_SEAT }
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $true }  # undeclared
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $source }  # undeclared
     $label = $raw.Trim().ToLowerInvariant()
-    if ($label -eq 'special') { return $false }
+    if ($label -eq 'special') { return $null }
     # An alias of Special is Special too, so the roster must be read; an unreadable one throws.
     $seats = Join-Path $root 'docs/roles/seats.json'
     if (-not (Test-Path -LiteralPath $seats -PathType Leaf)) {
@@ -135,29 +140,36 @@ function Test-SkillInstructionDue {
     }
     $aliases = (Get-Content -LiteralPath $seats -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).aliases
     $alias = $aliases.PSObject.Properties[$label]
-    return -not ($alias -and [string]$alias.Value -eq 'special')
+    if ($alias -and [string]$alias.Value -eq 'special') { return $null }
+    return $source
 }
 
 if (-not $sw.On) {
-    try { $due = Test-SkillInstructionDue }
+    try { $source = Get-SkillInstructionSource }
     catch {
         # On stderr for whoever runs the hook by hand or reads the hook debug log. Claude Code does
         # not show a hook's stderr at exit 0, so this is a diagnostic, not an alarm, and the tests
         # are what catch a change that silences every seat.
         [Console]::Error.WriteLine("afk-kill.ps1: no skill instruction, because $($_.Exception.Message)")
-        $due = $false
+        $source = $null
     }
-    if ($due -eq $true) {
-        # One text for every SessionStart source, with no "skip what is loaded" clause: after a
-        # compact or a /clear the summary may say both were loaded although their text is gone, and
-        # a resumed conversation may itself have been compacted. A redundant load costs one call.
+    if ($null -ne $source) {
+        # Which source gets which sentence, and why, is ADR 0211's to state.
+        if ($source -in @('compact', 'clear')) {
+            $reload = 'This session restarted from a compaction or a /clear, which can leave a summary ' +
+                'saying both were loaded while their text is gone, so load both again. '
+        }
+        else {
+            $reload = 'Skip a skill only if its full text is in your context now; a summary saying it ' +
+                'was loaded does not count. '
+        }
         $text = 'Before your first other action, load the `driver` skill and then the `empower` skill ' +
             'with the Skill tool, as the owner instructs every non-Special seat. In a cloud session ' +
             '(CLAUDE_CODE_REMOTE=true) they may be named `anthropic-skills:driver` and ' +
             '`anthropic-skills:empower`. If either is not available, say so in one line and continue. ' +
-            'Load both even if this conversation, or a summary of it, says they were loaded: a ' +
-            'compaction or a /clear drops their text, so load them again. A Special seat skips this, ' +
-            'including one the owner names as Special in its first message.'
+            $reload + 'An owner instruction in this conversation to stop using either skill outranks ' +
+            'this one. A Special seat skips this, including one the owner names as Special in its ' +
+            'first message.'
         Write-Output ('{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"' + (ConvertTo-JsonText $text) + '"}}')
     }
     exit 0
