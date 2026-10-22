@@ -213,7 +213,9 @@ def test_cache_shape(tmp_path: Path) -> None:
     pr = data["pullRequests"][0]
     assert pr["labels"] == ["ci-red"]
     assert pr["required"]["state"] == "SUCCESS"
-    assert not (tmp_path / "locks" / "pr-state.lock").exists()
+    assert (
+        tmp_path / "locks" / "pr-state.oslock"
+    ).exists()  # the lock file stays; the lock does not
 
 
 def test_missing_required_context_is_pending_not_green(tmp_path: Path) -> None:
@@ -261,18 +263,6 @@ def test_total_beyond_page_is_flagged_truncated(tmp_path: Path) -> None:
     assert doc["data"]["truncated"] is True and doc["data"]["openPullRequestCount"] == 5
 
 
-def test_lock_held_skips_quietly(tmp_path: Path) -> None:
-    (tmp_path / "locks").mkdir()
-    lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text("pid=1 host=X at=now", encoding="utf-8")
-    gh = FakeGh([_pr(1)], {1: _green()})
-    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
-    assert rc == 0
-    assert gh.calls == []
-    assert not (tmp_path / "c.json").exists()
-    assert lock.read_text(encoding="utf-8") == "pid=1 host=X at=now"  # never stolen
-
-
 def test_failed_poll_keeps_last_good_data(tmp_path: Path) -> None:
     _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
     later = NOW + timedelta(minutes=2)
@@ -311,21 +301,6 @@ def test_graphql_errors_fail_the_poll_and_wait_for_reset(tmp_path: Path) -> None
     rc, doc = _main(tmp_path, gh)
     assert rc == 1 and "rate limit" in doc["error"] and doc["data"] is None
     assert doc["nextPollNotBefore"] == "2026-10-22T12:45:00Z"
-
-
-def test_wedged_lock_leaves_the_cache_alone(tmp_path: Path) -> None:
-    """Only the lock holder writes the cache. A wedged lock shows as an ageing fetchedAt."""
-    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
-    before = (tmp_path / "pr-state.json").read_bytes()
-    lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text("pid=1 host=SOME-OTHER-PC at=then", encoding="utf-8")
-    old = lock.stat().st_mtime - ps.STALE_LOCK_SECONDS - 60
-    os.utime(lock, (old, old))
-    gh = FakeGh([_pr(1)], {1: _green()})
-    rc, _ = _main(tmp_path, gh, NOW + timedelta(minutes=20))
-    assert rc == 3 and gh.calls == []
-    assert (tmp_path / "pr-state.json").read_bytes() == before
-    assert lock.read_text(encoding="utf-8") == "pid=1 host=SOME-OTHER-PC at=then"
 
 
 # --- Controls for the 2026-10-22 brief. Each fails on 9cc98a971. -----------------------------------
@@ -371,26 +346,6 @@ def test_release_never_deletes_another_pollers_lock(tmp_path: Path) -> None:
     rc, _ = _main(tmp_path, gh)
     assert rc == 0
     assert lock.read_text(encoding="utf-8") == other
-
-
-def test_steal_does_not_take_a_lock_that_changed_after_it_was_judged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (tmp_path / "locks").mkdir()
-    lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text(f"pid={never_live_pid()} host={ps.coord_root.host()} at=dead", encoding="utf-8")
-    live = "pid=1 host=SOME-OTHER-PC at=live"
-
-    def judged_dead_then_raced(holder: str) -> bool:
-        lock.write_text(live, encoding="utf-8")  # a second poller stole and re-locked first
-        return True
-
-    monkeypatch.setattr(ps, "_holder_is_gone", judged_dead_then_raced)
-    gh = FakeGh([_pr(1)], {1: _green()})
-    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
-    assert rc == 0 and gh.calls == []
-    assert lock.read_text(encoding="utf-8") == live
-    assert list((tmp_path / "locks").iterdir()) == [lock]
 
 
 def test_failed_part_is_recorded(tmp_path: Path) -> None:
@@ -544,23 +499,6 @@ def test_truncated_context_page_never_reads_green(tmp_path: Path) -> None:
     assert verdict["state"] == "UNKNOWN" and sorted(verdict["unknown"]) == sorted(REQUIRED)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the pid check is Windows-only")
-def test_lock_of_a_dead_pid_on_this_host_is_recovered(tmp_path: Path) -> None:
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    (tmp_path / "locks").mkdir()
-    lock = tmp_path / "locks" / "pr-state.lock"
-    lock.write_text(f"pid={dead.pid} host={ps.coord_root.host()} at=then", encoding="utf-8")
-    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
-    assert rc == 0 and doc["error"] is None and not lock.exists()
-
-
-def test_live_or_foreign_holder_is_not_recovered() -> None:
-    assert ps._holder_is_gone(f"pid={os.getpid()} host={ps.coord_root.host()} at=x") is False
-    assert ps._holder_is_gone("pid=1 host=SOME-OTHER-PC at=x") is False
-    assert ps._holder_is_gone(f"pid=notanumber host={ps.coord_root.host()}") is False
-
-
 def test_unlisted_verdict_is_pending_not_green(tmp_path: Path) -> None:
     # STALE is a real CheckRun conclusion that no list named; _pr_checks now allowlists passes.
     contexts = [_run("CI gate"), _run("cla"), _run("test", "STALE")]
@@ -578,28 +516,6 @@ def test_required_list_is_the_union_of_protection_and_rulesets(tmp_path: Path) -
 # --- Review round 1 of the 2026-10-22 brief. ---------------------------------------------------------
 
 
-def test_a_second_stealer_backs_off_while_the_steal_mutex_is_held(tmp_path: Path) -> None:
-    (tmp_path / "locks").mkdir()
-    lock = tmp_path / "locks" / "pr-state.lock"
-    dead = f"pid={never_live_pid()} host={ps.coord_root.host()} at=dead"
-    lock.write_text(dead, encoding="utf-8")
-    (tmp_path / "locks" / "pr-state.steal.lock").write_text("", encoding="utf-8")
-    assert ps.steal_dead_lock(tmp_path, dead) is False
-    assert lock.read_text(encoding="utf-8") == dead
-    (tmp_path / "locks" / "pr-state.steal.lock").unlink()
-    assert ps.steal_dead_lock(tmp_path, dead) is True
-    assert not lock.exists() and not (tmp_path / "locks" / "pr-state.steal.lock").exists()
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="the pid check is Windows-only")
-def test_a_reused_pid_reads_as_gone() -> None:
-    # This process is alive, but it started long after a lock stamped in 2000 could have been written.
-    here = ps.coord_root.host()
-    assert ps._holder_is_gone(f"pid={os.getpid()} host={here} at=2000-01-01T00:00:00+00:00")
-    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-    assert not ps._holder_is_gone(f"pid={os.getpid()} host={here} at={future}")
-
-
 def test_a_future_backoff_stamp_is_not_obeyed(tmp_path: Path) -> None:
     _main(tmp_path, FakeGh([], {}, fail="boom"))
     path = tmp_path / "pr-state.json"
@@ -611,20 +527,94 @@ def test_a_future_backoff_stamp_is_not_obeyed(tmp_path: Path) -> None:
     assert rc == 0 and gh.calls and doc["error"] is None
 
 
-def test_an_unwritable_locks_directory_is_a_failing_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def refuse(src: object, dst: object) -> None:
-        raise PermissionError("denied")
-
-    monkeypatch.setattr(ps.os, "link", refuse)
-    gh = FakeGh([_pr(1)], {1: _green()})
-    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
-    assert rc == 4 and gh.calls == []
-
-
 def test_unknown_checkrun_status_reads_as_running(tmp_path: Path) -> None:
     odd = {**_run("test", "", "SOMETHING_NEW"), "startedAt": "2026-10-22T10:00:00Z"}
     newer = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
     _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), odd, newer]}))
     assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
+
+
+# --- The OS lock (review round 2 of the 2026-10-22 brief) ---------------------------------------------
+
+
+def _hold_lock_elsewhere(local: Path) -> int:
+    """Take the poller's lock through a second handle, as another poller's process would."""
+    fd = ps.acquire_lock(local)
+    assert fd is not None
+    return fd
+
+
+def test_a_held_lock_skips_quietly(tmp_path: Path) -> None:
+    """Fails on 9cc98a971, whose lock was a file this held handle does not create."""
+    fd = _hold_lock_elsewhere(tmp_path)
+    try:
+        gh = FakeGh([_pr(1)], {1: _green()})
+        rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
+        assert rc == 0 and gh.calls == []
+        assert not (tmp_path / "c.json").exists()
+    finally:
+        ps.release_lock(fd)
+    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    assert rc == 0 and doc["error"] is None
+
+
+def test_a_killed_holder_releases_the_lock(tmp_path: Path) -> None:
+    """A process that takes the lock and dies without releasing it leaves nothing to steal."""
+    code = (
+        "import importlib.util, sys; from pathlib import Path\n"
+        f"spec = importlib.util.spec_from_file_location('ps', {str(_SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['ps'] = m; spec.loader.exec_module(m)\n"
+        f"assert m.acquire_lock(Path({str(tmp_path)!r})) is not None\n"
+        "import os; os._exit(9)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], check=False, timeout=60)
+    assert done.returncode == 9
+    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    assert rc == 0 and doc["error"] is None
+
+
+def test_an_unusable_lock_directory_is_a_failing_result(tmp_path: Path) -> None:
+    (tmp_path / "locks").write_text("a file where the directory should be", encoding="utf-8")
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
+    assert rc == 4 and gh.calls == []
+
+
+def test_a_same_named_run_github_does_not_require_cannot_speak(tmp_path: Path) -> None:
+    other_app = {**_run("test"), "isRequired": False}
+    _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), other_app]}))
+    required = doc["data"]["pullRequests"][0]["required"]
+    assert required["state"] == "SUCCESS"  # "test" is not required on this PR, per GitHub
+    required_run = {**_run("test", "", "QUEUED"), "isRequired": True}
+    _, doc = _main(
+        tmp_path,
+        FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), other_app, required_run]}),
+        NOW,
+        "--force",
+    )
+    assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
+
+
+def test_a_failure_keeps_what_the_poll_learned(tmp_path: Path) -> None:
+    reply = {
+        "data": {
+            "rateLimit": {
+                "cost": 1,
+                "remaining": 0,
+                "limit": 5000,
+                "resetAt": "2026-10-22T12:45:00Z",
+            }
+        },
+        "errors": [{"message": "API rate limit exceeded"}],
+    }
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        if args[1] == "graphql":
+            raise ps.GhError("gh api graphql exited 1", json.dumps(reply))
+        return FakeGh([], {})(args, stdin)
+
+    rc, doc = _main(tmp_path, gh)
+    assert rc == 1
+    assert doc["rateLimit"]["remaining"] == 0
+    assert doc["requiredContexts"] == sorted(REQUIRED)
+    assert doc["requiredContextsFetchedAt"] == "2026-10-22T12:00:00Z"

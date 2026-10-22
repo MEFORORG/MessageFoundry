@@ -18,16 +18,12 @@ WHY PYTHON AND NOT POWERSHELL. The rollup vocabulary already has one reader, ``s
 and a second classifier would drift. The task also runs under ``pythonw.exe``, which opens no window;
 a ``pwsh -WindowStyle Hidden`` task still flashes a console every two minutes.
 
-WHY THE LOCK IS lock.ps1's PROTOCOL, NOT A CALL TO IT. Calling lock.ps1 would mean a pwsh process per
-poll, and that window flash again. So this takes the same lock the same way: it exclusively creates
-``mefor-coord/locks/pr-state.lock`` and writes the same ``pid= host= at=`` line. A PowerShell caller
-running ``Enter-CoordLock -Name pr-state`` excludes this poller and is excluded by it. A held lock
-means skip. Unlike lock.ps1 it removes one shape of lock (owner ruling 2026-10-22): this host's,
-naming a pid that is not running or was reused after the lock was written. A kill at the task's
-time limit, a logoff or a shutdown leaves that shape. The steal re-reads the lock under a second,
-short mutex, so two stealers never interleave, and a run deletes the lock only while it still
-carries its own line. Nothing writes the cache without holding the lock, so a lock that stays
-wedged shows as an ageing ``fetchedAt``.
+WHY THE LOCK IS AN OS LOCK, NOT lock.ps1. lock.ps1's lock is a file whose existence is the lock, so a
+kill (the task's time limit, a logoff, a shutdown) leaves it behind, and recovering it needs a
+liveness guess. This poller holds a byte-range lock on an open handle instead (``msvcrt.locking``;
+``fcntl.flock`` elsewhere), and the kernel releases it when the process dies, however it dies. A held
+lock means another poll is running, so the run exits. Nothing writes the cache without the lock.
+docs/WORKTREES.md, *A PR-state cache for read-only panes*, is where the lock is described for readers.
 
 A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``data`` block is kept with
 its own ``fetchedAt``, ``stale`` is true and ``error`` names the failure. With no previous data,
@@ -55,7 +51,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 CACHE_NAME = "pr-state.json"
-LOCK_NAME = "pr-state"
+LOCK_FILE = "pr-state.oslock"
 #: The base whose required list, queue and protection are read.
 BASE_BRANCH = "main"
 #: The open-PR page size. A page that comes back this full may be truncated, and the cache says so.
@@ -76,10 +72,6 @@ RATE_FLOOR = 300
 #: Failure back-off: the schedule's 2 minutes, doubled per consecutive failure, capped.
 FAIL_BASE_DELAY = 120
 FAIL_MAX_DELAY = 1800
-#: A poll holds the lock for seconds. The worst case is about 8 gh calls at GH_TIMEOUT_SECONDS each,
-#: under the task's 10-minute limit (install-pr-state-task.ps1 $timeLimitMinutes; keep this above
-#: it). A by-hand run has no limit, so a pid check, not this age, is what recovers a lock.
-STALE_LOCK_SECONDS = 900
 GH_TIMEOUT_SECONDS = 30
 #: A rate-limit failure with no resetAt to wait for waits this long instead of the short back-off.
 RATE_LIMIT_FALLBACK_SECONDS = 900
@@ -115,6 +107,7 @@ class GhError(RuntimeError):
         super().__init__(message)
         # gh exits 1 on a GraphQL reply that carries errors, with the reply on stdout.
         self.stdout = stdout
+        self.fresh: dict[str, Any] | None = None
 
 
 class PollError(RuntimeError):
@@ -122,6 +115,8 @@ class PollError(RuntimeError):
         # The message carries the part as its prefix, so a raise site names it once.
         super().__init__(f"{part}: {message}" if part else message)
         self.reset_at = reset_at
+        #: Cache fields the failing poll did learn, which failed() keeps over the previous ones.
+        self.fresh: dict[str, Any] | None = None
         #: Which request failed: "pulls" or "contexts PRs a-b".
         self.part = part
 
@@ -249,7 +244,10 @@ def graphql(
             str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in doc["errors"]
         )
         reset = rate.get("resetAt") if isinstance(rate, dict) else None
-        raise PollError(f"GraphQL errors: {msgs[:400]}", reset_at=reset, part=part)
+        err = PollError(f"GraphQL errors: {msgs[:400]}", reset_at=reset, part=part)
+        if isinstance(rate, dict):
+            err.fresh = {"rateLimit": {**rate, "queries": 1}}
+        raise err
     if not isinstance(data, dict) or not isinstance(data.get("repository"), dict):
         raise PollError("reply has no data.repository", part=part)
     return data["repository"], rate if isinstance(rate, dict) else {}
@@ -341,8 +339,13 @@ def required_verdict(
     out["requiredByGithubNotInList"] = sorted(flagged - req)
     # A check GitHub calls required counts even when the cached list does not name it yet.
     for name in sorted(req | flagged):
-        matching = [n for n in nodes if pr_checks.name_of(n) == name]
+        named = [n for n in nodes if pr_checks.name_of(n) == name]
+        # GitHub's per-PR isRequired is the truth where it answers: a same-named run from an app the
+        # rule does not count (False) cannot speak for the context.
+        matching = [n for n in named if not (isinstance(n, dict) and n.get("isRequired") is False)]
         if not matching:
+            if named:
+                continue  # every run of this name is one GitHub does not require here
             out["missing"].append(name)  # the page is complete, so absent means not yet run
             continue
         failing, unsettled = pr_checks.counts([_speaker(matching)])
@@ -475,6 +478,29 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
             # A stale list beats none; it is labelled with its own age. No list leaves every PR UNKNOWN.
             required_error = str(exc)
 
+    try:
+        return _poll_rest(gh, repo, owner, name, now, required, required_at, required_error)
+    except (PollError, GhError) as exc:
+        learned = {
+            "requiredContexts": required,
+            "requiredContextsFetchedAt": required_at if required is not None else None,
+            "requiredContextsError": required_error,
+        }
+        fresh = getattr(exc, "fresh", None) or {}
+        exc.fresh = {**learned, **fresh}
+        raise
+
+
+def _poll_rest(
+    gh: Gh,
+    repo: str,
+    owner: str,
+    name: str,
+    now: datetime,
+    required: list[str] | None,
+    required_at: Any,
+    required_error: str | None,
+) -> dict[str, Any]:
     repo_doc, rate = graphql(
         gh, MAIN_QUERY, {"owner": owner, "name": name, "limit": PR_PAGE}, "pulls"
     )
@@ -582,6 +608,7 @@ def failed(
     now: datetime,
     reset_at: str | None = None,
     part: str | None = None,
+    fresh: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The cache after a failed poll: the last good data kept, marked stale, and never an empty list."""
     prev = previous or {}
@@ -608,6 +635,8 @@ def failed(
             "requiredContexts": prev.get("requiredContexts"),
             "requiredContextsFetchedAt": prev.get("requiredContextsFetchedAt"),
             "requiredContextsError": prev.get("requiredContextsError"),
+            # What this failing poll did learn (a fresh required list, the error reply's rate).
+            **(fresh or {}),
             # The previous good block, with its own fetchedAt, or null. Never a fresh empty list.
             "data": data,
             "nextPollNotBefore": iso(not_before),
@@ -646,155 +675,48 @@ def write_cache(path: Path, doc: dict[str, Any]) -> None:
             time.sleep(0.1)
 
 
-#: What acquire_lock returns as the holder when the create was refused and no lock file exists.
-CREATE_REFUSED = "(create refused and no lock file: the locks directory may be unwritable)"
+class LockUnavailable(OSError):
+    """The lock file could not be opened at all: a missing or unwritable directory, not a holder."""
 
 
-def acquire_lock(local: Path) -> tuple[str | None, str | None]:
-    """``(own line, None)`` when taken; ``(None, holder)`` when held. lock.ps1's protocol, no retry.
+def acquire_lock(local: Path) -> int | None:
+    """An open, locked handle, or None when another process holds the lock.
 
-    The line is written to a temp file and hard-linked into place, so the lock appears with its
-    line already in it: a kill can never leave an empty lock nobody could judge. The own line is
-    what release_lock checks before it deletes anything.
+    Raises LockUnavailable when the lock file cannot be opened. The handle must be passed to
+    release_lock; if the process dies first, the kernel releases the lock with the handle.
     """
     lock = lock_path(local)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    line = f"pid={os.getpid()} host={coord_root.host()} at={datetime.now(UTC).isoformat()}"
-    tmp = lock.with_name(f"{lock.name}.{os.getpid()}.new")
-    tmp.write_text(line, encoding="utf-8")
     try:
-        os.link(tmp, lock)
-    except FileExistsError:
-        return None, _read_holder(lock)
-    except PermissionError:
-        # Windows refuses a create over a file a releaser is still deleting: a holder leaving.
-        return None, _read_holder(lock) if lock.exists() else CREATE_REFUSED
-    finally:
-        tmp.unlink(missing_ok=True)
-    return line, None
-
-
-def _read_holder(lock: Path) -> str:
-    try:
-        return lock.read_text(encoding="utf-8", errors="replace").strip() or "(empty)"
-    except OSError:
-        return "(unreadable)"
-
-
-def _unlink_quietly(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT)
     except OSError as exc:
-        # A reader holding the file open on Windows; never let cleanup mask the real outcome.
-        _say(f"could not remove {path}: {exc!r}")
-
-
-def release_lock(local: Path, own: str) -> None:
-    """Delete the lock only while it still carries this run's own line; never another poller's."""
-    lock = lock_path(local)
-    if _read_holder(lock) == own:
-        _unlink_quietly(lock)
-
-
-def steal_dead_lock(local: Path, judged: str) -> bool:
-    """Remove a dead holder's lock; True when this run removed exactly the line it judged dead.
-
-    The judge-then-remove pair runs under a second, microseconds-long mutex, so two stealers never
-    interleave. Inside it the lock is re-read: it can change only by being released, since a new
-    lock cannot be created over an existing one. A steal mutex older than a minute is itself the
-    leftover of a kill, and is cleared.
-    """
-    lock = lock_path(local)
-    mutex = lock.with_name(f"{LOCK_NAME}.steal.lock")
+        raise LockUnavailable(f"cannot open {lock}: {exc!r}") from exc
     try:
-        fd = os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except (FileExistsError, PermissionError):
-        try:
-            if time.time() - mutex.stat().st_mtime > 60:
-                _unlink_quietly(mutex)
-        except OSError:
-            pass
-        return False
-    os.close(fd)
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def release_lock(fd: int) -> None:
+    """Close the handle, which releases the lock. The lock file stays; it is never deleted."""
     try:
-        if _read_holder(lock) != judged:
-            return False  # released, or retaken, since it was judged
-        aside = lock.with_name(f"{lock.name}.dead.{os.getpid()}")
-        try:
-            os.rename(lock, aside)
-        except OSError:
-            return False
-        _unlink_quietly(aside)
-        return True
-    finally:
-        _unlink_quietly(mutex)
-
-
-def _holder_is_gone(holder: str) -> bool:
-    """True only when the lock names THIS host and its pid is provably not the process that wrote it.
-
-    The line may come from this poller or from an ``Enter-CoordLock -Name pr-state`` caller; both
-    write ``pid= host= at=``. Two answers count as gone: Windows says no such process, or the
-    process with that pid started AFTER the lock's ``at=`` stamp, so the pid was reused (after a
-    reboot, say). Another host, an unparsable line, or a process that could have written the line
-    reads as alive.
-    """
-    fields = dict(part.split("=", 1) for part in holder.split() if "=" in part)
-    if fields.get("host", "").casefold() != coord_root.host().casefold():
-        return False
-    try:
-        pid = int(fields.get("pid", ""))
-    except ValueError:
-        return False
-    if sys.platform != "win32" or not 0 < pid <= 0xFFFFFFFF:
-        return False
-    locked_at = parse_iso(fields.get("at"))
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    ft = ctypes.POINTER(wintypes.FILETIME)
-    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ft, ft, ft, ft]
-    kernel32.GetProcessTimes.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: no such process
-    try:
-        code = wintypes.DWORD()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        if code.value != 259:  # not STILL_ACTIVE
-            return True
-        if locked_at is None:
-            return False
-        created, ex, kern, user = (wintypes.FILETIME() for _ in range(4))
-        if not kernel32.GetProcessTimes(
-            handle, ctypes.byref(created), ctypes.byref(ex), ctypes.byref(kern), ctypes.byref(user)
-        ):
-            return False
-        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime  # 100 ns since 1601
-        started = datetime(1601, 1, 1, tzinfo=UTC) + timedelta(microseconds=ticks // 10)
-        # A margin for clock granularity: only a start clearly after the stamp is a reuse.
-        return started > locked_at + timedelta(seconds=5)
-    finally:
-        kernel32.CloseHandle(handle)
+        os.close(fd)
+    except OSError as exc:
+        _say(f"closing the lock handle failed: {exc!r}")
 
 
 def lock_path(local: Path) -> Path:
-    return local / "locks" / f"{LOCK_NAME}.lock"
-
-
-def lock_age_seconds(local: Path) -> float | None:
-    try:
-        return time.time() - lock_path(local).stat().st_mtime
-    except OSError:
-        return None
+    return local / "locks" / LOCK_FILE
 
 
 def _say(message: str) -> None:
@@ -834,24 +756,12 @@ def main(
         return 2
     out: Path = args.out if args.out is not None else local / CACHE_NAME
 
-    own, holder = acquire_lock(local)
-    if own is None and holder is not None and _holder_is_gone(holder):
-        # A kill (task time limit, logoff, shutdown) skipped the release below. Its pid is gone.
-        if steal_dead_lock(local, holder):
-            _say(f"removed the pr-state lock of a process that no longer runs: {holder}")
-        own, holder = acquire_lock(local)
-    if own is None and holder == CREATE_REFUSED:
-        _say(f"cannot create {lock_path(local)}: {holder}")
-        return 4  # a non-zero task result, so an unwritable directory is not a silent success
-    if own is None:
-        age = lock_age_seconds(local)
-        if age is not None and age > STALE_LOCK_SECONDS:
-            # Not written to the cache: only the lock holder writes it. Readers see fetchedAt age.
-            _say(
-                f"the pr-state lock has been held {int(age)} s by {holder}. NOT stealing it. If that "
-                f"process is gone, delete {lock_path(local)} by hand."
-            )
-            return 3
+    try:
+        fd = acquire_lock(local)
+    except LockUnavailable as exc:
+        _say(str(exc))
+        return 4  # a non-zero task result, so an unusable lock directory is not a silent success
+    if fd is None:
         return 0  # another poll is running; it will write the cache
     try:
         start = now()
@@ -867,8 +777,15 @@ def main(
         try:
             doc = poll(gh, args.repo, previous, start)
         except (PollError, GhError) as exc:
-            reset_at, part = getattr(exc, "reset_at", None), getattr(exc, "part", None)
-            doc = failed(args.repo, previous, str(exc), start, reset_at=reset_at, part=part)
+            doc = failed(
+                args.repo,
+                previous,
+                str(exc),
+                start,
+                reset_at=getattr(exc, "reset_at", None),
+                part=getattr(exc, "part", None),
+                fresh=getattr(exc, "fresh", None),
+            )
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             # A reply shape this code did not expect. Recorded, so the cache does not go silently old.
             doc = failed(args.repo, previous, f"unexpected reply shape: {exc!r}", start)
@@ -878,7 +795,7 @@ def main(
             return 1
         return 0
     finally:
-        release_lock(local, own)
+        release_lock(fd)
 
 
 if __name__ == "__main__":

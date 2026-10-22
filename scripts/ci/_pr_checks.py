@@ -54,7 +54,7 @@ def in_progress(node: object) -> bool:
     """
     if not isinstance(node, dict):
         return False
-    if node.get("status") is not None:
+    if node.get("status"):
         return str(node["status"]).upper() != "COMPLETED"
     return str(node.get("state") or "").upper() in UNSETTLED
 

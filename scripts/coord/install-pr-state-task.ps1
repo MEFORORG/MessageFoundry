@@ -120,7 +120,7 @@ $ghExists = [bool](Get-Command gh -CommandType Application -ErrorAction Silently
 
 $runLevel = 'Limited'
 $logonType = 'Interactive'
-# Keep under pr_state.py's STALE_LOCK_SECONDS (15 min).
+# A kill at this limit is safe: the poller's OS lock is released when its process dies.
 $timeLimitMinutes = 10
 $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
 $coordDir = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord'

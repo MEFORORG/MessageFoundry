@@ -737,17 +737,14 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
 
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
-unrecognised node reads as unsettled, never green. It takes `locks/pr-state.lock` the same way
-`lock.ps1` does. A held lock means another poll is running, so the run exits. It steals in one
-case only (owner ruling 2026-10-22). The lock must name this host, and a pid that is not running or
-that started after the lock was written. A kill at the task's time limit, a logoff or a shutdown
-leaves that shape. The steal re-reads the lock under a second, short mutex, and a run deletes the
-lock only while it still carries its own line. Only the lock holder writes the cache. So a lock
-that stays wedged shows up as an ageing `fetchedAt`, never as `error`. A run that cannot create the
-lock at all exits 4, so the task's last result shows it.
+unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
+handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releases it when the
+process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
+means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
+cannot open the lock file exits 4, so the task's last result shows it.
 
 ```powershell
-python scripts\coord\pr_state.py --out $env:TEMP\pr-state.json            # one poll, to a scratch file
+python scripts\coord\pr_state.py          # one poll by hand; it obeys the real cache's back-off
 pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -WhatIf        # show the task, register nothing
 pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC>             # from a plain terminal
 pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC> -Uninstall
