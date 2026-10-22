@@ -616,6 +616,20 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
+def _raise_a_swallowed_lookup_error(handler: logging.handlers.SysLogHandler) -> None:
+    """Connect again where the stdlib constructor swallowed a lookup error, so it raises as it did
+    before CPython 3.14.9.
+
+    3.14.9 catches a ``socket.gaierror`` from ``createSocket`` in ``SysLogHandler.__init__`` and
+    leaves ``socket`` None, deferring the lookup to the first send. A collector name that does not
+    resolve would then read as a forwarder that started, with no "failed permanently" ERROR. A
+    successful ``createSocket`` always sets ``socket``, so this connects again only after a
+    swallowed error, and the caller's handling sees it, transient or permanent, as before 3.14.9.
+    The cost is one more lookup on that failure."""
+    if getattr(handler, "socket", None) is None:
+        handler.createSocket()
+
+
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
     any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't park the calling
@@ -663,6 +677,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         kwargs["timeout"] = timeout
         try:
             super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+            _raise_a_swallowed_lookup_error(self)
         except OSError as exc:
             # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
@@ -908,6 +923,9 @@ def _build_syslog_handler(
     The handler this returns is **not** attached to a logger directly. :func:`configure_logging` puts
     it behind :class:`_ForwardQueueHandler`, which is what keeps the send off the caller's thread.
 
+    A name lookup that fails at startup raises on every arm, on CPython 3.14.9 too
+    (:func:`_raise_a_swallowed_lookup_error`).
+
     **The UDP arm stays the plain stdlib handler**, deliberately. Its socket is unconnected and it
     sends with ``sendto``, so there is no connection to lose mid-run and nothing for
     :meth:`_TimeoutSysLogHandler.handleError`'s reconnect to repair; the permanent-break defect that
@@ -933,9 +951,11 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    return logging.handlers.SysLogHandler(
+    handler = logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
     )
+    _raise_a_swallowed_lookup_error(handler)
+    return handler
 
 
 class _ForwardQueueListener(logging.handlers.QueueListener):
