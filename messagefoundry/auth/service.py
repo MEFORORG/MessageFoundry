@@ -15882,11 +15882,14 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Enumerates with ``list_users`` filtered on provider and disabled, then revokes each
-        account's unrevoked rows, so this needs no schema change on any backend. The count it
-        returns includes rows already past their limits, which the revoke ends too. Unlike the
-        reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
-        a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
+        Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
+        :meth:`_load_users`: every enabled directory account whose record passes its seal. An
+        account that fails its seal is left out, and so are its sessions. Each account's unrevoked
+        rows are then revoked with ``revoke_user_sessions``, so this needs no schema change on any
+        backend. The count it returns includes rows already past their limits, which the revoke
+        ends too. Unlike the reconciler this is NOT counted against the mass-revoke breaker: that
+        breaker exists to catch a directory the engine cannot read, and this is an administrator's
+        own step-up-gated edit.
         """
         revoked = 0
         for user_id in sorted(await self.sessions_ended_by_ad_map_save()):
