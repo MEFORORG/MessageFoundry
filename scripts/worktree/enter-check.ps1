@@ -100,10 +100,9 @@ function Add-Failure([string]$Check, [string]$Why) { $failures.Add("$Check. $Why
 $gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM')
 
-function Invoke-Child {
-    # A child process with argv passed as a list (no quoting to get wrong), UTF-8 output, and a
-    # bound. A child still running at the bound is killed and the call throws.
-    param([string]$Exe, [string[]]$ArgList, [int]$TimeoutSeconds = 30, [switch]$StripGit)
+function Start-Child {
+    # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
+    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit)
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
@@ -114,22 +113,33 @@ function Invoke-Child {
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     if ($StripGit) { foreach ($v in $gitEnvStrip) { [void]$psi.Environment.Remove($v) } }
     $p = [System.Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    [pscustomobject]@{ Process = $p; Name = (Split-Path -Leaf $Exe); Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() }
+}
+
+function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
+    # The child's exit code and output. A child still running at the bound is killed and this throws.
+    $p = $Child.Process
     try {
-        $p.StandardInput.Close()
-        $outTask = $p.StandardOutput.ReadToEndAsync()
-        $errTask = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
             try { $p.Kill($true) } catch { Write-Verbose "kill failed: $($_.Exception.Message)" }
-            throw "$(Split-Path -Leaf $Exe) did not finish within $TimeoutSeconds s"
+            throw "$($Child.Name) did not finish within $TimeoutSeconds s"
         }
         $p.WaitForExit()
-        return [pscustomobject]@{ Code = $p.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+        return [pscustomobject]@{ Code = $p.ExitCode; Out = $Child.Out.Result; Err = $Child.Err.Result }
     }
     finally { $p.Dispose() }
 }
 
+# git by its resolved path: a bare name given to CreateProcess is looked for in the current
+# directory before PATH (scripts/worktree/install-gate.ps1 records it), and PowerShell's own command
+# lookup never searches the current directory.
+# Resolved at first use, inside a check, so a machine with no git fails that check.
+$gitExe = $null
+
 function Invoke-Git([string]$Repo, [string[]]$GitArgs) {
-    Invoke-Child -Exe 'git' -StripGit -ArgList (@('-C', $Repo, '-c', 'core.fsmonitor=false', '--no-optional-locks') + $GitArgs)
+    if (-not $script:gitExe) { $script:gitExe = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    Wait-Child (Start-Child -Exe $gitExe -StripGit -ArgList (@('-C', $Repo, '-c', 'core.fsmonitor=false', '--no-optional-locks') + $GitArgs))
 }
 
 # The ignored files this repository's own hooks write into every worktree's .claude/: the seat
@@ -138,6 +148,28 @@ function Invoke-Git([string]$Repo, [string[]]$GitArgs) {
 $localMarkers = @('.claude/seat.local.txt', '.claude/ROLE.local.md')
 
 $nameCmp = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+
+function Split-PathSegments([string]$Full) {
+    $root = [System.IO.Path]::GetPathRoot($Full)
+    $segs = @($Full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    [pscustomobject]@{ Root = $root; Segs = $segs }
+}
+
+# One directory lookup per (directory, segment) per run: the fleet's worktree lists share their
+# leading directories, and every listed worktree is canonicalised for check b.
+$segmentCache = [System.Collections.Generic.Dictionary[string, System.IO.FileSystemInfo]]::new([System.StringComparer]::Ordinal)
+
+function Find-Segment([string]$Dir, [string]$Seg) {
+    $key = "$Dir`0$Seg"
+    $hit = $null
+    if ($segmentCache.TryGetValue($key, [ref]$hit)) { return $hit }
+    $found = @(foreach ($e in [System.IO.DirectoryInfo]::new($Dir).EnumerateFileSystemInfos($Seg)) {
+            if ([string]::Equals($e.Name, $Seg, $nameCmp)) { $e }
+        })
+    if ($found.Count -ne 1) { throw 'a path segment is not on disk under that name (missing, or an 8.3 short name)' }
+    $segmentCache[$key] = $found[0]
+    return $found[0]
+}
 
 function Resolve-Canonical([string]$Raw) {
     <#
@@ -149,18 +181,16 @@ function Resolve-Canonical([string]$Raw) {
     if ($Raw -match '^[\\/]{2}') { throw 'a \\?\, \\.\ or UNC path is refused' }
     $full = [System.IO.Path]::GetFullPath($Raw)
     for ($hop = 0; $hop -lt 40; $hop++) {
-        $root = [System.IO.Path]::GetPathRoot($full)
+        $split = Split-PathSegments $full
+        $root = $split.Root
         if (-not $root -or $root -match '^[\\/]{2}') { throw 'a path with no local root is refused' }
         $cur = if ($IsWindows) { $root.ToUpperInvariant() } else { $root }
-        $segs = $full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)
+        $segs = $split.Segs
         $relinked = $false
         for ($i = 0; $i -lt $segs.Count; $i++) {
             $seg = $segs[$i]
             if ($seg.IndexOfAny([char[]]'*?<>"') -ge 0) { throw 'a path segment holds a wildcard character' }
-            $parent = [System.IO.DirectoryInfo]::new($cur)
-            $found = @($parent.EnumerateFileSystemInfos($seg) | Where-Object { [string]::Equals($_.Name, $seg, $nameCmp) })
-            if ($found.Count -ne 1) { throw 'a path segment is not on disk under that name (missing, or an 8.3 short name)' }
-            $item = $found[0]
+            $item = Find-Segment $cur $seg
             $cur = $item.FullName
             if ($null -ne $item.LinkTarget) {
                 $target = $item.ResolveLinkTarget($true)
@@ -176,22 +206,15 @@ function Resolve-Canonical([string]$Raw) {
     throw 'more than 40 links along the path'
 }
 
-function Split-Canonical([string]$Canon) {
-    $root = [System.IO.Path]::GetPathRoot($Canon)
-    $segs = @($Canon.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
-    [pscustomobject]@{ Root = $root; Segs = $segs }
-}
-
 function Test-SamePath([string]$A, [string]$B) {
     if (-not $A -or -not $B) { return $false }
-    if ($IsWindows) { return [string]::Equals($A.ToUpperInvariant(), $B.ToUpperInvariant(), [System.StringComparison]::Ordinal) }
-    return [string]::Equals($A, $B, [System.StringComparison]::Ordinal)
+    return [string]::Equals($A, $B, $nameCmp)
 }
 
 function Test-AtOrUnder([string]$Child, [string]$Parent) {
     if (Test-SamePath $Child $Parent) { return $true }
-    $c = Split-Canonical $Child
-    $p = Split-Canonical $Parent
+    $c = Split-PathSegments $Child
+    $p = Split-PathSegments $Parent
     if (-not (Test-SamePath $c.Root $p.Root) -or $c.Segs.Count -le $p.Segs.Count) { return $false }
     for ($i = 0; $i -lt $p.Segs.Count; $i++) { if (-not [string]::Equals($c.Segs[$i], $p.Segs[$i], $nameCmp)) { return $false } }
     return $true
@@ -230,9 +253,17 @@ function Get-ObjectId([string]$Repo, [string]$Spec) {
 }
 
 try {
+    # Started first and read at check g: the read is a child pwsh and a network call, and nothing
+    # before g depends on it.
+    $killSwitch = $null
+    $killSwitchFault = ''
+    try {
+        $kill = Join-Path (Split-Path -Parent $PSScriptRoot) 'coord/afk-kill.ps1'
+        $killSwitch = Start-Child -Exe ([Environment]::ProcessPath) -ArgList @('-NoProfile', '-NonInteractive', '-File', $kill, '-Status')
+    }
+    catch { $killSwitchFault = $_.Exception.Message }
+
     $target = $null
-    $tempCanon = $null
-    $cwdCanon = $null
     $lists = @()
     $match = $null
 
@@ -276,11 +307,9 @@ try {
                 throw "the session id $SessionId is not a session uuid"
             }
             $tempCanon = Resolve-Canonical $TempRoot
-            $t = Split-Canonical $target
-            $r = Split-Canonical $tempCanon
-            $n = $r.Segs.Count
-            $own = (Test-SamePath $t.Root $r.Root) -and ($t.Segs.Count -ge $n + 5)
-            for ($i = 0; $own -and $i -lt $n; $i++) { $own = [string]::Equals($t.Segs[$i], $r.Segs[$i], $nameCmp) }
+            $t = Split-PathSegments $target
+            $n = (Split-PathSegments $tempCanon).Segs.Count
+            $own = (Test-AtOrUnder $target $tempCanon) -and ($t.Segs.Count -ge $n + 5)
             $own = $own -and ($t.Segs[$n] -ceq 'claude') -and ($t.Segs[$n + 2] -ceq $SessionId) -and ($t.Segs[$n + 3] -ceq 'scratchpad')
             if ($own) { [void]$passed.Add('c') }
             else { Add-Failure 'c' "$target is not under $tempCanon/claude/<project>/$SessionId/scratchpad/, this session's own scratchpad" }
@@ -346,8 +375,8 @@ try {
 
     # g. The AFK kill switch reads OFF.
     try {
-        $kill = Join-Path (Split-Path -Parent $PSScriptRoot) 'coord/afk-kill.ps1'
-        $k = Invoke-Child -Exe ([Environment]::ProcessPath) -TimeoutSeconds $KillSwitchTimeoutSeconds -ArgList @('-NoProfile', '-NonInteractive', '-File', $kill, '-Status')
+        if ($null -eq $killSwitch) { throw "it did not start ($killSwitchFault)" }
+        $k = Wait-Child $killSwitch -TimeoutSeconds $KillSwitchTimeoutSeconds
         $word = $k.Out.Trim()
         if ($k.Code -eq 0 -and $word -ceq 'OFF') { [void]$passed.Add('g') }
         else { Add-Failure 'g' "the AFK kill switch does not read OFF (it printed '$word', exit $($k.Code)); set MEFOR_AFK_KILL to off to allow" }
@@ -369,7 +398,6 @@ try {
     $safe = ($failures.Count -eq 0) -and ((@($passed) | Sort-Object) -join '') -ceq 'abcdefgh'
 }
 catch {
-    $safe = $false
     Add-Failure '-' "the check stopped on an error: $($_.Exception.Message)"
 }
 

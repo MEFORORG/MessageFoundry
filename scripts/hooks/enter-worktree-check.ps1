@@ -53,10 +53,10 @@ try {
     if ($toolInput -isnot [pscustomobject] -or -not $toolInput.PSObject.Properties['path']) { exit 0 }
     $path = [string]$toolInput.PSObject.Properties['path'].Value
     $sid = if ($props['session_id']) { [string]$props['session_id'].Value } else { '' }
-    $cwd = if ($props['cwd']) { [string]$props['cwd'].Value } else { '' }
-    if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($cwd)) { exit 0 }
+    $cwd = Get-CcxHookPayloadCwd -Payload $hook
+    if ([string]::IsNullOrWhiteSpace($path) -or -not $cwd.Cwd) { exit 0 }
 
-    $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd }
+    $check = @{ Path = $path; SessionId = $sid; SessionCwd = $cwd.Cwd }
     if ($FleetRepos) { $check['FleetRepos'] = $FleetRepos }
     if ($TempRoot) { $check['TempRoot'] = $TempRoot }
     $lines = @(& (Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree/enter-check.ps1') @check 2>$null)
