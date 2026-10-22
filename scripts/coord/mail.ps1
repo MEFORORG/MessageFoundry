@@ -221,10 +221,13 @@ function Resolve-SeatRecipient {
     # A SEAT ID PUBLISHED BEFORE THE HOST JOINED THE KEY is the old path-only key. Mail is never
     # written under it: on a shared root every PC at that path would read that box. It goes to the box
     # the same worktree and host key to now, which is the one the recipient's drain reads. No host on
-    # the record means this machine, as everywhere; a host that is not text names no box, so that
-    # record keeps the id it was published under.
+    # the record means this machine, as everywhere. A host that is not text names no box, and a
+    # worktree that does not normalise to a path names no key, so either one REFUSES the send.
     $key = $Id
-    if ($wt -and $seatHost -ne $script:CoordUnreadableHost -and $Id -ceq (ConvertTo-LegacyBoxKey -Path $wt)) {
+    $legacy = $null
+    try { if ($wt) { $legacy = ConvertTo-LegacyBoxKey -Path $wt } } catch { return $null }
+    if ($legacy -and $Id -ceq $legacy) {
+        if ($seatHost -eq $script:CoordUnreadableHost) { return $null }
         $key = ConvertTo-BoxKey -Path $wt -HostName $seatHost
     }
     return [pscustomobject]@{ Key = $key; Worktree = $wt; Host = $seatHost }

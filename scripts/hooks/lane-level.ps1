@@ -221,15 +221,22 @@ function Read-LaneFor([string]$Worktree, [string]$HostName) {
     # so the record at that key is this tree's. Failing that, the old path-only key, which a copy of
     # lane.ps1 older than the change still writes (it runs from each worktree's branch, while this
     # hook runs from the primary). Every PC at this path shares that old name, so a record there counts
-    # only when its host is this tree's host. No host means this machine, as everywhere.
+    # only when its host is this tree's host. No host means this machine, as everywhere. When both
+    # files are readable, the one with the fresher stated level wins: a `lane.ps1 -Asked` on the new
+    # key writes no number and must not hide a level stated on the old one.
     $rec = Read-Json (Join-Path $lanesDir "$(ConvertTo-BoxKey -Path $Worktree -HostName $HostName).json")
-    if ($null -ne $rec) { return $rec }
     $old = Read-Json (Join-Path $lanesDir "$(ConvertTo-LegacyBoxKey -Path $Worktree).json")
-    if ($null -eq $old -or $old -is [string]) { return $old }
-    $oldHost = Get-CoordRecordHost $old
-    if (-not $oldHost) { $oldHost = Get-CoordHost }
-    if ($oldHost -ine $HostName) { return $null }
-    return $old
+    if ($null -ne $old -and $old -isnot [string]) {
+        $oldHost = Get-CoordRecordHost $old
+        if (-not $oldHost) { $oldHost = Get-CoordHost }
+        if ($oldHost -ine $HostName) { $old = $null }
+    }
+    if ($null -eq $rec) { return $old }
+    if ($null -eq $old -or $old -is [string] -or $rec -is [string]) { return $rec }
+    $newAge = if (Test-Has $rec 'statedUtc') { Get-AgeMin $rec.statedUtc } else { $null }
+    $oldAge = if (Test-Has $old 'statedUtc') { Get-AgeMin $old.statedUtc } else { $null }
+    if ($null -ne $oldAge -and ($null -eq $newAge -or $oldAge -lt $newAge)) { return $old }
+    return $rec
 }
 $cwd = (Get-Location).Path
 $leaf = (Split-Path $cwd -Leaf)
@@ -266,41 +273,53 @@ if ($seatDirs.Count -lt $SEAT_DIR_FLOOR) {
     Emit
 }
 
-$lanes = @()
+# PASS 1: each seat directory's newest record, keyed by the box its tree and host have now
+# (mail-key.ps1), so the same path on two PCs is two lanes. A tree that crossed the box-key change has
+# two directories, the old path-only one and the new one, and only the NEWER of the two speaks for it:
+# filtering first would let a frozen, still-open legacy record stand in for a seat that has since
+# closed or re-declared in its new box. seatBox is the directory the record was found in; the
+# activity check reads its heartbeat there.
+$cands = @()
 foreach ($d in $seatDirs) {
     $newest = Get-ChildItem -LiteralPath $d.FullName -Filter *.json -File -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if (-not $newest) { continue }
     $s = Read-Json $newest.FullName
     if ($null -eq $s -or $s -is [string]) { continue }
-    $seat = if (Test-Has $s 'seat') { [string]$s.seat } else { '' }
     $wt = if (Test-Has $s 'worktree') { [string]$s.worktree } else { '' }
+    if (-not $wt) { continue }
+    $laneHost = Get-CoordRecordHost $s
+    if (-not $laneHost) { $laneHost = Get-CoordHost }
+    # A worktree that does not normalise to a path names no key, and no lane.
+    try { $laneBox = ConvertTo-BoxKey -Path $wt -HostName $laneHost } catch { continue }
+    $cands += [pscustomobject]@{
+        box = $laneBox; seatBox = $d.Name; worktree = $wt; host = $laneHost
+        at = $newest.LastWriteTimeUtc; rec = $s
+    }
+}
+$cands = @($cands | Sort-Object at -Descending | Group-Object box | ForEach-Object { $_.Group | Select-Object -First 1 })
+
+# PASS 2: is that newest record a live builder lane?
+$lanes = @()
+foreach ($c in $cands) {
+    $s = $c.rec
+    $wt = $c.worktree
+    $seat = if (Test-Has $s 'seat') { [string]$s.seat } else { '' }
     $life = if (Test-Has $s 'lifecycle') { [string]$s.lifecycle } else { '' }
     # MATCH ON THE DECLARED SEAT ONLY, NEVER ON THE WORKTREE NAME. Measured 2026-08-23: the CLEANER
     # was sitting in a worktree whose name begins `builder-handoff-seat`, so a name match calls it a
     # builder lane. A worktree name is a creation-time label and nothing keeps it true.
     if ($seat -notmatch '^\s*build') { continue }
     if ($life -eq 'closed') { continue }
-    if (-not $wt -or -not (Test-Path -LiteralPath $wt)) { continue }
+    if (-not (Test-Path -LiteralPath $wt)) { continue }
     # RECENCY, and the roster count below is what makes this safe. A seat record is stamped every turn,
     # so a lane silent for hours is one nobody is dispatching to. Measured today the live lanes sat at
     # 0.1h and 0.2h and the next candidate at 10.2h -- a real gap, not a threshold fitted to noise.
     # If this ever DROPS a live lane, `discovered` falls below `expected` and the ROSTER DRIFT block
     # fires. Narrowing can therefore cost noise; it can never manufacture a green.
-    if (((([datetime]::UtcNow) - $newest.LastWriteTimeUtc).TotalHours) -gt 6) { continue }
-    $laneHost = Get-CoordRecordHost $s
-    if (-not $laneHost) { $laneHost = Get-CoordHost }
-    # One lane per tree on one host, named by the box key that tree and host have now (mail-key.ps1),
-    # so the same path on two PCs is two lanes. seatBox is the directory the record was found in, which
-    # may be the old path-only one; the activity check reads its heartbeat there.
-    $lanes += [pscustomobject]@{
-        box = (ConvertTo-BoxKey -Path $wt -HostName $laneHost); seatBox = $d.Name
-        worktree = $wt; host = $laneHost; at = $newest.LastWriteTimeUtc
-    }
+    if (((([datetime]::UtcNow) - $c.at).TotalHours) -gt 6) { continue }
+    $lanes += $c
 }
-# NEWEST SEAT BOX FIRST, so a tree holding both its old path-only seat box and its new one is judged
-# by the box its writer still stamps.
-$lanes = @($lanes | Sort-Object at -Descending | Group-Object box | ForEach-Object { $_.Group | Select-Object -First 1 })
 
 # RETIRE THE DEAD ONES WITH A REAL LIVENESS CALL, NOT A NAME MATCH. Measured 2026-08-23 without this
 # step: 12 "lanes" discovered against 2 live, every one printing three lines of NO-RECORD. That is the

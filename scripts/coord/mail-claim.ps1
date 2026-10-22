@@ -377,10 +377,11 @@ function Move-LegacyInbox {
     # mail.ps1 -Status reports what is left in the legacy box instead.
     #
     # ONLY inbox/, and only names this channel minted. claiming/ belongs to a drain that may still be
-    # running, and stranded/, seen/ and expired/ stay where mail.ps1 -List reports them. Shown-markers
-    # are not carried: a moved message may be shown once more, and a duplicate display is the side of
-    # this channel's one tradeoff it accepts. Each move goes through Move-Claimed under the file's own
-    # token, so the name is kept and a drain that takes the file first simply has it.
+    # running, and stranded/, seen/ and expired/ stay where mail.ps1 -List reports them. Each message's
+    # shown-markers are copied with it; if a copy fails it may be shown once more, and a duplicate
+    # display is the side of this channel's one tradeoff it accepts. Each move goes through
+    # Move-Claimed under the file's own token, so the name is kept and a drain that takes the file
+    # first simply has it.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -394,11 +395,23 @@ function Move-LegacyInbox {
     try { $names = @([System.IO.Directory]::EnumerateFiles($src) | ForEach-Object { [System.IO.Path]::GetFileName($_) }) }
     catch { return }
     $dst = Join-Path $Root "box/$Key/inbox"
+    $oldShown = Join-Path $Root "box/$LegacyKey/shown"
+    $newShown = Join-Path $Root "box/$Key/shown"
     foreach ($n in $names) {
         $p = Split-MailFileName -Name $n
         if (-not $p) { continue }
         # A failed move leaves the file where -Status counts it, so the failure stays visible.
         try {
+            # Its shown-markers are COPIED first, so a message already shown and held is not shown,
+            # or woken on, a second time once it lands. A marker is a flag, so a copy loses nothing.
+            if ([System.IO.Directory]::Exists($oldShown)) {
+                foreach ($m in @([System.IO.Directory]::EnumerateFiles($oldShown, "$($p.Stem)--*.marker"))) {
+                    $mn = [System.IO.Path]::GetFileName($m)
+                    if (-not (Split-ShownMarkerName -Name $mn)) { continue }
+                    [System.IO.Directory]::CreateDirectory($newShown) | Out-Null
+                    try { [System.IO.File]::Copy($m, (Join-Path $newShown $mn), $false) } catch { }
+                }
+            }
             [System.IO.Directory]::CreateDirectory($dst) | Out-Null
             $null = Move-Claimed -Source (Join-Path $src $n) -DestinationDir $dst -Stem $p.Stem -Token $p.Token
         } catch { }

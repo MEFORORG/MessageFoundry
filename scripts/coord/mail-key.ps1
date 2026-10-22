@@ -75,18 +75,23 @@ function ConvertTo-LegacyBoxKey {
     return (Format-BoxKey -Norm $norm -HashInput $norm)
 }
 
+# Set at load so a StrictMode caller can read it before the first load below.
+$script:BoxKeyHostLoaded = $null
+
 function Get-BoxKeyHost {
     # coord-root.ps1's Get-CoordHost, the one host rule. A caller that dot-sourced this file alone
     # gets it loaded from beside this file, and THROWS when it is missing rather than hashing a host
     # from a second copy of the rule that could drift from the one the other end uses.
-    if (-not (Get-Command Get-CoordHost -ErrorAction SilentlyContinue)) {
-        $lib = Join-Path $PSScriptRoot 'coord-root.ps1'
-        if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
-            throw "mail-key.ps1: $lib is missing, so this machine's host cannot be named for a box key"
-        }
-        . $lib
+    if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { return [string](Get-CoordHost) }
+    # Loaded here, the definitions leave scope on return, so the answer is kept for the next call.
+    if ($script:BoxKeyHostLoaded) { return $script:BoxKeyHostLoaded }
+    $lib = Join-Path $PSScriptRoot 'coord-root.ps1'
+    if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
+        throw "mail-key.ps1: $lib is missing, so this machine's host cannot be named for a box key"
     }
-    return [string](Get-CoordHost)
+    . $lib
+    $script:BoxKeyHostLoaded = [string](Get-CoordHost)
+    return $script:BoxKeyHostLoaded
 }
 
 function ConvertTo-BoxKeyPath {

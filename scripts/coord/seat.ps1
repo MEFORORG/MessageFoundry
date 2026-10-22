@@ -941,10 +941,21 @@ try {
         try {
             $one = Get-Content -LiteralPath $p -Raw -EA Stop | ConvertFrom-Json -EA Stop
             if ($p -ne $recPath -and -not (Test-CoordRecordIsHere $one)) { continue }
-            $priors += [pscustomobject]@{ Rec = $one; At = (Get-Item -LiteralPath $p -EA Stop).LastWriteTimeUtc }
+            # By what the RECORD says, never by file time: a copy or a host stamp moves the file time.
+            # ConvertFrom-Json may hand asOf back as a [datetime]; compare instants, not culture text.
+            $at = [datetime]::MinValue
+            if ($one.PSObject.Properties.Name -contains 'asOf' -and $one.asOf) {
+                $at = if ($one.asOf -is [datetime]) { $one.asOf.ToUniversalTime() }
+                      else { [datetime]::Parse([string]$one.asOf, [cultureinfo]::InvariantCulture,
+                              [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal) }
+            }
+            $n = if ($one.PSObject.Properties.Name -contains 'writes') { [int]$one.writes } else { 0 }
+            $priors += [pscustomobject]@{ Rec = $one; At = $at; Writes = $n }
         } catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
     }
-    if ($priors.Count -gt 0) { $prior = ($priors | Sort-Object At -Descending | Select-Object -First 1).Rec }
+    if ($priors.Count -gt 0) {
+        $prior = ($priors | Sort-Object At, Writes -Descending | Select-Object -First 1).Rec
+    }
 
     function Prior([string]$Name, $Default) {
         if ($prior -and ($prior.PSObject.Properties.Name -contains $Name)) { return $prior.$Name }

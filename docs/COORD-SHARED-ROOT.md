@@ -258,16 +258,15 @@ design. Reads and builds keep working.
    ids, mailboxes and lane files. `ConvertTo-BoxKey` in `scripts/coord/mail-key.ps1` does this, and
    `ConvertTo-LegacyBoxKey` is the one definition of the old key, for readers only. The drain and
    the watcher move the old box's inbox into the new box before they read. `seat.ps1` takes its
-   prior from whichever of its two records was written last, and `fleet.ps1` treats a record in the
-   old box and one in the new box of the same tree as one seat. The lane hook reads the old lane
-   file when the new one is missing. A send to a seat id published before the change goes to the
+   prior from whichever of its two records says it is newer. `fleet.ps1` treats the old and new
+   boxes of one tree as one seat. The lane hook reads whichever lane file holds the fresher level. A send to a seat id published before the change goes to the
    new box. Writers write only the new key. `lane.ps1` no longer refuses another host's record,
    since the key now keeps the two apart. A record read from an old box is judged by its `host`,
    because every PC at that path shares the old name.
    **Roll out by updating the primary checkout soon after the merge.** The hooks run from it, while
    `mail.ps1`, `seat.ps1 -Declare` and `lane.ps1` run from each worktree's branch. Until the primary
-   carries this change, its drain reads only the old box, so mail a new sender queued waits, and its
-   lane hook reads only the old lane file.
+   carries this change, its drain reads only the old box. Mail a new sender queued then waits. Its
+   lane hook also reads only the old lane file.
    **Copy mail and lanes to the share under host-qualified keys only** (steps 6 and 10). An old box
    copied there would be read by every PC with a worktree at that path. Move each old inbox into
    its new box first; the drain does exactly that for its own tree.

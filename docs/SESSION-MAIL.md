@@ -183,9 +183,9 @@ environment variable cannot, and that is the point of it being a file. Delete it
 
 ## Addressing: a box is keyed by the recipient's worktree
 
-A mailbox is keyed by the recipient's **worktree path**, normalised and hashed by the single definition
-in [`scripts/coord/mail-key.ps1`](../scripts/coord/mail-key.ps1). Four properties of that key are
-load-bearing, and each is load-bearing for a different reason.
+A mailbox is keyed by the recipient's **host and worktree path**, normalised and hashed by the single
+definition in [`scripts/coord/mail-key.ps1`](../scripts/coord/mail-key.ps1). At least five properties
+of that key are load-bearing, and each is load-bearing for a different reason.
 
 **Keyed by worktree, not by worktree NAME.** A worktree name is a creation-time label and nothing keeps
 it current. One worktree in this repo was observed switched onto four different branches by four
@@ -217,8 +217,10 @@ injectivity; the slug exists only so a human can tell boxes apart in a directory
 a path-only key gave them one mailbox ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md), migration step
 4). Mail queued before that change sits under the old path-only key, which `ConvertTo-LegacyBoxKey`
 names. The drain and the watcher move that box's inbox into the new box before they read, and
-`-Status` counts what is left there. Nothing writes a new message under the old key. A send to a seat
-id published before the change goes to the box that seat's worktree and host key to now.
+`-Status` counts what is left there. This version of `mail.ps1` writes nothing under the old key. A
+send to a seat id published before the change goes to the box that seat's worktree and host key to
+now. A copy of `mail.ps1` on a branch older than the change still writes the old box, and the drain
+moves that mail too.
 
 **One definition, dot-sourced by both ends.** The sender and the drain must compute the same key from
 the same path or mail is written to a box nobody reads -- and that failure is silent on both ends: the

@@ -436,3 +436,41 @@ def test_the_lane_hook_ignores_another_hosts_legacy_lane_file(builder: Path, sha
     assert NAG in _lane_hook(builder, shared)
     _plant_lane(shared, _key(builder), None)
     assert NAG not in _lane_hook(builder, shared), "this host's own lane file is read first"
+
+
+def test_a_fresher_level_under_the_legacy_key_beats_an_unstated_new_file(
+    builder: Path, shared: Path
+) -> None:
+    """`lane.ps1 -Asked` on the new key writes no number; it must not hide a stated old level."""
+    lanes = shared / "lanes"
+    lanes.mkdir()
+    (lanes / f"{_key(builder)}.json").write_text(
+        json.dumps({"v": 1, "statedUtc": None, "turnsSinceStated": 0}), encoding="utf-8"
+    )
+    assert NAG in _lane_hook(builder, shared), "the control: an unstated new file alone nags"
+    _plant_lane(shared, _key(builder, legacy=True), None)
+    assert NAG not in _lane_hook(builder, shared)
+
+
+def test_a_legacy_seat_id_with_an_unreadable_host_is_refused(repo: Path, shared: Path) -> None:
+    legacy = _key(repo, legacy=True)
+    f = _plant_seat(shared / "seats", legacy, str(repo), None)
+    rec = json.loads(f.read_text(encoding="utf-8"))
+    rec["host"] = 123  # present but not text: NOT CHECKABLE HERE, and it names no box
+    f.write_text(json.dumps(rec), encoding="utf-8")
+    proc = _send(repo, shared, legacy, "to nobody")
+    assert proc.returncode != 0
+    assert not (shared / "mail" / "box").exists()
+
+
+def test_one_session_crossing_the_change_is_one_seat(repo: Path, shared: Path) -> None:
+    """Minutes apart is inside fleet.ps1's 0.1 h age rounding; the new box still wins."""
+    top = _top(repo)
+    seats = shared / "seats"
+    _plant_seat(seats, _key(top, legacy=True), top, None, sessionKey="sess-e")
+    _plant_seat(seats, _key(top), top, None, sessionKey="sess-e")
+    fleet = _ps(COORD / "fleet.ps1", repo, "-Json", env=_env(shared))
+    assert fleet.returncode in (0, 2), fleet.stderr
+    rows = {r["Box"]: r for r in json.loads(fleet.stdout)["rows"]}
+    assert rows[_key(top, legacy=True)]["State"] == "SUPERSEDED"
+    assert rows[_key(top)]["State"] != "SUPERSEDED"
