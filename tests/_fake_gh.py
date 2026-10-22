@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,21 @@ ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
 VAULT = "MEFORORG/MessageFoundry-vault"
 ENGINE = "MEFORORG/MessageFoundry"
+
+
+def utc_day_with_room(seconds: float = 120.0) -> str:
+    """Today's UTC day, first waiting out midnight if fewer than ``seconds`` of it remain.
+
+    decision.ps1 mints a record's id, and so its day, from the wall clock and has no seam for it.
+    A test whose script runs must all land on one day calls this first, so the runs that follow
+    it land on the day it returns rather than straddling UTC midnight.
+    """
+    now = datetime.now(UTC)
+    midnight = datetime(now.year, now.month, now.day, tzinfo=UTC) + timedelta(days=1)
+    left = (midnight - now).total_seconds()
+    if left < seconds:
+        time.sleep(left + 1)
+    return datetime.now(UTC).date().isoformat()
 
 
 def _answer(state: dict[str, Any], argv: list[str]) -> tuple[int, str, str]:
