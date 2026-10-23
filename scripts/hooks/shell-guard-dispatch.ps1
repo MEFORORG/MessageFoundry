@@ -19,6 +19,19 @@
     stdin is replaced with a fresh reader over the payload this file read once, and stdout with a
     buffer. `exit` inside a guard ends that guard's script, not this process (measured).
 
+    THE PAYLOAD IS READ AS UTF-8 BYTES, NOT THROUGH [Console]::In. That reader decodes with the
+    console code page, which a hook child does not choose: started from a cp437 console it read
+    U+00E9 as two characters, and on a double-byte page (cp932, cp936, cp950) a lead byte swallows
+    the next `\`, so a valid payload stops parsing. Every guard sees this file's decoding, so the
+    defect reached all of them. This file reads stdin to the end, so a guard that reads the
+    process's own stdin handle finds it at end of file and must take [Console]::In instead.
+    THE DECISION GOES OUT AS ASCII for the same reason: written in the console's output page, a
+    deny echoing U+30BD under cp932 carried the bytes 83 5C, a stray `\` in a JSON string, and a
+    deny that does not parse decides nothing. Every non-ASCII character in the decision on stdout
+    is written as \uXXXX. Stderr is not escaped: a guard's exit-2 reason and this file's own
+    failure lines still go out in the console's page, so a block holds but its reason can arrive
+    mangled. A guard run on its own, outside this file, still reads and writes in the console's page.
+
     ***SCOPE IS ISOLATED; THE PROCESS IS NOT.*** At least these are shared by every guard in the
     run, and none of the guards wired today touches them: the current location, environment
     variables, the Console encodings (setting [Console]::OutputEncoding rebuilds Console.Out, so
@@ -96,10 +109,29 @@ param(
 )
 
 $ShellGuardStdout = [Console]::Out
+# Read-CcxHookInput in _hookinput.ps1 decodes the same bytes the same way, but it is bounded in
+# time and returns '' on a failure or when stdin is not redirected; this read is unbounded, and a
+# failure exits 1. A caller that
+# leaves stdin open therefore holds this file until the hook times out, which lets the command run.
+# It is not dot-sourced here because scoping is dynamic, so its functions would be visible to every
+# guard.
 try {
-    $ShellGuardPayload = [Console]::In.ReadToEnd()
+    $ShellGuardPayload = [System.IO.StreamReader]::new(
+        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
 } catch {
-    exit 0
+    # No guard ran, so say so: exit 1 is the visible non-blocking hook error, as for a failed guard.
+    [Console]::Error.WriteLine("shell-guard-dispatch: could not read the hook input, so no guard ran: $($_.Exception.Message)")
+    exit 1
+}
+
+function ConvertTo-ShellGuardAscii([string]$Json) {
+    # A decision this file writes parsed as JSON, so a non-ASCII character in it normally sits
+    # inside a string, where \uXXXX names the same character. Escaped, the bytes are the same in
+    # every ASCII-compatible code page, at least the OEM and ANSI pages, so the console's output
+    # page cannot break a deny the way it once broke the input. ConvertFrom-Json is lenient, so such a character can also sit outside a string; the
+    # escape there is no more valid JSON than the character was. Whether Claude Code accepts either
+    # form there is not measured.
+    [regex]::Replace($Json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 }
 
 function Write-ShellGuardFailure([string]$Path, [string]$Why) {
@@ -245,7 +277,7 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
         continue
     }
     if ($ShellGuardVerdict -ceq 'deny') {
-        $ShellGuardStdout.Write($ShellGuardOutput)
+        $ShellGuardStdout.Write((ConvertTo-ShellGuardAscii $ShellGuardOutput))
         $ShellGuardStdout.Flush()
         exit 0
     }
@@ -276,7 +308,7 @@ if ($ShellGuardContexts.Count) {
     }
 }
 if ($null -ne $ShellGuardKept) {
-    $ShellGuardStdout.Write($ShellGuardKept)
+    $ShellGuardStdout.Write((ConvertTo-ShellGuardAscii $ShellGuardKept))
     $ShellGuardStdout.Flush()
     exit 0
 }

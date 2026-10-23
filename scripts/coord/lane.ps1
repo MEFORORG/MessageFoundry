@@ -103,15 +103,21 @@ $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
-New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
-
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Read-CoordText $file | ConvertFrom-Json } catch { $rec = $null }
 }
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
-# path has its own file and this one can never be it. A record under the old path-only key is not
+# path writes its own file, not this one. A record under the old path-only key is not
 # read: lane-level.ps1 asks for a fresh level after 15 minutes anyway, so a restatement replaces it.
+# A record at THIS key that still names another host got here at least by a copy, by hand, by a
+# collision on the short hash, or by a mistyped coord-migrate.ps1 -SourceHost. Taking it over would overwrite that lane's stated level with this one's, so a write refuses
+# and says so; -Show only reads, so it prints the record as it is. A record with no `host` was
+# written here, as every record before the field was.
+if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), not of this machine ($thisHost). Nothing was written. Read it with -Show; if it is a stray copy rather than that machine's live lane, move it out of $lanesDir by hand and state this lane's level again.")
+    exit 2
+}
 if (-not $rec) {
     $rec = [pscustomobject]@{
         v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
@@ -124,9 +130,46 @@ if (-not $rec) {
 }
 
 if ($Show) {
-    $rec | ConvertTo-Json -Depth 5
+    # -SHOW IS A STRICT READ. Its callers may hold only read access to the root, so it creates no
+    # directory and writes no file. (The resolver's down cache is the one exception, and it lives in
+    # this clone's own .git, never on the root.) It prints what ONE read of the record found, so the
+    # record and its `absent` reason cannot come from two reads that a restatement landed between.
+    # The read above keeps no reason, which is why this one stands alone. A found record prints as it
+    # is; otherwise the blank record above prints with `absent` saying why, so an unstated lane never
+    # reads as a stated one.
+    $shown = $null
+    $absent = $null
+    try {
+        $shown = Read-CoordText $file | ConvertFrom-Json
+        if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
+            $absent = "the lane record at $file is not a JSON object"
+        }
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+        $absent = if (Test-Path -LiteralPath $lanesDir -PathType Container) { "no lane record at $file" }
+                  else { "no lanes directory found at $lanesDir, so this root holds no lane record" }
+    } catch {
+        $absent = "the lane record at $file could not be read: $($_.Exception.Message)"
+    }
+    if ($absent) {
+        # A FRESH blank record, never $rec: $rec may hold what the earlier read found, so a restatement
+        # between the two reads would print a stated level beside an `absent` reason. The fields
+        # match the blank record above; fold the two together once that read keeps its reason.
+        $shown = [pscustomobject]@{
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            statedFree = $null; statedInFlight = $null; statedUtc = $null
+            statedBySessionId = $null; statedNote = ''
+            tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
+            tipNow = ''; claimHashNow = ''; lastTurnUtc = $null
+            promptedUtc = $null; promptCount = 0; askedByDispatcherUtc = $null
+            absent = $absent
+        }
+    }
+    $shown | ConvertTo-Json -Depth 5
     exit 0
 }
+
+# Made here, on the write path only, so -Show above creates nothing.
+New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $nowUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 

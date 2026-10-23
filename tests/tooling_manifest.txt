@@ -95,6 +95,7 @@ tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
 tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
+tests/test_cloud_batch.py
 tests/test_cloud_setup_hook.py
 tests/test_collision_gate.py
 tests/test_coord_box_activity.py
@@ -109,6 +110,7 @@ tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
+tests/test_coord_migrate.py
 tests/test_coord_occupancy_unplaceable.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
@@ -116,6 +118,7 @@ tests/test_coord_overlap_signals.py
 tests/test_coord_overlap_work_signal.py
 tests/test_coord_presence.py
 tests/test_coord_recoverable.py
+tests/test_coord_wait_pr.py
 tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
 tests/test_import_db_ca_console_text.py
@@ -162,6 +165,7 @@ tests/test_new_dependency_check.py
 tests/test_new_glyph_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py
+tests/test_pr_state.py
 tests/test_precompact_reprime_hook.py
 tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py

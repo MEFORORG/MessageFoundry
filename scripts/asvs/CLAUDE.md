@@ -3,7 +3,9 @@
 Moved verbatim from the root `CLAUDE.md` §12 on 2026-10-07. A nested `CLAUDE.md` loads when Claude
 reads files under this directory, so the vocabulary reaches the verifier's own work without costing
 context in every other session. The root file keeps the "never say vault cell" rule and the
-`--status` command. Only the one link target changed, so it resolves from here.
+`--status` command. Only the one link target changed, so it resolves from here. The VOCABULARY and
+CONTENT bullet was reworded on 2026-10-22 to follow korus `roles/COMMON.md`, and is no longer
+verbatim.
 
 - **ASVS vocabulary: the SUBJECT is the engine, and the record lives elsewhere — never let the storage
   location name the thing.** An **ASVS cell** is one requirement's graded row (verdict + reasoning +
@@ -38,6 +40,13 @@ context in every other session. The root file keeps the "never say vault cell" r
     the engine's. *Stale anchors* = the evidence moved. Different failures with adjacent names; the
     gate's own comment says the two "are easy to confuse", and instrument drift once made the gate
     **not run at all** on every matching pull request.
-  - **The VOCABULARY is public; the CONTENT is not.** Cell ids, coverage and gaps stay vaulted — a
-    path-to-cell map enumerates what IS covered over a closed public domain, so it hands out what is
-    NOT by subtraction. Naming the terms discloses nothing; pasting the scorecard does.
+  - **The VOCABULARY is public; the CONTENT is not.** A cell id is a bare OWASP ASVS requirement
+    number, and a requirement number may tag a sentence that says what the code does, or what a
+    change makes it do. A requirement's status (words such as gap, unmet, partial, residual, covered
+    or still open), its coverage, any count or score from the scorecard, and any map pairing cell
+    ids with paths stay vaulted — a path-to-cell map enumerates what IS covered over a closed public
+    domain, so it hands out what is NOT by subtraction. So in a public repository, no pull request,
+    comment, commit message or file may hold three or more requirement numbers each beside a path. Text already on a public
+    `main` is no precedent, and no seat sweeps it without a ruled item. Naming the terms discloses
+    nothing; pasting the scorecard does. korus `roles/COMMON.md`, *A public repository never
+    carries the scorecard's map*, is the source of record.

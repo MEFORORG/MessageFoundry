@@ -789,7 +789,11 @@ too. That variable replaces the system file for the driver (measured, last table
 what the programs it starts may still write is listed once, in
 [`testing/VERIFY.md`](testing/VERIFY.md), *What writes, and what does not*. It is not part of
 `messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
-engine runs as, with the same environment, after the reboot on Windows.
+engine runs as, with the same environment, after the reboot on Windows. That still matters:
+`verify` reads its settings and `OPENSSL_CONF` from it, and passes the OpenSSL variables on. But
+the programs it starts do not get all of it, as the manual commands run in your own shell do;
+[`DANGEROUS-FUNCTIONALITY.md`](DANGEROUS-FUNCTIONALITY.md) section 4, *What each child is
+handed*, states what each one gets.
 
 **It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
 installed in the Python that runs `verify`, found on the import path without being imported. It
@@ -815,8 +819,10 @@ It runs the commands of this step. It differs from them in at least the ways nam
 - Windows: `Get-TlsCipherSuite` through Windows PowerShell at its `System32` path, with the name
   filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
   registry. It imports the system TLS module by its path under the Windows PowerShell folder and
-  runs that module's own `Get-TlsCipherSuite`, so a script on the `PATH` or a module in the
-  account's Documents folder with the same name cannot answer instead. No command it runs is
+  runs the `Get-TlsCipherSuite` the imported module exports, never one looked up by name. Given a path,
+  `Import-Module` loads from that path and does not search the module path, which is where a
+  module in the account's Documents folder would be found. That is read from the command, not
+  measured: no run planted a same-named module in a Documents folder. No command it runs is
   looked up by a bare name, so a program or script of that name on the `PATH`, such as a
   `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
   `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.

@@ -164,7 +164,8 @@
     version-controlled document; reading a doc is not running a command.
 
     MESSAGE CONTENT CANNOT REACH COLUMN 0. Every line derived from a message carries the prefix
-    '    | ', applied by Format-Body, which is the only place in this script where a body becomes lines.
+    '    | ', applied by Format-Body and by Format-AnnounceLine, the two places in this script where a body
+    becomes lines. Audit both when the prefix or the sanitiser changes.
     Every other line in the injection was written here. That single structural rule is what stops a body
     forging this script's own delimiter, a system-reminder opener, or any framing nobody has invented yet
     -- and it is why there is deliberately no list of forbidden strings to keep up to date.
@@ -436,6 +437,12 @@ function Get-CleanLines {
 $BODY_PREFIX = '    | '
 $BODY_PREFIX_BYTES = $BODY_PREFIX.Length
 
+# The paste backstop's one pattern, shared by Format-Body and Format-AnnounceLine. Two copies would
+# let a segment added to one slip past the other.
+$HL7_SEGMENT_START = '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|'
+# The longest one-line announce render. A longer one renders in full through Format-Body instead.
+$MAX_ANNOUNCE_CHARS = 400
+
 function Measure-BodyBytes {
     # Bytes, not characters, and measured on the SANITISED text. Get-Clean has already substituted
     # every non-ASCII code point, so one character is one byte here -- which is the only reason a
@@ -452,7 +459,8 @@ function Measure-BodyBytes {
 }
 
 function Format-Body {
-    # THE ONLY PLACE A MESSAGE BODY BECOMES LINES. Every line gets the prefix '    | '. The prefix is
+    # WHERE A MESSAGE BODY BECOMES LINES, with Format-AnnounceLine as the only other place, for the
+    # one-line announce. Every line gets the prefix '    | '. The prefix is
     # the containment: a body line can no longer start at column 0, so it cannot forge this script's
     # '--- message' delimiter, a '<system-reminder>'-shaped opener, a 'Human:'/'Assistant:' turn
     # marker, or any framing the surrounding harness has not invented yet.
@@ -475,7 +483,7 @@ function Format-Body {
     # body". This is a backstop
     # for the realistic accident, and its presence is not evidence that the queue is PHI-safe.
     foreach ($l in $Lines) {
-        if ($l -cmatch '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|') {
+        if ($l -cmatch $HL7_SEGMENT_START) {
             return [pscustomobject]@{
                 Lines     = @(
                     "    | [mefor-mail: body withheld -- it contains a line shaped like an HL7 segment, and"
@@ -522,6 +530,55 @@ function Format-Body {
         $out += "    |  The whole message is on disk at $DiskPath.]"
     }
     return [pscustomobject]@{ Lines = @($out); Withheld = $false; Truncated = $truncated }
+}
+
+function Format-AnnounceLine {
+    # A [SESSION-ANNOUNCE] BROADCAST RENDERS AS ONE LINE. An audit of 196 mailed messages found 85
+    # were announces, each about 600 bytes framed, and the reader needs five facts from one: who,
+    # which branch, what they intend, what they touch, and when it was sent. Two lines are dropped:
+    # the tag line, whose worktree and branch repeat the from fields, and a final `via:` envelope line.
+    #
+    # NOTHING ELSE IS DROPPED. $null means "render it in full through Format-Body", and the shortcut
+    # returns $null for at least: a kind other than broadcast, extra text on the tag line, a field it
+    # does not know or that repeats, text after `via:`, a line the line cap already cut, a summary
+    # longer than $MAX_ANNOUNCE_CHARS, and a line Format-Body would withhold. So the HL7 backstop and
+    # the truncation markers are never bypassed, and the tag cannot hide the rest of a body.
+    #
+    # This is the second place a body becomes lines, beside Format-Body. The line is message content,
+    # so it carries $BODY_PREFIX, and every field went through Get-Fold. Only the frame delimiters
+    # stay at column 0.
+    param([string[]]$Lines, [string]$Kind, [bool]$LineCapped, [string]$FromCwd, [string]$FromBranch, [string]$Sent)
+    if ($Kind -ne 'broadcast' -or $LineCapped) { return $null }
+    if (-not $Lines -or -not ([string]$Lines[0]).StartsWith('[SESSION-ANNOUNCE]')) { return $null }
+    # The header must be exactly the hook's '<tag> <worktree> (<branch>)', which repeats the from
+    # fields. Any other text on it is content this line would not show.
+    if ([string]$Lines[0] -cnotmatch '\A\[SESSION-ANNOUNCE\] \S+ \(\S*\)\z') { return $null }
+    foreach ($l in $Lines) { if ($l -cmatch $HL7_SEGMENT_START) { return $null } }
+    # Get-CleanLines has trimmed every line, so a wrapped field's continuation lines arrive as bare
+    # text. A known key followed by ': ' starts a field. Any other 'word: ' line is a field this
+    # shortcut does not know, so the message renders in full. A wrapped 'https://...' or 'D:\...'
+    # has no space after its colon, so it stays a continuation.
+    # A repeated field would overwrite the first copy, and `via:` must be the last line, because its
+    # text is dropped and anything after it would be dropped with it.
+    $f = @{ intent = ''; touching = ''; via = '' }
+    $seen = @{}
+    $cur = ''
+    foreach ($l in @($Lines | Select-Object -Skip 1)) {
+        if (-not $l) { continue }
+        if ($cur -eq 'via') { return $null }
+        if ($l -cmatch '\A([a-z][a-z-]*):(?:\z| (.*)\z)') {
+            if (-not $f.ContainsKey($Matches[1]) -or $seen.ContainsKey($Matches[1])) { return $null }
+            $cur = $Matches[1]; $seen[$cur] = $true; $f[$cur] = [string]$Matches[2]; continue
+        }
+        if (-not $cur) { return $null }
+        $f[$cur] = "$($f[$cur]) $l"
+    }
+    $intent = if ($f.intent) { $f.intent } else { '(none given)' }
+    $text = "announce: $FromCwd (branch $FromBranch); intent: $intent"
+    if ($f.touching) { $text += "; touching: $($f.touching)" }
+    $text = Get-Fold "$text; sent $Sent"
+    if ($text.Length -gt $MAX_ANNOUNCE_CHARS) { return $null }
+    return "$BODY_PREFIX$text  [UNVERIFIED]"
 }
 
 function Write-MailReceipt {
@@ -1689,6 +1746,14 @@ try {
         #
         # The rule is now literally true: message-derived text cannot reach column 0 anywhere.
         $lines += "--- message id=$($d.Item.Id)"
+        $ann = Format-AnnounceLine -Lines $d.Item.CleanLines -Kind $kind -LineCapped $d.Item.LineCapped `
+            -FromCwd $fromCwd -FromBranch $fromBr -Sent $sent
+        if ($ann) {
+            $lines += $ann
+            $lines += "--- end message id=$($d.Item.Id)"
+            $lines += ""
+            continue
+        }
         # [UNVERIFIED] sits at the POINT OF USE so the reader does not have to carry the preamble down
         # thirty lines to a message header.
         $lines += "    | claimed-from: $fromCwd  (branch $fromBr)  [UNVERIFIED]"

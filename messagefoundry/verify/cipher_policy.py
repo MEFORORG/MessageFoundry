@@ -106,7 +106,8 @@ _SCHANNEL_SUITE_NAME = re.compile(r"(?:TLS|SSL)_[A-Za-z0-9_]+")
 _OPENSSL_SUITE_LINE = re.compile(r"\S+\s+\S+\s+Kx=\S+\s+Au=\S+\s+Enc=\S+\s+Mac=\S+")
 
 _OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
-#: The variables OpenSSL reads to find its configuration. They cross to the probe on top of what
+#: The variables OpenSSL reads to find its configuration file and the provider modules and engines
+#: it loads. They cross to the probe on top of what
 #: ``worker_environment`` passes to any child, which is the platform's start-up names and the
 #: Python interpreter's own variables; ``openssl`` is not Python, so it reads none of the latter.
 _OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES")
@@ -278,7 +279,8 @@ def _openssl_suites() -> list[str]:
 
     Found on ``PATH`` by bare name, as section 5.4's own command is. It gets what
     ``worker_environment`` gives any child, the start-up names and the interpreter's variables, and
-    the variables OpenSSL reads to find its configuration: section 5.4 asks for the check to run
+    the variables OpenSSL reads to find its configuration, providers and engines: section 5.4 asks
+    for the check to run
     with the engine's environment, and without ``OPENSSL_CONF`` it would read a different policy
     from the one the driver takes."""
     with _probe_errors("openssl"):

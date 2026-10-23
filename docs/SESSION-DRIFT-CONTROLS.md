@@ -92,8 +92,9 @@ auto-`checkout` of a **clean** primary that has drifted off its home branch — 
 ghost-stub cwd, and this worktree's HEAD not matching its recorded home branch.
 
 **[`session-context.ps1`](../scripts/worktree/session-context.ps1)** (project scope) injects the
-coordination banner: which worktree this chat owns, the full worktree list, the shared-memory write rule,
-and the open work claims.
+coordination banner. It holds at least which worktree this chat owns, the live peers, what they are
+building, the open work claims and the shared-memory write rule. Each list is capped. When the
+capped lists still pass the byte budget, a backstop cuts the end of the lists and says so.
 
 ### Coordination — commit-time gates (the D4 layer)
 

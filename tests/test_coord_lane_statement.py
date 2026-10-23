@@ -47,6 +47,7 @@ touched.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,12 +59,32 @@ from tests._no_prompt import run_holding_stdin_open
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane.ps1"
 
 
-def _pwsh(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _env(root: Path | str | None = None) -> dict[str, str]:
+    """The suite's environment with MEFOR_COORD_ROOT dropped, so the throwaway repo's own local root
+    is the one in use, or set to ``root`` when one is given."""
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    if root is not None:
+        env["MEFOR_COORD_ROOT"] = str(root)
+    return env
+
+
+def _pwsh(
+    repo: Path, *args: str, root: Path | str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run lane.ps1 in ``repo``, under ``_env(root)``."""
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT), *args],
         capture_output=True,
         text=True,
+        # A pwsh child of Python writes the console's OEM code page, not UTF-8, and no single codec
+        # matches every box. The asserts look only for ASCII text, so a non-ASCII byte (a path or a
+        # localized message) becomes U+FFFD rather than a UnicodeDecodeError hiding the result.
+        encoding="utf-8",
+        errors="replace",
         cwd=repo,
+        env=_env(root),
+        # Under pyproject's 60 s pytest-timeout, so a hung pwsh fails this test by name.
+        timeout=45,
     )
 
 
@@ -155,8 +176,120 @@ def test_a_statement_missing_a_number_refuses_instead_of_prompting(
     repo: Path, args: tuple[str, ...]
 ) -> None:
     """Vault BACKLOG #3627: the default ``State`` set bound without both numbers. Red pre-fix."""
-    rc, err = run_holding_stdin_open(["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args], cwd=repo)
+    rc, err = run_holding_stdin_open(
+        ["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args], cwd=repo, env=_env()
+    )
     assert rc != 0, "a statement without both numbers must be refused, not written"
     assert "-Free" in err and "-InFlight" in err, err
     # Refused means NOTHING written: the lanes directory is created on the write path.
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+# -SHOW IS A STRICT READ: it creates no directory and writes no file on the coordination root. Before
+# this change it ran `New-Item -Force` on `<root>\lanes` and `<root>\lanes\.tmp` on every call, so it
+# created both on a fresh root and threw on one it could not write. MEASURED 2026-10-22: every test
+# below fails against that code. The third passes its first arm, the found record, which is the
+# must-not-fire control.
+
+
+def _tree(top: Path) -> list[str]:
+    """Every file and directory under ``top``, as sorted relative paths: the before/after instrument."""
+    return sorted(str(p.relative_to(top)) for p in top.rglob("*"))
+
+
+def _show(repo: Path, root: Path | None = None) -> dict[str, object]:
+    proc = _pwsh(repo, "-Show", root=root)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out: dict[str, object] = json.loads(proc.stdout)
+    return out
+
+
+def test_show_with_no_lanes_dir_creates_nothing_and_says_absent(repo: Path) -> None:
+    before = _tree(repo)
+    assert any(p.startswith(".git") for p in before), "the instrument must see .git to count"
+
+    rec = _show(repo)
+
+    assert _tree(repo) == before, "lane.ps1 -Show wrote to the repository"
+    assert "no lanes directory" in str(rec["absent"]), rec
+    assert rec["statedFree"] is None and rec["statedInFlight"] is None
+
+
+# Everyone (S-1-1-0), so the ACE covers every SID in the token, an elevated one's groups included.
+# Hosted CI's first run denied only the user SID, and its write went through.
+_EVERYONE = "*S-1-1-0"
+
+
+def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
+    repo: Path, tmp_path: Path
+) -> None:
+    if os.name != "nt":
+        pytest.skip("the deny ACE is a Windows ACL")
+    shared = tmp_path / "read-only-root"
+    shared.mkdir()
+    # On the root itself, not inherited, so removing it is enough for cleanup.
+    subprocess.run(
+        ["icacls", str(shared), "/deny", f"{_EVERYONE}:(AD,WD)"], check=True, capture_output=True
+    )
+    try:
+        write = _pwsh(repo, "-Free", "1", "-InFlight", "0", root=shared)
+        # The control: the ACE is what stops a write, so a green -Show below is not vacuous. Where
+        # the account writes through it anyway (a privilege that bypasses the ACL), the precondition
+        # cannot hold, so this skips rather than fail. The no-lanes-dir test still covers no-write.
+        if write.returncode == 0:
+            pytest.skip(
+                "this account writes through a deny ACE, so a read-only root cannot be staged"
+            )
+        assert "denied" in write.stderr.lower(), write.stderr
+        assert not any(shared.iterdir())
+
+        rec = _show(repo, root=shared)
+        assert "no lanes directory" in str(rec["absent"]), rec
+        assert not any(shared.iterdir())
+    finally:
+        # check=False: a cleanup failure must not replace the assertion that is failing.
+        subprocess.run(["icacls", str(shared), "/remove:d", _EVERYONE], capture_output=True)
+
+
+def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_one(
+    repo: Path,
+) -> None:
+    assert _pwsh(repo, "-Free", "2", "-InFlight", "1", "-Note", "n").returncode == 0
+    rec = _show(repo)
+    assert "absent" not in rec, rec
+    assert rec["statedFree"] == 2 and rec["statedInFlight"] == 1
+
+    record = _lane_record(repo)
+    for body, reason in (("{not json", "could not be read"), ("0", "not a JSON object")):
+        record.write_text(body, encoding="utf-8")
+        rec = _show(repo)
+        assert reason in str(rec["absent"]), (body, rec)
+        assert rec["statedFree"] is None, (body, rec)
+    record.unlink()
+    assert "no lane record at" in str(_show(repo)["absent"])
+
+
+_BLANK_KEYS = {
+    "v", "boxKey", "worktree", "capacity", "statedFree", "statedInFlight", "statedUtc",
+    "statedBySessionId", "statedNote", "tipAtStated", "claimHashAtStated", "turnsSinceStated",
+    "tipNow", "claimHashNow", "lastTurnUtc", "promptedUtc", "promptCount", "askedByDispatcherUtc",
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("body", ["1", '"x"', "true", "[1, 2]"])
+def test_show_never_reuses_the_earlier_read_when_its_own_read_fails(repo: Path, body: str) -> None:
+    """-Show's fallback must be a FRESH blank record, never what the earlier read kept.
+
+    A restatement landing between the two reads is a race, so this stages the same split by
+    construction instead. A truthy non-object is KEPT by the earlier read (`if (-not $rec)` leaves it)
+    and REJECTED by -Show's own read, which is the earlier-read-succeeded, -Show-read-failed case.
+    Reusing $rec printed that value with an `absent` reason beside it. MEASURED 2026-10-22: every
+    case fails at 73d6668cd and passes with the fresh blank record.
+    """
+    assert _pwsh(repo, "-Free", "2", "-InFlight", "1").returncode == 0
+    record = _lane_record(repo)
+    record.write_text(body, encoding="utf-8")
+    rec = _show(repo)
+    assert "not a JSON object" in str(rec["absent"]), rec
+    assert set(rec) == _BLANK_KEYS | {"absent"}, rec
+    assert rec["statedFree"] is None and rec["statedInFlight"] is None, rec
