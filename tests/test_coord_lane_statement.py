@@ -215,11 +215,9 @@ def test_show_with_no_lanes_dir_creates_nothing_and_says_absent(repo: Path) -> N
     assert rec["statedFree"] is None and rec["statedInFlight"] is None
 
 
-def _my_sid() -> str:
-    out = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True
-    ).stdout
-    return out.strip().split(",")[-1].strip('"')
+# Everyone (S-1-1-0), so the ACE covers every SID in the token, an elevated one's groups included.
+# Hosted CI's first run denied only the user SID, and its write went through.
+_EVERYONE = "*S-1-1-0"
 
 
 def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
@@ -229,16 +227,19 @@ def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
         pytest.skip("the deny ACE is a Windows ACL")
     shared = tmp_path / "read-only-root"
     shared.mkdir()
-    # By SID, so a local account with the same name cannot take the ACE. On the root itself, not
-    # inherited, so removing it is enough for cleanup.
-    sid = f"*{_my_sid()}"
+    # On the root itself, not inherited, so removing it is enough for cleanup.
     subprocess.run(
-        ["icacls", str(shared), "/deny", f"{sid}:(AD,WD)"], check=True, capture_output=True
+        ["icacls", str(shared), "/deny", f"{_EVERYONE}:(AD,WD)"], check=True, capture_output=True
     )
     try:
         write = _pwsh(repo, "-Free", "1", "-InFlight", "0", root=shared)
-        # The control: the ACE is what stops a write, so a green -Show below is not vacuous.
-        assert write.returncode != 0, "the deny ACE did not stop a write; the test proves nothing"
+        # The control: the ACE is what stops a write, so a green -Show below is not vacuous. Where
+        # the account writes through it anyway (a privilege that bypasses the ACL), the precondition
+        # cannot hold, so this skips rather than fail. The no-lanes-dir test still covers no-write.
+        if write.returncode == 0:
+            pytest.skip(
+                "this account writes through a deny ACE, so a read-only root cannot be staged"
+            )
         assert "denied" in write.stderr.lower(), write.stderr
         assert not any(shared.iterdir())
 
@@ -247,7 +248,7 @@ def test_show_on_a_root_it_cannot_write_reads_and_writes_nothing(
         assert not any(shared.iterdir())
     finally:
         # check=False: a cleanup failure must not replace the assertion that is failing.
-        subprocess.run(["icacls", str(shared), "/remove:d", sid], capture_output=True)
+        subprocess.run(["icacls", str(shared), "/remove:d", _EVERYONE], capture_output=True)
 
 
 def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_one(
