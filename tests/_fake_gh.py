@@ -210,7 +210,10 @@ class Sandbox:
         return sorted(d.iterdir()) if d.is_dir() else []
 
     def env(self, **extra: str) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items() if k not in {"CLAUDE_CODE_REMOTE"}}
+        # MEFOR_COORD_ROOT would point a child at a real shared root, and KORUS_AGENT=codex would
+        # move its seat lookup to the Codex box. A test that wants either passes it in `extra`.
+        dropped = {"CLAUDE_CODE_REMOTE", "MEFOR_COORD_ROOT", "KORUS_AGENT"}
+        env = {k: v for k, v in os.environ.items() if k not in dropped}
         env["PATH"] = str(self.shim) + os.pathsep + env.get("PATH", "")
         env["FAKE_GH_STATE"] = str(self.state_path)
         env["CLAUDE_CODE_SESSION_ID"] = "sess-test-0001"
