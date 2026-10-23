@@ -917,12 +917,10 @@ def test_an_invalid_or_backtracking_match_is_an_error_before_any_call(
     assert run.calls == []
 
 
-def test_after_comment_id_0_finds_a_matching_comment_posted_before_the_wait(
-    tmp_path: Path,
-) -> None:
+def test_from_start_finds_a_matching_comment_posted_before_the_wait(tmp_path: Path) -> None:
     """The first wait on a PR must not drop a question asked before it started."""
     early = comment(5, "BUILDER-ASK: asked before anyone waited")
-    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, early])]}, "-AfterCommentId", "0")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, early])]}, "-FromStart")
     assert run.code == 0, run.err
     assert "after id 0 whose first line matches" in run.out
     assert "id=5 " in met_line(run.out)
@@ -936,25 +934,105 @@ def test_after_comment_id_0_finds_a_matching_comment_posted_before_the_wait(
     assert base.code == 2, base.err
 
 
+def bind(
+    tmp_path: Path, *args: str, command: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the script with a gh that cannot be found, so only parameter binding can pass or fail.
+
+    ``command`` runs it through ``-Command`` instead, for a value ``-File`` cannot pass, such as
+    ``$null``.
+    """
+    cmd = (
+        ["pwsh", "-NoProfile", "-Command", command]
+        if command is not None
+        else ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-GhCommand", "no-such-gh", *args]
+    )
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, env=SEAMS, cwd=tmp_path
+    )
+
+
+COMMENT_ARGS = ("-Repo", REPO, "-Pr", str(PR), "-Until", "comment")
+
+
+def test_bind_control_reaches_the_gh_lookup(tmp_path: Path) -> None:
+    """Valid arguments pass binding and stop at the missing gh, which a refusal must not reach."""
+    proc = bind(tmp_path, *COMMENT_ARGS, "-AfterCommentId", "3")
+    assert proc.returncode == 1
+    assert "cannot find gh as 'no-such-gh'" in proc.stderr
+
+
+def test_an_empty_after_comment_id_is_refused_at_bind(tmp_path: Path) -> None:
+    proc = bind(tmp_path, *COMMENT_ARGS, "-AfterCommentId", "")
+    assert proc.returncode != 0
+    assert "AfterCommentId" in proc.stderr
+    assert "cannot find gh" not in proc.stderr
+
+
+def test_a_null_after_comment_id_is_refused_at_bind(tmp_path: Path) -> None:
+    script = str(SCRIPT).replace("'", "''")
+    proc = bind(
+        tmp_path,
+        command=(
+            f"& '{script}' -GhCommand no-such-gh -Repo {REPO} -Pr {PR} -Until comment"
+            " -AfterCommentId $null"
+        ),
+    )
+    assert proc.returncode != 0
+    assert "AfterCommentId" in proc.stderr
+    assert "cannot find gh" not in proc.stderr
+
+
+def test_from_start_beside_after_comment_id_is_an_error_before_any_call(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {}, "-FromStart", "-AfterCommentId", "3")
+    assert run.code == 1
+    assert "-FromStart and -AfterCommentId both say where the wait starts" in run.err
+    assert run.calls == []
+
+
+def test_from_start_with_another_until_is_an_error(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [MERGED]}, "-FromStart")
+    assert run.code == 1
+    assert "-FromStart applies only to -Until comment" in run.err
+    assert run.calls == []
+
+
+def test_a_repo_with_a_trailing_newline_is_refused_at_bind(tmp_path: Path) -> None:
+    proc = bind(tmp_path, "-Repo", REPO + "\n", "-Pr", str(PR), "-Until", "merged")
+    assert proc.returncode != 0
+    assert "Cannot validate argument on parameter 'Repo'" in proc.stderr
+
+
 def resume_lines(out: str) -> list[str]:
     return [line.split(" wait-pr ", 1)[1] for line in out.splitlines() if ": resume: " in line]
 
 
 def resume(cid: int) -> str:
     return (
-        f"{REPO}#{PR}: resume: id={cid} is the newest comment read;"
-        f" wait again with -AfterCommentId {cid}"
+        f"{REPO}#{PR}: resume: id={cid} is this wait's bar; wait again with -AfterCommentId {cid}"
     )
 
 
-def test_a_comment_timeout_prints_the_resume_id(tmp_path: Path) -> None:
-    """Exit 2 names the newest comment read, so the next wait skips nothing in between."""
+def test_a_comment_timeout_resumes_at_its_own_bar_not_at_a_comment_read_above_it(
+    tmp_path: Path,
+) -> None:
+    """Comment 2 was read but never reported, so the next wait must read it again."""
     chat = comment(2, "not a question")
     run = wait_comment(
         tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
     )
     assert run.code == 2, run.err
-    assert resume_lines(run.out) == [resume(2)]
+    assert resume_lines(run.out) == [resume(1)]
+
+
+def test_a_from_start_timeout_resumes_with_from_start(tmp_path: Path) -> None:
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD])]}, "-FromStart", "-MaxMinutes", "2"
+    )
+    assert run.code == 2, run.err
+    assert resume_lines(run.out) == [
+        f"{REPO}#{PR}: resume: id=0, every comment counted; wait again with -FromStart"
+    ]
 
 
 def test_a_comment_wait_ending_on_transient_failures_prints_the_resume_id(tmp_path: Path) -> None:
@@ -965,10 +1043,29 @@ def test_a_comment_wait_ending_on_transient_failures_prints_the_resume_id(tmp_pa
     assert resume_lines(run.out) == [resume(3)]
 
 
-def test_a_failure_before_any_read_resumes_at_the_given_after_comment_id(tmp_path: Path) -> None:
+def test_transient_failures_before_any_read_resume_at_the_given_bar(tmp_path: Path) -> None:
     run = wait_comment(tmp_path, {COMMENTS: [{"status": 502}]}, "-AfterCommentId", "7")
     assert run.code == 1
     assert resume_lines(run.out) == [resume(7)]
+
+
+def test_transient_failures_before_any_read_with_no_bar_say_no_id_is_known(
+    tmp_path: Path,
+) -> None:
+    run = wait_comment(tmp_path, {COMMENTS: [{"status": 502}]})
+    assert run.code == 1
+    [line] = resume_lines(run.out)
+    assert "no id is known; -FromStart is the choice that misses no comment" in line
+    assert "id=" not in line
+
+
+def test_a_permanent_failure_prints_no_resume_line(tmp_path: Path) -> None:
+    spent = {"status": 403, "headers": ["X-Ratelimit-Remaining: 0"], "body": {"message": "x"}}
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])], SINCE: [spent]})
+    assert run.code == 1
+    assert "X-Ratelimit-Remaining 0" in run.err
+    assert resume_lines(run.out) == []
+    assert "wait again" not in run.out + run.err
 
 
 def test_paged_reads_stop_at_50_pages_when_the_server_ignores_page(tmp_path: Path) -> None:
@@ -978,8 +1075,52 @@ def test_paged_reads_stop_at_50_pages_when_the_server_ignores_page(tmp_path: Pat
     plan: dict[str, list[Any]] = {f"{path}{n}": [ok(full)] for n in range(1, 61)}
     run = wait_comment(tmp_path, plan)
     assert run.code == 1
-    assert "returned a full page 50 times, the most this script reads" in run.err
+    assert "asked for more than 50 pages, the most this script reads" in run.err
     assert [p for p in run.paths() if p.startswith(path)] == [f"{path}{n}" for n in range(1, 51)]
+
+
+def test_check_run_pages_stop_at_50_when_the_server_ignores_page(tmp_path: Path) -> None:
+    runs = [{"name": f"r{i}", "status": "in_progress"} for i in range(100)]
+    path = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page="
+    plan: dict[str, list[Any]] = {
+        f"{path}{n}": [ok({"total_count": 100000, "check_runs": runs})] for n in range(1, 61)
+    }
+    plan[PR_PATH] = [ok(pr())]
+    plan[BRANCH_PATH] = [ok({"name": "main", "protected": False})]
+    plan[RULES_PATH] = [ok([])]
+    run = wait_pr(tmp_path, "checks-complete", plan)
+    assert run.code == 1
+    assert "check-runs?per_page=100 asked for more than 50 pages" in run.err
+    assert [p for p in run.paths() if p.startswith(path)] == [f"{path}{n}" for n in range(1, 51)]
+
+
+def test_a_required_context_is_matched_ordinally(tmp_path: Path) -> None:
+    """A culture-aware compare ignores U+200B, so this run would satisfy `CI gate`."""
+    lookalike = {
+        "name": "CI \N{ZERO WIDTH SPACE}gate",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    protected = {
+        "protected": True,
+        "protection": {"required_status_checks": {"contexts": ["CI gate"]}},
+    }
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok(protected)],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [lookalike]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+        "-MaxMinutes",
+        "2",
+    )
+    assert run.code == 2, run.err
+    assert "required not reported=1" in run.out
+    assert "met:" not in run.out
 
 
 def test_a_login_with_a_zero_width_space_is_not_the_author(tmp_path: Path) -> None:
