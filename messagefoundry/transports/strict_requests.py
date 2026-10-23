@@ -101,7 +101,6 @@ import requests.adapters
 import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
-import urllib3.exceptions
 import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
@@ -142,10 +141,10 @@ class VaultHopRefused(InsecureHopRefused):
     """A refusal of the Vault hop, built in this module from fixed text (vault BACKLOG #3247).
 
     Every check this module runs on the hop raises this type, from the hop's fixed connector label
-    and a fixed reason. It names no part of the address, the proxy URL, the token or the reply.
-    The base type promises none of that: elsewhere in the engine an ``InsecureHopRefused`` can
-    echo a host (``transports/rest.py``). So :func:`vault_failure_text` keeps this type's text and
-    no other hop refusal's.
+    and a fixed reason. It names no part of the address, the proxy URL, the token or the reply,
+    and no CA path or CA text. The base type promises none of that: elsewhere in the engine an
+    ``InsecureHopRefused`` can echo a host (``transports/rest.py``). So :func:`vault_failure_text`
+    keeps this type's text and no other hop refusal's.
 
     Still an ``InsecureHopRefused``, so a handler written for the base type catches it.
 
@@ -287,10 +286,11 @@ def _narrowed_pool_classes(
             Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
             it, so this guards a later caller.
 
-            **The refusal is a** :class:`VaultHopRefused`, **like every other check on this hop.**
-            urllib3 does not catch that type, so it reaches the caller as it is, and
-            :func:`vault_failure_text` keeps its text. The base ``InsecureHopRefused`` would reach
-            the caller too, but that function would give only its type name;
+            **The refusal is a** :class:`VaultHopRefused`, **like the proxy leg's CA load
+            refusal in** :meth:`_narrow_the_proxy_leg`. urllib3 does not catch that type, so it
+            reaches the caller as it is, and :func:`vault_failure_text` keeps its text. The base
+            ``InsecureHopRefused`` would reach the caller too, but that function would give only
+            its type name;
             :class:`VaultHopRefused` says why. A urllib3 ``SSLError`` raised here would not reach
             the caller as it is. Measured with urllib3 2.8.0, one raised before the proxy has
             connected comes out of requests as a ``ProxyError``. The providers would then report a
@@ -331,7 +331,19 @@ def _narrowed_pool_classes(
             """Give the TLS leg to an https proxy its own context, or ``None`` if it has none.
 
             :meth:`_refuse_encrypted_ca_text` has already run, and says what this load is and is
-            not protected from."""
+            not protected from.
+
+            **A CA this load refuses is a** :class:`VaultHopRefused` **(BACKLOG #3090),** for
+            the reason :meth:`_refuse_encrypted_ca_text` gives against a urllib3 ``SSLError``
+            raised before the proxy has connected. Its texts are the ``_*_PROXY_LEG_CA`` constants.
+            Both types fail closed: the handlers :func:`vault_failure_text` names catch every
+            exception and read neither ``SSLError`` nor ``ProxyError`` to decide a retry, and the
+            adapter keeps requests' default of no retries.
+
+            **The Vault leg's own load is urllib3's, and is unchanged.** urllib3 loads the same CA
+            after the TCP connection opens and wraps a refusal as its ``SSLError``, which requests
+            reports as ``requests.exceptions.SSLError``. ``tests/test_vault_proxy_leg_ca_load.py``
+            measures both legs."""
             if (
                 self.proxy is None
                 or self.proxy.scheme != "https"
@@ -346,10 +358,16 @@ def _narrowed_pool_classes(
                     context.load_verify_locations(
                         self.ca_certs, self.ca_cert_dir, self.ca_cert_data
                     )
+                # Fixed text: the docstring says why this is not a urllib3 SSLError. The two
+                # types tell apart content the library refused and a file it could not read.
+                except ssl.SSLError as exc:
+                    raise VaultHopRefused(
+                        f"{connector}: {_UNLOADABLE_PROXY_LEG_CA} {_PROXY_LEG_CA_LEVER}"
+                    ) from exc
                 except OSError as exc:
-                    # urllib3 wraps this the same way when it loads the CA, so an unreadable CA
-                    # file still reaches requests as an SSLError, not a connection error.
-                    raise urllib3.exceptions.SSLError(exc) from exc
+                    raise VaultHopRefused(
+                        f"{connector}: {_UNREADABLE_PROXY_LEG_CA} {_PROXY_LEG_CA_LEVER}"
+                    ) from exc
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
             return context
@@ -700,12 +718,30 @@ def _unverifiable_proxy_leg(connector: str) -> str:
 
 
 #: What the encrypted-CA-text refusal says the check matches: ``trust_anchors``'s
-#: ``_ENCRYPTION_HEADER_SCOPE`` word for word, compared exactly by ``tests/test_trust_anchors.py``.
+#: ``ENCRYPTION_HEADER_SCOPE`` word for word, compared exactly by ``tests/test_trust_anchors.py``.
 #: A copy, not an import, because a marked refusal may interpolate only this module's own string
 #: literals (``tests/test_vault_hop_refusal_marker.py``).
 _ENCRYPTED_CA_TEXT = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
+)
+
+
+#: What the proxy leg's CA load refusals say (BACKLOG #3090). The load raises an ``ssl.SSLError``
+#: for content it will not load, and another ``OSError`` for a file it could not open or read, so
+#: each says only what its type shows. Neither names a path or any CA text.
+_UNLOADABLE_PROXY_LEG_CA = (
+    "the TLS library refused what it read from this hop's CA (its CA file, CA directory or CA "
+    "text) for the TLS leg to its https:// proxy. A PEM block it will not load, such as an "
+    "encrypted one, is one cause."
+)
+_UNREADABLE_PROXY_LEG_CA = (
+    "this hop's CA file could not be opened or read for the TLS leg to its https:// proxy, so "
+    "nothing was loaded."
+)
+_PROXY_LEG_CA_LEVER = (
+    "Check MEFOR_STORE_VAULT_CA_FILE or MEFOR_SECRETS_VAULT_CA_FILE, whichever this hop reads, or "
+    "the CA bundle hvac or requests chose when it is not set; refusing to connect (BACKLOG #3090)"
 )
 
 

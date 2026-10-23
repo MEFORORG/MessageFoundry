@@ -181,6 +181,8 @@ def read_vault_token(
         _problem(p)
     token_ref = hashlib.sha256(named.encode("utf-8")).hexdigest()
 
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
     looked_up = False
     policies: tuple[str, ...] = ()
     ttl: int | None = None
@@ -199,9 +201,11 @@ def read_vault_token(
         ttl = raw_ttl if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) else None
         raw_renewable = data.get("renewable")
         renewable = raw_renewable if isinstance(raw_renewable, bool) else None
-    except OSError as exc:
+    except (OSError, InsecureHopRefused) as exc:
         # A transport failure (requests' errors are OSErrors): the capabilities read would wait out
-        # the same timeout against the same server, so it is not sent.
+        # the same timeout against the same server, so it is not sent. A refusal of the hop itself,
+        # such as a proxy-leg CA the TLS library would not load (BACKLOG #3090), would refuse that
+        # read the same way, so it is not sent either.
         problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
         return VaultTokenReading(required=needed, problems=tuple(problems), token_ref=token_ref)
     except Exception as exc:  # Vault answered and refused, or answered in an unexpected shape
