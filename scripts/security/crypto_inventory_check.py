@@ -659,9 +659,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
     # is a posture decision on the scheme, and it calls no cipher or context.
     # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the once-per-
-    # proxy disclosure, which keeps the raw value out of that one set. The process still holds the
-    # credentialed URL elsewhere (proxy manager, os.environ), so this protects no credential. A
-    # dedupe key, not a security control: nothing is verified against it and no key is involved.
+    # hop-and-proxy disclosure. A dedupe key, not a security control and not key material; what it
+    # keeps out of memory, and what it does not, is the section 4 row "Vault hop ambient-proxy
+    # disclosure dedupe".
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "ssl"}
     ),
