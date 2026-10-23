@@ -199,7 +199,29 @@ pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -Path C:\path\to\the
 
 **A session runs it exactly like that, with no other switch.** `-Force` and
 `-AllowOrphanedAllocations` are the owner's. If the script refuses, that is final for a session: it
-tells the user what was refused and why, and stops.
+tells the user what was refused and why, and stops, with one exception.
+
+**The exception: a cache-only refusal on your own worktree (owner approval 2026-10-22).** A session
+may run the same line once more with `-Force` added, on **its own** worktree only, one this session
+made or that its claim or seat record names, when all three of these hold:
+
+1. The refusal is the one for uncommitted changes, untracked files or ignored files, and every line
+   it lists is an *ignored* directory: `!! venv/` at the tree root, or `!! <path>/` named
+   `node_modules`, `__pycache__`, `.mypy_cache`, `.ruff_cache` or `.pytest_cache`. An untracked
+   (`??`) line, a `venv` or `.venv` below the tree root (vault BACKLOG #1017 point (i)), a listed
+   file, a line marked as a link or unreadable, a `flagged` line, and a list cut short with
+   `... and N more` all fail this. The script already tolerates the other names in that ignored
+   form, so in practice this covers a root `venv`. A refusal that lists a file such as
+   `.claude/seat.local.txt` is not cache-only, and stays final.
+2. `git -C <tree> status --porcelain --untracked-files=all` prints nothing.
+3. The tree's branch tip is on the remote: `git ls-remote origin refs/heads/<branch>` prints the
+   SHA the tree's `HEAD` holds. Name the full ref: `--heads <branch>` also matches a branch whose
+   name only ends in `<branch>`. A detached `HEAD` fails this.
+
+Any other refusal stays final, and so does any refusal from the `-Force` run. That includes the
+refusal for a git repository inside a cache directory, such as an editable clone in `.venv/src`:
+`-Force` would discard commits it may hold. The tripwire hook (ADR 0211) records the `-Force`.
+While the AFK kill switch is on, the exception is off ([CLAUDE.md](../CLAUDE.md) section 5).
 
 **This reverses the earlier posture, for removal only.** Until 2026-10-04 the worktree gate's rule 3d
 told a session that removing any tree it was not standing in was the user's to run. The owner's

@@ -13,9 +13,8 @@ with no per-action owner approval.
 
 What enters the queue, and in what order.
 
-**Corrected by the owner on 2026-09-21:** the ASVS scorecard re-score is not the Lander's. Since
-2026-09-23 a Manager dispatches it to vault Builders; the row-status flip stays yours.
-CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
+The ASVS scorecard re-score is not yours: a Manager dispatches it to vault Builders (owner
+rulings 2026-09-21 and 2026-09-23). The row-status flip stays yours. History: `docs/METHOD.md`.
 
 ## What it must not do
 
@@ -41,7 +40,6 @@ commit nor batch a session's work into one commit.
 
 **Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
-**ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR.**
 **A PR you are handed may carry a whole wave** (owner ruling 2026-09-23): the Manager decides when
 to cut one and what goes in it. Repair it as you would any PR. Dropping an item is a re-cut, and a
 re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
@@ -84,7 +82,7 @@ Say what you ran. A number without its instrument is not a measurement.
 ## Reading a red, which is yours to triage since 2026-09-19
 
 The Regulator retired that day and nothing replaced it, so a red is yours to triage and route or
-the owner's to rule on. These two carried on its card; the work moved here, not the seat.
+the owner's to rule on.
 
 **One rerun. A second red on the same leg is a finding, not a flake.** Rerunning until green
 launders a real failure into a pass and destroys the evidence that it was real.
@@ -111,5 +109,9 @@ rule over korus, because the table it derives from states none.** Measured 2026-
 against a control of **1** for *"KORUS roster"* on the same read, while returning **2** here and
 appearing in five sibling cards. **A rule that lives only in a derived summary is not a rule.** The
 one disagreement it carried was resolved by owner ruling 2026-09-29; `docs/METHOD.md` keeps it.
+
+Apply the driver and empower rules by default; load both skills at session start. While
+`MEFOR_AFK_KILL` is not `off`, empower is off and the driver rules still apply. See CLAUDE.md
+section 5.
 
 Live state -- lane counts, throttles, item numbers -- belongs in a dated note, not here.

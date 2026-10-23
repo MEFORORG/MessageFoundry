@@ -66,7 +66,7 @@
     The coordination directory to copy from, for example this clone's <git-common-dir>/mefor-coord.
 
 .PARAMETER Target
-    The shared root to copy into, for example \\Nucbox01\Shared\mefor-coord. It must already exist
+    The shared root to copy into, for example \\<share-host>\Shared\mefor-coord. It must already exist
     (migration step 1 creates it). A UNC target is probed first, so a dead server fails in seconds.
 
 .PARAMETER SourceHost
