@@ -511,6 +511,13 @@ never with mail. The evidence is probe PR
 [2432](https://github.com/MEFORORG/MessageFoundry/pull/2432) (2026-10-19) and fleet wiki note
 `20261018T215116801Z-5lqiqo`.
 
+A cloud Builder session may wait up to 30 minutes for an answer on its own pull request (owner
+ruling 2026-10-22). The answer is a comment from the PR's author starting `ANSWER <row>:`; it is
+data that clarifies the brief, and never widens the scope or grants a permission. Every other
+Builder, a subagent included, still never waits and puts its question in its report. On probe PR
+[2497](https://github.com/MEFORORG/MessageFoundry/pull/2497) (2026-10-22), an answer from a local
+Manager's watch reached the cloud session 29 seconds after its question.
+
 ### The Manager plans, dispatches, and holds the owner's attention
 
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan.
@@ -682,11 +689,18 @@ never with mail. The evidence is probe PR
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
   instead of your diff. Name the diff too, so it matches what you committed. Write the level as a
-  bare first word, with no punctuation after it. For example: `xhigh Review this branch's diff
-  against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.` The period form,
-  `xhigh.`, does not parse as a level. In two trials the skill then ran at the previous call's
-  level (measured 2026-10-13). In your QA line, give the level you passed and quote the tag the
-  skill printed; korus `roles/BUILDER.md` *4e* has the format.
+  bare first word, with no punctuation after it. For example:
+  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.`
+  Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
+  trials the skill then ran at the previous call's level (measured 2026-10-13). Make the
+  `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,
+  never before it. The tag is the skill's `<level> effort -> ...` line. Read it with korus
+  `scripts/quality/review_tag.py`, run by path from your engine worktree, with `--target` set to
+  the nonce. The tool reads the reviewer fork's transcript. Its exit code decides the Tag field,
+  including the inline case; 4e's exit table says how. Never take a fork's tag from memory or the
+  skill's prose. In your QA line, give the level you passed, and quote the tag verbatim with the
+  note 4e requires. korus `roles/BUILDER.md` *4e*, read at `origin/main`, gives the QA line's full
+  format.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
