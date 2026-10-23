@@ -569,9 +569,12 @@ def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
     monkeypatch: pytest.MonkeyPatch, tls: bool
 ) -> None:
     """On CPython 3.14.9 the stdlib constructor swallows the first lookup, and our constructor's
-    retry looks the name up again. That retry must go through our ``createSocket`` override, which
-    pins the timeout on every reconnect and, for TLS, wraps the socket. The retry's lookup answers
-    with a loopback listener, so no name is resolved."""
+    retry looks the name up again, through the class's own ``createSocket``. The spy on
+    ``_TimeoutSysLogHandler.createSocket`` shows the retry ran that override; for TLS, the wrap
+    record shows the TLS override ran and wrapped the socket for the configured server name, and
+    that the handler kept the wrapped socket. The socket's timeout is checked as an outcome only:
+    the stdlib's ``createSocket`` applies the same value. The retry's lookup answers with a
+    loopback listener, so no name is resolved."""
     _simulate_cpython_3149_syslog_init(monkeypatch)
     real_create = _TimeoutSysLogHandler.createSocket
     creates: list[object] = []
@@ -587,12 +590,24 @@ def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
             monkeypatch,
             [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))],
         )
-        wrapped: list[Any] = []
+        wrapped: list[tuple[Any, str]] = []
+
+        class _Wrapped:
+            """What the fake context hands back, so the handler is seen to keep it."""
+
+            def __init__(self, sock: Any) -> None:
+                self.sock = sock
+
+            def gettimeout(self) -> float | None:
+                return float(self.sock.gettimeout())
+
+            def close(self) -> None:
+                self.sock.close()
 
         class _RecordingContext:
             def wrap_socket(self, sock: Any, server_hostname: str) -> Any:
-                wrapped.append(sock)
-                return sock
+                wrapped.append((sock, server_hostname))
+                return _Wrapped(sock)
 
         common: dict[str, Any] = {
             "address": ("siem.example.org", port),
@@ -604,7 +619,7 @@ def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
             _TlsSysLogHandler(
                 **common,
                 ssl_context=_RecordingContext(),  # type: ignore[arg-type]
-                server_hostname="siem.example.org",
+                server_hostname="collector.example.org",  # not the address host
             )
             if tls
             else _TimeoutSysLogHandler(**common)
@@ -615,7 +630,9 @@ def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
             assert handler.startup_error is None
             assert handler.socket is not None
             assert handler.socket.gettimeout() == 1.0
-            assert wrapped == ([handler.socket] if tls else [])
+            if tls:
+                assert isinstance(handler.socket, _Wrapped)
+                assert wrapped == [(handler.socket.sock, "collector.example.org")]
         finally:
             handler.close()
 
