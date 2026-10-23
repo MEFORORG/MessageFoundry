@@ -26,6 +26,7 @@ import re
 import tomllib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httptools
 import pytest
@@ -34,7 +35,10 @@ from packaging.utils import canonicalize_name
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from messagefoundry.api import create_app
-from messagefoundry.api.protocol_headers import floored_http_protocol_class
+from messagefoundry.api.protocol_headers import (
+    floored_http_protocol_class,
+    pinned_http_protocol_base,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_header_floor_wire import _ROOT, _served
@@ -179,6 +183,47 @@ async def test_the_api_refuses_ambiguous_request_framing(engine: Engine) -> None
         for shape, request in _REFUSED.items():
             statuses, raw = await _answers(port, request)
             if statuses != [400] or not raw.endswith(_PARSER_400_BODY):
+                misses.append(f"{shape}: {raw!r}")
+    assert not misses, "\n".join(misses)
+
+
+#: The refused shapes whose head parses before the body is refused, so the app's task has started.
+#: The app refuses a chunked body with a 411, so on these it has an answer of its own to send.
+_REFUSED_AFTER_THE_HEAD = ("chunk size not hex digits", "chunk lines ended by bare LF")
+
+
+def _closing_late(base: type[Any]) -> type[Any]:
+    """``base`` with the ``400``'s transport close deferred, so the app's task runs before the
+    connection is lost. That is the order the Windows proactor loop showed on CPython 3.14.9, where
+    the ``400``'s write is still in flight at ``close()``; the Linux selector loop drops a later
+    write at once, so without this the race cannot be seen here."""
+
+    class _ClosingLate(base):  # type: ignore[misc]
+        def send_400_response(self, *args: Any, **kwargs: Any) -> None:
+            transport = self.transport
+            close = transport.close
+            transport.close = lambda: asyncio.get_running_loop().call_later(0.3, close)
+            try:
+                super().send_400_response(*args, **kwargs)
+            finally:
+                del transport.close
+
+    return _ClosingLate
+
+
+@pytest.mark.parametrize("floored", [True, False], ids=["floored", "bare-control"])
+async def test_a_refused_request_gets_one_answer_when_the_close_lands_late(
+    engine: Engine, floored: bool
+) -> None:
+    """The ``400`` is the only answer to a request the parser refused, even when the app's task,
+    started on the head, runs before the connection is lost. The bare class is the control: it
+    sends the app's ``411`` behind the ``400``, which is what the floor's refused cycle end stops."""
+    base = floored_http_protocol_class() if floored else pinned_http_protocol_base()
+    misses = []
+    async with _served(create_app(engine), http=_closing_late(base)) as port:
+        for shape in _REFUSED_AFTER_THE_HEAD:
+            statuses, raw = await _answers(port, _REFUSED[shape])
+            if statuses != ([400] if floored else [400, 411]):
                 misses.append(f"{shape}: {raw!r}")
     assert not misses, "\n".join(misses)
 

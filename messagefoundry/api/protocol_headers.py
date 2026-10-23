@@ -32,6 +32,14 @@ dependency. uvicorn
 names it; handed to the class build, it is checked for the HTTP hooks like any other base.
 uvicorn's interim ``100 Continue`` carries no header either.
 
+**One thing this module does on the HTTP protocol beyond adding headers.** *It ends a refused
+request's cycle.* When the parser refuses a request after its head, the app task uvicorn started for
+that head is still live, and uvicorn marks its cycle disconnected only once the connection is lost.
+On CPython 3.14.9 the Windows proactor loop then sent the app's answer behind the ``400``, two
+responses to one request. :func:`_end_the_refused_cycle` marks the cycle disconnected as soon as the
+``400`` is written. ``tests/test_api_request_framing_wire.py`` measures it, with a control on the
+bare class.
+
 **Two things this module does on the sans-I/O protocol beyond adding headers.** Both work around
 uvicorn 0.54.0 behaviour that its legacy server did not have, and both are measured on the bare
 class too.
@@ -76,7 +84,8 @@ error. That check sees a name that is no longer assigned. It cannot see a name t
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
 another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
-``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
+``send_500_response``, ``default_headers``, ``disconnected``, ``response_complete`` and
+``message_event``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
 protocol they are ``data_received``, the ``conn``, ``transport``, ``handshake_initiated``,
 ``handshake_complete`` and ``close_sent`` attributes, and on the ``ServerProtocol`` its module
@@ -317,6 +326,8 @@ def _require_http_hooks(base: type[Any]) -> None:
     if not inspect.iscoroutinefunction(getattr(cycle_cls, "send_500_response", None)):
         raise _refusal(cycle_cls, "send_500_response coroutine")
     _require_assigned(cycle_cls, "default_headers", hook="send_500_response")
+    for attr in ("disconnected", "response_complete", "message_event"):
+        _require_assigned(cycle_cls, attr, hook="send_500_response")
 
 
 def _answers_through_conn(base: type[Any]) -> bool:
@@ -518,6 +529,28 @@ def _floor_the_conn_responses(conn: Any) -> None:
         _degraded("ws-sansio", "hook", exc)
 
 
+def _end_the_refused_cycle(protocol: Any) -> None:
+    """Mark the cycle of a request the parser refused as disconnected, so its app task cannot
+    answer it after the ``400``.
+
+    See the module docstring. The cycle's app task starts when the head parses, so a body the
+    parser then refuses already has one. uvicorn writes the ``400`` and closes the transport, but
+    marks the cycle disconnected only in ``connection_lost``. Until then the cycle's ``send`` still
+    writes, and a transport whose ``400`` is still in flight sends that write too: on CPython 3.14.9
+    the Windows proactor loop sent the app's ``411`` behind the ``400``. This sets what
+    ``connection_lost`` would, early. A cycle whose response is complete is a previous request's,
+    and is left alone. The class build requires ``disconnected``, ``response_complete`` and
+    ``message_event`` to be assigned by the cycle class."""
+    try:
+        cycle = protocol.cycle
+        if cycle is None or cycle.response_complete:
+            return
+        cycle.disconnected = True
+        cycle.message_event.set()
+    except Exception as exc:
+        _degraded("http-400", "refused cycle end", exc)
+
+
 def _answer_a_parser_rejection(protocol: Any) -> None:
     """Write what the websockets parser queued for a request it rejected, and close. For a 414 or
     431 that is the answer; for any other parse error the parser queued no answer, and this only
@@ -609,6 +642,7 @@ def _build_floored_http(base: type[Any]) -> type[asyncio.Protocol]:
             _write_with_headers(
                 self, "http-400", partial(super().send_400_response, *args, **kwargs)
             )
+            _end_the_refused_cycle(self)
 
         # Both implementations create each request's cycle with `self.cycle = RequestResponseCycle(...)`,
         # pipelined ones included, and before its task first runs. A property sees every one, once.

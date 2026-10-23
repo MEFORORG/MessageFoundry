@@ -985,10 +985,6 @@ def _sets_transport(self: Any) -> None:
     self.transport = None
 
 
-def _sets_default_headers(self: Any) -> None:
-    self.default_headers = []
-
-
 def _sets_nothing(self: Any) -> None:
     pass
 
@@ -1001,12 +997,17 @@ async def _sends_500(self: Any) -> None:
     pass
 
 
+#: What uvicorn's ``RequestResponseCycle`` assigns that the floor reads or writes. A drop of one of
+#: these names leaves the rest assigned.
+_HTTP_CYCLE_ATTRS = ("default_headers", "disconnected", "response_complete", "message_event")
+
+
 def _fake_http(monkeypatch: pytest.MonkeyPatch, drop: str | None) -> type[Any]:
     """An HTTP protocol shaped like uvicorn's with ``drop`` removed, in a registered module, so the
     floor looks up its cycle class the way it looks up uvicorn's."""
     cycle_members: dict[str, Any] = {
         "__module__": _FAKE_MODULE,
-        "__init__": _sets_nothing if drop == "default_headers" else _sets_default_headers,
+        "__init__": _init_assigning(*(a for a in _HTTP_CYCLE_ATTRS if a != drop)),
         # uvicorn's is a coroutine; a plain method in its place is the moved hook.
         "send_500_response": _writes if drop == "send_500_response" else _sends_500,
     }
@@ -1131,6 +1132,10 @@ def test_a_sans_io_base_missing_a_hook_is_refused(
         ("RequestResponseCycle", "RequestResponseCycle in its module"),
         ("send_500_response", "send_500_response coroutine"),
         ("default_headers", "default_headers attribute"),
+        # The refused cycle end: what it writes, what it reads, and what it wakes.
+        ("disconnected", "disconnected attribute"),
+        ("response_complete", "response_complete attribute"),
+        ("message_event", "message_event attribute"),
     ],
 )
 def test_an_http_base_missing_a_hook_is_refused(
