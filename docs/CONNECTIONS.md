@@ -1737,6 +1737,14 @@ not follow a mapped drive or a link, so keep those files on a local disk.
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
 
+An `SSLCA` file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its
+first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The driver loads that
+file with its own TLS library, which can wait for a password on an encrypted block. The check
+runs when the connection is built, not at each connect, so a file replaced afterwards is not
+checked. At least these cases are left to the driver unchecked: a file that does not exist, a
+directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
+read, or one over 16 MiB, is refused. An `SSLCERT` file is not checked this way.
+
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
 start the connection is not built, so it never connects. The refused set includes at least

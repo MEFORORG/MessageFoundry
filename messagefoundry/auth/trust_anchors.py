@@ -352,8 +352,9 @@ _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: What :func:`has_encryption_header` matches, in the words :func:`anchor_cadata`'s refusal uses
 #: (BACKLOG #3105). It names no block on purpose: the check models none. ``strict_requests`` keeps
 #: an identical literal, since its marked refusals may interpolate only that module's own
-#: literals; ``tests/test_trust_anchors.py`` compares the two exactly.
-_ENCRYPTION_HEADER_SCOPE = (
+#: literals; ``tests/test_trust_anchors.py`` compares the two exactly. Public because the refusals
+#: in ``pki`` and ``transports.database`` that use :func:`has_encryption_header_bytes` quote it too.
+ENCRYPTION_HEADER_SCOPE = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
 )
@@ -376,6 +377,13 @@ def has_encryption_header(text: str) -> bool:
         return False
     tail = text[begin:].lower()
     return any(header in tail for header in _PEM_ENCRYPTION_HEADERS)
+
+
+def has_encryption_header_bytes(data: bytes) -> bool:
+    """:func:`has_encryption_header` on a file's raw bytes, for a file the engine hands to another
+    TLS stack by path (BACKLOG #3090). latin-1 maps every byte, and the check looks only for ASCII
+    header names, so no byte is lost or refused on the way."""
+    return has_encryption_header(data.decode("latin-1"))
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -477,7 +485,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         ) from exc
     if has_encryption_header(text):
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} {_ENCRYPTION_HEADER_SCOPE}. An "
+            f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
             "format. A trust anchor needs only plain "
             "CERTIFICATE blocks, and loading an encrypted one can make the TLS library wait for a "
