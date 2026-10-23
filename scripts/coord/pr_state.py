@@ -336,11 +336,6 @@ def required_verdict(
     if required is None:
         out["reason"] = "no required-context list"
         return out
-    if not required:
-        # An empty list most likely means a read that found nothing, not a branch that requires
-        # nothing; either way it cannot make a PR read merge-ready.
-        out["reason"] = "the required-context list is empty"
-        return out
     if contexts is None:
         out["reason"] = "required-context query returned nothing for this PR"
         return out
@@ -391,6 +386,11 @@ def required_verdict(
         out["state"] = "PENDING"
     elif out["unknown"]:
         out["reason"] = "runs exist only from checks GitHub does not count as required here"
+    elif not required:
+        # An empty list most likely means a read that found nothing, not a branch that requires
+        # nothing. Runs GitHub flags as required can still make the PR red or pending above, but
+        # an empty list never makes it read merge-ready.
+        out["reason"] = "the required-context list is empty"
     else:
         out["state"] = "SUCCESS"
     return out
@@ -527,7 +527,12 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
     if due and retry_ok:
         tried_at = iso(now)
         try:
-            required = fetch_required(gh, repo)
+            fetched_list = fetch_required(gh, repo)
+            if not fetched_list:
+                # Treated as a failed refresh: keep the previous good list and retry in
+                # REQUIRED_RETRY_SECONDS, never cache an empty list for an hour.
+                raise PollError("empty required-context list from GitHub")
+            required = fetched_list
             required_at = iso(now)
             required_error = None
         except (GhError, PollError) as exc:

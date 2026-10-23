@@ -857,3 +857,43 @@ def test_a_log_write_failure_reaches_the_cache(
     assert doc["logError"] and "HTTP 502" in doc["logError"]["message"] and doc["logError"]["at"]
     _, clean = _main(tmp_path / "elsewhere", FakeGh([_pr(1)], {1: _green()}))
     assert clean["logError"] is None
+
+
+def test_an_empty_list_still_shows_a_github_required_failure() -> None:
+    """CONTROL (fails on dbe0299ce, whose early return read UNKNOWN and dropped the drift field)."""
+    red = {**_run("new-required", "FAILURE"), "isRequired": True}
+    ctx = {"oid": _sha(1), "nodes": [red], "hasNextPage": False}
+    verdict = ps.shape_pr(_pr(1), [], ctx)["required"]
+    assert verdict["state"] == "FAILURE" and verdict["failing"] == ["new-required"]
+    assert verdict["requiredByGithubNotInList"] == ["new-required"]
+
+
+def test_an_empty_list_with_only_green_flagged_runs_is_no_verdict() -> None:
+    green = {**_run("new-required"), "isRequired": True}
+    ctx = {"oid": _sha(1), "nodes": [green], "hasNextPage": False}
+    verdict = ps.shape_pr(_pr(1), [], ctx)["required"]
+    assert verdict["state"] == "UNKNOWN" and "empty" in verdict["reason"]
+
+
+def test_an_empty_list_from_github_keeps_the_previous_list(tmp_path: Path) -> None:
+    """CONTROL (fails on dbe0299ce, which cached [] as a good refresh for an hour)."""
+    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    calls: list[list[str]] = []
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        calls.append(args)
+        if args[-1].endswith("/rules/branches/main"):
+            return json.dumps([[]])
+        if args[-1].startswith("repos/"):
+            return json.dumps({"protection": {"required_status_checks": {"contexts": []}}})
+        return FakeGh([_pr(1)], {1: _green()})(args, stdin)
+
+    _, doc = _main(tmp_path, gh, NOW + timedelta(minutes=61))
+    assert doc["requiredContexts"] == sorted(REQUIRED)  # the previous good list, kept
+    assert doc["requiredContextsFetchedAt"] == "2026-10-22T12:00:00Z"
+    assert doc["requiredContextsError"] == "empty required-context list from GitHub"
+    fetches = sum(c[-1].startswith("repos/") for c in calls)
+    _main(tmp_path, gh, NOW + timedelta(minutes=63))
+    assert sum(c[-1].startswith("repos/") for c in calls) == fetches  # inside the 10-minute gate
+    _main(tmp_path, gh, NOW + timedelta(minutes=72))
+    assert sum(c[-1].startswith("repos/") for c in calls) > fetches  # retried after it
