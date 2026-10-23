@@ -7,9 +7,11 @@
 .DESCRIPTION
     -Log writes ONE record. It is spooled locally first and then posted to the vault's issue for
     its UTC day, so a network failure loses nothing: the record stays spooled, the script says so
-    and exits 4, and the next -Log or -Flush posts it. -NoPost spools only, with no network; the
-    tripwire hook uses it. Its default seat comes from the seat registry only when the registry is
-    on this machine: it never probes a shared root, and never reads one on a share.
+    and exits 4, and the next -Log or -Flush posts it. -NoPost spools only and posts nothing; the
+    tripwire hook uses it. It never probes a shared root, and it skips a seat registry it can tell
+    is on a share: at least a UNC path, a drive letter Windows reports as a network drive, and a
+    path whose kind cannot be told. It CANNOT tell a share mounted under `/`, or a junction or
+    symlink that leads to a share; a registry there is read, and a dead server can hang that read.
 
     -List reads records by day (-Day, default today UTC, and -Days for a range ending there), and
     filters them by -Seat or -Item. It reads the vault and the local spool, and marks a record that
@@ -32,7 +34,9 @@
     several, one per line. Called in-process (`& decision.ps1`), an array works as well.
 
     The seat defaults to the one this session declared in the seat registry, found by its session
-    id; the session id defaults to $env:CLAUDE_CODE_SESSION_ID.
+    id; the session id defaults to $env:CLAUDE_CODE_SESSION_ID. Only this worktree's two boxes and
+    this host's records count, so a seat declared from another worktree is not found. A record that
+    cannot be read names no seat. Under -NoPost a registry on a share (above) names no seat.
 
 .EXAMPLE
     decision.ps1 -Log -Item 3905 -Class B -Recommendation 'split the fix into two PRs' `
@@ -116,9 +120,9 @@ function ConvertTo-SeatRecordInstant($Value) {
 }
 
 function Test-SeatRootIsNetwork([string]$Path) {
-    # True when reading $Path could reach another machine: a UNC path, or a drive letter mapped to a
-    # share. DriveInfo asks Windows how the letter is mapped, a local call. A path whose kind cannot
-    # be told counts as network, so the offline lookup skips it rather than risk a hang.
+    # True when $Path is at least one of: a UNC path, a drive letter DriveInfo reports as Network (a
+    # local call), or a path whose kind cannot be told. NOT detected: a share mounted under `/`, and a
+    # junction or symlink that leads to a share. Those read as local.
     if (Get-CoordUncHost -Path $Path) { return $true }
     try {
         $rootOf = [System.IO.Path]::GetPathRoot($Path)
@@ -133,14 +137,19 @@ function Test-SeatRootIsNetwork([string]$Path) {
 }
 
 function Get-SeatCandidate([string]$File) {
-    # One seat record as a candidate, or $null. Anything wrong with a record skips that record only:
-    # an empty `{}`, bad JSON, a non-object, no seat, or a `host` naming another machine.
+    # One seat record as a candidate, or $null. A record that was read but is wrong skips that record
+    # only: an empty `{}`, bad JSON, a non-object, no seat, or a `host` naming another machine.
+    # A record that exists but cannot be READ throws to the caller, which then names no seat: it may
+    # be the newer record, so the other box's older one is not the seat.
+    if (-not [System.IO.File]::Exists($File) -and -not [System.IO.Directory]::Exists($File)) { return $null }
+    $text = [System.IO.File]::ReadAllText($File)
     try {
-        if (-not [System.IO.File]::Exists($File)) { return $null }
-        $r = [System.IO.File]::ReadAllText($File) | ConvertFrom-Json -ErrorAction Stop
+        $r = $text | ConvertFrom-Json -ErrorAction Stop
         if ($r -isnot [System.Management.Automation.PSCustomObject]) { return $null }
-        # A record in EITHER box that names another host is that PC's seat, copied or hand-made here;
-        # lane.ps1 refuses the same shape at its own key. A record with no host was written here.
+        # A record in EITHER box that names another host is that PC's seat, here for at least these
+        # reasons: copied, hand-made, a short-hash collision, or a mistyped coord-migrate.ps1
+        # -SourceHost. lane.ps1 refuses the same shape at its own key. A record with no host was
+        # written here.
         if (-not (Test-CoordRecordIsHere $r)) { return $null }
         $props = $r.PSObject.Properties
         $s = if ($props['seat'] -and $r.seat) { [string]$r.seat } else { '' }
@@ -165,10 +174,10 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
     # Codex seat's records stay on the local root. A root that does not resolve names no seat; it
     # never falls back to the local copy, which the other PC never sees.
     #
-    # -Offline (-NoPost, the tripwire hook's path) NEVER TOUCHES THE NETWORK. It resolves the root
-    # without the port-445 probe, and reads it only when it is on this machine. A root on a share
-    # names no seat there: a dead SMB server can hang one file call for about a minute, far past the
-    # hook's budget. A tripwire record needs no seat.
+    # -Offline (-NoPost, the tripwire hook's path) resolves the root without the port-445 probe, and
+    # skips a root Test-SeatRootIsNetwork flags; its comment says what that misses. A dead SMB server
+    # can hang one file call for about a minute, far past the hook's budget. A tripwire record needs
+    # no seat.
     #
     # WHICH BOX. Only this worktree's two boxes: the host-keyed one seat.ps1 writes, and the path-only
     # legacy one a session that declared before docs/COORD-SHARED-ROOT.md step 4 still has. A record
@@ -200,7 +209,8 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
                 Resolve-CoordSharedRoot -From $wt -LocalRoot $localRoot
             }
             if ($Offline -and $res.Path -and $res.Source -ne 'local' -and (Test-SeatRootIsNetwork $res.Path)) {
-                [Console]::Error.WriteLine("decision.ps1: -NoPost reads no network, and the seat registry is on $($res.Path), so no seat was read from it.")
+                # The error stream, not [Console]::Error, so the tripwire hook's 2>$null silences it.
+                Write-Error -ErrorAction Continue "decision.ps1: -NoPost reads no network, and the seat registry is on $($res.Path), so no seat was read from it."
                 return ''
             }
             $seats = if ($res.Path) { Join-Path $res.Path 'seats' } else { $null }
@@ -223,7 +233,8 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
         if ($best) { return $best.Seat }
         return ''
     } catch {
-        # An I/O error on the registry (an SMB share dropping, say) costs the default seat, not -Log.
+        # An I/O error on the registry (an SMB share dropping, or one record that cannot be read) costs
+        # the default seat, not -Log.
         [Console]::Error.WriteLine("decision.ps1: the seat registry could not be read, so no seat was read from it: $($_.Exception.Message)")
         return ''
     }

@@ -188,6 +188,7 @@ def test_a_hit_never_probes_an_unreachable_shared_root(sb: Sandbox) -> None:
     assert context is not None and "Recorded as tripwire d" in context
     assert not (sb.coord / "coord-root-down.json").exists(), "the hook probed the shared root"
     assert len(sb.spool()) == 1
+    assert "seat registry" not in proc.stderr, "decision.ps1's note escaped the hook's 2>$null"
 
 
 def test_a_miss_writes_nothing(sb: Sandbox) -> None:

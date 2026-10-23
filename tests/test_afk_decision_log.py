@@ -235,7 +235,7 @@ def _seat_file(seats: Path, box: str, rec: dict[str, Any] | str, sid: str = SID)
 
 
 def _logged_seat(sb: Sandbox, **extra: str) -> str:
-    proc = sb.run(DECISION, *LOG_NO_SEAT, **{"MEFOR_COORD_ROOT": "", **extra})
+    proc = sb.run(DECISION, *LOG_NO_SEAT, **extra)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     return str(_list(sb)[0]["seat"])
 
@@ -263,7 +263,7 @@ def test_the_newer_of_the_two_boxes_names_the_seat(sb: Sandbox) -> None:
         _seat_file(seats, hosted, {**(new if newer == "hosted" else old), "seat": "hosted-seat"})
         _seat_file(seats, legacy, {**(new if newer == "legacy" else old), "seat": "legacy-seat"})
         args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
-        proc = sb.run(DECISION, *args, MEFOR_COORD_ROOT="")
+        proc = sb.run(DECISION, *args)
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         got[newer] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
     assert got == {"hosted": "hosted-seat", "legacy": "legacy-seat"}
@@ -350,10 +350,22 @@ def test_an_empty_record_skips_only_itself(sb: Sandbox) -> None:
         _seat_file(seats, empty, "{}")
         _seat_file(seats, valid, {"seat": f"valid-{item}", "asOf": "2026-10-20T08:00:00Z"})
         args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
-        proc = sb.run(DECISION, *args, MEFOR_COORD_ROOT="")
+        proc = sb.run(DECISION, *args)
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         got[item] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
     assert got == {"201": "valid-201", "202": "valid-202"}
+
+
+def test_an_unreadable_record_names_no_seat_rather_than_the_older_one(sb: Sandbox) -> None:
+    """A record that exists but cannot be READ might be the newer one, so the older box's record
+    is not the seat. A directory where the file should be is an unreadable record on every OS."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    (seats / hosted / f"{SID}.json").mkdir(parents=True)
+    _seat_file(seats, legacy, {"seat": "older", "asOf": "2026-10-20T08:00:00Z"})
+    proc = sb.run(DECISION, "-Log", "-Kind", "tripwire", "-Note", "x", "-NoPost")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert _list(sb)[0]["seat"] == ""
 
 
 def test_a_host_keyed_record_naming_another_host_is_skipped(sb: Sandbox) -> None:
