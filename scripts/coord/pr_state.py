@@ -385,10 +385,7 @@ def required_verdict(
     elif out["unknown"]:
         out["reason"] = "runs exist only from checks GitHub does not count as required here"
     elif not required:
-        # No list, or an empty one. poll() never caches an empty refresh, so in the poller's output
-        # this is a list that was never read; [] reaches here only from a direct caller. Runs
-        # GitHub flags as required can still make the PR red or pending above, but a missing list
-        # never makes it read merge-ready.
+        # A missing or empty list never makes a PR read merge-ready.
         out["reason"] = (
             "no required-context list" if required is None else "the required-context list is empty"
         )
@@ -537,7 +534,8 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
             required_at = iso(now)
             required_error = None
         except (GhError, PollError) as exc:
-            # A stale list beats none; it is labelled with its own age. No list leaves every PR UNKNOWN.
+            # A stale list beats none; it is labelled with its own age. With no list, no PR can
+            # read SUCCESS; GitHub-flagged runs can still make one FAILURE or PENDING.
             required_error = str(exc)
 
     progress: dict[str, Any] = {"part": "pulls", "rate": None}

@@ -740,9 +740,9 @@ Five reading rules, each one a mistake the file is shaped to prevent:
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
    (`mergeStateKnown: false`). That is no state at all.
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
-5. When PRs read `UNKNOWN` with the reason "no required-context list", read `requiredContextsError`.
-   A poll can succeed, with `error` null, while every PR reads `UNKNOWN` because the list could
-   not be read.
+5. When the top-level `requiredContexts` is null or empty, read `requiredContextsError`. The poll
+   itself can still succeed, with `error` null. No PR then reads `SUCCESS`, and its `required` is
+   judged only by runs GitHub flags as required.
 
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
