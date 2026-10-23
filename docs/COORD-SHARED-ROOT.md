@@ -264,9 +264,11 @@ design. Reads and builds keep working.
    the watcher move the old box's inbox into the new box before they read. `seat.ps1` takes its
    prior from whichever of its two records says it is newer. `fleet.ps1` treats the old and new
    boxes of one tree as one seat. The lane hook reads whichever lane file holds the fresher level. A send to a seat id published before the change goes to the
-   new box. Writers write only the new key. `lane.ps1` no longer refuses another host's record,
-   since the key now keeps the two apart. A record read from an old box is judged by its `host`,
-   because every PC at that path shares the old name.
+   new box. Writers write only the new key. `lane.ps1` still refuses to overwrite a record at its
+   own key that names another host. The key keeps two PCs apart, so such a record was copied,
+   hand-made, or collided on the short hash. A record read from an old box is judged by its
+   `host`, because every PC at that path shares the old name. `decision.ps1` judges a seat record
+   by its `host` in both boxes.
    **Roll out by updating the primary checkout soon after the merge.** The hooks run from it, while
    `mail.ps1`, `seat.ps1 -Declare` and `lane.ps1` run from each worktree's branch. Until the primary
    carries this change, its drain reads only the old box. Mail a new sender queued then waits. Its
