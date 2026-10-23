@@ -25,8 +25,10 @@ import asyncio
 import logging
 import re
 import tomllib
+from asyncio import proactor_events
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httptools
@@ -52,7 +54,10 @@ _POST = b"POST /health HTTP/1.1\r\nHost: localhost\r\n"
 #: uvicorn's body for the 400 it writes itself when its parser refuses a request.
 _PARSER_400_BODY = b"Invalid HTTP request received."
 
-#: Ambiguous or malformed framing that llhttp refuses before the app runs.
+#: Ambiguous or malformed framing that llhttp refuses with one 400. Most shapes fail in the head,
+#: before the app runs. The two chunk shapes fail in the body, after uvicorn has started the app
+#: at the end of the head; the app may already be answering, and nothing it writes goes out after
+#: the 400 (``test_nothing_follows_the_parser_400_when_a_late_write_could_still_go_out``).
 _REFUSED: dict[str, bytes] = {
     "content-length with transfer-encoding": _POST
     + b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
@@ -188,123 +193,207 @@ async def test_the_api_refuses_ambiguous_request_framing(engine: Engine) -> None
     assert not misses, "\n".join(misses)
 
 
-#: The refused shapes whose head parses before the body is refused, so the app's task has started.
-#: The app refuses a chunked body with a 411, so on these it has an answer of its own to send.
-_REFUSED_AFTER_THE_HEAD = ("chunk size not hex digits", "chunk lines ended by bare LF")
-#: A valid request pipelined ahead of a refused one, in the same write. Its cycle is still running,
-#: its task not yet stepped, when the parser refuses the request behind it.
-_PIPELINED_AHEAD = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+#: Requests whose 400 comes after the app has started: llhttp fails in the body. The pipelined case
+#: is a well-framed chunked request, answered from its head, with the refused one behind it. Its
+#: answer comes from a cycle that ``protocol.cycle`` no longer names, since the refused request's
+#: cycle replaced it.
+_LATE_ANSWERS: dict[str, bytes] = {
+    "chunk size not hex digits": _REFUSED["chunk size not hex digits"],
+    "chunk lines ended by bare LF": _REFUSED["chunk lines ended by bare LF"],
+    "a pipelined chunked request ahead of a refused one": _POST
+    + b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    + _REFUSED["chunk size not hex digits"],
+}
+#: What uvicorn's own protocol puts on the wire for each of them when the transport lets a write
+#: made after ``close()`` go out: its 400, then the app's late 411.
+_LATE_STATUSES = [400, 411]
+#: How long the selector stand-in below keeps a closed transport writable.
+_SELECTOR_LATE_CLOSE_S = 0.5
 
 
-def _closing_late(base: type[Any]) -> type[Any]:
-    """``base`` with the ``400``'s transport close held until the connection's app tasks are done,
-    so they run before the connection is lost: the Windows proactor loop's order (see the
-    ``protocol_headers`` module docstring), which the Linux selector loop would otherwise hide. The
-    close itself is held, so the transport is not yet closing and uvicorn also starts a refused
-    request queued behind a pipelined one. A real late close would not, so that only adds answers
-    to the bare control."""
-
-    class _ClosingLate(base):  # type: ignore[misc]
-        def send_400_response(self, *args: Any, **kwargs: Any) -> None:
-            transport = self.transport
-            close = transport.close
-
-            async def _close_when_the_tasks_are_done() -> None:
-                for _ in range(500):  # bounded: 5 s
-                    if not self.tasks:
-                        break
-                    await asyncio.sleep(0.01)
-                close()
-
-            transport.close = lambda: asyncio.ensure_future(_close_when_the_tasks_are_done())
-            try:
-                super().send_400_response(*args, **kwargs)
-            finally:
-                del transport.close
-
-    return _ClosingLate
+def _proactor_close_as_in_cpython_3_14_9(self: Any) -> None:
+    """CPython 3.14.9's ``_ProactorBasePipeTransport.close``, run beside the installed release's
+    ``_loop_writing``. The connection is marked lost only when no write is pending. So a write
+    made after ``close()`` while the 400 is still in flight is sent. Earlier releases marked it lost
+    at once and dropped that write. This matches 3.14.9 only while the 400 is still pending, which
+    is the window the late 411 lands in."""
+    if self._closing:
+        return
+    self._closing = True
+    if not self._buffer and self._write_fut is None:
+        self._conn_lost += 1
+        self._loop.call_soon(self._call_connection_lost, None)
+    if self._read_fut is not None:
+        self._read_fut.cancel()
+        self._read_fut = None
 
 
-@pytest.mark.parametrize("floored", [True, False], ids=["floored", "bare-control"])
-async def test_nothing_is_answered_after_the_parser_400_when_the_close_lands_late(
-    engine: Engine, floored: bool
+def _selector_close_with_the_400_unsent(self: Any) -> None:
+    """``_SelectorTransport.close`` as it behaves when the 400 did not go out in one send: the
+    connection stays writable until the buffer drains. Held open for a fixed time instead, since
+    a loopback send of a short 400 always completes at once."""
+    if self._closing:
+        return
+    self._closing = True
+    self._loop._remove_reader(self._sock_fd)
+
+    def finish() -> None:
+        # A reset may have closed it meanwhile, or the write handler may have, once buffered bytes
+        # drained on a closing transport (that path clears _sock without bumping _conn_lost). With
+        # bytes still buffered, the write handler closes it once they drain.
+        if self._conn_lost or self._sock is None or self._buffer:
+            return
+        self._conn_lost += 1
+        self._loop._remove_writer(self._sock_fd)
+        self._call_connection_lost(None)
+
+    self._loop.call_later(_SELECTOR_LATE_CLOSE_S, finish)
+
+
+def _let_a_write_after_close_go_out(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Make the running loop's socket transports send a write made after ``close()``, on any
+    CPython: the proactor the way 3.14.9 does, the selector the way it does for a 400 that did not
+    fit in one send. Returns how long a close may still be pending once the test is done."""
+    # By dotted name: typeshed does not declare the selector's private base transport.
+    if isinstance(asyncio.get_running_loop(), proactor_events.BaseProactorEventLoop):
+        monkeypatch.setattr(
+            "asyncio.proactor_events._ProactorBasePipeTransport.close",
+            _proactor_close_as_in_cpython_3_14_9,
+        )
+        return 0.0
+    monkeypatch.setattr(
+        "asyncio.selector_events._SelectorTransport.close", _selector_close_with_the_400_unsent
+    )
+    return _SELECTOR_LATE_CLOSE_S
+
+
+async def test_nothing_follows_the_parser_400_when_a_late_write_could_still_go_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The parser's ``400`` is the last answer on the connection, even when the app tasks run before
-    the connection is lost: the refused request's own, and a pipelined one ahead of it. The bare
-    class is the control."""
-    base = floored_http_protocol_class() if floored else pinned_http_protocol_base()
-    probes = {shape: _REFUSED[shape] for shape in _REFUSED_AFTER_THE_HEAD}
-    probes |= {f"{shape}, pipelined": _PIPELINED_AHEAD + _REFUSED[shape] for shape in probes}
-    misses = []
-    async with _served(create_app(engine), http=_closing_late(base)) as port:
-        for shape, request in probes.items():
+    """The response-desync shape CPython 3.14.9 exposed. The app answers a refused request from
+    its head, with a chunked body's 411. llhttp then fails on the body, and uvicorn writes its 400
+    with ``connection: close``. A transport that still sends a write made after ``close()`` put
+    the app's answer on the wire behind that 400. The floor marks the cycles disconnected, so
+    exactly one 400 goes out.
+
+    The control is uvicorn's own protocol under the same patch. It must show the late answer, or
+    the patch reproduced nothing in this run and the floored leg proves nothing."""
+    pending_close = _let_a_write_after_close_go_out(monkeypatch)
+    async with _served(create_app(engine), http=pinned_http_protocol_base()) as port:
+        for shape, request in _LATE_ANSWERS.items():
             statuses, raw = await _answers(port, request)
-            answered_after_the_400 = statuses[:1] == [400] and len(statuses) > 1
-            if (statuses == [400]) if floored else answered_after_the_400:
-                continue
-            misses.append(f"{shape}: {raw!r}")
+            assert statuses == _LATE_STATUSES, f"control reproduced nothing, {shape}: {raw!r}"
+    misses = []
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        for shape, request in _LATE_ANSWERS.items():
+            statuses, raw = await _answers(port, request)
+            if statuses != [400] or not raw.endswith(_PARSER_400_BODY):
+                misses.append(f"{shape}: {raw!r}")
+    # Let the stand-in's delayed closes run here, not inside the next test on the shared loop.
+    await asyncio.sleep(pending_close)
     assert not misses, "\n".join(misses)
 
 
 class _Cycle:
-    """Stands in for uvicorn's cycle: the three names the cycle end reads and writes."""
+    """Just the cycle fields the 400 step reads and sets."""
 
-    def __init__(self, event: Any) -> None:
-        self.response_complete = False
-        self.disconnected = False
-        self.message_event = event
-
-
-class _SlottedCycle:
-    """A cycle with no ``__weakref__``, so tracking it fails."""
-
-    __slots__ = ("response_complete", "disconnected", "message_event")
-
-    def __init__(self) -> None:
-        self.response_complete = False
+    def __init__(self, *, complete: bool = False) -> None:
+        self.response_complete = complete
         self.disconnected = False
         self.message_event = asyncio.Event()
 
 
-class _Protocol:
-    pass
+class _BrokenCycle:
+    @property
+    def response_complete(self) -> bool:
+        raise RuntimeError("torn down")
 
 
-def _cycle_warnings(caplog: pytest.LogCaptureFixture, step: str) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if f"{step} failed" in r.getMessage()]
-
-
-def test_a_cycle_the_end_cannot_end_is_logged_once_and_the_others_are_still_ended(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The broken cycle is handed over first, so a loop that stopped at it would leave the rest."""
-    monkeypatch.setattr(protocol_headers, "_WARNED", set())
-    broken, whole = _Cycle(None), [_Cycle(asyncio.Event()) for _ in range(2)]
-    protocol = _Protocol()
-    protocol._mf_cycles = [broken, *whole]  # type: ignore[attr-defined]
-    with caplog.at_level(logging.WARNING, logger=protocol_headers._log.name):
-        protocol_headers._end_the_live_cycles(protocol)
-        protocol_headers._end_the_live_cycles(protocol)
-    assert all(c.disconnected and c.message_event.is_set() for c in whole)
-    warned = _cycle_warnings(caplog, "live cycle end")
-    assert len(warned) == 1, caplog.text
-    assert "second response" in warned[0].getMessage()
-
-
-def test_a_cycle_tracking_failure_still_ends_the_newest_cycle(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+def test_one_broken_cycle_does_not_leave_the_others_unmarked(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(protocol_headers, "_WARNED", set())
-    cycle = _SlottedCycle()
-    protocol = _Protocol()
-    protocol._mf_cycle = cycle  # type: ignore[attr-defined]
-    with caplog.at_level(logging.WARNING, logger=protocol_headers._log.name):
-        protocol_headers._track_the_cycle(protocol, cycle)
-        protocol_headers._end_the_live_cycles(protocol)
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    open_cycle, done = _Cycle(), _Cycle(complete=True)
+    protocol_headers._end_the_open_cycles([_BrokenCycle(), open_cycle, done])
+    assert open_cycle.disconnected and open_cycle.message_event.is_set()
+    # A completed response stays as it was; only its waiters are woken.
+    assert not done.disconnected and done.message_event.is_set()
+    _one_post_400_warning(caplog, "cycle end", "RuntimeError", protocol_headers._DESYNC_RISK)
+
+
+def _one_post_400_warning(
+    caplog: pytest.LogCaptureFixture, step: str, exc_type: str, effect: str
+) -> None:
+    """Exactly one warning from the floor, for ``step``, naming the exception type and ``effect``
+    and not the headers: no header is at stake around the parser's 400."""
+    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1, hits
+    assert f"http-400: {step} failed ({exc_type})" in hits[0], hits
+    assert effect in hits[0] and "security headers" not in hits[0], hits
+
+
+def test_a_cycle_that_cannot_be_recorded_degrades(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    protocol_headers._remember_the_cycle(SimpleNamespace(), object())  # object() takes no weakref
+    _one_post_400_warning(caplog, "cycle record", "TypeError", protocol_headers._DESYNC_RISK)
+
+
+class _RaisingBase:
+    def send_400_response(self, msg: str) -> None:
+        raise RuntimeError("writer failed")
+
+
+def test_a_400_writer_that_raises_still_ends_the_open_cycles_and_closes() -> None:
+    closes: list[bool] = []
+    protocol: Any = protocol_headers._build_floored_http(_RaisingBase)()
+    protocol.transport = SimpleNamespace(
+        is_closing=lambda: bool(closes), close=lambda: closes.append(True)
+    )
+    cycle = _Cycle()
+    protocol_headers._remember_the_cycle(protocol, cycle)
+    with pytest.raises(RuntimeError, match="writer failed"):
+        protocol.send_400_response("Invalid HTTP request received.")
     assert cycle.disconnected and cycle.message_event.is_set()
-    warned = _cycle_warnings(caplog, "cycle tracking")
-    assert len(warned) == 1, caplog.text
-    assert "second response" in warned[0].getMessage()
+    assert closes == [True]
+
+
+def test_no_second_close_after_a_400_writer_that_closed_then_raised() -> None:
+    """asyncio's TLS transport is not safe to close twice, so a transport the writer already
+    closed is left alone."""
+
+    class _ClosesThenRaises:
+        transport: Any
+
+        def send_400_response(self, msg: str) -> None:
+            self.transport.close()
+            raise RuntimeError("writer failed")
+
+    closes: list[bool] = []
+    protocol: Any = protocol_headers._build_floored_http(_ClosesThenRaises)()
+    protocol.transport = SimpleNamespace(
+        is_closing=lambda: bool(closes), close=lambda: closes.append(True)
+    )
+    with pytest.raises(RuntimeError, match="writer failed"):
+        protocol.send_400_response("Invalid HTTP request received.")
+    assert closes == [True]
+
+
+def test_a_close_that_fails_after_a_failed_400_degrades(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    protocol: Any = protocol_headers._build_floored_http(_RaisingBase)()
+    protocol.transport = SimpleNamespace()  # no close: the close step raises AttributeError
+    with pytest.raises(RuntimeError, match="writer failed"):  # the server's error, not the close's
+        protocol.send_400_response("Invalid HTTP request received.")
+    _one_post_400_warning(
+        caplog, "close after a failed 400", "AttributeError", protocol_headers._LEFT_OPEN
+    )
 
 
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
@@ -327,3 +416,73 @@ async def test_the_probe_sees_the_shapes_h11_would_accept(engine: Engine) -> Non
             # Two answers: the first request reached the app (a 405, or a 411 for the unfolded
             # chunked one), and the request behind it was read too.
             assert len(statuses) == 2 and statuses[0] != 400, f"{shape}: {raw!r}"
+
+
+async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes, bool]:
+    """Send ``head``, read the server's whole answer to it, then send ``body``. Return the statuses,
+    the raw bytes, and whether the server closed the connection within the timeout."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    raw = b""
+    closed = False
+    try:
+        writer.write(head)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10.0)
+        length = re.search(rb"(?im)^content-length:\s*(\d+)", raw)
+        assert length is not None, raw
+        raw += await asyncio.wait_for(reader.readexactly(int(length.group(1))), 10.0)
+        writer.write(body)
+        await writer.drain()
+        while chunk := await asyncio.wait_for(reader.read(65536), 3.0):
+            raw += chunk
+        closed = True
+    except ConnectionResetError:
+        closed = True
+    except TimeoutError:
+        pass
+    finally:
+        writer.close()
+    return [int(s) for s in re.findall(rb"HTTP/1\.[01] (\d{3}) ", raw)], raw, closed
+
+
+async def test_a_400_writer_that_raises_still_closes_the_connection(engine: Engine) -> None:
+    """On h11, a bad body that arrives after the app has answered the head makes uvicorn's own 400
+    writer raise, because h11 has already sent a response. On the proactor loop over plaintext,
+    asyncio then leaves the connection open, so the floor closes it.
+
+    The control is uvicorn's own h11 protocol, which must leave it open, or this run shows
+    nothing. The selector loop closes such a transport itself, so there is nothing to see there."""
+    if not isinstance(asyncio.get_running_loop(), proactor_events.BaseProactorEventLoop):
+        pytest.skip("only the proactor loop leaves this connection open")
+    head = _POST + b"Transfer-Encoding: chunked\r\n\r\n"
+    body = b"0x2\r\n{}\r\n0\r\n\r\n"
+    async with _served(create_app(engine), http=H11Protocol) as port:
+        _, raw, closed = await _split(port, head, body)
+    assert not closed, f"control: uvicorn's own h11 closed the connection: {raw!r}"
+    h11 = floored_http_protocol_class(base=H11Protocol)
+    async with _served(create_app(engine), http=h11) as port:
+        statuses, raw, closed = await _split(port, head, body)
+    assert closed, f"the connection stayed open: {raw!r}"
+    assert statuses == [411], raw
+
+
+async def test_a_request_read_with_the_bad_bytes_gets_a_disconnect() -> None:
+    """A well-framed GET and a malformed request line arrive in one read. uvicorn starts the GET's
+    app, then its parser writes the 400. The floor mutes the GET's cycle: its app still runs, but
+    ``receive()`` gives it ``http.disconnect`` and nothing it sends is written. Kept on purpose:
+    the connection is going down with a 400. This pins it, so a change to it is a decision."""
+    received: list[str] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        received.append((await receive())["type"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async with _served(app, http=floored_http_protocol_class()) as port:
+        statuses, raw = await _answers(
+            port, b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\nNOT A REQUEST LINE\r\n\r\n"
+        )
+    assert statuses == [400] and raw.endswith(_PARSER_400_BODY), raw
+    assert received == ["http.disconnect"]
