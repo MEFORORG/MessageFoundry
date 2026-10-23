@@ -1565,26 +1565,6 @@ such as a lone `all` proxy without the `[vault]` extra. Nor does it read any oth
 so it still logs when a bypass list covers every host the engine reaches. Other commands that reach
 these hops, such as `check-privileges` and `verify`, do not log this warning.
 
-**The Vault and OpenBao clients also name a proxy where they use it** (vault BACKLOG #4028). The
-start WARNING is read once, and only by `serve` and `supervise`. So when the client's adapter picks
-the connection for a send, after its own refusals at that point, it names the proxy `requests`
-picked, in one WARNING. A refusal later in the same send, before or at connect time, can still
-follow it, so the WARNING says the proxy was picked, not that the request reached Vault. It names
-the proxy as the start WARNING does, and names it "an unreadable value" where the parser that dials
-the proxy reads a different scheme, host or port from it. The engine gives these clients no proxy setting, so any
-proxy they pick came from the environment or the system settings.
-
-It logs once per hop and distinct proxy value in a process. A value the hop has not named before is
-named on the first send that picks it, which is how a proxy set after start is disclosed. A hop that
-goes back to a proxy it already named does not name it again, so the last line for a hop need not
-name the proxy in use now. It is a WARNING, so a log level above WARNING hides it, as it hides the
-start WARNING. A send that goes direct, because no proxy is set or a bypass list names the Vault
-host, logs nothing.
-
-It is logged by every command whose Vault client sends, at least `serve`, `supervise`,
-`check-privileges`, `verify`, and the commands that open a store keyed from Vault. The urllib hops
-listed above still rely on the start WARNING.
-
 **Some hosts go direct.** Both families send a host on `NO_PROXY` direct. With no `*_proxy`
 environment variable holding a value, they also send a host on the Windows or macOS system bypass
 list direct. A value in any `*_proxy` variable, even `NO_PROXY`, makes both families ignore the
@@ -1620,6 +1600,28 @@ system proxy, for the account the engine runs as. An address in `[egress].proxy_
 connection's `proxy_url` changes only the HTTP-family connections and their token requests. The
 other hops keep the environment proxy, and the WARNING still logs, because it reads only the
 environment. The operator API client and the tray ignore the environment proxy.
+
+##### The Vault and OpenBao clients also name a proxy where they use it
+
+The start WARNING reads the environment once, and only under `serve` and `supervise` (vault
+BACKLOG #4028). So when the client's adapter picks the connection for a send, after its own
+refusals at that point, it names the proxy `requests` picked, in one WARNING. A refusal later in
+the same send, before or at connect time, can still follow it, so the WARNING says the proxy was
+picked, not that the request reached Vault. It names the proxy as the start WARNING does, and
+names it "an unreadable value" where the parser that dials the proxy reads a different scheme,
+host or port from it. The engine gives these clients no proxy setting, so any proxy they pick
+came from the environment or the system settings.
+
+It logs once per hop and distinct proxy value in a process. A value the hop has not named before is
+named on the first send that picks it, which is how a proxy set after start is disclosed. A hop that
+goes back to a proxy it already named does not name it again, so the last line for a hop need not
+name the proxy in use now. It is a WARNING, so a log level above WARNING hides it, as it hides the
+start WARNING. A send that goes direct, because no proxy is set or a bypass list names the Vault
+host, logs nothing.
+
+It is logged by every command whose Vault client sends, at least `serve`, `supervise`,
+`check-privileges`, `verify`, and the commands that open a store keyed from Vault. The urllib hops
+listed above still rely on the start WARNING.
 
 ### `[shadow]`
 Parallel-run / **shadow-instance** egress suppression (#15). A *shadow* MessageFoundry processes real

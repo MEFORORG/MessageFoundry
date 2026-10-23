@@ -5,9 +5,9 @@
 Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. The start
 warning (``tests/test_ambient_proxy_disclosure.py``) misses commands other than ``serve`` and
 ``supervise``, and a proxy set after start. What the point-of-use WARNING covers is in
-``docs/CONFIGURATION.md``, *``serve`` names an environment proxy at start*. These tests drive the
-shipped clients and both commands through a loopback listener standing in for the proxy, which
-hangs up on every connection, so nothing reaches a real Vault.
+``docs/CONFIGURATION.md``, *The Vault and OpenBao clients also name a proxy where they use it*.
+These tests drive the shipped clients and both commands through a loopback listener standing in
+for the proxy, which hangs up on every connection, so nothing reaches a real Vault.
 """
 
 from __future__ import annotations

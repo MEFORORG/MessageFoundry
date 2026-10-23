@@ -929,7 +929,8 @@ def _first_crossing(connector: str, kind: str) -> bool:
 def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     """Log :func:`~messagefoundry.transports.ambient_proxy.vault_hop_proxy_warning` the first
     time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028). When it
-    logs is in ``docs/CONFIGURATION.md``, *``serve`` names an environment proxy at start*.
+    logs is in ``docs/CONFIGURATION.md``, *The Vault and OpenBao clients also name a proxy
+    where they use it*.
 
     Keyed by a digest of the raw value rather than the value, so this set adds no copy of it.
     That protects no credential: the process already holds the raw URL, at least in the proxy
