@@ -1099,13 +1099,19 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 You don't have to brief each new chat by hand. A `SessionStart` hook
 ([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
-into every new Claude Code window. It always prints the project's Ultracode working-default
-reminder, and **when 2+ worktrees
-share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
-full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
-working-default line.
+into every new Claude Code window. **When 2+ worktrees share this `.git`** it prints the
+parallel-session block. The block holds at least these: which worktree and branch this chat owns, the
+live peers, what they are building, the work claims, and the shared-memory write rule above. With a
+single worktree it prints at most a line about which worktree it read, such as a fault line.
 
-**Who is actually live — `presence.ps1`.** The worktree list above is the set of *checkouts*, not the
+The block is small on purpose. Past a size threshold, the harness saves a hook's output to a file. It
+then injects only a short preview of the head. This repository does not document that threshold. So
+the script sets its own byte budget, on its `$byteBudget` line. The high-signal sections print first.
+Each list stops at a cap and names the command that shows the rest. Past the budget, the script cuts
+the end of the lists and says so. On 2026-10-22, with 471 worktrees and 155 claims, the old banner
+printed every worktree and ran to 128,001 bytes. The peers and claims never reached the model.
+
+**Who is actually live — `presence.ps1`.** The worktree count is the set of *checkouts*, not the
 set of *sessions*: most worktrees usually have nobody in them, and the collision that matters — someone
 editing the shared primary right now — is invisible from it. The banner therefore also lists **live
 sessions**, from [../scripts/coord/presence.ps1](../scripts/coord/presence.ps1). Run it directly any time:
@@ -1443,7 +1449,20 @@ This doc previously asserted the opposite — that the call "fails silently, whi
 you" — which was an inference stated as a measurement, and it was teaching every session to expect a
 failure mode that does not occur. Getting the id wrong is *self-announcing*; you do not need to detect it.
 (Tested only with an id that matches no session. If a registry uuid ever collided with a live MCP id the
-behaviour would differ, but they are distinct by construction.)
+behaviour would differ, but they are distinct by construction.) Do not retry a not-found id against
+another peer: the id was wrong, and another peer's row will not make it right.
+
+**How the model reads the roster the hook prints.** Each peer row carries one verb. `MESSAGE` means send
+to it. `HOLD` means it is reachable but over this round's cap, and it is offered again later. `MAILED`
+means the hook already announced to it over the mail lane, so do nothing. `SKIP` means it can be neither
+messaged nor mailed now. A row's `claim:` line, where present, outranks the worktree name. The name is a
+creation-time label that nothing keeps current. One was measured describing work its session never did.
+A claim's bracketed age is the age of the note, not of the work, so an old note may describe a pull
+request that has since merged. After sending, the model appends one line per peer to
+`<state dir>/sent/<key>.tsv`, in the form
+`<iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED> TAB <sent | failed>`. Nothing else records what
+was delivered. A session that cannot use session messaging at all, such as a scheduled run, skips the
+whole instruction, and so does a trivial prompt.
 
 **What it asks the model to send.** A fixed `[SESSION-ANNOUNCE]` envelope, one line of intent, one line
 of expected footprint, no question. It arrives in the recipient as a **user turn**, so an announcement is
@@ -1472,7 +1491,7 @@ in the roster, meaning *already announced to, do nothing*. `mail.ps1` was built 
 cases and names them both in its own header; the two components shipped separately and the hook contained
 **zero** references to mail until 2026-09-14.
 
-Four properties of that lane, each of which cost a measurement:
+At least these properties of that lane cost a measurement or an audit:
 
 - **It runs before the `NO_PEERS` exit, and that order is the feature.** The new-peer set is computed from
   *messageable* peers alone, so a fleet in which every peer is cross-login would otherwise take that exit
@@ -1487,8 +1506,13 @@ Four properties of that lane, each of which cost a measurement:
   own prescribed text through the lane unmodified.
 - **The intent comes from the claim note, never from the user's prompt.** The hook *has* the prompt in its
   payload. Mailing it would copy arbitrary user text into a peer's transcript that nothing here can
-  delete, which `mail.ps1`'s body rule forbids outright. No claim note is reported as *not declared*
-  rather than filled in from the worktree name.
+  delete, which `mail.ps1`'s body rule forbids outright. With no claim note, the hook uses the goal this
+  session gave `seat.ps1 -Declare`, read from its own seat record for this worktree.
+- **No declared intent, no mail.** With no claim note and no seat goal, the hook sends nothing. The peers
+  stay unmailed, so a later prompt offers them again. A receipt written on that prompt carries the note
+  `mail held: no claim note or seat goal yet`. It used to mail an `intent: NOT DECLARED` body. An audit
+  of 196 mailed messages found 62 of those, each carrying nothing but a worktree name. A closed seat's
+  goal does not count, and a body built from a seat goal labels its age `seat declared`.
 
 **Three bounds, and the clock is the one that matters.** This is `UserPromptSubmit`, whose timeout is 15 s
 and whose failure mode is a **blocked user prompt** rather than degraded coordination. One send costs

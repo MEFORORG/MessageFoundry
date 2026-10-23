@@ -339,6 +339,15 @@ The metadata caps are not decoration: a cap on the body alone is a cap with an o
 unbounded `from.branch` pushes the preamble off the top of the injection just as effectively as an
 unbounded body would.
 
+**A `[SESSION-ANNOUNCE]` broadcast renders as one line.** An audit of 196 mailed messages found 85 were
+announces. The drain puts the claimed worktree, branch, intent, touching and sent time on one `    | `
+line marked `[UNVERIFIED]`. The usual id delimiters stay. Two lines are dropped: the tag line, whose
+worktree and branch the sender fields already carry, and a final `via:` envelope line. Anything the
+shortcut cannot render that way renders in full instead. That covers at least another kind, extra text
+on the tag line, an unknown or repeated field, text after `via:`, a line the line cap cut, a summary
+over 400 characters, and an HL7-shaped line. The
+selection pass still charges the full body, so the caps above stay an upper bound.
+
 **Where the numbers come from.** These anchors were measured in this repo on 2026-08-05. The
 per-injection **total** is not one of them: it is derived from the other caps, `5 * (2000 + 560)`, so
 that the message cap is the one that binds. That derivation is the correction BACKLOG #1386 records.
