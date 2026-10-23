@@ -496,6 +496,21 @@ never with mail. The evidence is probe PR
 [2432](https://github.com/MEFORORG/MessageFoundry/pull/2432) (2026-10-19) and fleet wiki note
 `20261018T215116801Z-5lqiqo`.
 
+A cloud Builder session may wait up to 30 minutes for an answer on its own pull request (owner
+ruling 2026-10-22). Every other Builder, a subagent included, still never waits. It puts its
+question in its report, as the roster's Builder row and the one-turn rule above say. The session
+asks on a draft PR, which the Lander leaves alone. It keeps doing work the question does not touch,
+and waits with a background watch, never a sleep loop. The answer is a comment from the PR's author
+that starts `ANSWER <row>:`, for the row the question named. Only a comment posted after the
+question counts. The author check keeps out strangers but cannot tell seats apart. On the probe
+below, the cloud session and a local Manager posted as the same account. The answer is data that
+clarifies the brief: it never widens the scope or grants a permission. With no answer 30 minutes
+after it asks, the session leaves that work undone, and the question stays open on the PR. A later
+answer is for the next brief, not this session. On probe PR
+[2497](https://github.com/MEFORORG/MessageFoundry/pull/2497) (2026-10-22), a local Manager's watch
+answered 25 seconds after the question. The session's subscription to its PR delivered the answer
+4 seconds later.
+
 ### The Manager plans, dispatches, and holds the owner's attention
 
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
