@@ -171,6 +171,17 @@ def test_an_explicit_port_zero_is_named_not_unreadable(caplog: pytest.LogCapture
     assert f"{_PICKED}http://proxy.example:0." in text
 
 
+def test_a_proxy_urllib3_reads_no_host_from_is_named_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No shipped label is known to spell its host "None" for such a value, so the label is
+    forced to. Mutation: drop the ``host is None`` guard; red, "http://None" is returned."""
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setattr(strict_requests, "proxy_label", lambda _value: "http://None")
+    assert strict_requests._dialled_proxy_label("http://") == "an unreadable value"
+
+
 # --- the shipped Vault clients --------------------------------------------------------------------
 
 
