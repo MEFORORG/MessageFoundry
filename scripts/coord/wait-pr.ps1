@@ -75,7 +75,9 @@
     comment by -Author can end the wait, so a stranger's comment on a public repository cannot.
     Unless -Author names one, the author is the PR's, read by the first check (and again if a
     transient failure makes that check run again); a PR with no author login is exit 1, never an
-    empty author. Logins are compared without regard to case, as GitHub's are. The check excludes
+    empty author. Logins are compared ordinally without regard to case, as GitHub's are, so an
+    invisible character in a login is never ignored the way a culture-aware compare ignores it;
+    -Author is anchored at the very end of its value, so a trailing newline is refused. The check excludes
     strangers only: every seat that posts through the same GitHub account passes it, so it is not
     proof that the Builder wrote the comment, and it narrows who can wake the waiter, not what the
     text may say. New means an id greater than the newest comment id read at the start, or than
@@ -84,9 +86,13 @@
     this wait, and review comments (`pulls/{n}/comments`) are not read: their ids are a separate
     sequence, so "newer than" would need a second baseline and a second resume id. Of several new
     matching comments the one with the lowest id is reported, and the line says how many more
-    follow it. ALWAYS wait again with -AfterCommentId set to the printed id: a wait without it takes
-    the newest comment at its own start as the baseline, so it skips every comment posted since the
-    last wait's final read. LIMIT: delivery rests on an id high-water mark, so a comment whose lower
+    follow it. START THE FIRST WAIT ON A PR WITH -AfterCommentId 0, which makes every comment on the
+    PR count, so a question posted before the wait started is still found. ALWAYS wait again with
+    -AfterCommentId set to the id the last wait printed: exit 0 prints it as the met line's `id=`,
+    and exit 2, and exit 1 once the loop has started, print a `resume: id=` line with the newest
+    comment id read, every comment up to it having been read and found not to match. A wait without
+    -AfterCommentId takes the newest comment at its own start as the baseline, so it skips every
+    comment posted before it started, including those since the last wait's final read. LIMIT: delivery rests on an id high-water mark, so a comment whose lower
     id becomes visible only after a higher one has been reported is skipped. On exit 0 it prints ONE
     line naming the comment's id, author, URL and first line, never the rest of the body. Author,
     URL and first line are each reduced to printable ASCII and cut to 300 characters: control,
@@ -108,7 +114,9 @@
     check reads the PR for its author (not when -Author is given) and every page of the PR's issue
     comments, 100 to a page; a transient failure repeats all of it. Every later check reads only the comments updated since 60
     s before the newest `updated_at` of that first read, through one fixed `?since=` path, so it is
-    one read unless more than 100 comments fall in that window. The first read of
+    one read unless 100 or more fall in that window: a full page of 100 always costs one more read.
+    Every paged read stops at 50 pages: a 50th full page is exit 1, never a 51st read, so a server
+    that ignores `page` cannot keep a wait reading. The first read of
     each path is unconditional and counted. Every later read of it is conditional: the ETag of the
     last 200 goes back as If-None-Match, and GitHub does not count a 304 against the primary rate
     limit, so an unchanging PR costs little after the first check. The 304
@@ -140,6 +148,12 @@
     as "still waiting". A 403 or 429 that says the rate budget is spent (X-Ratelimit-Remaining: 0)
     is exit 1 at once, with a message naming the budget: polling a spent budget every seat shares
     is the thing to stop. Any other 4xx is exit 1 too.
+
+    IT NEEDS pwsh 7.3 OR LATER. -Match is compiled with RegexOptions.NonBacktracking, which needs
+    .NET 7, and pwsh 7.3 is the first release on it. The #Requires line below refuses an older
+    PowerShell, Windows PowerShell 5.1 included, with exit 1 and a message naming the version,
+    before the script runs. Nothing in the script is syntax an older parser rejects, so that
+    message is the one an older PowerShell prints.
 
     REST ONLY, NEVER `gh pr`. `gh pr` speaks GraphQL, which the cloud GitHub proxy refuses
     (CLAUDE.md section 5, "A cloud session is a Builder in its own session"), and GraphQL has no
@@ -185,6 +199,7 @@
     at a sleeper that records the already clamped interval instead of sleeping, and shorten the
     timeout only where a stand-in hangs on purpose.
 #>
+#Requires -Version 7.3
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -201,10 +216,12 @@ param(
 
     [string]$Match = '^(BUILDER-ASK|BUILDER-STATUS):',
 
-    [ValidatePattern('^[A-Za-z0-9_-]+(\[bot\])?$')]
+    # \z, not $: $ also matches before a final newline.
+    [ValidatePattern('^[A-Za-z0-9_-]+(\[bot\])?\z')]
     [string]$Author = '',
 
-    [ValidateRange(1, 9223372036854775807)]
+    # 0 means every comment counts; leaving it out means the newest at the start is the baseline.
+    [ValidateRange(0, 9223372036854775807)]
     [long]$AfterCommentId = 0,
 
     [int]$IntervalSeconds = 120,
@@ -228,6 +245,7 @@ $MaxTotalMinutes = 60
 $RateFloor = 500
 $MaxPrintChars = 300
 $SinceMarginSeconds = 60
+$MaxPages = 50
 
 $script:Etags = @{}
 $script:Bodies = @{}
@@ -239,6 +257,9 @@ $script:DirtyReads = 0
 $script:CommentQuery = $null
 $script:CommentAfter = 0L
 $script:CommentAuthor = ''
+$script:CommentSeen = 0L
+$script:HasCursor = $PSBoundParameters.ContainsKey('AfterCommentId')
+$script:InLoop = $false
 $script:Utf8 = [System.Text.UTF8Encoding]::new($false)
 
 function Say([string]$Message) {
@@ -248,6 +269,11 @@ function Say([string]$Message) {
 }
 
 function Fail([string]$Message) {
+    # Once the loop runs, an error must not lose the comment cursor either.
+    if ($script:InLoop) {
+        $resume = Get-Resume
+        if ($resume) { Say $resume }
+    }
     [Console]::Error.WriteLine("wait-pr $Repo#${Pr}: error: $Message")
     exit 1
 }
@@ -279,7 +305,9 @@ function Resolve-Gh {
     if (-not $cmd) { Fail "cannot find gh as '$GhCommand'; is the GitHub CLI installed and on PATH?" }
     if ($cmd.CommandType -eq 'ExternalScript') {
         # $PSHOME, not the process path: under a host other than pwsh that path is not pwsh.
-        $pwsh = Join-Path $PSHOME ($IsWindows ? 'pwsh.exe' : 'pwsh')
+        # if, not the ternary operator: an older parser must reach the #Requires refusal.
+        $exe = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
+        $pwsh = Join-Path $PSHOME $exe
         return @{ File = $pwsh; Args = @('-NoProfile', '-NonInteractive', '-File', $cmd.Source) }
     }
     @{ File = $cmd.Source; Args = @() }
@@ -494,11 +522,14 @@ function Read-Required([string]$Base) {
     @($classic + $ruleset | Sort-Object -Unique -CaseSensitive)
 }
 
-# Every item of an endpoint that answers a bare JSON array, 100 to a page, until a short page.
-# $Path ends in `?` or `&`.
+# Every item of an endpoint that answers a bare JSON array, 100 to a page, until a short page, and
+# never past $MaxPages pages. $Path ends in `?` or `&`.
 function Read-Pages([string]$Path) {
     $page = 1
     do {
+        if ($page -gt $MaxPages) {
+            Fail "gh api ${Path}per_page=100 returned a full page $MaxPages times, the most this script reads; it stops rather than read on, since a server that ignores page would never return a short one."
+        }
         $batch = @(Get-Rest "${Path}per_page=100&page=$page" | ForEach-Object { $_ })
         $batch
         $page++
@@ -551,7 +582,7 @@ function Test-Comments {
             # A deleted comment leaves this too, so it is said, not refused.
             Say "-AfterCommentId $AfterCommentId is above every issue comment on the PR (newest $newest): a deleted comment, or an id from another PR or sequence"
         }
-        $script:CommentAfter = if ($AfterCommentId) { $AfterCommentId } else { $newest }
+        $script:CommentAfter = if ($script:HasCursor) { $AfterCommentId } else { $newest }
         $script:CommentQuery = if ($stamp) {
             $since = $stamp.AddSeconds(-$SinceMarginSeconds).UtcDateTime
             "since=$($since.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture))&"
@@ -567,9 +598,13 @@ function Test-Comments {
     }
     $after = $script:CommentAfter
     $new = @($comments | Where-Object { [long]$_.id -gt $after } | Sort-Object { [long]$_.id })
+    # Ordinal: -eq compares culture-aware, which can ignore a zero-width character in a login.
     $hits = @($new | Where-Object {
-            [string](Prop (Prop $_ 'user') 'login') -eq $script:CommentAuthor -and $script:MatchRx.IsMatch((Get-FirstLine $_))
+            [string]::Equals([string](Prop (Prop $_ 'user') 'login'), $script:CommentAuthor,
+                [System.StringComparison]::OrdinalIgnoreCase) -and $script:MatchRx.IsMatch((Get-FirstLine $_))
         })
+    # Every comment this read returned has now been judged, so the resume cursor may pass it.
+    foreach ($c in $comments) { $script:CommentSeen = [math]::Max($script:CommentSeen, [long]$c.id) }
     $r = @{ Met = $hits.Count -gt 0; NeedsPush = $null
         State = "last read: $($new.Count) comments after id ${after}, $($hits.Count) by the author matching" }
     if ($hits) {
@@ -580,6 +615,20 @@ function Test-Comments {
         $r.Summary = "id=$([long]$hit.id)$more author=$who url=$url first line: $(Get-Clean (Get-FirstLine $hit))"
     }
     $r
+}
+
+# The line that lets the next -Until comment wait start where this one stopped, or $null when
+# there is no comment cursor to give. Every comment up to the id it names was read and judged.
+function Get-Resume {
+    if ($Until -ne 'comment') { return $null }
+    if ($null -ne $script:CommentQuery) {
+        $id = [math]::Max($script:CommentAfter, $script:CommentSeen)
+    } elseif ($script:HasCursor) {
+        $id = $AfterCommentId
+    } else {
+        return 'resume: no comment was read and no -AfterCommentId was given, so there is no id to resume after'
+    }
+    "resume: id=$id is the newest comment read; wait again with -AfterCommentId $id"
 }
 
 # Untrusted text made safe to print on one line, in printable ASCII only. Each UTF-16 unit in
@@ -649,6 +698,7 @@ try {
     $script:Base = $null
     $transients = 0
     $script:Required = @()
+    $script:InLoop = $true
     while ($true) {
         try {
             # -Until comment never acts on the PR's state: a comment can arrive whatever it is.
@@ -677,6 +727,8 @@ try {
         # a wait whose reads, each cut off at its timeout, have added up past the ceiling.
         if ($slept + $IntervalSeconds -gt $maxSeconds -or $clock.Elapsed.TotalSeconds -gt $maxSeconds) {
             Say "timeout: $Until not met within $MaxMinutes min. $accounting"
+            $resume = Get-Resume
+            if ($resume) { Say $resume }
             exit 2
         }
         if ($SleepCommand) { & $SleepCommand $IntervalSeconds } else { Start-Sleep -Seconds $IntervalSeconds }
