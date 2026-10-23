@@ -15,10 +15,11 @@ protocol, the way uvicorn itself would receive it:
 
 * a request line the parser rejects, for the server's own ``400``;
 * a chunked request whose head starts the app and whose bad chunk then makes the parser write its
-  ``400``. Here nothing may follow the ``400``: not the ``500`` the server writes for the app, which
-  raises. On httptools this measures the floor's response-desync step, which marks the request
-  cycles disconnected after the ``400``, on the installed server. On h11, h11's own state machine
-  also refuses that ``500``. It is no header family of its own;
+  ``400``. Here nothing may follow the ``400``: not the late answer the app then sends. The drive
+  fails if the app never ran and tried that answer. On httptools this measures the floor's
+  response-desync step, which marks the request cycles disconnected after the ``400``, on the
+  installed server. On h11, h11's own state machine also refuses that answer. It is no header
+  family of its own;
 * a well-formed request to an app that raises, for the server's own ``500``;
 * a WebSocket upgrade with no ``Sec-WebSocket-Key``, for the handshake rejection the WebSocket
   library writes;
@@ -112,6 +113,9 @@ _SERVER_LOGGERS = ("uvicorn.error", "uvicorn.access")
 #: The path the stand-in app refuses a WebSocket on, by closing before it accepts.
 _REFUSED_PATH = "/selftest/refused"
 
+#: The path the stand-in app sends a late answer on, after the parser's 400.
+_LATE_PATH = "/selftest/late"
+
 #: The sample nonce from RFC 6455 section 1.3. It is public and protects nothing.
 _UPGRADE_KEY = b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
 
@@ -144,12 +148,12 @@ class _Drive(NamedTuple):
 _DRIVES = (
     _Drive("malformed-request 400", b"NOT A REQUEST LINE\r\n\r\n", (400,), False),
     # A chunked head starts the app; the bad chunk size then makes the parser write its 400. The
-    # app raises, and the server's 500 for it must not follow the 400. The transport here keeps
-    # every write, even after close, as CPython 3.14.9's proactor does while the 400 is pending.
+    # app then sends a late answer, which must not follow the 400. The transport here keeps every
+    # write, even after close, as CPython 3.14.9's proactor does while the 400 is pending.
     _Drive(
         "parser 400 after the app started",
-        b"POST /selftest HTTP/1.1\r\nHost: selftest\r\nTransfer-Encoding: chunked\r\n\r\n"
-        b"0x2\r\n{}\r\n0\r\n\r\n",
+        b"POST " + _LATE_PATH.encode("ascii") + b" HTTP/1.1\r\nHost: selftest\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0x2\r\n{}\r\n0\r\n\r\n",
         (400,),
         False,
         alone=True,
@@ -178,6 +182,23 @@ async def _failing_app(scope: Any, receive: Any, send: Any) -> None:
         await send({"type": "websocket.close"})
         return
     raise _SelfTestAppError
+
+
+class _StandInApp:
+    """The app every drive is served by. On the parser-400 drive's path it records that it ran and
+    sends a late answer; everywhere else it is :func:`_failing_app`. One per self-test run."""
+
+    def __init__(self) -> None:
+        #: Set before the late answer is sent, so a drive that never reached it shows as vacuous.
+        self.late_answer_tried = False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["path"] == _LATE_PATH:
+            self.late_answer_tried = True
+            await send({"type": "http.response.start", "status": 500, "headers": []})
+            await send({"type": "http.response.body", "body": b"late"})
+            return
+        await _failing_app(scope, receive, send)
 
 
 class _NeverWaits:
@@ -333,8 +354,9 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
 
     # workers and proxy_headers are spelled out so Config reads neither WEB_CONCURRENCY nor
     # FORWARDED_ALLOW_IPS: a bad value there is not a header floor failure and must not read as one.
+    app = _StandInApp()
     config = uvicorn.Config(
-        _failing_app,
+        app,
         http=http_class,
         ws=ws_class if ws_class is not None else "none",
         lifespan="off",
@@ -373,7 +395,10 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
         if drive.alone:
             # Give the app every turn it could take to answer, then look past the first response.
             await _turns(_LATE_ANSWER_TURNS)
-            if _after_the_first_response(bytes(transport.written)):
+            if not app.late_answer_tried:
+                # Nothing tried to answer, so "nothing followed the 400" would prove nothing.
+                problems.append(f"the {drive.response} drive never reached the app's late answer")
+            elif _after_the_first_response(bytes(transport.written)):
                 problems.append(f"the {drive.response} was followed by a second response")
 
     # Hang up as a client would, then cancel whatever is still waiting, so the loop is discarded

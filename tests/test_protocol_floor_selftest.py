@@ -147,6 +147,28 @@ def test_a_bare_400_is_refused(http_base: type[Any]) -> None:
         assert f"the {_LATE_400} was followed by a second response" in message, message
 
 
+def test_a_late_answer_drive_that_never_reaches_the_app_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vacuity control for the parser-400 drive. Bad bytes in the head make the parser reject
+    before any app runs, so nothing tries a late answer. "Nothing followed the 400" then proves
+    nothing, and the drive must refuse rather than pass."""
+    http, ws = _floored()
+    selftest_protocol_floor(http, ws)
+    drives = tuple(
+        drive._replace(request=b"POST /selftest/late HTTP/1.1\r\nBad Header\r\n\r\n")
+        if drive.response == _LATE_400
+        else drive
+        for drive in protocol_floor_selftest._DRIVES
+    )
+    monkeypatch.setattr(protocol_floor_selftest, "_DRIVES", drives)
+    message = _refusal(http, ws)
+    assert f"the {_LATE_400} drive never reached the app's late answer" in message, message
+    for other in _ALL_RESPONSES:
+        if other != _LATE_400:
+            assert other not in message, message
+
+
 def test_a_cycle_send_that_ignores_disconnected_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """The response-desync step: if uvicorn's cycle ``send`` stopped returning early on a
     disconnected cycle, the app's 500 would follow the parser's 400. Only that drive is refused.

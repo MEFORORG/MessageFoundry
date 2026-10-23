@@ -199,15 +199,19 @@ _WARNED: set[tuple[str, str]] = set()
 
 #: What a failed header step costs: the default effect :func:`_degraded` names.
 _MISSING_HEADERS = (
-    "responses of this family may lack the protocol-level security headers (BACKLOG #1120)"
+    "the server's own behaviour took this step over, so responses of this family may lack the "
+    "protocol-level security headers (BACKLOG #1120)"
 )
-#: What a failed step after the parser's 400 costs instead. No header is at stake there.
+#: What a failed step after the parser's 400 costs instead. No header is at stake there, and the
+#: step is simply skipped.
 _DESYNC_RISK = (
-    "an answer the app writes after the parser's 400 may go out behind it, a second response "
-    "on a connection the 400 marked for close"
+    "the step was skipped, so an answer the app writes after the parser's 400 may go out behind "
+    "it, a second response on a connection the 400 marked for close"
 )
 #: What a failed close after a failed 400 writer costs.
-_LEFT_OPEN = "the connection may stay open with no answer and nothing to close it"
+_LEFT_OPEN = (
+    "the close was skipped, so the connection may stay open with no answer and nothing to close it"
+)
 
 
 def _degraded(
@@ -220,8 +224,7 @@ def _degraded(
         return
     _WARNED.add((family, step))
     _log.warning(
-        "%s: %s failed (%s); the server's own behaviour took this step over, so %s. Re-measure "
-        "the uvicorn/websockets protocol layer.",
+        "%s: %s failed (%s); %s. Re-measure the uvicorn/websockets protocol layer.",
         family,
         step,
         type(exc).__name__,

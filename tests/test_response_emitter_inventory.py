@@ -298,6 +298,16 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         "writes its own 403 and the test can read the floor's headers off it. It answers an "
         "in-memory transport and is never served.",
     ),
+    Site(
+        "messagefoundry/api/protocol_floor_selftest.py",
+        "_StandInApp.__call__",
+        "asgi-response-start",
+    ): (
+        1,
+        "The startup self-test's stand-in app sends a late answer ON PURPOSE, after the parser's "
+        "400, so the test can show nothing follows the 400. It answers an in-memory transport and "
+        "is never served.",
+    ),
     Site("messagefoundry/transports/http_listener.py", "_status_line", "status-line"): (
         1,
         "The ADR 0023 listener's one status-line writer. Its caller, build_response, emits the "
