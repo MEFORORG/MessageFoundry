@@ -1565,6 +1565,18 @@ such as a lone `all` proxy without the `[vault]` extra. Nor does it read any oth
 so it still logs when a bypass list covers every host the engine reaches. Other commands that reach
 these hops, such as `check-privileges` and `verify`, do not log this warning.
 
+**The Vault and OpenBao clients also name a proxy where they use it** (vault BACKLOG #4028). The
+start WARNING is read once, and only by `serve` and `supervise`. So on each send, after every
+refusal the client makes, the client names the proxy `requests` picked for that send, in one
+WARNING, the first time that hop is sent by way of that proxy in the process. A later proxy for the
+same hop is named again. It names the proxy by scheme, host and port, never a user or password. The
+engine gives these clients no proxy setting, so any proxy they pick came from the environment or
+the system settings. This covers every command that reaches Vault, at least `serve`, `supervise`,
+`check-privileges`, `verify` and each command that opens a store keyed from Vault, and a proxy set
+after the process started. A send that goes direct, because no proxy is set or a bypass list names
+the Vault host, logs nothing. Of the hops above, only the Vault clients name a proxy at use; the
+urllib hops still rely on the start WARNING.
+
 **Some hosts go direct.** Both families send a host on `NO_PROXY` direct. With no `*_proxy`
 environment variable holding a value, they also send a host on the Windows or macOS system bypass
 list direct. A value in any `*_proxy` variable, even `NO_PROXY`, makes both families ignore the

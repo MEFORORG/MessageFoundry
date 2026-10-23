@@ -118,6 +118,7 @@ from messagefoundry.config.tls_policy import (
     revocation_hop_disposition,
     tls_revocation_attested,
 )
+from messagefoundry.transports.ambient_proxy import disclose_vault_hop_proxy
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     EgressReplyError,
@@ -541,6 +542,8 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # Vault BACKLOG #2983: checked at construction too. This catches a proxy that appeared
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
+        # Vault BACKLOG #4028: after every refusal above, so only a send that goes ahead is named.
+        disclose_vault_hop_proxy(self._connector, proxy, logger)
         return pool
 
     def _checks_revocation(self) -> bool:

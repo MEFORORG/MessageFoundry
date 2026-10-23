@@ -13,12 +13,17 @@ extra reaches no hop, and it is still named. It makes no claim about which hop u
 what the leg to it protects. Four review rounds found that every per-hop verdict a probe produced
 could be wrong, so the per-hop facts live once, in ``docs/CONFIGURATION.md``, *``serve`` names an
 environment proxy at start*, and the warning points there.
+
+**The Vault hop also discloses at the point of use (vault BACKLOG #4028):** see
+:func:`disclose_vault_hop_proxy`. Why, and what it covers, is in the same
+``docs/CONFIGURATION.md`` section.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
@@ -27,7 +32,12 @@ from typing import Any
 # _peer_label: the one secret-safe address parser, so a proxy URL is read the same way everywhere.
 from messagefoundry.config.wiring import _split_address
 
-__all__ = ["ambient_proxy_warning", "environment_proxy_hosts", "warn_ambient_proxy"]
+__all__ = [
+    "ambient_proxy_warning",
+    "disclose_vault_hop_proxy",
+    "environment_proxy_hosts",
+    "warn_ambient_proxy",
+]
 
 #: The ``getproxies()`` keys an engine HTTP hop can read: urllib reads a target's own scheme, and
 #: requests reads that or ``all``. Any other key, such as ``ftp`` or ``socks``, is not disclosed.
@@ -47,15 +57,19 @@ _POINTER = (
     "Per-hop detail, including which hosts go direct, is in docs/CONFIGURATION.md, [egress], "
     '"serve names an environment proxy at start". '
 )
+#: How to take the environment proxy away, shared by the start warning and the Vault hop's.
+_CLEAR = (
+    "clear http_proxy, https_proxy and all_proxy in either case, and the system proxy, for the "
+    "account the engine runs as"
+)
 _REMEDY = (
-    "To stop it, clear http_proxy, https_proxy and all_proxy in either case, and the system "
-    "proxy, for the account the engine runs as. Setting [egress].proxy_url to an address changes "
+    f"To stop it, {_CLEAR}. Setting [egress].proxy_url to an address changes "
     "only the HTTP-family connections and their token requests. Every other hop is unchanged, "
     "and this warning still logs, since it reads only the environment. "
 )
 
 
-#: Shared by the warning and its fallback, so one search finds both.
+#: Shared by the warning, its fallback and the Vault hop's, so one search finds all three.
 _OPENING = "a web proxy from the environment or the system proxy settings"
 
 
@@ -180,3 +194,38 @@ def warn_ambient_proxy(logger: logging.Logger) -> None:
         return
     if text is not None:
         logger.warning("%s", text)
+
+
+#: The (hop, proxy label) pairs this process has disclosed, so a hop that sends once per stored
+#: cell logs once per proxy rather than once per send. A label, never the raw URL, so the set holds
+#: no proxy credential.
+_VAULT_DISCLOSED: set[tuple[str, str]] = set()
+_VAULT_DISCLOSED_LOCK = threading.Lock()
+
+
+def disclose_vault_hop_proxy(connector: str, proxy: str | None, logger: logging.Logger) -> None:
+    """Log one WARNING the first time this process sends ``connector``'s Vault request by way of
+    ``proxy``, the URL ``requests.utils.select_proxy`` returned for the send. No proxy logs
+    nothing. ``docs/CONFIGURATION.md``, in the section :data:`_POINTER` names, says why.
+
+    The Vault clients take no proxy setting: the engine passes ``hvac`` no ``proxies`` and sets
+    none on the session, so the proxy came from the environment or the system settings, which is
+    what the WARNING says. It is named by :func:`_label`, which never carries a user or password
+    and never raises, so neither does this. A new proxy for the same hop is named again."""
+    if not proxy:
+        return
+    label = _label(proxy)
+    with _VAULT_DISCLOSED_LOCK:
+        if (connector, label) in _VAULT_DISCLOSED:
+            return
+        _VAULT_DISCLOSED.add((connector, label))
+    logger.warning(
+        "%s: %s was picked for a request to Vault: %s. No engine setting names it. This logs once "
+        "per proxy for this hop in this process. To send this hop direct, add the Vault host to "
+        "no_proxy, or %s. %s(vault BACKLOG #4028)",
+        connector,
+        _OPENING,
+        label,
+        _CLEAR,
+        _POINTER,
+    )
