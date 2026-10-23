@@ -180,6 +180,9 @@ _DANGEROUS_ROW_KEYS: dict[str, str] = {
     # checkout, so these tests skip here and in CI) and its 15.1.5 row must be rewritten to match.
     "**Sandbox IPC deserialization**": "_sandbox_codec",
     "**Other subprocess invocations**": "shell=False",
+    # The cipher-policy probe got a row of its own on 2026-10-23 (vault BACKLOG #3804 V1). Its one
+    # anchor, shell=False, is carried by other 15.1.5 rows too, so a key pins it by its own label.
+    "**Cipher-policy probe**": "shell=False",
     # This row had no anchor and no key, so deleting it failed no test (BACKLOG #3048). A key pins it
     # by its own label, which a bare `os.startfile` anchor would not once another row names that call.
     "**Tray opens through the Windows file-type association**": "os.startfile",
@@ -1659,7 +1662,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         # row, which carries other bounds, and a bare "30 s" is also inside "130 s" or "330 s"
         # (vault BACKLOG #3804 item 5).
         (
-            "**Other subprocess invocations**",
+            "**Cipher-policy probe**",
             cipher_policy._PROBE_TIMEOUT_S,
             f"each cipher-policy probe {cipher_policy._PROBE_TIMEOUT_S:g} s",
         ),
