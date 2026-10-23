@@ -152,8 +152,18 @@ client request first, so its parser decides for the whole chain. The engine's ow
 only the hop it can see, and it cannot see what your proxy accepted from the client.
 
 The engine API parses requests with llhttp, through `httptools`, which `serve` pins (BACKLOG
-#1125). That parser refuses at least the shapes below, each with one `400`, and the engine closes
-the connection before any engine code runs. llhttp refuses more than this table lists, so treat it
+#1125). That parser refuses at least the shapes below with a `400`, and the engine closes the
+connection. For most shapes llhttp refuses the request head before any engine code runs, so the
+`400` is the only response.
+
+The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
+once its head is read, and it answers any chunked body with `411` from the head alone. When the bad
+body arrives in the same read as the head, the engine writes only the `400`, and nothing after it.
+When the head arrives first and the bad body later, the engine can send its `411` and then the
+`400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
+sends one `Content-Length` never forwards a chunked body.
+
+llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
 socket, and its `_REFUSED` table holds the exact bytes.
 
@@ -191,9 +201,10 @@ Your proxy must also meet at least these four rules.
    (`underscores_in_headers off`).
 
 **Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
-proxy with a second request appended, as that test does. The client must get exactly one response,
+proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
 an error, and the appended request must never be answered. Two responses mean the proxy and the
-engine framed the bytes differently. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
+engine framed the bytes differently. For the two chunk shapes, a `411` then a `400` instead means
+the proxy forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
 [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md#option-b--tls-terminated-upstream-reverse-proxy--load-balancer))
 needs the same check.
 
