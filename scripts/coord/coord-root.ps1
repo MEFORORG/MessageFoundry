@@ -342,18 +342,27 @@ function ConvertTo-CoordFullPath {
 function Move-CoordFileReplace {
     # Renames $Source onto $Destination in one step, retrying a sharing violation or access denied.
     # -NoOverwrite keeps an existing destination and throws IOException, which is never retried.
-    # A read-only destination is replaced, as `Move-Item -Force` replaced it: File.Move refuses one.
+    # A read-only destination is refused at once with UnauthorizedAccessException, as File.Move refuses
+    # it, and is left as it was: the mark is not transient, so it is checked before any retry.
+    # -ReplaceReadOnly replaces it instead, as `Move-Item -Force` did, for the writers that used that.
     # If that replace still fails, the read-only mark is put back.
-    param([string]$Source, [string]$Destination, [switch]$NoOverwrite)
+    param([string]$Source, [string]$Destination, [switch]$NoOverwrite, [switch]$ReplaceReadOnly)
     $src = ConvertTo-CoordFullPath $Source
     $dst = ConvertTo-CoordFullPath $Destination
     $overwrite = -not $NoOverwrite
+    if ($overwrite -and -not $ReplaceReadOnly) {
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
+        if ($null -ne $attrs -and ($attrs -band [System.IO.FileAttributes]::ReadOnly)) {
+            throw [System.UnauthorizedAccessException]::new("$dst is read-only, so it was not replaced.")
+        }
+    }
     try {
         Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
     } catch [System.UnauthorizedAccessException] {
         $attrs = $null
         try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
-        if (-not $overwrite -or $null -eq $attrs -or -not ($attrs -band [System.IO.FileAttributes]::ReadOnly)) { throw }
+        if (-not ($overwrite -and $ReplaceReadOnly) -or $null -eq $attrs -or -not ($attrs -band [System.IO.FileAttributes]::ReadOnly)) { throw }
         [System.IO.File]::SetAttributes($dst, $attrs -band -bnot [System.IO.FileAttributes]::ReadOnly)
         try {
             Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $true) }

@@ -255,7 +255,7 @@ $r | ConvertTo-Json -Compress
     assert json.loads(out["helper"]) == {"v": "old"}, out
 
 
-def test_a_read_only_destination_is_replaced_as_move_item_did(tmp_path: Path) -> None:
+def _move_onto_read_only(tmp_path: Path, flags: str) -> tuple[dict[str, Any], Path, Path]:
     dst = tmp_path / "rec.json"
     dst.write_text('{"v": "old"}', encoding="utf-8")
     src = tmp_path / "rec.tmp"
@@ -263,13 +263,38 @@ def test_a_read_only_destination_is_replaced_as_move_item_did(tmp_path: Path) ->
     out = _ps(
         f"""
 [System.IO.File]::SetAttributes('{dst}', 'ReadOnly')
-$r = [ordered]@{{}}
-try {{ Move-CoordFileReplace -Source '{src}' -Destination '{dst}'; $r.ok = $true }} catch {{ $r.ok = "$_" }}
+$r = [ordered]@{{ ok = $false; type = $null; ms = 0 }}
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ Move-CoordFileReplace -Source '{src}' -Destination '{dst}' {flags}; $r.ok = $true }}
+catch {{ $r.type = (Get-CoordInnerException $_.Exception).GetType().FullName }}
+$r.ms = $sw.ElapsedMilliseconds
+$r.readOnly = [bool]([System.IO.File]::GetAttributes('{dst}') -band [System.IO.FileAttributes]::ReadOnly)
+[System.IO.File]::SetAttributes('{dst}', 'Normal')
 $r | ConvertTo-Json -Compress
 """
     )
+    return out, dst, src
+
+
+def test_a_read_only_destination_is_refused_at_once(tmp_path: Path) -> None:
+    # File.Move refuses a read-only destination, which handoff.ps1 -Replace and the claim refresh
+    # relied on before the helper. The helper refuses it too, before any retry: a read-only mark is
+    # not a transient error, so 8 tries over about 1.1 s would only delay the same answer.
+    out, dst, src = _move_onto_read_only(tmp_path, "")
+    assert out["ok"] is False, out
+    assert out["type"] == "System.UnauthorizedAccessException", out
+    assert out["ms"] < 400, f"a read-only destination was retried: {out}"
+    assert out["readOnly"] is True, out
+    assert json.loads(dst.read_text(encoding="utf-8")) == {"v": "old"}
+    assert src.exists()
+
+
+def test_replace_read_only_replaces_as_move_item_did(tmp_path: Path) -> None:
+    # The opt-in for lane.ps1 and seat.ps1, whose old `Move-Item -Force` replaced a read-only file.
+    out, dst, src = _move_onto_read_only(tmp_path, "-ReplaceReadOnly")
     assert out["ok"] is True, out
     assert json.loads(dst.read_text(encoding="utf-8")) == {"v": "new"}
+    assert not src.exists()
 
 
 def test_an_empty_file_reads_as_nothing_like_get_content(tmp_path: Path) -> None:
