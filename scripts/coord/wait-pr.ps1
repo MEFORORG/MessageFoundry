@@ -90,10 +90,11 @@
     count, so a question posted before the wait started is still found. -FromStart beside
     -AfterCommentId is exit 1, and -AfterCommentId starts at 1, so a $null or '' from a caller whose
     parse failed is refused rather than read as "every comment". ALWAYS wait again from what the
-    last wait printed: exit 0 prints the met line's `id=`; exit 2, and exit 1 after three transient
-    failures in a row or on a spent rate budget (which GitHub resets), print a `resume:` line naming
-    this wait's own bar, or -FromStart when the bar is 0. Every other exit 1, such as bad arguments,
-    a PR with no author login or the page cap, is permanent and prints no resume line. A wait with neither option takes
+    last wait printed: exit 0 prints the met line's `id=`; exit 2, and an exit 1 that waiting may
+    clear, print a `resume:` line naming this wait's own bar, or -FromStart when the bar is 0. Those
+    exits 1 are at least three transient failures in a row, a spent rate budget mid-wait and a
+    budget below the starting floor, both of which GitHub resets. At least bad arguments, a PR with
+    no author login and the page cap are permanent and print no resume line. A wait with neither option takes
     the newest comment at its own start as the bar, so it skips every comment posted before it
     started, including those since the last wait's final read. LIMIT: delivery rests on the bar, and
     only a met line moves it, to the id it reports. A comment read above the bar but not reported is
@@ -451,7 +452,7 @@ function Test-Merged($p) {
 # missing value are GitHub still computing, so they neither count nor reset. The header says why
 # `behind` resets rather than counts.
 function Measure-DirtyReads([string]$State, [string]$Mergeable, [string]$Key) {
-    if (-not [string]::Equals($Key, $script:DirtyKey, [System.StringComparison]::Ordinal)) {
+    if ($null -eq $script:DirtyKey -or -not [string]::Equals($Key, $script:DirtyKey, [System.StringComparison]::Ordinal)) {
         $script:DirtyKey = $Key
         $script:DirtyReads = 0
     }
@@ -561,7 +562,10 @@ function Read-Pages([string]$Path) {
 function Test-Pr {
     $p = Get-Rest "repos/$Repo/pulls/$Pr"
     $prBase = [string]$p.base.ref
-    if ($Until -eq 'checks-complete' -and -not [string]::Equals($prBase, $script:Base, [System.StringComparison]::Ordinal)) {
+    # The $null test first: a $null passed to a [string] parameter arrives as '', so an empty base
+    # would otherwise equal "never read" and skip the required set.
+    if ($Until -eq 'checks-complete' -and
+        ($null -eq $script:Base -or -not [string]::Equals($prBase, $script:Base, [System.StringComparison]::Ordinal))) {
         # The base moves only once the read has finished, so a read cut short is read again.
         $script:Required = @(Read-Required $prBase)
         $script:Base = $prBase
@@ -704,6 +708,9 @@ try {
     $limit = Get-Rest 'rate_limit' -Free
     $remaining = [int]$limit.resources.core.remaining
     if ($remaining -lt $RateFloor) {
+        # As recoverable as a spent budget, so a given bar must survive this exit too.
+        $resume = Get-Resume
+        if ($resume) { Say $resume }
         Fail "refusing to start: $remaining core requests remain, below the floor of $RateFloor that every seat shares."
     }
     Say "waiting until $Until, every $IntervalSeconds s for at most $MaxMinutes min ($remaining core requests remain)"
@@ -727,7 +734,7 @@ try {
         } catch [TransientReadException] {
             $transients++
             if ($transients -ge 3) {
-                # Only this exit 1 may be worth waiting again after; the others are permanent.
+                # A run of transient failures may clear, so the comment bar must survive this exit.
                 $resume = Get-Resume
                 if ($resume) { Say $resume }
                 Fail "three transient failures in a row, the last: $($_.Exception.Message)"
