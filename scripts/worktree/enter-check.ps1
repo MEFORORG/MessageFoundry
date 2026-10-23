@@ -125,24 +125,33 @@ $failures = [System.Collections.Generic.List[string]]::new()
 $passed = [System.Collections.Generic.HashSet[string]]::new()
 function Add-Failure([string]$Check, [string]$Why) { $failures.Add("$Check. $Why") }
 
-# A git child inherits none of this process's git variables. GIT_DIR and its kin would redirect
-# `git -C` at another repository than the one named. GIT_EXEC_PATH, GIT_SSH_COMMAND, GIT_TRACE*,
-# GIT_SSL_NO_VERIFY and GIT_SSL_CAINFO would choose what runs, where output goes, or which server is
-# trusted. So every GIT_* name goes. So do the CA-bundle names libcurl and OpenSSL read: they are
-# not GIT_* but pick the trusted roots all the same. The proxy names stay. A proxy carries the
+# A git child inherits none of this process's git variables but three. GIT_DIR and its kin would
+# redirect `git -C` at another repository than the one named. GIT_EXEC_PATH, GIT_SSH_COMMAND,
+# GIT_TRACE*, GIT_SSL_NO_VERIFY and GIT_SSL_CAINFO would choose what runs, where output goes, or
+# which server is trusted. So every GIT_* name goes, except the three that say where this
+# machine's own config lives: a `safe.directory` there is what lets git read a clone at all.
+# The remote read overrides two of them with its isolated config, and GIT_CONFIG_NOSYSTEM=1 makes
+# the third moot. The OpenSSL names go as well: they are not GIT_* but pick the trusted roots, the
+# config or the loadable modules all the same. CURL_CA_BUNDLE is read by the curl tool, not by
+# libcurl, and goes anyway because it costs nothing. The proxy names stay. A proxy carries the
 # remote read's TLS but cannot forge it while verification holds, and a machine behind one could
 # not reach the remote at all without them.
-$caEnvStrip = @('SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE')
+$gitEnvKeep = @('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM')
+$caEnvStrip = @('SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES')
 # Set on every git child. Without it, a promisor remote written into the clone's shared config
 # would let a lookup of a missing object (f's cat-file and merge-base) fetch it, and that fetch
-# runs the remote's upload-pack, a command any session can choose.
+# runs the remote's upload-pack, a command any session can choose. Git before 2.44 ignores the
+# variable, so the `--no-lazy-fetch` option goes on every argv too: an older git rejects it and
+# exits non-zero, and the check fails closed.
 $gitEnvSet = @{ GIT_NO_LAZY_FETCH = '1' }
 
 function Start-Child {
-    # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
-    param([string]$Exe, [string[]]$ArgList, [switch]$StripGit, [string]$StdinText, [hashtable]$SetEnv)
+    # A git child, the only kind this script starts, with argv passed as a list (no quoting to
+    # get wrong) and UTF-8 output. The hardening is unconditional, so no call can skip it.
+    param([string]$Exe, [string[]]$ArgList, [string]$StdinText, [hashtable]$SetEnv)
     if ((Get-BudgetLeftMs) -le 0) { throw "$Exe was not started: $budgetSpent" }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
+    $psi.ArgumentList.Add('--no-lazy-fetch')
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -151,11 +160,10 @@ function Start-Child {
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
-    if ($StripGit) {
-        $names = @($psi.Environment.Keys | Where-Object { $_.StartsWith('GIT_', [System.StringComparison]::OrdinalIgnoreCase) -or $_ -in $caEnvStrip })
-        foreach ($v in $names) { [void]$psi.Environment.Remove($v) }
-        foreach ($k in $gitEnvSet.Keys) { $psi.Environment[$k] = $gitEnvSet[$k] }
-    }
+    $names = @($psi.Environment.Keys | Where-Object {
+            ($_.StartsWith('GIT_', [System.StringComparison]::OrdinalIgnoreCase) -and $_ -notin $gitEnvKeep) -or $_ -in $caEnvStrip })
+    foreach ($v in $names) { [void]$psi.Environment.Remove($v) }
+    foreach ($k in $gitEnvSet.Keys) { $psi.Environment[$k] = $gitEnvSet[$k] }
     if ($SetEnv) { foreach ($k in $SetEnv.Keys) { $psi.Environment[$k] = [string]$SetEnv[$k] } }
     $p = [System.Diagnostics.Process]::Start($psi)
     # Readers first, so a child that answers as it reads cannot fill its pipe and stall the write.
@@ -214,7 +222,7 @@ function Invoke-Git([string]$Repo, [string[]]$GitArgs, [string]$StdinText, [int]
     # The untracked cache sits in the index, which the worktree's owner writes.
     $argv = @('-C', $Repo, '--no-replace-objects', '-c', 'core.commitGraph=false', '-c', 'core.untrackedCache=false',
         '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=off', '--no-optional-locks') + $GitArgs
-    Wait-Child (Start-Child -Exe $gitExe -StripGit -ArgList $argv -StdinText $StdinText) -TimeoutSeconds $TimeoutSeconds
+    Wait-Child (Start-Child -Exe $gitExe -ArgList $argv -StdinText $StdinText) -TimeoutSeconds $TimeoutSeconds
 }
 
 function Get-RemoteMain([string]$Url, [int]$TimeoutSeconds) {
@@ -230,7 +238,7 @@ function Get-RemoteMain([string]$Url, [int]$TimeoutSeconds) {
         GCM_INTERACTIVE     = 'never'
     }
     $argv = @('-c', 'credential.helper=', '-c', 'credential.helper=manager', 'ls-remote', '--exit-code', $Url, 'refs/heads/main')
-    $ls = Wait-Child (Start-Child -Exe $gitExe -StripGit -SetEnv $isolated -ArgList $argv) -TimeoutSeconds $TimeoutSeconds
+    $ls = Wait-Child (Start-Child -Exe $gitExe -SetEnv $isolated -ArgList $argv) -TimeoutSeconds $TimeoutSeconds
     if ($ls.Code -ne 0) { throw "git ls-remote of the pinned remote failed (exit $($ls.Code))" }
     $ids = @($ls.Out.Split("`n") | Where-Object { $_ -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})\trefs/heads/main$' } | ForEach-Object { $_.Split("`t")[0] })
     if ($ids.Count -ne 1) { throw 'the remote names no single main commit' }
@@ -570,7 +578,9 @@ try {
             foreach ($e in $tree.Out.Split([char]0, [System.StringSplitOptions]::RemoveEmptyEntries)) {
                 $meta, $p = $e -split "`t", 2
                 $mode, $type, $id = $meta.Split(' ')
-                if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains("`n")) { $odd++; continue }
+                # hash-object --stdin-paths reads a line: it unquotes one that starts with `"` and
+                # may drop a trailing CR, so either would hash another file than the one tracked.
+                if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains("`n") -or $p.Contains("`r") -or $p.StartsWith('"')) { $odd++; continue }
                 $paths.Add($p); $blobs.Add($id)
             }
             # A filter, ident or working-tree-encoding attribute converts content between disk and

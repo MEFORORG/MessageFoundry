@@ -798,6 +798,105 @@ def test_the_parent_s_git_variables_do_not_reach_a_git_child(fleet: Fleet, tmp_p
     assert not trace.exists()
 
 
+def test_every_git_child_gets_the_hardened_environment_and_argv(
+    fleet: Fleet, tmp_path: Path
+) -> None:
+    """A stand-in git first on PATH records what each child the check starts actually receives."""
+    fake = tmp_path / "fake-git"
+    fake.mkdir()
+    dump = tmp_path / "child-env.txt"
+    argv = tmp_path / "child-argv.txt"
+    if os.name == "nt":
+        (fake / "git.cmd").write_text(
+            f'@echo off\r\nset > "{dump}"\r\necho %* >> "{argv}"\r\nexit /b 1\r\n', encoding="ascii"
+        )
+    else:
+        script = fake / "git"
+        script.write_text(
+            f"#!/bin/sh\nenv > '{dump}'\nprintf '%s\\n' \"$*\" >> '{argv}'\nexit 1\n",
+            encoding="ascii",
+        )
+        script.chmod(0o755)
+    planted = {
+        "PATH": str(fake) + os.pathsep + fleet.sb.env()["PATH"],
+        # Positive control: a name the check leaves alone must reach the child.
+        "ENTER_CHECK_PROBE": "inherited",
+        "SSL_CERT_FILE": str(tmp_path / "no-ca.pem"),
+        "SSL_CERT_DIR": str(tmp_path / "no-ca"),
+        "OPENSSL_CONF": str(tmp_path / "no-openssl.cnf"),
+        "OPENSSL_MODULES": str(tmp_path / "no-modules"),
+        "OPENSSL_ENGINES": str(tmp_path / "no-engines"),
+        "CURL_CA_BUNDLE": str(tmp_path / "no-bundle.pem"),
+        "GIT_SSL_NO_VERIFY": "1",
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "own-global.gitconfig"),
+    }
+    proc = fleet.check(fleet.scratch() / "w", env=planted)
+    # The stand-in fails every call, so the verdict fails closed.
+    assert _verdict(proc) == "UNSAFE", (proc.stdout, proc.stderr)
+    assert dump.exists() and argv.exists(), (
+        "the stand-in git never ran, so this test proves nothing"
+    )
+    names = {
+        line.split("=", 1)[0].upper(): line.split("=", 1)[1]
+        for line in dump.read_text(encoding="utf-8", errors="replace").splitlines()
+        if "=" in line
+    }
+    assert names.get("ENTER_CHECK_PROBE") == "inherited", sorted(names)
+    for gone in (
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        "OPENSSL_ENGINES",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_NO_VERIFY",
+    ):
+        assert gone not in names, gone
+    # Where this machine's own config lives is kept, so its safe.directory still applies.
+    assert names.get("GIT_CONFIG_GLOBAL") == planted["GIT_CONFIG_GLOBAL"], sorted(names)
+    assert names.get("GIT_NO_LAZY_FETCH") == "1", sorted(names)
+    calls = [
+        ln for ln in argv.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()
+    ]
+    assert calls and all(ln.split()[0] == "--no-lazy-fetch" for ln in calls), calls
+
+
+@pytest.mark.parametrize("name", ['"quoted.txt', "carriage\rreturn.txt"])
+def test_a_tracked_path_hash_object_would_misread_is_unreadable(fleet: Fleet, name: str) -> None:
+    """hash-object --stdin-paths unquotes a leading quote and may drop a CR, so neither reaches it.
+    Neither name can exist on NTFS, so the tree is built without a checkout."""
+
+    def plumb(*args: str, stdin: str = "") -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(fleet.engine), *args],
+            input=stdin,
+            env=_plain_git_env(
+                GIT_AUTHOR_NAME="t",
+                GIT_AUTHOR_EMAIL="t@example.invalid",
+                GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@example.invalid",
+            ),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, (args, proc.stdout, proc.stderr)
+        return proc.stdout.strip()
+
+    blob = plumb("hash-object", "-w", "--stdin", stdin="x\n")
+    tree = plumb("mktree", "-z", stdin=f"100644 blob {blob}\t{name}\0")
+    commit = plumb("commit-tree", tree, "-p", "origin/main", "-m", "odd path")
+    plumb("push", "-q", "origin", f"{commit}:refs/heads/main")
+    plumb("fetch", "-q", "origin")
+    wt = fleet.scratch() / "odd"
+    plumb("worktree", "add", "-q", "--no-checkout", "--detach", str(wt), "origin/main")
+    proc = fleet.check(wt)
+    assert_unsafe(proc, "f")
+    assert "1 symlink, submodule or unreadable entries" in proc.stdout, proc.stdout
+
+
 # ---------------------------------------------------------------- the local OFF file
 
 
