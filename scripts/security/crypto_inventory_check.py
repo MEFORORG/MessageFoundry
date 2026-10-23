@@ -2648,7 +2648,7 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "scripts/worktree/install-gate.ps1": frozenset({"hash:SHA256"}),
     # A stable identifier for a lane, from its sorted member keys.
     "scripts/coord/lane.ps1": frozenset({"hash:SHA256"}),
-    # A mailbox key from a normalized worktree path.
+    # A mailbox key from the host and a normalized worktree path, plus the old path-only key.
     "scripts/coord/mail-key.ps1": frozenset({"hash:SHA256"}),
     # A SHA-256 of a handoff file, recorded in the seat record so a reader knows which version it saw.
     "scripts/coord/seat.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),

@@ -10,6 +10,7 @@
 
         . "$PSScriptRoot\mail-key.ps1"
         $key = ConvertTo-BoxKey -Path $cwd
+        $old = ConvertTo-LegacyBoxKey -Path $cwd   # READERS ONLY; see that function
 
     ONE COPY ON PURPOSE, for the same reason session-registry.ps1 states for the liveness fence. The
     sender (scripts/coord/mail.ps1) and the drain (scripts/hooks/mail-drain.ps1) must compute the SAME
@@ -27,8 +28,8 @@
 
     INJECTIVITY IS THE POINT OF THE HASH. A readable slug alone is not enough: two different worktree
     paths can sanitise to the same slug, and the failure mode is one worktree silently reading
-    another's mail. The hash is computed over the NORMALISED path and is what carries injectivity. The
-    slug exists only so a human can tell boxes apart in a directory listing.
+    another's mail. The hash is computed over the host and the NORMALISED path and is what carries
+    injectivity. The slug exists only so a human can tell boxes apart in a directory listing.
 
     THE MESSAGE ID IS ALSO A SHARED CONTRACT, AND IT FAILS THE SAME WAY THE BOX KEY DOES. The drain
     treats the ON-DISK NAME as the message's identity -- the JSON 'id' field inside a message is body
@@ -45,17 +46,67 @@
 #>
 
 function ConvertTo-BoxKey {
+    # THE KEY HASHES THE HOST AS WELL AS THE PATH (docs/COORD-SHARED-ROOT.md, migration step 4). On a
+    # shared root two PCs can each hold a worktree at the same path, and a path-only key gave them one
+    # seat id, one mailbox and one lane file. The hash input is '<HOST>|<normalised path>', with the
+    # host upper-cased because Windows machine names are case-insensitive. The slug is unchanged, so
+    # a directory listing still reads the same.
+    #
+    # -HostName exists for a reader that must name ANOTHER PC's box, and for tests. A writer passes
+    # nothing and gets this machine.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [string]$HostName)
+    if (-not $HostName -or -not $HostName.Trim()) { $HostName = Get-BoxKeyHost }
+    $norm = ConvertTo-BoxKeyPath -Path $Path
+    return (Format-BoxKey -Norm $norm -HashInput ($HostName.Trim().ToUpperInvariant() + '|' + $norm))
+}
+
+function ConvertTo-LegacyBoxKey {
+    # THE PATH-ONLY KEY, FOR READING ONLY. Every seat record, mailbox, lane file, handoff directory and
+    # writer-alive heartbeat written before the host joined the key sits under this name. A reader
+    # looks here too so nothing already written goes unread; NO WRITER MAY CALL THIS. A new record
+    # under the legacy key is the collision step 4 removed. This is the one definition of the old key.
+    #
+    # THE LEGACY BOX IS SHARED BY EVERY PC AT THIS PATH, so a record read from it is judged by its
+    # `host` field (Test-CoordRecordIsHere) before it is taken as this machine's.
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
+    $norm = ConvertTo-BoxKeyPath -Path $Path
+    return (Format-BoxKey -Norm $norm -HashInput $norm)
+}
 
-    $norm = $Path.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
+# Set at load so a StrictMode caller can read it before the first load below.
+$script:BoxKeyHostLoaded = $null
 
+function Get-BoxKeyHost {
+    # coord-root.ps1's Get-CoordHost, the one host rule. A caller that dot-sourced this file alone
+    # gets it loaded from beside this file, and THROWS when it is missing rather than hashing a host
+    # from a second copy of the rule that could drift from the one the other end uses.
+    if (Get-Command Get-CoordHost -ErrorAction SilentlyContinue) { return [string](Get-CoordHost) }
+    # Loaded here, the definitions leave scope on return, so the answer is kept for the next call.
+    if ($script:BoxKeyHostLoaded) { return $script:BoxKeyHostLoaded }
+    $lib = Join-Path $PSScriptRoot 'coord-root.ps1'
+    if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
+        throw "mail-key.ps1: $lib is missing, so this machine's host cannot be named for a box key"
+    }
+    . $lib
+    $script:BoxKeyHostLoaded = [string](Get-CoordHost)
+    return $script:BoxKeyHostLoaded
+}
+
+function ConvertTo-BoxKeyPath {
+    param([Parameter(Mandatory)][string]$Path)
+    return ($Path.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\')
+}
+
+function Format-BoxKey {
+    param([Parameter(Mandatory)][string]$Norm, [Parameter(Mandatory)][string]$HashInput)
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($norm)) }
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($HashInput)) }
     finally { $sha.Dispose() }
     $short = -join ($bytes[0..3] | ForEach-Object { $_.ToString('x2') })
 
-    $slug = (Split-Path $norm -Leaf) -replace '[^a-zA-Z0-9._-]', '-'
+    $slug = (Split-Path $Norm -Leaf) -replace '[^a-zA-Z0-9._-]', '-'
     if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40) }
     if (-not $slug) { $slug = 'root' }
 

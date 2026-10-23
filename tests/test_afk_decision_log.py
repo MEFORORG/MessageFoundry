@@ -9,7 +9,9 @@ repository, so the vault it writes is a JSON file and the spool is the sandbox's
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -203,23 +205,210 @@ def test_list_says_incomplete_when_the_vault_cannot_be_read(sb: Sandbox) -> None
     assert "[spooled, not posted]" in proc.stdout
 
 
+LOG_NO_SEAT = ("-Log", "-Item", "1", "-Class", "B", "-Recommendation", "x", "-NoPost")
+SID = "sess-test-0001"
+
+
+def _box_keys(sb: Sandbox) -> tuple[str, str]:
+    """This sandbox worktree's (host-keyed, legacy path-only) seat box keys, from mail-key.ps1."""
+    script = (
+        ". ./scripts/coord/mail-key.ps1; . ./scripts/coord/coord-root.ps1; "
+        "$wt = (Resolve-Path -LiteralPath (git rev-parse --show-toplevel)).Path; "
+        "ConvertTo-BoxKey -Path $wt; ConvertTo-LegacyBoxKey -Path $wt"
+    )
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        cwd=str(sb.repo),
+        capture_output=True,
+        text=True,
+        timeout=GUARDED_TIMEOUT_S,
+        check=True,
+    ).stdout.split()
+    assert len(out) == 2, out
+    return out[0], out[1]
+
+
+def _seat_file(seats: Path, box: str, rec: dict[str, Any] | str, sid: str = SID) -> None:
+    (seats / box).mkdir(parents=True, exist_ok=True)
+    body = rec if isinstance(rec, str) else json.dumps(rec)
+    (seats / box / f"{sid}.json").write_text(body, encoding="utf-8")
+
+
+def _logged_seat(sb: Sandbox, **extra: str) -> str:
+    proc = sb.run(DECISION, *LOG_NO_SEAT, **extra)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    return str(_list(sb)[0]["seat"])
+
+
 def test_the_seat_defaults_to_the_sessions_declared_seat(sb: Sandbox) -> None:
-    box = sb.coord / "seats" / "box1"
-    box.mkdir(parents=True)
-    (box / "sess-test-0001.json").write_text(json.dumps({"seat": "builder"}), encoding="utf-8")
-    args = ("-Log", "-Item", "1", "-Class", "B", "-Recommendation", "x", "-NoPost")
-    assert sb.run(DECISION, *args).returncode == 0
-    assert _list(sb)[0]["seat"] == "builder"
+    hosted, _ = _box_keys(sb)
+    _seat_file(sb.coord / "seats", hosted, {"seat": "builder"})
+    assert _logged_seat(sb) == "builder"
+
+
+def test_the_newer_of_the_two_boxes_names_the_seat(sb: Sandbox) -> None:
+    """A session that declared before the host joined the box key keeps a record under the
+    path-only key (docs/COORD-SHARED-ROOT.md, step 4). Whichever of this worktree's two records
+    was written last names the seat, as seat.ps1 picks its prior.
+
+    Both directions run in ONE sandbox, so the two box names and their listing order are the same
+    for both. A lookup that takes whichever box it meets first returns the same box twice and
+    fails one direction, whatever order the file system lists them in."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    old = {"asOf": "2026-10-20T08:00:00Z", "writes": 9, "seatSource": "declared"}
+    new = {"asOf": "2026-10-22T08:00:00Z", "writes": 2, "seatSource": "declared"}
+    got: dict[str, str] = {}
+    for item, newer in (("101", "hosted"), ("102", "legacy")):
+        _seat_file(seats, hosted, {**(new if newer == "hosted" else old), "seat": "hosted-seat"})
+        _seat_file(seats, legacy, {**(new if newer == "legacy" else old), "seat": "legacy-seat"})
+        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        proc = sb.run(DECISION, *args)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        got[newer] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
+    assert got == {"hosted": "hosted-seat", "legacy": "legacy-seat"}
+
+
+def test_a_declared_seat_beats_a_newer_derived_one(sb: Sandbox) -> None:
+    """seat.ps1's rule: declared wins, and a derived seat fills only a vacuum."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    old = {"seat": "builder", "seatSource": "declared", "asOf": "2026-10-20T08:00:00Z"}
+    new = {"seat": "manager", "seatSource": "derived:caller", "asOf": "2026-10-22T08:00:00Z"}
+    _seat_file(seats, legacy, old)
+    _seat_file(seats, hosted, new)
+    assert _logged_seat(sb) == "builder"
+
+
+def test_only_this_worktrees_boxes_on_this_host_are_read(sb: Sandbox) -> None:
+    """A legacy record stamped by another PC, and the same session id in another worktree's box,
+    are not this seat, however new they are."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    newest = "2026-10-23T08:00:00Z"
+    _seat_file(seats, hosted, {"seat": "manager", "asOf": "2026-10-20T08:00:00Z"})
+    _seat_file(seats, legacy, {"seat": "other-pc", "host": "OTHER-PC", "asOf": newest})
+    _seat_file(seats, "aaa-elsewhere-0000", {"seat": "elsewhere", "asOf": newest})
+    _seat_file(seats, "zzz-elsewhere-ffff", {"seat": "elsewhere", "asOf": newest})
+    assert _logged_seat(sb) == "manager"
+
+
+def test_a_bad_sort_key_does_not_drop_the_seat(sb: Sandbox) -> None:
+    hosted, _ = _box_keys(sb)
+    _seat_file(sb.coord / "seats", hosted, {"seat": "lander", "asOf": "not a date", "writes": "x"})
+    assert _logged_seat(sb) == "lander"
+
+
+def test_an_unreadable_box_beside_a_readable_one_still_names_the_seat(sb: Sandbox) -> None:
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    _seat_file(seats, hosted, "{not json")
+    _seat_file(seats, legacy, {"seat": "builder", "asOf": "2026-10-20T08:00:00Z"})
+    assert _logged_seat(sb) == "builder"
+
+
+def test_an_offsetless_asof_is_read_as_utc(sb: Sandbox) -> None:
+    """An asOf with no offset is UTC, never local time. Read as local, 08:00 on a PC behind UTC
+    would outrank 09:00Z. This proves nothing on a PC at UTC or ahead of it."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    _seat_file(seats, hosted, {"seat": "naive", "asOf": "2026-10-22T08:00:00"})
+    _seat_file(seats, legacy, {"seat": "zulu", "asOf": "2026-10-22T09:00:00Z"})
+    assert _logged_seat(sb) == "zulu"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shared-root probe is exercised on Windows")
+def test_the_seat_is_read_from_the_shared_root_seat_ps1_writes(sb: Sandbox, tmp_path: Path) -> None:
+    """seats/ is a shared kind: seat.ps1 writes it on the resolved shared root, so the lookup reads
+    it there too, and a stale copy on the local root is not the seat."""
+    hosted, _ = _box_keys(sb)
+    shared = tmp_path / "shared-root"
+    shared.mkdir()
+    _seat_file(shared / "seats", hosted, {"seat": "manager", "asOf": "2026-10-20T08:00:00Z"})
+    _seat_file(sb.coord / "seats", hosted, {"seat": "stale-local", "asOf": "2026-10-22T08:00:00Z"})
+    proc = sb.run(DECISION, *LOG_NO_SEAT, MEFOR_COORD_ROOT=str(shared))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert _list(sb)[0]["seat"] == "manager"
 
 
 def test_the_seat_file_is_found_by_seat_ps1s_session_key(sb: Sandbox) -> None:
     """seat.ps1 names the file by a sanitised key, so an id holding `:` is found under `-`."""
-    box = sb.coord / "seats" / "box1"
-    box.mkdir(parents=True)
-    (box / "local-a.b-c.json").write_text(json.dumps({"seat": "lander"}), encoding="utf-8")
-    args = ("-Log", "-Item", "1", "-Class", "B", "-Recommendation", "x", "-NoPost")
-    assert sb.run(DECISION, *args, CLAUDE_CODE_SESSION_ID="local:a.b-c").returncode == 0
-    assert _list(sb)[0]["seat"] == "lander"
+    hosted, _ = _box_keys(sb)
+    _seat_file(sb.coord / "seats", hosted, {"seat": "lander"}, sid="local-a.b-c")
+    assert _logged_seat(sb, CLAUDE_CODE_SESSION_ID="local:a.b-c") == "lander"
+
+
+def test_an_empty_record_skips_only_itself(sb: Sandbox) -> None:
+    """`{}` parses to an object with no properties. Under StrictMode it once threw outside the
+    per-record guard, so the valid record in the other box lost its seat too. Both directions run,
+    so whichever box is read first holds the empty record once."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    got: dict[str, str] = {}
+    for item, empty in (("201", hosted), ("202", legacy)):
+        valid = legacy if empty == hosted else hosted
+        _seat_file(seats, empty, "{}")
+        _seat_file(seats, valid, {"seat": f"valid-{item}", "asOf": "2026-10-20T08:00:00Z"})
+        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        proc = sb.run(DECISION, *args)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        got[item] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
+    assert got == {"201": "valid-201", "202": "valid-202"}
+
+
+def test_an_unreadable_record_names_no_seat_rather_than_the_older_one(sb: Sandbox) -> None:
+    """A record that exists but cannot be READ might be the newer one, so the older box's record
+    is not the seat. A directory where the file should be is an unreadable record on every OS."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    (seats / hosted / f"{SID}.json").mkdir(parents=True)
+    _seat_file(seats, legacy, {"seat": "older", "asOf": "2026-10-20T08:00:00Z"})
+    proc = sb.run(DECISION, "-Log", "-Kind", "tripwire", "-Note", "x", "-NoPost")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert _list(sb)[0]["seat"] == ""
+
+
+def test_a_host_keyed_record_naming_another_host_is_skipped(sb: Sandbox) -> None:
+    """The host-keyed box is judged by its `host` too, as lane.ps1 refuses a record at its own key
+    that names another machine: a copied or hand-made file is not this seat, however new."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    _seat_file(
+        seats, hosted, {"seat": "other-pc", "host": "OTHER-PC", "asOf": "2026-10-23T08:00:00Z"}
+    )
+    _seat_file(seats, legacy, {"seat": "manager", "asOf": "2026-10-20T08:00:00Z"})
+    assert _logged_seat(sb) == "manager"
+
+
+# TEST-NET-1 (RFC 5737): no host answers there, so a probe of it times out or fails.
+UNREACHABLE_ROOT = r"\\192.0.2.1\coord"
+
+
+def test_no_post_never_probes_or_reads_a_network_root(sb: Sandbox) -> None:
+    """-NoPost is the tripwire hook's path, and its header promises no network. The probe writes
+    coord-root-down.json when the root does not answer, so that file is the instrument. The
+    control, a -Log without -NoPost, shows the instrument sees a probe."""
+    down = sb.coord / "coord-root-down.json"
+    tripwire = ("-Log", "-Kind", "tripwire", "-Note", "x")
+    proc = sb.run(DECISION, *tripwire, "-NoPost", MEFOR_COORD_ROOT=UNREACHABLE_ROOT)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert not down.exists(), "-NoPost probed the shared root"
+    assert _list(sb)[0]["seat"] == ""
+    control = sb.run(DECISION, *tripwire, MEFOR_COORD_ROOT=UNREACHABLE_ROOT)
+    assert control.returncode == 0, (control.stdout, control.stderr)
+    assert down.exists(), "the control did not probe, so the instrument proves nothing"
+
+
+def test_the_sandbox_does_not_pass_the_coord_root_or_agent_through(
+    sb: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real MEFOR_COORD_ROOT would send a seat test to a real share, and KORUS_AGENT=codex would
+    flip it to the Codex box."""
+    monkeypatch.setenv("MEFOR_COORD_ROOT", UNREACHABLE_ROOT)
+    monkeypatch.setenv("KORUS_AGENT", "codex")
+    env = sb.env()
+    assert "MEFOR_COORD_ROOT" not in env and "KORUS_AGENT" not in env
+    assert sb.env(KORUS_AGENT="codex")["KORUS_AGENT"] == "codex", "an explicit value is kept"
 
 
 @pytest.mark.parametrize(

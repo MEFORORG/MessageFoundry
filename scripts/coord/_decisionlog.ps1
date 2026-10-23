@@ -12,7 +12,9 @@
 
     EVERY RECORD IS SPOOLED LOCALLY FIRST, under <git-common-dir>/mefor-coord/decisions/spool, and
     the spool is flushed to the vault after. So a record survives a network failure, and the
-    tripwire hook can log with no network at all (-NoPost); the next flush posts it. A reader merges
+    tripwire hook can log without posting (-NoPost); the next flush posts it. With -NoPost,
+    decision.ps1 also skips a seat registry it can tell is on a share; its header lists what it can
+    and cannot tell, and a share it cannot tell is still read. A reader merges
     the vault's records with the spool's and drops duplicates by id, so a record posted twice (a
     lost response, two flushers) reads once.
 
