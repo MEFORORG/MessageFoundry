@@ -142,16 +142,18 @@ $caEnvStrip = @('SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'OPENSSL_CONF
 # would let a lookup of a missing object (f's cat-file and merge-base) fetch it, and that fetch
 # runs the remote's upload-pack, a command any session can choose. Git before 2.44 ignores the
 # variable, so the `--no-lazy-fetch` option goes on every argv too: an older git rejects it and
-# exits non-zero, and the check fails closed.
+# exits non-zero, and the check fails closed. The one exception is the OFF file's git-dir read,
+# which reads no object: with the option there, the OFF switch could never work on an older git.
 $gitEnvSet = @{ GIT_NO_LAZY_FETCH = '1' }
 
 function Start-Child {
     # A git child, the only kind this script starts, with argv passed as a list (no quoting to
-    # get wrong) and UTF-8 output. The hardening is unconditional, so no call can skip it.
-    param([string]$Exe, [string[]]$ArgList, [string]$StdinText, [hashtable]$SetEnv)
+    # get wrong) and UTF-8 output. The environment hardening is unconditional, so no call can
+    # skip it. -ReadsNoObject drops only the `--no-lazy-fetch` option, never the variable.
+    param([string]$Exe, [string[]]$ArgList, [string]$StdinText, [hashtable]$SetEnv, [switch]$ReadsNoObject)
     if ((Get-BudgetLeftMs) -le 0) { throw "$Exe was not started: $budgetSpent" }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
-    $psi.ArgumentList.Add('--no-lazy-fetch')
+    if (-not $ReadsNoObject) { $psi.ArgumentList.Add('--no-lazy-fetch') }
     foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -215,14 +217,14 @@ function Wait-Child($Child, [int]$TimeoutSeconds = 30) {
 # Resolved at first use, inside a check, so a machine with no git fails that check.
 $gitExe = $null
 
-function Invoke-Git([string]$Repo, [string[]]$GitArgs, [string]$StdinText, [int]$TimeoutSeconds = 15) {
+function Invoke-Git([string]$Repo, [string[]]$GitArgs, [string]$StdinText, [int]$TimeoutSeconds = 15, [switch]$ReadsNoObject) {
     if (-not $script:gitExe) { $script:gitExe = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
     # The clone's shared state is writable by every session, so none of it may stand in for an
     # object: a replace ref swaps a commit's content and a commit-graph can lie about parents.
     # The untracked cache sits in the index, which the worktree's owner writes.
     $argv = @('-C', $Repo, '--no-replace-objects', '-c', 'core.commitGraph=false', '-c', 'core.untrackedCache=false',
         '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=off', '--no-optional-locks') + $GitArgs
-    Wait-Child (Start-Child -Exe $gitExe -ArgList $argv -StdinText $StdinText) -TimeoutSeconds $TimeoutSeconds
+    Wait-Child (Start-Child -Exe $gitExe -ArgList $argv -StdinText $StdinText -ReadsNoObject:$ReadsNoObject) -TimeoutSeconds $TimeoutSeconds
 }
 
 function Get-RemoteMain([string]$Url, [int]$TimeoutSeconds) {
@@ -403,7 +405,7 @@ function Get-PrimaryHolding([string]$Canon, $Lists) {
 # hook, which exits 0, the harness does not surface it.
 try {
     if (-not $FleetRepos) { throw 'no engine repository named' }
-    $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir')
+    $c = Invoke-Git $FleetRepos[0] @('rev-parse', '--path-format=absolute', '--git-common-dir') -ReadsNoObject
     if ($c.Code -ne 0 -or -not $c.Out.Trim()) { throw "the engine's git common dir could not be read (exit $($c.Code))" }
     if (Test-Path -LiteralPath (Join-Path $c.Out.Trim() 'mefor-coord/enter-check/OFF')) {
         Write-Output 'OFF'
@@ -580,7 +582,7 @@ try {
                 $mode, $type, $id = $meta.Split(' ')
                 # hash-object --stdin-paths reads a line: it unquotes one that starts with `"` and
                 # may drop a trailing CR, so either would hash another file than the one tracked.
-                if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains("`n") -or $p.Contains("`r") -or $p.StartsWith('"')) { $odd++; continue }
+                if ($type -cne 'blob' -or $mode -notin @('100644', '100755') -or $p.Contains([char]10) -or $p.Contains([char]13) -or $p.StartsWith('"', [System.StringComparison]::Ordinal)) { $odd++; continue }
                 $paths.Add($p); $blobs.Add($id)
             }
             # A filter, ident or working-tree-encoding attribute converts content between disk and

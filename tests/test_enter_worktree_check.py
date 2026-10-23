@@ -774,7 +774,8 @@ def test_a_promisor_remote_in_the_clone_runs_no_lazy_fetch(fleet: Fleet, tmp_pat
 
 
 def test_the_parent_s_git_variables_do_not_reach_a_git_child(fleet: Fleet, tmp_path: Path) -> None:
-    """Every GIT_* name is dropped, the remote read's included, whatever the session set."""
+    """The GIT_* names a session sets are dropped, the remote read's included. Only the three
+    that locate this machine's own config are kept."""
     wt = fleet.own_wt()
     trace = tmp_path / "git-trace.txt"
     planted = {
@@ -858,10 +859,16 @@ def test_every_git_child_gets_the_hardened_environment_and_argv(
     calls = [
         ln for ln in argv.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()
     ]
-    assert calls and all(ln.split()[0] == "--no-lazy-fetch" for ln in calls), calls
+    # The OFF file's git-dir read comes first and reads no object, so only it goes without the
+    # option, which an older git would reject; every later call carries it.
+    assert len(calls) > 1, calls
+    assert calls[0].split()[0] != "--no-lazy-fetch" and "--git-common-dir" in calls[0], calls
+    assert all(ln.split()[0] == "--no-lazy-fetch" for ln in calls[1:]), calls
 
 
-@pytest.mark.parametrize("name", ['"quoted.txt', "carriage\rreturn.txt"])
+# The third name puts a combining acute accent after the quote: a culture-aware StartsWith('"')
+# reads that pair as another character and lets the path through.
+@pytest.mark.parametrize("name", ['"quoted.txt', "carriage\rreturn.txt", '"́README.md'])
 def test_a_tracked_path_hash_object_would_misread_is_unreadable(fleet: Fleet, name: str) -> None:
     """hash-object --stdin-paths unquotes a leading quote and may drop a CR, so neither reaches it.
     Neither name can exist on NTFS, so the tree is built without a checkout."""
