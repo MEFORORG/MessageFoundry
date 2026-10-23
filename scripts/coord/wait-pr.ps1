@@ -86,14 +86,19 @@
     this wait, and review comments (`pulls/{n}/comments`) are not read: their ids are a separate
     sequence, so "newer than" would need a second baseline and a second resume id. Of several new
     matching comments the one with the lowest id is reported, and the line says how many more
-    follow it. START THE FIRST WAIT ON A PR WITH -AfterCommentId 0, which makes every comment on the
-    PR count, so a question posted before the wait started is still found. ALWAYS wait again with
-    -AfterCommentId set to the id the last wait printed: exit 0 prints it as the met line's `id=`,
-    and exit 2, and exit 1 once the loop has started, print a `resume: id=` line with the newest
-    comment id read, every comment up to it having been read and found not to match. A wait without
-    -AfterCommentId takes the newest comment at its own start as the baseline, so it skips every
-    comment posted before it started, including those since the last wait's final read. LIMIT: delivery rests on an id high-water mark, so a comment whose lower
-    id becomes visible only after a higher one has been reported is skipped. On exit 0 it prints ONE
+    follow it. START THE FIRST WAIT ON A PR WITH -FromStart, which makes every comment on the PR
+    count, so a question posted before the wait started is still found. -FromStart beside
+    -AfterCommentId is exit 1, and -AfterCommentId starts at 1, so a $null or '' from a caller whose
+    parse failed is refused rather than read as "every comment". ALWAYS wait again from what the
+    last wait printed: exit 0 prints the met line's `id=`; exit 2, and exit 1 after three transient
+    failures in a row, print a `resume:` line naming this wait's own bar, or -FromStart when the bar
+    is 0. Every other exit 1 is permanent and prints no resume line. A wait with neither option takes
+    the newest comment at its own start as the bar, so it skips every comment posted before it
+    started, including those since the last wait's final read. LIMIT: delivery rests on the bar, and
+    only a met line moves it, to the id it reports. A comment read above the bar but not reported is
+    read again by the next wait, so a deletion that shifts pages or an edited first line cannot hide
+    it; a comment whose lower id becomes visible only after a higher one has been REPORTED is
+    skipped. On exit 0 it prints ONE
     line naming the comment's id, author, URL and first line, never the rest of the body. Author,
     URL and first line are each reduced to printable ASCII and cut to 300 characters: control,
     format and line-separator units, at least, become a space, and every other unit outside
@@ -102,7 +107,8 @@
     takes over; a non-matching comment is counted there and never printed. -Match is the caller's
     pattern run over the commenter's text, so it is compiled non-backtracking, which runs in linear
     time and refuses a backreference or lookaround (exit 1), and each match is still cut off at 2
-    s, a cut-off being exit 1. -Match, -Author and -AfterCommentId with any other -Until are exit 1.
+    s, a cut-off being exit 1. -Match, -Author, -AfterCommentId and -FromStart with any other
+    -Until are exit 1.
 
 .NOTES
     THE BOUNDS ARE THE POINT. Every seat draws on ONE shared 5000-per-hour GitHub budget (the
@@ -115,8 +121,9 @@
     comments, 100 to a page; a transient failure repeats all of it. Every later check reads only the comments updated since 60
     s before the newest `updated_at` of that first read, through one fixed `?since=` path, so it is
     one read unless 100 or more fall in that window: a full page of 100 always costs one more read.
-    Every paged read stops at 50 pages: a 50th full page is exit 1, never a 51st read, so a server
-    that ignores `page` cannot keep a wait reading. The first read of
+    Every paged read, comments, rulesets, check runs and commit statuses alike, stops at 50 pages: a
+    read that would need a 51st page is exit 1, never a 51st read, so a server that ignores `page`
+    cannot keep a wait reading. The first read of
     each path is unconditional and counted. Every later read of it is conditional: the ETag of the
     last 200 goes back as If-None-Match, and GitHub does not count a 304 against the primary rate
     limit, so an unchanging PR costs little after the first check. The 304
@@ -177,7 +184,8 @@
     invisible to a list of the runs that exist (CLAUDE.md section 5, the Lander's safeguard 1). So
     the required set is read from classic protection and from rulesets, through the same two
     endpoints scripts/ci/required_contexts.py reads, and every name in it must have reported, matched
-    case-sensitively so a near-miss name never satisfies it. It is read again if the PR's base
+    ordinally, code unit by code unit, so a near-miss name never satisfies it, not even one that
+    differs only by an invisible character a culture-aware compare ignores. It is read again if the PR's base
     changes, and a transient failure part-way through that read leaves it unread, to be read again
     next check. A protected base whose payload carries no contexts key is exit 1, never an empty
     set, which is that reader's rule too; an empty contexts list is a real empty answer. Only a
@@ -203,7 +211,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
+    [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z')]
     [string]$Repo,
 
     [Parameter(Mandatory)]
@@ -220,9 +228,12 @@ param(
     [ValidatePattern('^[A-Za-z0-9_-]+(\[bot\])?\z')]
     [string]$Author = '',
 
-    # 0 means every comment counts; leaving it out means the newest at the start is the baseline.
-    [ValidateRange(0, 9223372036854775807)]
+    # From 1, so a $null or '' from a caller whose parse failed is refused, never read as "all".
+    [ValidateRange(1, 9223372036854775807)]
     [long]$AfterCommentId = 0,
+
+    # Every comment counts, those before the wait included. Refused beside -AfterCommentId.
+    [switch]$FromStart,
 
     [int]$IntervalSeconds = 120,
 
@@ -257,9 +268,7 @@ $script:DirtyReads = 0
 $script:CommentQuery = $null
 $script:CommentAfter = 0L
 $script:CommentAuthor = ''
-$script:CommentSeen = 0L
 $script:HasCursor = $PSBoundParameters.ContainsKey('AfterCommentId')
-$script:InLoop = $false
 $script:Utf8 = [System.Text.UTF8Encoding]::new($false)
 
 function Say([string]$Message) {
@@ -269,11 +278,6 @@ function Say([string]$Message) {
 }
 
 function Fail([string]$Message) {
-    # Once the loop runs, an error must not lose the comment cursor either.
-    if ($script:InLoop) {
-        $resume = Get-Resume
-        if ($resume) { Say $resume }
-    }
     [Console]::Error.WriteLine("wait-pr $Repo#${Pr}: error: $Message")
     exit 1
 }
@@ -463,6 +467,7 @@ function Test-Checks($p) {
     $runs = @()
     $page = 1
     do {
+        Assert-PageCap $page "repos/$Repo/commits/$sha/check-runs?per_page=100"
         $b = Get-Rest "repos/$Repo/commits/$sha/check-runs?per_page=100&page=$page"
         $batch = @($b.check_runs)
         $runs += $batch
@@ -471,6 +476,7 @@ function Test-Checks($p) {
     $statuses = @()
     $page = 1
     do {
+        Assert-PageCap $page "repos/$Repo/commits/$sha/status?per_page=100"
         $b = Get-Rest "repos/$Repo/commits/$sha/status?per_page=100&page=$page"
         $list = Prop $b 'statuses'
         $batch = @($list)
@@ -488,7 +494,9 @@ function Test-Checks($p) {
     foreach ($s in $statuses) {
         if ($s.state -eq 'pending') { $pending += $s } else { $reported += [string]$s.context }
     }
-    $missing = @($script:Required | Where-Object { $reported -cnotcontains $_ })
+    # Ordinal: -cnotcontains compares culture-aware, which can ignore a zero-width character.
+    $seen = [System.Collections.Generic.HashSet[string]]::new([string[]]$reported, [System.StringComparer]::Ordinal)
+    $missing = @($script:Required | Where-Object { -not $seen.Contains($_) })
 
     $met = ($runs.Count + $statuses.Count) -gt 0 -and $running.Count -eq 0 -and
         $pending.Count -eq 0 -and $missing.Count -eq 0
@@ -522,14 +530,20 @@ function Read-Required([string]$Base) {
     @($classic + $ruleset | Sort-Object -Unique -CaseSensitive)
 }
 
+# Every paged read stops before page $MaxPages + 1, so a server that ignores `page` cannot keep a
+# wait reading. $What names the read in the message.
+function Assert-PageCap([int]$Page, [string]$What) {
+    if ($Page -gt $MaxPages) {
+        Fail "gh api $What asked for more than $MaxPages pages, the most this script reads; it stops rather than read on, since a server that ignores page would never end the list."
+    }
+}
+
 # Every item of an endpoint that answers a bare JSON array, 100 to a page, until a short page, and
 # never past $MaxPages pages. $Path ends in `?` or `&`.
 function Read-Pages([string]$Path) {
     $page = 1
     do {
-        if ($page -gt $MaxPages) {
-            Fail "gh api ${Path}per_page=100 returned a full page $MaxPages times, the most this script reads; it stops rather than read on, since a server that ignores page would never return a short one."
-        }
+        Assert-PageCap $page "${Path}per_page=100"
         $batch = @(Get-Rest "${Path}per_page=100&page=$page" | ForEach-Object { $_ })
         $batch
         $page++
@@ -582,7 +596,7 @@ function Test-Comments {
             # A deleted comment leaves this too, so it is said, not refused.
             Say "-AfterCommentId $AfterCommentId is above every issue comment on the PR (newest $newest): a deleted comment, or an id from another PR or sequence"
         }
-        $script:CommentAfter = if ($script:HasCursor) { $AfterCommentId } else { $newest }
+        $script:CommentAfter = if ($script:HasCursor) { $AfterCommentId } elseif ($FromStart) { 0L } else { $newest }
         $script:CommentQuery = if ($stamp) {
             $since = $stamp.AddSeconds(-$SinceMarginSeconds).UtcDateTime
             "since=$($since.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture))&"
@@ -603,8 +617,6 @@ function Test-Comments {
             [string]::Equals([string](Prop (Prop $_ 'user') 'login'), $script:CommentAuthor,
                 [System.StringComparison]::OrdinalIgnoreCase) -and $script:MatchRx.IsMatch((Get-FirstLine $_))
         })
-    # Every comment this read returned has now been judged, so the resume cursor may pass it.
-    foreach ($c in $comments) { $script:CommentSeen = [math]::Max($script:CommentSeen, [long]$c.id) }
     $r = @{ Met = $hits.Count -gt 0; NeedsPush = $null
         State = "last read: $($new.Count) comments after id ${after}, $($hits.Count) by the author matching" }
     if ($hits) {
@@ -617,18 +629,17 @@ function Test-Comments {
     $r
 }
 
-# The line that lets the next -Until comment wait start where this one stopped, or $null when
-# there is no comment cursor to give. Every comment up to the id it names was read and judged.
+# The line that lets the next -Until comment wait start where this one did, or $null for any
+# other -Until. It is this wait's own bar, never an id merely read: a comment read above the bar may
+# not have been judged in its final form, so the next wait reads everything above the bar again.
 function Get-Resume {
     if ($Until -ne 'comment') { return $null }
-    if ($null -ne $script:CommentQuery) {
-        $id = [math]::Max($script:CommentAfter, $script:CommentSeen)
-    } elseif ($script:HasCursor) {
-        $id = $AfterCommentId
-    } else {
-        return 'resume: no comment was read and no -AfterCommentId was given, so there is no id to resume after'
-    }
-    "resume: id=$id is the newest comment read; wait again with -AfterCommentId $id"
+    $bar = if ($null -ne $script:CommentQuery) { $script:CommentAfter }
+        elseif ($script:HasCursor) { $AfterCommentId }
+        elseif ($FromStart) { 0L }
+        else { return 'resume: no comment was read and this wait had no bar, so no id is known; -FromStart is the choice that misses no comment, at the cost of seeing old, answered ones again' }
+    if ($bar -eq 0) { return 'resume: id=0, every comment counted; wait again with -FromStart' }
+    "resume: id=$bar is this wait's bar; wait again with -AfterCommentId $bar"
 }
 
 # Untrusted text made safe to print on one line, in printable ASCII only. Each UTF-16 unit in
@@ -653,9 +664,12 @@ try {
         }
     }
     if ($Until -ne 'comment') {
-        $stray = @('Match', 'Author', 'AfterCommentId' | Where-Object { $PSBoundParameters.ContainsKey($_) })
+        $stray = @('Match', 'Author', 'AfterCommentId', 'FromStart' | Where-Object { $PSBoundParameters.ContainsKey($_) })
         if ($stray) { Fail "$(($stray | ForEach-Object { "-$_" }) -join ' and ') applies only to -Until comment." }
     } else {
+        if ($FromStart -and $script:HasCursor) {
+            Fail '-FromStart and -AfterCommentId both say where the wait starts; give one.'
+        }
         # Case-sensitive and linear-time: the pattern is the caller's, the text it runs over is not,
         # so a commenter cannot make it backtrack. The timeout stays as a second bound.
         try {
@@ -698,7 +712,6 @@ try {
     $script:Base = $null
     $transients = 0
     $script:Required = @()
-    $script:InLoop = $true
     while ($true) {
         try {
             # -Until comment never acts on the PR's state: a comment can arrive whatever it is.
@@ -706,7 +719,12 @@ try {
             $transients = 0
         } catch [TransientReadException] {
             $transients++
-            if ($transients -ge 3) { Fail "three transient failures in a row, the last: $($_.Exception.Message)" }
+            if ($transients -ge 3) {
+                # Only this exit 1 may be worth waiting again after; the others are permanent.
+                $resume = Get-Resume
+                if ($resume) { Say $resume }
+                Fail "three transient failures in a row, the last: $($_.Exception.Message)"
+            }
             $r = @{ Met = $false; NeedsPush = $null; State = "transient, reading again next interval: $($_.Exception.Message)" }
         }
         if ($r.State -ne $last) {
