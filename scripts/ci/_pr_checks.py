@@ -31,7 +31,7 @@ PASSING = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
 #: A CheckRun conclusion GitHub gives a run it abandoned after 14 days. counts() reads it as neither
 #: failing nor unsettled, as it always has, so an optional stale run never hides a stalled PR from
-#: check_stalled_prs. A caller asking "is this REQUIRED check green" must treat it as not green.
+#: check_stalled_prs. A caller asking "is this REQUIRED check green" passes stale_settled=False.
 STALE = "STALE"
 
 #: StatusContext ``state`` values that mean it has not reported. ``EXPECTED`` is a status that has
@@ -72,7 +72,7 @@ def verdict_of(node: object) -> str:
     return str(node.get("conclusion") or node.get("state") or "").upper()
 
 
-def counts(rollup: object) -> tuple[int, int]:
+def counts(rollup: object, *, stale_settled: bool = True) -> tuple[int, int]:
     """``(failing, unsettled)`` over a ``statusCheckRollup`` payload.
 
     Pure. A node whose shape is unrecognised is counted as UNSETTLED -- see the module docstring for
@@ -90,7 +90,7 @@ def counts(rollup: object) -> tuple[int, int]:
             unsettled += 1
         elif verdict in FAILING:
             failing += 1
-        elif verdict not in PASSING and verdict != STALE:
+        elif verdict not in PASSING and not (stale_settled and verdict == STALE):
             # An allowlist, not a denylist: a verdict nobody listed is unsettled, never green.
             unsettled += 1
     return (failing, unsettled)

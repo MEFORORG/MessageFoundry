@@ -22,7 +22,8 @@ WHY THE LOCK IS AN OS LOCK, NOT lock.ps1. lock.ps1's lock is a file whose existe
 kill (the task's time limit, a logoff, a shutdown) leaves it behind, and recovering it needs a
 liveness guess. This poller holds a byte-range lock on an open handle instead (``msvcrt.locking``;
 ``fcntl.flock`` elsewhere), and the kernel releases it when the process dies, however it dies. A held
-lock means another poll is running, so the run exits. Nothing writes the cache without the lock.
+lock means another poll is running, so the run exits. Only the lock holder writes the cache; the
+one exception is in main() and in the doc.
 docs/WORKTREES.md, *A PR-state cache for read-only panes*, is where the lock is described for readers.
 
 A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``data`` block is kept with
@@ -40,6 +41,7 @@ import errno
 import importlib.util
 import json
 import os
+import re
 import subprocess  # nosec B404 - fixed argv, no shell
 import sys
 import time
@@ -77,8 +79,14 @@ GH_TIMEOUT_SECONDS = 30
 #: A rate-limit failure with no resetAt to wait for waits this long instead of the short back-off.
 RATE_LIMIT_FALLBACK_SECONDS = 900
 #: No legitimate back-off is longer: the cap, or an hour's wait for a rate-limit reset.
-MAX_BACKOFF = timedelta(seconds=max(FAIL_MAX_DELAY, 3600) + 60)
+#: Two hours, so a reset an hour out read by a clock running behind GitHub still counts.
+MAX_BACKOFF = timedelta(seconds=max(FAIL_MAX_DELAY, 3600) * 2)
 START_SLACK = timedelta(seconds=15)
+#: A lock failure is written into the cache only when nothing wrote it for this long.
+LOCK_FAILURE_QUIET = timedelta(minutes=5)
+#: Where messages go when there is no stderr (pythonw). Capped, so it cannot grow without bound.
+LOG_NAME = "pr-state.log"
+LOG_MAX_BYTES = 256 * 1024
 
 _HERE = Path(__file__).resolve().parent
 
@@ -108,8 +116,6 @@ class GhError(RuntimeError):
         super().__init__(message)
         # gh exits 1 on a GraphQL reply that carries errors, with the reply on stdout.
         self.stdout = stdout
-        self.fresh: dict[str, Any] | None = None
-        self.part: str | None = None
 
 
 class PollError(RuntimeError):
@@ -198,17 +204,26 @@ query($owner: String!, $name: String!, $limit: Int!) {
 """.replace("%BASE%", BASE_BRANCH)
 
 
-def contexts_query(numbers: list[int]) -> str:
-    """One aliased query asking each PR's head commit for its contexts and whether each is required."""
+_OID = re.compile(r"\A[0-9a-f]{40}\Z")
+
+
+def contexts_query(heads: dict[int, str]) -> str:
+    """One aliased query asking each PR's head commit, BY SHA, for its contexts and which are required.
+
+    Pinning to the headRefOid the main query returned means a push between the two queries cannot
+    make the reply describe another commit, and nothing depends on commits(last: 1) being the head.
+    """
     parts = []
-    for n in numbers:
+    for n, oid in heads.items():
+        if not _OID.match(oid):
+            raise PollError(f"head SHA for PR {n} is not 40 hex characters: {oid!r}", part="pulls")
         parts.append(
-            f"p{n}: pullRequest(number: {n}) {{ commits(last: 1) {{ nodes {{ commit {{ oid "
+            f'p{n}: object(oid: "{oid}") {{ ... on Commit {{ oid '
             f"statusCheckRollup {{ contexts(first: {CONTEXT_PAGE}) {{ pageInfo {{ hasNextPage }} nodes {{ "
             f"__typename "
             f"... on CheckRun {{ name status conclusion startedAt isRequired(pullRequestNumber: {n}) }} "
             f"... on StatusContext {{ context state createdAt isRequired(pullRequestNumber: {n}) }} "
-            f"}} }} }} }} }} }} }}"
+            f"}} }} }} }} }}"
         )
     body = "\n    ".join(parts)
     return (
@@ -351,12 +366,11 @@ def required_verdict(
             out["unknown" if named else "missing"].append(name)
             continue
         speaker = _speaker(matching)
-        failing, unsettled = pr_checks.counts([speaker])
-        stale = pr_checks.verdict_of(speaker) == pr_checks.STALE
+        # stale_settled=False: for a REQUIRED check an abandoned (STALE) run is not green.
+        failing, unsettled = pr_checks.counts([speaker], stale_settled=False)
         if failing:
             out["failing"].append(name)
-        elif unsettled or stale:
-            # counts() reads STALE as settled; for a REQUIRED check it is not green.
+        elif unsettled:
             out["pending"].append(name)
     if out["failing"]:
         out["state"] = "FAILURE"
@@ -435,20 +449,21 @@ def shape_pr(
 
 
 def fetch_contexts(
-    gh: Gh, owner: str, name: str, numbers: list[int]
+    gh: Gh, owner: str, name: str, heads: dict[int, str]
 ) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
     out: dict[int, dict[str, Any]] = {}
     rates: list[dict[str, Any]] = []
+    numbers = list(heads)
     for i in range(0, len(numbers), CONTEXT_CHUNK):
         chunk = numbers[i : i + CONTEXT_CHUNK]
         part = f"contexts PRs {chunk[0]}-{chunk[-1]}"
-        repo, rate = graphql(gh, contexts_query(chunk), {"owner": owner, "name": name}, part)
+        query = contexts_query({n: heads[n] for n in chunk})
+        repo, rate = graphql(gh, query, {"owner": owner, "name": name}, part)
         rates.append(rate)
         for n in chunk:
-            pr = repo.get(f"p{n}")
-            if not isinstance(pr, dict):
+            commit = repo.get(f"p{n}")
+            if not isinstance(commit, dict):
                 continue
-            commit = _head_commit(pr)
             rollup = commit.get("statusCheckRollup")
             conn = rollup.get("contexts") if isinstance(rollup, dict) else None
             page = conn.get("pageInfo") if isinstance(conn, dict) else None
@@ -492,10 +507,8 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         )
     except (KeyError, TypeError, ValueError, AttributeError) as shape:
         # A reply shape this code did not expect, recorded against the request that returned it.
-        err: PollError | GhError = PollError(
-            f"unexpected reply shape: {shape!r}", part=progress["part"]
-        )
-    except (PollError, GhError) as exc:
+        err = PollError(f"unexpected reply shape: {shape!r}", part=progress["part"])
+    except PollError as exc:
         err = exc
     learned: dict[str, Any] = {
         "requiredContexts": required,
@@ -525,7 +538,6 @@ def _poll_rest(
         gh, MAIN_QUERY, {"owner": owner, "name": name, "limit": PR_PAGE}, "pulls"
     )
     progress["rate"] = {**rate, "queries": 1} if rate else None
-    progress["part"] = "contexts"
     conn = repo_doc.get("pullRequests") if isinstance(repo_doc.get("pullRequests"), dict) else None
     if conn is None or not isinstance(conn.get("nodes"), list):
         raise PollError("reply has no pullRequests.nodes", part="pulls")
@@ -538,16 +550,18 @@ def _poll_rest(
         or (isinstance(total, int) and total > len(prs))
     )
 
-    numbers = [
-        p["number"]
+    heads = {
+        p["number"]: str(p.get("headRefOid") or "")
         for p in prs
         if isinstance(p.get("number"), int) and p.get("baseRefName") == BASE_BRANCH
-    ]
+    }
     rates = [rate]
     ctx: dict[int, dict[str, Any]] = {}
-    if numbers:
-        ctx, more = fetch_contexts(gh, owner, name, numbers)
+    if heads:
+        progress["part"] = "contexts"
+        ctx, more = fetch_contexts(gh, owner, name, heads)
         rates += more
+        progress["part"] = "pulls"  # what follows is processing the main reply
 
     mq = repo_doc.get("mergeQueue")
     queue: list[dict[str, Any]] | None = None
@@ -695,7 +709,11 @@ def write_cache(path: Path, doc: dict[str, Any]) -> None:
     """Temp file then rename, so a reader sees the old file or the new one, never half of one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
+    try:
+        tmp.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
     for attempt in range(5):
         try:
             os.replace(tmp, path)
@@ -778,10 +796,24 @@ def lock_path(local: Path) -> Path:
     return local / "locks" / LOCK_FILE
 
 
+_log_path: Path | None = None
+
+
 def _say(message: str) -> None:
-    # Under pythonw there is no stderr; print to a None stream is a no-op, which is what we want.
+    """To stderr; under pythonw, where there is none, to <coord-dir>/pr-state.log, capped."""
     if sys.stderr is not None:
         print(f"pr-state: {message}", file=sys.stderr)
+        return
+    if _log_path is None:
+        return
+    line = f"{datetime.now(UTC).isoformat()} {message}\n"
+    try:
+        if _log_path.exists() and _log_path.stat().st_size > LOG_MAX_BYTES:
+            _log_path.replace(_log_path.with_suffix(".log.1"))
+        with _log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass  # the log is the last place anything can be said; there is nowhere left to say this
 
 
 def main(
@@ -813,20 +845,29 @@ def main(
     if local is None:
         _say("git could not name the common dir; nothing written")
         return 2
+    global _log_path
+    _log_path = local / LOG_NAME
+    if args.repo != DEFAULT_REPO and args.out is None:
+        # The default cache is the panes' file for DEFAULT_REPO; another repo must not overwrite it.
+        _say(f"--repo {args.repo} needs --out; the default cache belongs to {DEFAULT_REPO}")
+        return 2
     out: Path = args.out if args.out is not None else local / CACHE_NAME
 
     try:
         fd = acquire_lock(local)
     except LockUnavailable as exc:
         _say(str(exc))
-        # Written without the lock, because the lock itself is what is broken: no run can hold it,
-        # so no run is writing the cache. Readers see why it stopped moving.
+        # Written without the lock, so only when the cache shows no healthy poller is writing:
+        # nothing fresher than LOCK_FAILURE_QUIET. A failure local to this one run (a sharing
+        # violation, say) then never overwrites a holder's fresh poll.
         previous = _previous(out, args.repo)
-        try:
-            doc = failed(args.repo, previous, str(exc), now(), part="lock")
-            write_cache(out, doc)
-        except OSError as werr:
-            _say(f"could not record the lock failure in the cache either: {werr!r}")
+        stamp = parse_iso((previous or {}).get("fetchedAt"))
+        current = now()
+        if stamp is None or not current - LOCK_FAILURE_QUIET < stamp <= current:
+            try:
+                write_cache(out, failed(args.repo, previous, str(exc), current, part="lock"))
+            except OSError as werr:
+                _say(f"could not record the lock failure in the cache either: {werr!r}")
         return 4  # a non-zero task result, so a broken lock is not a silent success
     if fd is None:
         return 0  # another poll is running; it will write the cache
@@ -841,20 +882,28 @@ def main(
             return 0  # backing off; the cache already says until when
         try:
             doc = poll(gh, args.repo, previous, start)
-        except (PollError, GhError) as exc:
+        except PollError as exc:
             doc = failed(
                 args.repo,
                 previous,
                 str(exc),
                 start,
-                reset_at=getattr(exc, "reset_at", None),
-                part=getattr(exc, "part", None),
-                fresh=getattr(exc, "fresh", None),
+                reset_at=exc.reset_at,
+                part=exc.part,
+                fresh=exc.fresh,
             )
+        except GhError as exc:
+            # graphql() and fetch_required() convert gh failures; this is a last guard.
+            doc = failed(args.repo, previous, str(exc), start, part="gh")
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             # poll() converts reply-shape errors itself; this is a last guard around the rest.
             doc = failed(args.repo, previous, f"unexpected error: {exc!r}", start, part="poller")
-        write_cache(out, doc)
+        try:
+            write_cache(out, doc)
+        except OSError as exc:
+            # The cache cannot say this about itself, so the log file does.
+            _say(f"could not write {out}; the poll's result is lost: {exc!r}")
+            return 5
         if doc["error"]:
             _say(f"poll failed, last good data kept: {doc['error']}")
             return 1

@@ -731,9 +731,10 @@ Four reading rules, each one a mistake the file is shaped to prevent:
 1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
    said no PR is open.
 2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
-   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has at least five
-   causes, and `required.reason` names the one that fired. They are a base other than `main`, no
-   required list, no context reply, a head that moved between the queries, and a truncated page.
+   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has several
+   causes, and `required.reason` always names the one that fired. Read the reason, not a list of
+   causes. At the time of writing they include a base other than `main`, no required list, and a
+   truncated context page.
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
    (`mergeStateKnown: false`). That is no state at all.
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
@@ -742,8 +743,11 @@ It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_che
 unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
 handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releases it when the
 process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
-means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
-cannot open the lock file exits 4, so the task's last result shows it.
+means another poll is running, so the run exits. Only the lock holder writes the cache, with one
+exception. A run that cannot open or lock the file at all exits 4. It records that error in the cache
+only when nothing has written the cache for five minutes, so it never overwrites a fresh poll. A run
+that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+`mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
 
 ```powershell
 python scripts\coord\pr_state.py          # one poll by hand; it obeys the real cache's back-off

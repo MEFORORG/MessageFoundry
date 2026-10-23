@@ -21,14 +21,9 @@
     Windows. It runs under pythonw.exe, so no window opens, on battery too, and stops after ten
     minutes. A second start while one runs is ignored, and pr_state.py's own lock covers the rest.
 
-    WHAT THE TASK TRUSTS. Every 2 minutes, as you and with your gh token, it runs whatever
-    pr_state.py, coord_root.py, _pr_checks.py and required_contexts.py are in the primary checkout.
-    That is the same trust the checkout's .claude/settings.json hooks already get. Nothing here
-    checks those files before they run. pythonw runs with -I, so PYTHON* variables, the user site
-    directory and the working directory add no code of their own.
-
-    The CLAUDECODE check only decides who registers or removes the task: the owner, from a plain
-    terminal. It does not protect what the task runs. -WhatIf, and -Json without -Uninstall, change
+    WHAT THE TASK TRUSTS is stated once, in docs/WORKTREES.md, "A PR-state cache for read-only
+    panes": it runs the primary checkout's poller files as you, with your gh token, unchecked.
+    pythonw runs with -I. The CLAUDECODE check only decides who registers or removes the task. -WhatIf, and -Json without -Uninstall, change
     nothing and are allowed anywhere.
 
     THE HOST CHECK. -ExpectedHost names the machine this must run on. Registering or removing a task

@@ -16,6 +16,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,11 @@ REQUIRED = ["CI gate", "cla", "test"]
 NOW = datetime(2026, 10, 22, 12, 0, 0, tzinfo=UTC)
 
 
+def _sha(n: int) -> str:
+    """A 40-hex head SHA, since the contexts query pins each PR to its head by SHA."""
+    return f"{n:040x}"
+
+
 def _pr(
     number: int, *, mergeable: str = "MERGEABLE", merge_state: str = "CLEAN", base: str = "main"
 ) -> dict[str, Any]:
@@ -51,7 +57,7 @@ def _pr(
         "title": f"pr {number}",
         "baseRefName": base,
         "headRefName": f"b{number}",
-        "headRefOid": f"oid{number}",
+        "headRefOid": _sha(number),
         "isDraft": False,
         "mergeable": mergeable,
         "mergeStateStatus": merge_state,
@@ -62,7 +68,7 @@ def _pr(
             "nodes": [
                 {
                     "commit": {
-                        "oid": f"oid{number}",
+                        "oid": _sha(number),
                         "statusCheckRollup": {
                             "state": "SUCCESS",
                             "contexts": {
@@ -156,22 +162,12 @@ class FakeGh:
         repo = {}
         for n, nodes in self.contexts.items():
             if f"p{n}:" in query:
+                assert f'object(oid: "{_sha(n)}")' in query  # pinned to the head SHA
                 repo[f"p{n}"] = {
-                    "commits": {
-                        "nodes": [
-                            {
-                                "commit": {
-                                    "oid": f"oid{n}",
-                                    "statusCheckRollup": {
-                                        "contexts": {
-                                            "pageInfo": {"hasNextPage": False},
-                                            "nodes": nodes,
-                                        }
-                                    },
-                                }
-                            }
-                        ]
-                    }
+                    "oid": _sha(n),
+                    "statusCheckRollup": {
+                        "contexts": {"pageInfo": {"hasNextPage": False}, "nodes": nodes}
+                    },
                 }
         return json.dumps({"data": {"rateLimit": rate, "repository": repo}})
 
@@ -321,7 +317,7 @@ def test_in_progress_run_still_outranks_a_newer_finished_one(tmp_path: Path) -> 
 
 def test_truncated_page_never_reads_red(tmp_path: Path) -> None:
     """Page one holds an old FAILURE; a newer SUCCESS may sit on page two."""
-    ctx = {"oid": "oid1", "nodes": [*_green()[:2], _run("test", "FAILURE")], "hasNextPage": True}
+    ctx = {"oid": _sha(1), "nodes": [*_green()[:2], _run("test", "FAILURE")], "hasNextPage": True}
     verdict = ps.shape_pr(_pr(1), sorted(REQUIRED), ctx)["required"]
     assert verdict["state"] == "UNKNOWN" and verdict["failing"] == []
 
@@ -498,7 +494,7 @@ def test_github_required_check_missing_from_list_still_counts(tmp_path: Path) ->
 
 def test_truncated_context_page_never_reads_green(tmp_path: Path) -> None:
     pr = _pr(1)
-    ctx = {"oid": "oid1", "nodes": _green(), "hasNextPage": True}
+    ctx = {"oid": _sha(1), "nodes": _green(), "hasNextPage": True}
     verdict = ps.shape_pr(pr, sorted(REQUIRED), ctx)["required"]
     assert verdict["state"] == "UNKNOWN" and sorted(verdict["unknown"]) == sorted(REQUIRED)
 
@@ -573,6 +569,13 @@ def test_a_killed_holder_releases_the_lock(tmp_path: Path) -> None:
     )
     done = subprocess.run([sys.executable, "-c", code], check=False, timeout=60)
     assert done.returncode == 9
+    # Windows frees a dead process's lock "depending on available system resources", so wait a
+    # bounded while for the kernel, never for a cleanup this code would have to do.
+    deadline = time.monotonic() + 10
+    while (fd := ps.acquire_lock(tmp_path)) is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert fd is not None, "the kernel did not release a dead process's lock within 10 s"
+    ps.release_lock(fd)
     rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
     assert rc == 0 and doc["error"] is None
 
@@ -646,7 +649,7 @@ def test_a_lock_error_that_is_not_contention_is_exit_4_with_the_error_cached(
 
         monkeypatch.setattr(fcntl, "flock", broken)
     gh = FakeGh([_pr(1)], {1: _green()})
-    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=2))
+    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=10))
     assert rc == 4 and gh.calls == []
     assert doc["error"] and "cannot lock" in doc["error"] and doc["errorPart"] == "lock"
     assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
@@ -679,7 +682,7 @@ def test_an_unexpected_shape_names_its_part_and_keeps_the_budget(
 
 def test_a_truncated_page_still_lists_github_required_names() -> None:
     extra = {**_run("new-required"), "isRequired": True}
-    ctx = {"oid": "oid1", "nodes": [*_green(), extra], "hasNextPage": True}
+    ctx = {"oid": _sha(1), "nodes": [*_green(), extra], "hasNextPage": True}
     verdict = ps.shape_pr(_pr(1), sorted(REQUIRED), ctx)["required"]
     assert verdict["requiredByGithubNotInList"] == ["new-required"]
     assert "new-required" in verdict["unknown"]
@@ -689,3 +692,53 @@ def test_a_stale_required_run_is_not_green(tmp_path: Path) -> None:
     contexts = [_run("CI gate"), _run("cla"), _run("test", "STALE")]
     _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}))
     assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
+
+
+# --- Review round 1 of the third fix brief -----------------------------------------------------------
+
+
+def test_a_lock_failure_never_overwrites_a_fresh_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    before = (tmp_path / "pr-state.json").read_bytes()
+
+    def broken(local: Path) -> int | None:
+        raise ps.LockUnavailable("cannot open: a sharing violation in this run only")
+
+    monkeypatch.setattr(ps, "acquire_lock", broken)
+    rc, _ = _main(tmp_path, FakeGh([], {}), NOW + timedelta(minutes=2))
+    assert rc == 4
+    assert (tmp_path / "pr-state.json").read_bytes() == before
+
+
+def test_another_repo_needs_its_own_out(tmp_path: Path) -> None:
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc = ps.main(["--repo", "o/other"], gh=gh, now=lambda: NOW, local=tmp_path)
+    assert rc == 2 and gh.calls == [] and not (tmp_path / "pr-state.json").exists()
+
+
+def test_an_unwritable_cache_is_a_distinct_failing_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(path: Path, doc: dict[str, Any]) -> None:
+        raise PermissionError("a reader holds the file open")
+
+    monkeypatch.setattr(ps, "write_cache", refuse)
+    gh = FakeGh([_pr(1)], {1: _green()})
+    rc = ps.main(["--out", str(tmp_path / "c.json")], gh=gh, now=lambda: NOW, local=tmp_path)
+    assert rc == 5
+
+
+def test_messages_go_to_a_log_file_when_there_is_no_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "stderr", None)
+    rc, _ = _main(tmp_path, FakeGh([], {}, fail="HTTP 502"))
+    assert rc == 1
+    assert "HTTP 502" in (tmp_path / "pr-state.log").read_text(encoding="utf-8")
+
+
+def test_a_bad_head_sha_never_reaches_the_query() -> None:
+    with pytest.raises(ps.PollError):
+        ps.contexts_query({1: 'abc") { x } y: object(oid: "'})
