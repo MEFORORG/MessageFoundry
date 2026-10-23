@@ -791,6 +791,18 @@ def test_a_failed_required_refresh_is_retried_at_most_every_ten_minutes(tmp_path
 # --- Final narrow brief ----------------------------------------------------------------------------
 
 
+def test_a_failure_stale_tie_does_not_depend_on_order(tmp_path: Path) -> None:
+    same = "2026-10-22T10:00:00Z"
+    red = {**_run("test", "FAILURE"), "startedAt": same}
+    stale = {**_run("test", "STALE"), "startedAt": same}
+    reasons = set()
+    for order in ([red, stale], [stale, red]):
+        contexts = [_run("CI gate"), _run("cla"), *order]
+        _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}), NOW, "--force")
+        reasons.add(doc["data"]["pullRequests"][0]["required"]["reason"])
+    assert reasons == {None}  # the FAILURE speaks in both orders
+
+
 def test_a_stale_success_tie_reads_failing_in_both_orders(tmp_path: Path) -> None:
     """CONTROL (fails on 84461e1ef, where the tie went to list order)."""
     same = "2026-10-22T10:00:00Z"
@@ -807,13 +819,18 @@ def test_a_stale_success_tie_reads_failing_in_both_orders(tmp_path: Path) -> Non
 def test_a_gated_poll_keeps_the_required_list_error(tmp_path: Path) -> None:
     """CONTROL (fails on 84461e1ef, which reset the error to null on a gated poll)."""
 
+    calls: list[list[str]] = []
+
     def gh(args: list[str], stdin: str | None) -> str:
+        calls.append(args)
         if args[-1].startswith("repos/"):
             raise ps.GhError("HTTP 403")
         return FakeGh([_pr(1)], {1: _green()})(args, stdin)
 
     _, first = _main(tmp_path, gh)
     assert first["requiredContexts"] is None and "403" in first["requiredContextsError"]
+    fetches = sum(c[-1].startswith("repos/") for c in calls)
     _, gated = _main(tmp_path, gh, NOW + timedelta(minutes=2))  # inside the retry gate: no fetch
+    assert sum(c[-1].startswith("repos/") for c in calls) == fetches  # carried, not re-fetched
     assert gated["requiredContexts"] is None
     assert gated["requiredContextsError"] and "403" in gated["requiredContextsError"]

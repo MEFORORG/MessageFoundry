@@ -375,7 +375,11 @@ def required_verdict(
         elif unsettled:
             out["pending"].append(name)
     if stale_names:
-        out["reason"] = f"needs a re-run: {', '.join(stale_names)} STALE (GitHub never re-runs it)"
+        others = [n for n in out["failing"] if n not in stale_names]
+        out["reason"] = (
+            f"needs a re-run: STALE run of {', '.join(stale_names)}, which GitHub never re-runs"
+            + (f"; also failing: {', '.join(others)}" if others else "")
+        )
     if out["failing"]:
         out["state"] = "FAILURE"
     elif out["pending"] or out["missing"]:
@@ -389,8 +393,9 @@ def required_verdict(
 
 def _speaker(runs: list[Any]) -> Any:
     """The run that speaks for one name: modelled on clear_stale_ci_red.newest_by_name, on GraphQL
-    fields, and different from it in two ways. On equal timestamps the worse verdict wins, where
-    newest_by_name has no tie-break. A STALE run ranks as failing in that tie-break.
+    fields. It differs from it in at least these ways: on equal timestamps the worse verdict wins
+    (failing, then STALE, then unsettled), where newest_by_name has no tie-break; it falls back to a
+    StatusContext's createdAt; and it reads StatusContexts at all.
 
     A run still IN PROGRESS beats a finished one outright; a head can carry two concurrent runs of
     a name and the earlier-started one can finish last. Among finished runs the latest start wins,
@@ -406,8 +411,9 @@ def _speaker(runs: list[Any]) -> Any:
         failing, unsettled = pr_checks.counts([run])
         # Ties go to the worse verdict, so equal stamps never leave the answer to list order. STALE
         # ranks with failing: counts() reads it as neither, but a required STALE run is red here.
+        # A total order (failing, stale, unsettled, passed), so no two verdicts tie.
         stale = pr_checks.verdict_of(run) == pr_checks.STALE
-        worse = 2 if failing or stale else 1 if unsettled else 0
+        worse = 3 if failing else 2 if stale else 1 if unsettled else 0
         return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""), worse)
 
     return max(runs, key=key)
@@ -540,7 +546,8 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         "requiredContextsTriedAt": tried_at,
     }
     if progress["rate"]:
-        learned["rateLimit"] = progress["rate"]  # the main query succeeded; its budget is current
+        # The main query's reading. A later contexts chunk's reading is not kept on failure.
+        learned["rateLimit"] = progress["rate"]
     if err.part is None:
         err.part = progress["part"]
     err.fresh = {**learned, **(err.fresh or {})}
@@ -828,7 +835,6 @@ def lock_path(local: Path) -> Path:
 
 
 _log_path: Path | None = None
-_log_failures: list[str] = []
 
 
 def _say(message: str) -> None:
@@ -844,10 +850,10 @@ def _say(message: str) -> None:
             _log_path.replace(_log_path.with_suffix(".log.1"))
         with _log_path.open("a", encoding="utf-8") as fh:
             fh.write(line)
-    except OSError as exc:
-        # R8: no handler drops an error unlogged. The log is what failed, so the one channel left is
-        # the task's exit code, which main() still returns; this records the cause in memory.
-        _log_failures.append(f"{line.strip()} [log write failed: {exc!r}]")
+    except OSError:
+        # Dropped: the log is the last channel, and it is what failed. The task's exit code, which
+        # main() still returns, and the cache's ageing fetchedAt are what remain.
+        return
 
 
 def main(

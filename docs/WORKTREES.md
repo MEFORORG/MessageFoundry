@@ -716,8 +716,8 @@ poll keeps the last good data and marks it stale. The fields:
 | `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
 | `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
 | `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
-| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the last reading any query returned, which may be older than `fetchedAt`. |
-| `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. |
+| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the failing poll's main-query reading if that query ran, else the last good poll's; it can be older than `fetchedAt`. |
+| `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. The error is the last refresh attempt's, carried until the next attempt, and can sit beside an older list. |
 | `data` | The last good poll, or null if there never was one. |
 | `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
 | `data.openPullRequestCount` | GitHub's count of open PRs, which can exceed the list when it is truncated. |
@@ -732,7 +732,8 @@ Four reading rules, each one a mistake the file is shaped to prevent:
    said no PR is open.
 2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
    no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has several
-   causes, and `required.reason` always names the one that fired. Read the reason, not a list of
+   causes, and `required.reason` always names the one that fired. A FAILURE can carry a reason too,
+   such as a STALE run that needs a re-run. Read the reason, not a list of
    causes. At the time of writing they include a base other than `main`, no required list, and a
    truncated context page.
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
@@ -745,8 +746,8 @@ handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releas
 process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
 means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
 cannot open or lock the file at all exits 4 and writes nothing, so a broken lock shows as an ageing
-`fetchedAt`, and in the log when the log can be written. If it cannot, the exit code is the only
-signal. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+`fetchedAt`, and in the log when the log can be written. If it cannot, the signals left include at
+least the exit code and that ageing `fetchedAt`. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
 `mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
 
 ```powershell
