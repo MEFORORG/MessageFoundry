@@ -39,8 +39,10 @@ on:
       - ".github/workflows/py314-latest-canary.yml"
 
 concurrency:
-  group: py314-latest-canary-${{ github.ref }}
-  cancel-in-progress: true
+  # The event is in the key, so a manual dispatch never cancels the week's scheduled run, or the
+  # other way round. Only a pull request's runs replace each other.
+  group: py314-latest-canary-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only: install and test. No gh writes, no secrets.
 permissions:
@@ -81,38 +83,66 @@ jobs:
           python-version: "3.14"
           check-latest: true
 
-      # What the canary measured, and how it compares to the pin every other 3.14 step reads.
-      - name: Record the interpreter and compare it to the pin
+      # What the canary measured, and how it compares to the pin every other 3.14 step reads. When
+      # check-latest cannot resolve the manifest, setup-python only logs it and falls back to the
+      # image's cached patch, so the newest stable 3.14 is read from the manifest here as well. A
+      # mismatch, or a manifest this step cannot read, fails the probe rather than reading as clean.
+      - name: Record the interpreter and compare it to the pin and the manifest
         id: probe
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
           python - <<'PY'
-          import os, sys
+          import json, os, sys, urllib.request
           from pathlib import Path
-          pin = Path("ci/python-version").read_text(encoding="utf-8").strip()
-          have = sys.version.split()[0]
+          MANIFEST = "https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json"
           def key(v):
               return tuple(int(part) for part in v.split("."))
+          pin = Path("ci/python-version").read_text(encoding="utf-8").strip()
+          have = sys.version.split()[0]
+          with urllib.request.urlopen(MANIFEST, timeout=60) as resp:
+              releases = json.load(resp)
+          platform = "win32" if sys.platform == "win32" else "linux"
+          newest = max(
+              (
+                  r["version"]
+                  for r in releases
+                  if r["stable"]
+                  and r["version"].startswith("3.14.")
+                  and any(f["platform"] == platform and f["arch"] == "x64" for f in r["files"])
+              ),
+              key=key,
+          )
           newer = key(have) > key(pin)
           print(f"sys.version = {sys.version}")
           print(f"pinned in ci/python-version = {pin}")
-          print(f"newest provisioned = {have}, newer than the pin = {newer}")
+          print(f"newest stable 3.14 in the manifest for {platform} = {newest}")
+          print(f"provisioned = {have}, newer than the pin = {newer}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"version={have}\n")
               out.write(f"pin={pin}\n")
+              out.write(f"newest={newest}\n")
               out.write(f"newer={newer}\n")
+          if have != newest:
+              sys.exit(f"setup-python provisioned {have}, not the manifest's newest {newest}")
           PY
 
-      # Constrained, unlike py315-canary.yml: this canary measures the interpreter patch, and
-      # constraints.lock is what every 3.14 leg installs, so the lock is held fixed here.
+      # The same installer and lock as ci.yml's 3.14 legs, unlike py315-canary.yml: this canary
+      # measures the interpreter patch, so everything else is held to what those legs install.
+      - name: Set up uv
+        if: steps.setup.outcome == 'success'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
       - name: Install the engine (dev and CI extras)
         id: install
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --constraint constraints.lock -e ".[$EXTRAS]"
+          uv pip install --system --constraint constraints.lock -e ".[$EXTRAS]"
 
       # A smoke of the engine suite with the same selection the required legs use. Its result goes in
       # the verdict and the summary; read the log for which tests failed and why.
@@ -139,6 +169,7 @@ jobs:
           SUITE: ${{ steps.suite.outcome }}
           VERSION: ${{ steps.probe.outputs.version }}
           PIN: ${{ steps.probe.outputs.pin }}
+          NEWEST: ${{ steps.probe.outputs.newest }}
           NEWER: ${{ steps.probe.outputs.newer }}
           SUITE_SUMMARY: ${{ steps.suite.outputs.summary }}
         run: |
@@ -171,6 +202,7 @@ jobs:
             echo "| Step | Outcome |"
             echo "| --- | --- |"
             echo "| provision the newest 3.14 | $SETUP (${VERSION:-n/a}) |"
+            echo "| newest stable 3.14 in the manifest | ${NEWEST:-n/a} |"
             echo "| pinned in ci/python-version | ${PIN:-n/a} |"
             echo "| newer than the pin | ${NEWER:-n/a} |"
             echo "| install | $INSTALL |"
