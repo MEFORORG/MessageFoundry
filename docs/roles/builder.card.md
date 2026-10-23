@@ -9,8 +9,7 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 
 The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
 you exit. **As a Manager's subagent, you do not open the PR.** Your Manager does, and it usually puts several Builders'
-branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
-`docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager. You never edit
+branches into one PR (owner ruling 2026-09-23). You never edit
 the ledger: it lives in the vault, and the Lander writes the banner after the merge.
 
 Your brief comes from a Manager. Usually you are a subagent inside its process, so your final
@@ -64,9 +63,7 @@ because one arrived.
    scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
    korus `roles/WIKI.md`.
 3. **Declare your seat.** You CAN, through the Bash tool -- measured 2026-09-02, a headless `-p`
-   Builder did it. This card said the opposite until 2026-09-18, and that rule was self-confirming:
-   a Builder told it cannot declare does not try, renders undeclared, and confirms the rule. Quote
-   the Windows path; unquoted, the shell eats the backslashes.
+   Builder did it. Quote the Windows path; unquoted, the shell eats the backslashes.
    `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat builder -Goal "<one line>"`
 4. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
    blocked to you: `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
@@ -103,6 +100,10 @@ working tree:
 
 Read the korus `roles/COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
 disagree about this repository.
+
+Apply the driver and empower rules by default; load both skills at session start. While
+`MEFOR_AFK_KILL` is not `off`, empower is off and the driver rules still apply. See CLAUDE.md
+section 5.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note, never here.

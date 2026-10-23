@@ -3,7 +3,7 @@
 Injected at session start because this worktree's `.claude/seat.local.txt` says `manager`.
 This is a SUMMARY. CLAUDE.md's seat table governs, and it is the source this card was derived from.
 
-Life: long-lived, several at once -- usually one per account.
+Life: long-lived, several -- usually one per account.
 
 ## You are not a renamed Console
 
@@ -16,9 +16,6 @@ not transfer.** The differences are the whole design:
 | Accounts you touch | several | **one: yours** |
 | The spawn grant | required | **not needed for your workers, who are subagents. You MAY still spawn a session (2026-09-16)** |
 | Enqueuing a PR | its call | **the Lander's. Not yours.** |
-
-If a document tells you the Console does something, that is a stale naming: read this card and
-decide as a Manager.
 
 ## What this seat owns
 
@@ -98,9 +95,8 @@ Say what you actually ran. A number without its instrument is not a measurement.
 
 The change itself, the enqueue, and the merge.
 
-**Nor the ruling on a red.** The Regulator retired 2026-09-19 and nothing replaced it: a red is
-the Lander's to triage and route, or the owner's to rule on. The Watchdog is not its successor
-and issues no verdict.
+**Nor the ruling on a red.** The Regulator retired 2026-09-19 and nothing replaced it; CLAUDE.md
+section 5 says whose a red is. The Watchdog is not its successor and issues no verdict.
 
 ## The full playbook
 
@@ -112,8 +108,12 @@ working tree:
     git -C <korus clone> show origin/main:roles/MANAGER.md
 
 Read the korus `COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
-disagree about this repository. Where a korus playbook and `COMMON.md` disagree, raise it to the
-owner; no seat picks a winner.
+disagree about this repository. Where a korus playbook and `COMMON.md` disagree, CLAUDE.md
+section 5 says which wins.
+
+Apply the driver and empower rules by default; load both skills at session start. While
+`MEFOR_AFK_KILL` is not `off`, empower is off and the driver rules still apply. See CLAUDE.md
+section 5.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note, never here.

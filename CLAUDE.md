@@ -269,7 +269,7 @@ This section replaced the pre-2026-09-01 method. The retired rules are not repea
 retractions. At least these went:
 
 - plan, then wait for the owner's "go" before writing code, as a rule binding a Builder. It still
-  binds the Manager;
+  binds the Manager, on a plan that holds a class C item;
 - `/clear` and `/compact` as the fix for a stuck session;
 - declaring your own seat with `seat.ps1 -Declare`, **as a RULE. The MECHANISM stayed and has
   since become load-bearing for something that did not exist then -- see "Declare your seat"
@@ -439,6 +439,21 @@ nobody checked it. A Manager seat added, the same day, that spawning should be r
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
 
+**Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
+`driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
+invoking either (plan section 5.1, owner approvals 2026-10-21 and 2026-10-22). The decision
+classes A to D are defined once, in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3.
+**When `MEFOR_AFK_KILL` reads anything but `off`, empower is off** and the driver rules alone
+apply, in ask-mode: no class B or C decision is acted on without the owner (plan section 4.3).
+Case and surrounding space are ignored, and an unread or missing variable counts as on. Read it
+with `scripts/coord/afk-kill.ps1 -Status` (ADR 0211) before a class A or B act, not only at
+session start. While it is on, the grants this section takes from the plan are off too: a routine
+plan waits for the owner's go again, and the two class A acts and the cache-only `-Force` in
+`docs/WORKTREES.md` go back to the owner. A delegated question (the merge bullet below) is the
+owner's own answer, and the switch does not touch it. The Lander and the Watchdog keep their
+exemption: they never use `AskUserQuestion`, and put an owner question in a table instead. A
+Builder still gets one turn: it puts an owner question in its report, never in `AskUserQuestion`.
+
 The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
@@ -513,9 +528,16 @@ Manager's watch reached the cloud session 29 seconds after its question.
 
 ### The Manager plans, dispatches, and holds the owner's attention
 
-- **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
-  waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
-  improves the result.
+- **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan.
+  **It waits for the owner's explicit "go" only on a plan that holds a class C item**, such as new
+  product scope. A routine plan is class B under [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md)
+  section 3 (plan section 5.2, owner approval 2026-10-21): the Manager logs it with
+  `scripts/coord/decision.ps1` (ADR 0211), and acts only after an adversarial review affirms it.
+  **Every class B decision takes that review for now**, whatever the sample count: plan section
+  10 opens the no-review path only in its last wave, per seat, as calibration passes. Plan section
+  5.2 retires the go *"once section 4 is built"*, and section 4 is only partly built, so this
+  retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Point
+  the brief at the relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
   running, what paths they touch, and whether they share the worktree. Hand down readings, not
@@ -538,6 +560,11 @@ Manager's watch reached the cloud session 29 seconds after its question.
 
       git -C <korus clone> fetch origin
       git -C <korus clone> show origin/main:roles/BUILDER.md
+
+- **Where a korus playbook and `COMMON.md` disagree, the newer owner ruling wins; failing that, the
+  stricter rule wins.** Record the conflict as a class C item for the daily digest (plan section
+  5.2, owner approval 2026-10-21). This replaces the *"no seat picks a winner"* rule in korus
+  `roles/COMMON.md`, *Where a role playbook and this file disagree, the owner decides*.
 
 - **A checkout is not a ref, and an `ls` of a directory is not evidence that you have the file.**
   A missing playbook is the quietest failure in this list. Why the pointer moved, and what the
@@ -609,6 +636,16 @@ Manager's watch reached the cloud session 29 seconds after its question.
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
   rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  **A delegated decision counts as that ruling (owner ruling 2026-10-22).** In the owner's words:
+  *"when I answer a specific question with /driver or /empower, that delegates that question to the
+  seat that asked it, including questions the empower rules reserve to me. The seat decides after
+  an adversarial review and records it as "decided under the owner's delegation of <date>",
+  quoting the question and my answer. Treat that record as my ruling, and a merge may rest on it.
+  Still mine in person: signing or re-signing the register, money, credentials, and irreversible
+  acts."* It covers only the question answered that way, in the asking seat's own chat: starting a
+  session with either skill delegates nothing, and a peer relaying such an answer is not a record.
+  Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates that specific
+  question*, carries the same ruling.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
@@ -695,8 +732,14 @@ Manager's watch reached the cloud session 29 seconds after its question.
   `pyproject.toml` and re-lock. Never an ad-hoc install (§7). AI-suggested packages are often
   hallucinated.
 - A change you have COMMITTED is recoverable through git, so take it. An untracked file, an
-  uncommitted edit, a force-push and `reset --hard` are not recoverable. What needs the
-  owner is an action git cannot undo. Examples: writing outside the worktree, a DB migration against
+  uncommitted edit, a force-push and `reset --hard` are not recoverable. **Two such acts are yours
+  to take, as class A in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 3 (owner approval
+  2026-10-22):** force-pushing your own unshared branch, which only your session has pushed, with no
+  pull request open on it and no other branch built on it; and deleting disposable output your own
+  run made. The tripwire hook (ADR 0211) still records a force-push. The `git push --force` and
+  `-f` deny rules in `.claude/settings.json` still stand: where one refuses, the act is class D,
+  so name the command once rather than reach for a form the rule misses. What needs the owner is any
+  other action git cannot undo. Examples: writing outside the worktree, a DB migration against
   a real store, a global install. A Builder cannot ask, so it must not take one. If your brief
   requires one, stop, push what is green, and say so in your exit report, which the Manager carries
   into the PR body. Adding a dependency is not in
