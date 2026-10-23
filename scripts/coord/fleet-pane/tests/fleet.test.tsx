@@ -306,7 +306,7 @@ test('an old poll inside the poller back-off is not flagged as stopped', async (
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /POLLER STOPPED/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /backing off until/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /backing off/ }))?.text).toBe('poller backing off for 14 more min')
   await ui.unmount()
 })
 
@@ -338,9 +338,9 @@ test('the stopped-poller rule follows the poller: back-off, its 2 h cap, then on
   expect(looksStopped(cache(null), at('2026-10-23T15:26:00Z'))).toBe(true)
   // Inside a back-off, and in the scheduled interval right after it ends, it is not.
   expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:26:00Z'))).toBe(false)
-  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:41:00Z'))).toBe(false)
-  // Once that interval has passed with no new poll, it is.
-  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:43:00Z'))).toBe(true)
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:43:00Z'))).toBe(false)
+  // Once that interval and the pane's own read lag have passed with no new poll, it is.
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:44:00Z'))).toBe(true)
   // A stamp the poller would ignore (over 2 h past the poll that wrote it) holds nothing back.
   expect(looksStopped(cache('2026-10-24T14:00:00Z'), at('2026-10-23T15:26:00Z'))).toBe(true)
 })

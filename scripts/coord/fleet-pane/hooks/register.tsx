@@ -12,6 +12,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { FleetLane, FleetPrs, FleetSeat, FleetSection, FleetUsage } from '../types'
 import {
   ageWords,
+  backOffUntil,
   firstLine,
   isBackingOff,
   isOurOrigin,
@@ -287,7 +288,9 @@ export const register: Register = on => {
               </Text>
             )}
             {isBackingOff(pd, t) && (
-              <Text color="yellow">{cut(`poller backing off until ${pd.nextPollNotBefore}`)}</Text>
+              <Text color="yellow">
+                {cut(`poller backing off for ${Math.ceil(((backOffUntil(pd) ?? t) - t) / 60000)} more min`)}
+              </Text>
             )}
             {pd.pollError !== null && (
               <Text color="red">

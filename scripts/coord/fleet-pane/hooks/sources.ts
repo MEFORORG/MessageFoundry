@@ -187,8 +187,10 @@ export const isOurOrigin = (url: string): boolean => OUR_REMOTE.test(url)
 // clock or a copied file (pr_state.py, main), so the pane does too, measured from the poll that
 // wrote it.
 const MAX_BACKOFF_MS = 2 * 3600000
-// The poller runs every 2 minutes, plus START_SLACK; after a back-off its next poll is that far off.
-const POLL_GRACE_MS = 2 * 60000 + 15000
+// After a back-off the next poll is up to one 2-minute task interval away (plus START_SLACK), and
+// the pane sees it only at its own next read of the file, every 30 s. A further 30 s covers the
+// poll's own run time.
+const POLL_GRACE_MS = 2 * 60000 + 15000 + 30000 + 30000
 // The poller writes every 2 minutes; a poll older than this means it has stopped.
 const PR_STALE_MS = 10 * 60000
 
