@@ -223,6 +223,31 @@ def test_the_seat_file_is_found_by_seat_ps1s_session_key(sb: Sandbox) -> None:
 
 
 @pytest.mark.parametrize(
+    ("legacy_box", "new_box"),
+    [
+        pytest.param("aaa-legacy", "zzz-hosted", id="legacy-listed-first"),
+        pytest.param("zzz-legacy", "aaa-hosted", id="hosted-listed-first"),
+    ],
+)
+def test_the_newest_seat_record_wins_when_a_legacy_box_holds_the_same_session(
+    sb: Sandbox, legacy_box: str, new_box: str
+) -> None:
+    """A session that declared before the host joined the box key has a frozen record in the
+    path-only box and a live one in the host-keyed box (docs/COORD-SHARED-ROOT.md, step 4). The
+    seat is the one the newer record names, whichever box the directory listing returns first."""
+    seats = sb.coord / "seats"
+    old = {"seat": "builder", "asOf": "2026-10-20T08:00:00Z", "writes": 9}
+    live = {"seat": "manager", "asOf": "2026-10-22T08:00:00Z", "writes": 2}
+    for box, rec in ((legacy_box, old), (new_box, live)):
+        (seats / box).mkdir(parents=True)
+        (seats / box / "sess-test-0001.json").write_text(json.dumps(rec), encoding="utf-8")
+    args = ("-Log", "-Item", "1", "-Class", "B", "-Recommendation", "x", "-NoPost")
+    proc = sb.run(DECISION, *args)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert _list(sb)[0]["seat"] == "manager"
+
+
+@pytest.mark.parametrize(
     ("args", "needs"),
     [
         pytest.param(("-Log", "-Class", "B", "-Seat", "m"), "Item, Recommendation", id="decision"),

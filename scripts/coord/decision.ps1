@@ -101,17 +101,35 @@ function Resolve-SeatFromRegistry([string]$Sid) {
     # seat.ps1 keeps a Codex session's records in their own directory.
     $seats = Join-Path $coord $(if ($env:KORUS_AGENT -eq 'codex') { 'codex-seats' } else { 'seats' })
     if (-not [System.IO.Directory]::Exists($seats)) { return '' }
+    # ONE SESSION CAN HAVE A RECORD IN TWO BOXES. Since the box key hashes the host as well as the
+    # path (docs/COORD-SHARED-ROOT.md, step 4), a session that declared before that change keeps a
+    # frozen record under the path-only key, and seat.ps1 writes on under the host-keyed one. The
+    # directory listing order says nothing about which is current, so take the record written LAST,
+    # by its own asOf and then its write count: the rule seat.ps1 uses to pick its prior.
+    $best = $null
     foreach ($box in [System.IO.Directory]::EnumerateDirectories($seats)) {
         $f = Join-Path $box "$Sid.json"
-        if ([System.IO.File]::Exists($f)) {
-            try {
-                $s = ([System.IO.File]::ReadAllText($f) | ConvertFrom-Json).seat
-                if ($s) { return [string]$s }
-            } catch {
-                return ''
+        if (-not [System.IO.File]::Exists($f)) { continue }
+        try {
+            $r = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+            $s = if ($r.PSObject.Properties.Name -contains 'seat') { [string]$r.seat } else { '' }
+            if (-not $s) { continue }
+            $at = [datetime]::MinValue
+            if ($r.PSObject.Properties.Name -contains 'asOf' -and $r.asOf) {
+                $at = if ($r.asOf -is [datetime]) { $r.asOf.ToUniversalTime() }
+                      else { [datetime]::Parse([string]$r.asOf, [cultureinfo]::InvariantCulture,
+                              [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal) }
             }
+            $n = if ($r.PSObject.Properties.Name -contains 'writes') { [int]$r.writes } else { 0 }
+        } catch {
+            # An unreadable record names no seat; another box may still hold a readable one.
+            continue
+        }
+        if (-not $best -or $at -gt $best.At -or ($at -eq $best.At -and $n -gt $best.Writes)) {
+            $best = [pscustomobject]@{ Seat = $s; At = $at; Writes = $n }
         }
     }
+    if ($best) { return $best.Seat }
     return ''
 }
 
