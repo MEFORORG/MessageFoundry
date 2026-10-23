@@ -1068,6 +1068,14 @@ def test_a_spent_rate_budget_prints_the_resume_line(tmp_path: Path) -> None:
     assert resume_lines(run.out) == [resume(1)]
 
 
+def test_a_budget_below_the_start_floor_prints_the_resume_line(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {"rate_limit": [rate(10)]}, "-AfterCommentId", "7")
+    assert run.code == 1
+    assert "refusing to start" in run.err
+    assert resume_lines(run.out) == [resume(7)]
+    assert run.paths() == ["rate_limit"]
+
+
 def test_a_permanent_failure_prints_no_resume_line(tmp_path: Path) -> None:
     run = wait_comment(tmp_path, {PR_PATH: [ok({**pr(), "user": None})], COMMENTS: [ok([OLD])]})
     assert run.code == 1
@@ -1129,6 +1137,48 @@ def test_a_required_context_is_matched_ordinally(tmp_path: Path) -> None:
     assert run.code == 2, run.err
     assert "required not reported=1" in run.out
     assert "met:" not in run.out
+
+
+def test_an_empty_base_ref_still_reads_the_required_set(tmp_path: Path) -> None:
+    """An empty base must not pass for the base already read, or one run would meet the wait."""
+    lint = {"name": "lint", "status": "completed", "conclusion": "success"}
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr(base=""))],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [lint]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code != 0
+    assert "met:" not in run.out
+    assert f"repos/{REPO}/branches/" in run.paths()
+
+
+def test_a_retarget_reads_the_required_set_again(tmp_path: Path) -> None:
+    lint = {"name": "lint", "status": "completed", "conclusion": "success"}
+    unprotected = [ok({"protected": False})]
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr()), ok(pr(base="release"))],
+            BRANCH_PATH: unprotected,
+            RULES_PATH: [ok([])],
+            f"repos/{REPO}/branches/release": unprotected,
+            f"repos/{REPO}/rules/branches/release?per_page=100&page=1": [ok([])],
+            RUNS_PATH: [
+                ok({"total_count": 0, "check_runs": []}),
+                ok({"total_count": 1, "check_runs": [lint]}),
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert run.paths().count(BRANCH_PATH) == 1
+    assert run.paths().count(f"repos/{REPO}/branches/release") == 1
+    assert "no required contexts on release" in run.out
 
 
 def test_two_required_contexts_that_differ_by_an_invisible_character_are_both_required(
