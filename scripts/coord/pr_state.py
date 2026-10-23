@@ -351,6 +351,7 @@ def required_verdict(
         out["reason"] = "context page truncated; no required verdict from a partial page"
         out["unknown"] = sorted(req | flagged)
         return out
+    stale_names: list[str] = []
     # A check GitHub calls required counts even when the cached list does not name it yet.
     for name in sorted(req | flagged):
         named = [n for n in nodes if pr_checks.name_of(n) == name]
@@ -368,10 +369,13 @@ def required_verdict(
             # GitHub abandoned this run and never re-runs it, so waiting is wrong: it needs a
             # re-run, as a failure does.
             failing = 1
+            stale_names.append(name)
         if failing:
             out["failing"].append(name)
         elif unsettled:
             out["pending"].append(name)
+    if stale_names:
+        out["reason"] = f"needs a re-run: {', '.join(stale_names)} STALE (GitHub never re-runs it)"
     if out["failing"]:
         out["state"] = "FAILURE"
     elif out["pending"] or out["missing"]:
@@ -384,7 +388,9 @@ def required_verdict(
 
 
 def _speaker(runs: list[Any]) -> Any:
-    """The run that speaks for one name: clear_stale_ci_red.newest_by_name's rule, on GraphQL fields.
+    """The run that speaks for one name: modelled on clear_stale_ci_red.newest_by_name, on GraphQL
+    fields, and different from it in two ways. On equal timestamps the worse verdict wins, where
+    newest_by_name has no tie-break. A STALE run ranks as failing in that tie-break.
 
     A run still IN PROGRESS beats a finished one outright; a head can carry two concurrent runs of
     a name and the earlier-started one can finish last. Among finished runs the latest start wins,
@@ -398,8 +404,10 @@ def _speaker(runs: list[Any]) -> Any:
             return (0, "", 1)
         stamp = run.get("startedAt") or run.get("createdAt")
         failing, unsettled = pr_checks.counts([run])
-        # Ties go to the worse verdict, so equal stamps never leave the answer to list order.
-        worse = 2 if failing else 1 if unsettled else 0
+        # Ties go to the worse verdict, so equal stamps never leave the answer to list order. STALE
+        # ranks with failing: counts() reads it as neither, but a required STALE run is red here.
+        stale = pr_checks.verdict_of(run) == pr_checks.STALE
+        worse = 2 if failing or stale else 1 if unsettled else 0
         return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""), worse)
 
     return max(runs, key=key)
@@ -488,7 +496,10 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         prev.get("requiredContexts") if isinstance(prev.get("requiredContexts"), list) else None
     )
     required_at = prev.get("requiredContextsFetchedAt")
-    required_error: str | None = None
+    # Carried from the last attempt until the next one, so a gated poll does not erase why the
+    # list is missing.
+    carried = prev.get("requiredContextsError")
+    required_error: str | None = carried if isinstance(carried, str) else None
     fetched = parse_iso(required_at)
     if fetched is not None and fetched > now:
         fetched = None  # a future stamp is a skewed clock, so refresh rather than trust it
@@ -507,6 +518,7 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         try:
             required = fetch_required(gh, repo)
             required_at = iso(now)
+            required_error = None
         except (GhError, PollError) as exc:
             # A stale list beats none; it is labelled with its own age. No list leaves every PR UNKNOWN.
             required_error = str(exc)

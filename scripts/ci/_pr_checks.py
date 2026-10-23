@@ -31,7 +31,8 @@ PASSING = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
 #: A CheckRun conclusion GitHub gives a run it abandoned after 14 days. counts() reads it as neither
 #: failing nor unsettled, as it always has, so an optional stale run never hides a stalled PR from
-#: check_stalled_prs. pr_state reads a STALE REQUIRED run as failing: GitHub never re-runs it.
+#: check_stalled_prs. pr_state reads a STALE REQUIRED run as failing, since GitHub never re-runs it,
+#: and ranks it as failing when it breaks a tie between same-named runs.
 STALE = "STALE"
 
 #: StatusContext ``state`` values that mean it has not reported. ``EXPECTED`` is a status that has

@@ -716,7 +716,7 @@ poll keeps the last good data and marks it stale. The fields:
 | `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
 | `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
 | `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
-| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. |
+| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the last reading any query returned, which may be older than `fetchedAt`. |
 | `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. |
 | `data` | The last good poll, or null if there never was one. |
 | `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
@@ -745,7 +745,8 @@ handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releas
 process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
 means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
 cannot open or lock the file at all exits 4 and writes nothing, so a broken lock shows as an ageing
-`fetchedAt` and in the log. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+`fetchedAt`, and in the log when the log can be written. If it cannot, the exit code is the only
+signal. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
 `mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
 
 ```powershell
@@ -757,8 +758,9 @@ pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <thi
 
 The task runs `pythonw.exe -I` on the primary checkout's copy, so no window opens. It runs as you, at
 run level Limited, because gh reads its token from your keyring. Every 2 minutes it runs whatever
-`pr_state.py`, `coord_root.py`, `_pr_checks.py` and `required_contexts.py` the primary checkout holds,
-with your token, whether or not any session is running, and nothing checks those files first. That
+poller files the primary checkout holds, at least `pr_state.py`, `coord_root.py`, `_pr_checks.py` and
+`required_contexts.py`, with your token, whether or not any session is running. Nothing checks those
+files first. That
 is more exposure than the checkout's `.claude/settings.json` hooks, which run only when a session
 starts there. A change to any of those files in the primary checkout runs, unattended, within two
 minutes. The installer refuses inside Claude Code and on any machine
