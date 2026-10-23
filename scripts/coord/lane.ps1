@@ -106,12 +106,23 @@ $file     = Join-Path $lanesDir "$boxKey.json"
 $rec = $null
 $recFault = $null
 if (Test-Path -LiteralPath $file) {
-    try { $rec = Read-CoordText $file | ConvertFrom-Json }
+    try {
+        $rec = Read-CoordText $file | ConvertFrom-Json
+        # An empty file, or JSON that is not an object (0, null, "", [], 1, [1, 2]), is not a lane
+        # record, and nor is {}: an object with no fields records nothing to judge or keep.
+        if ($rec -isnot [System.Management.Automation.PSCustomObject]) {
+            $recFault = 'it is not a JSON object'
+        } elseif (@($rec.PSObject.Properties).Count -eq 0) {
+            $recFault = 'it is an empty JSON object'
+        }
+    }
     catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { $rec = $null }
     catch { $recFault = $_.Exception.Message }
 }
-# FAIL CLOSED. The host refusal below needs the record read, so a record that exists but cannot be
-# read or parsed must not be taken as no record and replaced. -Show reads it again on its own.
+# FAIL CLOSED. The host refusal below needs the record read, so a record file that exists but cannot
+# be read, parsed, or taken as a record must not be taken as no record and replaced. Only a missing
+# file means no record. A record with fields but no `host` is still this machine's, as below.
+# -Show reads it again on its own.
 if (-not $Show -and $recFault) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the lane record at $file exists but could not be read ($recFault). Nothing was written. Read it with -Show; if it is damaged rather than busy, move it out of $lanesDir by hand and state this lane's level again.")
     exit 2
