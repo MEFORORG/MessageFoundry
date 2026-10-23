@@ -931,9 +931,10 @@ def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028). When it
     logs is in ``docs/CONFIGURATION.md``, *``serve`` names an environment proxy at start*.
 
-    Keyed by a digest of the raw value rather than the value, so the set holds no credential,
-    and rather than the label, so an already-named proxy costs one hash rather than a parse on
-    each send (the Transit cipher sends once per stored cell)."""
+    Keyed by a digest of the raw value rather than the value, so this set adds no copy of it.
+    That protects no credential: the process already holds the raw URL, at least in the proxy
+    manager and the environment. Keyed by it rather than the label, so an already-named proxy costs
+    one hash rather than a parse on each send (the Transit cipher sends once per stored cell)."""
     if not proxy:
         return
     digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
