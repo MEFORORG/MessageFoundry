@@ -118,7 +118,7 @@ from messagefoundry.config.tls_policy import (
     revocation_hop_disposition,
     tls_revocation_attested,
 )
-from messagefoundry.transports.ambient_proxy import disclose_vault_hop_proxy
+from messagefoundry.transports.ambient_proxy import proxy_label, vault_hop_proxy_warning
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     EgressReplyError,
@@ -542,8 +542,9 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # Vault BACKLOG #2983: checked at construction too. This catches a proxy that appeared
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
-        # Vault BACKLOG #4028: after every refusal above, so only a send that goes ahead is named.
-        disclose_vault_hop_proxy(self._connector, proxy, logger)
+        # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
+        # A refusal at connect time, such as of the proxy's CONNECT reply, can still follow.
+        _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
     def _checks_revocation(self) -> bool:
@@ -914,6 +915,21 @@ def _first_crossing(connector: str, kind: str) -> bool:
             return False
         _CROSSINGS_LOGGED.add(key)
         return True
+
+
+def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
+    """Log :func:`~messagefoundry.transports.ambient_proxy.vault_hop_proxy_warning` the first
+    time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028).
+
+    Deduplicated by :func:`_first_crossing`, so the Transit cipher, which sends once per stored
+    cell, logs once per proxy. The key is the proxy's label, never its URL, so the set holds no
+    credential. Two consequences: two proxies that are both unreadable share one key, and a hop
+    that goes back to a proxy it already named does not name it again."""
+    if not proxy:
+        return
+    label = proxy_label(proxy)
+    if _first_crossing(connector, f"ambient proxy {label}"):
+        logger.warning("%s", vault_hop_proxy_warning(connector, label))
 
 
 def _refuse_an_unrevoked_vault_hop(

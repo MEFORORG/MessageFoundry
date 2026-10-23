@@ -22,14 +22,12 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.transports import ambient_proxy
-from messagefoundry.transports.ambient_proxy import disclose_vault_hop_proxy
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # The cleartext-hop tests' stand-in proxy: a loopback socket that hangs up on every connection.
 from tests.test_vault_cleartext_hop import _closed_port, _Listener
 
-_VAULT_EXTRA = pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
     reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
 )
@@ -52,13 +50,14 @@ def _clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     # With no *_proxy variable left, urllib falls back to the host's own system proxy.
     monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
     monkeypatch.setattr(urllib.request, "getproxies_macosx_sysconf", dict, raising=False)
-    monkeypatch.setattr(ambient_proxy, "_VAULT_DISCLOSED", set())
-    if extra_is_installed(OPTIONAL_EXTRAS["vault"]):
-        # hvac reads these once, at import, so unsetting the env vars would not undo them.
-        import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
+    from messagefoundry.transports import strict_requests
 
-        for name in ("VAULT_CACERT", "VAULT_CAPATH", "VAULT_CLIENT_CERT", "VAULT_CLIENT_KEY"):
-            monkeypatch.setattr(hvac.v1, name, None, raising=False)
+    monkeypatch.setattr(strict_requests, "_CROSSINGS_LOGGED", set())
+    # hvac reads these once, at import, so unsetting the env vars would not undo them.
+    import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
+
+    for name in ("VAULT_CACERT", "VAULT_CAPATH", "VAULT_CLIENT_CERT", "VAULT_CLIENT_KEY"):
+        monkeypatch.setattr(hvac.v1, name, None, raising=False)
 
 
 @pytest.fixture
@@ -77,13 +76,18 @@ def _disclosures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 # --- the disclosure itself ------------------------------------------------------------------------
 
 
+def _disclose(connector: str, proxy: str | None) -> None:
+    from messagefoundry.transports.strict_requests import _disclose_ambient_proxy
+
+    _disclose_ambient_proxy(connector, proxy)
+
+
 def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    log = logging.getLogger("test.vault_hop_proxy")
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
-            disclose_vault_hop_proxy(_KV, f"http://alice:{_SECRET}@proxy.example:3128", log)
+            _disclose(_KV, f"http://alice:{_SECRET}@proxy.example:3128")
     records = _disclosures(caplog)
     assert len(records) == 1, caplog.text
     text = records[0].getMessage()
@@ -93,23 +97,25 @@ def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
         "http://proxy.example:3128. "
     )
     assert "No engine setting names it" in text
-    assert "no_proxy" in text and "vault BACKLOG #4028" in text
+    assert "no_proxy" in text and "the system bypass list" in text
+    assert "vault BACKLOG #4028" in text
     assert "alice" not in text and _SECRET not in text and "@" not in text
 
 
 def test_a_new_proxy_or_another_hop_is_named_again(caplog: pytest.LogCaptureFixture) -> None:
-    log = logging.getLogger("test.vault_hop_proxy")
     with caplog.at_level(logging.WARNING):
-        disclose_vault_hop_proxy(_KV, "http://proxy.example:3128", log)
-        disclose_vault_hop_proxy(_KV, "http://other.example:8080", log)
-        disclose_vault_hop_proxy("Vault KEK unwrap", "http://proxy.example:3128", log)
+        _disclose(_KV, "http://proxy.example:3128")
+        _disclose(_KV, "http://other.example:8080")
+        _disclose("Vault transit key provider", "http://proxy.example:3128")
+        # Going back to a proxy already named for this hop does not name it again.
+        _disclose(_KV, "http://proxy.example:3128")
     assert len(_disclosures(caplog)) == 3, caplog.text
 
 
 @pytest.mark.parametrize("proxy", [None, ""])
 def test_no_proxy_logs_nothing(proxy: str | None, caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
-        disclose_vault_hop_proxy(_KV, proxy, logging.getLogger("test.vault_hop_proxy"))
+        _disclose(_KV, proxy)
     assert caplog.records == []
 
 
@@ -117,9 +123,7 @@ def test_a_proxy_value_that_does_not_parse_is_named_unreadable_never_echoed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        disclose_vault_hop_proxy(
-            _KV, f"http://alice:{_SECRET}@proxy.example:3128 ", logging.getLogger("test.x")
-        )
+        _disclose(_KV, f"http://alice:{_SECRET}@proxy.example:3128 ")
     text = _disclosures(caplog)[0].getMessage()
     assert f"{_PICKED}an unreadable value." in text
     assert _SECRET not in text and "proxy.example" not in text
@@ -155,7 +159,6 @@ def _send(client: Any) -> None:
         client.adapter.get("v1/auth/token/lookup-self")
 
 
-@_VAULT_EXTRA
 @_CLIENTS
 @pytest.mark.parametrize("variable", ["HTTPS_PROXY", "ALL_PROXY"])
 def test_each_vault_client_names_the_environment_proxy_it_sends_by(
@@ -182,7 +185,6 @@ def test_each_vault_client_names_the_environment_proxy_it_sends_by(
     assert f"{_PICKED}{listener.url}." in records[0].getMessage()
 
 
-@_VAULT_EXTRA
 @_CLIENTS
 def test_a_proxy_set_after_the_client_is_built_is_named_on_the_send_that_picks_it_up(
     build: Any,
@@ -201,7 +203,6 @@ def test_a_proxy_set_after_the_client_is_built_is_named_on_the_send_that_picks_i
     assert len(_disclosures(caplog)) == 1, caplog.text
 
 
-@_VAULT_EXTRA
 def test_control_a_direct_send_or_a_bypassed_host_names_no_proxy(
     monkeypatch: pytest.MonkeyPatch, listener: _Listener, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -220,7 +221,37 @@ def test_control_a_direct_send_or_a_bypassed_host_names_no_proxy(
     assert _disclosures(caplog) == []
 
 
-@_VAULT_EXTRA
+def test_control_a_send_with_no_proxy_set_names_none(caplog: pytest.LogCaptureFixture) -> None:
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+
+    client = secretprovider_vault._build_client(
+        f"https://127.0.0.1:{_closed_port()}", _TOKEN, revocation_attested=True
+    )
+    with caplog.at_level(logging.WARNING), pytest.raises(requests.exceptions.RequestException):
+        client.adapter.get("v1/auth/token/lookup-self")
+    assert _disclosures(caplog) == []
+
+
+def test_a_send_refused_for_revocation_is_not_disclosed_as_picked(
+    monkeypatch: pytest.MonkeyPatch, listener: _Listener, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A proxy set after start takes a loopback Vault off the box, and the send-time revocation
+    guard then refuses it (vault BACKLOG #2983). Mutation: disclose before that guard; red."""
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    client = secretprovider_vault._build_client(
+        f"https://127.0.0.1:{_closed_port()}", _TOKEN, revocation_attested=False
+    )
+    monkeypatch.setenv("HTTPS_PROXY", listener.url)
+    with caplog.at_level(logging.WARNING), pytest.raises(InsecureHopRefused):
+        client.adapter.get("v1/auth/token/lookup-self")
+    assert listener.connections == 0
+    assert _disclosures(caplog) == []
+
+
 def test_a_refused_send_is_not_disclosed_as_picked(
     monkeypatch: pytest.MonkeyPatch, listener: _Listener, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -242,7 +273,6 @@ def test_a_refused_send_is_not_disclosed_as_picked(
 # --- the commands that reach Vault outside serve and supervise ------------------------------------
 
 
-@_VAULT_EXTRA
 def test_check_privileges_names_the_proxy_its_vault_probe_sends_by(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -279,7 +309,6 @@ def test_check_privileges_names_the_proxy_its_vault_probe_sends_by(
     assert _TOKEN not in caplog.text
 
 
-@_VAULT_EXTRA
 def test_verify_names_the_proxy_its_oidc_credential_read_sends_by(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

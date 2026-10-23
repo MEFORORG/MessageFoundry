@@ -15,7 +15,7 @@ could be wrong, so the per-hop facts live once, in ``docs/CONFIGURATION.md``, *`
 environment proxy at start*, and the warning points there.
 
 **The Vault hop also discloses at the point of use (vault BACKLOG #4028):** see
-:func:`disclose_vault_hop_proxy`. Why, and what it covers, is in the same
+:func:`vault_hop_proxy_warning`. Why, and what it covers, is in the same
 ``docs/CONFIGURATION.md`` section.
 """
 
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import threading
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
@@ -34,8 +33,9 @@ from messagefoundry.config.wiring import _split_address
 
 __all__ = [
     "ambient_proxy_warning",
-    "disclose_vault_hop_proxy",
     "environment_proxy_hosts",
+    "proxy_label",
+    "vault_hop_proxy_warning",
     "warn_ambient_proxy",
 ]
 
@@ -196,36 +196,24 @@ def warn_ambient_proxy(logger: logging.Logger) -> None:
         logger.warning("%s", text)
 
 
-#: The (hop, proxy label) pairs this process has disclosed, so a hop that sends once per stored
-#: cell logs once per proxy rather than once per send. A label, never the raw URL, so the set holds
-#: no proxy credential.
-_VAULT_DISCLOSED: set[tuple[str, str]] = set()
-_VAULT_DISCLOSED_LOCK = threading.Lock()
+def proxy_label(value: object) -> str:
+    """One proxy URL as ``scheme://host:port``, or "an unreadable value". It never carries a user
+    or password from the URL, and never raises: the label every disclosure names a proxy by."""
+    return _label(value)
 
 
-def disclose_vault_hop_proxy(connector: str, proxy: str | None, logger: logging.Logger) -> None:
-    """Log one WARNING the first time this process sends ``connector``'s Vault request by way of
-    ``proxy``, the URL ``requests.utils.select_proxy`` returned for the send. No proxy logs
-    nothing. ``docs/CONFIGURATION.md``, in the section :data:`_POINTER` names, says why.
+def vault_hop_proxy_warning(connector: str, label: str) -> str:
+    """The WARNING a Vault hop logs when ``requests`` picks a proxy for one of its sends (vault
+    BACKLOG #4028). ``label`` is :func:`proxy_label`'s. The engine gives the Vault clients no
+    proxy setting, so the text says the proxy came from the environment or the system settings.
 
-    The Vault clients take no proxy setting: the engine passes ``hvac`` no ``proxies`` and sets
-    none on the session, so the proxy came from the environment or the system settings, which is
-    what the WARNING says. It is named by :func:`_label`, which never carries a user or password
-    and never raises, so neither does this. A new proxy for the same hop is named again."""
-    if not proxy:
-        return
-    label = _label(proxy)
-    with _VAULT_DISCLOSED_LOCK:
-        if (connector, label) in _VAULT_DISCLOSED:
-            return
-        _VAULT_DISCLOSED.add((connector, label))
-    logger.warning(
-        "%s: %s was picked for a request to Vault: %s. No engine setting names it. This logs once "
-        "per proxy for this hop in this process. To send this hop direct, add the Vault host to "
-        "no_proxy, or %s. %s(vault BACKLOG #4028)",
-        connector,
-        _OPENING,
-        label,
-        _CLEAR,
-        _POINTER,
+    The remedy names both bypass lists, because a value in any ``*_proxy`` variable, ``no_proxy``
+    included, makes every hop ignore the system proxy settings."""
+    return (
+        f"{connector}: {_OPENING} was picked for a request to Vault: {label}. No engine setting "
+        "names it. This logs once per proxy for this hop in this process. To send this hop "
+        "direct, add the Vault host to the bypass list of whatever set the proxy: no_proxy for a "
+        "*_proxy variable, or the system bypass list for the system proxy, since setting any "
+        f"*_proxy variable makes every hop ignore the system proxy settings. Or {_CLEAR}. "
+        f"{_POINTER}(vault BACKLOG #4028)"
     )
