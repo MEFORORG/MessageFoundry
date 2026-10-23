@@ -110,6 +110,14 @@ if (Test-Path -LiteralPath $file) {
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
 # path has its own file and this one can never be it. A record under the old path-only key is not
 # read: lane-level.ps1 asks for a fresh level after 15 minutes anyway, so a restatement replaces it.
+# A record at THIS key that still names another host was copied, hand-made, or collided on the short
+# hash. Taking it over would overwrite that lane's stated level with this one's, so a write refuses
+# and says so; -Show only reads, so it prints the record as it is. A record with no `host` was
+# written here, as every record before the field was.
+if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), not of this machine ($thisHost). Nothing was written.")
+    exit 2
+}
 if (-not $rec) {
     $rec = [pscustomobject]@{
         v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
