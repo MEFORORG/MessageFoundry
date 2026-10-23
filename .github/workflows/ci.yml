@@ -1985,8 +1985,8 @@ jobs:
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
     # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, and is
-    # 60/48 now; the paragraphs below are why -- that sentence about sizing a cap close to the observed
-    # run is the rule that moved it, applied to its own tier.
+    # 60/48, and is 78/65 now; the paragraphs below are why -- that sentence about sizing a cap close
+    # to the observed run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -2147,11 +2147,58 @@ jobs:
     # worker count, which the -n 3 paragraphs above leave to BACKLOG #1109; this re-derivation does not
     # touch it.
     #
+    # THE 36:55 TRIGGER BELOW FIRED, AND THE 48-MINUTE CAP STARTED KILLING GREEN WORK, so the caps
+    # are re-derived a third time, 2026-10-23, to 78/65. The step was killed AT 48:07 to 48:08 four
+    # times, at 99 percent with no failure printed: push runs 39904086527 (job 120252005912) and
+    # 39915444027 (job 120287975617) on `main`, and PR 2498's run 39930938959 on both attempts (jobs
+    # 120338855211 and 120484240748). Same method as the 2026-10-07 pool: every ci.yml run created
+    # from 2026-10-16T00:00:00Z to 2026-10-23 about 12:00Z UTC, events push, pull_request and
+    # workflow_dispatch each listed on its own (623 runs; nine job listings returned HTTP 502 and are
+    # missing), jobs with ?filter=all, a row is the `Harness tests (pytest)` STEP keyed on its own
+    # conclusion, duration = its completed_at minus started_at, identical-stamp re-run copies dropped.
+    #
+    #   leg             green n   median   p90     p95     max     step failures
+    #   ubuntu-latest   500       16:16    18:37   20:28   24:35   30, longest 19:43
+    #   windows-2025    434       39:22    43:23   45:08   47:58   15, 4 of them killed at the cap
+    #
+    # 267 of the 434 windows-2025 greens sit above 36:55. The largest green, 47:58, is run
+    # 39733693111 (job 119674474670), 9 seconds under the kill, so this maximum is right-censored
+    # again for the reason recorded above. Daily green medians on that leg ROSE THE WHOLE WEEK:
+    # 31:11 on 2026-10-16, 38:55, 40:19, 34:58, 41:05, 41:30, 42:45, and 44:52 on 2026-10-23. That
+    # is about 14 minutes in a week, and it is GROWTH, not noise.
+    #
+    # THE STEP CAP IS 65 = ceil_minute(1.35x 48:08), the largest killed step, by the same #131 rule as
+    # the 48 it replaces. The JOB cap is 78. Setup terms are the larger of the two pools' maxima:
+    # ubuntu keeps 5:06 (run 37383773400; this pool's ubuntu maximum is 1:37, run 39975213140), and
+    # windows-2025 moves to 4:33 (run 39664551193, job 119446204553), above the old pool's 3:13:
+    #
+    #   ubuntu-latest   setup 5:06, pad 4:30, step cap 65:00: 74:36 of 78:00, slack 3:24
+    #   windows-2025    setup 4:33, pad 4:30, step cap 65:00: 74:03 of 78:00, slack 3:57
+    #
+    # The largest job-minus-step time in this pool is 4:40, which is setup plus the `if: always()`
+    # steps, and it fits in setup plus slack on both legs. These rows supersede the 2026-10-07 nesting
+    # rows above, which stay as their record.
+    #
+    # THE WORKER LEVER WAS CONSIDERED AND NOT TAKEN. Moving windows-2025 back to TOOLING_WORKERS=4
+    # might save the 3 to 5.5 minutes the -n 3 paragraphs above put on that choice, but those are one
+    # green per arm from September, the trigger below fires on that change with no data under it, and
+    # #1304 starved a launch at 4 workers. Five minutes back also buys about three days of the growth
+    # just measured. Whether to keep -n 3 stays BACKLOG #1109's call. THE CAP IS NOT THE FIX FOR THE
+    # GROWTH: at the week's slope, 65 minutes holds about two weeks before the trigger below fires, so
+    # the tier's runtime itself wants a look -- that is unfiled work, not this change.
+    #
+    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 50:00 -- the 65-minute cap
+    # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
+    # include this one, so nothing reads this trigger for you -- or if TOOLING_WORKERS changes, or if
+    # any run is killed at the 65-minute step cap, and re-measure in any case after a week, because
+    # the daily median is still rising. THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its
+    # record:
+    #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
     # include this one, so nothing reads this trigger for you -- or if TOOLING_WORKERS changes, and
     # re-measure in any case once about a week of runs exists under the 48-minute kill, because the
-    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its
+    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its
     # record:
     #
     # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
@@ -2163,7 +2210,7 @@ jobs:
     # or it stops meaning anything.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
-    timeout-minutes: 60
+    timeout-minutes: 78
     defaults:
       run:
         shell: bash
@@ -2275,7 +2322,7 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        timeout-minutes: 48 # see the job cap above for the derivation; must stay under it with setup
+        timeout-minutes: 65 # see the job cap above for the derivation; must stay under it with setup
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
