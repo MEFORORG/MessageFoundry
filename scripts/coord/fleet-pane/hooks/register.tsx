@@ -22,8 +22,9 @@ const EVERY = { seats: 60000, prs: 30000, usage: 120000, lane: 120000 } as const
 const TICK = 15000
 // The poller writes every 2 minutes; data older than this means it has stopped.
 const PR_STALE_MS = 10 * 60000
-// Only this repository's scripts run, so a user-wide install never runs another repo's scripts/coord.
-const OUR_REMOTE = /[/:]MEFORORG\/MessageFoundry(\.git)?$/i
+// The coordination scripts run only where origin is this repository on github.com, so a user-wide
+// install does not run another clone's scripts/coord. It checks the origin URL, nothing more.
+const OUR_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)MEFORORG\/MessageFoundry(?:\.git)?\/?$/i
 type SourceName = keyof typeof EVERY
 const SOURCES = Object.keys(EVERY) as SourceName[]
 
@@ -46,6 +47,7 @@ const slashes = (p: string): string => p.trim().replace(/\\/g, '/')
 let sessionCwd: string | null = null
 let where: Promise<Where> | null = null
 let isTicking = false
+let lastLogged = ''
 const busy = new Set<SourceName>()
 const lastRun: Partial<Record<SourceName, number>> = {}
 
@@ -67,7 +69,7 @@ async function resolveWhere($: EngineInterface): Promise<Where> {
   }
   const origin = remote.stdout.trim()
   if (!OUR_REMOTE.test(origin)) {
-    throw new Error(`this checkout's origin is ${origin || 'unset'}, not MEFORORG/MessageFoundry; nothing was run`)
+    throw new Error(`this checkout's origin is ${origin || 'unset'}, not github.com/MEFORORG/MessageFoundry; no script was run`)
   }
   // CLAUDE_CONFIG_DIR is unset in desktop sessions; the default root is the profile's .claude.
   const configRoot = configDir ? slashes(configDir) : profile ? `${slashes(profile)}/.claude` : ''
@@ -162,9 +164,14 @@ async function readAndTick($: EngineInterface, names: SourceName[]): Promise<voi
   await update($, now, () => t)
 }
 
-// Fire-and-forget work still reports a failure, in the debug log and the transcript's dim line.
+// Fire-and-forget work still reports a failure, once per distinct message so a stuck failure does
+// not write a line every tick.
 function background($: EngineInterface, work: Promise<void>): void {
-  work.catch(err => $.ui.log(`fleet-pane: ${words(err)}`))
+  work.catch(err => {
+    const line = `fleet-pane: ${words(err)}`
+    if (line !== lastLogged) $.ui.log(line)
+    lastLogged = line
+  })
 }
 
 // One tick: nothing while the pane is not placed, else every source whose interval has passed.
@@ -205,14 +212,15 @@ export const register: Register = on => {
     const width = Math.max(20, e.props.bodyColumns)
     const cut = (s: string) => (s.length > width ? `${s.slice(0, width - 1)}~` : s)
 
+    // `!= null` on purpose: $.state outlives a reload, and an earlier version's value lacks failedAt.
     function head<T>(title: string, s: FleetSection<T>, name: SourceName) {
       const age =
-        s.okAt !== null ? `read ${ageWords(t - s.okAt)}` : s.failedAt !== null ? 'no good read yet' : 'not read yet'
+        s.okAt != null ? `read ${ageWords(t - s.okAt)}` : s.failedAt != null ? 'no good read yet' : 'not read yet'
       return (
         <Box flexDirection="column">
           <Text bold>{cut(`${title}  (${age}; every ${EVERY[name] / 1000}s)`)}</Text>
           {s.error !== null && (
-            <Text color="red">{cut(`READ FAILED ${s.failedAt === null ? '' : ageWords(t - s.failedAt)}: ${s.error}`)}</Text>
+            <Text color="red">{cut(`READ FAILED${s.failedAt == null ? '' : ` ${ageWords(t - s.failedAt)}`}: ${s.error}`)}</Text>
           )}
           {s.error !== null && s.data !== null && <Text dimColor>showing the last good read</Text>}
         </Box>

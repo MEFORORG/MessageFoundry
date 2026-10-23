@@ -71,8 +71,9 @@ function parsePr(pr: Json): FleetPr {
     failing: len(required.failing),
     pending: len(required.pending),
     missing: len(required.missing),
-    // Contexts the verdict could not settle, including ones GitHub requires but the list lacks.
-    unknown: len(required.unknown) + len(required.requiredByGithubNotInList),
+    // Contexts the verdict could not settle. requiredByGithubNotInList is not added: pr_state.py
+    // already judges those names into the lists above.
+    unknown: len(required.unknown),
     mergeable: mergeableWord(pr),
     queuePosition: entry ? numOrNull(entry.position) : null,
   }

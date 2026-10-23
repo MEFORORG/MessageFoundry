@@ -2,8 +2,9 @@
 
 A Claude Code mod that adds `/fleet`: a pane beside the chat with the fleet's state. It is
 read-only and makes no model call. It reads the coordination scripts in this folder's parent, in
-the checkout the session runs in, and runs nothing unless that checkout's `origin` is
-MEFORORG/MessageFoundry.
+the checkout the session runs in. It runs `git` there to find the checkout, and runs none of
+those scripts unless the checkout's `origin` URL is github.com/MEFORORG/MessageFoundry. That is a
+check on the URL, not on the files.
 
 | Section | Source | Read every |
 |---|---|---|

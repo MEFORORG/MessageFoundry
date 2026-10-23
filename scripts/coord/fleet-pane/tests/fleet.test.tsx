@@ -71,7 +71,7 @@ const FLEET = {
   presentation: { isFullscreen: true, columns: 200 },
 } as const
 
-type World = { presence?: { stdout: string; stderr: string }; origin?: string }
+type World = { presence?: { stdout: string; stderr: string }; origin?: string; prState?: unknown }
 
 // Answers every host call the pane makes, and records any call it must never make.
 function host(on: On, world: World = {}) {
@@ -92,7 +92,7 @@ function host(on: On, world: World = {}) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('fs.read', (_, e) => {
     ran.push(`read ${e.path}`)
-    return { value: JSON.stringify(PR_STATE) }
+    return { value: JSON.stringify(world.prState ?? PR_STATE) }
   })
   on('process.run', (_, e) => {
     const argv = e.argv.join(' ')
@@ -176,6 +176,61 @@ test('another repository runs nothing, and every section says why', async ($, on
 
   expect(ran.filter(r => r.startsWith('pwsh') || r.startsWith('read'))).toEqual([])
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /READ FAILED/ }))?.text).toContain('not MEFORORG/MessageFoundry')
+  expect((await ui.find({ type: 'Text', text: /READ FAILED/ }))?.text).toContain('not github.com/MEFORORG/MessageFoundry')
   await ui.unmount()
+})
+
+test('a stopped poller is flagged, and unknown counts only unsettled contexts', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  const old = '2026-10-23T14:00:00Z'
+  const pr = {
+    ...PR_STATE.data.pullRequests[0],
+    required: {
+      state: 'UNKNOWN',
+      failing: [],
+      pending: ['a'],
+      missing: [],
+      unknown: ['b'],
+      requiredByGithubNotInList: ['a'],
+      reason: null,
+    },
+  }
+  const prState = { ...PR_STATE, fetchedAt: old, data: { ...PR_STATE.data, fetchedAt: old, pullRequests: [pr] } }
+  host(on, { prState })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await $.command.run(FLEET)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /POLLER STOPPED\?/ })).toBeDefined()
+  const row = (await ui.find({ type: 'Text', text: /#2504/ }))?.text ?? ''
+  expect(row).toContain('1 pending 1 unknown')
+  await ui.unmount()
+})
+
+test('a fresh poll raises no stopped-poller flag', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  host(on)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await $.command.run(FLEET)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /POLLER STOPPED/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a source is read again at its interval, not a tick late', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  const { ran } = host(on)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  // Open the pane off the tick grid: the PR read lands 1 s after a tick, so the tick 29 s later must
+  // still count it as due. An exact comparison would wait for the tick after that, 44 s later.
+  await clock.advance(1000)
+  await $.command.run(FLEET)
+  await clock.settle()
+  const reads = () => ran.filter(r => r.startsWith('read')).length
+  const first = reads()
+  await clock.advance(29000)
+  expect(reads()).toBe(first + 1)
 })
