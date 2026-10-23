@@ -897,6 +897,42 @@ started". Assert on the count of legs you *expect*, not on the absence of pendin
 Both are the same failure as taking `--ours` on a conflict: **the instrument was accurate about what it
 looked at and silent about what it did not.** `main` moved seven times during one pair of PRs.
 
+### Waiting for a PR in the background — `wait-pr.ps1`
+
+To carry a PR to completion without a hand-written poll loop, run
+[`wait-pr.ps1`](../scripts/coord/wait-pr.ps1) with `run_in_background` and let its exit wake you:
+
+```powershell
+pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr <N> -Until merged
+```
+
+Measured 2026-10-21 in a worktree-isolated subagent: the PowerShell tool ran this form in the
+foreground and returned the script's exit code, a `run_in_background` run's task notification
+reported its exit 1, and the Bash tool refused the form there. Exits 0, 2 and 3 in the background
+were not measured.
+
+`-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out, needs a
+push and error apart. It prints one line per state change, and for `merged` and `closed` that line
+carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
+in the table above. **With `-Until merged`, `dirty` is acted on:** a PR read `dirty` on repeated
+checks of one head and base ends the wait with its own exit code instead of running to the timeout,
+and the fix is a conflict to resolve by hand, not a mechanical rebase (see the table above).
+**`behind` is only printed and does not end the wait**, so a background wait on a PR that stays
+stale wakes you at its timeout, with the state in its output. Whether that PR then needs an update
+depends on whether its base requires the merge queue; the script's header says which case is which,
+and why. Nor is the failing arm an exit: a red required check reads `blocked` and still runs to the
+timeout. With `closed` the state is only printed, and the `checks-complete` line does not carry it.
+`checks-complete` waits for every context the base branch requires, not only the checks that already
+exist.
+
+Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
+options: the two test seams that replace the sleep and the timeout are refused unless
+`MEFOR_WAIT_PR_TEST_SEAMS=1` is set, so never leave that variable set outside a test run. Every
+read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on the last ETag, so an unchanged answer does not count against the shared rate
+limit. The script's header is the one place that states the numbers, the exit codes, how many
+`dirty` reads end a wait, and why it does not trip
+[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
+
 ### Resolving a conflict: never take a side wholesale
 
 `docs/BACKLOG.md` and `CHANGELOG.md` were single large files every session appended to, so they
