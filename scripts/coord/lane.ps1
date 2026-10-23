@@ -103,8 +103,6 @@ $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
-New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
-
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
@@ -124,9 +122,46 @@ if (-not $rec) {
 }
 
 if ($Show) {
-    $rec | ConvertTo-Json -Depth 5
+    # -SHOW IS A STRICT READ. Its callers may hold only read access to the root, so it creates no
+    # directory and writes no file. (The resolver's down cache is the one exception, and it lives in
+    # this clone's own .git, never on the root.) It prints what ONE read of the record found, so the
+    # record and its `absent` reason cannot come from two reads that a restatement landed between.
+    # The read above keeps no reason, which is why this one stands alone. A found record prints as it
+    # is; otherwise the blank record above prints with `absent` saying why, so an unstated lane never
+    # reads as a stated one.
+    $shown = $null
+    $absent = $null
+    try {
+        $shown = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
+            $absent = "the lane record at $file is not a JSON object"
+        }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $absent = if (Test-Path -LiteralPath $lanesDir -PathType Container) { "no lane record at $file" }
+                  else { "no lanes directory found at $lanesDir, so this root holds no lane record" }
+    } catch {
+        $absent = "the lane record at $file could not be read: $($_.Exception.Message)"
+    }
+    if ($absent) {
+        # A FRESH blank record, never $rec: $rec may hold what the earlier read found, so a restatement
+        # between the two reads would print a stated level beside an `absent` reason. The fields
+        # match the blank record above; fold the two together once that read keeps its reason.
+        $shown = [pscustomobject]@{
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            statedFree = $null; statedInFlight = $null; statedUtc = $null
+            statedBySessionId = $null; statedNote = ''
+            tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
+            tipNow = ''; claimHashNow = ''; lastTurnUtc = $null
+            promptedUtc = $null; promptCount = 0; askedByDispatcherUtc = $null
+            absent = $absent
+        }
+    }
+    $shown | ConvertTo-Json -Depth 5
     exit 0
 }
+
+# Made here, on the write path only, so -Show above creates nothing.
+New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $nowUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 

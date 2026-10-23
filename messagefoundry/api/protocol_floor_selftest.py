@@ -14,6 +14,12 @@ when a header is missing.
 protocol, the way uvicorn itself would receive it:
 
 * a request line the parser rejects, for the server's own ``400``;
+* a chunked request whose head starts the app and whose bad chunk then makes the parser write its
+  ``400``. Here nothing may follow the ``400``: not the late answer the app then sends. The drive
+  fails if the app never ran and tried that answer. On httptools this measures the floor's
+  response-desync step, which marks the request cycles disconnected after the ``400``, on the
+  installed server. On h11, h11's own state machine also refuses that answer. It is no header
+  family of its own;
 * a well-formed request to an app that raises, for the server's own ``500``;
 * a WebSocket upgrade with no ``Sec-WebSocket-Key``, for the handshake rejection the WebSocket
   library writes;
@@ -44,8 +50,10 @@ in asyncio and in this module read apart.
 
 **What it does not prove.** At least these are outside it:
 
-* A response family other than the six above. One a new server version adds is outside it, as it is
-  outside the floor.
+* A response family other than the six above. One a new server version adds is outside it, as it
+  is outside the floor. The parser-400 drive is a check, not a family.
+* A late answer after the parser's ``400`` that comes after ``_LATE_ANSWER_TURNS``, or one from a
+  pipelined request's cycle. The drive sends one request.
 * The settings ``serve`` runs with. The drives use a plain ``uvicorn.Config``: no TLS, no server-wide
   default headers, one worker, and nothing read from the environment. A header merge that depended
   on those would not show here.
@@ -87,8 +95,12 @@ _log = logging.getLogger(__name__)
 
 #: Loop turns one drive may take before its response counts as missing. Each turn is a zero-timeout
 #: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.2: the six
-#: drives take 3 turns between them on the sans-I/O protocol and 9 on the legacy server.
+#: response drives take 3 turns between them on the sans-I/O protocol and 9 on the legacy server.
 _MAX_TURNS = 200
+
+#: Turns the app gets to write a late answer after the parser's 400. The same bound as above, kept
+#: apart so tightening one does not shrink the other.
+_LATE_ANSWER_TURNS = 200
 
 #: Turns given to the driven connections to close, and again to their cancelled tasks, before the
 #: private loop is discarded.
@@ -100,6 +112,9 @@ _SERVER_LOGGERS = ("uvicorn.error", "uvicorn.access")
 
 #: The path the stand-in app refuses a WebSocket on, by closing before it accepts.
 _REFUSED_PATH = "/selftest/refused"
+
+#: The path the stand-in app sends a late answer on, after the parser's 400.
+_LATE_PATH = "/selftest/late"
 
 #: The sample nonce from RFC 6455 section 1.3. It is public and protects nothing.
 _UPGRADE_KEY = b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
@@ -120,16 +135,29 @@ _HOOK = "startup self-test"
 
 
 class _Drive(NamedTuple):
-    """One response family: what to send, and which statuses mean the intended path answered."""
+    """One response family: what to send, and which statuses mean the intended path answered.
+    ``alone`` asks that nothing be written after that response."""
 
     response: str
     request: bytes
     statuses: Container[int]
     websocket: bool
+    alone: bool = False
 
 
 _DRIVES = (
     _Drive("malformed-request 400", b"NOT A REQUEST LINE\r\n\r\n", (400,), False),
+    # A chunked head starts the app; the bad chunk size then makes the parser write its 400. The
+    # app then sends a late answer, which must not follow the 400. The transport here keeps every
+    # write, even after close, as CPython 3.14.9's proactor does while the 400 is pending.
+    _Drive(
+        "parser 400 after the app started",
+        b"POST " + _LATE_PATH.encode("ascii") + b" HTTP/1.1\r\nHost: selftest\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0x2\r\n{}\r\n0\r\n\r\n",
+        (400,),
+        False,
+        alone=True,
+    ),
     _Drive("app-error 500", b"GET /selftest HTTP/1.1\r\nHost: selftest\r\n\r\n", (500,), False),
     # Any 4xx: which one the library picks for a bad handshake is its own choice.
     _Drive("WebSocket handshake rejection", _upgrade(key=False), range(400, 500), True),
@@ -154,6 +182,23 @@ async def _failing_app(scope: Any, receive: Any, send: Any) -> None:
         await send({"type": "websocket.close"})
         return
     raise _SelfTestAppError
+
+
+class _StandInApp:
+    """The app every drive is served by. On the parser-400 drive's path it records that it ran and
+    sends a late answer; everywhere else it is :func:`_failing_app`. One per self-test run."""
+
+    def __init__(self) -> None:
+        #: Set before the late answer is sent, so a drive that never reached it shows as vacuous.
+        self.late_answer_tried = False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["path"] == _LATE_PATH:
+            self.late_answer_tried = True
+            await send({"type": "http.response.start", "status": 500, "headers": []})
+            await send({"type": "http.response.body", "body": b"late"})
+            return
+        await _failing_app(scope, receive, send)
 
 
 class _NeverWaits:
@@ -279,6 +324,23 @@ def _missing(drive: _Drive, written: bytes) -> list[str]:
     return problems
 
 
+def _after_the_first_response(written: bytes) -> bytes:
+    """What was written after the first response. That is the server's own ``400``, framed by a
+    ``Content-Length`` on httptools and chunked on h11; a chunked one ends at its last chunk."""
+    head, _, rest = written.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        name, value = name.strip().lower(), value.strip().lower()
+        if name == b"content-length" and value.isdigit():
+            length = int(value)
+        elif name == b"transfer-encoding" and value.endswith(b"chunked"):
+            end = b"\r\n0\r\n\r\n"
+            last = rest.find(end)
+            return rest[last + len(end) :] if last >= 0 else b""
+    return rest[length:]
+
+
 async def _turns(count: int) -> None:
     for _ in range(count):
         await asyncio.sleep(0)
@@ -292,8 +354,9 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
 
     # workers and proxy_headers are spelled out so Config reads neither WEB_CONCURRENCY nor
     # FORWARDED_ALLOW_IPS: a bad value there is not a header floor failure and must not read as one.
+    app = _StandInApp()
     config = uvicorn.Config(
-        _failing_app,
+        app,
         http=http_class,
         ws=ws_class if ws_class is not None else "none",
         lifespan="off",
@@ -329,6 +392,14 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
             problems.append(f"the {drive.response} drive never reached the WebSocket protocol")
         else:
             problems += _missing(drive, bytes(transport.written))
+        if drive.alone:
+            # Give the app every turn it could take to answer, then look past the first response.
+            await _turns(_LATE_ANSWER_TURNS)
+            if not app.late_answer_tried:
+                # Nothing tried to answer, so "nothing followed the 400" would prove nothing.
+                problems.append(f"the {drive.response} drive never reached the app's late answer")
+            elif _after_the_first_response(bytes(transport.written)):
+                problems.append(f"the {drive.response} was followed by a second response")
 
     # Hang up as a client would, then cancel whatever is still waiting, so the loop is discarded
     # with nothing pending on it.

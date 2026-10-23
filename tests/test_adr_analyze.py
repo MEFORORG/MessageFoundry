@@ -533,3 +533,75 @@ def test_the_agreement_check_fails_when_the_shared_terminal_rule_diverges(
         "the toolkit line does not escape Zl",
         "the check-privileges text does not escape Zl",
     ]
+
+
+# --- BACKLOG #3787: a ref is read from the start of its path token --------------------------------
+
+
+def test_a_full_packaging_path_is_read_whole_and_resolves(tmp_path: Path) -> None:
+    adr, root = _repo(tmp_path)
+    pkg = root / "packaging" / "pkg" / "tests"
+    pkg.mkdir(parents=True)
+    (pkg / "test_pkg.py").write_text("def test_p(): ...\n", encoding="utf-8")
+    _write(
+        adr,
+        "0013-pkg.md",
+        "# 0013 - Pkg\n\n- **Status:** Accepted\n\n## Acceptance Criteria\n\n"
+        "- **AC-1** - THE SYSTEM SHALL ship. -> `packaging/pkg/tests/test_pkg.py::test_p`\n"
+        "- **AC-2** - THE SYSTEM SHALL stay. -> `tests/test_real.py`\n"
+        "- **AC-3** - THE SYSTEM SHALL link. -> [tests/test_real.py](../../tests/test_real.py)\n"
+        "- **AC-4** - THE SYSTEM SHALL host. -> https://example.invalid/x/tests/test_real.py and"
+        " `/abs/tests/test_real.py`\n",
+    )
+    result = analyze_adrs(adr, repo_root=root)
+    (rep,) = result.reports
+    full, bare, link, url = rep.criteria
+    # Unanchored, this read ``tests/test_pkg.py::test_p`` out of the middle and reported it missing.
+    assert full.test_refs == ["packaging/pkg/tests/test_pkg.py::test_p"]
+    assert full.covered and full.missing_refs == []
+    assert (
+        bare.test_refs == ["tests/test_real.py"] and bare.covered
+    )  # control: a bare ref still reads
+    # The file-relative link target is the same file as its text, not a path outside the root.
+    assert link.test_refs == ["tests/test_real.py"] and link.covered and link.outside_refs == []
+    # A URL's path after its host, and an absolute path, are not repository refs.
+    assert url.test_refs == []
+    assert result.outside_refs == [] and result.coverage_gaps == []
+
+
+#: A 100,002-character path token takes about 10 ms when the search starts only at its first
+#: character, and seconds once every ``/`` is a fresh start; this leaves a slow runner wide headroom.
+_TOKEN_BOUND_S = 2.0
+
+
+def test_a_long_path_token_is_matched_in_linear_time() -> None:
+    # Many leading directories with no root keyword, then one with it. The lookbehind lets the
+    # search start only at the token's first character, so neither goes quadratic.
+    token = "a/" * 50_000
+    start = time.perf_counter()
+    assert adr_analyze._REF_RE.search(token + "x.py") is None
+    m = adr_analyze._REF_RE.search(token + "tests/x.py")
+    elapsed = time.perf_counter() - start
+    assert m is not None and m.group("ref") == token + "tests/x.py"
+    assert elapsed < _TOKEN_BOUND_S, f"{elapsed:.2f} s over a {len(token)}-character token"
+
+
+def test_no_shipped_ref_is_the_tail_of_a_longer_path() -> None:
+    # ADRs 0068 and 0142 (and at least 0143 and 0207) cite the console suite by its full packaging
+    # path; unanchored, the analyzer read a ``tests/...`` fragment out of each and reported it
+    # missing. Asserts refs are READ whole, not that the corpus has no gaps: the analyzer is
+    # advisory, and a true gap must not turn this red.
+    root = Path(__file__).resolve().parents[1]
+    reports = analyze_adrs(root / "docs" / "adr", repo_root=root).reports
+    prefix = "packaging/messagefoundry-webconsole/tests/"
+    packaged = [ref for r in reports for c in r.criteria for ref in c.test_refs if prefix in ref]
+    assert packaged  # control: the shape under test is in the corpus
+    fragments = []
+    for rep in reports:
+        # Only the block the refs come from: the same tail may sit in a longer path elsewhere.
+        sections = adr_analyze._sections(Path(rep.path).read_text(encoding="utf-8"))
+        text = "\n".join(sections.get("acceptance criteria", []))
+        for ref in {ref for c in rep.criteria for ref in c.test_refs}:
+            if re.search(r"[A-Za-z0-9_\-]/" + re.escape(ref), text):
+                fragments.append((rep.adr_id, ref))
+    assert fragments == []

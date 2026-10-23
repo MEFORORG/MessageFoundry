@@ -10,18 +10,27 @@ WHAT MUST HOLD IS EQUIVALENCE, NOT A NEW POLICY. Each guard keeps its own tests,
 guard file standalone. This module asserts the other half: that the dispatcher's decision on a
 payload is exactly what the guards decide standalone, taken in the settings file's order with the
 first deny winning, and that one guard's scope, failure or absence cannot change another's verdict.
+
+AT LEAST THESE DIFFERENCES ARE DELIBERATE: the dispatcher reads the payload as UTF-8 bytes and
+writes its decision with every non-ASCII character escaped (why is in its header), and a kept
+decision is re-serialised to carry other guards' contexts. The encoding test at the end of this
+module is where the first two change a verdict.
 """
 
 from __future__ import annotations
 
 import atexit
+import ctypes
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -116,6 +125,89 @@ def _dispatch(guards: list[Path], raw: str, *, burst: bool = False) -> str:
     return _run(_dispatch_argv(guards), raw, burst=burst)
 
 
+def _skeleton_matches(got: object, expected: object) -> bool:
+    """``got`` and ``expected`` have the same shape and values, except that a string of ``got``
+    holding non-ASCII text matches an ``expected`` string with the same ASCII runs in the same
+    order, each non-ASCII run standing for 1 to 4 characters per character. A standalone guard
+    wrote that text in the console's page, which may best-fit or replace each such character, and
+    this process decodes those bytes in its own locale, so the characters cannot be compared and
+    the ASCII around them can."""
+    if isinstance(got, dict):
+        return (
+            isinstance(expected, dict)
+            and got.keys() == expected.keys()
+            and all(_skeleton_matches(got[k], expected[k]) for k in got)
+        )
+    if isinstance(got, list):
+        return (
+            isinstance(expected, list)
+            and len(got) == len(expected)
+            and all(_skeleton_matches(g, e) for g, e in zip(got, expected, strict=True))
+        )
+    if isinstance(got, str) and not got.isascii():
+        pattern = "".join(
+            re.escape(part) if part.isascii() else f".{{1,{4 * len(part)}}}"
+            for part in re.split(r"([^\x00-\x7f]+)", got)
+        )
+        return isinstance(expected, str) and re.fullmatch(pattern, expected, re.DOTALL) is not None
+    return got == expected
+
+
+def _same_decision(got: str, expected: str) -> bool:
+    """Whether the dispatcher's stdout is what the guards decided standalone.
+
+    BYTE FOR BYTE UNLESS THE DISPATCHER'S DECISION CARRIES NON-ASCII TEXT, which is read from the
+    decoded decision, not the standalone bytes: a console page can best-fit non-ASCII text into
+    ASCII, so the standalone side being ASCII says nothing. Where it does carry such text, the
+    dispatcher's stdout must be ASCII, both sides must parse, and they must match as
+    _skeleton_matches says."""
+    if not got.isascii():
+        return False
+    if got == expected:
+        return True
+    try:
+        g, e = json.loads(got), json.loads(expected)
+    except json.JSONDecodeError:
+        return False
+    if json.dumps(g, ensure_ascii=False).isascii():
+        return False
+    return _skeleton_matches(g, e)
+
+
+_E = chr(0xE9)
+_BEST_FIT = '{"r":"find /proc/' + _E + "t" + _E + '"}'
+
+
+@pytest.mark.parametrize(
+    ("got", "expected", "same"),
+    [
+        # The cp932 case: the standalone page best-fit U+00E9 to `e`, so its bytes are ASCII.
+        ('{"r":"find /proc/\\u00e9t\\u00e9"}', '{"r":"find /proc/ete"}', True),
+        # A page that replaces the character instead.
+        ('{"r":"find /proc/\\u00e9t\\u00e9"}', '{"r":"find /proc/?t?"}', True),
+        # A UTF-8 page: the standalone text is the character itself.
+        ('{"r":"find /proc/\\u00e9t\\u00e9"}', _BEST_FIT, True),
+        # Another guard's reason around the same character is not the same decision.
+        ('{"r":"find /proc/\\u00e9t\\u00e9"}', '{"r":"scan /proc/ete"}', False),
+        # Nor is a reason with a clause where one character was.
+        ('{"r":"a\\u00e9b"}', '{"r":"a, and something else entirely, b"}', False),
+        # A context-only answer against a deny: no KeyError, just a mismatch.
+        ('{"c":"x\\u00e9"}', '{"r":"xe"}', False),
+        # No non-ASCII text in the decision: byte for byte.
+        ('{"r": "a"}', '{"r":"a"}', False),
+        # The dispatcher's stdout must be ASCII, even where it equals the standalone bytes.
+        (_BEST_FIT, _BEST_FIT.replace(_E, "e"), False),
+        (_BEST_FIT, _BEST_FIT, False),
+    ],
+)
+def test_same_decision_reads_the_dispatcher_s_decoded_text(
+    got: str, expected: str, same: bool
+) -> None:
+    """_same_decision chooses byte-for-byte from the dispatcher's decoded decision, so a console
+    page that best-fits the standalone text into ASCII still gets the skeleton comparison."""
+    assert _same_decision(got, expected) is same
+
+
 def _decision(stdout: str) -> dict[str, Any] | None:
     return json.loads(stdout) if stdout.strip() else None
 
@@ -193,8 +285,9 @@ _CORPUS: list[str] = [
 
 
 def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> None:
-    """Byte-for-byte: the dispatcher's stdout is the first non-empty stdout of the guards run
-    standalone, in the settings file's order -- or nothing, when every guard allows."""
+    """The dispatcher's stdout is the first non-empty stdout of the guards run standalone, in the
+    settings file's order -- or nothing, when every guard allows. Byte for byte where that output
+    is ASCII; _same_decision says what is compared where it is not."""
     guards = _wired_guards()
     # Six concurrent pwsh launches are a storm, so each chunk holds the exclusive side of the spawn
     # lock (BACKLOG #1304). The test flaked once in a parallel suite run, with its detail lost; the
@@ -217,7 +310,7 @@ def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> N
                         (out for g in guards if (out := standalone[(raw, g)].result()).strip()), ""
                     )
                     got = dispatched[raw].result()
-                    if got != expected:
+                    if not _same_decision(got, expected):
                         mismatches.append((raw[:120], expected[:200], got[:200]))
     assert not mismatches, mismatches
 
@@ -1026,3 +1119,159 @@ def test_the_gate_gets_a_large_payload_whole_and_a_failed_feed_blocks(tmp_path: 
     command = _Entry(world).command
     feed = command.index('exec {h}<<< "$in" || exit 1')
     assert feed < command.index('pwsh -NoProfile -File "$g" <&"$h"')
+
+
+# ================================================================== the payload's encoding
+
+
+#: The command the encoding test sends. Each non-ASCII character in it is one the dispatcher's
+#: header names, for the reason given there.
+_ENCODED_COMMAND = "ls Other" + chr(0x200B) + "\\x" + chr(0xE9) + chr(0x30BD)
+
+#: Denies only when the command arrives whole, and echoes it in the reason, so the deny carries
+#: non-ASCII text out. A mangled or unparseable payload is no deny.
+_ENCODING_PROBE = (
+    "$c = ([Console]::In.ReadToEnd() | ConvertFrom-Json).tool_input.command\n"
+    "$want = 'ls Other' + [char]0x200B + '\\x' + [char]0xE9 + [char]0x30BD\n"
+    "if ($c -ceq $want) { [Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+    "permissionDecision='deny';permissionDecisionReason=('whole ' + $c)}} | ConvertTo-Json -Compress)) }"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="console code pages are a Windows concept")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("codepage", [437, 932])
+def test_the_payload_and_the_decision_are_utf8_whatever_the_console_code_page(
+    tmp_path: Path, codepage: int
+) -> None:
+    """Claude Code writes the payload as UTF-8 and reads the decision as UTF-8, so the decision is
+    read back here that way. What each code page did to the old reads is in the dispatcher's
+    header.
+
+    The dispatcher runs in a console of its own, so chcp reaches nothing pytest shares;
+    tests/test_coord_alloc_floor.py has the incident. A bare chcp reports the page first, so a host
+    that cannot take it skips rather than passing for the wrong reason."""
+    if sys.platform != "win32":  # the skipif above already skips; this line tells mypy
+        pytest.skip("Windows only")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    if 0 in shared:
+        warnings.warn(
+            pytest.PytestWarning(
+                "this process has no console, so the check that chcp left the shared console "
+                "alone has nothing to measure; the encoding itself is still checked"
+            ),
+            stacklevel=1,
+        )
+    probe = _guard(tmp_path, "encoding.ps1", _ENCODING_PROBE)
+    raw = json.dumps(bash(_ENCODED_COMMAND), ensure_ascii=False).encode("utf-8")
+
+    def in_console(dispatcher: Path) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
+        with single_spawn():
+            proc = subprocess.run(
+                f"chcp {codepage} >nul && chcp && pwsh -NoProfile -NonInteractive -File "
+                f'"{dispatcher}" "{probe}"',
+                shell=True,
+                input=raw,
+                capture_output=True,
+                timeout=120,
+                env={**os.environ, **_HERMETIC},
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+        # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
+        if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
+            restored = kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1])
+            pytest.fail(
+                f"chcp {codepage} reached pytest's shared console, {shared} -> {after}; "
+                + (
+                    "it was put back"
+                    if restored
+                    else f"putting it back FAILED, {ctypes.get_last_error()}"
+                )
+            )
+        page, _, decision = proc.stdout.partition(b"\n")
+        # A word match, not a suffix: a localized chcp may end its line with a period.
+        if not re.search(rf"\b{codepage}\b".encode(), page):
+            pytest.skip(f"this host's console did not take cp{codepage}: {proc.stdout!r}")
+        return proc, decision
+
+    # The CONTROL: the dispatcher's old read through [Console]::In, and no escaping. Unless it gets
+    # the deny wrong, the page never reached pwsh and the pass below would prove nothing.
+    old = _dispatcher_copy(
+        tmp_path / "dispatch_console_reader.ps1",
+        (_PAYLOAD_READ, "$ShellGuardPayload = [Console]::In.ReadToEnd()"),
+        (_ESCAPE, "$Json"),
+    )
+    old_proc, old_decision = in_console(old)
+    try:
+        old_parsed = json.loads(old_decision.decode("utf-8")) if old_decision.strip() else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        old_parsed = None
+    old_right = (
+        old_proc.returncode == 0
+        and old_parsed is not None
+        and old_parsed.get("hookSpecificOutput", {}).get("permissionDecisionReason")
+        == "whole " + _ENCODED_COMMAND
+    )
+    assert not old_right, f"the old reader got cp{codepage} right, so this measures nothing"
+
+    proc, decision = in_console(DISPATCHER)
+    err = proc.stderr.decode(f"cp{codepage}", errors="replace")
+    assert proc.returncode == 0, f"the probe failed, so the payload did not parse: {err}"
+    assert decision.strip(), f"the probe saw a mangled payload and allowed: {err}"
+    try:
+        parsed = json.loads(decision.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"the decision does not parse as UTF-8 JSON: {decision!r}") from exc
+    assert assert_denied(parsed) == "whole " + _ENCODED_COMMAND
+
+
+#: The dispatcher's payload read, byte for byte, and its failure report. Used only to build the
+#: read-failure test's two copies.
+_PAYLOAD_READ = (
+    "$ShellGuardPayload = [System.IO.StreamReader]::new(\n"
+    "        [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()"
+)
+#: ConvertTo-ShellGuardAscii's body, which the encoding test's control replaces with its input.
+_ESCAPE = (
+    "[regex]::Replace($Json, '[^\\x00-\\x7F]', { param($m) '\\u{0:x4}' -f [int][char]$m.Value })"
+)
+_READ_FAILURE = (
+    '    [Console]::Error.WriteLine("shell-guard-dispatch: could not read the hook input, so no '
+    'guard ran: $($_.Exception.Message)")\n'
+    "    exit 1\n"
+)
+
+
+def _dispatcher_copy(dst: Path, *pairs: tuple[str, str]) -> Path:
+    """The dispatcher with each (old, new) pair applied. Each rewrite is asserted to have happened,
+    or the copy would be the dispatcher itself and the test would pass for the wrong reason."""
+    src = DISPATCHER.read_text(encoding="utf-8")
+    for old, new in pairs:
+        assert src.count(old) == 1, f"the dispatcher's text moved: {old!r}"
+        src = src.replace(old, new)
+    dst.write_text(src, encoding="utf-8")
+    return dst
+
+
+@pytest.mark.timeout(300)
+def test_a_payload_read_that_throws_is_a_visible_hook_error(tmp_path: Path) -> None:
+    """No guard ran, so the dispatcher says so on stderr and exits 1, the non-blocking hook error.
+    The control is the catch as it stood before, which exited 0 with nothing on stderr: an allow
+    nobody could tell from a guard's."""
+    probe = _guard(tmp_path, "deny.ps1", _DENY % "a guard ran")
+    throws = (_PAYLOAD_READ, "$ShellGuardPayload = throw 'injected read failure'")
+    failing = _dispatcher_copy(tmp_path / "dispatch_read_throws.ps1", throws)
+    silent = _dispatcher_copy(
+        tmp_path / "dispatch_read_throws_silent.ps1", throws, (_READ_FAILURE, "    exit 0\n")
+    )
+    raw = json.dumps(bash("ls"))
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+    proc = _proc([*argv, str(failing), str(probe)], raw)
+    assert proc.returncode == 1, proc
+    assert "could not read the hook input, so no guard ran" in proc.stderr
+    assert "injected read failure" in proc.stderr
+    assert proc.stdout == ""
+    control = _proc([*argv, str(silent), str(probe)], raw)
+    assert (control.returncode, control.stdout, control.stderr) == (0, "", "")

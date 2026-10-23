@@ -118,6 +118,34 @@
     The file lives outside git and the Steward owns it. A schema version this hook does not know is
     UNKNOWN rather than a guess.
 
+    A REPEAT GETS ONE SHORT LINE, NOT THE BLOCK. Measured 2026-10-22 over 26 transcripts: 182 firings,
+    each about 680 bytes, nearly all repeating verdict text the session had already read. The full block
+    prints when this session has not seen it for this config root, or when what it says has changed.
+    Otherwise one line names the verdict and says it is unchanged. Silence is not the repeat answer:
+    the rule above, NEVER SILENCE, exists because an empty injection looks the same as a hook that
+    never ran.
+
+      WHAT COUNTS AS A CHANGE is the block's own text, with reset times masked and ages kept only as a
+      coarse bucket, since both move every call. Each percentage is kept as its 10-point band, so a
+      move from 42% to 55% prints in full under any verdict, the fallback's ungraded numbers included.
+      A new reason, wiring note, pool or provenance line changes the text, so it prints in full too.
+
+      A HIGH READING ALWAYS PRINTS IN FULL. That means a WARN, CRITICAL or UNAVAILABLE verdict, a window
+      line marked WARN or CRITICAL, or any percentage at 85 or more, which is usage.ps1's WARN
+      threshold. The last two cover a high number under an UNKNOWN verdict: the Steward fallback is
+      ungraded, and the reader downgrades a WARN to UNKNOWN on a root it does not trust.
+
+      THE STATE IS ADVICE THAT EXPIRES. The key is the session id, the agent id and the config root,
+      because a Manager and its subagents share a session id. That the harness sends `agent_id` inside
+      a subagent and not on the main thread is ASSUMED here, not measured. It lives in one small file
+      per key in <git common dir>/mefor-coord/usage-headroom, found through _hookinput.ps1 without
+      spawning git. The file cannot see a compaction, or a block the harness dropped, so the block
+      prints in full again once the file is 30 minutes old; inside that window those two cases get
+      the short line. At least these print the full block: a payload with no session id, a checkout
+      with no common dir, a missing helper, and a missing, unreadable or unwritable state file. Under
+      -StateDir it is off unless -DedupDir is also named, for the reason the fallback stays off there:
+      a probe must not touch a real session's state.
+
 .EXAMPLE
     Drive it by hand the way the harness drives it:
         '{"tool_name":"Task"}' | pwsh -NoProfile -File scripts\hooks\usage-headroom-inject.ps1
@@ -141,7 +169,10 @@ param(
     [string]$LoginRecord,
     # The desktop app's session records. Unset in production (%APPDATA%\Claude\claude-code-sessions);
     # set by tests.
-    [string]$DesktopSessionsDir
+    [string]$DesktopSessionsDir,
+    # Where the last-printed state lives. Unset in production (<local coord root>\usage-headroom); set by
+    # tests. Under -StateDir with this unset, every firing prints in full.
+    [string]$DedupDir
 )
 
 # No `Stop`: this hook informs, and a throw here would be a tool call broken by a decoration.
@@ -151,6 +182,12 @@ $ErrorActionPreference = "SilentlyContinue"
 # configuration and this file is not: wired on `*` by a future edit, the hook would otherwise pay its
 # spawn cost on every tool call in the session.
 $SPAWN_TOOLS = @("Task", "Agent", "Workflow")
+
+# Functions only, no side effect on load. The repeat check uses its no-git common-dir lookup and hash.
+# Without it the repeat check is off and every firing prints in full, which is the safe side.
+$HookInputPath = Join-Path $PSScriptRoot "_hookinput.ps1"
+$HaveHookInput = Test-Path -LiteralPath $HookInputPath
+if ($HaveHookInput) { . $HookInputPath }
 
 # Fold a value that came out of a FILE before putting it in prose the model reads.
 #
@@ -169,15 +206,110 @@ function Get-Folded([object]$Value, [int]$Max = 300) {
     return $s
 }
 
-function Write-Context([string]$Text) {
+function Write-Context([string]$Text, [string]$Verdict) {
+    $statePath = Get-DedupPath
+    $print = $Text
+    $hash = $null
+    $last = $null
+    if ($statePath) {
+        $hash = Get-CcxShortHash (Get-ChangeKey $Text) 32
+        $age = $null
+        try {
+            $last = [System.IO.File]::ReadAllText($statePath).Trim()
+            $age = ([datetime]::UtcNow - [System.IO.File]::GetLastWriteTimeUtc($statePath)).TotalMinutes
+        }
+        catch { $last = $null }
+        $fresh = $null -ne $age -and $age -ge 0 -and $age -lt $REPRINT_MINUTES
+        if ($fresh -and $last -ceq $hash -and -not (Test-AlwaysFull $Text $Verdict)) {
+            $print = "[usage headroom: verdict $(Get-Folded $Verdict 40), unchanged since this session last spawned; block not repeated.]"
+            $hash = $null
+        }
+    }
     $payload = [pscustomobject]@{
         hookSpecificOutput = [pscustomobject]@{
             hookEventName     = "PreToolUse"
-            additionalContext = $Text
+            additionalContext = $print
         }
     }
-    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    # The save comes AFTER the write and only if the write did not throw, so a hook killed or failing
+    # before its output left records nothing as printed. A pipe the harness closed may not throw, and
+    # that case is the one the reprint interval below still has to cover.
+    $wrote = $false
+    try { [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6)); $wrote = $true } catch { }
+    if ($wrote -and $hash) { Save-DedupState $statePath $hash ($null -eq $last) }
     exit 0
+}
+
+# A full print at least this often, even when nothing changed. The state file cannot see a compaction
+# or a delivery the harness dropped, so it is advice that expires rather than a fact that stands.
+$REPRINT_MINUTES = 30
+
+# What has to differ for the block to count as changed: its text, with the numbers that move on every
+# call masked. A percentage keeps its 10-point band, written as a LETTER so no digit survives to vary.
+# The decimal separator may be a comma, because Format-Window formats under the current culture.
+function Get-ChangeKey([string]$Text) {
+    $k = [regex]::Replace($Text, "(\d+)(?:[.,]\d+)?%", {
+            param($m) "band-" + [char](65 + [math]::Min(25, [math]::Floor([double]$m.Groups[1].Value / 10))) + "%"
+        })
+    # An age keeps a coarse bucket (under 5, 15 or 60 min, or older), so a jump from a fresh reading to
+    # a stale one is a change while the minute-by-minute drift is not.
+    $k = [regex]::Replace($k, "(\d+)(?:[.,]\d+)?\s*min\b", {
+            param($m)
+            $n = [double]$m.Groups[1].Value
+            "age-" + $(if ($n -lt 5) { "A" } elseif ($n -lt 15) { "B" } elseif ($n -lt 60) { "C" } else { "D" }) + " min"
+        })
+    return ($k -replace "\d+h\d+m", "#h#m")
+}
+
+# WARN, CRITICAL and UNAVAILABLE print in full every time, and so does any block that names a WARN or
+# CRITICAL window or shows a percentage at 85 or more. The last two catch a high reading under an
+# UNKNOWN verdict: the Steward fallback is ungraded, and usage.ps1 can downgrade a WARN to UNKNOWN on
+# a root it does not trust. 85 is usage.ps1's own WARN threshold.
+function Test-AlwaysFull([string]$Text, [string]$Verdict) {
+    if ($Verdict -in @("WARN", "CRITICAL", "UNAVAILABLE")) { return $true }
+    if ($Text -cmatch "\b(WARN|CRITICAL) --") { return $true }
+    foreach ($m in [regex]::Matches($Text, "(\d+)(?:[.,]\d+)?%")) {
+        if ([int]$m.Groups[1].Value -ge 85) { return $true }
+    }
+    return $false
+}
+
+function Save-DedupState([string]$Path, [string]$Hash, [bool]$First) {
+    try {
+        $dir = Split-Path -Parent $Path
+        [void][System.IO.Directory]::CreateDirectory($dir)
+        # A session's first write prunes this hook's own files that nobody touched for a week.
+        if ($First) {
+            Get-ChildItem -LiteralPath $dir -Filter "*$DEDUP_EXT" -File |
+                Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-7) } |
+                Remove-Item -Force
+        }
+        [System.IO.File]::WriteAllText($Path, $Hash)
+    }
+    catch {
+        # Never keep the PREVIOUS hash once a newer block went out: a later text matching it would be
+        # called unchanged. No file is a full print next time, which is the safe side.
+        try { [System.IO.File]::Delete($Path) } catch { }
+    }
+}
+
+$DEDUP_EXT = ".usage-headroom"
+
+# The file holding what this context last printed, or $null when dedup is off or the context cannot be
+# named; $null means print in full. The key is the session id, the agent id and the config root: a
+# Manager and its subagents share one session id, and only the agent id tells their contexts apart.
+function Get-DedupPath {
+    if (-not $SessionId -or -not $HaveHookInput) { return $null }
+    $dir = $DedupDir
+    if (-not $dir) {
+        if ($StateDir) { return $null }
+        $common = Get-CcxGitCommonDir (Get-CcxWorktreeRoot $PSScriptRoot)
+        if (-not $common) { return $null }
+        $dir = Join-Path (Join-Path $common "mefor-coord") "usage-headroom"
+    }
+    $root = if ($env:CLAUDE_CONFIG_DIR) { ConvertTo-CcxNormPath $env:CLAUDE_CONFIG_DIR } else { "(default)" }
+    $key = "$SessionId`n$AgentId`n$($root.ToLowerInvariant())"
+    return (Join-Path $dir ((Get-CcxShortHash $key 16) + $DEDUP_EXT))
 }
 
 $HEAD = "[usage headroom, read at the spawn point from the file the statusLine collector already " +
@@ -449,7 +581,7 @@ function Write-Unknown([string]$Detail, [string[]]$Extra = @()) {
             "  UNKNOWN is not zero headroom and it is not full headroom. It is no measurement."
             "  Spawn on your own judgment, and expect a cutoff to be possible at any point."
             @(Get-StewardFallback)
-        ) -join "`n")
+        ) -join "`n") "UNKNOWN"
 }
 
 # UNAVAILABLE IS NOT UNKNOWN, AND ROUTING IT THROUGH Write-Unknown WOULD BE A LIE IN THE SAFE-LOOKING
@@ -466,7 +598,7 @@ function Write-Unavailable([string]$Reason, [string]$Account) {
         "  This is a MEASUREMENT, not a gap: it is zero spendable capacity, not an unread number."
         "  Do not send work here, and do not read a quiet publish directory under it as spare capacity."
     )
-    Write-Context ($lines -join "`n")
+    Write-Context ($lines -join "`n") "UNAVAILABLE"
 }
 
 # --- which tool is this ---------------------------------------------------------------------------
@@ -477,6 +609,8 @@ try { if ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() } } c
 $toolName = $null
 # The session id names the desktop app's record for this session; the Steward fallback reads it.
 $SessionId = $null
+# Set only inside a subagent; it keys the repeat check apart from the parent context's.
+$AgentId = $null
 if ($raw) {
     # -AsHashtable: tool_input is the caller's JSON, and keys in it that differ only by case would make
     # the plain parse throw and lose the session id with it.
@@ -485,6 +619,7 @@ if ($raw) {
         if ($p -is [System.Collections.IDictionary]) {
             if ($p.ContainsKey("tool_name")) { $toolName = [string]$p["tool_name"] }
             if ($p.ContainsKey("session_id")) { $SessionId = [string]$p["session_id"] }
+            if ($p.ContainsKey("agent_id")) { $AgentId = [string]$p["agent_id"] }
         }
     }
     catch { }
@@ -625,4 +760,4 @@ $lines += "  $AGE_NOTE"
 # AFTER the age note, which is about the statusLine reading and does not apply to the fallback.
 if ($state -eq "UNKNOWN") { $lines += @(Get-StewardFallback) }
 
-Write-Context ($lines -join "`n")
+Write-Context ($lines -join "`n") $state

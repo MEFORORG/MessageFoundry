@@ -2,6 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ODBC installer steps must guard their pipes, so a failed fetch fails THERE (BACKLOG #1544).
 
+This module also holds the jobs that run those steps on ``ubuntu-24.04``; the reason is at ci.yml's
+``sqlserver-store`` job.
+
 THE DEFECT IS A MISLEADING DIAGNOSTIC, NOT A SILENT PASS. Each of the three steps below opens with
 
     curl -fsSL --max-time 60 https://packages.microsoft.com/... | sudo tee <file> > /dev/null
@@ -78,6 +81,9 @@ _PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 #: The first two gate a merge. The third is off the merge path entirely -- ``benchmark.yml`` runs on
 #: its own schedule -- and is held to the same rule because it is the SAME BODY, byte for byte.
 #: A reader debugging a benchmark run is owed the same honest message.
+#: The fetch that marks a job as an ODBC installer, for the discovery scan below.
+_MS_UBUNTU_REPO = "packages.microsoft.com/config/ubuntu/"
+
 _GUARDED: tuple[tuple[str, str, str], ...] = (
     (_CI, "sqlserver-store", "Install Microsoft ODBC Driver 18 + sqlcmd"),
     (_CI, "load-test-sqlserver", "Install Microsoft ODBC Driver 18 + sqlcmd"),
@@ -266,13 +272,45 @@ def test_each_installer_step_guards_its_pipes(workflow: str, job_id: str, step_n
 
 
 @pytest.mark.parametrize(("workflow", "job_id", "step_name"), _GUARDED)
+def test_each_installer_job_stays_on_ubuntu_2404(
+    workflow: str, job_id: str, step_name: str
+) -> None:
+    """These jobs stay on ``ubuntu-24.04``; ci.yml's ``sqlserver-store`` says why and when to unpin.
+
+    Two of the three never run on an ordinary PR (``baseline-sqlserver`` runs only on a manual
+    dispatch), so a sweep back to ``ubuntu-latest`` would otherwise pass review unseen.
+    """
+    runs_on = _job(workflow, job_id).get("runs-on")
+    assert runs_on == "ubuntu-24.04", (
+        f"{workflow}:{job_id} runs on {runs_on!r}, not ubuntu-24.04. "
+        "Read the comment at ci.yml's sqlserver-store job before moving this label."
+    )
+
+
+def test_every_job_that_fetches_a_microsoft_ubuntu_repo_is_guarded() -> None:
+    """Find the jobs by what they do, so a copied installer step cannot dodge the pin above."""
+    named = {(w, j) for w, j, _ in _GUARDED}
+    fetching = set()
+    for workflow in (_CI, _BENCH):
+        for job_id, job in (_workflow(workflow).get("jobs") or {}).items():
+            bodies = [str(s.get("run", "")) for s in job.get("steps") or [] if isinstance(s, dict)]
+            if any(_MS_UBUNTU_REPO in body for body in bodies):
+                fetching.add((workflow, job_id))
+    assert fetching, f"no job fetches {_MS_UBUNTU_REPO!r}, so this scan is asserting nothing"
+    assert fetching <= named, (
+        f"unguarded jobs fetch a Microsoft Ubuntu repo: {sorted(fetching - named)}"
+    )
+
+
+@pytest.mark.parametrize(("workflow", "job_id", "step_name"), _GUARDED)
 def test_no_installer_step_acquires_pipefail_by_switching_shells(
     workflow: str, job_id: str, step_name: str
 ) -> None:
     """The guard belongs in the run body, not in a declared shell.
 
-    NOT because a declared shell would be wrong here. All three of these jobs are ``ubuntu-latest``
-    with no Windows leg to surprise, and ci.yml deliberately sets ``defaults.run.shell: bash`` on
+    NOT because a declared shell would be wrong here. All three of these jobs are Linux-only
+    (``ubuntu-24.04``) with no Windows leg to surprise, and ci.yml deliberately sets
+    ``defaults.run.shell: bash`` on
     other jobs (ci.yml:98, "available on all runners ... one set of commands"). Reading this pin as
     a general rule against that would be wrong.
 
