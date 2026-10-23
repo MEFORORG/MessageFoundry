@@ -45,14 +45,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
 
+from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, has_encryption_header_bytes
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
     DEFAULT_DB_CONNECT_TIMEOUT,
@@ -539,6 +543,90 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     )
 
 
+#: How much of an ``sslca`` file :func:`_refuse_encrypted_driver_ca` reads. A CA bundle is tens or
+#: hundreds of KiB; the system bundles a site might name are well under this.
+_MAX_DRIVER_CA_FILE_BYTES = 16 * 2**20
+#: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
+#: space before the drive letter.
+_WINDOWS_INVALID_NAME = 123
+
+
+def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+    """Refuse an ``sslca`` CA file with an encryption header before the driver loads it (BACKLOG
+    #3090).
+
+    MySQL's ODBC driver takes its CA file as ``SSLCA`` and loads it with its own TLS library, so
+    the engine never reads it otherwise. Python's ``ssl`` was measured refusing an encrypted block
+    in a CA file at once (``tests/test_encrypted_pem_cafile_pin.py``); a driver's own library was
+    not. So the file goes through
+    :func:`~messagefoundry.auth.trust_anchors.has_encryption_header_bytes` first. The refusal names
+    the setting and never the file's content. A file past :data:`_MAX_DRIVER_CA_FILE_BYTES` is
+    refused rather than read in part, since a header past the cut would pass unseen.
+
+    Like :func:`~messagefoundry.keywrap.refuse_weak_key_file`, a path that does not exist is left to
+    the driver, which reports it. So is anything that is not a regular file: a directory, which
+    this keyword should not name (a CA directory is ``sslcapath``) and which is loaded as before,
+    and a device or pipe, which the engine does not open because reading one could itself wait.
+    Any other read failure is refused, because a file this check cannot read is one it cannot
+    clear. The value is checked as sent and trimmed, since :func:`_refuse_remote_path` judges the
+    trimmed spelling and a driver may trim it.
+
+    **It runs when the connection is built, not at each connect.** A file replaced afterwards
+    reaches the driver unchecked."""
+    ca_path = named.get("sslca")
+    if not ca_path:
+        return
+    setting = f"{hop_name_prefix(connection)}DATABASE odbc_params sslca"
+    raw = str(ca_path)
+    for path in dict.fromkeys((raw, raw.strip())):
+        _refuse_one_encrypted_ca_file(path, setting)
+
+
+def _refuse_one_encrypted_ca_file(path: str, setting: str) -> None:
+    """One spelling of :func:`_refuse_encrypted_driver_ca`'s check.
+
+    The file is opened once and judged by its own descriptor, so nothing can swap a pipe in
+    between a check and the open. ``O_NONBLOCK``, where the platform has it, keeps that open from
+    waiting on a pipe with no writer."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        with os.fdopen(os.open(path, flags), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                logger.debug("%s: not a regular file, so no encryption-header check", setting)
+                return
+            data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        # No such file, a path through a file, or a NUL in the path: the driver cannot load it
+        # either.
+        logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
+        return
+    except OSError as exc:
+        # Opening a directory fails, as IsADirectoryError on POSIX and PermissionError on Windows.
+        # A directory is loaded as before.
+        if os.path.isdir(path):
+            logger.debug("%s: not a regular file, so no encryption-header check", setting)
+            return
+        if exc.errno == errno.EINVAL or getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
+            # A name the platform cannot spell, such as a padded Windows path: no such file.
+            logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
+            return
+        raise ValueError(
+            f"{setting}: the CA file could not be read to check it for an encryption header: "
+            f"{exc.strerror or type(exc).__name__}"
+        ) from exc
+    if len(data) > _MAX_DRIVER_CA_FILE_BYTES:
+        raise ValueError(
+            f"{setting}: the CA file is larger than the {_MAX_DRIVER_CA_FILE_BYTES // 2**20} MiB "
+            "the engine reads to check it for an encryption header"
+        )
+    if has_encryption_header_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its own "
+            "TLS library, which can wait for a password on an encrypted block; refusing to hand "
+            "it over (BACKLOG #3090)"
+        )
+
+
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
     Driver 18 / T-SQL preset so a DB reached through its own ODBC driver (PostgreSQL, MySQL) works. The
@@ -640,8 +728,9 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
         parts.append(f"{k}={literal}")
-    # After the loop on purpose: this opens the key file, so the keywords are settled first.
+    # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
+    _refuse_encrypted_driver_ca(named, connection=connection)
     _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
 
