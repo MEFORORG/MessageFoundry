@@ -336,6 +336,11 @@ def required_verdict(
     if required is None:
         out["reason"] = "no required-context list"
         return out
+    if not required:
+        # An empty list most likely means a read that found nothing, not a branch that requires
+        # nothing; either way it cannot make a PR read merge-ready.
+        out["reason"] = "the required-context list is empty"
+        return out
     if contexts is None:
         out["reason"] = "required-context query returned nothing for this PR"
         return out
@@ -410,8 +415,8 @@ def _speaker(runs: list[Any]) -> Any:
         stamp = run.get("startedAt") or run.get("createdAt")
         failing, unsettled = pr_checks.counts([run])
         # Ties go to the worse verdict, so equal stamps never leave the answer to list order. STALE
-        # ranks with failing: counts() reads it as neither, but a required STALE run is red here.
-        # A total order (failing, stale, unsettled, passed), so no two verdicts tie.
+        # ranks below a failure and above anything unsettled: counts() reads it as neither, but a
+        # required STALE run is red here. A total order, so no two verdicts tie.
         stale = pr_checks.verdict_of(run) == pr_checks.STALE
         worse = 3 if failing else 2 if stale else 1 if unsettled else 0
         return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""), worse)
@@ -835,6 +840,8 @@ def lock_path(local: Path) -> Path:
 
 
 _log_path: Path | None = None
+#: The last failure to write the log in this run, for the lock holder's cache write to carry.
+_log_error: dict[str, str] | None = None
 
 
 def _say(message: str) -> None:
@@ -850,10 +857,14 @@ def _say(message: str) -> None:
             _log_path.replace(_log_path.with_suffix(".log.1"))
         with _log_path.open("a", encoding="utf-8") as fh:
             fh.write(line)
-    except OSError:
-        # Dropped: the log is the last channel, and it is what failed. The task's exit code, which
-        # main() still returns, and the cache's ageing fetchedAt are what remain.
-        return
+    except OSError as exc:
+        # The log is what failed, so the record goes into the cache instead, as `logError`. Only
+        # the lock holder's write in main() carries it, so only the holder writes the cache.
+        global _log_error
+        _log_error = {
+            "message": f"{exc!r} while logging: {message}"[:500],
+            "at": iso(datetime.now(UTC)),
+        }
 
 
 def main(
@@ -885,8 +896,9 @@ def main(
     if local is None:
         _say("git could not name the common dir; nothing written")
         return 2
-    global _log_path
+    global _log_path, _log_error
     _log_path = local / LOG_NAME
+    _log_error = None
     if args.repo != DEFAULT_REPO and args.out is None:
         # The default cache is the panes' file for DEFAULT_REPO; another repo must not overwrite it.
         _say(f"--repo {args.repo} needs --out; the default cache belongs to {DEFAULT_REPO}")
@@ -929,16 +941,17 @@ def main(
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             # poll() converts reply-shape errors itself; this is a last guard around the rest.
             doc = failed(args.repo, previous, f"unexpected error: {exc!r}", start, part="poller")
+        if doc["error"]:
+            # Said before the write, so a failure to log it is carried by that write.
+            _say(f"poll failed, last good data kept: {doc['error']}")
+        doc["logError"] = _log_error
         try:
             write_cache(out, doc)
         except OSError as exc:
             # The cache cannot say this about itself, so the log file does.
             _say(f"could not write {out}; the poll's result is lost: {exc!r}")
             return 5
-        if doc["error"]:
-            _say(f"poll failed, last good data kept: {doc['error']}")
-            return 1
-        return 0
+        return 1 if doc["error"] else 0
     finally:
         release_lock(fd)
 

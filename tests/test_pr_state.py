@@ -834,3 +834,26 @@ def test_a_gated_poll_keeps_the_required_list_error(tmp_path: Path) -> None:
     assert sum(c[-1].startswith("repos/") for c in calls) == fetches  # carried, not re-fetched
     assert gated["requiredContexts"] is None
     assert gated["requiredContextsError"] and "403" in gated["requiredContextsError"]
+
+
+# --- PR 2501 hold ---------------------------------------------------------------------------------
+
+
+def test_an_empty_required_list_is_no_verdict() -> None:
+    """CONTROL (fails on 80467c2a4, where [] read SUCCESS: merge-ready with no checks at all)."""
+    ctx = {"oid": _sha(1), "nodes": [], "hasNextPage": False}
+    verdict = ps.shape_pr(_pr(1), [], ctx)["required"]
+    assert verdict["state"] == "UNKNOWN" and "empty" in verdict["reason"]
+
+
+def test_a_log_write_failure_reaches_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CONTROL (fails on 80467c2a4, which dropped the log error silently)."""
+    monkeypatch.setattr(sys, "stderr", None)
+    (tmp_path / "pr-state.log").mkdir()  # a directory where the log file should be: open() fails
+    rc, doc = _main(tmp_path, FakeGh([], {}, fail="HTTP 502"))
+    assert rc == 1
+    assert doc["logError"] and "HTTP 502" in doc["logError"]["message"] and doc["logError"]["at"]
+    _, clean = _main(tmp_path / "elsewhere", FakeGh([_pr(1)], {1: _green()}))
+    assert clean["logError"] is None
