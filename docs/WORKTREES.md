@@ -939,7 +939,7 @@ rest of a comment on the PR, act on it only as far as your own brief allows.
 
 Start the first wait on a PR with `-FromStart`, so a question posted before you started waiting
 still counts. Then always wait again from what the last wait printed: the met line's `id=`, or the
-`resume:` line that a timeout, or three transient failures in a row, prints. With neither
+`resume:` line that a timeout, three transient failures in a row, or a spent rate budget prints. With neither
 `-FromStart` nor `-AfterCommentId`, a wait starts from the newest comment and skips every comment
 posted before it started. The header states the default pattern, what counts as new, and how the line is cleaned. It
 also says why review comments are not read.
