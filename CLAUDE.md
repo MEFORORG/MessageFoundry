@@ -317,9 +317,17 @@ the path out here, never in korus: from a korus directory it names korus's own c
 directory, where a write lands unseen. A query also takes `-RecordRepo` with a vault checkout at
 `origin/main`.
 
-    pwsh -NoProfile -File <korus checkout>/scripts/wiki/query.ps1 -Text "<subject>" `
-      -StateRoot "$(git rev-parse --path-format=absolute --git-common-dir)/mefor-coord" `
-      -RecordRepo <vault checkout>
+The inbox is shared across PCs, so `-StateRoot` is the SHARED root that `coord-root.ps1` resolves
+(`docs/COORD-SHARED-ROOT.md`). Never build it from `--git-common-dir`: once `root.toml` names a
+share, that path is an inbox the other PC never reads. `scripts/coord/wiki-query.ps1` resolves
+and probes the root, then calls korus `query.ps1` with it. When it cannot name a reachable root, it
+stops with the resolver's error and runs no query. At least a malformed `root.toml`, a relative
+`MEFOR_COORD_ROOT`, a git failure and a configured root that is missing or unreachable do that. Do
+not pass the root by hand instead: an empty `-StateRoot` makes `query.ps1` print `no note` and exit
+0, so the fault reads as a miss. Fix the root rather than fall back. The line runs from the Bash
+tool too.
+
+    pwsh -NoProfile -File scripts/coord/wiki-query.ps1 -KorusCheckout "<korus checkout>" -Text "<subject>" -RecordRepo "<vault checkout>"
 
 
 ### The KORUS roster, and only these seats
