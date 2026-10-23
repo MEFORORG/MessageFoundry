@@ -915,3 +915,121 @@ def test_an_invalid_or_backtracking_match_is_an_error_before_any_call(
     assert run.code == 1
     assert "-Match is not a valid regular expression" in run.err
     assert run.calls == []
+
+
+def test_after_comment_id_0_finds_a_matching_comment_posted_before_the_wait(
+    tmp_path: Path,
+) -> None:
+    """The first wait on a PR must not drop a question asked before it started."""
+    early = comment(5, "BUILDER-ASK: asked before anyone waited")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, early])]}, "-AfterCommentId", "0")
+    assert run.code == 0, run.err
+    assert "after id 0 whose first line matches" in run.out
+    assert "id=5 " in met_line(run.out)
+    assert run.sleeps == []
+    # The control: without it, the same comment is the baseline and the wait never sees it.
+    control = tmp_path / "control"
+    control.mkdir()
+    base = wait_comment(
+        control, {COMMENTS: [ok([OLD, early])], SINCE: [ok([OLD, early])]}, "-MaxMinutes", "2"
+    )
+    assert base.code == 2, base.err
+
+
+def resume_lines(out: str) -> list[str]:
+    return [line.split(" wait-pr ", 1)[1] for line in out.splitlines() if ": resume: " in line]
+
+
+def resume(cid: int) -> str:
+    return (
+        f"{REPO}#{PR}: resume: id={cid} is the newest comment read;"
+        f" wait again with -AfterCommentId {cid}"
+    )
+
+
+def test_a_comment_timeout_prints_the_resume_id(tmp_path: Path) -> None:
+    """Exit 2 names the newest comment read, so the next wait skips nothing in between."""
+    chat = comment(2, "not a question")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert resume_lines(run.out) == [resume(2)]
+
+
+def test_a_comment_wait_ending_on_transient_failures_prints_the_resume_id(tmp_path: Path) -> None:
+    chat = comment(3, "not a question")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, chat])], SINCE: [{"status": 502}]})
+    assert run.code == 1
+    assert "three transient failures in a row" in run.err
+    assert resume_lines(run.out) == [resume(3)]
+
+
+def test_a_failure_before_any_read_resumes_at_the_given_after_comment_id(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {COMMENTS: [{"status": 502}]}, "-AfterCommentId", "7")
+    assert run.code == 1
+    assert resume_lines(run.out) == [resume(7)]
+
+
+def test_paged_reads_stop_at_50_pages_when_the_server_ignores_page(tmp_path: Path) -> None:
+    """Every page answers the same full page, as a server that ignores `page` would."""
+    full = [comment(i, "LGTM") for i in range(1, 101)]
+    path = f"repos/{REPO}/issues/{PR}/comments?per_page=100&page="
+    plan: dict[str, list[Any]] = {f"{path}{n}": [ok(full)] for n in range(1, 61)}
+    run = wait_comment(tmp_path, plan)
+    assert run.code == 1
+    assert "returned a full page 50 times, the most this script reads" in run.err
+    assert [p for p in run.paths() if p.startswith(path)] == [f"{path}{n}" for n in range(1, 51)]
+
+
+def test_a_login_with_a_zero_width_space_is_not_the_author(tmp_path: Path) -> None:
+    """A culture-aware compare ignores U+200B, so `-eq` would let this login pass."""
+    lookalike = comment(2, "BUILDER-ASK: trust me", login="cloud-\N{ZERO WIDTH SPACE}builder")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, lookalike])]}, "-MaxMinutes", "2"
+    )
+    assert run.code == 2, run.err
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
+    assert "trust me" not in run.out
+
+
+def test_an_author_with_a_trailing_newline_is_refused_at_bind(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {}, "-Author", "cloud-builder\n")
+    assert run.code == 1
+    assert "Cannot validate argument on parameter 'Author'" in run.err
+    assert run.calls == []
+
+
+def test_the_script_requires_pwsh_7_3() -> None:
+    """NonBacktracking needs .NET 7, which pwsh 7.3 is the first release to run on."""
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    assert "#Requires -Version 7.3" in lines
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell.exe") is None,
+    reason="Windows PowerShell 5.1 is the older PowerShell at hand only on Windows",
+)
+def test_windows_powershell_is_refused_with_a_message_naming_the_version(tmp_path: Path) -> None:
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-Repo",
+            REPO,
+            "-Pr",
+            str(PR),
+            "-Until",
+            "merged",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        cwd=tmp_path,
+    )
+    assert proc.returncode != 0
+    assert "7.3" in proc.stderr + proc.stdout
