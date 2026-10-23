@@ -477,6 +477,9 @@ NOT_GUARDED = {
     "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
+    "hooks/usage-headroom-inject.ps1": "project hook; clone-local cache of what this session saw",
+    # Writes only the clone-local pr-state.json cache and its lock, both true of the clone it polls.
+    "coord/pr_state.py": "clone-local PR-state cache",
     # A dot-sourced library: it names where state lives and writes only its clone-local down-cache.
     # Every script that calls it carries its own refusal.
     "coord/coord-root.ps1": "resolver library, clone-local down-cache only",
@@ -490,6 +493,7 @@ NOT_GUARDED = {
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
+    "coord/install-pr-state-task.ps1": "mention",
     "coord/rescue.ps1": "mention",
     "coord/unbacked_check.ps1": "mention",
     "worktree/register-hygiene-task.ps1": "mention",

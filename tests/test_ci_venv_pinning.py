@@ -637,7 +637,18 @@ def _tokens_after(rest: str) -> list[str]:
         if skip_next:
             skip_next = False
             continue
-        if tok in ("-r", "--requirement", "-c", "--constraint", "--index-url", "--extra-index-url"):
+        # `--only-binary` and `--no-binary` take a separate value too (`:all:`, `:none:` or names),
+        # which is not a package to pin (vault BACKLOG #3861).
+        if tok in (
+            "-r",
+            "--requirement",
+            "-c",
+            "--constraint",
+            "--index-url",
+            "--extra-index-url",
+            "--only-binary",
+            "--no-binary",
+        ):
             skip_next = True
             continue
         if tok.startswith("-"):
@@ -2492,3 +2503,58 @@ def test_the_release_signing_toolchain_is_installed_from_a_hashed_lock() -> None
         "deliberate, restore an equivalent guard in the same commit -- otherwise the lock is inert "
         "and the signing step is back to resolving unhashed dependencies at tag time."
     )
+
+
+def test_a_binary_option_value_is_not_an_install_target() -> None:
+    """``--only-binary :all:`` names a format rule, not a package; the package after it still counts,
+    so a skip that swallowed more than the one value would show here (vault BACKLOG #3861)."""
+    assert _install_targets("pip install --require-hashes --only-binary :all: -r x.lock") == []
+    assert _install_targets("pip install --only-binary :all: requests") == ["requests"]
+    assert _install_targets("pip install --no-binary :none: requests==2.0") == ["requests==2.0"]
+
+
+#: The security.yml jobs that audit a dependency lock, which vault BACKLOG #3861 closed. Not every job
+#: that installs a lock: at least sbom, sbom-windows, bandit and repo-scan install one without either
+#: control, and are not pinned here.
+_LOCK_AUDIT_JOBS = ("pip-audit", "released-line-audit", "dependency-and-secret-scan")
+
+
+@pytest.mark.parametrize("job", _LOCK_AUDIT_JOBS)
+def test_a_lock_audit_job_takes_wheels_only_and_keeps_no_checkout_token(job: str) -> None:
+    """The job sets ``PIP_ONLY_BINARY`` at job level, which pip, the auditor's dry-runs included,
+    reads unless a step or a pip flag overrides it; and the checkout stores no job token. This reads
+    the job-level setting only, not every step and pip line. Removing either fails here."""
+    pytest.importorskip("yaml")
+    from tests._workflow_contexts import jobs_of
+
+    jobs = jobs_of("security.yml")
+    assert job in jobs, f"security.yml has no `{job}` job; update _LOCK_AUDIT_JOBS"
+    assert (jobs[job].get("env") or {}).get("PIP_ONLY_BINARY") == ":all:", job
+    checkouts = [s for s in jobs[job]["steps"] if "actions/checkout" in str(s.get("uses", ""))]
+    assert checkouts, f"{job} has no checkout step"
+    for step in checkouts:
+        assert (step.get("with") or {}).get("persist-credentials") is False, job
+
+
+def test_the_released_line_auditor_runs_without_the_gh_token() -> None:
+    """The step that audits a released lock holds ``GH_TOKEN`` for ``gh``; the auditor's pip and
+    pip-audit children must not inherit it."""
+    pytest.importorskip("yaml")
+    from tests._workflow_contexts import jobs_of
+
+    jobs = jobs_of("security.yml")
+    runs = [str(s.get("run", "")) for s in jobs["released-line-audit"]["steps"]]
+    calls = [
+        line.strip() for run in runs for line in run.splitlines() if _AUDITOR_CALL.search(line)
+    ]
+    assert calls, "the released-line audit no longer calls the auditor; update this test"
+    for call in calls:
+        assert call.startswith("env -u GH_TOKEN "), call
+    # The matcher sees a call that lacks the unset, and not a line that only names the script.
+    assert _AUDITOR_CALL.search('python scripts/security/audit_all_platforms.py "x.lock"')
+    assert not _AUDITOR_CALL.search('echo "see the audit_all_platforms.py line"')
+
+
+#: A line that runs the auditor, as opposed to one that names it: at the start of a line, the form
+#: the workflow uses. A call after `&&` or inside `if !` is not seen.
+_AUDITOR_CALL = re.compile(r"^\s*(?:env\s+-u\s+\S+\s+)?python\S*\s+\S*audit_all_platforms\.py\b")
