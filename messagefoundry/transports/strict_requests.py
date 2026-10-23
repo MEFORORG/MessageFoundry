@@ -86,6 +86,7 @@ shrinking it to a type name.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import logging
 import re
@@ -116,6 +117,11 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
     revocation_hop_disposition,
     tls_revocation_attested,
+)
+from messagefoundry.transports.ambient_proxy import (
+    UNREADABLE_PROXY_LABEL,
+    proxy_label,
+    vault_hop_proxy_warning,
 )
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
@@ -559,6 +565,9 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # Vault BACKLOG #2983: checked at construction too. This catches a proxy that appeared
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
+        # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
+        # What the WARNING claims is in docs/CONFIGURATION.md, the point-of-use paragraphs.
+        _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
     def _checks_revocation(self) -> bool:
@@ -923,13 +932,17 @@ _REVOCATION_PAIR: dict[VaultAttestationSection, str] = {
     "secrets": "[secrets].vault_revocation_attested",
 }
 
-#: The crossings already logged in this process, by connector label and kind.
+#: The crossings already logged in this process, by connector label and kind. Also holds the
+#: ambient proxies :func:`_disclose_ambient_proxy` has named, under kinds of their own.
 _CROSSINGS_LOGGED: set[tuple[str, str]] = set()
 _CROSSINGS_LOCK = threading.Lock()
 
 
 def _first_crossing(connector: str, kind: str) -> bool:
     """Whether this is the first ``kind`` of crossing on the ``connector`` hop in this process.
+
+    Shared by the revocation crossings (kinds ``attested`` and ``warned``) and the ambient proxy
+    disclosure (kind ``ambient proxy <digest>``), so resetting the set resets both.
 
     A crossing is logged once per process for each hop, not at every client build. The secret
     provider builds a client on every ``resolve``, and the key provider on every DR backup pass,
@@ -947,6 +960,43 @@ def _first_crossing(connector: str, kind: str) -> bool:
             return False
         _CROSSINGS_LOGGED.add(key)
         return True
+
+
+def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
+    """Log :func:`~messagefoundry.transports.ambient_proxy.vault_hop_proxy_warning` the first
+    time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028). When it
+    logs is in ``docs/CONFIGURATION.md``, *The Vault and OpenBao clients also name a proxy
+    where they use it*.
+
+    Keyed by a digest of the raw value, never the raw string: why, and what that does not
+    protect, is the ``docs/ASVS-L2-PHASE0-CHANGES.md`` section 4 row "Vault hop ambient-proxy
+    disclosure dedupe". Keyed by it rather than the label, so an already-named proxy costs one
+    hash rather than a parse on each send (the Transit cipher sends once per stored cell)."""
+    if not proxy:
+        return
+    digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
+    if _first_crossing(connector, f"ambient proxy {digest}"):
+        logger.warning("%s", vault_hop_proxy_warning(connector, _dialled_proxy_label(proxy)))
+
+
+def _dialled_proxy_label(proxy: str) -> str:
+    """:func:`~messagefoundry.transports.ambient_proxy.proxy_label`, kept only when urllib3,
+    which dials the proxy, reads the same scheme, host and port from it.
+
+    The label's parser is urlsplit's, and urllib3's is not. A backslash before ``@`` makes them
+    disagree on the host, so a label alone could name a host the hop does not dial. urllib3's
+    host is never named instead, because it can be the user part of the URL."""
+    label = proxy_label(proxy)
+    try:
+        parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))
+    except (ValueError, urllib3.exceptions.LocationParseError):
+        return UNREADABLE_PROXY_LABEL
+    if parsed.host is None:  # else the f-string below would compare a host spelled "None"
+        return UNREADABLE_PROXY_LABEL
+    dialled = f"{parsed.scheme}://{parsed.host}" + (
+        f":{parsed.port}" if parsed.port is not None else ""
+    )
+    return label if label.lower() == dialled.lower() else UNREADABLE_PROXY_LABEL
 
 
 def _refuse_an_unrevoked_vault_hop(

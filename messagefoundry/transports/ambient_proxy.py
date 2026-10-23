@@ -13,6 +13,10 @@ extra reaches no hop, and it is still named. It makes no claim about which hop u
 what the leg to it protects. Four review rounds found that every per-hop verdict a probe produced
 could be wrong, so the per-hop facts live once, in ``docs/CONFIGURATION.md``, *``serve`` names an
 environment proxy at start*, and the warning points there.
+
+**The Vault hop also discloses at the point of use (vault BACKLOG #4028):** see
+:func:`vault_hop_proxy_warning`. Why, and what it covers, is in ``docs/CONFIGURATION.md``, *The
+Vault and OpenBao clients also name a proxy where they use it*.
 """
 
 from __future__ import annotations
@@ -27,12 +31,21 @@ from typing import Any
 # _peer_label: the one secret-safe address parser, so a proxy URL is read the same way everywhere.
 from messagefoundry.config.wiring import _split_address
 
-__all__ = ["ambient_proxy_warning", "environment_proxy_hosts", "warn_ambient_proxy"]
+__all__ = [
+    "ambient_proxy_warning",
+    "environment_proxy_hosts",
+    "UNREADABLE_PROXY_LABEL",
+    "proxy_label",
+    "vault_hop_proxy_warning",
+    "warn_ambient_proxy",
+]
 
 #: The ``getproxies()`` keys an engine HTTP hop can read: urllib reads a target's own scheme, and
 #: requests reads that or ``all``. Any other key, such as ``ftp`` or ``socks``, is not disclosed.
 _READ_KEYS = ("all", "http", "https")
 _UNREADABLE = "an unreadable value"
+#: The label of a proxy value no disclosure can name safely. Public for the Vault hop's cross-check.
+UNREADABLE_PROXY_LABEL = _UNREADABLE
 
 _HOPS = (
     "HTTP-family connections (REST, SOAP, FHIR, fhir_lookup, DICOMweb) and their OAuth2 and SMART "
@@ -47,15 +60,24 @@ _POINTER = (
     "Per-hop detail, including which hosts go direct, is in docs/CONFIGURATION.md, [egress], "
     '"serve names an environment proxy at start". '
 )
+#: The Vault hop WARNING's pointer: its own sub-heading under the section :data:`_POINTER` names.
+_VAULT_HOP_POINTER = (
+    'What this WARNING claims is in docs/CONFIGURATION.md, [egress], "The Vault and OpenBao '
+    'clients also name a proxy where they use it". '
+)
+#: How to take the environment proxy away, shared by the start warning and the Vault hop's.
+_CLEAR = (
+    "clear http_proxy, https_proxy and all_proxy in either case, and the system proxy, for the "
+    "account the engine runs as"
+)
 _REMEDY = (
-    "To stop it, clear http_proxy, https_proxy and all_proxy in either case, and the system "
-    "proxy, for the account the engine runs as. Setting [egress].proxy_url to an address changes "
+    f"To stop it, {_CLEAR}. Setting [egress].proxy_url to an address changes "
     "only the HTTP-family connections and their token requests. Every other hop is unchanged, "
     "and this warning still logs, since it reads only the environment. "
 )
 
 
-#: Shared by the warning and its fallback, so one search finds both.
+#: Shared by the warning, its fallback and the Vault hop's, so one search finds all three.
 _OPENING = "a web proxy from the environment or the system proxy settings"
 
 
@@ -180,3 +202,23 @@ def warn_ambient_proxy(logger: logging.Logger) -> None:
         return
     if text is not None:
         logger.warning("%s", text)
+
+
+def proxy_label(value: object) -> str:
+    """One proxy URL as ``scheme://host:port``, or "an unreadable value". It never carries a user
+    or password from the URL, and never raises: the label every disclosure names a proxy by."""
+    return _label(value)
+
+
+def vault_hop_proxy_warning(connector: str, label: str) -> str:
+    """The WARNING a Vault hop logs when ``requests`` picks a proxy for one of its sends (vault
+    BACKLOG #4028). ``label`` names the proxy, as :func:`proxy_label` does. What the text claims,
+    and why, is in the ``docs/CONFIGURATION.md`` sub-heading :data:`_VAULT_HOP_POINTER` names."""
+    return (
+        f"{connector}: {_OPENING} was picked for a request to Vault: {label}. No engine setting "
+        "names it. This logs once per hop and distinct proxy value in this process. To send this hop "
+        "direct, add the Vault host to the bypass list of whatever set the proxy: no_proxy for a "
+        "*_proxy variable, or the system bypass list for the system proxy, since setting any "
+        f"*_proxy variable makes every hop ignore the system proxy settings. Or {_CLEAR}. "
+        f"{_VAULT_HOP_POINTER}(vault BACKLOG #4028)"
+    )

@@ -93,6 +93,10 @@ _MUST_NOT_BE_REQUIRED = (
     # trigger and runs on a pull request only when its own file changes.
     "python 3.15 canary (ubuntu-latest)",
     "python 3.15 canary (windows-latest)",
+    # The newest-3.14-patch canary, the advisory half of the ci/python-version pin. Same shape and
+    # the same reasons as the 3.15 canary above.
+    "python 3.14 latest canary (ubuntu-latest)",
+    "python 3.14 latest canary (windows-latest)",
     "complexity triage (advisory)",
     "clone detection (advisory)",
     "diff-coverage (advisory)",

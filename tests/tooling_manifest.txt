@@ -65,6 +65,7 @@ tests/test_cla_action_advisory_gate.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
+tests/test_claude_md_wiki_state_root.py
 tests/test_codex_bridge.py
 tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
@@ -89,6 +90,7 @@ tests/test_coord_smb_retry.py
 tests/test_durability_hook_provenance.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
+tests/test_enter_worktree_check.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_payload_cwd.py
 tests/test_hook_prose_folding.py

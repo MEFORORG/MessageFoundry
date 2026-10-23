@@ -24,8 +24,6 @@ Synthetic data only: the token, key names and host names are made up.
 from __future__ import annotations
 
 import re
-import socket
-import threading
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -35,6 +33,7 @@ from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._vault_hop_sockets import _closed_port, _Listener
 from tests._wire_proxy import _WireProxy
 
 pytestmark = pytest.mark.skipif(
@@ -85,38 +84,6 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "synthetic-data-key")
 
 
-class _Listener:
-    """A loopback socket that counts the connections it accepts and answers none of them."""
-
-    def __init__(self) -> None:
-        self.connections = 0
-        self._sock = socket.socket()
-        self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(4)
-        self._sock.settimeout(0.05)  # how long close() can wait for the accept loop
-        self.port = self._sock.getsockname()[1]
-        self.url = f"http://127.0.0.1:{self.port}"
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._accept, daemon=True)
-        self._thread.start()
-
-    def _accept(self) -> None:
-        while not self._stop.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            self.connections += 1
-            conn.close()
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
-        self._sock.close()
-
-
 @pytest.fixture
 def listener() -> Iterator[_Listener]:
     lst = _Listener()
@@ -124,14 +91,6 @@ def listener() -> Iterator[_Listener]:
         yield lst
     finally:
         lst.close()
-
-
-def _closed_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port: int = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 # --- the three shipped entry points ---------------------------------------------------------------

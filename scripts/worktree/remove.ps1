@@ -77,7 +77,9 @@
     editable clones), and one in an ignored node_modules, an @scope level included. A clone deeper
     than that, or in another ignored directory, is not looked for.
     -Force is the operator's switch. A session runs -Path without it, and a refusal is final for a
-    session: it reports what was refused and why, and stops.
+    session: it reports what was refused and why, and stops. The one exception is a cache-only
+    refusal on the session's own tree, under the three conditions docs\WORKTREES.md "Remove one"
+    lists (owner approval 2026-10-22).
 
     WHAT ONLY -AllowOrphanedAllocations OVERRIDES, on both removal routes: a target that owns a
     ledger number (alloc.ps1) whose item is not on origin/main, or an allocation record that cannot

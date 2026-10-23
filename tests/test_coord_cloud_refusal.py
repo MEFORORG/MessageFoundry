@@ -176,6 +176,7 @@ def _run(
         pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
         pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
         pytest.param("coord/digest.ps1", (), id="digest"),
+        pytest.param("coord/wiki-query.ps1", ("-KorusCheckout", "no-korus"), id="wiki-query"),
         *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
         pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
@@ -445,6 +446,8 @@ GUARDED = (
     "coord/claim-adjudicate.ps1",
     "coord/claim-reconcile.ps1",
     "coord/fleet.ps1",
+    # The wiki query wrapper: a VM's empty inbox would answer `no note`, a clean-looking miss.
+    "coord/wiki-query.ps1",
 )
 PY_GUARDED = "coord/owner_log.py"
 
@@ -491,6 +494,9 @@ NOT_GUARDED = {
     "hooks/precompact-reprime.ps1": "reader, project hook",
     "hooks/worktree_gate.ps1": "reader; writes only its own log, outside mefor-coord",
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
+    # Reads only this machine's own OFF switch (ADR 0212), whose absence is the right answer in a VM
+    # too, and judges worktrees of this clone. The New-Item line it names is header prose for a person.
+    "worktree/enter-check.ps1": "reader; this machine's OFF file and this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
     "coord/install-pr-state-task.ps1": "mention",
