@@ -25,7 +25,7 @@ import pytest
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # The cleartext-hop tests' stand-in proxy: a loopback socket that hangs up on every connection.
-from tests.test_vault_cleartext_hop import _closed_port, _Listener
+from tests._vault_hop_sockets import _closed_port, _Listener
 
 pytestmark = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
