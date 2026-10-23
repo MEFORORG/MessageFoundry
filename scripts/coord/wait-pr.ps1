@@ -517,6 +517,8 @@ function Test-Checks($p) {
 # protection through `branches/{base}`, which needs no admin scope (unlike
 # `.../protection/required_status_checks`), and every ruleset through `rules/branches/{base}`.
 function Read-Required([string]$Base) {
+    # A second guard behind Test-Pr's: `branches/` with no name is the list endpoint.
+    if ([string]::IsNullOrWhiteSpace($Base)) { Fail 'the required contexts of an empty base name cannot be read.' }
     $branch = Get-Rest "repos/$Repo/branches/$(Esc $Base)"
     $classic = @()
     if ((Prop $branch 'protected') -eq $true) {
@@ -562,6 +564,10 @@ function Read-Pages([string]$Path) {
 function Test-Pr {
     $p = Get-Rest "repos/$Repo/pulls/$Pr"
     $prBase = [string]$p.base.ref
+    # An empty base would read the branch LIST endpoint, never a protection; refused, not waited on.
+    if ($Until -eq 'checks-complete' -and [string]::IsNullOrWhiteSpace($prBase)) {
+        Fail 'the PR names no base branch, so its required contexts cannot be read; checks-complete will not wait on the visible checks alone.'
+    }
     # The $null test first: a $null passed to a [string] parameter arrives as '', so an empty base
     # would otherwise equal "never read" and skip the required set.
     if ($Until -eq 'checks-complete' -and
