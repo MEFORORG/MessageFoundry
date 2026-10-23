@@ -41,7 +41,8 @@ $tail = @()
 # session, so dropping one would hide the very hazard the banner exists to report. Add-Hazard appends
 # to $lines and records the index; the backstop skips every recorded index. Callers clip each line's
 # variable part with Format-Reason or Format-Field, since a protected line that grows has nothing to
-# cut it.
+# cut it. One exception: the header prints this worktree's path in full, because it is the session's
+# identity, and the budget already counts that path at a fixed $pathReserve.
 $hazard = @()
 function Add-Hazard([string[]]$Text) {
     foreach ($t in $Text) { $script:lines += $t; $script:hazard += ($script:lines.Count - 1) }
@@ -87,7 +88,7 @@ function Format-Reason($Value, [int]$TokenWidth = 100) {
         '...' + $w.Substring($start)
     }
     $r = $words -join ' '
-    # Many short words can still run long, so past 400 the middle goes and both ends stay.
+    # Many short words can still run long, so past 400 the middle goes and both ends stay. That cut
     if ($r.Length -gt 400) { $r = $r.Substring(0, 200) + ' ... ' + $r.Substring($r.Length - 195) }
     return $r
 }
@@ -126,7 +127,7 @@ if ($root) {
         }
 
         $lines += ""
-        Add-Hazard "[PARALLEL SESSION ($($wt.Count) worktrees active)]", "This chat's worktree: $root  (branch: $branch)"
+        Add-Hazard "[PARALLEL SESSION ($($wt.Count) worktrees active)]", "This chat's worktree: $root  (branch: $(Format-Field $branch 80))"
 
         if ($null -eq $isPrimary) {
             $lines += ""
@@ -158,7 +159,7 @@ if ($root) {
         # roster that spans surfaces: the Desktop app's own session tooling never registers a session it
         # did not spawn, so a VS Code session working in this repo does not appear in it at all.
         $presence = Join-Path $PSScriptRoot "..\coord\presence.ps1"
-        if (Test-Path $presence) {
+        if (Test-Path -LiteralPath $presence -PathType Leaf) {
             $peers = @()
             # A SessionStart hook must never fail loudly: whatever this prints IS the chat's starting
             # context, so a throw here would replace the coordination banner with a stack trace.
@@ -223,7 +224,7 @@ if ($root) {
             # fixing one npm advisory, in DIFFERENT files, so nothing file-shaped could have caught it.
             # Sourced from each session's own task list, so no one has to declare anything.
             $overlap = Join-Path $PSScriptRoot "..\coord\overlap.ps1"
-            if (Test-Path $overlap) {
+            if (Test-Path -LiteralPath $overlap -PathType Leaf) {
                 $inflight = @()
                 # Work that threw must not read as "nobody is building anything", so it says so,
                 # protected. It goes with the other in-flight lines, after the claims.

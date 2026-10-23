@@ -112,7 +112,9 @@ def test_banner_survives_a_missing_presence_script(staged: Path) -> None:
     assert ALWAYS_PRINTED in proc.stdout
     assert "LIVE sessions" not in proc.stdout  # degraded, not crashed
     # Degraded aloud: a missing roster must not read as "nobody else is live".
-    assert "Live sessions: NOT READ (" in proc.stdout and "is missing)" in proc.stdout, proc.stdout
+    assert re.search(
+        r"Live sessions: NOT READ \([^\n]*presence\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
 
 
 def test_a_missing_presence_script_does_not_hide_the_in_flight_list(staged: Path) -> None:
@@ -132,11 +134,30 @@ def test_a_missing_presence_script_does_not_hide_the_in_flight_list(staged: Path
     )
 
 
+def test_a_checkout_path_with_brackets_still_finds_its_roster_scripts(tmp_path: Path) -> None:
+    """Test-Path without -LiteralPath reads `[x]` as a wildcard class, so a present presence.ps1 or
+    overlap.ps1 under such a path read as missing, a false NOT READ."""
+    base = Path(os.path.realpath(tmp_path)) / "co[x]de"
+    base.mkdir()
+    repo = _make_staged(base)
+    fake_presence(repo, _peer_rows(1))
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text("Write-Output '[]'\n", encoding="utf-8")
+    proc = run_context(repo)
+    assert proc.returncode == 0, proc.stderr
+    # The positive control: the banner ran, under the bracketed path.
+    assert "co[x]de" in proc.stdout, proc.stdout
+    assert "LIVE sessions in this repo right now (1 besides you)" in proc.stdout, proc.stdout
+    assert "Live sessions: NOT READ" not in proc.stdout, proc.stdout
+    assert "In-flight work: NOT READ" not in proc.stdout, proc.stdout
+
+
 def test_a_missing_overlap_script_is_said_aloud(staged: Path) -> None:
     fake_presence(staged, [])
     assert not (staged / "scripts" / "coord" / "overlap.ps1").exists()
     proc = run_context(staged)
-    assert "In-flight work: NOT READ (" in proc.stdout and "is missing)" in proc.stdout, proc.stdout
+    assert re.search(
+        r"In-flight work: NOT READ \([^\n]*overlap\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
 
 
 def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
