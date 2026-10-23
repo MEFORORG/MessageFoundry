@@ -111,6 +111,7 @@ export function parsePrState(text: string): FleetPrs {
     pollFetchedAt: strOrNull(doc.fetchedAt),
     pollError: pollError ? (part ? `${pollError} (${part})` : pollError) : null,
     consecutiveFailures: numOrNull(doc.consecutiveFailures) ?? 0,
+    nextPollNotBefore: strOrNull(doc.nextPollNotBefore),
     requiredContextsNote,
     pullRequests: prs,
     openCount: numOrNull(data.openPullRequestCount),
@@ -173,6 +174,19 @@ export function ageWords(ms: number): string {
   const m = Math.round(s / 60)
   if (m < 120) return `${m}m ago`
   return `${Math.round(m / 60)}h ago`
+}
+
+// The coordination scripts run only where origin is this repository on github.com, so a user-wide
+// install does not run another clone's scripts/coord. It checks the origin URL, nothing more.
+const OUR_REMOTE =
+  /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)MEFORORG\/MessageFoundry(?:\.git)?\/?$/i
+
+export const isOurOrigin = (url: string): boolean => OUR_REMOTE.test(url)
+
+// pr_state.py's deliberate back-off: no poll runs before this time, so an old poll is expected then.
+export function isBackingOff(iso: string | null, now: number): boolean {
+  const t = iso ? Date.parse(iso) : NaN
+  return !Number.isNaN(t) && now < t
 }
 
 // How old an ISO time is, in ms; an absent or unreadable one counts as infinitely old.

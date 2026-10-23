@@ -4,6 +4,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { isOurOrigin } from '../hooks/sources'
+
 const PANE = {
   plugin: 'fleet-pane',
   component: 'Pane',
@@ -71,7 +73,12 @@ const FLEET = {
   presentation: { isFullscreen: true, columns: 200 },
 } as const
 
-type World = { presence?: { stdout: string; stderr: string }; origin?: string; prState?: unknown }
+type World = {
+  presence?: { stdout: string; stderr: string }
+  origin?: string
+  prState?: unknown
+  panesDeny?: string
+}
 
 // Answers every host call the pane makes, and records any call it must never make.
 function host(on: On, world: World = {}) {
@@ -88,7 +95,16 @@ function host(on: On, world: World = {}) {
   mock.env(on, { USERPROFILE: 'D:/profile' })
   on('command.register', () => ({ value: { command: 'fleet' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [{ id: 'fleet', title: 'Fleet', isShown: true, isFocused: false, isPlaced: true }] }))
+  const logs: string[] = []
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.panes', () =>
+    world.panesDeny
+      ? { deny: world.panesDeny }
+      : { value: [{ id: 'fleet', title: 'Fleet', isShown: true, isFocused: false, isPlaced: true }] },
+  )
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('fs.read', (_, e) => {
     ran.push(`read ${e.path}`)
@@ -110,7 +126,7 @@ function host(on: On, world: World = {}) {
     if (argv.includes('lane.ps1')) return ok(JSON.stringify(LANE))
     throw new Error(`unexpected command: ${argv}`)
   })
-  return { forbidden, ran }
+  return { forbidden, ran, logs }
 }
 
 test('the pane reads every source and no hook beneath sees a model, agent, prompt or tool call', async ($, on) => {
@@ -176,7 +192,9 @@ test('another repository runs nothing, and every section says why', async ($, on
 
   expect(ran.filter(r => r.startsWith('pwsh') || r.startsWith('read'))).toEqual([])
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /READ FAILED/ }))?.text).toContain('not github.com/MEFORORG/MessageFoundry')
+  const failed = (await ui.find({ type: 'Text', text: /READ FAILED/ }))?.text ?? ''
+  expect(failed).toContain('not github.com/MEFORORG/MessageFoundry')
+  expect(failed).not.toContain('someone')
   await ui.unmount()
 })
 
@@ -233,4 +251,80 @@ test('a source is read again at its interval, not a tick late', async ($, on) =>
   const first = reads()
   await clock.advance(29000)
   expect(reads()).toBe(first + 1)
+})
+
+test('the origin check takes github.com spellings of this repository and nothing else', () => {
+  for (const url of [
+    'https://github.com/MEFORORG/MessageFoundry.git',
+    'https://github.com/MEFORORG/MessageFoundry',
+    'https://github.com/MEFORORG/MessageFoundry/',
+    'git@github.com:MEFORORG/MessageFoundry.git',
+    'ssh://git@github.com/MEFORORG/MessageFoundry.git',
+  ]) {
+    expect(isOurOrigin(url)).toBe(true)
+  }
+  for (const url of [
+    'https://evil.example/MEFORORG/MessageFoundry.git',
+    'https://github.com.evil.example/MEFORORG/MessageFoundry.git',
+    'https://x-access-token:secret@github.com/MEFORORG/MessageFoundry.git',
+    'git@evil.example:MEFORORG/MessageFoundry.git',
+    'ssh://git@github.com.evil.example/MEFORORG/MessageFoundry.git',
+    'https://github.com/MEFORORG/MessageFoundry-fork.git',
+    'https://github.com/someone/MessageFoundry.git',
+    '',
+  ]) {
+    expect(isOurOrigin(url)).toBe(false)
+  }
+})
+
+test('the origin token never reaches the pane', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  host(on, { origin: 'https://x-access-token:secret@evil.example/MEFORORG/MessageFoundry.git\n' })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await $.command.run(FLEET)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /secret/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /READ FAILED/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an old poll inside the poller back-off is not flagged as stopped', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  const old = '2026-10-23T14:00:00Z'
+  const prState = {
+    ...PR_STATE,
+    fetchedAt: old,
+    nextPollNotBefore: '2026-10-23T15:40:00Z',
+    data: { ...PR_STATE.data, fetchedAt: old },
+  }
+  host(on, { prState })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await $.command.run(FLEET)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /POLLER STOPPED/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /backing off until/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a fault is logged once, and again if it returns after a recovery', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  const world: World = {}
+  const { logs } = host(on, world)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+
+  world.panesDeny = 'panes unavailable'
+  await clock.advance(15000)
+  await clock.advance(15000)
+  expect(logs.length).toBe(1)
+
+  world.panesDeny = undefined
+  await clock.advance(15000)
+  world.panesDeny = 'panes unavailable'
+  await clock.advance(15000)
+  expect(logs.length).toBe(2)
 })

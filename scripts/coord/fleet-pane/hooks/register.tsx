@@ -10,7 +10,19 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetLane, FleetPrs, FleetSeat, FleetSection, FleetUsage } from '../types'
-import { ageWords, firstLine, parseLane, parsePresence, parsePrState, parseUsage, pollAge, sinceIso, words } from './sources'
+import {
+  ageWords,
+  firstLine,
+  isBackingOff,
+  isOurOrigin,
+  parseLane,
+  parsePresence,
+  parsePrState,
+  parseUsage,
+  pollAge,
+  sinceIso,
+  words,
+} from './sources'
 import type { Ran } from './sources'
 
 const PANE = 'fleet'
@@ -22,9 +34,6 @@ const EVERY = { seats: 60000, prs: 30000, usage: 120000, lane: 120000 } as const
 const TICK = 15000
 // The poller writes every 2 minutes; data older than this means it has stopped.
 const PR_STALE_MS = 10 * 60000
-// The coordination scripts run only where origin is this repository on github.com, so a user-wide
-// install does not run another clone's scripts/coord. It checks the origin URL, nothing more.
-const OUR_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)MEFORORG\/MessageFoundry(?:\.git)?\/?$/i
 type SourceName = keyof typeof EVERY
 const SOURCES = Object.keys(EVERY) as SourceName[]
 
@@ -68,8 +77,9 @@ async function resolveWhere($: EngineInterface): Promise<Where> {
     throw new Error(`not in a git checkout (${firstLine(git.stderr) || `git exited ${git.exitCode}`})`)
   }
   const origin = remote.stdout.trim()
-  if (!OUR_REMOTE.test(origin)) {
-    throw new Error(`this checkout's origin is ${origin || 'unset'}, not github.com/MEFORORG/MessageFoundry; no script was run`)
+  // The URL itself is never echoed: an origin can carry a token in its userinfo.
+  if (!isOurOrigin(origin)) {
+    throw new Error(`this checkout's origin is ${origin ? 'not' : 'unset, so not'} github.com/MEFORORG/MessageFoundry; no script was run`)
   }
   // CLAUDE_CONFIG_DIR is unset in desktop sessions; the default root is the profile's .claude.
   const configRoot = configDir ? slashes(configDir) : profile ? `${slashes(profile)}/.claude` : ''
@@ -166,12 +176,18 @@ async function readAndTick($: EngineInterface, names: SourceName[]): Promise<voi
 
 // Fire-and-forget work still reports a failure, once per distinct message so a stuck failure does
 // not write a line every tick.
+// A success clears the memory, so a fault that comes back after a recovery is logged again.
 function background($: EngineInterface, work: Promise<void>): void {
-  work.catch(err => {
-    const line = `fleet-pane: ${words(err)}`
-    if (line !== lastLogged) $.ui.log(line)
-    lastLogged = line
-  })
+  work.then(
+    () => {
+      lastLogged = ''
+    },
+    err => {
+      const line = `fleet-pane: ${words(err)}`
+      if (line !== lastLogged) $.ui.log(line)
+      lastLogged = line
+    },
+  )
 }
 
 // One tick: nothing while the pane is not placed, else every source whose interval has passed.
@@ -267,10 +283,13 @@ export const register: Register = on => {
             <Text dimColor>
               {cut(`poller data ${sinceIso(pd.dataFetchedAt, t)}; last poll ${sinceIso(pd.pollFetchedAt, t)}`)}
             </Text>
-            {pd.pollError === null && pollAge(pd.pollFetchedAt, t) > PR_STALE_MS && (
+            {pd.pollError === null && pollAge(pd.pollFetchedAt, t) > PR_STALE_MS && !isBackingOff(pd.nextPollNotBefore, t) && (
               <Text color="red">
                 {cut(`POLLER STOPPED? last poll ${sinceIso(pd.pollFetchedAt, t)}; is the MEFOR-PR-State task running?`)}
               </Text>
+            )}
+            {isBackingOff(pd.nextPollNotBefore, t) && (
+              <Text color="yellow">{cut(`poller backing off until ${pd.nextPollNotBefore}`)}</Text>
             )}
             {pd.pollError !== null && (
               <Text color="red">

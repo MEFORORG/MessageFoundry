@@ -44,6 +44,7 @@ export type FleetPrs = {
   pollFetchedAt: string | null
   pollError: string | null
   consecutiveFailures: number
+  nextPollNotBefore: string | null
   requiredContextsNote: string | null
   // null: the poller has no good data yet, which is unknown, never "no PRs".
   pullRequests: FleetPr[] | null
