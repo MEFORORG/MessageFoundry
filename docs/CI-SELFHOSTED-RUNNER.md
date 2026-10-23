@@ -81,7 +81,9 @@ unchanged: it's still a real Windows Server 2025 SKU.
    self-install it (see **Provisioning gotchas**). Install a standalone 3.14 and place it at
    `<runner-dir>\_work\_tool\Python\3.14.x\x64\`, drop an **empty** `...\3.14.x\x64.complete` marker
    file beside it, then `icacls <runner-dir>\_work\_tool /grant <service-user>:(OI)(CI)M`.
-   `actions/setup-python` then cache-hits and skips the (admin-only) installer. uv is installed
+   `actions/setup-python` then cache-hits and skips the (admin-only) installer. The `3.14.x` must
+   be the exact patch in `ci/python-version`, which the required legs read; any other patch misses
+   the cache, and each bump of that file needs a re-seed on every runner. uv is installed
    per-run by `astral-sh/setup-uv`; nothing to preinstall for it.
 4. ~30 GB free (two work dirs + tool cache + uv cache).
 5. Power: never sleep (Server default). Optional: BIOS "restore on AC power" so a power blip

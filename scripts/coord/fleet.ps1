@@ -377,6 +377,30 @@ function Get-AgeHours($iso) {
     } catch { return $null }
 }
 
+# EACH RECORD'S TREE: the box its worktree and host key to now (docs/COORD-SHARED-ROOT.md, step 4).
+# A record in the old path-only box of that worktree belongs to the same tree as one in the new box,
+# because one session crosses the change with a record in each: seat.ps1 writes the new box only,
+# while an older copy of it may still write the old one. Anything else keeps its own box.
+$legacyKeyOf = @{}
+foreach ($r in $records) {
+    $tree = $r.Box
+    $w = if ($r.Rec.PSObject.Properties.Name -contains 'worktree') { [string]$r.Rec.worktree } else { '' }
+    # A worktree that does not normalise to a path names no key; that record keeps its own box.
+    try {
+        if ($w -and -not $legacyKeyOf.ContainsKey($w)) { $legacyKeyOf[$w] = ConvertTo-LegacyBoxKey -Path $w }
+        if ($w -and $r.Box -ceq $legacyKeyOf[$w]) {
+            $tree = ConvertTo-BoxKey -Path $w -HostName (Get-CoordRecordHost $r.Rec)
+        }
+    } catch { $tree = $r.Box }
+    $sk = if ($r.Rec.PSObject.Properties.Name -contains 'sessionKey') { [string]$r.Rec.sessionKey } else { '' }
+    $r | Add-Member -NotePropertyName Tree -NotePropertyValue $tree -Force
+    $r | Add-Member -NotePropertyName SessionKey -NotePropertyValue $sk -Force
+}
+# Legacy-box records whose OWN SESSION has a record in the new box. No writer reaches them now, so
+# the pointer census below skips them: the seat repairs its pointer in the new record. A different
+# session's legacy record is still counted, because -ClearHandoff can still reach it.
+$frozenLegacy = @{}
+
 $rows = @()
 foreach ($r in $records) {
     $rec = $r.Rec
@@ -395,11 +419,20 @@ foreach ($r in $records) {
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
     $ageH = Get-AgeHours $rec.asOf
 
-    # SUPERSEDED: a newer record in the same box, or a later record naming this one as predecessor.
+    # SUPERSEDED: a newer record of the same tree (above), or a later record naming this one as
+    # predecessor. Without the tree, a session that crossed the box-key change reads as two seats.
+    # A legacy-box record whose own session also has a record in the new box is superseded outright:
+    # the two can be minutes apart, inside Get-AgeHours's 0.1 h rounding, and the new box is the one
+    # the writer keeps.
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
-        if ($o.Box -ne $r.Box) { continue }
+        if ($o.Tree -cne $r.Tree) { continue }
+        if ($r.Tree -cne $r.Box -and $o.Box -ceq $r.Tree -and $r.SessionKey -and $o.SessionKey -ceq $r.SessionKey) {
+            $superseded = $true
+            $frozenLegacy[$r.File] = $true
+            continue
+        }
         $oAge = Get-AgeHours $o.Rec.asOf
         if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
     }
@@ -474,6 +507,8 @@ foreach ($o in $records) {
     # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
     # stop below for a document that resolves where it was written, so it is counted apart.
     if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
+    # A frozen legacy copy of a live seat's record; its pointer is the newer record's to answer for.
+    if ($frozenLegacy.ContainsKey($o.File)) { continue }
     $ptrTotal++
     # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
     # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves
@@ -482,7 +517,7 @@ foreach ($o in $records) {
     # rows carry a pointer", which is right for the per-row render below. It is the WRONG denominator
     # for "how many seats would be sent somewhere broken", and it inflates the moment anyone
     # remediates. Both are printed so a reader can see 5-across-4 rather than inferring 5 seats.
-    $ptrBoxes[$o.Box] = $true
+    $ptrBoxes[$o.Tree] = $true
     try {
         if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { $ptrDangling++ }
         elseif ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { $ptrDrifted++ }

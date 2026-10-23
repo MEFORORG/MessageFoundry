@@ -56,13 +56,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Only the scanner is read, so only its directory is fetched.
-          sparse-checkout: scripts/security
+          # Only the scanner is read, so only its directory is fetched, plus ci/ for the Python pin
+          # that setup-python reads below.
+          sparse-checkout: |
+            scripts/security
+            ci
           # zizmor artipacked: nothing here pushes or calls the API, so no credential is persisted.
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       - name: Scan the pull request body for requirement verdicts, gaps and code maps
         shell: bash
         run: python scripts/security/scan_forbidden.py --pr-body-event "$GITHUB_EVENT_PATH"

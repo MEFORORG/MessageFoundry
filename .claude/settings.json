@@ -101,7 +101,7 @@
             "shell": "bash",
             "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; bash \"${CLAUDE_PROJECT_DIR}/scripts/hooks/cloud-setup.sh\"",
             "timeout": 300,
-            "statusMessage": "Cloud session only: installing pwsh and Python 3.14, setting the git identity"
+            "statusMessage": "Cloud session only: installing pwsh and Python 3.14, setting the git identity, installing the git hooks"
           }
         ]
       }
@@ -143,6 +143,23 @@
             ],
             "timeout": 75,
             "statusMessage": "Checking the worktree gate, blanket git stage, GitHub API polling, filesystem scans and AFK tripwires"
+          }
+        ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/enter-worktree-check.ps1"
+            ],
+            "timeout": 60,
+            "statusMessage": "Checking whether this worktree looks safe to enter, for the permission prompt"
           }
         ]
       }

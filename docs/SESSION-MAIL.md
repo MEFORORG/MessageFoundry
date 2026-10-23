@@ -156,9 +156,9 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
 - `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
   registry holds a readable record for it. **Use this for a seat on another PC**: its worktree path
-  does not exist here, so the path form cannot reach it. **Not yet handled:** a seat id is derived
-  from the worktree path, so two PCs with a worktree at the SAME path share one seat id and one
-  mailbox, and mail to it reaches whichever PC drains first.
+  does not exist here, so the path form cannot reach it. A seat id hashes the host as well as the
+  path, so two PCs with a worktree at the same path have two seat ids and two mailboxes. A path
+  target is keyed for this PC.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
 - `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
@@ -183,9 +183,9 @@ environment variable cannot, and that is the point of it being a file. Delete it
 
 ## Addressing: a box is keyed by the recipient's worktree
 
-A mailbox is keyed by the recipient's **worktree path**, normalised and hashed by the single definition
-in [`scripts/coord/mail-key.ps1`](../scripts/coord/mail-key.ps1). Four properties of that key are
-load-bearing, and each is load-bearing for a different reason.
+A mailbox is keyed by the recipient's **host and worktree path**, normalised and hashed by the single
+definition in [`scripts/coord/mail-key.ps1`](../scripts/coord/mail-key.ps1). At least five properties
+of that key are load-bearing, and each is load-bearing for a different reason.
 
 **Keyed by worktree, not by worktree NAME.** A worktree name is a creation-time label and nothing keeps
 it current. One worktree in this repo was observed switched onto four different branches by four
@@ -210,8 +210,17 @@ one from both ends.
 
 **Injectivity comes from the hash, not the slug.** The key is `<readable-slug>-<hash>`. Two different
 worktree paths can sanitise to the same slug, and the failure mode of a slug-only key is one worktree
-reading another's mail. The hash is computed over the normalised path and carries the injectivity; the
-slug exists only so a human can tell boxes apart in a directory listing.
+reading another's mail. The hash is computed over `<HOST>|<normalised path>` and carries the
+injectivity; the slug exists only so a human can tell boxes apart in a directory listing.
+
+**The host is part of the key.** On a shared root two PCs can each hold a worktree at the same path, and
+a path-only key gave them one mailbox ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md), migration step
+4). Mail queued before that change sits under the old path-only key, which `ConvertTo-LegacyBoxKey`
+names. The drain and the watcher move that box's inbox into the new box before they read, and
+`-Status` counts what is left there. This version of `mail.ps1` writes nothing under the old key. A
+send to a seat id published before the change goes to the box that seat's worktree and host key to
+now. A copy of `mail.ps1` on a branch older than the change still writes the old box, and the drain
+moves that mail too.
 
 **One definition, dot-sourced by both ends.** The sender and the drain must compute the same key from
 the same path or mail is written to a box nobody reads -- and that failure is silent on both ends: the

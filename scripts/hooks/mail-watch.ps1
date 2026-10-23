@@ -110,6 +110,9 @@ try {
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
     $key = ConvertTo-BoxKey -Path $cwd
     $inboxDir = Join-Path $root "box/$key/inbox"
+    # Mail queued under the old path-only key is moved into this box each pass, by the same function
+    # the drain uses, so the pending test below sees it under the one box the drain will read.
+    $legacyKey = ConvertTo-LegacyBoxKey -Path $cwd
     $shownDir = Join-Path $root "box/$key/shown"
     # Validated before any path is built from it, exactly as the drain does; $null means UNMARKABLE.
     $sessionKey = ConvertTo-SessionKey -SessionId ([string]$hook.session_id)
@@ -163,6 +166,7 @@ try {
             if ($owner -and $owner -match '^\d+ [0-9a-fA-F-]{36}$' -and $owner -ne $myToken) { exit 0 }
         }
 
+        Move-LegacyInbox -Root $root -Key $key -LegacyKey $legacyKey
         if (Test-Path -LiteralPath $inboxDir) {
             # "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "THE INBOX IS NON-EMPTY". Those were the same
             # question until the drain stopped consuming at SessionStart: mail it shows now STAYS in the

@@ -71,6 +71,7 @@ tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
+tests/test_coord_host_box_key.py
 tests/test_coord_root.py
 tests/test_coord_shared_root_claims.py
 tests/test_coord_shared_root_seats_mail.py
@@ -87,12 +88,14 @@ tests/test_coord_shared_root_seats_mail.py
 tests/test_durability_hook_provenance.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
+tests/test_enter_worktree_check.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_payload_cwd.py
 tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
 tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
+tests/test_cloud_batch.py
 tests/test_cloud_setup_hook.py
 tests/test_collision_gate.py
 tests/test_coord_box_activity.py

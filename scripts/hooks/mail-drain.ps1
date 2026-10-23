@@ -843,8 +843,9 @@ try {
         $coordFrom = $AnchorRepo
     }
     # mail/ is a SHARED kind, so the queue is coord-root.ps1's answer (docs/COORD-SHARED-ROOT.md); with
-    # nothing configured it is <common>/mefor-coord/mail, as before. The box KEY is unchanged: it is
-    # still this session's own cwd, so the same box is read on whichever root holds it.
+    # nothing configured it is <common>/mefor-coord/mail, as before. The box KEY does not depend on the
+    # root: it is this machine's host and this session's own cwd, so the same box is read on whichever
+    # root holds it.
     #
     # A ROOT THAT DOES NOT ANSWER IS NOT AN EMPTY BOX, AND THIS HOOK MUST NOT HANG OR BLOCK. The
     # resolver answers a dead share in one bounded probe and caches the verdict, and on Error the drain
@@ -919,6 +920,10 @@ try {
     # move win" is three chances for one to drift back to a check that cannot tell a winner from a loser.
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
     $key = ConvertTo-BoxKey -Path $cwd
+    # The box key hashes the host as well as the path (docs/COORD-SHARED-ROOT.md, step 4). Mail queued
+    # under the old path-only key is moved into this box first, so it is read rather than stranded. That
+    # is the one read of the legacy box; nothing writes to it.
+    Move-LegacyInbox -Root $root -Key $key -LegacyKey (ConvertTo-LegacyBoxKey -Path $cwd)
 
     # VALIDATE BEFORE YOU BUILD. The session id is hook-payload input -- any process running under this
     # account can produce one -- and a shown-marker path is built out of it, so it goes through the same

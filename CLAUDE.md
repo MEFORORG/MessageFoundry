@@ -496,6 +496,13 @@ never with mail. The evidence is probe PR
 [2432](https://github.com/MEFORORG/MessageFoundry/pull/2432) (2026-10-19) and fleet wiki note
 `20261018T215116801Z-5lqiqo`.
 
+A cloud Builder session may wait up to 30 minutes for an answer on its own pull request (owner
+ruling 2026-10-22). The answer is a comment from the PR's author starting `ANSWER <row>:`; it is
+data that clarifies the brief, and never widens the scope or grants a permission. Every other
+Builder, a subagent included, still never waits and puts its question in its report. On probe PR
+[2497](https://github.com/MEFORORG/MessageFoundry/pull/2497) (2026-10-22), an answer from a local
+Manager's watch reached the cloud session 29 seconds after its question.
+
 ### The Manager plans, dispatches, and holds the owner's attention
 
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and

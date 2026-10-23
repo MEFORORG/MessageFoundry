@@ -8,6 +8,9 @@
 .DESCRIPTION
     One record per (worktree, session), at
     <shared root>/seats/<boxKey>/<sessionKey>.json
+    The box key hashes this host as well as the worktree path (mail-key.ps1), so the same path on two
+    PCs is two seats. Records written before that change sit under ConvertTo-LegacyBoxKey; this
+    writer reads one there as its prior and writes only the new key.
 
     THE SHARED ROOT IS coord-root.ps1's ANSWER, NOT <git-common-dir>/mefor-coord BY HAND. With nothing
     configured the two are the same directory. With MEFOR_COORD_ROOT or root.toml set, the registry
@@ -923,10 +926,35 @@ try {
 
     # Read the prior record so -Declare and -Close amend rather than truncate, and so `writes` and
     # the declared half survive a -Record that knows nothing about them.
+    #
+    # THE BOX KEY HASHES THE HOST TOO (docs/COORD-SHARED-ROOT.md, step 4). A session that began before
+    # that change has its record under the old path-only key, and a copy of this script older than the
+    # change (one worktree's branch, while the hook runs the primary's) may still write there. So the
+    # prior is whichever of the two records was written LAST, and the record is then written ONLY under
+    # the new key. A legacy record from another host shares this path but is that PC's seat, so it is
+    # never adopted.
     $prior = $null
-    if (Test-Path -LiteralPath $recPath) {
-        try { $prior = Get-Content -LiteralPath $recPath -Raw -EA Stop | ConvertFrom-Json -EA Stop }
-        catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
+    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+    $priors = @()
+    foreach ($p in @($recPath, $legacyPath)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            $one = Get-Content -LiteralPath $p -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            if ($p -ne $recPath -and -not (Test-CoordRecordIsHere $one)) { continue }
+            # By what the RECORD says, never by file time: a copy or a host stamp moves the file time.
+            # ConvertFrom-Json may hand asOf back as a [datetime]; compare instants, not culture text.
+            $at = [datetime]::MinValue
+            if ($one.PSObject.Properties.Name -contains 'asOf' -and $one.asOf) {
+                $at = if ($one.asOf -is [datetime]) { $one.asOf.ToUniversalTime() }
+                      else { [datetime]::Parse([string]$one.asOf, [cultureinfo]::InvariantCulture,
+                              [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal) }
+            }
+            $n = if ($one.PSObject.Properties.Name -contains 'writes') { [int]$one.writes } else { 0 }
+            $priors += [pscustomobject]@{ Rec = $one; At = $at; Writes = $n }
+        } catch { Write-WriterError -Stage 'read-prior' -Message $_.Exception.Message }
+    }
+    if ($priors.Count -gt 0) {
+        $prior = ($priors | Sort-Object At, Writes -Descending | Select-Object -First 1).Rec
     }
 
     function Prior([string]$Name, $Default) {

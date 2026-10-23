@@ -161,7 +161,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       # `git rev-parse HEAD`, not $GITHUB_SHA: the checkout above is the commit every build job
       # checks out, and HEAD is that commit even when the tag is annotated.
@@ -206,7 +206,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Generate the shipped CycloneDX SBOM (license-complete, hash-locked core runtime)
         run: |
@@ -284,7 +284,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Generate the Windows-resolved CycloneDX SBOM (license-complete, hash-locked core runtime)
         # bash (Git Bash on the Windows runner), so this step reads like its Linux twin and the
@@ -364,7 +364,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       # BACKLOG #2534. The trigger above accepts any `vX.Y.Z-*` tag, and the version gate compares
       # PEP 440 versions, so `v0.5.0-rc.1` would release a wheel saying 0.5.0rc1. A verifier holds
@@ -1390,7 +1390,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
@@ -1891,7 +1891,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
         run: |

@@ -50,7 +50,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       # Stdlib only, so nothing is installed. Exit 1 means renewal is due, exit 2 means the date could
       # not be read; both are red, and the verdict lands in the run summary the issue links to.
       # setup-python matches the project's 3.14 floor rather than trusting the image's python3.

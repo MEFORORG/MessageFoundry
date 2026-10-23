@@ -72,6 +72,7 @@ on:
       - 'scripts/asvs/**'
       - 'tests/test_asvs_anchor_report.py'
       - '.github/workflows/asvs-anchor-report.yml'
+      - 'ci/python-version'
   push:
     branches: [main]
     paths: *anchor_paths
@@ -120,7 +121,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.14'
+          # The engine is checked out under engine/, so the pin is read from there.
+          python-version-file: engine/ci/python-version
 
       # No install step and no dependency: the reporter is stdlib-only, which is what lets it run on
       # a bare interpreter here and in the vault alike. tests/test_asvs_anchor_report.py holds that

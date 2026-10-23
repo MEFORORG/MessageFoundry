@@ -109,7 +109,9 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          # The exact patch is ci/python-version's, not matrix.python-version's. The matrix value
+          # still names this job's context (the `py3.14`), so it stays as it is.
+          python-version-file: ci/python-version
           # No `cache: pip`: installs now go through uv (the "Set up uv" step below), which keeps its
           # OWN wheel/download cache — a pip cache here would be a second, redundant cache competing
           # for the repo's 10 GB cache budget. uv's cache is keyed on pyproject.toml + requirements.lock.
@@ -1312,7 +1314,9 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          # The exact patch is ci/python-version's, not matrix.python-version's. The matrix value
+          # still names this job's context (the `py3.14`), so it stays as it is.
+          python-version-file: ci/python-version
 
       - name: Install Qt offscreen system libraries
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
@@ -1984,9 +1988,10 @@ jobs:
     # These are DEADLOCK BACKSTOPS, not tightness gates -- the same reasoning the engine matrix records
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
-    # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, and is
-    # 60/48 now; the paragraphs below are why -- that sentence about sizing a cap close to the observed
-    # run is the rule that moved it, applied to its own tier.
+    # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, then to
+    # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 is 80/67, every other leg
+    # stays 60/48. The paragraphs below are why -- that sentence about sizing a cap close to the
+    # observed run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -2116,6 +2121,9 @@ jobs:
     # trap 3: 35:00 is the largest green that FIT under the 35-minute kill, and the runs that wanted
     # longer were killed and left the green sample. It is a LOWER BOUND on the worst green.
     #
+    # SUPERSEDED FOR windows-2025 ON 2026-10-23 (see "RE-DERIVED A THIRD TIME" below); the 48/60 and
+    # the ubuntu-latest nesting row in this paragraph are still the ubuntu values in force.
+    #
     # THE STEP CAP IS 48 = ceil_minute(1.35x 35:08), the largest killed step, which is the same 48 that
     # 1.35x the censored 35:00 gives. This tier's earlier derivation fixed no multiple -- its 19
     # percent was a by-product of the -n 3 bound -- so this one takes the rule the engine and web
@@ -2129,7 +2137,7 @@ jobs:
     # nesting table carries, for the same reason:
     #
     #   ubuntu-latest   setup 5:06, pad 4:30, step cap 48:00: 57:36 of 60:00, slack 2:24
-    #   windows-2025    setup 3:13, pad 4:30, step cap 48:00: 55:43 of 60:00, slack 4:17
+    #   windows-2025    setup 3:13, pad 4:30, step cap 48:00: 55:43 of 60:00, slack 4:17  <- SUPERSEDED 2026-10-23
     #
     # On ubuntu the pad is what absorbs the apt step running to its own 8-minute bound: 8:00 plus the
     # rest of that setup is still under the 9:36 budgeted. Spelled differently from the web console
@@ -2138,7 +2146,8 @@ jobs:
     # receipt and junit-upload steps after a killed step run in. The earlier 7 + 35 = 42 under 45 sum
     # counted the windows setup only. Both caps are deadlock backstops, as above. The ubuntu leg, at a
     # 20:29 worst, shares the literals and is not what sized them; a per-leg expression would keep its
-    # backstop nearer its own data, and is a separate change from this re-measure.
+    # backstop nearer its own data, and is a separate change from this re-measure. (That per-leg
+    # expression is what the 2026-10-23 re-derivation below added.)
     #
     # NO SINGLE TEST IS THE CAUSE, which is the question to ask before raising a cap. The killed run's
     # own `--durations=40` list tops out at 90.42s (test_session_mail.py's claim-verdict test) on a
@@ -2147,11 +2156,82 @@ jobs:
     # worker count, which the -n 3 paragraphs above leave to BACKLOG #1109; this re-derivation does not
     # touch it.
     #
+    # RE-DERIVED A THIRD TIME, 2026-10-23, FOR windows-2025 ONLY, TO 80/67, because the 36:55 trigger
+    # below fired and the 48-minute cap started killing work that showed no failure. The step was
+    # killed AT 48:07 to 48:08 four times, with no F or E in the progress line. The last progress
+    # each job log printed before the kill:
+    #
+    #   run 39904086527  job 120252005912  push `main`          killed 48:08  last progress [100%]
+    #   run 39915444027  job 120287975617  push `main`          killed 48:07  last progress [99%]
+    #   run 39930938959  job 120338855211  PR 2498, attempt 1   killed 48:07  last progress [99%]
+    #   run 39930938959  job 120484240748  PR 2498, attempt 2   killed 48:07  last progress [98%]
+    #
+    # Pool, by the 2026-10-07 method: every ci.yml run CREATED from 2026-10-16T00:00:00Z to
+    # 2026-10-23T15:38:42Z UTC (the newest run in the pool), events push, pull_request and
+    # workflow_dispatch each listed on its own, 623 runs. A re-run attempt counts whenever it ran, so
+    # the newest step in the pool ended 15:53:39Z. Nine job listings returned HTTP 502 and are
+    # missing. Jobs with ?filter=all; a row is the `Harness tests (pytest)` STEP keyed on its own
+    # conclusion, duration = its completed_at minus started_at, identical-stamp re-run copies dropped.
+    #
+    #   leg             green n   median   p90     p95     max     step failures
+    #   ubuntu-latest   500       16:16    18:37   20:28   24:35   30, longest 19:43
+    #   windows-2025    434       39:22    43:23   45:08   47:58   15, 4 of them killed at the cap
+    #
+    # 267 of the 434 windows-2025 greens sit above 36:55. The largest green, 47:58, is run
+    # 39733693111 (job 119674474670), 9 seconds under the kill, so this maximum is right-censored
+    # again for the reason recorded above.
+    #
+    # THE WINDOWS GREENS ARE NOT ONE DISTRIBUTION DRIFTING UP, and the summary row above hides that.
+    # Split at 36 and 40 minutes, the runs under 36 have a daily median of 29:18 to 32:24 on every day
+    # of the pool, with no trend. The runs at 40 or more have a daily median that rose from 40:24 on
+    # 2026-10-17 to 45:36 on 2026-10-23, and they are the larger share on most days. A third group
+    # sits between 36 and 40, most of it on 2026-10-17. Runs that started minutes apart land in
+    # different groups: run 39870659760 (job 120144121559) took 46:31 and run 39870993840 (job
+    # 120145231499) took 28:51, started 165 seconds apart. Those two are different heads and their
+    # test counts were not compared, so this RULES IN a slow population on some runners or under some
+    # load; it does not yet name its cause. The slow group's own median moved about 5 minutes in six
+    # days. This note makes NO runway claim from that: a daily median on a bimodal leg does not
+    # support one.
+    #
+    # THE STEP CAP IS 67 = ceil_minute(1.35x 49:06). The kills were cut short, so their true durations
+    # are longer than 48:08. The progress figure is tests done over tests collected, so the [98%] kill,
+    # job 120484240748, gives its full length as about 48:07 / 0.98 = 49:06. That is an ESTIMATE:
+    # under `--dist loadfile` the last files need not take the average time per test. It is the
+    # longest of the four. The JOB cap is 80. Setup is the larger of the two pools' windows maxima,
+    # 4:33 (run 39664551193, job 119446204553), above the old pool's 3:13:
+    #
+    #   windows-2025    setup 4:33, pad 4:30, step cap 67:00: 76:03 of 80:00, slack 3:57
+    #
+    # The largest job-minus-step time on windows-2025 in this pool is 4:40, which is setup plus the
+    # `if: always()` steps, and it fits in setup plus slack. EVERY OTHER LEG KEEPS 48/60, through the
+    # `matrix.os` expressions on both caps, and its 2026-10-07 nesting row above still holds: ubuntu's
+    # worst green here is 24:35 and its setup maximum 1:37 (run 39975213140), both inside that row.
+    # Its own 1.35x rule would give a smaller cap; lowering it is not part of this change.
+    #
+    # THE WORKER LEVER WAS CONSIDERED AND NOT TAKEN. Moving windows-2025 back to TOOLING_WORKERS=4
+    # might save the 3 to 5.5 minutes the -n 3 paragraphs above put on that choice, but those are one
+    # green per arm from September, the trigger below fires on that change with no data under it, and
+    # #1304 starved a launch at 4 workers. A worker change also says nothing about the slow population
+    # above. Whether to keep -n 3 stays BACKLOG #1109's call. THE CAP IS NOT THE FIX for the slow
+    # population: finding what makes some windows-2025 runs take half as long again is unfiled work.
+    #
+    # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
+    # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
+    # a margin step, a margin-cap knob in the `tooling_matrix` the `changes` job builds, a row per leg
+    # in scripts/ci/step_margin_baseline.toml with its pool file, and an entry in the per-job tables
+    # tests/test_ci_step_margin.py checks. That is its own change, and it is unfiled.
+    #
+    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 51:32 -- the 67-minute cap
+    # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if any
+    # run is killed at the 67-minute step cap, or if TOOLING_WORKERS changes, and re-measure in any
+    # case after a week, because the slow population's median was still rising when this was written.
+    # THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
     # include this one, so nothing reads this trigger for you -- or if TOOLING_WORKERS changes, and
     # re-measure in any case once about a week of runs exists under the 48-minute kill, because the
-    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its
+    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its
     # record:
     #
     # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
@@ -2163,7 +2243,8 @@ jobs:
     # or it stops meaning anything.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
-    timeout-minutes: 60
+    # Per leg, see "RE-DERIVED A THIRD TIME" above: windows-2025 80, every other leg 60.
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 80 || 60 }}
     defaults:
       run:
         shell: bash
@@ -2176,7 +2257,7 @@ jobs:
       - name: Set up Python 3.14
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       # NEEDED EVEN THOUGH NO HARNESS TEST TOUCHES Qt, because `-m tooling` FILTERS AFTER COLLECTION.
       # pytest imports every module under `testpaths` to collect it and only then applies the marker
@@ -2275,7 +2356,9 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        timeout-minutes: 48 # see the job cap above for the derivation; must stay under it with setup
+        # Per leg, windows-2025 67 and every other leg 48; see the job cap above for the derivation.
+        # Each must stay under its own leg's job cap with setup.
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 67 || 48 }}
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
@@ -2427,7 +2510,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms)
         # Stdlib-only (no install). Exits non-zero, failing the job, on any drift.
         run: python scripts/security/crypto_inventory_check.py --non-python-operations
@@ -2834,7 +2917,9 @@ jobs:
           # PR 2335; they reached it earlier through tests/_session_seal_contract.py, unchecked.
           # Vault BACKLOG #2223: the SQL Server store open runs the pin checks in pki.py and in
           # auth/trust_anchors.py and auth/anchor_path.py, and test_sqlserver_store.py imports pki.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
+          # ci/python-version is the interpreter every one of these legs runs, so a patch bump
+          # must meet them on its own PR rather than first on the nightly after the merge.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -2860,7 +2945,8 @@ jobs:
           # job. The tracked-tree half of the same question is free and DOES run on every PR --
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|\.github/workflows/(ci|release)\.yml)'; then
+          # ci/python-version is listed because it is the interpreter the build runs on.
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -2921,7 +3007,9 @@ jobs:
           # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
+          # tests/test_ci_tool_and_image_pins.py, a manifest entry, is what reads it.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -3074,7 +3162,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
@@ -3463,7 +3551,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -3732,7 +3820,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -3815,7 +3903,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -4010,7 +4098,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
@@ -4292,7 +4380,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -5612,7 +5700,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Build every published distribution
         run: |

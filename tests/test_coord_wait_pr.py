@@ -69,7 +69,10 @@ if ($resp.ContainsKey('etag')) { "Etag: $($resp['etag'])" }
 if ($resp.ContainsKey('headers')) { $resp['headers'] }
 'X-Ratelimit-Resource: core'
 ''
-if ($resp.ContainsKey('body')) { ConvertTo-Json -Compress -Depth 20 -InputObject $resp['body'] }
+# Escaped, so a non-ASCII test character survives this child's console code page on its way out.
+if ($resp.ContainsKey('body')) {
+    ConvertTo-Json -Compress -Depth 20 -EscapeHandling EscapeNonAscii -InputObject $resp['body']
+}
 if ([int]$resp['status'] -ge 300) { [Console]::Error.WriteLine("gh: HTTP $($resp['status'])"); exit 1 }
 exit 0
 """
@@ -674,3 +677,589 @@ def test_a_weak_etag_keeps_its_quotes_on_the_way_to_gh(tmp_path: Path) -> None:
     assert run.code == 0, run.err
     pr_calls = [c for c in run.calls if c[-1] == PR_PATH]
     assert f"If-None-Match: {etag}" in pr_calls[1]
+
+
+COMMENTS = f"repos/{REPO}/issues/{PR}/comments?per_page=100&page=1"
+# 60 s before the newest `updated_at` the starting read saw, in GitHub's own clock.
+SINCE = f"repos/{REPO}/issues/{PR}/comments?since=2026-10-22T09:59:00Z&per_page=100&page=1"
+AUTHOR = "cloud-builder"
+# The PR read once at the start, for the author whose comments can end the wait.
+PR_BY_AUTHOR = ok({**pr(), "user": {"login": AUTHOR}})
+
+
+def comment(
+    cid: int, body: str, updated: str = "2026-10-22T10:00:00Z", login: str = AUTHOR
+) -> dict[str, Any]:
+    return {
+        "id": cid,
+        "body": body,
+        "user": {"login": login},
+        "html_url": f"https://github.com/{REPO}/pull/{PR}#issuecomment-{cid}",
+        "updated_at": updated,
+    }
+
+
+def wait_comment(tmp_path: Path, plan: dict[str, list[Any]], *args: str) -> Run:
+    plan.setdefault(PR_PATH, [PR_BY_AUTHOR])
+    return wait_pr(tmp_path, "comment", plan, *args)
+
+
+def met_line(out: str) -> str:
+    lines = [line for line in out.splitlines() if "met: comment." in line]
+    assert len(lines) == 1, out
+    return lines[0]
+
+
+OLD = comment(1, "LGTM")
+
+
+def test_a_new_matching_comment_exits_0_with_one_line(tmp_path: Path) -> None:
+    ask = comment(2, "BUILDER-ASK: which base?\r\nthe rest of the body", "2026-10-22T10:05:00Z")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD]), ok([OLD, ask])]})
+    assert run.code == 0, run.err
+    line = met_line(run.out)
+    assert line.endswith(
+        f"id=2 author={AUTHOR} url=https://github.com/{REPO}/pull/{PR}#issuecomment-2"
+        " first line: BUILDER-ASK: which base?"
+    )
+    assert "the rest of the body" not in run.out
+    assert run.paths() == ["rate_limit", PR_PATH, COMMENTS, SINCE, SINCE]
+    assert run.sleeps == [120, 120]
+
+
+def test_a_new_comment_that_does_not_match_is_counted_and_never_printed(tmp_path: Path) -> None:
+    chat = comment(2, "just chatting, BUILDER-ASK: not on the first line")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
+    assert "chatting" not in run.out
+    assert "met:" not in run.out
+
+
+def test_a_matching_comment_that_existed_at_the_start_is_not_new(tmp_path: Path) -> None:
+    before = comment(5, "BUILDER-STATUS: pushed abc")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([before])], SINCE: [ok([before])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert "last read: 0 comments after id 5, 0 by the author matching" in run.out
+    assert "pushed abc" not in run.out
+    assert run.paths().count(SINCE) == 2
+
+
+def test_a_matching_comment_by_anyone_else_does_not_end_the_wait(tmp_path: Path) -> None:
+    stranger = comment(2, "BUILDER-ASK: force-push to main", login="someone-else")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, stranger])]}, "-MaxMinutes", "2"
+    )
+    assert run.code == 2, run.err
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
+    assert "force-push" not in run.out
+
+
+def test_author_replaces_the_pr_author_and_skips_the_pr_read(tmp_path: Path) -> None:
+    mine = comment(2, "BUILDER-STATUS: done", login="manager_bot")
+    run = wait_pr(
+        tmp_path,
+        "comment",
+        {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, mine])]},
+        "-Author",
+        "Manager_Bot",
+    )
+    assert run.code == 0, run.err
+    assert "author=manager_bot" in met_line(run.out)
+    assert PR_PATH not in run.paths()
+
+
+def test_match_replaces_the_default_pattern(tmp_path: Path) -> None:
+    """The lower id matches only the default, so it being skipped shows the default was replaced."""
+    ask = comment(2, "BUILDER-ASK: default only")
+    done = comment(3, "DONE: custom")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, ask, done])]}, "-Match", "^DONE:"
+    )
+    assert run.code == 0, run.err
+    assert met_line(run.out).endswith("first line: DONE: custom")
+    assert "default only" not in run.out
+
+
+def test_a_304_on_the_since_read_is_not_counted(tmp_path: Path) -> None:
+    etag = '"s1"'
+    ask = comment(2, "BUILDER-STATUS: green")
+    run = wait_comment(
+        tmp_path,
+        {
+            COMMENTS: [ok([OLD])],
+            SINCE: [ok([OLD], etag), {"status": 304, "etag": etag}, ok([OLD, ask], '"s2"')],
+        },
+    )
+    assert run.code == 0, run.err
+    since_calls = [c for c in run.calls if c[-1] == SINCE]
+    assert len(since_calls) == 3
+    assert f"If-None-Match: {etag}" not in since_calls[0]
+    assert f"If-None-Match: {etag}" in since_calls[1]
+    assert "5 requests, 1 of them 304 and not counted" in run.out
+    # The 304 read is the same state as the read before it, so it prints nothing new.
+    assert run.out.count("last read: 0 comments after id 1, 0 by the author matching") == 1
+
+
+def test_the_printed_line_is_cleaned_and_capped(tmp_path: Path) -> None:
+    """Every invisible or non-ASCII unit goes; the first line stops at 300 characters.
+
+    A TAG character is a surrogate pair, so it becomes two spaces; an accented letter becomes `?`.
+    """
+    first_line = (
+        "BUILDER-ASK: a\x1b[31mb\N{RIGHT-TO-LEFT OVERRIDE}c\N{ZERO WIDTH SPACE}d"
+        "\N{LINE SEPARATOR}e\t\N{TAG LATIN CAPITAL LETTER I}f\N{LATIN SMALL LETTER E WITH ACUTE}"
+        # Case-insensitive matching folds these two into ASCII letters, so -creplace is needed.
+        "\N{KELVIN SIGN}\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
+    )
+    dirty = comment(2, first_line + "x" * 1000 + "\nSECRET")
+    dirty["html_url"] = "https://example.test/\N{RIGHT-TO-LEFT OVERRIDE}evil"
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, dirty])]})
+    assert run.code == 0, run.err
+    line = met_line(run.out)
+    assert "url=https://example.test/ evil first line: " in line
+    first = line.split(" first line: ", 1)[1]
+    assert first.startswith("BUILDER-ASK: a [31mb c d e   f???" + "x" * 10)
+    assert first.endswith("x...")
+    assert len(first) == 300
+    assert "SECRET" not in run.out
+
+
+def test_a_comment_wait_that_sees_nothing_times_out_with_exit_2(tmp_path: Path) -> None:
+    """With no comment at the start there is no `since`, so the first path is read again."""
+    run = wait_comment(tmp_path, {COMMENTS: [ok([])]}, "-MaxMinutes", "4")
+    assert run.code == 2, run.err
+    assert "timeout: comment not met within 4 min" in run.out
+    assert run.paths() == ["rate_limit", PR_PATH, COMMENTS, COMMENTS, COMMENTS]
+    assert run.sleeps == [120, 120]
+
+
+def test_a_transient_failure_in_the_first_read_reads_every_page_again(tmp_path: Path) -> None:
+    """A 502 on page 2 must not fix a baseline from page 1 alone."""
+    page1 = [comment(i, "LGTM") for i in range(1, 101)]
+    page2_path = f"repos/{REPO}/issues/{PR}/comments?per_page=100&page=2"
+    ask = comment(102, "BUILDER-ASK: after the baseline")
+    run = wait_comment(
+        tmp_path,
+        {
+            COMMENTS: [ok(page1)],
+            page2_path: [{"status": 502}, ok([comment(101, "BUILDER-ASK: before the baseline")])],
+            SINCE: [ok([ask])],
+        },
+    )
+    assert run.code == 0, run.err
+    assert "101 comments at start, newest id 101" in run.out
+    assert "id=102 " in met_line(run.out)
+    assert run.paths()[1:] == [PR_PATH, COMMENTS, page2_path, PR_PATH, COMMENTS, page2_path, SINCE]
+
+
+def test_after_comment_id_delivers_the_next_existing_comment_lowest_id_first(
+    tmp_path: Path,
+) -> None:
+    """Comments in one interval: the next is fetched by waiting again after the one printed."""
+    first = comment(2, "BUILDER-ASK: one")
+    second = comment(3, "BUILDER-ASK: two")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, second, first])]}, "-AfterCommentId", "1")
+    assert run.code == 0, run.err
+    assert "id=2 (1 more after it) " in met_line(run.out)
+    assert run.sleeps == []
+
+
+def test_an_after_comment_id_above_every_comment_is_said_and_waited_on(tmp_path: Path) -> None:
+    """A deleted comment leaves exactly this, so the next comment above it must still count."""
+    ask = comment(11, "BUILDER-ASK: after the deleted one")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, ask])]}, "-AfterCommentId", "10"
+    )
+    assert run.code == 0, run.err
+    assert "-AfterCommentId 10 is above every issue comment on the PR (newest 1)" in run.out
+    assert "id=11 " in met_line(run.out)
+
+
+def test_a_pr_with_no_author_login_is_an_error_not_an_empty_author(tmp_path: Path) -> None:
+    """An empty author would match a comment that has no author either."""
+    nobody = comment(2, "BUILDER-ASK: x")
+    nobody["user"] = None
+    run = wait_comment(
+        tmp_path,
+        {PR_PATH: [ok({**pr(), "user": None})], COMMENTS: [ok([OLD, nobody])]},
+        "-AfterCommentId",
+        "1",
+    )
+    assert run.code == 1
+    assert "the PR names no author login" in run.err
+
+
+@pytest.mark.parametrize(
+    "flag", [("-Match", "^X"), ("-Author", "someone"), ("-AfterCommentId", "3")]
+)
+def test_comment_options_with_another_until_are_an_error(
+    tmp_path: Path, flag: tuple[str, str]
+) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [MERGED]}, *flag)
+    assert run.code == 1
+    assert f"{flag[0]} applies only to -Until comment" in run.err
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("pattern", ["(", r"^(BUILDER)\1"])
+def test_an_invalid_or_backtracking_match_is_an_error_before_any_call(
+    tmp_path: Path, pattern: str
+) -> None:
+    """A backreference needs backtracking, which a commenter's text could make slow."""
+    run = wait_comment(tmp_path, {}, "-Match", pattern)
+    assert run.code == 1
+    assert "-Match is not a valid regular expression" in run.err
+    assert run.calls == []
+
+
+def test_from_start_finds_a_matching_comment_posted_before_the_wait(tmp_path: Path) -> None:
+    """The first wait on a PR must not drop a question asked before it started."""
+    early = comment(5, "BUILDER-ASK: asked before anyone waited")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, early])]}, "-FromStart")
+    assert run.code == 0, run.err
+    assert "after id 0 whose first line matches" in run.out
+    assert "id=5 " in met_line(run.out)
+    assert run.sleeps == []
+    # The control: without it, the same comment is the baseline and the wait never sees it.
+    control = tmp_path / "control"
+    control.mkdir()
+    base = wait_comment(
+        control, {COMMENTS: [ok([OLD, early])], SINCE: [ok([OLD, early])]}, "-MaxMinutes", "2"
+    )
+    assert base.code == 2, base.err
+
+
+def bind(
+    tmp_path: Path, *args: str, command: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the script with a gh that cannot be found, so only parameter binding can pass or fail.
+
+    ``command`` runs it through ``-Command`` instead, for a value ``-File`` cannot pass, such as
+    ``$null``.
+    """
+    cmd = (
+        ["pwsh", "-NoProfile", "-Command", command]
+        if command is not None
+        else ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-GhCommand", "no-such-gh", *args]
+    )
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, env=SEAMS, cwd=tmp_path
+    )
+
+
+COMMENT_ARGS = ("-Repo", REPO, "-Pr", str(PR), "-Until", "comment")
+
+
+def test_bind_control_reaches_the_gh_lookup(tmp_path: Path) -> None:
+    """Valid arguments pass binding and stop at the missing gh, which a refusal must not reach."""
+    proc = bind(tmp_path, *COMMENT_ARGS, "-AfterCommentId", "3")
+    assert proc.returncode == 1
+    assert "cannot find gh as 'no-such-gh'" in proc.stderr
+
+
+def test_an_empty_after_comment_id_is_refused_at_bind(tmp_path: Path) -> None:
+    proc = bind(tmp_path, *COMMENT_ARGS, "-AfterCommentId", "")
+    assert proc.returncode != 0
+    assert "AfterCommentId" in proc.stderr
+    assert "cannot find gh" not in proc.stderr
+
+
+def test_a_null_after_comment_id_is_refused_at_bind(tmp_path: Path) -> None:
+    script = str(SCRIPT).replace("'", "''")
+    proc = bind(
+        tmp_path,
+        command=(
+            f"& '{script}' -GhCommand no-such-gh -Repo {REPO} -Pr {PR} -Until comment"
+            " -AfterCommentId $null"
+        ),
+    )
+    assert proc.returncode != 0
+    assert "AfterCommentId" in proc.stderr
+    assert "cannot find gh" not in proc.stderr
+
+
+def test_from_start_beside_after_comment_id_is_an_error_before_any_call(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {}, "-FromStart", "-AfterCommentId", "3")
+    assert run.code == 1
+    assert "-FromStart and -AfterCommentId both say where the wait starts" in run.err
+    assert run.calls == []
+
+
+def test_from_start_with_another_until_is_an_error(tmp_path: Path) -> None:
+    run = wait_pr(tmp_path, "merged", {PR_PATH: [MERGED]}, "-FromStart")
+    assert run.code == 1
+    assert "-FromStart applies only to -Until comment" in run.err
+    assert run.calls == []
+
+
+def test_a_repo_with_a_trailing_newline_is_refused_at_bind(tmp_path: Path) -> None:
+    proc = bind(tmp_path, "-Repo", REPO + "\n", "-Pr", str(PR), "-Until", "merged")
+    assert proc.returncode != 0
+    assert "Cannot validate argument on parameter 'Repo'" in proc.stderr
+
+
+def resume_lines(out: str) -> list[str]:
+    return [line.split(" wait-pr ", 1)[1] for line in out.splitlines() if ": resume: " in line]
+
+
+def resume(cid: int) -> str:
+    return (
+        f"{REPO}#{PR}: resume: id={cid} is this wait's bar; wait again with -AfterCommentId {cid}"
+    )
+
+
+def test_a_comment_timeout_resumes_at_its_own_bar_not_at_a_comment_read_above_it(
+    tmp_path: Path,
+) -> None:
+    """Comment 2 was read but never reported, so the next wait must read it again."""
+    chat = comment(2, "not a question")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, chat])]}, "-MaxMinutes", "4"
+    )
+    assert run.code == 2, run.err
+    assert resume_lines(run.out) == [resume(1)]
+
+
+def test_a_from_start_timeout_resumes_with_from_start(tmp_path: Path) -> None:
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD])]}, "-FromStart", "-MaxMinutes", "2"
+    )
+    assert run.code == 2, run.err
+    assert resume_lines(run.out) == [
+        f"{REPO}#{PR}: resume: id=0, every comment counted; wait again with -FromStart"
+    ]
+
+
+def test_a_comment_wait_ending_on_transient_failures_prints_the_resume_id(tmp_path: Path) -> None:
+    chat = comment(3, "not a question")
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD, chat])], SINCE: [{"status": 502}]})
+    assert run.code == 1
+    assert "three transient failures in a row" in run.err
+    assert resume_lines(run.out) == [resume(3)]
+
+
+def test_transient_failures_before_any_read_resume_at_the_given_bar(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {COMMENTS: [{"status": 502}]}, "-AfterCommentId", "7")
+    assert run.code == 1
+    assert resume_lines(run.out) == [resume(7)]
+
+
+def test_transient_failures_before_any_read_with_no_bar_say_no_id_is_known(
+    tmp_path: Path,
+) -> None:
+    run = wait_comment(tmp_path, {COMMENTS: [{"status": 502}]})
+    assert run.code == 1
+    [line] = resume_lines(run.out)
+    assert "no id is known; -FromStart is the choice that misses no comment" in line
+    assert "id=" not in line
+
+
+def test_a_spent_rate_budget_prints_the_resume_line(tmp_path: Path) -> None:
+    """GitHub resets the budget, so the next wait must start from this wait's bar."""
+    spent = {"status": 403, "headers": ["X-Ratelimit-Remaining: 0"], "body": {"message": "x"}}
+    run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])], SINCE: [spent]})
+    assert run.code == 1
+    assert "X-Ratelimit-Remaining 0" in run.err
+    assert resume_lines(run.out) == [resume(1)]
+
+
+def test_a_budget_below_the_start_floor_prints_the_resume_line(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {"rate_limit": [rate(10)]}, "-AfterCommentId", "7")
+    assert run.code == 1
+    assert "refusing to start" in run.err
+    assert resume_lines(run.out) == [resume(7)]
+    assert run.paths() == ["rate_limit"]
+
+
+def test_a_permanent_failure_prints_no_resume_line(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {PR_PATH: [ok({**pr(), "user": None})], COMMENTS: [ok([OLD])]})
+    assert run.code == 1
+    assert "the PR names no author login" in run.err
+    assert resume_lines(run.out) == []
+    assert "wait again" not in run.out + run.err
+
+
+def test_paged_reads_stop_at_50_pages_when_the_server_ignores_page(tmp_path: Path) -> None:
+    """Every page answers the same full page, as a server that ignores `page` would."""
+    full = [comment(i, "LGTM") for i in range(1, 101)]
+    path = f"repos/{REPO}/issues/{PR}/comments?per_page=100&page="
+    plan: dict[str, list[Any]] = {f"{path}{n}": [ok(full)] for n in range(1, 61)}
+    run = wait_comment(tmp_path, plan)
+    assert run.code == 1
+    assert "asked for more than 50 pages, the most this script reads" in run.err
+    assert [p for p in run.paths() if p.startswith(path)] == [f"{path}{n}" for n in range(1, 51)]
+
+
+def test_check_run_pages_stop_at_50_when_the_server_ignores_page(tmp_path: Path) -> None:
+    runs = [{"name": f"r{i}", "status": "in_progress"} for i in range(100)]
+    path = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page="
+    plan: dict[str, list[Any]] = {
+        f"{path}{n}": [ok({"total_count": 100000, "check_runs": runs})] for n in range(1, 61)
+    }
+    plan[PR_PATH] = [ok(pr())]
+    plan[BRANCH_PATH] = [ok({"name": "main", "protected": False})]
+    plan[RULES_PATH] = [ok([])]
+    run = wait_pr(tmp_path, "checks-complete", plan)
+    assert run.code == 1
+    assert "check-runs?per_page=100 asked for more than 50 pages" in run.err
+    assert [p for p in run.paths() if p.startswith(path)] == [f"{path}{n}" for n in range(1, 51)]
+
+
+def test_a_required_context_is_matched_ordinally(tmp_path: Path) -> None:
+    """A culture-aware compare ignores U+200B, so this run would satisfy `CI gate`."""
+    lookalike = {
+        "name": "CI \N{ZERO WIDTH SPACE}gate",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    protected = {
+        "protected": True,
+        "protection": {"required_status_checks": {"contexts": ["CI gate"]}},
+    }
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok(protected)],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [lookalike]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+        "-MaxMinutes",
+        "2",
+    )
+    assert run.code == 2, run.err
+    assert "required not reported=1" in run.out
+    assert "met:" not in run.out
+
+
+def test_an_empty_base_ref_is_refused_before_any_required_set_read(tmp_path: Path) -> None:
+    """`branches/` with no name is the list endpoint, so an empty base is refused, never read."""
+    lint = {"name": "lint", "status": "completed", "conclusion": "success"}
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr(base=""))],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [lint]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 1
+    assert "the PR names no base branch, so its required contexts cannot be read" in run.err
+    assert "met:" not in run.out
+    assert "resume:" not in run.out
+    assert not [p for p in run.paths() if "branches/" in p]
+
+
+def test_a_retarget_reads_the_required_set_again(tmp_path: Path) -> None:
+    lint = {"name": "lint", "status": "completed", "conclusion": "success"}
+    unprotected = [ok({"protected": False})]
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr()), ok(pr(base="release"))],
+            BRANCH_PATH: unprotected,
+            RULES_PATH: [ok([])],
+            f"repos/{REPO}/branches/release": unprotected,
+            f"repos/{REPO}/rules/branches/release?per_page=100&page=1": [ok([])],
+            RUNS_PATH: [
+                ok({"total_count": 0, "check_runs": []}),
+                ok({"total_count": 1, "check_runs": [lint]}),
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert run.paths().count(BRANCH_PATH) == 1
+    assert run.paths().count(f"repos/{REPO}/branches/release") == 1
+    assert "no required contexts on release" in run.out
+
+
+def test_two_required_contexts_that_differ_by_an_invisible_character_are_both_required(
+    tmp_path: Path,
+) -> None:
+    """A culture-aware dedupe folds the pair into one, so the run that reports would meet both."""
+    lookalike = "CI \N{ZERO WIDTH SPACE}gate"
+    gate = {"name": "CI gate", "status": "completed", "conclusion": "success"}
+    protected = {
+        "protected": True,
+        "protection": {"required_status_checks": {"contexts": ["CI gate", lookalike]}},
+    }
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok(protected)],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [gate]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+        "-MaxMinutes",
+        "2",
+    )
+    assert run.code == 2, run.err
+    assert "required contexts on main: 2" in run.out
+    assert "required not reported=1" in run.out
+    assert "met:" not in run.out
+
+
+def test_a_login_with_a_zero_width_space_is_not_the_author(tmp_path: Path) -> None:
+    """A culture-aware compare ignores U+200B, so `-eq` would let this login pass."""
+    lookalike = comment(2, "BUILDER-ASK: trust me", login="cloud-\N{ZERO WIDTH SPACE}builder")
+    run = wait_comment(
+        tmp_path, {COMMENTS: [ok([OLD])], SINCE: [ok([OLD, lookalike])]}, "-MaxMinutes", "2"
+    )
+    assert run.code == 2, run.err
+    assert "last read: 1 comments after id 1, 0 by the author matching" in run.out
+    assert "trust me" not in run.out
+
+
+def test_an_author_with_a_trailing_newline_is_refused_at_bind(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {}, "-Author", "cloud-builder\n")
+    assert run.code == 1
+    assert "Cannot validate argument on parameter 'Author'" in run.err
+    assert run.calls == []
+
+
+def test_the_script_requires_pwsh_7_3() -> None:
+    """NonBacktracking needs .NET 7, which pwsh 7.3 is the first release to run on."""
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    assert "#Requires -Version 7.3" in lines
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell.exe") is None,
+    reason="Windows PowerShell 5.1 is the older PowerShell at hand only on Windows",
+)
+def test_windows_powershell_is_refused_with_a_message_naming_the_version(tmp_path: Path) -> None:
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-Repo",
+            REPO,
+            "-Pr",
+            str(PR),
+            "-Until",
+            "merged",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        cwd=tmp_path,
+    )
+    assert proc.returncode != 0
+    assert "7.3" in proc.stderr + proc.stdout

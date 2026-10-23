@@ -107,12 +107,15 @@ $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
 }
-# THE BOX KEY IS A PATH, AND TWO PCs CAN SHARE A PATH. On a shared root the record at this key may
-# be another machine's lane. Taking it over would overwrite that lane's stated level with this one's,
-# so a write refuses and says so; -Show only reads, so it prints the record as it is. A record with no
-# `host` was written here, as every record before the field was.
+# The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
+# path writes its own file, not this one. A record under the old path-only key is not
+# read: lane-level.ps1 asks for a fresh level after 15 minutes anyway, so a restatement replaces it.
+# A record at THIS key that still names another host got here at least by a copy, by hand, by a
+# collision on the short hash, or by a mistyped coord-migrate.ps1 -SourceHost. Taking it over would overwrite that lane's stated level with this one's, so a write refuses
+# and says so; -Show only reads, so it prints the record as it is. A record with no `host` was
+# written here, as every record before the field was.
 if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
-    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), whose worktree has the same path as this one. Nothing was written.")
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), not of this machine ($thisHost). Nothing was written. Read it with -Show; if it is a stray copy rather than that machine's live lane, move it out of $lanesDir by hand and state this lane's level again.")
     exit 2
 }
 if (-not $rec) {
