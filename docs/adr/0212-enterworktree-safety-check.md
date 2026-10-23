@@ -129,16 +129,18 @@ check's run time and a child process.
   9. `git status` can still run a clean filter for an index entry HEAD does not hold. The verdict
      is UNSAFE, but a command has already run.
 
-  The review of PR 2483's head found at least five more open findings. Of these, 12 and 13 can
-  let a SAFE verdict name an unsafe worktree; the other three withhold a verdict or spoil one:
+  The review of PR 2483's head found at least five more findings, and at least four remain open.
+  Of those four, only 12 can let a SAFE verdict name an unsafe worktree; the other three
+  withhold a verdict or spoil one. So at least ten SAFE-when-unsafe paths remain open in all:
 
   10. Any `.claude` then `worktrees` segment pair anywhere in the path makes the hook return no
       decision, not only the repository's own `.claude/worktrees/`.
   11. One listed worktree that does not canonicalise makes every verdict UNSAFE.
   12. f cannot detect a tracked file that is a hard link to a file outside the worktree.
-  13. A tracked path with a leading quote or a trailing CR makes `hash-object --stdin-paths` hash
-      a different file.
-  14. On macOS, a temp root under `/var` canonicalises to `/private/var`, and check c fails.
+  13. On macOS, a temp root under `/var` canonicalises to `/private/var`, and check c fails.
+
+  The fifth is closed: check f counts a tracked path that starts with a quote or holds a CR as
+  unreadable, so `hash-object --stdin-paths` never reads it.
 
   The tenth of the third pass's findings, a relative `-Path` joined to the session's cwd, is closed: check a refuses any path
   that is not fully qualified.
