@@ -15,8 +15,8 @@ could be wrong, so the per-hop facts live once, in ``docs/CONFIGURATION.md``, *`
 environment proxy at start*, and the warning points there.
 
 **The Vault hop also discloses at the point of use (vault BACKLOG #4028):** see
-:func:`vault_hop_proxy_warning`. Why, and what it covers, is in the same
-``docs/CONFIGURATION.md`` section.
+:func:`vault_hop_proxy_warning`. Why, and what it covers, is in ``docs/CONFIGURATION.md``, *The
+Vault and OpenBao clients also name a proxy where they use it*.
 """
 
 from __future__ import annotations
@@ -59,6 +59,11 @@ _VAULT = "the Vault and OpenBao clients"
 _POINTER = (
     "Per-hop detail, including which hosts go direct, is in docs/CONFIGURATION.md, [egress], "
     '"serve names an environment proxy at start". '
+)
+#: The Vault hop WARNING's pointer: its own sub-heading under the section :data:`_POINTER` names.
+_VAULT_HOP_POINTER = (
+    'What this WARNING claims is in docs/CONFIGURATION.md, [egress], "The Vault and OpenBao '
+    'clients also name a proxy where they use it". '
 )
 #: How to take the environment proxy away, shared by the start warning and the Vault hop's.
 _CLEAR = (
@@ -208,12 +213,12 @@ def proxy_label(value: object) -> str:
 def vault_hop_proxy_warning(connector: str, label: str) -> str:
     """The WARNING a Vault hop logs when ``requests`` picks a proxy for one of its sends (vault
     BACKLOG #4028). ``label`` names the proxy, as :func:`proxy_label` does. What the text claims,
-    and why, is in the ``docs/CONFIGURATION.md`` section :data:`_POINTER` names."""
+    and why, is in the ``docs/CONFIGURATION.md`` sub-heading :data:`_VAULT_HOP_POINTER` names."""
     return (
         f"{connector}: {_OPENING} was picked for a request to Vault: {label}. No engine setting "
-        "names it. This logs once per proxy for this hop in this process. To send this hop "
+        "names it. This logs once per hop and distinct proxy value in this process. To send this hop "
         "direct, add the Vault host to the bypass list of whatever set the proxy: no_proxy for a "
         "*_proxy variable, or the system bypass list for the system proxy, since setting any "
         f"*_proxy variable makes every hop ignore the system proxy settings. Or {_CLEAR}. "
-        f"{_POINTER}(vault BACKLOG #4028)"
+        f"{_VAULT_HOP_POINTER}(vault BACKLOG #4028)"
     )

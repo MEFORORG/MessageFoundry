@@ -40,6 +40,9 @@ _CANARY = "c4nary-userinfo"
 _KV = "Vault KV secret provider"
 _PICKED = "was picked for a request to Vault: "
 _REASON = "synthetic test: the Vault certificate is short-lived"
+#: The CONFIGURATION.md sub-heading the WARNING points at.
+_HOP_HEADING = "The Vault and OpenBao clients also name a proxy where they use it"
+_HOP_POINTER = f'[egress], "{_HOP_HEADING}"'
 
 
 @pytest.fixture(autouse=True)
@@ -99,9 +102,16 @@ def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
         "http://proxy.example:3128. "
     )
     assert "No engine setting names it" in text
+    assert "once per hop and distinct proxy value" in text
     assert "no_proxy" in text and "the system bypass list" in text
+    assert _HOP_POINTER in text and "serve names an environment proxy" not in text
     assert "vault BACKLOG #4028" in text
     assert "alice" not in text and _CANARY not in text and "@" not in text
+
+
+def test_the_pointer_names_a_heading_the_doc_has() -> None:
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text("utf-8")
+    assert f"##### {_HOP_HEADING}\n" in doc.replace("\r\n", "\n")
 
 
 def test_a_new_proxy_or_another_hop_is_named_again(caplog: pytest.LogCaptureFixture) -> None:
