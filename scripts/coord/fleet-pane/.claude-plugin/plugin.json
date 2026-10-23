@@ -1,0 +1,10 @@
+{
+  "name": "fleet-pane",
+  "version": "0.1.0",
+  "description": "Read-only /fleet pane: live seats, open PRs and merge queue, usage, this lane. No model calls.",
+  "author": {
+    "name": "MessageFoundry Foundation, LLC"
+  },
+  "license": "AGPL-3.0-or-later",
+  "types": "./types/index.d.ts"
+}
