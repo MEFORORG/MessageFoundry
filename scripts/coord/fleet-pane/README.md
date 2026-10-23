@@ -15,7 +15,9 @@ check on the URL, not on the files.
 
 Each section shows its own age. A failed read says so in red, with when it failed, and keeps the
 last good data beside it, so a broken read never looks like an empty list. A PR poll older than
-10 minutes is flagged as a stopped poller. The timers skip all work while the pane is not
+10 minutes is flagged as a stopped poller, except while `pr_state.py` backs off and for one
+scheduled interval after; the pane then says it is backing off. A back-off stamp more than 2 hours
+past the poll that wrote it is ignored, as the poller ignores it. The timers skip all work while the pane is not
 placed. The pane never calls GitHub: the PR section reads the cache the `MEFOR-PR-State` scheduled
 task writes, under the reader rules in `docs/WORKTREES.md`, "A PR-state cache for read-only panes".
 

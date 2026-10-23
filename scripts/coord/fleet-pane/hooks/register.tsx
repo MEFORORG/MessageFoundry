@@ -15,11 +15,11 @@ import {
   firstLine,
   isBackingOff,
   isOurOrigin,
+  looksStopped,
   parseLane,
   parsePresence,
   parsePrState,
   parseUsage,
-  pollAge,
   sinceIso,
   words,
 } from './sources'
@@ -32,8 +32,6 @@ const TITLE = 'Fleet'
 // sources that are due, so a closed pane costs one engine call per tick and nothing else.
 const EVERY = { seats: 60000, prs: 30000, usage: 120000, lane: 120000 } as const
 const TICK = 15000
-// The poller writes every 2 minutes; data older than this means it has stopped.
-const PR_STALE_MS = 10 * 60000
 type SourceName = keyof typeof EVERY
 const SOURCES = Object.keys(EVERY) as SourceName[]
 
@@ -56,7 +54,7 @@ const slashes = (p: string): string => p.trim().replace(/\\/g, '/')
 let sessionCwd: string | null = null
 let where: Promise<Where> | null = null
 let isTicking = false
-let lastLogged = ''
+const lastLogged = new Map<string, string>()
 const busy = new Set<SourceName>()
 const lastRun: Partial<Record<SourceName, number>> = {}
 
@@ -174,18 +172,18 @@ async function readAndTick($: EngineInterface, names: SourceName[]): Promise<voi
   await update($, now, () => t)
 }
 
-// Fire-and-forget work still reports a failure, once per distinct message so a stuck failure does
-// not write a line every tick.
-// A success clears the memory, so a fault that comes back after a recovery is logged again.
-function background($: EngineInterface, work: Promise<void>): void {
+// Fire-and-forget work still reports a failure, once per distinct message and caller so a stuck
+// failure does not write a line every tick. That caller's success clears it, so a fault that comes
+// back after a recovery is logged again.
+function background($: EngineInterface, caller: string, work: Promise<void>): void {
   work.then(
     () => {
-      lastLogged = ''
+      lastLogged.delete(caller)
     },
     err => {
       const line = `fleet-pane: ${words(err)}`
-      if (line !== lastLogged) $.ui.log(line)
-      lastLogged = line
+      if (line !== lastLogged.get(caller)) $.ui.log(line)
+      lastLogged.set(caller, line)
     },
   )
 }
@@ -209,16 +207,16 @@ export const register: Register = on => {
     })
     if (!isTicking) {
       isTicking = true
-      $.clock.every(TICK, () => background($, onTick($)))
+      $.clock.every(TICK, () => background($, 'tick', onTick($)))
     }
     // A reload keeps the pane open but starts the module over; refill it at once if it is up.
-    background($, onTick($))
+    background($, 'tick', onTick($))
     return next(e)
   })
 
   on('command.run', { command: 'fleet' }, async $ => {
     const opened = await $.ui.open({ id: PANE, title: TITLE })
-    background($, readAndTick($, SOURCES))
+    background($, 'fleet', readAndTick($, SOURCES))
     return { text: opened.isPlaced ? 'Fleet pane opened.' : `Fleet pane is open but not drawn: ${opened.reason}` }
   })
 
@@ -283,12 +281,12 @@ export const register: Register = on => {
             <Text dimColor>
               {cut(`poller data ${sinceIso(pd.dataFetchedAt, t)}; last poll ${sinceIso(pd.pollFetchedAt, t)}`)}
             </Text>
-            {pd.pollError === null && pollAge(pd.pollFetchedAt, t) > PR_STALE_MS && !isBackingOff(pd.nextPollNotBefore, t) && (
+            {looksStopped(pd, t) && (
               <Text color="red">
                 {cut(`POLLER STOPPED? last poll ${sinceIso(pd.pollFetchedAt, t)}; is the MEFOR-PR-State task running?`)}
               </Text>
             )}
-            {isBackingOff(pd.nextPollNotBefore, t) && (
+            {isBackingOff(pd, t) && (
               <Text color="yellow">{cut(`poller backing off until ${pd.nextPollNotBefore}`)}</Text>
             )}
             {pd.pollError !== null && (

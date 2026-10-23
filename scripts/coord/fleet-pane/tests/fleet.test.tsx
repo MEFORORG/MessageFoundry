@@ -4,7 +4,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { isOurOrigin } from '../hooks/sources'
+import { isOurOrigin, looksStopped, parsePrState } from '../hooks/sources'
 
 const PANE = {
   plugin: 'fleet-pane',
@@ -327,4 +327,20 @@ test('a fault is logged once, and again if it returns after a recovery', async (
   world.panesDeny = 'panes unavailable'
   await clock.advance(15000)
   expect(logs.length).toBe(2)
+})
+
+test('the stopped-poller rule follows the poller: back-off, its 2 h cap, then one interval of grace', () => {
+  const at = (iso: string) => Date.parse(iso)
+  const cache = (nextPollNotBefore: string | null) =>
+    parsePrState(JSON.stringify({ ...PR_STATE, fetchedAt: '2026-10-23T14:00:00Z', nextPollNotBefore }))
+
+  // No back-off: an 86-minute-old poll is a stopped poller.
+  expect(looksStopped(cache(null), at('2026-10-23T15:26:00Z'))).toBe(true)
+  // Inside a back-off, and in the scheduled interval right after it ends, it is not.
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:26:00Z'))).toBe(false)
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:41:00Z'))).toBe(false)
+  // Once that interval has passed with no new poll, it is.
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:43:00Z'))).toBe(true)
+  // A stamp the poller would ignore (over 2 h past the poll that wrote it) holds nothing back.
+  expect(looksStopped(cache('2026-10-24T14:00:00Z'), at('2026-10-23T15:26:00Z'))).toBe(true)
 })

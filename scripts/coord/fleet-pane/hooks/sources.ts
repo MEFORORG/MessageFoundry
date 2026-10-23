@@ -183,15 +183,41 @@ const OUR_REMOTE =
 
 export const isOurOrigin = (url: string): boolean => OUR_REMOTE.test(url)
 
-// pr_state.py's deliberate back-off: no poll runs before this time, so an old poll is expected then.
-export function isBackingOff(iso: string | null, now: number): boolean {
-  const t = iso ? Date.parse(iso) : NaN
-  return !Number.isNaN(t) && now < t
+// pr_state.py ignores a back-off stamp more than MAX_BACKOFF (2 h) past its own start, as a skewed
+// clock or a copied file (pr_state.py, main), so the pane does too, measured from the poll that
+// wrote it.
+const MAX_BACKOFF_MS = 2 * 3600000
+// The poller runs every 2 minutes, plus START_SLACK; after a back-off its next poll is that far off.
+const POLL_GRACE_MS = 2 * 60000 + 15000
+// The poller writes every 2 minutes; a poll older than this means it has stopped.
+const PR_STALE_MS = 10 * 60000
+
+const parseTime = (iso: string | null): number => (iso ? Date.parse(iso) : NaN)
+
+// The end of the poller's deliberate back-off, or null when there is none it would honour.
+export function backOffUntil(prs: Pick<FleetPrs, 'nextPollNotBefore' | 'pollFetchedAt'>): number | null {
+  const until = parseTime(prs.nextPollNotBefore)
+  if (Number.isNaN(until)) return null
+  const wrote = parseTime(prs.pollFetchedAt)
+  return !Number.isNaN(wrote) && until > wrote + MAX_BACKOFF_MS ? null : until
+}
+
+export const isBackingOff = (prs: Pick<FleetPrs, 'nextPollNotBefore' | 'pollFetchedAt'>, now: number): boolean => {
+  const until = backOffUntil(prs)
+  return until !== null && now < until
+}
+
+// An old poll with no error is a stopped poller, except during a back-off and the one scheduled
+// interval after it, when the next poll is not yet due.
+export function looksStopped(prs: FleetPrs, now: number): boolean {
+  if (prs.pollError !== null || pollAge(prs.pollFetchedAt, now) <= PR_STALE_MS) return false
+  const until = backOffUntil(prs)
+  return until === null || now >= until + POLL_GRACE_MS
 }
 
 // How old an ISO time is, in ms; an absent or unreadable one counts as infinitely old.
 export function pollAge(iso: string | null, now: number): number {
-  const t = iso ? Date.parse(iso) : NaN
+  const t = parseTime(iso)
   return Number.isNaN(t) ? Infinity : now - t
 }
 
