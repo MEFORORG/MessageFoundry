@@ -46,6 +46,8 @@ _HTTP_BASES = [HttpToolsProtocol, H11Protocol]
 _WS_BASES = [WebSocketsSansIOProtocol, WebSocketProtocol]
 _ALL_RESPONSES = [drive.response for drive in protocol_floor_selftest._DRIVES]
 _WS_RESPONSES = {drive.response for drive in protocol_floor_selftest._DRIVES if drive.websocket}
+#: The drive that checks nothing follows the parser's 400.
+_LATE_400 = "parser 400 after the app started"
 
 
 def _floored(
@@ -116,8 +118,9 @@ def test_no_websocket_protocol_drives_the_http_families_alone() -> None:
 def test_the_unfloored_classes_are_refused_for_every_response(ws_base: type[Any]) -> None:
     """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail every
     drive."""
-    assert len(_ALL_RESPONSES) == 6 and len(_WS_RESPONSES) == 4
+    assert len(_ALL_RESPONSES) == 7 and len(_WS_RESPONSES) == 4
     message = _refusal(HttpToolsProtocol, ws_base)
+    assert f"the {_LATE_400} was followed by a second response" in message, message
     # uvicorn's own sans-I/O protocol never writes the answer its parser queued, so that drive
     # fails as unwritten there. Every other drive, on either protocol, is written bare.
     unwritten = ["WebSocket parser rejection"] if ws_base is WebSocketsSansIOProtocol else []
@@ -136,7 +139,34 @@ def test_a_bare_400_is_refused(http_base: type[Any]) -> None:
     http, ws = _floored(http_base)
     selftest_protocol_floor(http, ws)
     del http.send_400_response  # the server's own writer answers
-    _names_only(_refusal(http, ws), "malformed-request 400")
+    message = _refusal(http, ws)
+    _names_only(message, "malformed-request 400", _LATE_400)
+    if http_base is HttpToolsProtocol:
+        # The floor's override is gone, so the app's 500 follows the bare 400 too. h11's own state
+        # machine refuses a second response on its connection, so nothing follows there.
+        assert f"the {_LATE_400} was followed by a second response" in message, message
+
+
+def test_a_cycle_send_that_ignores_disconnected_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The response-desync step: if uvicorn's cycle ``send`` stopped returning early on a
+    disconnected cycle, the app's 500 would follow the parser's 400. Only that drive is refused.
+    httptools only: on h11, h11's own state machine refuses that 500 whatever the floor does."""
+    http_base = HttpToolsProtocol
+    http, ws = _floored(http_base)
+    selftest_protocol_floor(http, ws)
+    cycle_cls = sys.modules[http_base.__module__].RequestResponseCycle
+    original = cycle_cls.send
+
+    async def send_regardless(self: Any, message: Any) -> None:
+        self.disconnected = False
+        await original(self, message)
+
+    monkeypatch.setattr(cycle_cls, "send", send_regardless)
+    message = _refusal(http, ws)
+    assert f"the {_LATE_400} was followed by a second response" in message, message
+    for other in _ALL_RESPONSES:
+        if other != _LATE_400:
+            assert other not in message, message
 
 
 @pytest.mark.parametrize("http_base", _HTTP_BASES)

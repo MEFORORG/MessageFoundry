@@ -319,8 +319,18 @@ def test_one_broken_cycle_does_not_leave_the_others_unmarked(
     assert open_cycle.disconnected and open_cycle.message_event.is_set()
     # A completed response stays as it was; only its waiters are woken.
     assert not done.disconnected and done.message_event.is_set()
+    _one_post_400_warning(caplog, "cycle end", "RuntimeError", protocol_headers._DESYNC_RISK)
+
+
+def _one_post_400_warning(
+    caplog: pytest.LogCaptureFixture, step: str, exc_type: str, effect: str
+) -> None:
+    """Exactly one warning from the floor, for ``step``, naming the exception type and ``effect``
+    and not the headers: no header is at stake around the parser's 400."""
     hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
-    assert len(hits) == 1 and "http-400: cycle end" in hits[0] and "RuntimeError" in hits[0], hits
+    assert len(hits) == 1, hits
+    assert f"http-400: {step} failed ({exc_type})" in hits[0], hits
+    assert effect in hits[0] and "security headers" not in hits[0], hits
 
 
 def test_a_cycle_that_cannot_be_recorded_degrades(
@@ -329,23 +339,61 @@ def test_a_cycle_that_cannot_be_recorded_degrades(
     monkeypatch.setattr(protocol_headers, "_WARNED", set())
     caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
     protocol_headers._remember_the_cycle(SimpleNamespace(), object())  # object() takes no weakref
-    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
-    assert len(hits) == 1 and "http-400: cycle record" in hits[0], hits
+    _one_post_400_warning(caplog, "cycle record", "TypeError", protocol_headers._DESYNC_RISK)
 
 
-def test_a_400_writer_that_raises_still_ends_the_open_cycles() -> None:
-    class _RaisingBase:
-        def send_400_response(self, msg: str) -> None:
-            raise RuntimeError("writer failed")
+class _RaisingBase:
+    def send_400_response(self, msg: str) -> None:
+        raise RuntimeError("writer failed")
 
-    floored = protocol_headers._build_floored_http(_RaisingBase)
-    protocol: Any = floored()
-    protocol.transport = SimpleNamespace()
+
+def test_a_400_writer_that_raises_still_ends_the_open_cycles_and_closes() -> None:
+    closes: list[bool] = []
+    protocol: Any = protocol_headers._build_floored_http(_RaisingBase)()
+    protocol.transport = SimpleNamespace(
+        is_closing=lambda: bool(closes), close=lambda: closes.append(True)
+    )
     cycle = _Cycle()
     protocol_headers._remember_the_cycle(protocol, cycle)
     with pytest.raises(RuntimeError, match="writer failed"):
         protocol.send_400_response("Invalid HTTP request received.")
     assert cycle.disconnected and cycle.message_event.is_set()
+    assert closes == [True]
+
+
+def test_no_second_close_after_a_400_writer_that_closed_then_raised() -> None:
+    """asyncio's TLS transport is not safe to close twice, so a transport the writer already
+    closed is left alone."""
+
+    class _ClosesThenRaises:
+        transport: Any
+
+        def send_400_response(self, msg: str) -> None:
+            self.transport.close()
+            raise RuntimeError("writer failed")
+
+    closes: list[bool] = []
+    protocol: Any = protocol_headers._build_floored_http(_ClosesThenRaises)()
+    protocol.transport = SimpleNamespace(
+        is_closing=lambda: bool(closes), close=lambda: closes.append(True)
+    )
+    with pytest.raises(RuntimeError, match="writer failed"):
+        protocol.send_400_response("Invalid HTTP request received.")
+    assert closes == [True]
+
+
+def test_a_close_that_fails_after_a_failed_400_degrades(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    protocol: Any = protocol_headers._build_floored_http(_RaisingBase)()
+    protocol.transport = SimpleNamespace()  # no close: the close step raises AttributeError
+    with pytest.raises(RuntimeError, match="writer failed"):  # the server's error, not the close's
+        protocol.send_400_response("Invalid HTTP request received.")
+    _one_post_400_warning(
+        caplog, "close after a failed 400", "AttributeError", protocol_headers._LEFT_OPEN
+    )
 
 
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
@@ -368,3 +416,73 @@ async def test_the_probe_sees_the_shapes_h11_would_accept(engine: Engine) -> Non
             # Two answers: the first request reached the app (a 405, or a 411 for the unfolded
             # chunked one), and the request behind it was read too.
             assert len(statuses) == 2 and statuses[0] != 400, f"{shape}: {raw!r}"
+
+
+async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes, bool]:
+    """Send ``head``, read the server's whole answer to it, then send ``body``. Return the statuses,
+    the raw bytes, and whether the server closed the connection within the timeout."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    raw = b""
+    closed = False
+    try:
+        writer.write(head)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10.0)
+        length = re.search(rb"(?im)^content-length:\s*(\d+)", raw)
+        assert length is not None, raw
+        raw += await asyncio.wait_for(reader.readexactly(int(length.group(1))), 10.0)
+        writer.write(body)
+        await writer.drain()
+        while chunk := await asyncio.wait_for(reader.read(65536), 3.0):
+            raw += chunk
+        closed = True
+    except ConnectionResetError:
+        closed = True
+    except TimeoutError:
+        pass
+    finally:
+        writer.close()
+    return [int(s) for s in re.findall(rb"HTTP/1\.[01] (\d{3}) ", raw)], raw, closed
+
+
+async def test_a_400_writer_that_raises_still_closes_the_connection(engine: Engine) -> None:
+    """On h11, a bad body that arrives after the app has answered the head makes uvicorn's own 400
+    writer raise, because h11 has already sent a response. On the proactor loop over plaintext,
+    asyncio then leaves the connection open, so the floor closes it.
+
+    The control is uvicorn's own h11 protocol, which must leave it open, or this run shows
+    nothing. The selector loop closes such a transport itself, so there is nothing to see there."""
+    if not isinstance(asyncio.get_running_loop(), proactor_events.BaseProactorEventLoop):
+        pytest.skip("only the proactor loop leaves this connection open")
+    head = _POST + b"Transfer-Encoding: chunked\r\n\r\n"
+    body = b"0x2\r\n{}\r\n0\r\n\r\n"
+    async with _served(create_app(engine), http=H11Protocol) as port:
+        _, raw, closed = await _split(port, head, body)
+    assert not closed, f"control: uvicorn's own h11 closed the connection: {raw!r}"
+    h11 = floored_http_protocol_class(base=H11Protocol)
+    async with _served(create_app(engine), http=h11) as port:
+        statuses, raw, closed = await _split(port, head, body)
+    assert closed, f"the connection stayed open: {raw!r}"
+    assert statuses == [411], raw
+
+
+async def test_a_request_read_with_the_bad_bytes_gets_a_disconnect() -> None:
+    """A well-framed GET and a malformed request line arrive in one read. uvicorn starts the GET's
+    app, then its parser writes the 400. The floor mutes the GET's cycle: its app still runs, but
+    ``receive()`` gives it ``http.disconnect`` and nothing it sends is written. Kept on purpose:
+    the connection is going down with a 400. This pins it, so a change to it is a decision."""
+    received: list[str] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        received.append((await receive())["type"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async with _served(app, http=floored_http_protocol_class()) as port:
+        statuses, raw = await _answers(
+            port, b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\nNOT A REQUEST LINE\r\n\r\n"
+        )
+    assert statuses == [400] and raw.endswith(_PARSER_400_BODY), raw
+    assert received == ["http.disconnect"]
