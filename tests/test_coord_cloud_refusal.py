@@ -491,6 +491,9 @@ NOT_GUARDED = {
     "hooks/precompact-reprime.ps1": "reader, project hook",
     "hooks/worktree_gate.ps1": "reader; writes only its own log, outside mefor-coord",
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
+    # Reads only this machine's own OFF switch (ADR 0212), whose absence is the right answer in a VM
+    # too, and judges worktrees of this clone. The New-Item line it names is header prose for a person.
+    "worktree/enter-check.ps1": "reader; this machine's OFF file and this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
     "coord/install-pr-state-task.ps1": "mention",
