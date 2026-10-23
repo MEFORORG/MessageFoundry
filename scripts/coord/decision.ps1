@@ -8,7 +8,8 @@
     -Log writes ONE record. It is spooled locally first and then posted to the vault's issue for
     its UTC day, so a network failure loses nothing: the record stays spooled, the script says so
     and exits 4, and the next -Log or -Flush posts it. -NoPost spools only, with no network; the
-    tripwire hook uses it.
+    tripwire hook uses it. Its default seat comes from the seat registry only when the registry is
+    on this machine: it never probes a shared root, and never reads one on a share.
 
     -List reads records by day (-Day, default today UTC, and -Days for a range ending there), and
     filters them by -Seat or -Item. It reads the vault and the local spool, and marks a record that
@@ -114,7 +115,47 @@ function ConvertTo-SeatRecordInstant($Value) {
     }
 }
 
-function Resolve-SeatFromRegistry([string]$Sid) {
+function Test-SeatRootIsNetwork([string]$Path) {
+    # True when reading $Path could reach another machine: a UNC path, or a drive letter mapped to a
+    # share. DriveInfo asks Windows how the letter is mapped, a local call. A path whose kind cannot
+    # be told counts as network, so the offline lookup skips it rather than risk a hang.
+    if (Get-CoordUncHost -Path $Path) { return $true }
+    try {
+        $rootOf = [System.IO.Path]::GetPathRoot($Path)
+        if (-not $rootOf) { return $true }
+        if ($rootOf -match '\A[A-Za-z]:') {
+            return ([System.IO.DriveInfo]::new($rootOf).DriveType -eq [System.IO.DriveType]::Network)
+        }
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Get-SeatCandidate([string]$File) {
+    # One seat record as a candidate, or $null. Anything wrong with a record skips that record only:
+    # an empty `{}`, bad JSON, a non-object, no seat, or a `host` naming another machine.
+    try {
+        if (-not [System.IO.File]::Exists($File)) { return $null }
+        $r = [System.IO.File]::ReadAllText($File) | ConvertFrom-Json -ErrorAction Stop
+        if ($r -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        # A record in EITHER box that names another host is that PC's seat, copied or hand-made here;
+        # lane.ps1 refuses the same shape at its own key. A record with no host was written here.
+        if (-not (Test-CoordRecordIsHere $r)) { return $null }
+        $props = $r.PSObject.Properties
+        $s = if ($props['seat'] -and $r.seat) { [string]$r.seat } else { '' }
+        if (-not $s) { return $null }
+        $declared = [bool]$props['seatSource'] -and ([string]$r.seatSource -eq 'declared')
+        $at = if ($props['asOf']) { ConvertTo-SeatRecordInstant $r.asOf } else { [datetime]::MinValue }
+        $n = 0
+        if ($props['writes']) { try { $n = [int]$r.writes } catch { $n = 0 } }
+        return [pscustomobject]@{ Seat = $s; Declared = $declared; At = $at; Writes = $n }
+    } catch {
+        return $null
+    }
+}
+
+function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
     # The seat this session declared, read where seat.ps1 writes it and picked by seat.ps1's rules.
     # The file name is seat.ps1's Get-SessionKey of the id (keep the two in step), sanitised so an id
     # cannot widen the match.
@@ -124,9 +165,14 @@ function Resolve-SeatFromRegistry([string]$Sid) {
     # Codex seat's records stay on the local root. A root that does not resolve names no seat; it
     # never falls back to the local copy, which the other PC never sees.
     #
+    # -Offline (-NoPost, the tripwire hook's path) NEVER TOUCHES THE NETWORK. It resolves the root
+    # without the port-445 probe, and reads it only when it is on this machine. A root on a share
+    # names no seat there: a dead SMB server can hang one file call for about a minute, far past the
+    # hook's budget. A tripwire record needs no seat.
+    #
     # WHICH BOX. Only this worktree's two boxes: the host-keyed one seat.ps1 writes, and the path-only
-    # legacy one a session that declared before docs/COORD-SHARED-ROOT.md step 4 still has. A legacy
-    # record stamped by another host is that PC's seat and is skipped, as seat.ps1 skips it.
+    # legacy one a session that declared before docs/COORD-SHARED-ROOT.md step 4 still has. A record
+    # in either box stamped by another host is that PC's seat and is skipped.
     #
     # WHICH RECORD. A declared seat beats a derived one (seat.ps1: "declared wins, derived fills only a
     # vacuum"). Among equals the record written LAST wins, by its own asOf and then its write count,
@@ -148,30 +194,25 @@ function Resolve-SeatFromRegistry([string]$Sid) {
             $res = Resolve-CoordDir -From $wt -Kind 'codex-seats' -LocalRoot $localRoot
             $seats = $res.Path
         } else {
-            $res = Resolve-CoordSharedRoot -From $wt -LocalRoot $localRoot
+            $res = if ($Offline) {
+                Get-CoordSharedRoot -From $wt -LocalRoot $localRoot
+            } else {
+                Resolve-CoordSharedRoot -From $wt -LocalRoot $localRoot
+            }
+            if ($Offline -and $res.Path -and $res.Source -ne 'local' -and (Test-SeatRootIsNetwork $res.Path)) {
+                [Console]::Error.WriteLine("decision.ps1: -NoPost reads no network, and the seat registry is on $($res.Path), so no seat was read from it.")
+                return ''
+            }
             $seats = if ($res.Path) { Join-Path $res.Path 'seats' } else { $null }
         }
         if ($res.Error -or -not $seats) {
             [Console]::Error.WriteLine("decision.ps1: the seat registry did not resolve, so no seat was read from it: $($res.Error)")
             return ''
         }
-        $hosted = ConvertTo-BoxKey -Path $wt
-        $legacy = ConvertTo-LegacyBoxKey -Path $wt
         $best = $null
-        foreach ($box in @($hosted, $legacy)) {
-            $f = Join-Path (Join-Path $seats $box) "$Sid.json"
-            if (-not [System.IO.File]::Exists($f)) { continue }
-            try { $r = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($r -isnot [System.Management.Automation.PSCustomObject]) { continue }
-            if ($box -eq $legacy -and -not (Test-CoordRecordIsHere $r)) { continue }
-            $names = $r.PSObject.Properties.Name
-            $s = if ($names -contains 'seat' -and $r.seat) { [string]$r.seat } else { '' }
-            if (-not $s) { continue }
-            $declared = ($names -contains 'seatSource') -and ([string]$r.seatSource -eq 'declared')
-            $at = if ($names -contains 'asOf') { ConvertTo-SeatRecordInstant $r.asOf } else { [datetime]::MinValue }
-            $n = 0
-            if ($names -contains 'writes') { try { $n = [int]$r.writes } catch { $n = 0 } }
-            $cand = [pscustomobject]@{ Seat = $s; Declared = $declared; At = $at; Writes = $n }
+        foreach ($box in @((ConvertTo-BoxKey -Path $wt), (ConvertTo-LegacyBoxKey -Path $wt))) {
+            $cand = Get-SeatCandidate (Join-Path (Join-Path $seats $box) "$Sid.json")
+            if (-not $cand) { continue }
             if (-not $best) { $best = $cand; continue }
             if ($cand.Declared -ne $best.Declared) {
                 if ($cand.Declared) { $best = $cand }
@@ -225,7 +266,7 @@ if ($List) {
 
 # -Log. Refuse a record missing what its kind needs, before anything is written.
 if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
-if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session }
+if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session -Offline:$NoPost }
 $missing = switch ($Kind) {
     'decision' { @(@{ Item = $Item; Class = $Class; Recommendation = $Recommendation; Seat = $Seat }.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key) }
     'tripwire' { @(if (-not $Note) { 'Note' }) }

@@ -179,6 +179,17 @@ def test_a_hit_is_spooled_as_a_tripwire_record_with_no_network(sb: Sandbox) -> N
     assert "SECRET-TOKEN" not in spooled.read_text(encoding="utf-8"), "the command text was logged"
 
 
+def test_a_hit_never_probes_an_unreachable_shared_root(sb: Sandbox) -> None:
+    """The header says no network. A configured root that does not answer must not be probed:
+    the probe would write coord-root-down.json, and a dead SMB read can hang for a minute."""
+    proc = sb.run(HOOK, stdin=_payload("git reset --hard"), MEFOR_COORD_ROOT=r"\\192.0.2.1\coord")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    context = _context(proc.stdout)
+    assert context is not None and "Recorded as tripwire d" in context
+    assert not (sb.coord / "coord-root-down.json").exists(), "the hook probed the shared root"
+    assert len(sb.spool()) == 1
+
+
 def test_a_miss_writes_nothing(sb: Sandbox) -> None:
     assert _run(sb, "git status", cloud=False) is None
     assert sb.spool() == []

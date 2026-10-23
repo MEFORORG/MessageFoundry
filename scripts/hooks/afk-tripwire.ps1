@@ -49,8 +49,9 @@
     block-blanket-git-stage.ps1 and block-unbounded-fs-scan.ps1, whose header says the copies should
     become one shared helper; each copy has its own blind spots until then.
 
-    FAST AND OFFLINE: no network, no git call of its own (decision.ps1 runs one `git rev-parse` on a
-    hit), and a command naming none of the words a hit needs is not tokenised at all. It runs under
+    FAST AND OFFLINE: no network, no git call of its own (decision.ps1 runs a few local
+    `git rev-parse` calls on a hit, and with -NoPost never probes or reads a shared root on a
+    share), and a command naming none of the words a hit needs is not tokenised at all. It runs under
     scripts/hooks/shell-guard-dispatch.ps1, after block-blanket-git-stage.ps1, whose length cap
     bounds what reaches it, and the dispatcher passes its context-only answer through. Fail-open on
     any error.

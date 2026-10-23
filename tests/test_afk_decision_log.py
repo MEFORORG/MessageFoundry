@@ -338,6 +338,67 @@ def test_the_seat_file_is_found_by_seat_ps1s_session_key(sb: Sandbox) -> None:
     assert _logged_seat(sb, CLAUDE_CODE_SESSION_ID="local:a.b-c") == "lander"
 
 
+def test_an_empty_record_skips_only_itself(sb: Sandbox) -> None:
+    """`{}` parses to an object with no properties. Under StrictMode it once threw outside the
+    per-record guard, so the valid record in the other box lost its seat too. Both directions run,
+    so whichever box is read first holds the empty record once."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    got: dict[str, str] = {}
+    for item, empty in (("201", hosted), ("202", legacy)):
+        valid = legacy if empty == hosted else hosted
+        _seat_file(seats, empty, "{}")
+        _seat_file(seats, valid, {"seat": f"valid-{item}", "asOf": "2026-10-20T08:00:00Z"})
+        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        proc = sb.run(DECISION, *args, MEFOR_COORD_ROOT="")
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        got[item] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
+    assert got == {"201": "valid-201", "202": "valid-202"}
+
+
+def test_a_host_keyed_record_naming_another_host_is_skipped(sb: Sandbox) -> None:
+    """The host-keyed box is judged by its `host` too, as lane.ps1 refuses a record at its own key
+    that names another machine: a copied or hand-made file is not this seat, however new."""
+    hosted, legacy = _box_keys(sb)
+    seats = sb.coord / "seats"
+    _seat_file(
+        seats, hosted, {"seat": "other-pc", "host": "OTHER-PC", "asOf": "2026-10-23T08:00:00Z"}
+    )
+    _seat_file(seats, legacy, {"seat": "manager", "asOf": "2026-10-20T08:00:00Z"})
+    assert _logged_seat(sb) == "manager"
+
+
+# TEST-NET-1 (RFC 5737): no host answers there, so a probe of it times out or fails.
+UNREACHABLE_ROOT = r"\\192.0.2.1\coord"
+
+
+def test_no_post_never_probes_or_reads_a_network_root(sb: Sandbox) -> None:
+    """-NoPost is the tripwire hook's path, and its header promises no network. The probe writes
+    coord-root-down.json when the root does not answer, so that file is the instrument. The
+    control, a -Log without -NoPost, shows the instrument sees a probe."""
+    down = sb.coord / "coord-root-down.json"
+    tripwire = ("-Log", "-Kind", "tripwire", "-Note", "x")
+    proc = sb.run(DECISION, *tripwire, "-NoPost", MEFOR_COORD_ROOT=UNREACHABLE_ROOT)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert not down.exists(), "-NoPost probed the shared root"
+    assert _list(sb)[0]["seat"] == ""
+    control = sb.run(DECISION, *tripwire, MEFOR_COORD_ROOT=UNREACHABLE_ROOT)
+    assert control.returncode == 0, (control.stdout, control.stderr)
+    assert down.exists(), "the control did not probe, so the instrument proves nothing"
+
+
+def test_the_sandbox_does_not_pass_the_coord_root_or_agent_through(
+    sb: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real MEFOR_COORD_ROOT would send a seat test to a real share, and KORUS_AGENT=codex would
+    flip it to the Codex box."""
+    monkeypatch.setenv("MEFOR_COORD_ROOT", UNREACHABLE_ROOT)
+    monkeypatch.setenv("KORUS_AGENT", "codex")
+    env = sb.env()
+    assert "MEFOR_COORD_ROOT" not in env and "KORUS_AGENT" not in env
+    assert sb.env(KORUS_AGENT="codex")["KORUS_AGENT"] == "codex", "an explicit value is kept"
+
+
 @pytest.mark.parametrize(
     ("args", "needs"),
     [
