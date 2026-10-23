@@ -34,6 +34,7 @@ from messagefoundry.config.wiring import _split_address
 __all__ = [
     "ambient_proxy_warning",
     "environment_proxy_hosts",
+    "UNREADABLE_PROXY_LABEL",
     "proxy_label",
     "vault_hop_proxy_warning",
     "warn_ambient_proxy",
@@ -43,6 +44,8 @@ __all__ = [
 #: requests reads that or ``all``. Any other key, such as ``ftp`` or ``socks``, is not disclosed.
 _READ_KEYS = ("all", "http", "https")
 _UNREADABLE = "an unreadable value"
+#: The label of a proxy value no disclosure can name safely. Public for the Vault hop's cross-check.
+UNREADABLE_PROXY_LABEL = _UNREADABLE
 
 _HOPS = (
     "HTTP-family connections (REST, SOAP, FHIR, fhir_lookup, DICOMweb) and their OAuth2 and SMART "
@@ -204,11 +207,8 @@ def proxy_label(value: object) -> str:
 
 def vault_hop_proxy_warning(connector: str, label: str) -> str:
     """The WARNING a Vault hop logs when ``requests`` picks a proxy for one of its sends (vault
-    BACKLOG #4028). ``label`` is :func:`proxy_label`'s. The engine gives the Vault clients no
-    proxy setting, so the text says the proxy came from the environment or the system settings.
-
-    The remedy names both bypass lists, because a value in any ``*_proxy`` variable, ``no_proxy``
-    included, makes every hop ignore the system proxy settings."""
+    BACKLOG #4028). ``label`` names the proxy, as :func:`proxy_label` does. What the text claims,
+    and why, is in the ``docs/CONFIGURATION.md`` section :data:`_POINTER` names."""
     return (
         f"{connector}: {_OPENING} was picked for a request to Vault: {label}. No engine setting "
         "names it. This logs once per proxy for this hop in this process. To send this hop "

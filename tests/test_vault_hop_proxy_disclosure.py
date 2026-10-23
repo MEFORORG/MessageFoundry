@@ -129,6 +129,27 @@ def test_a_proxy_value_that_does_not_parse_is_named_unreadable_never_echoed(
     assert _SECRET not in text and "proxy.example" not in text
 
 
+def test_two_different_unreadable_proxies_are_each_named(caplog: pytest.LogCaptureFixture) -> None:
+    """The dedupe key is the raw value's digest, not its label. Mutation: key on the label; red."""
+    with caplog.at_level(logging.WARNING):
+        _disclose(_KV, "http://proxy.example:3128 ")
+        _disclose(_KV, "http://other.example:8080 ")
+    assert len(_disclosures(caplog)) == 2, caplog.text
+
+
+def test_a_proxy_the_two_parsers_read_differently_is_named_unreadable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """urlsplit reads the host after the backslash and ``@``; urllib3, which dials, reads the one
+    before it. Naming either would be wrong or could print the user part, so neither is named.
+    Mutation: name proxy_label's answer alone; red, the WARNING names corp-proxy.example."""
+    with caplog.at_level(logging.WARNING):
+        _disclose(_KV, "https://proxy.dialled.example:443\\@corp-proxy.example:443")
+    text = _disclosures(caplog)[0].getMessage()
+    assert f"{_PICKED}an unreadable value." in text
+    assert "corp-proxy.example" not in text and "proxy.dialled.example" not in text
+
+
 # --- the shipped Vault clients --------------------------------------------------------------------
 
 
@@ -255,8 +276,9 @@ def test_a_send_refused_for_revocation_is_not_disclosed_as_picked(
 def test_a_refused_send_is_not_disclosed_as_picked(
     monkeypatch: pytest.MonkeyPatch, listener: _Listener, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A loopback ``http://`` Vault behind a proxy is refused before sending (BACKLOG #2317). The
-    refusal names the hop, and no WARNING may say a proxy was picked for a request never sent."""
+    """A loopback ``http://`` Vault behind a proxy is refused when the adapter picks its pool
+    (BACKLOG #2317), so the disclosure, which runs after that method's refusals, does not log. A
+    refusal later in the send, such as at connect time, can still follow a disclosure."""
     from messagefoundry.config import secretprovider_vault
     from messagefoundry.config.tls_policy import InsecureHopRefused
 

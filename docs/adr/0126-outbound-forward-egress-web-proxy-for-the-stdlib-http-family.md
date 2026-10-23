@@ -321,6 +321,17 @@ that also writes a `Proxy-Authorization` into its static `headers` is refused wh
 Under Digest the static header would otherwise cross the cleartext leg on that admission (vault
 BACKLOG #3443).
 
+### Amendment F (2026-10-23) — the Vault hop names an environment proxy where it uses it
+
+Amendment C's start WARNING is read once, and only by `serve` and `supervise`, so a command such as
+`check-privileges` or `verify` reached Vault through an environment proxy with no disclosure, and so
+did a proxy set after start. An owner ruling of 2026-10-22 chose to fix the engine (vault BACKLOG
+#4028). The Vault clients' strict adapter now names the proxy `requests` picked for a send, once per
+hop and proxy in a process. Unlike the start WARNING it is a per-hop claim, but not a probe: it
+names the result of the send's own proxy selection. The start WARNING is unchanged, and so is every
+`proxy_url`. What it says, and what it does not, is in
+[CONFIGURATION.md](../CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
+
 ## Deviations from the phase doc
 
 - **Proxy-auth dispatch lives in `transports/rest.py`, not `transports/http_auth.py`.** `smart.py`'s token
