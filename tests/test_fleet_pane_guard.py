@@ -42,7 +42,8 @@ FORBIDDEN = {
     "aliasing $": re.compile(r"=\s*\$\s*(?:[;,)\n]|as\b|$)", re.MULTILINE),
 }
 
-BACKSLASH_PATH = re.compile(r"[A-Za-z]:\\")
+# A drive letter is one letter on its own: `ssh:\/\/` in a regex literal is not a path.
+BACKSLASH_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:\\")
 
 SHOULD_CATCH = {
     "model": "await $.model.complete({ model, prompt })",
@@ -101,6 +102,7 @@ def test_no_module_reaches_a_model_agent_prompt_or_tool() -> None:
 
 def test_path_literals_use_forward_slashes() -> None:
     assert BACKSLASH_PATH.search("'C:\\Temp\\x'")
+    assert not BACKSLASH_PATH.search(r"/^(?:ssh:\/\/git@github\.com\/)x$/")
     hits = [
         f"{p.relative_to(MOD)}:{n}"
         for p in _sources()
