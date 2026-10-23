@@ -107,7 +107,7 @@ $rec = $null
 $recFault = $null
 if (Test-Path -LiteralPath $file) {
     try {
-        $rec = Read-CoordText $file | ConvertFrom-Json
+        $rec = Read-CoordText $file | ConvertFrom-Json -NoEnumerate
         # An empty file, or JSON that is not an object (0, null, "", [], 1, [1, 2]), is not a lane
         # record, and nor is {}: an object with no fields records nothing to judge or keep.
         if ($rec -isnot [System.Management.Automation.PSCustomObject]) {
@@ -160,7 +160,7 @@ if ($Show) {
     $shown = $null
     $absent = $null
     try {
-        $shown = Read-CoordText $file | ConvertFrom-Json
+        $shown = Read-CoordText $file | ConvertFrom-Json -NoEnumerate
         if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
             $absent = "the lane record at $file is not a JSON object"
         }

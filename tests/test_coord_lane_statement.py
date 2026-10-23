@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -269,11 +270,16 @@ def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_
     assert "no lane record at" in str(_show(repo)["absent"])
 
 
+# [Environment]::MachineName, which lane.ps1 stamps: the NetBIOS name on Windows, the hostname elsewhere.
+_THIS_HOST = os.environ.get("COMPUTERNAME") or socket.gethostname()
+
+
 @pytest.mark.parametrize(
     "body",
-    [b"{not json", b"", b"0", b"null", b"[]", b'""', b"1", b"[1, 2]", b"{}"],
+    [b"{not json", b"", b"0", b"null", b"[]", b'""', b"1", b"[1, 2]", b"{}",
+     json.dumps([{"host": "x"}]).encode(), json.dumps([{"host": _THIS_HOST}]).encode()],
     ids=["bad-json", "empty-file", "zero", "null", "empty-array", "empty-string", "one", "array",
-         "empty-object"],
+         "empty-object", "one-object-array-other-host", "one-object-array-this-host"],
 )  # fmt: skip
 def test_a_write_over_an_unreadable_record_is_refused_and_leaves_it(
     repo: Path, body: bytes
