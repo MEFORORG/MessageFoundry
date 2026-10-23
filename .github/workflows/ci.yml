@@ -109,7 +109,9 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          # The exact patch is ci/python-version's, not matrix.python-version's. The matrix value
+          # still names this job's context (the `py3.14`), so it stays as it is.
+          python-version-file: ci/python-version
           # No `cache: pip`: installs now go through uv (the "Set up uv" step below), which keeps its
           # OWN wheel/download cache — a pip cache here would be a second, redundant cache competing
           # for the repo's 10 GB cache budget. uv's cache is keyed on pyproject.toml + requirements.lock.
@@ -1312,7 +1314,9 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          # The exact patch is ci/python-version's, not matrix.python-version's. The matrix value
+          # still names this job's context (the `py3.14`), so it stays as it is.
+          python-version-file: ci/python-version
 
       - name: Install Qt offscreen system libraries
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
@@ -2176,7 +2180,7 @@ jobs:
       - name: Set up Python 3.14
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       # NEEDED EVEN THOUGH NO HARNESS TEST TOUCHES Qt, because `-m tooling` FILTERS AFTER COLLECTION.
       # pytest imports every module under `testpaths` to collect it and only then applies the marker
@@ -2427,7 +2431,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms)
         # Stdlib-only (no install). Exits non-zero, failing the job, on any drift.
         run: python scripts/security/crypto_inventory_check.py --non-python-operations
@@ -2921,7 +2925,9 @@ jobs:
           # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
+          # tests/test_ci_tool_and_image_pins.py, a manifest entry, is what reads it.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -3074,7 +3080,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
@@ -3463,7 +3469,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -3732,7 +3738,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -3815,7 +3821,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -4010,7 +4016,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
@@ -4292,7 +4298,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version-file: ci/python-version
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -5612,7 +5618,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
 
       - name: Build every published distribution
         run: |

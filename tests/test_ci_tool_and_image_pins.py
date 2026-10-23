@@ -2,13 +2,20 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Two kinds of CI download are pinned to a name that cannot move (vault BACKLOG #2793).
 
-This holds those two shapes and nothing wider: runner images, `setup-*` versions and apt packages
-still resolve at run time, and nothing here says otherwise. The two shapes: ``npx --yes <tool>@<version>`` pinned the top package and resolved every transitive
+This holds those two shapes, and the Python pin described below, and nothing wider: runner images,
+other `setup-*` versions and apt packages still resolve at run time, and nothing here says
+otherwise. The two shapes: ``npx --yes <tool>@<version>`` pinned the top package and resolved every transitive
 dependency fresh on each run, and the server-DB legs pulled their service images by tag
 (``postgres:16``, ``mssql/server:2022-latest``), which a registry rebuild moves. The npm tools now
 install from the committed ``ci/npm-tools/package-lock.json`` (why: that package.json's
 description) and the images are pinned by digest (why, and how to move one: ci.yml's
 ``sqlserver-store`` matrix).
+
+The Python pin (follow-up to engine PR 2485): every ``actions/setup-python`` step that wants the
+supported 3.14 reads one exact patch from ``ci/python-version``. When they asked for ``"3.14"``,
+each runner used whichever patch it had cached, and a release that reached some runners first
+turned pull requests red at random. ``py314-latest-canary.yml`` measures the newest patch, so the
+next bump is a deliberate edit to that file.
 
 Every scan prints what it found and carries a floor, because a scan that matches nothing is
 indistinguishable from a clean tree.
@@ -20,6 +27,7 @@ import functools
 import json
 import posixpath
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -188,3 +196,125 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
         assert str(entry.get("resolved", "")).startswith("https://registry.npmjs.org/"), (
             f"{path} resolves outside the npm registry: {entry.get('resolved')!r}"
         )
+
+
+_PY_PIN = "ci/python-version"
+#: The setup-python steps that ask for something other than the pin, each on purpose. A row here
+#: that no step uses fails the scan, so a retired canary cannot leave a stale exemption behind.
+_UNPINNED_PYTHON = {
+    ("py315-canary.yml", "3.15"),  # the next minor's readiness canary
+    ("freethread-smoke.yml", "3.14t"),  # the free-threaded build
+    # The newest patch, with check-latest: the pin's other half.
+    ("py314-latest-canary.yml", "3.14"),
+}
+
+
+def _setup_python_steps() -> list[tuple[str, str, dict[str, Any], str, list[str] | None]]:
+    """Every setup-python step as (workflow, job, with, root, sparse): ``root`` is where its job
+    checked out THIS repository before the step, and ``sparse`` that checkout's sparse list."""
+    found: list[tuple[str, str, dict[str, Any], str, list[str] | None]] = []
+    for wf_name, wf in _workflows().items():
+        for job_name, job in (wf.get("jobs") or {}).items():
+            root, sparse = ".", None
+            for step in job.get("steps") or []:
+                uses = str(step.get("uses", ""))
+                with_ = step.get("with") or {}
+                if uses.startswith("actions/checkout@") and "repository" not in with_:
+                    root = str(with_.get("path", "."))
+                    raw = with_.get("sparse-checkout")
+                    sparse = None if raw is None else str(raw).split()
+                if uses.startswith("actions/setup-python@"):
+                    found.append((wf_name, job_name, dict(with_), root, sparse))
+    return found
+
+
+def _pin_problem(workflow: str, with_: dict[str, Any], root: str, sparse: list[str] | None) -> str:
+    """Why this step does not read the pin, or an empty string when it does or is exempt."""
+    if "python-version-file" in with_:
+        if "python-version" in with_:
+            return "names python-version too, and setup-python then ignores the file"
+        expected = posixpath.normpath(posixpath.join(root, _PY_PIN))
+        if with_["python-version-file"] != expected:
+            return f"reads {with_['python-version-file']!r}, not {expected!r}"
+        if sparse is not None and not {e.strip("/") for e in sparse} & {"ci", _PY_PIN}:
+            return f"its sparse checkout {sparse} does not fetch {_PY_PIN}"
+        return ""
+    if (workflow, str(with_.get("python-version"))) in _UNPINNED_PYTHON:
+        return ""
+    return f"asks for {with_.get('python-version')!r} instead of reading {_PY_PIN}"
+
+
+def _pinned_minor() -> str:
+    """The pin's X.Y, after checking the file holds one exact X.Y.Z and a newline."""
+    text = (_REPO / _PY_PIN).read_text(encoding="utf-8")
+    print(f"{_PY_PIN}: {text!r}")
+    # One line only: setup-python installs EVERY non-comment line of a plain version file.
+    match = re.fullmatch(r"(?P<minor>\d+\.\d+)\.\d+\n", text)
+    assert match, f"{_PY_PIN} must hold one exact X.Y.Z and a newline, found {text!r}"
+    return match.group("minor")
+
+
+def test_the_python_pin_is_one_exact_patch_of_the_supported_minor() -> None:
+    minor = _pinned_minor()
+    project = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == f">={minor}", (
+        f"{_PY_PIN} pins {minor}, but requires-python is "
+        f"{project['requires-python']!r}: CI would test a minor the project does not floor at"
+    )
+
+
+def test_the_hand_written_minors_agree_with_the_pin() -> None:
+    """setup-python no longer reads matrix.python-version, so that value is only a label: the
+    `py3.14` in the required context names, artifact names and the connscale leg name. Nothing would
+    notice a minor bump that moved the pin and left those labels, or the latest canary, behind."""
+    minor = _pinned_minor()
+    ci = (_WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    labels = re.findall(r'"python-version":"([^"]*)"', ci)
+    for job in _workflows()["ci.yml"]["jobs"].values():
+        matrix = (job.get("strategy") or {}).get("matrix")
+        rows = matrix.get("include") if isinstance(matrix, dict) else None
+        if isinstance(rows, list):
+            labels += [str(row["python-version"]) for row in rows if "python-version" in row]
+    print(f"ci.yml matrix python-version labels: {labels}")
+    # Floor: the three test legs' JSON rows and the three service-smoke include rows.
+    assert len(labels) >= 6, f"expected ci.yml's matrix python-version labels, found {labels}"
+    assert set(labels) == {minor}, f"ci.yml labels {sorted(set(labels))} but {_PY_PIN} is {minor}"
+    canary = _workflows()["py314-latest-canary.yml"]["jobs"]["canary"]["steps"]
+    asked = [
+        str(s["with"]["python-version"]) for s in canary if "setup-python" in s.get("uses", "")
+    ]
+    assert asked == [minor], f"the latest canary asks for {asked}, but {_PY_PIN} is {minor}"
+
+
+def test_every_setup_python_step_reads_the_pin_or_is_exempt_by_name() -> None:
+    steps = _setup_python_steps()
+    print(f"setup-python steps scanned: {len(steps)}")
+    # Floor: 53 steps read the pin on the day it was added, plus the three exempt ones.
+    assert len(steps) >= 50, f"expected the workflows' setup-python steps, found {len(steps)}"
+    # Controls: the classifier tells each failure shape from a pinned step.
+    pinned = {"python-version-file": _PY_PIN}
+    engine = {"python-version-file": "engine/ci/python-version"}
+    assert not _pin_problem("x.yml", pinned, ".", None)
+    assert not _pin_problem("x.yml", engine, "engine", None)
+    assert _pin_problem("x.yml", {"python-version": "3.14"}, ".", None)
+    assert _pin_problem("x.yml", pinned, "engine", None)
+    assert _pin_problem("x.yml", {**pinned, "python-version": "3.14"}, ".", None)
+    assert _pin_problem("x.yml", pinned, ".", ["scripts/security"])
+    assert not _pin_problem("x.yml", pinned, ".", ["scripts/security", "ci"])
+    problems = [
+        (wf, job, why)
+        for wf, job, with_, root, sparse in steps
+        if (why := _pin_problem(wf, with_, root, sparse))
+    ]
+    assert not problems, f"setup-python steps that bypass {_PY_PIN}: {problems}"
+    used = {(wf, str(w.get("python-version"))) for wf, _, w, _, _ in steps if "python-version" in w}
+    stale = sorted(_UNPINNED_PYTHON - used)
+    assert not stale, f"exemptions no setup-python step uses any more: {stale}"
+
+
+def test_only_the_latest_canary_uses_check_latest() -> None:
+    """Anywhere else, check-latest lets a PR run and its merge-queue run use different patches."""
+    steps = _setup_python_steps()
+    latest = [(wf, job) for wf, job, with_, _, _ in steps if with_.get("check-latest")]
+    print(f"setup-python steps with check-latest: {latest}")
+    assert latest == [("py314-latest-canary.yml", "canary")], latest

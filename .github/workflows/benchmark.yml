@@ -31,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       # --constraint constraints.lock for the reason spelled out in ci.yml's "Set up uv" step: a bare
       # `-e ".[extras]"` re-resolves from pyproject's `>=` floors and adopts whatever upstream shipped
       # since. A benchmark leg is the worst place for that — a silent dependency change reads as a
@@ -184,7 +184,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       - name: Install project (dev + postgres)
         run: |
           python -m pip install --upgrade pip
@@ -359,7 +359,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: ci/python-version
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
         # visibly hurting. The Qt sites sit in jobs carrying a job-level `timeout-minutes`, so a

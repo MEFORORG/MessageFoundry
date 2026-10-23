@@ -1,0 +1,185 @@
+# Newest Python 3.14 patch canary -- ADVISORY, NEVER REQUIRED.
+#
+# Every other 3.14 setup step reads ONE exact patch from ci/python-version, so a new 3.14.x release
+# reaches CI only when someone bumps that file. That is deliberate: when every step asked for "3.14",
+# each runner used whichever patch its image had cached, and a patch that reached some runners before
+# others turned pull requests red at random (the fix landed in engine PR 2485). This workflow is the
+# other half of the pin. It runs the suite on the NEWEST 3.14.x the runners can provision, so the next
+# patch is measured before the bump rather than discovered by it.
+#
+# WHAT IT REPORTS:
+#   * Whether the newest 3.14.x is newer than the pin. That is a warning, not a failure: the bump is a
+#     deliberate edit to ci/python-version, and this run says whether the suite passed on that patch.
+#   * Whether install and the engine suite passed there. Either failing is a finding, and goes red.
+#
+# IT MUST NEVER BLOCK A MERGE:
+#   * Its job name, "python 3.14 latest canary (<os>)", is NOT in .github/required-contexts.txt, and
+#     tests/test_required_contexts.py lists it in _MUST_NOT_BE_REQUIRED. Do not add it to branch
+#     protection: it has no merge_group trigger, so a required copy would never report in the queue
+#     and would wedge every entry.
+#   * On a pull request it runs only when this file changes, so the PR that edits the canary can
+#     read it. Weekly cron and manual dispatch are its normal cadence.
+#
+# IT IS ALLOWED TO GO RED, and that is deliberate. It copies py315-canary.yml's shape: every
+# diagnostic step is continue-on-error so all outcomes are collected, and a final verdict step rules
+# on them. A canary that cannot fail cannot tell "flew clean" from "never flew".
+#
+# `check-latest: true` is used HERE AND NOWHERE ELSE. Everywhere else it would let one pull request's
+# run and its merge-queue run use different patches, and land a breaking patch on every open pull
+# request at once, which are the two failures the pin exists to prevent.
+
+name: python 3.14 latest canary
+
+on:
+  schedule:
+    - cron: "30 6 * * 3" # Wednesdays 06:30 UTC, off freethread-smoke's Monday and py315-canary's Tuesday
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/py314-latest-canary.yml"
+
+concurrency:
+  group: py314-latest-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: install and test. No gh writes, no secrets.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Explicit bash gives `-eo pipefail` on every OS, including the Windows leg (Git Bash).
+    shell: bash
+
+jobs:
+  canary:
+    name: python 3.14 latest canary (${{ matrix.os }})
+    # NO job-level continue-on-error: see the header.
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the deployment target; Linux is the cheap breadth.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONFAULTHANDLER: "1"
+      # py315-canary.yml's extras, kept the same so the two canaries' suite smokes compare. No
+      # `harness`: the canary runs no Qt, and the Qt system libraries ci.yml installs are not here.
+      EXTRAS: dev,fhir,dicom,x12,xml,webauthn,vault
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # read-only job; do not persist the token (zizmor: artipacked)
+
+      - name: Set up the newest Python 3.14
+        id: setup
+        continue-on-error: true
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          check-latest: true
+
+      # What the canary measured, and how it compares to the pin every other 3.14 step reads.
+      - name: Record the interpreter and compare it to the pin
+        id: probe
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          pin = Path("ci/python-version").read_text(encoding="utf-8").strip()
+          have = sys.version.split()[0]
+          def key(v):
+              return tuple(int(part) for part in v.split("."))
+          newer = key(have) > key(pin)
+          print(f"sys.version = {sys.version}")
+          print(f"pinned in ci/python-version = {pin}")
+          print(f"newest provisioned = {have}, newer than the pin = {newer}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={have}\n")
+              out.write(f"pin={pin}\n")
+              out.write(f"newer={newer}\n")
+          PY
+
+      # Constrained, unlike py315-canary.yml: this canary measures the interpreter patch, and
+      # constraints.lock is what every 3.14 leg installs, so the lock is held fixed here.
+      - name: Install the engine (dev and CI extras)
+        id: install
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --constraint constraints.lock -e ".[$EXTRAS]"
+
+      # A smoke of the engine suite with the same selection the required legs use. Its result goes in
+      # the verdict and the summary; read the log for which tests failed and why.
+      - name: Engine suite smoke
+        id: suite
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 50
+        run: |
+          STATUS=0
+          python -m pytest -q -n auto --dist loadfile -p no:cacheprovider -m 'not tooling' \
+            --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
+            --timeout=120 > suite.txt 2>&1 || STATUS=$?
+          tail -200 suite.txt
+          echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
+          exit $STATUS
+
+      - name: Verdict -- did the canary fly, and what did it find?
+        if: always()
+        env:
+          SETUP: ${{ steps.setup.outcome }}
+          PROBE: ${{ steps.probe.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          SUITE: ${{ steps.suite.outcome }}
+          VERSION: ${{ steps.probe.outputs.version }}
+          PIN: ${{ steps.probe.outputs.pin }}
+          NEWER: ${{ steps.probe.outputs.newer }}
+          SUITE_SUMMARY: ${{ steps.suite.outputs.summary }}
+        run: |
+          # Each finding prints its own ::error line; FAILED only records that one fired.
+          FAILED=""
+          if [ "$SETUP" != "success" ]; then
+            echo "::error title=3.14 latest canary did not fly::could not provision the newest Python 3.14 (setup outcome=$SETUP)"
+            FAILED=1
+          else
+            for pair in "probe:$PROBE" "install:$INSTALL" "suite smoke:$SUITE"; do
+              NAME="${pair%%:*}"
+              OUT="${pair##*:}"
+              if [ "$OUT" != "success" ]; then
+                echo "::error title=3.14 latest canary finding::$NAME outcome=$OUT on Python $VERSION"
+                FAILED=1
+              fi
+            done
+            # pytest's summary names "N passed" only when N > 0; the expansion is unchanged without it.
+            if [ "$SUITE" = "success" ] && [ "${SUITE_SUMMARY#* passed}" = "$SUITE_SUMMARY" ]; then
+              echo "::error title=3.14 latest canary measured nothing::the suite step succeeded with no passing tests"
+              FAILED=1
+            fi
+          fi
+          if [ "$NEWER" = "True" ]; then
+            echo "::warning title=Newer Python 3.14 patch::$VERSION is out and ci/python-version pins $PIN. Bump the pin in its own pull request; this run's suite result is the evidence for that bump."
+          fi
+          {
+            echo "## Python 3.14 latest canary (${RUNNER_OS})"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "| --- | --- |"
+            echo "| provision the newest 3.14 | $SETUP (${VERSION:-n/a}) |"
+            echo "| pinned in ci/python-version | ${PIN:-n/a} |"
+            echo "| newer than the pin | ${NEWER:-n/a} |"
+            echo "| install | $INSTALL |"
+            echo "| engine suite smoke | $SUITE: ${SUITE_SUMMARY:-n/a} |"
+            echo ""
+            if [ -z "$FAILED" ]; then
+              echo "The canary flew clean on Python $VERSION."
+            else
+              echo "The canary found something; the ::error lines name each finding. Advisory: it blocks nothing."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -z "$FAILED" ]
