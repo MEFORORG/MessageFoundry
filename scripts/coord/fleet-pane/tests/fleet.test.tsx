@@ -71,13 +71,15 @@ const FLEET = {
   presentation: { isFullscreen: true, columns: 200 },
 } as const
 
-type World = { presence?: { stdout: string; stderr: string } }
+type World = { presence?: { stdout: string; stderr: string }; origin?: string }
 
 // Answers every host call the pane makes, and records any call it must never make.
 function host(on: On, world: World = {}) {
   const forbidden: string[] = []
   const ran: string[] = []
-  for (const name of ['model.complete', 'model.fork', 'agent.spawn', 'agent.register', 'prompt.submit', 'tool.register'] as const) {
+  // The host refuses some of these before any hook here sees them (a prompt.submit from a
+  // command.run hook), so this is a run-time check only; tests/test_fleet_pane_guard.py scans the source.
+  for (const name of ['model.complete', 'model.fork', 'agent.spawn', 'agent.register', 'prompt.submit', 'tool.register', 'tool.call', 'command.run'] as const) {
     on(name, () => {
       forbidden.push(name)
       throw new Error(`fleet-pane must not call ${name}`)
@@ -98,6 +100,7 @@ function host(on: On, world: World = {}) {
     const ok = (stdout: string, stderr = '') => ({
       value: { exitCode: 0, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (argv.startsWith('git config')) return ok(world.origin ?? 'https://github.com/MEFORORG/MessageFoundry.git\n')
     if (argv.startsWith('git ')) return ok('D:/repo\nD:/repo/.git\n')
     if (argv.includes('presence.ps1')) {
       const p = world.presence ?? { stdout: JSON.stringify([SEAT]), stderr: '' }
@@ -110,7 +113,7 @@ function host(on: On, world: World = {}) {
   return { forbidden, ran }
 }
 
-test('the pane reads every source and never reaches a model, agent, prompt or tool', async ($, on) => {
+test('the pane reads every source and no hook beneath sees a model, agent, prompt or tool call', async ($, on) => {
   const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
   const { forbidden, ran } = host(on)
 
@@ -161,5 +164,18 @@ test('an unavailable roster reads as a failure, never as an empty list', async (
     'roster unavailable: coordination root unreachable',
   )
   expect(await ui.find({ type: 'Text', text: /no live seats/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('another repository runs nothing, and every section says why', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-23T15:26:00Z') })
+  const { ran } = host(on, { origin: 'https://github.com/someone/other.git\n' })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true })
+  await $.command.run(FLEET)
+  await clock.settle()
+
+  expect(ran.filter(r => r.startsWith('pwsh') || r.startsWith('read'))).toEqual([])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /READ FAILED/ }))?.text).toContain('not MEFORORG/MessageFoundry')
   await ui.unmount()
 })

@@ -5,8 +5,10 @@
 ``scripts/coord/fleet-pane`` is a Claude Code mod. Its own ``claude plugin test`` checks the same
 promise at run time, but CI has no Claude Code, and the host refuses some calls (a
 ``$.prompt.submit`` from a ``command.run`` hook) before any test hook sees them. So this reads the
-source: no module may reach ``$.model``, ``$.agent``, ``$.prompt.submit`` or ``$.tool.register``,
-nor hand ``$`` to anything that could, by aliasing it or indexing it by a computed name.
+source for at least these routes to a model: ``$.model``, ``$.agent``, ``$.prompt.submit``,
+``$.tool.register``, ``$.tool.call`` (the Agent tool) and ``$.command.run`` (a command that asks
+the model), written with ``.`` or ``?.``, and ``$`` aliased or indexed by a computed name. It is a
+text scan, so it bounds the spellings it knows, not every possible route.
 
 It also holds every path literal to forward slashes: in a JS string ``C:\\Users`` turns ``\\U`` into
 an escape, the path silently breaks, and tsc does not catch it.
@@ -24,14 +26,20 @@ import pytest
 
 MOD = Path(__file__).resolve().parent.parent / "scripts" / "coord" / "fleet-pane"
 
+# A member access on `$`, plain or optional: `$.x` and `$?.x`.
+_DOT = r"\$\s*\??\.\s*"
+_ON = r"\s*\??\.\s*"
+
 FORBIDDEN = {
-    "model": re.compile(r"\$\s*\.\s*model\b"),
-    "agent": re.compile(r"\$\s*\.\s*agent\b"),
-    "prompt.submit": re.compile(r"\$\s*\.\s*prompt\s*\.\s*submit\b"),
-    "tool.register": re.compile(r"\$\s*\.\s*tool\s*\.\s*register\b"),
-    # `$['model']`, or `$` copied into another name or destructured, would slip past the four above.
-    "indexing $": re.compile(r"\$\s*\["),
-    "aliasing $": re.compile(r"=\s*\$\s*(?:[;,)\n]|$)", re.MULTILINE),
+    "model": re.compile(_DOT + r"model\b"),
+    "agent": re.compile(_DOT + r"agent\b"),
+    "prompt.submit": re.compile(_DOT + r"prompt" + _ON + r"submit\b"),
+    "tool.register": re.compile(_DOT + r"tool" + _ON + r"register\b"),
+    "tool.call": re.compile(_DOT + r"tool" + _ON + r"call\b"),
+    "command.run": re.compile(_DOT + r"command" + _ON + r"run\b"),
+    # `$['model']`, or `$` copied into another name or destructured, would slip past the rules above.
+    "indexing $": re.compile(r"\$\s*\??\.?\s*\["),
+    "aliasing $": re.compile(r"=\s*\$\s*(?:[;,)\n]|as\b|$)", re.MULTILINE),
 }
 
 BACKSLASH_PATH = re.compile(r"[A-Za-z]:\\")
@@ -41,8 +49,10 @@ SHOULD_CATCH = {
     "agent": "$ .agent.spawn({ subagentType })",
     "prompt.submit": "void $.prompt.submit({ text })",
     "tool.register": "await $.tool.register(spec)",
-    "indexing $": "const m = $['model']",
-    "aliasing $": "const { model } = $\n",
+    "tool.call": "await $?.tool.call({ tool: 'Agent' })",
+    "command.run": "await $.command.run({ command: 'compact' })",
+    "indexing $": "const m = $?.['model']",
+    "aliasing $": "const x = $ as EngineInterface",
 }
 
 # Lines the rules must leave alone: the module's real calls.
@@ -51,6 +61,8 @@ SHOULD_PASS = [
     "text = await $.fs.read(path)",
     "await $.ui.open({ id: PANE, title: TITLE })",
     "await update($, seats, old => applied(old, t, o))",
+    "await $.command.register({ name: 'fleet' })",
+    "on('command.run', { command: 'fleet' }, async $ => {",
 ]
 
 
@@ -88,7 +100,7 @@ def test_no_module_reaches_a_model_agent_prompt_or_tool() -> None:
 
 
 def test_path_literals_use_forward_slashes() -> None:
-    assert BACKSLASH_PATH.search("'C:\\Users\\Scott'")
+    assert BACKSLASH_PATH.search("'C:\\Temp\\x'")
     hits = [
         f"{p.relative_to(MOD)}:{n}"
         for p in _sources()

@@ -71,6 +71,8 @@ function parsePr(pr: Json): FleetPr {
     failing: len(required.failing),
     pending: len(required.pending),
     missing: len(required.missing),
+    // Contexts the verdict could not settle, including ones GitHub requires but the list lacks.
+    unknown: len(required.unknown) + len(required.requiredByGithubNotInList),
     mergeable: mergeableWord(pr),
     queuePosition: entry ? numOrNull(entry.position) : null,
   }
@@ -170,6 +172,12 @@ export function ageWords(ms: number): string {
   const m = Math.round(s / 60)
   if (m < 120) return `${m}m ago`
   return `${Math.round(m / 60)}h ago`
+}
+
+// How old an ISO time is, in ms; an absent or unreadable one counts as infinitely old.
+export function pollAge(iso: string | null, now: number): number {
+  const t = iso ? Date.parse(iso) : NaN
+  return Number.isNaN(t) ? Infinity : now - t
 }
 
 export function sinceIso(iso: string | null, now: number): string {

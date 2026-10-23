@@ -10,7 +10,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetLane, FleetPrs, FleetSeat, FleetSection, FleetUsage } from '../types'
-import { ageWords, firstLine, parseLane, parsePresence, parsePrState, parseUsage, sinceIso, words } from './sources'
+import { ageWords, firstLine, parseLane, parsePresence, parsePrState, parseUsage, pollAge, sinceIso, words } from './sources'
 import type { Ran } from './sources'
 
 const PANE = 'fleet'
@@ -20,10 +20,14 @@ const TITLE = 'Fleet'
 // sources that are due, so a closed pane costs one engine call per tick and nothing else.
 const EVERY = { seats: 60000, prs: 30000, usage: 120000, lane: 120000 } as const
 const TICK = 15000
+// The poller writes every 2 minutes; data older than this means it has stopped.
+const PR_STALE_MS = 10 * 60000
+// Only this repository's scripts run, so a user-wide install never runs another repo's scripts/coord.
+const OUR_REMOTE = /[/:]MEFORORG\/MessageFoundry(\.git)?$/i
 type SourceName = keyof typeof EVERY
 const SOURCES = Object.keys(EVERY) as SourceName[]
 
-const blank = { okAt: null, error: null, data: null }
+const blank = { okAt: null, failedAt: null, error: null, data: null }
 const seats = atom({ plugin: 'fleet-pane', key: 'seats' } as const, blank as FleetSection<FleetSeat[]>)
 const prs = atom({ plugin: 'fleet-pane', key: 'prs' } as const, blank as FleetSection<FleetPrs>)
 const usage = atom({ plugin: 'fleet-pane', key: 'usage' } as const, blank as FleetSection<FleetUsage>)
@@ -48,17 +52,22 @@ const lastRun: Partial<Record<SourceName, number>> = {}
 async function resolveWhere($: EngineInterface): Promise<Where> {
   if (!sessionCwd) throw new Error('the session has not started yet')
   const cwd = sessionCwd
-  const [git, configDir, profile] = await Promise.all([
+  const [git, remote, configDir, profile] = await Promise.all([
     $.process.run(['git', 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'], {
       cwd,
       timeoutMs: 10000,
     }),
+    $.process.run(['git', 'config', '--get', 'remote.origin.url'], { cwd, timeoutMs: 10000 }),
     $.env.get('CLAUDE_CONFIG_DIR'),
     $.env.get('USERPROFILE'),
   ])
   const [root, commonDir] = git.stdout.trim().split(/\r?\n/)
   if (git.exitCode !== 0 || !root || !commonDir) {
     throw new Error(`not in a git checkout (${firstLine(git.stderr) || `git exited ${git.exitCode}`})`)
+  }
+  const origin = remote.stdout.trim()
+  if (!OUR_REMOTE.test(origin)) {
+    throw new Error(`this checkout's origin is ${origin || 'unset'}, not MEFORORG/MessageFoundry; nothing was run`)
   }
   // CLAUDE_CONFIG_DIR is unset in desktop sessions; the default root is the profile's .claude.
   const configRoot = configDir ? slashes(configDir) : profile ? `${slashes(profile)}/.claude` : ''
@@ -109,7 +118,7 @@ async function attempt<T>(read: Promise<T>): Promise<Outcome<T>> {
 
 // A failure keeps the last good data beside the error, so the pane can show both.
 function applied<T>(old: FleetSection<T>, t: number, o: Outcome<T>): FleetSection<T> {
-  return o.ok ? { okAt: t, error: null, data: o.data } : { ...old, error: o.error }
+  return o.ok ? { okAt: t, failedAt: null, error: null, data: o.data } : { ...old, failedAt: t, error: o.error }
 }
 
 async function readSource($: EngineInterface, name: SourceName): Promise<void> {
@@ -153,15 +162,23 @@ async function readAndTick($: EngineInterface, names: SourceName[]): Promise<voi
   await update($, now, () => t)
 }
 
+// Fire-and-forget work still reports a failure, in the debug log and the transcript's dim line.
+function background($: EngineInterface, work: Promise<void>): void {
+  work.catch(err => $.ui.log(`fleet-pane: ${words(err)}`))
+}
+
 // One tick: nothing while the pane is not placed, else every source whose interval has passed.
 async function onTick($: EngineInterface): Promise<void> {
   if (!(await isPlaced($))) return
   const t = await $.clock.now()
-  await readAndTick($, SOURCES.filter(name => t - (lastRun[name] ?? -Infinity) >= EVERY[name]))
+  // Half a tick of slack: lastRun is stamped a few ms after the tick that started the read, so an
+  // exact comparison would push every source one whole tick late.
+  await readAndTick($, SOURCES.filter(name => t - (lastRun[name] ?? -Infinity) >= EVERY[name] - TICK / 2))
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    if (e.cwd !== sessionCwd) where = null
     sessionCwd = e.cwd
     await $.command.register({
       name: 'fleet',
@@ -169,16 +186,16 @@ export const register: Register = on => {
     })
     if (!isTicking) {
       isTicking = true
-      $.clock.every(TICK, () => void onTick($))
+      $.clock.every(TICK, () => background($, onTick($)))
     }
     // A reload keeps the pane open but starts the module over; refill it at once if it is up.
-    void onTick($)
+    background($, onTick($))
     return next(e)
   })
 
   on('command.run', { command: 'fleet' }, async $ => {
     const opened = await $.ui.open({ id: PANE, title: TITLE })
-    void readAndTick($, SOURCES)
+    background($, readAndTick($, SOURCES))
     return { text: opened.isPlaced ? 'Fleet pane opened.' : `Fleet pane is open but not drawn: ${opened.reason}` }
   })
 
@@ -189,11 +206,14 @@ export const register: Register = on => {
     const cut = (s: string) => (s.length > width ? `${s.slice(0, width - 1)}~` : s)
 
     function head<T>(title: string, s: FleetSection<T>, name: SourceName) {
-      const age = s.okAt === null ? 'not read yet' : `read ${ageWords(t - s.okAt)}`
+      const age =
+        s.okAt !== null ? `read ${ageWords(t - s.okAt)}` : s.failedAt !== null ? 'no good read yet' : 'not read yet'
       return (
         <Box flexDirection="column">
           <Text bold>{cut(`${title}  (${age}; every ${EVERY[name] / 1000}s)`)}</Text>
-          {s.error !== null && <Text color="red">{cut(`READ FAILED: ${s.error}`)}</Text>}
+          {s.error !== null && (
+            <Text color="red">{cut(`READ FAILED ${s.failedAt === null ? '' : ageWords(t - s.failedAt)}: ${s.error}`)}</Text>
+          )}
           {s.error !== null && s.data !== null && <Text dimColor>showing the last good read</Text>}
         </Box>
       )
@@ -216,7 +236,7 @@ export const register: Register = on => {
         {cut(
           `#${pr.number} ${pr.required}` +
             `${pr.failing ? ` ${pr.failing} failing` : ''}${pr.pending ? ` ${pr.pending} pending` : ''}` +
-            `${pr.missing ? ` ${pr.missing} missing` : ''}${pr.requiredReason ? ` (${pr.requiredReason})` : ''}` +
+            `${pr.missing ? ` ${pr.missing} missing` : ''}${pr.unknown ? ` ${pr.unknown} unknown` : ''}${pr.requiredReason ? ` (${pr.requiredReason})` : ''}` +
             ` merge:${pr.mergeable}${pr.queuePosition !== null ? ` queue#${pr.queuePosition}` : ''}` +
             `${pr.isDraft ? ' draft' : ''} ${pr.title}`,
         )}
@@ -239,6 +259,11 @@ export const register: Register = on => {
             <Text dimColor>
               {cut(`poller data ${sinceIso(pd.dataFetchedAt, t)}; last poll ${sinceIso(pd.pollFetchedAt, t)}`)}
             </Text>
+            {pd.pollError === null && pollAge(pd.pollFetchedAt, t) > PR_STALE_MS && (
+              <Text color="red">
+                {cut(`POLLER STOPPED? last poll ${sinceIso(pd.pollFetchedAt, t)}; is the MEFOR-PR-State task running?`)}
+              </Text>
+            )}
             {pd.pollError !== null && (
               <Text color="red">
                 {cut(`POLL FAILED (${pd.consecutiveFailures} in a row, data is stale): ${pd.pollError}`)}

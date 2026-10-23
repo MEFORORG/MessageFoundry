@@ -6,6 +6,8 @@
 // is only possible before the first read, which the pane shows as "not read yet".
 export type FleetSection<T> = {
   okAt: number | null
+  // When the latest read failed, or null once a read succeeds.
+  failedAt: number | null
   error: string | null
   data: T | null
 }
@@ -30,6 +32,7 @@ export type FleetPr = {
   failing: number
   pending: number
   missing: number
+  unknown: number
   mergeable: string
   queuePosition: number | null
 }
