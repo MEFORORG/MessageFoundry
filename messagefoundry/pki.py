@@ -779,7 +779,26 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
     The ODBC ``ServerCertificate`` pin is an exact match against the certificate the server presents
     (vault BACKLOG #2223). A file holding several certificates, or a CA certificate that signs
     others, is refused here with a reason rather than by the driver at every connect. Raises
-    :class:`PinRefused` for those, and ``cryptography``'s own errors for a file that does not parse."""
+    :class:`PinRefused` for those, and ``cryptography``'s own errors for a file that does not parse.
+
+    **A file with an encryption header is refused too (BACKLOG #3090).** The ODBC driver reads the
+    pin file itself, with its own TLS library, and a ``Proc-Type: 4,ENCRYPTED`` block can send a
+    TLS library to a password prompt. ``cryptography``'s parser does not stop it. Measured with
+    cryptography 50.0.2: a valid certificate block carrying the two RFC 1421 headers parses, and so
+    does a certificate followed by an encrypted key block. So the text goes through the check
+    ``anchor_cadata`` uses first. The refusal names no part of the file."""
+    # Lazy: auth.trust_anchors imports far more than this module needs at import time.
+    from messagefoundry.auth.trust_anchors import (
+        ENCRYPTION_HEADER_SCOPE,
+        has_encryption_header_bytes,
+    )
+
+    if has_encryption_header_bytes(data):
+        raise PinRefused(
+            f"it {ENCRYPTION_HEADER_SCOPE}. The ODBC driver loads this file with its own TLS "
+            "library, which can wait for a password on an encrypted block; name the server's "
+            "certificate without encryption headers"
+        )
     if b"-----BEGIN" in data:
         certs = x509.load_pem_x509_certificates(data)  # ValueError when the file holds none
         if len(certs) != 1:

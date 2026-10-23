@@ -427,6 +427,20 @@ def test_an_unreachable_vault_is_unobservable_and_names_only_the_type() -> None:
     assert _TOKEN not in _out(hop)
 
 
+def test_a_refused_hop_stops_the_probe_after_one_call() -> None:
+    """A hop refusal, such as the proxy leg's CA load refusal (BACKLOG #3090), would refuse the
+    capabilities read the same way, so that read is not sent and the cause is reported once.
+    Red with ``InsecureHopRefused`` dropped from the early-return arm: the probe then asks for
+    capabilities and the reading carries two problems."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    refusal = InsecureHopRefused("Vault test hop: fixed text")
+    vault = _FakeVault(caps=_least_caps(), lookup_error=refusal)
+    reading = _reading(vault)
+    assert vault.asked == [], "the capabilities read was sent after the hop was refused"
+    assert reading.problems == ("token lookup-self failed: Vault test hop: fixed text",)
+
+
 def test_a_client_that_cannot_be_built_is_unobservable_with_the_engines_own_text() -> None:
     def _refuse(address: str, token: str) -> Any:
         raise KeyProviderError("Vault transit key provider: refusing a cleartext address")
