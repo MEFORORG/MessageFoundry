@@ -110,7 +110,9 @@ What this changes:
    **Not covered, at least:** `alloc.ps1` still rewrites `alloc/<kind>/.floor-highwater` in place.
    `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
    report reads each handoff with its own capped read. `mail-claim.ps1` keeps its own claim-by-rename
-   protocol, and the drain's citation walk fails closed on a held file without retrying.
+   protocol, and the drain's citation walk fails closed on a held file without retrying. The wiki
+   inbox (`wiki/`) and `wiki-cycle/` are read and written by korus scripts, which use neither
+   helper.
 2. **The cross-PC race holds (measured 2026-10-22).** The race above ran two processes on one
    client, which cannot see the two clients' caches. The rerun put one process on each PC: 100
    slots with 50 ms gates, 36 and 64 wins, **no double winners, no empty slots and no content
@@ -304,9 +306,10 @@ design. Reads and builds keep working.
    **Copy mail and lanes to the share under host-qualified keys only** (steps 6 and 10). An old box
    copied there would be read by every PC with a worktree at that path. Move each old inbox into
    its new box first; the drain does exactly that for its own tree.
-   Also before step 7: the CreateNew race rerun with one process on each PC, which passed on
-   2026-10-22 (see *What MEFORDEV01 measured*). The rename-retry change for writers and readers
-   of shared kinds is BUILT (same section, item 1).
+   Also before step 7: the CreateNew race rerun with one process on each PC (*What MEFORDEV01
+   measured*, item 2), and the rename-retry change (same section, item 1). That change is built
+   for the writers and readers item 1 names. The gaps in its "Not covered, at least" list are still
+   open, and they include the wiki inbox and `wiki-cycle/`, whose korus scripts use neither helper.
 5. Pick a quiet window. Announce it on the old mail lane.
 6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
    `robocopy /E /COPY:DT`. Leave the originals in place. **Then stamp `host = ALIENWARE` on every
