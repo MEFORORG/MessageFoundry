@@ -715,6 +715,7 @@ poll keeps the last good data and marks it stale. The fields:
 | `schemaVersion` | `1`. A reader that sees another number should not guess. |
 | `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
 | `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
+| `logError` | Null, or `message` and `at` (UTC) for this run's failure to write `pr-state.log`. Only the lock holder writes it. |
 | `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
 | `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the failing poll's main-query reading if that query ran, else the last good poll's; it can be older than `fetchedAt`. |
 | `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. The error is the last refresh attempt's, carried until the next attempt, and can sit beside an older list. |
@@ -726,19 +727,22 @@ poll keeps the last good data and marks it stale. The fields:
 | `...mergeable`, `...mergeStateStatus`, `...mergeStateKnown` | GitHub's merge answers per PR, null while GitHub has not computed them. |
 | `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
 
-Four reading rules, each one a mistake the file is shaped to prevent:
+Five reading rules, each one a mistake the file is shaped to prevent:
 
 1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
    said no PR is open.
 2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
    no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has several
    causes, and `required.reason` always names the one that fired. A FAILURE can carry a reason too,
-   such as a STALE run that needs a re-run. Read the reason, not a list of
-   causes. At the time of writing they include a base other than `main`, no required list, and a
+   such as a STALE run that needs a re-run. Read the reason, not a list of causes. At the time of
+   writing they include a base other than `main`, a required list that is missing or empty, and a
    truncated context page.
 3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
    (`mergeStateKnown: false`). That is no state at all.
 4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
+5. When the top-level `requiredContexts` is null or empty, read `requiredContextsError`. The poll
+   itself can still succeed, with `error` null. No PR then reads `SUCCESS`, and its `required` is
+   judged only by runs GitHub flags as required.
 
 It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
 unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
