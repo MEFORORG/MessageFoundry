@@ -333,14 +333,12 @@ def required_verdict(
         # The list is BASE_BRANCH's. Judging another base's PR by it is a verdict about nothing.
         out["reason"] = f"base is {base!r}; only {BASE_BRANCH}'s required list is read"
         return out
-    if required is None:
-        out["reason"] = "no required-context list"
-        return out
     if contexts is None:
         out["reason"] = "required-context query returned nothing for this PR"
         return out
     nodes = [n for n in contexts.get("nodes", []) if n is not None]
-    req = set(required)
+    # No list (None) and an empty one are judged alike: runs GitHub flags as required still count.
+    req = set(required or [])
     flagged = {
         pr_checks.name_of(n) for n in nodes if isinstance(n, dict) and n.get("isRequired") is True
     }
@@ -387,10 +385,13 @@ def required_verdict(
     elif out["unknown"]:
         out["reason"] = "runs exist only from checks GitHub does not count as required here"
     elif not required:
-        # An empty list most likely means a read that found nothing, not a branch that requires
-        # nothing. Runs GitHub flags as required can still make the PR red or pending above, but
-        # an empty list never makes it read merge-ready.
-        out["reason"] = "the required-context list is empty"
+        # No list, or an empty one. poll() never caches an empty refresh, so in the poller's output
+        # this is a list that was never read; [] reaches here only from a direct caller. Runs
+        # GitHub flags as required can still make the PR red or pending above, but a missing list
+        # never makes it read merge-ready.
+        out["reason"] = (
+            "no required-context list" if required is None else "the required-context list is empty"
+        )
     else:
         out["state"] = "SUCCESS"
     return out

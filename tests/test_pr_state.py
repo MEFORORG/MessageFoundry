@@ -897,3 +897,28 @@ def test_an_empty_list_from_github_keeps_the_previous_list(tmp_path: Path) -> No
     assert sum(c[-1].startswith("repos/") for c in calls) == fetches  # inside the 10-minute gate
     _main(tmp_path, gh, NOW + timedelta(minutes=72))
     assert sum(c[-1].startswith("repos/") for c in calls) > fetches  # retried after it
+
+
+def test_no_list_on_a_cold_cache_still_shows_a_github_required_failure(tmp_path: Path) -> None:
+    """CONTROL (fails on d6a1ce4fc, which returned UNKNOWN before judging the flagged runs)."""
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        if args[-1].endswith("/rules/branches/main"):
+            return json.dumps([[]])
+        if args[-1].startswith("repos/"):
+            return json.dumps({"protection": {"required_status_checks": {"contexts": []}}})
+        red = {**_run("new-required", "FAILURE"), "isRequired": True}
+        return FakeGh([_pr(1)], {1: [red]})(args, stdin)
+
+    rc, doc = _main(tmp_path, gh)  # cold cache: no previous list to keep
+    assert rc == 0 and doc["requiredContexts"] is None
+    assert doc["requiredContextsError"] == "empty required-context list from GitHub"
+    required = doc["data"]["pullRequests"][0]["required"]
+    assert required["state"] == "FAILURE" and required["failing"] == ["new-required"]
+    assert required["requiredByGithubNotInList"] == ["new-required"]
+
+
+def test_no_list_and_no_flagged_runs_reads_unknown_with_its_reason() -> None:
+    ctx = {"oid": _sha(1), "nodes": [], "hasNextPage": False}
+    verdict = ps.shape_pr(_pr(1), None, ctx)["required"]
+    assert verdict["state"] == "UNKNOWN" and verdict["reason"] == "no required-context list"
