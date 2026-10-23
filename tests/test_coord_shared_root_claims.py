@@ -329,6 +329,21 @@ def test_a_lane_record_naming_another_machine_is_not_overwritten(repo: Path, sha
     assert run(repo, "lane.ps1", "-Show", root=shared).returncode == 0
 
 
+def test_asked_does_not_take_over_another_machines_lane_record(repo: Path, shared: Path) -> None:
+    # -Asked writes a stamp, so it meets the same refusal as a stated level.
+    assert run(repo, "lane.ps1", "-Free", "1", "-InFlight", "2", root=shared).returncode == 0
+    (record,) = list((shared / "lanes").glob("*.json"))
+    rec = json.loads(record.read_text(encoding="utf-8-sig"))
+    rec["host"] = OTHER
+    record.write_text(json.dumps(rec), encoding="utf-8")
+    before = record.read_bytes()
+
+    proc = run(repo, "lane.ps1", "-Asked", root=shared)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert OTHER in proc.stderr
+    assert record.read_bytes() == before
+
+
 def test_the_owner_log_follows_the_shared_root(
     repo: Path, shared: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

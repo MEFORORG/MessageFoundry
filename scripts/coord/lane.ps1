@@ -115,7 +115,7 @@ if (Test-Path -LiteralPath $file) {
 # and says so; -Show only reads, so it prints the record as it is. A record with no `host` was
 # written here, as every record before the field was.
 if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
-    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), not of this machine ($thisHost). Nothing was written.")
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), not of this machine ($thisHost). Nothing was written. Read it with -Show; if it is a stray copy rather than that machine's live lane, move it out of $lanesDir by hand and state this lane's level again.")
     exit 2
 }
 if (-not $rec) {
