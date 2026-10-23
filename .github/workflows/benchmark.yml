@@ -331,7 +331,8 @@ jobs:
 
   baseline-sqlserver:
     name: baseline (sqlserver)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04 for the ODBC install from packages.microsoft.com; why is at ci.yml's sqlserver-store job.
+    runs-on: ubuntu-24.04
     services:
       mssql:
         # Digest-pinned, the same 2022 digest as ci.yml; see ci.yml's sqlserver-store matrix.
