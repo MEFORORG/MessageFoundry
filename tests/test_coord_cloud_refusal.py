@@ -170,6 +170,8 @@ def _run(
         pytest.param("coord/handoff.ps1", ("-Where",), id="handoff-where"),
         pytest.param("coord/lane.ps1", ("-Free", "1", "-InFlight", "0"), id="lane-state"),
         pytest.param("coord/tombstone-retired-backlog-allocator.ps1", (), id="tombstone-write"),
+        pytest.param("coord/coord-migrate.ps1", (), id="coord-migrate"),
+        pytest.param("coord/coord-race.ps1", ("-Compare",), id="coord-race"),
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
         pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
         pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
@@ -210,6 +212,15 @@ def test_mail_send_refuses_before_writing_to_an_explicit_mail_root(
         ),
         pytest.param(
             "worktree/hygiene-report.ps1", HYGIENE_OFFLINE, "-OutDir", id="hygiene-outdir"
+        ),
+        pytest.param(
+            "coord/coord-migrate.ps1", ("-Source", "."), "-Target", id="coord-migrate-target"
+        ),
+        pytest.param(
+            "coord/coord-race.ps1",
+            ("-Tag", "t", "-StartAtUtc", "2026-01-01T00:00:00Z"),
+            "-Dir",
+            id="coord-race-dir",
         ),
     ],
 )
@@ -422,6 +433,9 @@ GUARDED = (
     "coord/handoff.ps1",
     "coord/lane.ps1",
     "coord/tombstone-retired-backlog-allocator.ps1",
+    # The shared-root migration tools; their -Source, -Target and -Dir bypass git entirely.
+    "coord/coord-migrate.ps1",
+    "coord/coord-race.ps1",
     "worktree/hygiene-report.ps1",
     # The AFK-autonomy decision log and its digest (ADR 0211): vault work, which stays local.
     "coord/decision.ps1",
@@ -463,6 +477,9 @@ NOT_GUARDED = {
     "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
     # Writes state that is correct for the clone it runs in, so it is no dead letter in a VM.
     "coord/lock.ps1": "clone-local mutex around worktree/new.ps1",
+    "hooks/usage-headroom-inject.ps1": "project hook; clone-local cache of what this session saw",
+    # Writes only the clone-local pr-state.json cache and its lock, both true of the clone it polls.
+    "coord/pr_state.py": "clone-local PR-state cache",
     # A dot-sourced library: it names where state lives and writes only its clone-local down-cache.
     # Every script that calls it carries its own refusal.
     "coord/coord-root.ps1": "resolver library, clone-local down-cache only",
@@ -476,6 +493,7 @@ NOT_GUARDED = {
     "worktree/prune-merged.ps1": "reader; decides about this clone's worktrees only",
     # Names the directory in prose or prints its path, and writes nothing there.
     "coord/install-coordination.ps1": "mention",
+    "coord/install-pr-state-task.ps1": "mention",
     "coord/rescue.ps1": "mention",
     "coord/unbacked_check.ps1": "mention",
     "worktree/register-hygiene-task.ps1": "mention",

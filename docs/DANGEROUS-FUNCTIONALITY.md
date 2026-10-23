@@ -331,12 +331,10 @@ Three argument-list starts are not pinned that way:
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
-environment for the sandbox worker, the disaster-recovery hook and the engine shards. The module
-also builds one for the config-loading child that runs before any shard starts, and for the tray's
-branded relaunch. The module's docstring says what each one gets, and why that is not an isolation
-boundary by itself. The tray's relaunch also takes its command line from that module, so it
-starts with `-P` like the engine's Python children. Its environment is the user's whole
-environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
+environment for each start the list after this paragraph names. The list says what each one gets;
+the module's docstring says why that is not an isolation boundary by itself. The tray's branded
+relaunch also takes its command line from that module, so it starts with `-P` like the engine's
+Python children. Autostart starts the first tray
 process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
 the script only from a checkout. Windows hands that process the user's environment unfiltered.
 `-E` makes the interpreter ignore its `PYTHON*` variables, so no `PYTHONPATH` entry reaches that
@@ -344,12 +342,44 @@ process's import path (vault BACKLOG #2852). The relaunch it starts repeats that
 the login command adds where `PYTHONNOUSERSITE` is set, as every Python child repeats its parent's
 isolation (vault BACKLOG #2701). A tray started by hand gets none of the options, and its relaunch
 reads the user's `PYTHONPATH`. Section 3, under
-*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The `icacls.exe` and `sc.exe` starts get
-the platform's start-up names and nothing else, from the same module (vault BACKLOG #2716). The other
-starts in the table hand over the whole environment. One of them leaves two names out: when the
-tray starts VS Code, it drops the two variables VS Code's own launcher manages. `tests/test_child_process_environment.py`
+*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path.
+
+What at least these starts get, read from the builder each calls. Each item names the modules
+and the builders, and a test checks that each module named calls each builder named:
+
+- The `icacls.exe` starts in `auth/trust_anchors.py` and `store/store.py`, the `sc.exe` starts in
+  `service.py` and `service_status.py`, and the `powershell.exe` start in
+  `verify/cipher_policy.py` get the platform's start-up names and nothing else
+  (`system_tool_environment`, vault BACKLOG #2716).
+- The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
+  platform's start-up names, the interpreter's own variables, the engine switches its own code
+  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
+  passed none.
+- The disaster-recovery hook, in `pipeline/dr.py`, gets everything outside the engine's `MEFOR_*`
+  namespace, less the few secret names the module lists outside it (`hook_environment`). A secret
+  kept under any other name still reaches it.
+- The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
+  branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
+  empty or relative `PYTHONPATH` entry (`engine_environment`).
+- The `openssl` start in `verify/cipher_policy.py` gets the platform's start-up names, the
+  interpreter's own variables, and the variables OpenSSL reads to find its configuration file,
+  `OPENSSL_CONF` and `OPENSSL_CONF_INCLUDE`, and the provider modules and engines it loads,
+  `OPENSSL_MODULES` and `OPENSSL_ENGINES`
+  (`worker_environment`). No other variable reaches it.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
+  disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
+  over `engine_environment`). So they keep the index, proxy and certificate settings they read
+  from the environment, and any other variable the runner set, a CI token among them, reaches them
+  too.
+
+At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
+variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
+launcher manages. The elevated service-control and install commands go through `ShellExecute`,
+which takes no environment argument, so the code chooses none; which environment Windows gives a
+child raised through the UAC prompt is not measured here. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
-that module.
+one of that module's builders.
 
 **The other forms are the ones to look at hardest.**
 
@@ -382,6 +412,9 @@ setting or message reaches it, and it calls `Get-TlsCipherSuite` through the sys
 imported by its path, never by name. No command it runs is looked up by a bare name, so a
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
+Each of the module's two starts, `powershell.exe` and `openssl`, is bounded at 30 s
+(`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and that reading is an
+ERROR.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
@@ -747,7 +780,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke` runs NSSM the same way. |
+| `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope like the rest of this folder by owner ruling of 2026-10-05 ([`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2). It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -1125,7 +1158,9 @@ A test checks the lists and counts in seven sections. `tests/test_dangerous_func
 reads the code and fails when one of these no longer matches it:
 
 - the section 4 table: a new process start, or a start that changes form, such as a new
-  `shell=True`;
+  `shell=True`. In the list under *What each child is handed*, each module an item names must call
+  each builder it names. The host cipher probes' timeout and the `OPENSSL_*` names must match
+  `verify/cipher_policy.py`, and each of its starts must pass that timeout;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
 - the section 7 parser tables: a parse site the six patterns find that the first two tables omit,
@@ -1147,7 +1182,10 @@ reads the code and fails when one of these no longer matches it:
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Some things no test checks. They include what a script grants, what holds a site, and sections 1,
-2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether either
+2, 3 and 6. In section 4, no test checks the page's account of what each builder lets through
+against `messagefoundry/childenv.py`; `tests/test_child_process_environment.py` tests the builders
+themselves. Nor does any test check that the environment list names every start, or that a
+module's start uses the builder named rather than another the module also calls. In section 7, no test checks which table a parse site belongs in, or whether either
 hand-read table is complete. In section 11, no test checks the settings a harness-started engine
 is given, the store reset, the listener bind addresses, or which row a parse site belongs in. The
 import-by-name and config-loader checks match the called name, so a call through another name

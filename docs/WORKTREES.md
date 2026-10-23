@@ -696,6 +696,82 @@ Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_
 parse the script and fail on any git verb outside a read-only list, with a positive control. They
 also drive it against a temp repository with a fake gh.
 
+## A PR-state cache for read-only panes — `pr_state.py`
+
+One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads
+that file and makes no API call of its own. Every Claude account on a box shares one GitHub token,
+so eleven panes polling for themselves would spend the shared budget eleven times over.
+
+[`scripts/coord/pr_state.py`](../scripts/coord/pr_state.py) does one poll per run and exits. A
+scheduled task runs it every 2 minutes. It writes `<git common dir>/mefor-coord/pr-state.json`, on
+the local root, never the shared one. Measured 2026-10-22 with 13 open PRs: one poll cost 4 GraphQL
+points in two queries, took about 4.4 seconds end to end, and wrote about 18 KB.
+
+**A reader must check `error` and the data's `fetchedAt` before it trusts anything else.** A failed
+poll keeps the last good data and marks it stale. The fields:
+
+| Field | What it holds |
+|---|---|
+| `schemaVersion` | `1`. A reader that sees another number should not guess. |
+| `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
+| `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
+| `logError` | Null, or `message` and `at` (UTC) for this run's failure to write `pr-state.log`. Only the lock holder writes it. |
+| `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
+| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the failing poll's main-query reading if that query ran, else the last good poll's; it can be older than `fetchedAt`. |
+| `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. The error is the last refresh attempt's, carried until the next attempt, and can sit beside an older list. |
+| `data` | The last good poll, or null if there never was one. |
+| `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
+| `data.openPullRequestCount` | GitHub's count of open PRs, which can exceed the list when it is truncated. |
+| `data.truncated` | True when the PR page came back full, or GitHub reports more open PRs than it sent. |
+| `data.pullRequests[]` | Per PR: number, title, base and head branch, head SHA, draft, labels, queue entry, auto-merge time, `allChecks` (with `forHead`) and `required`. |
+| `...mergeable`, `...mergeStateStatus`, `...mergeStateKnown` | GitHub's merge answers per PR, null while GitHub has not computed them. |
+| `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
+
+Five reading rules, each one a mistake the file is shaped to prevent:
+
+1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
+   said no PR is open.
+2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
+   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has several
+   causes, and `required.reason` always names the one that fired. A FAILURE can carry a reason too,
+   such as a STALE run that needs a re-run. Read the reason, not a list of causes. At the time of
+   writing they include a base other than `main`, a required list that is missing or empty, and a
+   truncated context page.
+3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
+   (`mergeStateKnown: false`). That is no state at all.
+4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
+5. When the top-level `requiredContexts` is null or empty, read `requiredContextsError`. The poll
+   itself can still succeed, with `error` null. No PR then reads `SUCCESS`, and its `required` is
+   judged only by runs GitHub flags as required.
+
+It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
+unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
+handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releases it when the
+process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
+means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
+cannot open or lock the file at all exits 4 and writes nothing, so a broken lock shows as an ageing
+`fetchedAt`, and in the log when the log can be written. If it cannot, the signals left include at
+least the exit code and that ageing `fetchedAt`. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+`mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
+
+```powershell
+python scripts\coord\pr_state.py          # one poll by hand; it obeys the real cache's back-off
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -WhatIf        # show the task, register nothing
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC>             # from a plain terminal
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC> -Uninstall
+```
+
+The task runs `pythonw.exe -I` on the primary checkout's copy, so no window opens. It runs as you, at
+run level Limited, because gh reads its token from your keyring. Every 2 minutes it runs whatever
+poller files the primary checkout holds, at least `pr_state.py`, `coord_root.py`, `_pr_checks.py` and
+`required_contexts.py`, with your token, whether or not any session is running. Nothing checks those
+files first. That
+is more exposure than the checkout's `.claude/settings.json` hooks, which run only when a session
+starts there. A change to any of those files in the primary checkout runs, unattended, within two
+minutes. The installer refuses inside Claude Code and on any machine
+other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
+[`tests/test_pr_state.py`](../tests/test_pr_state.py).
+
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 
 `prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and
@@ -820,6 +896,42 @@ started". Assert on the count of legs you *expect*, not on the absence of pendin
 
 Both are the same failure as taking `--ours` on a conflict: **the instrument was accurate about what it
 looked at and silent about what it did not.** `main` moved seven times during one pair of PRs.
+
+### Waiting for a PR in the background — `wait-pr.ps1`
+
+To carry a PR to completion without a hand-written poll loop, run
+[`wait-pr.ps1`](../scripts/coord/wait-pr.ps1) with `run_in_background` and let its exit wake you:
+
+```powershell
+pwsh -NoProfile -File scripts/coord/wait-pr.ps1 -Repo MEFORORG/MessageFoundry -Pr <N> -Until merged
+```
+
+Measured 2026-10-21 in a worktree-isolated subagent: the PowerShell tool ran this form in the
+foreground and returned the script's exit code, a `run_in_background` run's task notification
+reported its exit 1, and the Bash tool refused the form there. Exits 0, 2 and 3 in the background
+were not measured.
+
+`-Until` is `merged`, `closed` or `checks-complete`; the exit code tells met, timed out, needs a
+push and error apart. It prints one line per state change, and for `merged` and `closed` that line
+carries REST's lower-case `mergeable_state` (`behind`, `dirty`), not the upper-case GraphQL values
+in the table above. **With `-Until merged`, `dirty` is acted on:** a PR read `dirty` on repeated
+checks of one head and base ends the wait with its own exit code instead of running to the timeout,
+and the fix is a conflict to resolve by hand, not a mechanical rebase (see the table above).
+**`behind` is only printed and does not end the wait**, so a background wait on a PR that stays
+stale wakes you at its timeout, with the state in its output. Whether that PR then needs an update
+depends on whether its base requires the merge queue; the script's header says which case is which,
+and why. Nor is the failing arm an exit: a red required check reads `blocked` and still runs to the
+timeout. With `closed` the state is only printed, and the `checks-complete` line does not carry it.
+`checks-complete` waits for every context the base branch requires, not only the checks that already
+exist.
+
+Its interval floor, total ceiling, starting rate-budget floor and per-call timeout are not
+options: the two test seams that replace the sleep and the timeout are refused unless
+`MEFOR_WAIT_PR_TEST_SEAMS=1` is set, so never leave that variable set outside a test run. Every
+read is REST through `gh api`, never `gh pr`, so it also runs in a cloud session, and is conditional on the last ETag, so an unchanged answer does not count against the shared rate
+limit. The script's header is the one place that states the numbers, the exit codes, how many
+`dirty` reads end a wait, and why it does not trip
+[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1).
 
 ### Resolving a conflict: never take a side wholesale
 
@@ -987,13 +1099,19 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 You don't have to brief each new chat by hand. A `SessionStart` hook
 ([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
-into every new Claude Code window. It always prints the project's Ultracode working-default
-reminder, and **when 2+ worktrees
-share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
-full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
-working-default line.
+into every new Claude Code window. **When 2+ worktrees share this `.git`** it prints the
+parallel-session block. The block holds at least these: which worktree and branch this chat owns, the
+live peers, what they are building, the work claims, and the shared-memory write rule above. With a
+single worktree it prints at most a line about which worktree it read, such as a fault line.
 
-**Who is actually live — `presence.ps1`.** The worktree list above is the set of *checkouts*, not the
+The block is small on purpose. Past a size threshold, the harness saves a hook's output to a file. It
+then injects only a short preview of the head. This repository does not document that threshold. So
+the script sets its own byte budget, on its `$byteBudget` line. The high-signal sections print first.
+Each list stops at a cap and names the command that shows the rest. Past the budget, the script cuts
+the end of the lists and says so. On 2026-10-22, with 471 worktrees and 155 claims, the old banner
+printed every worktree and ran to 128,001 bytes. The peers and claims never reached the model.
+
+**Who is actually live — `presence.ps1`.** The worktree count is the set of *checkouts*, not the
 set of *sessions*: most worktrees usually have nobody in them, and the collision that matters — someone
 editing the shared primary right now — is invisible from it. The banner therefore also lists **live
 sessions**, from [../scripts/coord/presence.ps1](../scripts/coord/presence.ps1). Run it directly any time:
@@ -1331,7 +1449,20 @@ This doc previously asserted the opposite — that the call "fails silently, whi
 you" — which was an inference stated as a measurement, and it was teaching every session to expect a
 failure mode that does not occur. Getting the id wrong is *self-announcing*; you do not need to detect it.
 (Tested only with an id that matches no session. If a registry uuid ever collided with a live MCP id the
-behaviour would differ, but they are distinct by construction.)
+behaviour would differ, but they are distinct by construction.) Do not retry a not-found id against
+another peer: the id was wrong, and another peer's row will not make it right.
+
+**How the model reads the roster the hook prints.** Each peer row carries one verb. `MESSAGE` means send
+to it. `HOLD` means it is reachable but over this round's cap, and it is offered again later. `MAILED`
+means the hook already announced to it over the mail lane, so do nothing. `SKIP` means it can be neither
+messaged nor mailed now. A row's `claim:` line, where present, outranks the worktree name. The name is a
+creation-time label that nothing keeps current. One was measured describing work its session never did.
+A claim's bracketed age is the age of the note, not of the work, so an old note may describe a pull
+request that has since merged. After sending, the model appends one line per peer to
+`<state dir>/sent/<key>.tsv`, in the form
+`<iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED> TAB <sent | failed>`. Nothing else records what
+was delivered. A session that cannot use session messaging at all, such as a scheduled run, skips the
+whole instruction, and so does a trivial prompt.
 
 **What it asks the model to send.** A fixed `[SESSION-ANNOUNCE]` envelope, one line of intent, one line
 of expected footprint, no question. It arrives in the recipient as a **user turn**, so an announcement is
@@ -1360,7 +1491,7 @@ in the roster, meaning *already announced to, do nothing*. `mail.ps1` was built 
 cases and names them both in its own header; the two components shipped separately and the hook contained
 **zero** references to mail until 2026-09-14.
 
-Four properties of that lane, each of which cost a measurement:
+At least these properties of that lane cost a measurement or an audit:
 
 - **It runs before the `NO_PEERS` exit, and that order is the feature.** The new-peer set is computed from
   *messageable* peers alone, so a fleet in which every peer is cross-login would otherwise take that exit
@@ -1375,8 +1506,13 @@ Four properties of that lane, each of which cost a measurement:
   own prescribed text through the lane unmodified.
 - **The intent comes from the claim note, never from the user's prompt.** The hook *has* the prompt in its
   payload. Mailing it would copy arbitrary user text into a peer's transcript that nothing here can
-  delete, which `mail.ps1`'s body rule forbids outright. No claim note is reported as *not declared*
-  rather than filled in from the worktree name.
+  delete, which `mail.ps1`'s body rule forbids outright. With no claim note, the hook uses the goal this
+  session gave `seat.ps1 -Declare`, read from its own seat record for this worktree.
+- **No declared intent, no mail.** With no claim note and no seat goal, the hook sends nothing. The peers
+  stay unmailed, so a later prompt offers them again. A receipt written on that prompt carries the note
+  `mail held: no claim note or seat goal yet`. It used to mail an `intent: NOT DECLARED` body. An audit
+  of 196 mailed messages found 62 of those, each carrying nothing but a worktree name. A closed seat's
+  goal does not count, and a body built from a seat goal labels its age `seat declared`.
 
 **Three bounds, and the clock is the one that matters.** This is `UserPromptSubmit`, whose timeout is 15 s
 and whose failure mode is a **blocked user prompt** rather than degraded coordination. One send costs

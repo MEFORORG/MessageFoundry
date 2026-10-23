@@ -885,6 +885,7 @@ def _checks() -> list[tuple[str, object, object]]:
     from messagefoundry.transports import bounded_read, database, dicom, http_listener, mllp
     from messagefoundry.transports import file as file_transport
     from messagefoundry.transports.base import DEFAULT_MAX_ITEMS_PER_POLL
+    from messagefoundry.verify import cipher_policy
 
     s = ServiceSettings()
     mib = 1024 * 1024
@@ -1024,6 +1025,7 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.5 OIDC pending-flow TTL = 300 s", s.auth.oidc_flow_ttl_seconds, 300),
         ("15.1.5 OIDC pending-flow cap = 512 (reject-when-full)", s.auth.oidc_flow_cache_max, 512),
         ("15.1.5 DR hook timeout = 30.0 s", s.dr.takeover_timeout_seconds, 30.0),
+        ("15.1.5 cipher-policy probe timeout = 30.0 s", cipher_policy._PROBE_TIMEOUT_S, 30.0),
         ("15.1.5 web console served by default", s.api.serve_ui, True),
         (
             # The MODEL default. It was OFF with a serve-side flip (BACKLOG #1935's 2026-09-24
@@ -1324,7 +1326,7 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
     "verify/cipher_policy.py": (
         "verify's host cipher policy read (BACKLOG #3277): Get-TlsCipherSuite through the System32 "
-        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, 30 s bound"
+        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, bounded by _PROBE_TIMEOUT_S"
     ),
 }
 
@@ -1616,6 +1618,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
     from messagefoundry.auth.oidc import jwks
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.pipeline import sandbox
+    from messagefoundry.verify import cipher_policy
 
     s = ServiceSettings()
     mib = 1024 * 1024
@@ -1652,6 +1655,14 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
             "`[auth].oidc_flow_ttl_seconds` **300 s**",
         ),
         ("**Operator-configured SHELL execution**", s.dr.takeover_timeout_seconds, "30.0 s"),
+        # The full phrase, rendered from the constant: the check is a substring match within the
+        # row, which carries other bounds, and a bare "30 s" is also inside "130 s" or "330 s"
+        # (vault BACKLOG #3804 item 5).
+        (
+            "**Other subprocess invocations**",
+            cipher_policy._PROBE_TIMEOUT_S,
+            f"each cipher-policy probe {cipher_policy._PROBE_TIMEOUT_S:g} s",
+        ),
         ("**HTTP uploads**", s.store.max_upload_bytes // mib, "25 MiB"),
     ]
 
