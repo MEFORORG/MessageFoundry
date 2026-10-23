@@ -269,6 +269,20 @@ def test_show_prints_a_found_record_unchanged_and_names_a_missing_or_unreadable_
     assert "no lane record at" in str(_show(repo)["absent"])
 
 
+def test_a_write_over_an_unreadable_record_is_refused_and_leaves_it(repo: Path) -> None:
+    """The host refusal needs the record read. A record that exists but does not parse used to read
+    as no record, so the write skipped that refusal and replaced it. It now fails closed."""
+    assert _pwsh(repo, "-Free", "2", "-InFlight", "1").returncode == 0
+    record = _lane_record(repo)
+    record.write_bytes(b"{not json")
+    proc = _pwsh(repo, "-Free", "3", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "could not be read" in proc.stderr, proc.stderr
+    assert record.read_bytes() == b"{not json", "an unreadable lane record was overwritten"
+    # -Show only reads, so it still answers, with the reason.
+    assert "could not be read" in str(_show(repo)["absent"])
+
+
 _BLANK_KEYS = {
     "v", "boxKey", "worktree", "capacity", "statedFree", "statedInFlight", "statedUtc",
     "statedBySessionId", "statedNote", "tipAtStated", "claimHashAtStated", "turnsSinceStated",

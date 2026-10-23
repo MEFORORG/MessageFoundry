@@ -104,8 +104,17 @@ $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
 $rec = $null
+$recFault = $null
 if (Test-Path -LiteralPath $file) {
-    try { $rec = Read-CoordText $file | ConvertFrom-Json } catch { $rec = $null }
+    try { $rec = Read-CoordText $file | ConvertFrom-Json }
+    catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { $rec = $null }
+    catch { $recFault = $_.Exception.Message }
+}
+# FAIL CLOSED. The host refusal below needs the record read, so a record that exists but cannot be
+# read or parsed must not be taken as no record and replaced. -Show reads it again on its own.
+if (-not $Show -and $recFault) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- the lane record at $file exists but could not be read ($recFault). Nothing was written. Read it with -Show; if it is damaged rather than busy, move it out of $lanesDir by hand and state this lane's level again.")
+    exit 2
 }
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
 # path writes its own file, not this one. A record under the old path-only key is not
@@ -225,7 +234,7 @@ $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json'
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline
 # One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
 # which deletes first, so the lane hook could read the level as missing.
-Move-CoordFileReplace -Source $tmp -Destination $file
+Move-CoordFileReplace -Source $tmp -Destination $file -ReplaceReadOnly
 
 if ($Asked) {
     Write-Host "lane: recorded that a dispatcher asked. No number written."

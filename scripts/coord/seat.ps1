@@ -671,7 +671,7 @@ function Write-RecordAtomic {
     Set-Content -LiteralPath $tmp -Value $json -Encoding utf8 -EA Stop
     # One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
     # which deletes first, so a reader could find the record missing.
-    try { Move-CoordFileReplace -Source $tmp -Destination $Path }
+    try { Move-CoordFileReplace -Source $tmp -Destination $Path -ReplaceReadOnly }
     catch { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue; throw }
 }
 

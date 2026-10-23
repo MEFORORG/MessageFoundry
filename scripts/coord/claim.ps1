@@ -1015,8 +1015,17 @@ try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
     # sibling session got here first, and that throw IS the mutual exclusion.
     $fs = [System.IO.File]::Open($file, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-} catch [System.IO.IOException] {
-    $info = Get-Mine $file
+} catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+    # Access denied is the same contention on an SMB share: a claim file that is delete-pending, mid
+    # -Release or mid-replace, refuses CreateNew that way rather than as "already exists". It is
+    # never success, and the read below can fail on that same name, so a failed read refuses too.
+    try { $info = Get-Mine $file } catch {
+        Write-Host ""
+        Write-Host "BLOCKED: '$Take' could not be taken -- its claim file could not be created or read." -ForegroundColor Red
+        Write-Host "  reason: $($_.Exception.Message)"
+        Write-Host "  Another session may be releasing or replacing it. Nothing was written. Retry in a moment."
+        exit 1
+    }
     if ($info.IsMine) {
         # Re-taking your own claim is not an error: a session should be able to re-assert freely. It was
         # also, until now, not a REFRESH -- despite the -Take parameter documenting one. A new -Note was
@@ -1078,11 +1087,14 @@ try {
             # backoff on a sharing violation or access denied, which an SMB share also raises.
             try { Move-CoordFileReplace -Source $tmp -Destination $file }
             catch {
+                $why = $_.Exception.Message
                 # Never orphan the temp: this directory is the claim registry, and a k.json.<pid>.tmp
                 # nothing ever removes accumulates in it for the life of the repo.
                 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
                 Write-Host ""
-                Write-Host "Could NOT refresh the note on '$Take' -- the file was locked by another process." -ForegroundColor Yellow
+                # Usually locked by another process; a read-only claim file is refused too, never replaced.
+                Write-Host "Could NOT refresh the note on '$Take' -- the file was locked by another process, or is read-only." -ForegroundColor Yellow
+                Write-Host "  reason: $why"
                 Write-Host "  Your claim is UNCHANGED and still yours; only the note was not updated."
                 Write-Host "  Retry in a moment. Do NOT -Release: that would drop a claim you still hold."
                 exit 1
