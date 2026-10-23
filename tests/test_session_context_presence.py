@@ -111,6 +111,53 @@ def test_banner_survives_a_missing_presence_script(staged: Path) -> None:
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
     assert "LIVE sessions" not in proc.stdout  # degraded, not crashed
+    # Degraded aloud: a missing roster must not read as "nobody else is live".
+    assert re.search(
+        r"Live sessions: NOT READ \([^\n]*presence\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
+
+
+def test_a_missing_presence_script_does_not_hide_the_in_flight_list(staged: Path) -> None:
+    """The in-flight list used to sit inside the presence branch, so a missing presence.ps1 hid it."""
+    (staged / "scripts" / "coord" / "overlap.ps1").write_text(
+        "Write-Output '"
+        + json.dumps(
+            [{"Short": "b0000000", "Branch": "peer", "Live": True, "Work": ["task"], "Files": []}]
+        )
+        + "'\n",
+        encoding="utf-8",
+    )
+    proc = run_context(staged)
+    assert "Live sessions: NOT READ (" in proc.stdout, proc.stdout
+    assert "WHAT THEY ARE BUILDING" in proc.stdout and "session b0000000" in proc.stdout, (
+        proc.stdout
+    )
+
+
+def test_a_checkout_path_with_brackets_still_finds_its_roster_scripts(tmp_path: Path) -> None:
+    """Test-Path without -LiteralPath reads `[x]` as a wildcard class, so a present presence.ps1 or
+    overlap.ps1 under such a path read as missing, a false NOT READ."""
+    base = Path(os.path.realpath(tmp_path)) / "co[x]de"
+    base.mkdir()
+    repo = _make_staged(base)
+    fake_presence(repo, _peer_rows(1))
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text("Write-Output '[]'\n", encoding="utf-8")
+    proc = run_context(repo)
+    assert proc.returncode == 0, proc.stderr
+    # The positive control: the banner ran, under the bracketed path.
+    assert "co[x]de" in proc.stdout, proc.stdout
+    assert "LIVE sessions in this repo right now (1 besides you)" in proc.stdout, proc.stdout
+    assert "Live sessions: NOT READ" not in proc.stdout, proc.stdout
+    assert "In-flight work: NOT READ" not in proc.stdout, proc.stdout
+
+
+def test_a_missing_overlap_script_is_said_aloud(staged: Path) -> None:
+    fake_presence(staged, [])
+    assert not (staged / "scripts" / "coord" / "overlap.ps1").exists()
+    proc = run_context(staged)
+    assert re.search(
+        r"In-flight work: NOT READ \([^\n]*overlap\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
 
 
 def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
@@ -357,6 +404,20 @@ def test_a_cwd_that_does_not_exist_is_said_aloud(
     assert f"This chat's worktree: {_top(repo)}" in out, (
         "the fallback is the old behaviour, said aloud"
     )
+
+
+def test_a_long_missing_cwd_keeps_the_reason_whole(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The reason puts its diagnosis after the path ("... names cwd <path>, which does not exist").
+    Clipping the whole sentence cut the diagnosis off a long path; only the path may be clipped,
+    and it keeps its tail. The path is never created, so its length needs no long-path support."""
+    repo, _ = primary_and_worktree
+    gone = Path(os.path.realpath(tmp_path)) / ("q" * 200) / "deleted-worktree"
+    out = run_in_primary(repo, {"hook_event_name": "SessionStart", "cwd": str(gone)})
+    fault = next(ln for ln in out.splitlines() if "COULD NOT READ THIS SESSION'S WORKTREE" in ln)
+    assert "deleted-worktree, which does not exist" in fault, fault
+    assert "where this hook runs, which may not be your worktree." in fault, fault
 
 
 def test_a_missing_input_reader_is_said_aloud(primary_and_worktree: tuple[Path, Path]) -> None:
@@ -768,3 +829,23 @@ def test_the_backstop_never_cuts_a_claims_registry_that_did_not_resolve(tmp_path
     )
     assert "Active work claims: NOT READ" in out, out
     assert _size(out, repo) <= 2000, out
+
+
+@pytest.mark.parametrize(
+    ("script", "line"),
+    [("presence.ps1", "Live sessions: NOT READ ("), ("overlap.ps1", "In-flight work: NOT READ (")],
+)
+def test_the_backstop_never_cuts_a_roster_that_did_not_read(
+    tmp_path: Path, script: str, line: str
+) -> None:
+    """A roster that threw is a hazard line too: the cut must leave it in place."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    (repo / "scripts" / "coord" / script).write_text("throw 'roster exploded'\n", encoding="utf-8")
+    _shrink_budget(repo, 1700)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert line + "roster exploded)" in out, out
+    assert _size(out, repo) <= 1700, out

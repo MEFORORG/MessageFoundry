@@ -40,7 +40,9 @@ $tail = @()
 # Lines the byte backstop never cuts: each says a view below is incomplete or unsafe, or names this
 # session, so dropping one would hide the very hazard the banner exists to report. Add-Hazard appends
 # to $lines and records the index; the backstop skips every recorded index. Callers clip each line's
-# variable part with Format-Field, since a protected line that grows has nothing to cut it.
+# variable part with Format-Reason or Format-Field, since a protected line that grows has nothing to
+# cut it. One exception: the header prints this worktree's path in full, because it is the session's
+# identity, and the budget already counts that path at a fixed $pathReserve.
 $hazard = @()
 function Add-Hazard([string[]]$Text) {
     foreach ($t in $Text) { $script:lines += $t; $script:hazard += ($script:lines.Count - 1) }
@@ -73,6 +75,24 @@ function Format-Field($Value, [int]$Width) {
     return $s.Substring(0, $cut) + '...'
 }
 
+# A sentence for a protected line: a reason, a note or an error message. Its words stay whole,
+# because the diagnosis is often at the end ("... names cwd <path>, which does not exist"). Only an
+# overlong single token, in practice a path or a pasted value, is clipped, and it keeps its TAIL,
+# which is the part that names it ("...\worktrees\foo"). Folded like Format-Field.
+function Format-Reason($Value, [int]$TokenWidth = 100) {
+    $s = ("$Value" -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]', ' ').Trim()
+    $words = foreach ($w in ($s -split ' ')) {
+        if ($w.Length -le $TokenWidth) { $w; continue }
+        $start = $w.Length - ($TokenWidth - 3)
+        if ([char]::IsLowSurrogate($w[$start])) { $start++ }
+        '...' + $w.Substring($start)
+    }
+    $r = $words -join ' '
+    # Many short words can still run long, so past 400 the middle goes and both ends stay. That cut
+    if ($r.Length -gt 400) { $r = $r.Substring(0, 200) + ' ... ' + $r.Substring($r.Length - 195) }
+    return $r
+}
+
 # Into the session's own directory BEFORE any git call. Under SilentlyContinue a dot-source of a
 # missing file does not throw, so the helper is tested for first and its absence is said aloud.
 $cwdFault = ''
@@ -82,10 +102,10 @@ try {
     . $hookInput
     $session = Enter-CcxHookSession -Text (Read-CcxHookInput)
     $cwdFault = $session.Reason
-    if ($session.Note) { Add-Hazard "[session-context] $(Format-Field $session.Note 200)." }
+    if ($session.Note) { Add-Hazard "[session-context] $(Format-Reason $session.Note)." }
 } catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
 if ($cwdFault) {
-    Add-Hazard "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $(Format-Field $cwdFault 200). Everything below describes $(Format-Field (Get-Location).Path 200), where this hook runs, which may not be your worktree."
+    Add-Hazard "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $(Format-Reason $cwdFault). Everything below describes $(Format-Reason (Get-Location).Path), where this hook runs, which may not be your worktree."
 }
 
 # Add parallel-session coordination only when 2+ worktrees share this .git (real collision risk).
@@ -107,7 +127,7 @@ if ($root) {
         }
 
         $lines += ""
-        Add-Hazard "[PARALLEL SESSION ($($wt.Count) worktrees active)]", "This chat's worktree: $root  (branch: $branch)"
+        Add-Hazard "[PARALLEL SESSION ($($wt.Count) worktrees active)]", "This chat's worktree: $root  (branch: $(Format-Field $branch 80))"
 
         if ($null -eq $isPrimary) {
             $lines += ""
@@ -139,14 +159,14 @@ if ($root) {
         # roster that spans surfaces: the Desktop app's own session tooling never registers a session it
         # did not spawn, so a VS Code session working in this repo does not appear in it at all.
         $presence = Join-Path $PSScriptRoot "..\coord\presence.ps1"
-        if (Test-Path $presence) {
+        if (Test-Path -LiteralPath $presence -PathType Leaf) {
             $peers = @()
             # A SessionStart hook must never fail loudly: whatever this prints IS the chat's starting
             # context, so a throw here would replace the coordination banner with a stack trace.
             # A roster that threw must not read as "nobody else is live", so it says so, protected.
             try { $peers = @(& $presence -Json | ConvertFrom-Json) } catch {
                 $peers = @()
-                Add-Hazard "", "Live sessions: NOT READ ($(Format-Field $_.Exception.Message 120)). Run: scripts\coord\presence.ps1 -All"
+                Add-Hazard "", "Live sessions: NOT READ ($(Format-Reason $_.Exception.Message)). Run: scripts\coord\presence.ps1 -All"
             }
 
             $others = @($peers | Where-Object { -not $_.IsSelf })
@@ -190,6 +210,13 @@ if ($root) {
                     $lines += "  Full roster:  $roster"
                 }
             }
+        } else {
+            # A missing roster must not read as "nobody else is live", so it says so, protected. The
+            # in-flight list below no longer hangs off this branch, so it still runs.
+            Add-Hazard "", "Live sessions: NOT READ ($(Format-Reason $presence) is missing)."
+        }
+
+        # The in-flight list stands on its own: neither a missing nor a failing presence.ps1 hides it.
 
             # WHAT they are building, not just where they are. The roster above prevents you editing
             # the same FILE; this is the only thing that prevents you building the same THING. That is
@@ -197,13 +224,13 @@ if ($root) {
             # fixing one npm advisory, in DIFFERENT files, so nothing file-shaped could have caught it.
             # Sourced from each session's own task list, so no one has to declare anything.
             $overlap = Join-Path $PSScriptRoot "..\coord\overlap.ps1"
-            if (Test-Path $overlap) {
+            if (Test-Path -LiteralPath $overlap -PathType Leaf) {
                 $inflight = @()
                 # Work that threw must not read as "nobody is building anything", so it says so,
                 # protected. It goes with the other in-flight lines, after the claims.
                 try { $inflight = @(& $overlap -Json | ConvertFrom-Json) } catch {
                     $inflight = @()
-                    $overlapFault = "In-flight work: NOT READ ($(Format-Field $_.Exception.Message 120)). Run: scripts\coord\overlap.ps1"
+                    $overlapFault = "In-flight work: NOT READ ($(Format-Reason $_.Exception.Message)). Run: scripts\coord\overlap.ps1"
                 }
                 # @($null).Count is 1, so a null Work or Files is filtered out before it is counted.
                 $busy = @($inflight | Where-Object { $_.Live -and (@($_.Work | Where-Object { $_ }).Count -gt 0 -or @($_.Files | Where-Object { $_ }).Count -gt 0) })
@@ -225,8 +252,9 @@ if ($root) {
                     if ($busy.Count -gt $busyCap) { $busyLines += "  +$($busy.Count - $busyCap) more" }
                     $busyLines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
                 }
+            } else {
+                $overlapFault = "In-flight work: NOT READ ($(Format-Reason $overlap) is missing). Run: git status in each peer worktree"
             }
-        }
 
         # BACKLOG #309: what the OTHER sessions are building, before you start building it too. The commit-msg
         # claim gate only enforces NUMBERED items; this banner is the whole mechanism for ad-hoc work -- and
@@ -250,7 +278,7 @@ if ($root) {
         }
         if ($claimFault) {
             $lines += ""
-            Add-Hazard "Active work claims: NOT READ -- the claim registry did not resolve ($(Format-Field $claimFault 160))."
+            Add-Hazard "Active work claims: NOT READ -- the claim registry did not resolve ($(Format-Reason $claimFault))."
         }
         $claimFiles = @(if ($claimDir) { Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name })
         if ($claimFiles.Count -gt 0) {
@@ -287,7 +315,7 @@ if ($root) {
             $recent = @($rows | Where-Object { $_.Age -lt $staleHours }).Count
             $lines += ""
             $lines += "Active work claims ($($rows.Count), $recent touched in the last ${staleHours}h; all: scripts\coord\claim.ps1 -List) -- do NOT start one another session holds:"
-            if ($unreadable -gt 0) { Add-Hazard "  WARNING: $unreadable claim file(s) in $(Format-Field $claimDir 120) could not be read, so they are not listed." }
+            if ($unreadable -gt 0) { Add-Hazard "  WARNING: $unreadable claim file(s) in $(Format-Reason $claimDir) could not be read, so they are not listed." }
             $mineRows = @($rows | Where-Object { $_.Mine })
             if ($mineRows.Count -gt 0) {
                 Add-Hazard "  THIS session holds $($mineRows.Count): $(Format-Field (($mineRows | ForEach-Object Key) -join ', ') 160)"
