@@ -36,6 +36,14 @@ $lines = @()
 $busyLines = @()
 $tail = @()
 
+# Lines the byte backstop never cuts: each says a view below is incomplete or unsafe, or names this
+# session, so dropping one would hide the very hazard the banner exists to report. Add-Hazard appends
+# to $lines and records the index; the backstop skips every recorded index.
+$hazard = @()
+function Add-Hazard([string[]]$Text) {
+    foreach ($t in $Text) { $script:lines += $t; $script:hazard += ($script:lines.Count - 1) }
+}
+
 # A claim stamp as UTC, or $null. ConvertFrom-Json has usually coerced the ISO string to a [datetime]
 # already, and re-parsing that through a string reads it in the current culture, which swaps day and
 # month on an en-GB box. So a [datetime] is used as it is, and only a real string is parsed.
@@ -72,10 +80,10 @@ try {
     . $hookInput
     $session = Enter-CcxHookSession -Text (Read-CcxHookInput)
     $cwdFault = $session.Reason
-    if ($session.Note) { $lines += "[session-context] $($session.Note)." }
+    if ($session.Note) { Add-Hazard "[session-context] $($session.Note)." }
 } catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
 if ($cwdFault) {
-    $lines += "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
+    Add-Hazard "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
 }
 
 # Add parallel-session coordination only when 2+ worktrees share this .git (real collision risk).
@@ -97,22 +105,21 @@ if ($root) {
         }
 
         $lines += ""
-        $lines += "[PARALLEL SESSION ($($wt.Count) worktrees active)]"
-        $lines += "This chat's worktree: $root  (branch: $branch)"
+        Add-Hazard "[PARALLEL SESSION ($($wt.Count) worktrees active)]", "This chat's worktree: $root  (branch: $branch)"
 
         if ($null -eq $isPrimary) {
             $lines += ""
-            $lines += "  >>> git did not say whether this is the SHARED PRIMARY checkout or your own worktree."
-            $lines += "  >>> If it is the primary, create and work in your OWN worktree before substantive edits."
+            Add-Hazard "  >>> git did not say whether this is the SHARED PRIMARY checkout or your own worktree.",
+                "  >>> If it is the primary, create and work in your OWN worktree before substantive edits."
         }
 
         # Loudest, first: if this session sits in the SHARED trunk, tell it to branch into its own worktree.
         if ($isPrimary) {
             $lines += ""
-            $lines += "  >>> You are in the SHARED PRIMARY checkout, where parallel sessions collide."
-            $lines += "  >>> Before any substantive edits, create and work in your OWN worktree:"
-            $lines += "  >>>     scripts\worktree\new.ps1 -Name <short-task-name>"
-            $lines += "  >>> (A trivial one-off read/edit here is fine; anything you'll iterate on gets a worktree.)"
+            Add-Hazard "  >>> You are in the SHARED PRIMARY checkout, where parallel sessions collide.",
+                "  >>> Before any substantive edits, create and work in your OWN worktree:",
+                "  >>>     scripts\worktree\new.ps1 -Name <short-task-name>",
+                "  >>> (A trivial one-off read/edit here is fine; anything you'll iterate on gets a worktree.)"
         }
 
         # HIGH SIGNAL FIRST, AND EVERY LIST CAPPED, so the banner reaches the model whole rather than
@@ -153,12 +160,12 @@ if ($root) {
                 # them last.
                 # The surfaces differ in what can reach them, and that changes how you coordinate.
                 if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
-                    $lines += "  NOTE: a non-desktop (e.g. VS Code) session is live. It cannot be reached by"
-                    $lines += "        session messaging -- coordinate through a claim or the PR, not a message."
+                    Add-Hazard "  NOTE: a non-desktop (e.g. VS Code) session is live. It cannot be reached by",
+                        "        session messaging -- coordinate through a claim or the PR, not a message."
                 }
                 if (@($others | Where-Object { $_.IsPrimary }).Count -gt 0) {
-                    $lines += "  WARNING: a session is working in the SHARED PRIMARY checkout. Anything you do"
-                    $lines += "           there can collide with it -- stay in this worktree."
+                    Add-Hazard "  WARNING: a session is working in the SHARED PRIMARY checkout. Anything you do",
+                        "           there can collide with it -- stay in this worktree."
                 }
                 # The peers the notes name come first, so the cap never hides the one they mean.
                 # The index keeps presence.ps1's own order within each group. It is a sort key, not
@@ -233,7 +240,7 @@ if ($root) {
         }
         if ($claimFault) {
             $lines += ""
-            $lines += "Active work claims: NOT READ -- the claim registry did not resolve ($claimFault)."
+            Add-Hazard "Active work claims: NOT READ -- the claim registry did not resolve ($claimFault)."
         }
         $claimFiles = @(if ($claimDir) { Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name })
         if ($claimFiles.Count -gt 0) {
@@ -270,7 +277,7 @@ if ($root) {
             $recent = @($rows | Where-Object { $_.Age -lt $staleHours }).Count
             $lines += ""
             $lines += "Active work claims ($($rows.Count), $recent touched in the last ${staleHours}h; all: scripts\coord\claim.ps1 -List) -- do NOT start one another session holds:"
-            if ($unreadable -gt 0) { $lines += "  WARNING: $unreadable claim file(s) in $claimDir could not be read, so they are not listed." }
+            if ($unreadable -gt 0) { Add-Hazard "  WARNING: $unreadable claim file(s) in $claimDir could not be read, so they are not listed." }
             $mineRows = @($rows | Where-Object { $_.Mine })
             if ($mineRows.Count -gt 0) {
                 $lines += "  THIS session holds $($mineRows.Count): $(Format-Field (($mineRows | ForEach-Object Key) -join ', ') 160)"
@@ -327,8 +334,8 @@ if ($root) {
 
 # Two bounds behind the row caps, because row counts alone do not bound bytes. Format-Field clips
 # each field a peer's record supplies, so a long path, branch or task line cannot grow a row. And past
-# the budget the end of the lists goes, with one line saying so; the lists run in priority order,
-# hazards first, and the short fixed sections in $tail always print.
+# the budget the end of the lists goes, with one line naming the sections cut; the lists run in
+# priority order, and the hazard lines (Add-Hazard) and the short fixed sections in $tail always print.
 #
 # WHICH LINES SURVIVE MUST NOT DEPEND ON WHERE THE REPO LIVES. Measured 2026-10-22: counting the path
 # as it is, a CI runner's longer temp path cut two list lines that a desktop kept. So the count reads
@@ -353,17 +360,28 @@ $measure = {
     [Text.Encoding]::UTF8.GetByteCount($t)
 }
 if ((& $measure ($lines + $tail)) -gt $byteBudget) {
-    $closing = "[session-context] cut the last {0} list line(s) to fit the budget. Run: scripts\coord\presence.ps1 -All, scripts\coord\claim.ps1 -List, scripts\coord\overlap.ps1"
-    # Room for the fixed sections and the closing line, so the cut banner still ends under the budget.
-    $room = $byteBudget - (& $measure $tail) - $closing.Length - 8
-    $kept = @()
+    # Cut from the end, skipping every line Add-Hazard recorded, until the rest fits beside $tail and
+    # the closing line. The closing line names each section it cut from, so a reader knows which view
+    # is short. 260 bytes is room for that line at its longest: three section names and the commands.
+    $room = $byteBudget - (& $measure $tail) - 260
+    $section = 'header'
+    $sectionOf = @(foreach ($l in $lines) {
+        if ($l -like 'LIVE sessions*') { $section = 'live peers' }
+        elseif ($l -like 'Active work claims*') { $section = 'work claims' }
+        elseif ($l -like 'WHAT THEY ARE BUILDING*') { $section = 'what they are building' }
+        $section
+    })
+    $drop = New-Object bool[] $lines.Count
     $used = 0
-    foreach ($l in $lines) {
-        $n = (& $measure @($l)) + 1
-        if ($used + $n -gt $room) { break }
-        $kept += $l
-        $used += $n
+    for ($i = 0; $i -lt $lines.Count; $i++) { $used += (& $measure @($lines[$i])) + 1 }
+    for ($i = $lines.Count - 1; $i -ge 0 -and $used -gt $room; $i--) {
+        if ($hazard -contains $i) { continue }
+        $drop[$i] = $true
+        $used -= (& $measure @($lines[$i])) + 1
     }
-    $lines = $kept + ($closing -f ($lines.Count - $kept.Count))
+    $cut = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($drop[$i] -and $lines[$i]) { $i } })
+    $kept = @(for ($i = 0; $i -lt $lines.Count; $i++) { if (-not $drop[$i]) { $lines[$i] } })
+    $cutSections = @($cut | ForEach-Object { $sectionOf[$_] } | Select-Object -Unique) -join ', '
+    $lines = $kept + "[session-context] cut $($cut.Count) line(s) from: $cutSections, to fit the budget. Run: scripts\coord\presence.ps1 -All, scripts\coord\claim.ps1 -List, scripts\coord\overlap.ps1"
 }
 (($lines + $tail) -join "`n") | Write-Output

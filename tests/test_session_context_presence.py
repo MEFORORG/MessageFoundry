@@ -552,7 +552,7 @@ def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
     assert "Active work claims (60, 40 touched in the last 12h;" in out, out
     assert "+54 more, by key: fresh06, fresh07" in out and "claim.ps1 -List" in out, out
     # The row caps alone fit, so every section, the rules last, reaches the model.
-    assert "cut the last" not in out, out
+    assert "[session-context] cut " not in out, out
     assert "Coordination rules for parallel sessions" in out, out
 
     assert size <= BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
@@ -673,7 +673,7 @@ def test_which_lines_print_does_not_depend_on_where_the_repo_lives(
         # Each fixture repo has its own commit, so its SHA differs too; same length either way.
         outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, r)))
     assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
-    assert "cut the last" not in outs[1], outs[1]
+    assert "[session-context] cut " not in outs[1], outs[1]
 
 
 def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
@@ -692,7 +692,7 @@ def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path)
         script.write_text(small, encoding="utf-8")
         out = _banner(repo, env)
         assert "LIVE sessions in this repo right now (30 besides you)" in out, out
-        assert "list line(s) to fit the budget" in out and "claim.ps1 -List" in out, out
+        assert "line(s) from: " in out and "claim.ps1 -List" in out, out
         assert "Coordination rules for parallel sessions" in out, out
         assert "this session owns it" in out, out
         # The fixed sections print whole, this worktree's row among them.
@@ -700,3 +700,46 @@ def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path)
         assert _size(out, repo) <= 1500, out
         outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, repo)))
     assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
+
+
+def _shrink_budget(repo: Path, budget: int) -> None:
+    """Write a smaller budget into the fixture's copy of the script, so the backstop must cut."""
+    script = repo / "scripts" / "worktree" / "session-context.ps1"
+    text = script.read_text(encoding="utf-8")
+    small = text.replace(f"$byteBudget = {BYTE_BUDGET}", f"$byteBudget = {budget}")
+    assert small != text, "the budget line was not found to shrink"
+    script.write_text(small, encoding="utf-8")
+
+
+def test_the_backstop_never_cuts_an_unreadable_claims_warning(tmp_path: Path) -> None:
+    """The Lander's blocker: the claims section prints after the peer rows, so a cut from the end
+    dropped the WARNING that the claims view is incomplete. It must survive, and the cut line must
+    name the section it cut from."""
+    base = Path(os.path.realpath(tmp_path))
+    claims = _many_claims()
+    claims["broken"] = "{ not json"
+    repo, env = _crowd(base, _peer_rows(12), claims)
+    _shrink_budget(repo, 2000)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert "WARNING: 1 claim file(s)" in out, out
+    cut = next(ln for ln in out.splitlines() if ln.startswith("[session-context] cut "))
+    assert "work claims" in cut, cut
+    assert _size(out, repo) <= 2000, out
+
+
+def test_the_backstop_never_cuts_a_claims_registry_that_did_not_resolve(tmp_path: Path) -> None:
+    """The other claims-registry hazard: with no resolver, the banner says the claims were NOT READ,
+    and that line must survive a cut too."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    (repo / "scripts" / "coord" / "coord-root.ps1").unlink()
+    _shrink_budget(repo, 2000)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert "Active work claims: NOT READ" in out, out
+    assert _size(out, repo) <= 2000, out
