@@ -118,6 +118,13 @@ _CASES = [
     # row nobody believes gets deleted the first time it is inconvenient.
     (["uv.lock"], False, "sibling locks are unlisted: constraints.lock is what the test READS"),
     (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
+    # The CI Python pin. A patch bump edits that one file, and the test that reads it is a manifest
+    # entry, so without this arm the bump PR would meet that test on no leg.
+    (
+        ["ci/python-version"],
+        True,
+        "a patch bump edits only the pin test_ci_tool_and_image_pins reads",
+    ),
     (
         ["messagefoundry/api/app.py", "docs/ARCHITECTURE.md"],
         True,
