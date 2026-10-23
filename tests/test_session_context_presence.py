@@ -121,6 +121,19 @@ def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
     assert "LIVE sessions" not in proc.stdout
+    # A roster that threw must not read as "nobody else is live".
+    assert "Live sessions: NOT READ (presence exploded)" in proc.stdout, proc.stdout
+
+
+def test_an_overlap_script_that_throws_is_said_aloud(staged: Path) -> None:
+    """Work that threw must not read as "nobody is building anything"."""
+    fake_presence(staged, [])
+    (staged / "scripts" / "coord" / "overlap.ps1").write_text(
+        "throw 'overlap exploded'\n", encoding="utf-8"
+    )
+    proc = run_context(staged)
+    assert proc.returncode == 0
+    assert "In-flight work: NOT READ (overlap exploded)" in proc.stdout, proc.stdout
 
 
 def test_banner_survives_presence_emitting_junk(staged: Path) -> None:
@@ -728,6 +741,18 @@ def test_the_backstop_never_cuts_an_unreadable_claims_warning(tmp_path: Path) ->
     cut = next(ln for ln in out.splitlines() if ln.startswith("[session-context] cut "))
     assert "work claims" in cut, cut
     assert _size(out, repo) <= 2000, out
+
+
+def test_a_long_resolver_error_is_clipped_in_its_protected_line(tmp_path: Path) -> None:
+    """A protected line has nothing to cut it, so its variable part is clipped. Measured in review:
+    a resolver error quoting a whole MEFOR_COORD_ROOT value took the banner to 4522 bytes."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    env = {**env, "MEFOR_COORD_ROOT": "not-an-absolute-root-" + "x" * 3000}
+    out = _banner(repo, env)
+    fault = next(ln for ln in out.splitlines() if ln.startswith("Active work claims: NOT READ"))
+    assert len(fault) <= 260, fault
+    assert _size(out, repo) <= BYTE_BUDGET, out
 
 
 def test_the_backstop_never_cuts_a_claims_registry_that_did_not_resolve(tmp_path: Path) -> None:
