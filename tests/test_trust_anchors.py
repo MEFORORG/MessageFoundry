@@ -2188,7 +2188,7 @@ def test_an_encrypted_pem_block_refuses_before_the_tls_load(
     monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
     with pytest.raises(TrustAnchorError) as err:
         ta.anchor_cadata(shape(), spec)
-    assert ta._ENCRYPTION_HEADER_SCOPE in str(err.value)
+    assert ta.ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 def test_an_encryption_header_outside_a_block_still_passes() -> None:
@@ -2248,7 +2248,7 @@ def test_the_vault_hop_states_the_same_scope() -> None:
         and any(isinstance(n, ast.Name) and n.id == "_ENCRYPTED_CA_TEXT" for n in stmt.targets)
         and isinstance(stmt.value, ast.Constant)
     ]
-    assert value == ta._ENCRYPTION_HEADER_SCOPE
+    assert value == ta.ENCRYPTION_HEADER_SCOPE
 
 
 def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
