@@ -187,10 +187,14 @@ export const isOurOrigin = (url: string): boolean => OUR_REMOTE.test(url)
 // clock or a copied file (pr_state.py, main), so the pane does too, measured from the poll that
 // wrote it.
 const MAX_BACKOFF_MS = 2 * 3600000
-// After a back-off the next poll is up to one 2-minute task interval away (plus START_SLACK), and
-// the pane sees it only at its own next read of the file, every 30 s. A further 30 s covers the
-// poll's own run time.
-const POLL_GRACE_MS = 2 * 60000 + 15000 + 30000 + 30000
+// The grace window after a back-off ends: the next scheduled run is up to one 2-minute task
+// interval away (START_SLACK only lets it start up to 15 s early, so it adds nothing), the poll can
+// take up to 8 gh calls at GH_TIMEOUT_SECONDS (30 s) each, and the pane sees the result only at its
+// next read of the file, every 30 s.
+const TASK_INTERVAL_MS = 2 * 60000
+const POLL_RUN_MAX_MS = 8 * 30000
+const PANE_READ_LAG_MS = 30000
+const POLL_GRACE_MS = TASK_INTERVAL_MS + POLL_RUN_MAX_MS + PANE_READ_LAG_MS
 // The poller writes every 2 minutes; a poll older than this means it has stopped.
 const PR_STALE_MS = 10 * 60000
 
@@ -209,8 +213,8 @@ export const isBackingOff = (prs: Pick<FleetPrs, 'nextPollNotBefore' | 'pollFetc
   return until !== null && now < until
 }
 
-// An old poll with no error is a stopped poller, except during a back-off and the one scheduled
-// interval after it, when the next poll is not yet due.
+// An old poll with no error is a stopped poller, except during a back-off and the grace window
+// after it, when the next poll may not have landed yet.
 export function looksStopped(prs: FleetPrs, now: number): boolean {
   if (prs.pollError !== null || pollAge(prs.pollFetchedAt, now) <= PR_STALE_MS) return false
   const until = backOffUntil(prs)

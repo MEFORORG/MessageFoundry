@@ -329,18 +329,18 @@ test('a fault is logged once, and again if it returns after a recovery', async (
   expect(logs.length).toBe(2)
 })
 
-test('the stopped-poller rule follows the poller: back-off, its 2 h cap, then one interval of grace', () => {
+test('the stopped-poller rule follows the poller: back-off, its 2 h cap, then a grace window', () => {
   const at = (iso: string) => Date.parse(iso)
   const cache = (nextPollNotBefore: string | null) =>
     parsePrState(JSON.stringify({ ...PR_STATE, fetchedAt: '2026-10-23T14:00:00Z', nextPollNotBefore }))
 
   // No back-off: an 86-minute-old poll is a stopped poller.
   expect(looksStopped(cache(null), at('2026-10-23T15:26:00Z'))).toBe(true)
-  // Inside a back-off, and in the scheduled interval right after it ends, it is not.
+  // Inside a back-off, and in the 6.5-minute grace window after it ends, it is not.
   expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:26:00Z'))).toBe(false)
-  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:43:00Z'))).toBe(false)
-  // Once that interval and the pane's own read lag have passed with no new poll, it is.
-  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:44:00Z'))).toBe(true)
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:46:29Z'))).toBe(false)
+  // From the end of the grace window with no new poll, it is.
+  expect(looksStopped(cache('2026-10-23T15:40:00Z'), at('2026-10-23T15:46:30Z'))).toBe(true)
   // A stamp the poller would ignore (over 2 h past the poll that wrote it) holds nothing back.
   expect(looksStopped(cache('2026-10-24T14:00:00Z'), at('2026-10-23T15:26:00Z'))).toBe(true)
 })

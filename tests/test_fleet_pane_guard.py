@@ -103,9 +103,11 @@ def test_no_module_reaches_a_model_agent_prompt_or_tool() -> None:
 def test_path_literals_use_forward_slashes() -> None:
     assert BACKSLASH_PATH.search("'C:\\Temp\\x'")
     assert not BACKSLASH_PATH.search(r"/^(?:ssh:\/\/git@github\.com\/)x$/")
+    sources = _sources()
+    assert len(sources) >= 2, f"scanned {[str(p) for p in sources]}"
     hits = [
         f"{p.relative_to(MOD)}:{n}"
-        for p in _sources()
+        for p in sources
         for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
         if BACKSLASH_PATH.search(line)
     ]
