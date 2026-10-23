@@ -1,9 +1,10 @@
 # Newest Python 3.14 patch canary -- ADVISORY, NEVER REQUIRED.
 #
-# Every other 3.14 setup step reads ONE exact patch from ci/python-version, so a new 3.14.x release
-# reaches CI only when someone bumps that file. That is deliberate: when every step asked for "3.14",
-# each runner used whichever patch its image had cached, and a patch that reached some runners before
-# others turned pull requests red at random (the fix landed in engine PR 2485). This workflow is the
+# Every 3.14 setup step except this one and freethread-smoke.yml's 3.14t reads ONE exact patch from
+# ci/python-version, so a new 3.14.x release reaches CI only when someone bumps that file. That is
+# deliberate: when those steps asked for "3.14", each runner used whichever patch its image had
+# cached, and a patch that reached some runners before others turned pull requests red at random
+# (decided on engine PR 2485). tests/test_ci_tool_and_image_pins.py holds the list. This workflow is the
 # other half of the pin. It runs the suite on the NEWEST 3.14.x the runners can provision, so the next
 # patch is measured before the bump rather than discovered by it.
 #
@@ -83,54 +84,62 @@ jobs:
           python-version: "3.14"
           check-latest: true
 
-      # What the canary measured, and how it compares to the pin every other 3.14 step reads. When
-      # check-latest cannot resolve the manifest, setup-python only logs it and falls back to the
-      # image's cached patch, so the newest stable 3.14 is read from the manifest here as well. A
-      # mismatch, or a manifest this step cannot read, fails the probe rather than reading as clean.
+      # What the canary measured, and how it compares to the pin. When check-latest cannot resolve
+      # the manifest, setup-python only logs it and falls back to the image's cached patch, so the
+      # newest stable 3.14 for THIS image is read from the manifest as well. The probe also checks
+      # that the pin itself has a build for this image, which the required legs need. A mismatch,
+      # a pin with no build, or a manifest this step cannot read fails the probe.
       - name: Record the interpreter and compare it to the pin and the manifest
         id: probe
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
           python - <<'PY'
-          import json, os, sys, urllib.request
+          import json, os, platform, sys, urllib.request
           from pathlib import Path
           MANIFEST = "https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json"
           def key(v):
               return tuple(int(part) for part in v.split("."))
           pin = Path("ci/python-version").read_text(encoding="utf-8").strip()
           have = sys.version.split()[0]
-          with urllib.request.urlopen(MANIFEST, timeout=60) as resp:
-              releases = json.load(resp)
-          platform = "win32" if sys.platform == "win32" else "linux"
-          newest = max(
-              (
-                  r["version"]
-                  for r in releases
-                  if r["stable"]
-                  and r["version"].startswith("3.14.")
-                  and any(f["platform"] == platform and f["arch"] == "x64" for f in r["files"])
-              ),
-              key=key,
-          )
           newer = key(have) > key(pin)
           print(f"sys.version = {sys.version}")
           print(f"pinned in ci/python-version = {pin}")
-          print(f"newest stable 3.14 in the manifest for {platform} = {newest}")
           print(f"provisioned = {have}, newer than the pin = {newer}")
+          # Written before the network read, so a manifest outage still leaves the pin comparison.
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"version={have}\n")
               out.write(f"pin={pin}\n")
-              out.write(f"newest={newest}\n")
               out.write(f"newer={newer}\n")
+          if sys.platform == "win32":
+              image = ("win32", None)
+          else:
+              image = ("linux", platform.freedesktop_os_release()["VERSION_ID"])
+          def builds_here(release):
+              return any(
+                  f["arch"] == "x64"
+                  and f["platform"] == image[0]
+                  and (image[1] is None or f.get("platform_version") == image[1])
+                  for f in release["files"]
+              )
+          with urllib.request.urlopen(MANIFEST, timeout=60) as resp:
+              releases = json.load(resp)
+          here = [r["version"] for r in releases if r["stable"] and builds_here(r)]
+          newest = max((v for v in here if v.startswith("3.14.")), key=key)
+          print(f"newest stable 3.14 in the manifest for {image} = {newest}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"newest={newest}\n")
+          if pin not in here:
+              sys.exit(f"the pin {pin} has no stable x64 build for {image}; the required legs need one")
           if have != newest:
               sys.exit(f"setup-python provisioned {have}, not the manifest's newest {newest}")
           PY
 
-      # The same installer and lock as ci.yml's 3.14 legs, unlike py315-canary.yml: this canary
-      # measures the interpreter patch, so everything else is held to what those legs install.
+      # The same installer and lock as ci.yml's 3.14 legs, unlike py315-canary.yml. The extras are
+      # py315-canary.yml's, so the required legs' sftp and web console coverage is not measured here.
       - name: Set up uv
         if: steps.setup.outcome == 'success'
+        continue-on-error: true
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
@@ -144,7 +153,7 @@ jobs:
         run: |
           uv pip install --system --constraint constraints.lock -e ".[$EXTRAS]"
 
-      # A smoke of the engine suite with the same selection the required legs use. Its result goes in
+      # A smoke of the engine suite with the required legs' pytest selection. Its result goes in
       # the verdict and the summary; read the log for which tests failed and why.
       - name: Engine suite smoke
         id: suite

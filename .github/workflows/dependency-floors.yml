@@ -41,6 +41,7 @@ on:
       - "tests/test_thread_pool_fairness_baseline.py"
       - "tests/test_check_dependency_floors.py"
       - ".github/workflows/dependency-floors.yml"
+      - "ci/python-version"
   workflow_dispatch:
   schedule:
     - cron: "23 6 * * 1"

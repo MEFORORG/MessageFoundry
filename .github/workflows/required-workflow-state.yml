@@ -30,6 +30,7 @@ on:
     paths:
       - ".github/required-contexts.txt"
       - ".github/workflows/**"
+      - "ci/python-version"
 
 permissions:
   contents: read

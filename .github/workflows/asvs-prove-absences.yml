@@ -111,6 +111,7 @@ on:
   pull_request:
     paths: &wiring_paths
       - ".github/workflows/asvs-prove-absences.yml"
+      - "ci/python-version"
       - "scripts/asvs/**"
       - "tests/test_asvs_prove_absences_wiring.py"
   push:

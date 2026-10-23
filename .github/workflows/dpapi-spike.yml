@@ -46,6 +46,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/dpapi-spike.yml
+      - ci/python-version
       - scripts/ci/dpapi_spike.ps1
       - scripts/ci/dpapi_spike_worker.py
 

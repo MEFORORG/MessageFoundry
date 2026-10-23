@@ -72,6 +72,7 @@ on:
       - 'scripts/asvs/**'
       - 'tests/test_asvs_anchor_report.py'
       - '.github/workflows/asvs-anchor-report.yml'
+      - 'ci/python-version'
   push:
     branches: [main]
     paths: *anchor_paths

@@ -88,6 +88,7 @@ on:
       - "fuzz/**"
       - "tests/test_fuzz_targets.py"
       - ".github/workflows/fuzz.yml"
+      - "ci/python-version"
   workflow_dispatch:
   schedule:
     # Nightly, and this is the run that matters. A 60-second pull-request pass re-walks known

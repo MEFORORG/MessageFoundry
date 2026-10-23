@@ -31,6 +31,8 @@ from typing import Any
 
 import yaml
 
+from tests._workflow_contexts import on_block
+
 _REPO = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO / ".github" / "workflows"
 _NPM_TOOLS = _REPO / "ci" / "npm-tools"
@@ -222,7 +224,8 @@ def _setup_python_steps() -> list[_Step]:
             for step in job.get("steps") or []:
                 uses = str(step.get("uses", ""))
                 with_ = step.get("with") or {}
-                if uses.startswith("actions/checkout@") and "repository" not in with_:
+                this_repo = str(with_.get("repository", "${{ github.repository }}"))
+                if uses.startswith("actions/checkout@") and this_repo == "${{ github.repository }}":
                     root = str(with_.get("path", "."))
                     raw = with_.get("sparse-checkout")
                     sparse = None if raw is None else str(raw).split()
@@ -324,6 +327,38 @@ def test_every_setup_python_step_reads_the_pin_or_is_exempt_by_name() -> None:
     }
     stale = sorted(_UNPINNED_PYTHON - used)
     assert not stale, f"exemptions no setup-python step uses any more: {stale}"
+
+
+def _events_that_skip_the_pin(on: Any) -> list[str]:
+    """The events whose ``paths`` filter would not fire on a change to the pin alone."""
+    if not isinstance(on, dict):
+        return []
+    return [
+        event
+        for event, spec in on.items()
+        if isinstance(spec, dict)
+        and isinstance(spec.get("paths"), list)
+        and not {_PY_PIN, "ci/**", "**"} & {str(p) for p in spec["paths"]}
+    ]
+
+
+def test_a_pin_bump_runs_every_path_filtered_workflow_that_reads_the_pin() -> None:
+    """A bump must meet each workflow that reads the pin on its own pull request, not first on the
+    next unrelated one after the merge."""
+    assert _events_that_skip_the_pin({"pull_request": {"paths": ["src/**"]}}) == ["pull_request"]
+    assert not _events_that_skip_the_pin({"pull_request": {"paths": ["src/**", _PY_PIN]}})
+    assert not _events_that_skip_the_pin(
+        {"pull_request": None, "schedule": [{"cron": "0 0 * * *"}]}
+    )
+    readers = sorted({wf for wf, _, w, _, _ in _setup_python_steps() if "python-version-file" in w})
+    print(f"workflows that read {_PY_PIN}: {readers}")
+    assert len(readers) >= 20, f"expected the pinned workflows, found {readers}"
+    skipping = {
+        wf: events
+        for wf in readers
+        if (events := _events_that_skip_the_pin(on_block(_workflows()[wf])))
+    }
+    assert not skipping, f"paths filters that do not fire on {_PY_PIN}: {skipping}"
 
 
 def test_only_the_latest_canary_uses_check_latest() -> None:

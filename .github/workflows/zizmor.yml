@@ -13,6 +13,7 @@ on:
   pull_request:
     paths:
       - ".github/**"
+      - "ci/python-version"
       # zizmor's own VERSION lives OUTSIDE .github/ — pyproject.toml's [dependency-groups].ci-scanners,
       # hash-pinned through this export, which the install step below reads. A bump PR touching only
       # those two never ran this gate (PR #66, zizmor 1.5.2 -> 1.28.0: 33 contexts, not one of them
