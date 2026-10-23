@@ -548,7 +548,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
         # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
-        # A refusal at connect time, such as of the proxy's CONNECT reply, can still follow.
+        # What the WARNING claims is in docs/CONFIGURATION.md, the point-of-use paragraphs.
         _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
@@ -928,11 +928,12 @@ def _first_crossing(connector: str, kind: str) -> bool:
 
 def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     """Log :func:`~messagefoundry.transports.ambient_proxy.vault_hop_proxy_warning` the first
-    time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028).
+    time this process picks ``proxy`` for a ``connector`` send (vault BACKLOG #4028). When it
+    logs is in ``docs/CONFIGURATION.md``, *``serve`` names an environment proxy at start*.
 
-    Keyed by a digest of the raw value, so each distinct proxy is named once, the set holds no
-    credential, and an already-named proxy costs one hash rather than a parse on each send (the
-    Transit cipher sends once per stored cell)."""
+    Keyed by a digest of the raw value rather than the value, so the set holds no credential,
+    and rather than the label, so an already-named proxy costs one hash rather than a parse on
+    each send (the Transit cipher sends once per stored cell)."""
     if not proxy:
         return
     digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
@@ -945,8 +946,8 @@ def _dialled_proxy_label(proxy: str) -> str:
     which dials the proxy, reads the same scheme, host and port from it.
 
     The label's parser is urlsplit's, and urllib3's is not. A backslash before ``@`` makes them
-    disagree on the host, so a label alone could name a host the hop does not dial. Then the
-    proxy is named unreadable, never by urllib3's host, which can be the user part of the URL."""
+    disagree on the host, so a label alone could name a host the hop does not dial. urllib3's
+    host is never named instead, because it can be the user part of the URL."""
     label = proxy_label(proxy)
     try:
         parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))

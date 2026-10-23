@@ -2,13 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An environment proxy on a Vault hop is disclosed where it is used (vault BACKLOG #4028).
 
-Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. ``serve``
-and ``supervise`` disclose one at start (``tests/test_ambient_proxy_disclosure.py``), but that read
-is once, at start, and only in those two commands. ``check-privileges`` probes the configured
-Vault, ``verify`` reads a ``*_ref`` OIDC credential from it, and a proxy can be set after start. So
-the Vault clients' adapter names the proxy ``requests`` picked for a send, once per hop and proxy
-per process. These tests drive the shipped clients and both commands through a loopback listener
-standing in for the proxy, which hangs up on every connection, so nothing reaches a real Vault.
+Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. The start
+warning (``tests/test_ambient_proxy_disclosure.py``) misses commands other than ``serve`` and
+``supervise``, and a proxy set after start. What the point-of-use WARNING covers is in
+``docs/CONFIGURATION.md``, *``serve`` names an environment proxy at start*. These tests drive the
+shipped clients and both commands through a loopback listener standing in for the proxy, which
+hangs up on every connection, so nothing reaches a real Vault.
 """
 
 from __future__ import annotations
@@ -277,8 +276,7 @@ def test_a_refused_send_is_not_disclosed_as_picked(
     monkeypatch: pytest.MonkeyPatch, listener: _Listener, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A loopback ``http://`` Vault behind a proxy is refused when the adapter picks its pool
-    (BACKLOG #2317), so the disclosure, which runs after that method's refusals, does not log. A
-    refusal later in the send, such as at connect time, can still follow a disclosure."""
+    (BACKLOG #2317), so the disclosure, which runs after that method's refusals, does not log."""
     from messagefoundry.config import secretprovider_vault
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
