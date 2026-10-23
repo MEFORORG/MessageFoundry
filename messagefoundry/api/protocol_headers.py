@@ -32,13 +32,19 @@ dependency. uvicorn
 names it; handed to the class build, it is checked for the HTTP hooks like any other base.
 uvicorn's interim ``100 Continue`` carries no header either.
 
-**One thing this module does on the HTTP protocol beyond adding headers.** *It ends a refused
-request's cycle.* When the parser refuses a request after its head, the app task uvicorn started for
-that head is still live, and uvicorn marks its cycle disconnected only once the connection is lost.
-On CPython 3.14.9 the Windows proactor loop then sent the app's answer behind the ``400``, two
-responses to one request. :func:`_end_the_refused_cycle` marks the cycle disconnected as soon as the
-``400`` is written. ``tests/test_api_request_framing_wire.py`` measures it, with a control on the
-bare class.
+**One thing this module does on the HTTP protocol beyond adding headers.** *Nothing is written
+after the parser's 400.* uvicorn writes that ``400`` and closes, but marks a cycle disconnected only
+once the connection is lost, and only its newest cycle; a cycle's ``send`` writes until then.
+Whether the transport still sends such a write depends on the event loop and its version. On
+CPython 3.14.9 the Windows proactor loop did, on the plaintext loopback the wire tests serve: it
+sent the refused request's own ``411`` behind the ``400``, because the app task starts when the
+head parses. A pipelined request still running ahead of the refused one could answer there too.
+(One queued behind it cannot: uvicorn starts a queued cycle only while the transport is not
+closing.) :func:`_end_the_live_cycles` marks every incomplete cycle on the connection disconnected
+as soon as the ``400`` is written, so an earlier pipelined request is answered by nothing but that
+``400``. ``tests/test_api_request_framing_wire.py`` models the late close on any loop, with a
+control on the bare class; the test legs that draw 3.14.9 on Windows are what measure it there.
+The tracking costs every request one weak-set insert.
 
 **Two things this module does on the sans-I/O protocol beyond adding headers.** Both work around
 uvicorn 0.54.0 behaviour that its legacy server did not have, and both are measured on the bare
@@ -78,9 +84,9 @@ handshake answer, on either WebSocket protocol, is a headers object the library 
 yet, so the override adds to that object.
 
 **Refuse at startup.** Each hook this module overrides is checked when the class is built,
-against the server class it is handed. So is every attribute the two sans-I/O steps above read
-or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
-error. That check sees a name that is no longer assigned. It cannot see a name the server still
+against the server class it is handed. So is every attribute the steps above read or write: a
+rename there would otherwise turn a step off, or leave it writing a dead name, with no error.
+That check sees a name that is no longer assigned. It cannot see a name the server still
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
 another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
@@ -111,11 +117,13 @@ drives and what it does not prove.
 
 **Per-response steps degrade, and say so.** Once the class is built, a step this module adds to one
 response (the transport swap and restore, the status-line injection, the 500 hook and its header
-extension, the handshake header addition) catches ``Exception``, logs the type once per family and
-step at WARNING, and lets the server's own response go out without the headers. Refusing that one
-response would change its status, which the floor must never do. The overrides take
-``*args, **kwargs`` so a changed server signature reaches the server's method unchanged.
-``tests/test_header_floor_wire.py`` injects failures into those steps.
+extension, the handshake header addition, the cycle tracking and end after a parser ``400``)
+catches ``Exception``, logs the type once per family and step at WARNING, and lets the server's own
+behaviour take over: a response without the headers, or for the cycle end, uvicorn's own late
+disconnect. Refusing that one response would change its status, which the floor must never do.
+The overrides take ``*args, **kwargs`` so a changed server signature reaches the server's method
+unchanged. ``tests/test_header_floor_wire.py`` injects failures into the header steps, and
+``tests/test_api_request_framing_wire.py`` into the cycle tracking and end.
 
 **This leans on uvicorn and websockets INTERNALS.** None of the hooks above is public API.
 ``pyproject.toml`` pins uvicorn and websockets to exact versions.
@@ -140,6 +148,7 @@ from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from types import CodeType
 from typing import Any
+from weakref import WeakSet
 
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
@@ -183,19 +192,24 @@ _HEADER_PAIRS = [
 _WARNED: set[tuple[str, str]] = set()
 
 
-def _degraded(family: str, step: str, exc: BaseException) -> None:
-    """Log one per-response header-path failure, once per (family, step). Only the exception TYPE is
-    logged: the message could carry request bytes, and this runs on requests that may carry PHI."""
+#: What a failed per-response step costs, unless the step names its own.
+_LACKS_HEADERS = "responses of this family may lack the protocol-level security headers"
+
+
+def _degraded(family: str, step: str, exc: BaseException, *, effect: str = _LACKS_HEADERS) -> None:
+    """Log one per-response step failure, once per (family, step). ``effect`` says what the failure
+    costs. Only the exception TYPE is logged: the message could carry request bytes, and this runs
+    on requests that may carry PHI."""
     if (family, step) in _WARNED:
         return
     _WARNED.add((family, step))
     _log.warning(
-        "%s: %s failed (%s); the server's own behaviour took this step over, so responses of "
-        "this family may lack the protocol-level security headers (BACKLOG #1120). Re-measure the "
-        "uvicorn/websockets protocol layer.",
+        "%s: %s failed (%s); the server's own behaviour took this step over, so %s "
+        "(BACKLOG #1120). Re-measure the uvicorn/websockets protocol layer.",
         family,
         step,
         type(exc).__name__,
+        effect,
     )
 
 
@@ -211,25 +225,37 @@ class ProtocolFloorUnavailable(RuntimeError):
     hook: str = ""
 
 
-def _refusal(base: type[Any], hook: str) -> ProtocolFloorUnavailable:
+#: What a server class the floor refuses would cost, unless the check names its own.
+_REFUSED_FLOOR_COST = (
+    "The responses the server writes below the app could go out without the floor's headers"
+)
+
+
+def _refusal(
+    base: type[Any], hook: str, *, cost: str = _REFUSED_FLOOR_COST
+) -> ProtocolFloorUnavailable:
     return floor_unavailable(
-        f"cannot be built on {base.__module__}.{base.__qualname__}: it has no {hook}", hook
+        f"cannot be built on {base.__module__}.{base.__qualname__}: it has no {hook}",
+        hook,
+        cost=cost,
     )
 
 
-def floor_unavailable(problem: str, hook: str) -> ProtocolFloorUnavailable:
+def floor_unavailable(
+    problem: str, hook: str, *, cost: str = _REFUSED_FLOOR_COST
+) -> ProtocolFloorUnavailable:
     """The refusal both floor checks raise: the class build here, and the self-test in
     :mod:`messagefoundry.api.protocol_floor_selftest`. A missing pinned parser raises the same type
-    from :func:`pinned_http_protocol_base`, with its own message. ``problem`` completes "the protocol header
-    floor ...", and ``hook`` is what :attr:`ProtocolFloorUnavailable.hook` holds."""
+    from :func:`pinned_http_protocol_base`, with its own message. ``problem`` completes "the
+    protocol header floor ...", ``hook`` is what :attr:`ProtocolFloorUnavailable.hook` holds, and
+    ``cost`` says what the server would get wrong."""
     # Built here rather than in an __init__ override, so the exception keeps RuntimeError's own
     # (message,) args and pickles and copies like any other.
     refused = ProtocolFloorUnavailable(
         f"the protocol header floor (BACKLOG #1120) {problem} "
-        f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). The responses "
-        "the server writes below the app could go out without the floor's headers. Re-read the server's "
-        "protocol modules and update messagefoundry/api/protocol_headers.py, or install the uvicorn "
-        "and websockets the lock pins"
+        f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). {cost}. "
+        "Re-read the server's protocol modules and update messagefoundry/api/protocol_headers.py, "
+        "or install the uvicorn and websockets the lock pins"
     )
     refused.hook = hook
     return refused
@@ -291,12 +317,14 @@ def _require_sync_method(base: type[Any], name: str) -> None:
         raise _refusal(base, f"synchronous {name} method")
 
 
-def _require_assigned(base: type[Any], attr: str, *, hook: str) -> None:
+def _require_assigned(
+    base: type[Any], attr: str, *, hook: str, cost: str = _REFUSED_FLOOR_COST
+) -> None:
     owner = _root_definer(base, hook)
     if owner is None:
-        raise _refusal(base, f"{hook} in any class body")
+        raise _refusal(base, f"{hook} in any class body", cost=cost)
     if not _assigns(base, attr, upto=owner):
-        raise _refusal(base, f"{attr} attribute")
+        raise _refusal(base, f"{attr} attribute", cost=cost)
 
 
 #: The class the sans-I/O WebSocket protocol builds each connection's ``conn`` from, looked up in
@@ -326,8 +354,9 @@ def _require_http_hooks(base: type[Any]) -> None:
     if not inspect.iscoroutinefunction(getattr(cycle_cls, "send_500_response", None)):
         raise _refusal(cycle_cls, "send_500_response coroutine")
     _require_assigned(cycle_cls, "default_headers", hook="send_500_response")
-    for attr in ("disconnected", "response_complete", "message_event"):
-        _require_assigned(cycle_cls, attr, hook="send_500_response")
+    for attr in _ENDED_CYCLE_ATTRS:
+        cost = f"After a parser 400, {_MAY_ANSWER_AFTER_400}"
+        _require_assigned(cycle_cls, attr, hook="send_500_response", cost=cost)
 
 
 def _answers_through_conn(base: type[Any]) -> bool:
@@ -529,26 +558,43 @@ def _floor_the_conn_responses(conn: Any) -> None:
         _degraded("ws-sansio", "hook", exc)
 
 
-def _end_the_refused_cycle(protocol: Any) -> None:
-    """Mark the cycle of a request the parser refused as disconnected, so its app task cannot
-    answer it after the ``400``.
+#: What :func:`_end_the_live_cycles` reads and writes on a cycle. The class build requires the
+#: cycle class to assign each of them.
+_ENDED_CYCLE_ATTRS = ("disconnected", "response_complete", "message_event")
 
-    See the module docstring. The cycle's app task starts when the head parses, so a body the
-    parser then refuses already has one. uvicorn writes the ``400`` and closes the transport, but
-    marks the cycle disconnected only in ``connection_lost``. Until then the cycle's ``send`` still
-    writes, and a transport whose ``400`` is still in flight sends that write too: on CPython 3.14.9
-    the Windows proactor loop sent the app's ``411`` behind the ``400``. This sets what
-    ``connection_lost`` would, early. A cycle whose response is complete is a previous request's,
-    and is left alone. The class build requires ``disconnected``, ``response_complete`` and
-    ``message_event`` to be assigned by the cycle class."""
+#: What a failed :func:`_end_the_live_cycles` costs.
+_MAY_ANSWER_AFTER_400 = (
+    "an app may still answer on a connection after its parser 400, a second response the client "
+    "pairs with the wrong request"
+)
+
+
+def _track_the_cycle(protocol: Any, cycle: Any) -> None:
+    """Remember ``cycle`` for :func:`_end_the_live_cycles`. Weakly, so a finished cycle is freed."""
     try:
-        cycle = protocol.cycle
-        if cycle is None or cycle.response_complete:
-            return
-        cycle.disconnected = True
-        cycle.message_event.set()
+        cycles = vars(protocol).get("_mf_cycles")
+        if cycles is None:
+            cycles = protocol._mf_cycles = WeakSet()
+        cycles.add(cycle)
     except Exception as exc:
-        _degraded("http-400", "refused cycle end", exc)
+        _degraded("http-400", "cycle tracking", exc, effect=_MAY_ANSWER_AFTER_400)
+
+
+def _end_the_live_cycles(protocol: Any) -> None:
+    """Mark every incomplete cycle on the connection disconnected once the parser's ``400`` is
+    written, so nothing is written after it: the refused request's own cycle, and a pipelined one
+    still running ahead of it. The module docstring says why. The newest cycle is ended even when
+    tracking failed for it."""
+    newest = vars(protocol).get("_mf_cycle")
+    tracked = list(vars(protocol).get("_mf_cycles", ()))
+    for cycle in [*tracked, *([newest] if newest is not None and newest not in tracked else [])]:
+        try:
+            if cycle.response_complete:
+                continue
+            cycle.disconnected = True
+            cycle.message_event.set()
+        except Exception as exc:
+            _degraded("http-400", "live cycle end", exc, effect=_MAY_ANSWER_AFTER_400)
 
 
 def _answer_a_parser_rejection(protocol: Any) -> None:
@@ -639,10 +685,12 @@ def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.P
 def _build_floored_http(base: type[Any]) -> type[asyncio.Protocol]:
     class _FlooredHTTPProtocol(base):  # type: ignore[misc]
         def send_400_response(self, *args: Any, **kwargs: Any) -> None:
-            _write_with_headers(
-                self, "http-400", partial(super().send_400_response, *args, **kwargs)
-            )
-            _end_the_refused_cycle(self)
+            try:
+                _write_with_headers(
+                    self, "http-400", partial(super().send_400_response, *args, **kwargs)
+                )
+            finally:
+                _end_the_live_cycles(self)
 
         # Both implementations create each request's cycle with `self.cycle = RequestResponseCycle(...)`,
         # pipelined ones included, and before its task first runs. A property sees every one, once.
@@ -654,6 +702,7 @@ def _build_floored_http(base: type[Any]) -> type[asyncio.Protocol]:
         def cycle(self, value: Any) -> None:
             self._mf_cycle = value  # first, so no failure below can lose the cycle
             if value is not None:
+                _track_the_cycle(self, value)
                 _floor_the_cycle_500(value)
 
     return _FlooredHTTPProtocol

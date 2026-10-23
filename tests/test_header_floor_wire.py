@@ -1150,6 +1150,18 @@ def test_an_http_base_missing_a_hook_is_refused(
     assert f"websockets {websockets_version}" in message, message
 
 
+@pytest.mark.parametrize("drop", ["disconnected", "response_complete", "message_event"])
+def test_a_cycle_end_refusal_names_what_it_would_cost(
+    drop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """These three serve the cycle end after a parser 400, not a header, so the refusal says so."""
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
+        floored_http_protocol_class(base=_fake_http(monkeypatch, drop))
+    message = str(refused.value)
+    assert "second response" in message, message
+    assert "without the floor's headers" not in message, message
+
+
 @pytest.mark.parametrize(
     ("drop", "named"),
     [

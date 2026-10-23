@@ -22,6 +22,7 @@ Measured on uvicorn 0.54.0 and httptools 0.8.0. This suite pins httptools, and
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import tomllib
 from collections.abc import AsyncIterator
@@ -34,7 +35,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from messagefoundry.api import create_app
+from messagefoundry.api import create_app, protocol_headers
 from messagefoundry.api.protocol_headers import (
     floored_http_protocol_class,
     pinned_http_protocol_base,
@@ -190,19 +191,32 @@ async def test_the_api_refuses_ambiguous_request_framing(engine: Engine) -> None
 #: The refused shapes whose head parses before the body is refused, so the app's task has started.
 #: The app refuses a chunked body with a 411, so on these it has an answer of its own to send.
 _REFUSED_AFTER_THE_HEAD = ("chunk size not hex digits", "chunk lines ended by bare LF")
+#: A valid request pipelined ahead of a refused one, in the same write. Its cycle is still running,
+#: its task not yet stepped, when the parser refuses the request behind it.
+_PIPELINED_AHEAD = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
 
 
 def _closing_late(base: type[Any]) -> type[Any]:
-    """``base`` with the ``400``'s transport close deferred, so the app's task runs before the
-    connection is lost. That is the order the Windows proactor loop showed on CPython 3.14.9, where
-    the ``400``'s write is still in flight at ``close()``; the Linux selector loop drops a later
-    write at once, so without this the race cannot be seen here."""
+    """``base`` with the ``400``'s transport close held until the connection's app tasks are done,
+    so they run before the connection is lost: the Windows proactor loop's order (see the
+    ``protocol_headers`` module docstring), which the Linux selector loop would otherwise hide. The
+    close itself is held, so the transport is not yet closing and uvicorn also starts a refused
+    request queued behind a pipelined one. A real late close would not, so that only adds answers
+    to the bare control."""
 
     class _ClosingLate(base):  # type: ignore[misc]
         def send_400_response(self, *args: Any, **kwargs: Any) -> None:
             transport = self.transport
             close = transport.close
-            transport.close = lambda: asyncio.get_running_loop().call_later(0.3, close)
+
+            async def _close_when_the_tasks_are_done() -> None:
+                for _ in range(500):  # bounded: 5 s
+                    if not self.tasks:
+                        break
+                    await asyncio.sleep(0.01)
+                close()
+
+            transport.close = lambda: asyncio.ensure_future(_close_when_the_tasks_are_done())
             try:
                 super().send_400_response(*args, **kwargs)
             finally:
@@ -212,20 +226,85 @@ def _closing_late(base: type[Any]) -> type[Any]:
 
 
 @pytest.mark.parametrize("floored", [True, False], ids=["floored", "bare-control"])
-async def test_a_refused_request_gets_one_answer_when_the_close_lands_late(
+async def test_nothing_is_answered_after_the_parser_400_when_the_close_lands_late(
     engine: Engine, floored: bool
 ) -> None:
-    """The ``400`` is the only answer to a request the parser refused, even when the app's task,
-    started on the head, runs before the connection is lost. The bare class is the control: it
-    sends the app's ``411`` behind the ``400``, which is what the floor's refused cycle end stops."""
+    """The parser's ``400`` is the last answer on the connection, even when the app tasks run before
+    the connection is lost: the refused request's own, and a pipelined one ahead of it. The bare
+    class is the control."""
     base = floored_http_protocol_class() if floored else pinned_http_protocol_base()
+    probes = {shape: _REFUSED[shape] for shape in _REFUSED_AFTER_THE_HEAD}
+    probes |= {f"{shape}, pipelined": _PIPELINED_AHEAD + _REFUSED[shape] for shape in probes}
     misses = []
     async with _served(create_app(engine), http=_closing_late(base)) as port:
-        for shape in _REFUSED_AFTER_THE_HEAD:
-            statuses, raw = await _answers(port, _REFUSED[shape])
-            if statuses != ([400] if floored else [400, 411]):
-                misses.append(f"{shape}: {raw!r}")
+        for shape, request in probes.items():
+            statuses, raw = await _answers(port, request)
+            answered_after_the_400 = statuses[:1] == [400] and len(statuses) > 1
+            if (statuses == [400]) if floored else answered_after_the_400:
+                continue
+            misses.append(f"{shape}: {raw!r}")
     assert not misses, "\n".join(misses)
+
+
+class _Cycle:
+    """Stands in for uvicorn's cycle: the three names the cycle end reads and writes."""
+
+    def __init__(self, event: Any) -> None:
+        self.response_complete = False
+        self.disconnected = False
+        self.message_event = event
+
+
+class _SlottedCycle:
+    """A cycle with no ``__weakref__``, so tracking it fails."""
+
+    __slots__ = ("response_complete", "disconnected", "message_event")
+
+    def __init__(self) -> None:
+        self.response_complete = False
+        self.disconnected = False
+        self.message_event = asyncio.Event()
+
+
+class _Protocol:
+    pass
+
+
+def _cycle_warnings(caplog: pytest.LogCaptureFixture, step: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if f"{step} failed" in r.getMessage()]
+
+
+def test_a_cycle_the_end_cannot_end_is_logged_once_and_the_others_are_still_ended(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The broken cycle is handed over first, so a loop that stopped at it would leave the rest."""
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    broken, whole = _Cycle(None), [_Cycle(asyncio.Event()) for _ in range(2)]
+    protocol = _Protocol()
+    protocol._mf_cycles = [broken, *whole]  # type: ignore[attr-defined]
+    with caplog.at_level(logging.WARNING, logger=protocol_headers._log.name):
+        protocol_headers._end_the_live_cycles(protocol)
+        protocol_headers._end_the_live_cycles(protocol)
+    assert all(c.disconnected and c.message_event.is_set() for c in whole)
+    warned = _cycle_warnings(caplog, "live cycle end")
+    assert len(warned) == 1, caplog.text
+    assert "second response" in warned[0].getMessage()
+
+
+def test_a_cycle_tracking_failure_still_ends_the_newest_cycle(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    cycle = _SlottedCycle()
+    protocol = _Protocol()
+    protocol._mf_cycle = cycle  # type: ignore[attr-defined]
+    with caplog.at_level(logging.WARNING, logger=protocol_headers._log.name):
+        protocol_headers._track_the_cycle(protocol, cycle)
+        protocol_headers._end_the_live_cycles(protocol)
+    assert cycle.disconnected and cycle.message_event.is_set()
+    warned = _cycle_warnings(caplog, "cycle tracking")
+    assert len(warned) == 1, caplog.text
+    assert "second response" in warned[0].getMessage()
 
 
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
