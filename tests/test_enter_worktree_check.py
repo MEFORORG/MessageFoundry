@@ -275,8 +275,14 @@ def test_an_extra_project_segment_is_unsafe(fleet: Fleet) -> None:
 
 
 def test_the_own_session_id_deeper_in_another_scratchpad_is_unsafe(fleet: Fleet) -> None:
-    """The id must sit at its one position; a `-like "*<id>*"` match would take this path."""
-    wt = fleet.add_worktree(fleet.scratch(OTHER_SID) / SID / "eng-main")
+    """The id must sit at its one position; a `-like "*<id>*"` match would take this path.
+
+    The other session's segment is short and the worktree is the id itself, because `git worktree
+    add` sets GIT_DIR to `<path>/.git` and git refuses one longer than PATH_MAX - 40, which is 220
+    on Windows. Two uuids, `scratchpad` and a leaf under a CI runner's xdist temp root crossed it.
+    Check c reads no segment but the own one, so a short other id is still another scratchpad.
+    """
+    wt = fleet.add_worktree(fleet.scratch("other") / SID)
     assert_unsafe(fleet.check(wt), "c")
 
 
