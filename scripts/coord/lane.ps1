@@ -110,8 +110,8 @@ if (Test-Path -LiteralPath $file) {
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
 # path writes its own file, not this one. A record under the old path-only key is not
 # read: lane-level.ps1 asks for a fresh level after 15 minutes anyway, so a restatement replaces it.
-# A record at THIS key that still names another host was copied, hand-made, or collided on the short
-# hash. Taking it over would overwrite that lane's stated level with this one's, so a write refuses
+# A record at THIS key that still names another host got here at least by a copy, by hand, by a
+# collision on the short hash, or by a mistyped coord-migrate.ps1 -SourceHost. Taking it over would overwrite that lane's stated level with this one's, so a write refuses
 # and says so; -Show only reads, so it prints the record as it is. A record with no `host` was
 # written here, as every record before the field was.
 if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
