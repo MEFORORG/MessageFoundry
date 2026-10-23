@@ -246,19 +246,27 @@ def test_the_seat_defaults_to_the_sessions_declared_seat(sb: Sandbox) -> None:
     assert _logged_seat(sb) == "builder"
 
 
-@pytest.mark.parametrize("newer", ["hosted", "legacy"])
-def test_the_newer_of_the_two_boxes_names_the_seat(sb: Sandbox, newer: str) -> None:
+def test_the_newer_of_the_two_boxes_names_the_seat(sb: Sandbox) -> None:
     """A session that declared before the host joined the box key keeps a record under the
     path-only key (docs/COORD-SHARED-ROOT.md, step 4). Whichever of this worktree's two records
-    was written last names the seat, as seat.ps1 picks its prior. Both directions run, so a lookup
-    that takes whichever box it meets first fails one of them in any directory listing order."""
+    was written last names the seat, as seat.ps1 picks its prior.
+
+    Both directions run in ONE sandbox, so the two box names and their listing order are the same
+    for both. A lookup that takes whichever box it meets first returns the same box twice and
+    fails one direction, whatever order the file system lists them in."""
     hosted, legacy = _box_keys(sb)
     seats = sb.coord / "seats"
     old = {"asOf": "2026-10-20T08:00:00Z", "writes": 9, "seatSource": "declared"}
     new = {"asOf": "2026-10-22T08:00:00Z", "writes": 2, "seatSource": "declared"}
-    _seat_file(seats, hosted, {**(new if newer == "hosted" else old), "seat": "hosted-seat"})
-    _seat_file(seats, legacy, {**(new if newer == "legacy" else old), "seat": "legacy-seat"})
-    assert _logged_seat(sb) == f"{newer}-seat"
+    got: dict[str, str] = {}
+    for item, newer in (("101", "hosted"), ("102", "legacy")):
+        _seat_file(seats, hosted, {**(new if newer == "hosted" else old), "seat": "hosted-seat"})
+        _seat_file(seats, legacy, {**(new if newer == "legacy" else old), "seat": "legacy-seat"})
+        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        proc = sb.run(DECISION, *args, MEFOR_COORD_ROOT="")
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        got[newer] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
+    assert got == {"hosted": "hosted-seat", "legacy": "legacy-seat"}
 
 
 def test_a_declared_seat_beats_a_newer_derived_one(sb: Sandbox) -> None:
