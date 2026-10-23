@@ -124,6 +124,7 @@ class Fleet:
         transcript: str | None = None,
         remote: str | None = None,
         extra: tuple[str, ...] = (),
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # One repository: `pwsh -File` binds `a,b` as ONE string, not an array.
         return self.sb.run(
@@ -143,6 +144,7 @@ class Fleet:
             "-TranscriptPath",
             self.transcript() if transcript is None else transcript,
             *extra,
+            **(env or {}),
         )
 
     def turn_off(self) -> Path:
@@ -719,7 +721,7 @@ def silent_remote() -> Iterator[str]:
 
 
 def test_a_hung_child_is_bounded_by_the_run_s_budget(fleet: Fleet, silent_remote: str) -> None:
-    """The remote read's own bound is 30 s here; the 6 s budget stops it first."""
+    """The remote read's own bound is 60 s here; the 10 s budget stops it first."""
     wt = fleet.own_wt()
     start = time.monotonic()
     proc = fleet.check(
@@ -728,6 +730,72 @@ def test_a_hung_child_is_bounded_by_the_run_s_budget(fleet: Fleet, silent_remote
     assert_unsafe(proc, "f")
     assert "budget ran out" in proc.stdout, proc.stdout
     assert time.monotonic() - start < 45, proc.stdout
+
+
+def _plain_git_env(**extra: str) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(extra)
+    return env
+
+
+def test_a_promisor_remote_in_the_clone_runs_no_lazy_fetch(fleet: Fleet, tmp_path: Path) -> None:
+    """The remote's main moves on unfetched, so f looks up a commit the clone lacks. A promisor
+    remote in the clone's shared config would fetch it through a session-chosen upload-pack."""
+    wt = fleet.own_wt()
+    pusher = tmp_path / "pusher"
+    _git("clone", "-q", str(fleet.origin), str(pusher), cwd=tmp_path)
+    (pusher / "README.md").write_text("moved on\n", encoding="utf-8")
+    _git("commit", "-q", "-am", "move on", cwd=pusher)
+    _git("push", "-q", "origin", "HEAD:main", cwd=pusher)
+    moved = _git("rev-parse", "HEAD", cwd=pusher)
+    marker = tmp_path / "lazy-fetch-ran"
+    for key, value in (
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "evil"),
+        ("remote.evil.url", str(fleet.origin)),
+        ("remote.evil.promisor", "true"),
+        ("remote.evil.uploadpack", f"touch '{marker.as_posix()}'; false"),
+    ):
+        _git("config", key, value, cwd=fleet.engine)
+    # Positive control: without GIT_NO_LAZY_FETCH the same lookup runs the command.
+    subprocess.run(
+        ["git", "-C", str(fleet.engine), "cat-file", "-e", f"{moved}^{{commit}}"],
+        env=_plain_git_env(),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert marker.exists(), "the promisor remote did not fire, so this test proves nothing"
+    marker.unlink()
+    proc = fleet.check(wt)
+    assert_unsafe(proc, "f")
+    assert "fetch origin first" in proc.stdout, proc.stdout
+    assert not marker.exists(), proc.stdout
+
+
+def test_the_parent_s_git_variables_do_not_reach_a_git_child(fleet: Fleet, tmp_path: Path) -> None:
+    """Every GIT_* name is dropped, the remote read's included, whatever the session set."""
+    wt = fleet.own_wt()
+    trace = tmp_path / "git-trace.txt"
+    planted = {
+        "GIT_TRACE": str(trace),
+        "GIT_EXEC_PATH": str(tmp_path / "no-exec-path"),
+        "GIT_SSL_NO_VERIFY": "1",
+        "SSL_CERT_FILE": str(tmp_path / "no-ca.pem"),
+    }
+    # Positive control: a git child that inherits them writes the trace.
+    subprocess.run(
+        ["git", "ls-remote", str(fleet.origin)],
+        env=_plain_git_env(**planted),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert trace.exists(), "GIT_TRACE did not reach a plain git child, so this test proves nothing"
+    trace.unlink()
+    # No trace file: no git child the check started, the remote read included, kept GIT_TRACE.
+    assert_safe(fleet.check(wt, env=planted))
+    assert not trace.exists()
 
 
 # ---------------------------------------------------------------- the local OFF file
@@ -848,6 +916,15 @@ def test_the_hook_asks_with_a_safe_reason_on_safe(fleet: Fleet) -> None:
     reason = _reason(_decision(fleet.hook(_payload(fleet, wt))))
     assert reason.startswith("enter-check: SAFE"), reason
     assert "origin/main" not in reason and "kill switch" not in reason, reason
+
+
+def test_the_hook_writes_ascii_json_for_a_non_ascii_path(fleet: Fleet) -> None:
+    """U+30BD is 83 5C in cp932, a stray backslash in a JSON string written under that code page."""
+    wt = fleet.add_worktree(fleet.scratch("other") / "wéソ")
+    proc = fleet.hook(_payload(fleet, wt))
+    assert proc.stdout.isascii(), proc.stdout
+    reason = _reason(_decision(proc))
+    assert reason.startswith("enter-check: UNSAFE") and "wéソ" in reason, reason
 
 
 def test_the_hook_asks_with_an_unsafe_reason_on_unsafe(fleet: Fleet) -> None:

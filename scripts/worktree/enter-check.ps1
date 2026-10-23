@@ -51,10 +51,11 @@
          settings, hook code and instructions alike, is one that merged. The same shared state
          may not stand in for an object either: replace refs and the commit-graph are off, an
          `info/grafts` file fails f, and the HEAD the verified admin dir names must be the one
-         git listed, before and after the reads. Its working tree matches HEAD byte for byte:
-         no tracked path carries a filter, ident or working-tree-encoding attribute, every
-         tracked file's on-disk hash equals its HEAD blob (a stat-cache read alone can be
-         fooled), no index entry is flagged assume-unchanged or skip-worktree, nothing is
+         git listed, before and after the reads. Its working tree matches HEAD up to git's
+         line-ending conversion: no tracked path carries a filter, ident or
+         working-tree-encoding attribute, every tracked file's on-disk content, hashed through
+         the eol conversion git applies on add, equals its HEAD blob (a stat-cache read alone
+         can be fooled; a file that differs only in its line endings passes), no index entry is flagged assume-unchanged or skip-worktree, nothing is
          modified or untracked, and no ignored file sits where the harness reads settings or
          instructions (`.claude`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`, at any depth and
          in any case). Ignored means ignored by the tree's own `.gitignore` files, never by
@@ -64,8 +65,14 @@
     definition (parsed, never copied), because a path or a git message is attacker-choosable text.
 
     TO SILENCE IT (ADR 0212):
-      * this machine only: create the OFF file, which the hook reads as no verdict at all:
-            New-Item -ItemType File -Force -Path "$(git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir)/mefor-coord/enter-check/OFF"
+      * this machine only: create the OFF file, which the hook reads as no verdict at all. Put
+        this machine's name for <HOST>. A failed git call stops before New-Item, which would
+        otherwise create the file at the drive root and report success:
+            if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+                $common = git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir
+                if ($LASTEXITCODE -ne 0 -or -not $common) { Write-Host "STOP     git did not name the engine's git common dir; nothing ran" }
+                else { New-Item -ItemType File -Force -Path (Join-Path $common 'mefor-coord/enter-check/OFF') }
+            }
         and delete that file to turn it back on;
       * permanently: remove the EnterWorktree entry from .claude/settings.json.
 
@@ -118,10 +125,18 @@ $failures = [System.Collections.Generic.List[string]]::new()
 $passed = [System.Collections.Generic.HashSet[string]]::new()
 function Add-Failure([string]$Check, [string]$Why) { $failures.Add("$Check. $Why") }
 
-# Inherited git variables would redirect `git -C` at another repository than the one named.
-$gitEnvStrip = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
-    'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')
+# A git child inherits none of this process's git variables. GIT_DIR and its kin would redirect
+# `git -C` at another repository than the one named. GIT_EXEC_PATH, GIT_SSH_COMMAND, GIT_TRACE*,
+# GIT_SSL_NO_VERIFY and GIT_SSL_CAINFO would choose what runs, where output goes, or which server is
+# trusted. So every GIT_* name goes. So do the CA-bundle names libcurl and OpenSSL read: they are
+# not GIT_* but pick the trusted roots all the same. The proxy names stay. A proxy carries the
+# remote read's TLS but cannot forge it while verification holds, and a machine behind one could
+# not reach the remote at all without them.
+$caEnvStrip = @('SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE')
+# Set on every git child. Without it, a promisor remote written into the clone's shared config
+# would let a lookup of a missing object (f's cat-file and merge-base) fetch it, and that fetch
+# runs the remote's upload-pack, a command any session can choose.
+$gitEnvSet = @{ GIT_NO_LAZY_FETCH = '1' }
 
 function Start-Child {
     # A child process with argv passed as a list (no quoting to get wrong) and UTF-8 output.
@@ -136,7 +151,11 @@ function Start-Child {
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
-    if ($StripGit) { foreach ($v in $gitEnvStrip) { [void]$psi.Environment.Remove($v) } }
+    if ($StripGit) {
+        $names = @($psi.Environment.Keys | Where-Object { $_.StartsWith('GIT_', [System.StringComparison]::OrdinalIgnoreCase) -or $_ -in $caEnvStrip })
+        foreach ($v in $names) { [void]$psi.Environment.Remove($v) }
+        foreach ($k in $gitEnvSet.Keys) { $psi.Environment[$k] = $gitEnvSet[$k] }
+    }
     if ($SetEnv) { foreach ($k in $SetEnv.Keys) { $psi.Environment[$k] = [string]$SetEnv[$k] } }
     $p = [System.Diagnostics.Process]::Start($psi)
     # Readers first, so a child that answers as it reads cannot fill its pipe and stall the write.
@@ -515,7 +534,7 @@ try {
         catch { Add-Failure 'e' "the worktree state could not be read: $($_.Exception.Message)" }
     }
 
-    # f. HEAD is a merged commit of the remote's main, and the working tree is HEAD, byte for byte.
+    # f. HEAD is a merged commit of the remote's main, and the working tree is HEAD up to git's eol conversion.
     if ($match) {
         try {
             $repo = $match.Repo

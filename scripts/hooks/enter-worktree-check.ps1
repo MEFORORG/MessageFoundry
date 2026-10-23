@@ -43,7 +43,9 @@ $ErrorActionPreference = 'Stop'
 function Write-Ask([string]$Reason) {
     # The only decision this hook writes, fixed here rather than passed in.
     $out = @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'ask'; permissionDecisionReason = $Reason } }
-    [Console]::Out.Write(($out | ConvertTo-Json -Compress -Depth 4))
+    # ASCII only, as worktree_gate.ps1 writes its own: a reason quotes a path, and under a legacy
+    # code page a non-ASCII byte pair can carry a stray `\` that leaves the JSON unparseable.
+    [Console]::Out.Write(($out | ConvertTo-Json -Compress -Depth 4 -EscapeHandling EscapeNonAscii))
 }
 
 function Get-PromptText([string]$Text, [int]$Max) {
