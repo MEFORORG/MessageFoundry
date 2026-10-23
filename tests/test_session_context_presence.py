@@ -14,10 +14,13 @@ the repo -- these same scripts are live in every sibling session while the suite
 
 from __future__ import annotations
 
+import functools
 import json
 import os
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,6 +51,10 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture
 def staged(tmp_path: Path) -> Path:
+    return _make_staged(tmp_path)
+
+
+def _make_staged(tmp_path: Path) -> Path:
     """A git repo with 2+ worktrees (so the parallel-session block runs) holding script copies."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -69,7 +76,7 @@ def staged(tmp_path: Path) -> Path:
     return repo
 
 
-def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
+def run_context(repo: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "pwsh",
@@ -82,8 +89,10 @@ def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
         input="",  # the hook reads its input; an inherited stdin would hold the read to its bound
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=180,
         check=False,  # the whole point is that it exits 0 even when presence.ps1 fails
+        env=env,
     )
 
 
@@ -102,6 +111,53 @@ def test_banner_survives_a_missing_presence_script(staged: Path) -> None:
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
     assert "LIVE sessions" not in proc.stdout  # degraded, not crashed
+    # Degraded aloud: a missing roster must not read as "nobody else is live".
+    assert re.search(
+        r"Live sessions: NOT READ \([^\n]*presence\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
+
+
+def test_a_missing_presence_script_does_not_hide_the_in_flight_list(staged: Path) -> None:
+    """The in-flight list used to sit inside the presence branch, so a missing presence.ps1 hid it."""
+    (staged / "scripts" / "coord" / "overlap.ps1").write_text(
+        "Write-Output '"
+        + json.dumps(
+            [{"Short": "b0000000", "Branch": "peer", "Live": True, "Work": ["task"], "Files": []}]
+        )
+        + "'\n",
+        encoding="utf-8",
+    )
+    proc = run_context(staged)
+    assert "Live sessions: NOT READ (" in proc.stdout, proc.stdout
+    assert "WHAT THEY ARE BUILDING" in proc.stdout and "session b0000000" in proc.stdout, (
+        proc.stdout
+    )
+
+
+def test_a_checkout_path_with_brackets_still_finds_its_roster_scripts(tmp_path: Path) -> None:
+    """Test-Path without -LiteralPath reads `[x]` as a wildcard class, so a present presence.ps1 or
+    overlap.ps1 under such a path read as missing, a false NOT READ."""
+    base = Path(os.path.realpath(tmp_path)) / "co[x]de"
+    base.mkdir()
+    repo = _make_staged(base)
+    fake_presence(repo, _peer_rows(1))
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text("Write-Output '[]'\n", encoding="utf-8")
+    proc = run_context(repo)
+    assert proc.returncode == 0, proc.stderr
+    # The positive control: the banner ran, under the bracketed path.
+    assert "co[x]de" in proc.stdout, proc.stdout
+    assert "LIVE sessions in this repo right now (1 besides you)" in proc.stdout, proc.stdout
+    assert "Live sessions: NOT READ" not in proc.stdout, proc.stdout
+    assert "In-flight work: NOT READ" not in proc.stdout, proc.stdout
+
+
+def test_a_missing_overlap_script_is_said_aloud(staged: Path) -> None:
+    fake_presence(staged, [])
+    assert not (staged / "scripts" / "coord" / "overlap.ps1").exists()
+    proc = run_context(staged)
+    assert re.search(
+        r"In-flight work: NOT READ \([^\n]*overlap\.ps1 is missing\)\.", proc.stdout
+    ), proc.stdout
 
 
 def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
@@ -112,6 +168,19 @@ def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
     assert "LIVE sessions" not in proc.stdout
+    # A roster that threw must not read as "nobody else is live".
+    assert "Live sessions: NOT READ (presence exploded)" in proc.stdout, proc.stdout
+
+
+def test_an_overlap_script_that_throws_is_said_aloud(staged: Path) -> None:
+    """Work that threw must not read as "nobody is building anything"."""
+    fake_presence(staged, [])
+    (staged / "scripts" / "coord" / "overlap.ps1").write_text(
+        "throw 'overlap exploded'\n", encoding="utf-8"
+    )
+    proc = run_context(staged)
+    assert proc.returncode == 0
+    assert "In-flight work: NOT READ (overlap exploded)" in proc.stdout, proc.stdout
 
 
 def test_banner_survives_presence_emitting_junk(staged: Path) -> None:
@@ -160,7 +229,7 @@ def test_the_session_id_is_labelled_because_the_same_banner_prints_real_shas(
     """BACKLOG #1098: an 8-hex session id printed bare reads as an abbreviated commit SHA.
 
     It reads that way for a measured reason rather than a vague one, and this test measures it: the
-    ``git worktree list`` block a few lines up prints ``<path> <abbreviated sha> [branch]``, so the same
+    banner's own ``git worktree list`` row prints ``<path> <abbreviated sha> [branch]``, so the same
     banner already teaches "8 hex before a bracketed branch = commit SHA". The roster then reused the
     shape for a registry session id, which resolves to no git object at all. A session comparing "is that
     worktree ahead of mine" against it gets an error at best, and the wrong tree if the prefix resolves.
@@ -239,6 +308,7 @@ def test_self_is_excluded_from_the_peer_count(staged: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
+@functools.cache
 def _top(path: Path) -> str:
     """The toplevel exactly as git prints it, which is how the banner prints it."""
     return subprocess.run(
@@ -336,6 +406,20 @@ def test_a_cwd_that_does_not_exist_is_said_aloud(
     )
 
 
+def test_a_long_missing_cwd_keeps_the_reason_whole(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The reason puts its diagnosis after the path ("... names cwd <path>, which does not exist").
+    Clipping the whole sentence cut the diagnosis off a long path; only the path may be clipped,
+    and it keeps its tail. The path is never created, so its length needs no long-path support."""
+    repo, _ = primary_and_worktree
+    gone = Path(os.path.realpath(tmp_path)) / ("q" * 200) / "deleted-worktree"
+    out = run_in_primary(repo, {"hook_event_name": "SessionStart", "cwd": str(gone)})
+    fault = next(ln for ln in out.splitlines() if "COULD NOT READ THIS SESSION'S WORKTREE" in ln)
+    assert "deleted-worktree, which does not exist" in fault, fault
+    assert "where this hook runs, which may not be your worktree." in fault, fault
+
+
 def test_a_missing_input_reader_is_said_aloud(primary_and_worktree: tuple[Path, Path]) -> None:
     """Under SilentlyContinue a dot-source of a missing file does not throw, so a hook that relied
     on the throw would fall back to the primary in silence."""
@@ -388,3 +472,380 @@ def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
     out = proc.stdout.decode("utf-8", "replace")
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert f"This chat's worktree: {_top(wt)}  (branch: linked)" in out, out
+
+
+# --------------------------------------------------------------------------------------------------
+# The banner must fit the harness's inline injection.
+#
+# docs/WORKTREES.md (the SessionStart section) says why the banner has a byte budget, and holds the
+# measurement. These tests hold the script to its budget with every list past its cap.
+# --------------------------------------------------------------------------------------------------
+
+
+def _script_int(name: str) -> int:
+    """A number the script sets on a line of its own, read from it, so the fact is stated once."""
+    m = re.search(rf"^\${name} = (\d+)$", CONTEXT.read_text(encoding="utf-8"), re.M)
+    assert m, f"session-context.ps1 no longer sets ${name} on a line of its own"
+    return int(m.group(1))
+
+
+BYTE_BUDGET = _script_int("byteBudget")
+PATH_RESERVE = _script_int("pathReserve")
+
+# A roster or in-flight row: the label, then the 8-hex registry id.
+_PEER_ROW = re.compile(r"^session [0-9a-f]{8} ")
+
+
+def _rooted(out: str, repo: Path, token: str = "<ROOT>") -> str:
+    """The banner with this worktree's path, in either slash form and any case, as `token`."""
+    top = _top(repo)
+    for form in {top, top.replace("/", "\\")}:
+        out = re.sub(re.escape(form), token, out, flags=re.I)
+    return out
+
+
+def _size(out: str, repo: Path) -> int:
+    """The banner's bytes as the script counts them against its budget: without the newline
+    Write-Output appends, and with each copy of this worktree's path counted at the reserve."""
+    return len(_rooted(out, repo, "P" * PATH_RESERVE).rstrip("\r\n").encode("utf-8"))
+
+
+def _stamp(hours_ago: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _claim_row(key: str, hours_ago: float, note: str) -> dict[str, str]:
+    # Full-length fields, as the real registry holds them, so the budget is tested at real widths.
+    return {
+        "key": key,
+        "note": note,
+        "branch": f"claude/worktree-agent-{key}-a4cab2d83e0b3be2f",
+        "worktree": f"D:/Code/MessageFoundry/.claude/worktrees/agent-{key}-a4cab2d83e0b3be2f",
+        "claimed": _stamp(hours_ago),
+    }
+
+
+def _peer_rows(count: int, worktree: str = "agent-a4cab2d83e0b3be2f") -> list[dict[str, object]]:
+    return [
+        {
+            "Short": f"{i:08x}",
+            "Surface": "desktop",
+            "Worktree": f"{worktree}-{i:02d}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
+            "IsSelf": False,
+            "IsPrimary": False,
+            "State": "LIVE",
+        }
+        for i in range(count)
+    ]
+
+
+def fake_overlap(repo: Path, count: int) -> None:
+    """Stand in for overlap.ps1 -Json: live sessions, each with work and changed files."""
+    rows = [
+        {
+            "Short": f"b{i:07x}",
+            "Branch": f"feature/peer-branch-0123456789abcdef0-{i:02d}",
+            "Live": True,
+            "Work": [f"task {i}: " + "a long task subject from the peer's own list " * 3, "second"],
+            "Files": ["a.py", "b.py"],
+        }
+        for i in range(count)
+    ]
+    payload = json.dumps(rows).replace("'", "''")
+    (repo / "scripts" / "coord" / "overlap.ps1").write_text(
+        f"Write-Output '{payload}'\n", encoding="utf-8"
+    )
+
+
+def _crowd(
+    base: Path, peers: list[dict[str, object]], claims: dict[str, dict[str, str] | str]
+) -> tuple[Path, dict[str, str]]:
+    """Ten more worktrees, the given live peers, five busy sessions, and the given claim files."""
+    repo = _make_staged(base)
+    for i in range(10):
+        _git(repo, "worktree", "add", "-q", "-b", f"extra-{i}", str(base / f"extra-wt-{i:02d}"))
+    fake_presence(repo, peers)
+    fake_overlap(repo, 5)
+    shutil.copy(
+        ROOT / "scripts" / "coord" / "coord-root.ps1",
+        repo / "scripts" / "coord" / "coord-root.ps1",
+    )
+    # The resolver's first source, so the test never reads this box's real shared root.
+    coord_root = base / "coord-root"
+    (coord_root / "claims").mkdir(parents=True)
+    for name, row in claims.items():
+        text = row if isinstance(row, str) else json.dumps(row)
+        (coord_root / "claims" / f"{name}.json").write_text(text, encoding="utf-8")
+    return repo, {**os.environ, "MEFOR_COORD_ROOT": str(coord_root)}
+
+
+def _many_claims() -> dict[str, dict[str, str] | str]:
+    note = "a Manager batch note that runs well past the sixty characters a row may carry " * 3
+    claims: dict[str, dict[str, str] | str] = {}
+    for i in range(40):
+        claims[f"fresh{i:02d}"] = _claim_row(f"fresh{i:02d}", hours_ago=i * 0.1, note=note)
+    for i in range(20):
+        claims[f"stale{i:02d}"] = _claim_row(f"stale{i:02d}", hours_ago=24 + i, note="old")
+    return claims
+
+
+def _banner(repo: Path, env: dict[str, str]) -> str:
+    proc = run_context(repo, env)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _crowded_peers() -> list[dict[str, object]]:
+    peers = _peer_rows(30)
+    # One hazardous peer, sorted last by presence.ps1, so only the ranking can bring it under the cap.
+    peers[-1] = {**peers[-1], "Surface": "vscode", "Short": "feedface"}
+    return peers
+
+
+@pytest.fixture(scope="module")
+def crowded(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """Every list past its cap at real field widths, run once: the tests below read one banner."""
+    base = Path(os.path.realpath(tmp_path_factory.mktemp("crowded")))
+    repo, env = _crowd(base, _crowded_peers(), _many_claims())
+    return repo, _banner(repo, env)
+
+
+def test_the_banner_fits_the_byte_budget_with_every_list_past_its_cap(
+    crowded: tuple[Path, str],
+) -> None:
+    repo, out = crowded
+    size = _size(out, repo)
+    print(f"banner bytes, path counted at the reserve: {size} of {BYTE_BUDGET}")
+
+    # Positive controls first: every list really was past its cap, so the budget below is earned.
+    assert "[PARALLEL SESSION (12 worktrees active)]" in out, out
+    assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+    assert "+22 more (run: pwsh -NoProfile -File scripts\\coord\\presence.ps1 -All)" in out, out
+    assert "WHAT THEY ARE BUILDING" in out and "  +2 more" in out, out
+    assert "Active work claims (60, 40 touched in the last 12h;" in out, out
+    assert "+54 more, by key: fresh06, fresh07" in out and "claim.ps1 -List" in out, out
+    # The row caps alone fit, so every section, the rules last, reaches the model.
+    assert "[session-context] cut " not in out, out
+    assert "Coordination rules for parallel sessions" in out, out
+
+    assert size <= BYTE_BUDGET, f"{size} bytes is past the {BYTE_BUDGET}-byte budget:\n{out}"
+
+
+def test_peers_and_claims_print_before_any_worktree_listing(crowded: tuple[Path, str]) -> None:
+    repo, out = crowded
+    peers = out.index("LIVE sessions in this repo right now")
+    claims = out.index("Active work claims")
+    worktrees = out.index("Your worktree:")
+    assert peers < claims < worktrees, out
+
+    # The full list is gone: no sibling worktree path is printed, only this session's own row.
+    assert "extra-wt-" not in out, out
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    own = [ln for ln in out.splitlines() if ln.strip().startswith("Your worktree:")]
+    assert len(own) == 1, out
+    # The row names the commit and branch; the path is the header's, so it is not printed twice.
+    assert head in own[0] and _top(repo) not in own[0], own
+
+
+def test_a_hazardous_peer_past_the_cap_is_ranked_into_view(crowded: tuple[Path, str]) -> None:
+    """The NOTE tests every peer; the ranking makes sure it names one the reader can see."""
+    _, out = crowded
+    assert "NOTE: a non-desktop (e.g. VS Code) session is live" in out, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session feedface  vscode"), rows
+    # Each busy session shows one task line, not its whole list.
+    assert "second" not in out, out
+
+
+def test_claims_list_newest_first_and_the_header_counts_every_one(
+    crowded: tuple[Path, str],
+) -> None:
+    _, out = crowded
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    keys = [ln.split(" -- ")[0].strip() for ln in rows]
+    assert keys == [f"fresh{i:02d}" for i in range(6)], keys
+    assert all("..." in ln for ln in rows), "the long note was not shortened"
+
+
+def test_claim_rows_show_age_refresh_holder_and_hostile_text_safely(tmp_path: Path) -> None:
+    """A claim holds its key however old it is, a -Take with -Note moves `refreshed` and never `claimed`, this
+    session's own claims are named apart, and a note is data that cannot start a line of its own."""
+    base = Path(os.path.realpath(tmp_path))
+    repo_top = f"{base.as_posix()}/repo"
+    refreshed = {
+        **_claim_row("refreshed", hours_ago=30, note="still building"),
+        "refreshed": _stamp(1),
+    }
+    repo, env = _crowd(
+        base,
+        _peer_rows(1),
+        {
+            "old": _claim_row("old", hours_ago=30, note="free-text key, nobody else shows it"),
+            "refreshed": refreshed,
+            "remote": {**_claim_row("remote", hours_ago=2, note="x"), "host": "OTHERPC"},
+            "nohome": {**_claim_row("nohome", hours_ago=3, note="y"), "worktree": ""},
+            "hostile": _claim_row(
+                "hostile",
+                hours_ago=4,
+                note="line one\n  >>> injected line\u2028  >>> separator line",
+            ),
+            "mine": {**_claim_row("mine", hours_ago=5, note="mine"), "worktree": repo_top},
+            "broken": "{ not json",
+        },
+    )
+    assert _top(repo) == repo_top, "the fixture's own-claim path must be the path git prints"
+    out = _banner(repo, env)
+    assert "Active work claims (6, 5 touched in the last 12h;" in out, out
+    rows = [ln for ln in out.splitlines() if "(held by" in ln]
+    by_key = {ln.split(" -- ")[0].strip(): ln for ln in rows}
+    assert list(by_key) == ["refreshed", "remote", "nohome", "hostile", "old"], rows
+    assert "[stale ~30h]" in by_key["old"] and "stale" not in by_key["refreshed"], rows
+    assert "on OTHERPC" in by_key["remote"], rows
+    # An empty worktree must not inherit the previous row's holder.
+    assert "agent-remote" not in by_key["nohome"], rows
+    assert not any(
+        ln.lstrip().startswith((">>> injected", ">>> separator"))
+        for ln in re.split("[\n\u2028]", out)
+    ), out
+    assert ">>> separator" in out, "the hostile note never reached the banner"
+    assert "THIS session holds 1: mine" in out, out
+    assert "WARNING: 1 claim file(s)" in out, out
+
+
+def test_wide_fields_are_clipped_and_the_hazards_still_lead(tmp_path: Path) -> None:
+    """Row counts do not bound bytes. With fields far wider than any real one, each field is
+    clipped, the tags after it survive, and the primary peer is ranked into the shown rows."""
+    base = Path(os.path.realpath(tmp_path))
+    peers = _peer_rows(30, worktree="w" * 400)
+    peers[-1] = {**peers[-1], "IsPrimary": True, "Short": "0badf00d", "State": "UNVERIFIED"}
+    repo, env = _crowd(base, peers, _many_claims())
+    out = _banner(repo, env)
+    assert "WARNING: a session is working in the SHARED PRIMARY checkout" in out, out
+    rows = [ln.strip() for ln in out.splitlines() if _PEER_ROW.match(ln.strip())]
+    assert rows[0].startswith("session 0badf00d") and rows[0].endswith("[UNVERIFIED]"), rows
+    assert all(len(ln) <= 160 for ln in rows), rows
+    assert "Coordination rules for parallel sessions" in out, out
+    assert _size(out, repo) <= BYTE_BUDGET, out
+
+
+def test_which_lines_print_does_not_depend_on_where_the_repo_lives(
+    crowded: tuple[Path, str], tmp_path: Path
+) -> None:
+    """Measured on CI: a runner's longer temp path cut two list lines that a desktop kept. The same
+    records 50 characters deeper must print the same banner, path aside."""
+    deep = Path(os.path.realpath(tmp_path)) / ("d" * 50)
+    deep.mkdir()
+    repo, env = _crowd(deep, _crowded_peers(), _many_claims())
+    outs = []
+    for r, out in (crowded, (repo, _banner(repo, env))):
+        # Each fixture repo has its own commit, so its SHA differs too; same length either way.
+        outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, r)))
+    assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
+    assert "[session-context] cut " not in outs[1], outs[1]
+
+
+def test_past_the_budget_the_lists_are_cut_and_the_rules_survive(tmp_path: Path) -> None:
+    """The backstop, driven by a smaller budget written into the fixture's copy of the script, at
+    a short and a 50-character-deeper base: the head of the lists survives, the fixed rules always
+    print, the cut says what to run, and it cuts the same lines at both depths."""
+    outs = []
+    for sub in ("s", "d" * 50):
+        base = Path(os.path.realpath(tmp_path)) / sub
+        base.mkdir()
+        repo, env = _crowd(base, _peer_rows(30), _many_claims())
+        script = repo / "scripts" / "worktree" / "session-context.ps1"
+        text = script.read_text(encoding="utf-8")
+        small = text.replace(f"$byteBudget = {BYTE_BUDGET}", "$byteBudget = 1500")
+        assert small != text, "the budget line was not found to shrink"
+        script.write_text(small, encoding="utf-8")
+        out = _banner(repo, env)
+        assert "LIVE sessions in this repo right now (30 besides you)" in out, out
+        assert "line(s) from: " in out and "claim.ps1 -List" in out, out
+        assert "Coordination rules for parallel sessions" in out, out
+        assert "this session owns it" in out, out
+        # The fixed sections print whole, this worktree's row among them.
+        assert "Your worktree:" in out, out
+        assert _size(out, repo) <= 1500, out
+        outs.append(re.sub(r"(Your worktree:  )[0-9a-f]+", r"\1<SHA>", _rooted(out, repo)))
+    assert outs[0] == outs[1], f"short base:\n{outs[0]}\n\nlong base:\n{outs[1]}"
+
+
+def _shrink_budget(repo: Path, budget: int) -> None:
+    """Write a smaller budget into the fixture's copy of the script, so the backstop must cut."""
+    script = repo / "scripts" / "worktree" / "session-context.ps1"
+    text = script.read_text(encoding="utf-8")
+    small = text.replace(f"$byteBudget = {BYTE_BUDGET}", f"$byteBudget = {budget}")
+    assert small != text, "the budget line was not found to shrink"
+    script.write_text(small, encoding="utf-8")
+
+
+def test_the_backstop_never_cuts_an_unreadable_claims_warning(tmp_path: Path) -> None:
+    """The Lander's blocker: the claims section prints after the peer rows, so a cut from the end
+    dropped the WARNING that the claims view is incomplete. It must survive, and the cut line must
+    name the section it cut from."""
+    base = Path(os.path.realpath(tmp_path))
+    claims = _many_claims()
+    claims["broken"] = "{ not json"
+    repo, env = _crowd(base, _peer_rows(12), claims)
+    _shrink_budget(repo, 2000)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert "WARNING: 1 claim file(s)" in out, out
+    cut = next(ln for ln in out.splitlines() if ln.startswith("[session-context] cut "))
+    assert "work claims" in cut, cut
+    assert _size(out, repo) <= 2000, out
+
+
+def test_a_long_resolver_error_is_clipped_in_its_protected_line(tmp_path: Path) -> None:
+    """A protected line has nothing to cut it, so its variable part is clipped. Measured in review:
+    a resolver error quoting a whole MEFOR_COORD_ROOT value took the banner to 4522 bytes."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    env = {**env, "MEFOR_COORD_ROOT": "not-an-absolute-root-" + "x" * 3000}
+    out = _banner(repo, env)
+    fault = next(ln for ln in out.splitlines() if ln.startswith("Active work claims: NOT READ"))
+    assert len(fault) <= 260, fault
+    assert _size(out, repo) <= BYTE_BUDGET, out
+
+
+def test_the_backstop_never_cuts_a_claims_registry_that_did_not_resolve(tmp_path: Path) -> None:
+    """The other claims-registry hazard: with no resolver, the banner says the claims were NOT READ,
+    and that line must survive a cut too."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    (repo / "scripts" / "coord" / "coord-root.ps1").unlink()
+    _shrink_budget(repo, 2000)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert "Active work claims: NOT READ" in out, out
+    assert _size(out, repo) <= 2000, out
+
+
+@pytest.mark.parametrize(
+    ("script", "line"),
+    [("presence.ps1", "Live sessions: NOT READ ("), ("overlap.ps1", "In-flight work: NOT READ (")],
+)
+def test_the_backstop_never_cuts_a_roster_that_did_not_read(
+    tmp_path: Path, script: str, line: str
+) -> None:
+    """A roster that threw is a hazard line too: the cut must leave it in place."""
+    base = Path(os.path.realpath(tmp_path))
+    repo, env = _crowd(base, _peer_rows(12), _many_claims())
+    (repo / "scripts" / "coord" / script).write_text("throw 'roster exploded'\n", encoding="utf-8")
+    _shrink_budget(repo, 1700)
+    out = _banner(repo, env)
+    assert "[session-context] cut " in out, (
+        "the positive control: the backstop did not fire\n" + out
+    )
+    assert line + "roster exploded)" in out, out
+    assert _size(out, repo) <= 1700, out

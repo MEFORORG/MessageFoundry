@@ -27,6 +27,7 @@ from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry,
 from messagefoundry.logging_setup import (
     SyslogForward,
     _build_queued_forwarder,
+    _build_syslog_handler,
     _ForwardQueueHandler,
     _ForwardQueueListener,
     _open_forward_spool,
@@ -525,8 +526,9 @@ def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
 def test_a_transient_connect_failure_is_still_deferred(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The control for the test above: a refused connect IS deferred, so that test's refusal to
-    defer is about the error class, not about deferral being broken."""
+    """The control for ``test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred``: a
+    refused connect IS deferred, so that test's refusal to defer is about the error class, not about
+    deferral being broken."""
     monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
     installed = configure_logging(
         "INFO",
@@ -540,6 +542,118 @@ def test_a_transient_connect_failure_is_still_deferred(
     )
     assert installed is True
     assert "not reachable yet" in capsys.readouterr().out
+
+
+def _first_lookup_of_the_collector_fails(
+    monkeypatch: pytest.MonkeyPatch, answer: list[Any]
+) -> list[object]:
+    """Fail the first lookup of ``siem.example.org`` with a transient ``gaierror``, answer later
+    ones with ``answer``, and pass any other host to the real lookup. Returns that host's lookups."""
+    real_getaddrinfo = socket.getaddrinfo
+    lookups: list[object] = []
+
+    def _getaddrinfo(host: object, *args: Any, **kwargs: Any) -> Any:
+        if host != "siem.example.org":
+            return real_getaddrinfo(host, *args, **kwargs)  # type: ignore[arg-type]
+        lookups.append(host)
+        if len(lookups) == 1:
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
+        return answer
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    return lookups
+
+
+@pytest.mark.parametrize("tls", [False, True], ids=["tcp", "tls"])
+def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
+    monkeypatch: pytest.MonkeyPatch, tls: bool
+) -> None:
+    """On CPython 3.14.9 the stdlib constructor swallows the first lookup, and our constructor's
+    retry looks the name up again, through the class's own ``createSocket``. The spy on
+    ``_TimeoutSysLogHandler.createSocket`` shows the retry ran that override; for TLS, the wrap
+    record shows the TLS override ran and wrapped the socket for the configured server name, and
+    that the handler kept the wrapped socket. The socket's timeout is checked as an outcome only:
+    the stdlib's ``createSocket`` applies the same value. The retry's lookup answers with a
+    loopback listener, so no name is resolved."""
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    real_create = _TimeoutSysLogHandler.createSocket
+    creates: list[object] = []
+
+    def _counting_create(self: _TimeoutSysLogHandler) -> None:
+        creates.append(self)
+        real_create(self)
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _counting_create)
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        port = server.getsockname()[1]
+        lookups = _first_lookup_of_the_collector_fails(
+            monkeypatch,
+            [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))],
+        )
+        wrapped: list[tuple[Any, str]] = []
+
+        class _Wrapped:
+            """What the fake context hands back, so the handler is seen to keep it."""
+
+            def __init__(self, sock: Any) -> None:
+                self.sock = sock
+
+            def gettimeout(self) -> float | None:
+                return float(self.sock.gettimeout())
+
+            def close(self) -> None:
+                self.sock.close()
+
+        class _RecordingContext:
+            def wrap_socket(self, sock: Any, server_hostname: str) -> Any:
+                wrapped.append((sock, server_hostname))
+                return _Wrapped(sock)
+
+        common: dict[str, Any] = {
+            "address": ("siem.example.org", port),
+            "socktype": socket.SOCK_STREAM,
+            "timeout": 1.0,
+            "defer_connect": True,
+        }
+        handler = (
+            _TlsSysLogHandler(
+                **common,
+                ssl_context=_RecordingContext(),  # type: ignore[arg-type]
+                server_hostname="collector.example.org",  # not the address host
+            )
+            if tls
+            else _TimeoutSysLogHandler(**common)
+        )
+        try:
+            assert len(lookups) == 2  # the swallowed lookup, then the retry
+            assert creates == [handler, handler]  # both through our override, the retry included
+            assert handler.startup_error is None
+            assert handler.socket is not None
+            assert handler.socket.gettimeout() == 1.0
+            if tls:
+                assert isinstance(handler.socket, _Wrapped)
+                assert wrapped == [(handler.socket.sock, "collector.example.org")]
+        finally:
+            handler.close()
+
+
+def test_a_udp_lookup_that_answers_on_the_retry_returns_a_handler_with_a_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The UDP arm builds the plain stdlib handler and retries in ``_build_syslog_handler``. A retry
+    that answers must hand back that handler, open, with its socket."""
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    lookups = _first_lookup_of_the_collector_fails(
+        monkeypatch,
+        [(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("127.0.0.1", 514))],
+    )
+    handler = _build_syslog_handler(SyslogForward(host="siem.example.org", port=514))
+    try:
+        assert len(lookups) == 2  # the swallowed lookup, then the retry
+        assert getattr(handler, "socket", None) is not None
+        assert handler.socktype == socket.SOCK_DGRAM
+    finally:
+        handler.close()
 
 
 def test_a_send_error_that_is_not_a_network_error_is_never_counted_as_sent(

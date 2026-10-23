@@ -187,7 +187,15 @@ def _run(cmd: list[str]) -> int:
     # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
     # working directory back on the children's sys.path, which -P keeps off it.
     env = hook_environment(engine_environment())
-    return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - fixed argv, no shell
+    # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
+    # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
+    # interpreter and its child flags, some fixed and some repeated from this process's own flags
+    # and environment. From the caller: the lock path (a workflow, the scaffolded audit-pin job or
+    # a person names it; security.yml's released-line audit names it after the release tag it read
+    # the lock at), and every argument after the lock, passed through to pip-audit. The temporary
+    # copy's path is a fresh directory under $RUNNER_TEMP, or the system temp folder, then that
+    # lock's file name. Each is one argv item, and each path follows -r as its value.
+    return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - argv list, no shell
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:
