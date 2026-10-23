@@ -69,6 +69,7 @@ def repo(tmp_path: Path) -> Path:
     git(r, "config", "user.name", "t")
     shutil.copy2(SEAT, r / "scripts" / "coord" / "seat.ps1")
     shutil.copy2(MAILKEY, r / "scripts" / "coord" / "mail-key.ps1")
+    shutil.copy2(MAILKEY.parent / "coord-root.ps1", r / "scripts" / "coord" / "coord-root.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")

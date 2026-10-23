@@ -365,8 +365,10 @@ jobs:
           # importorskip-skipping (BACKLOG #2084). Without it a paramiko bump could reword a message a
           # fix matches on, and CI would stay green. MEFOR_REQUIRE_SFTP_EXTRA on the pytest step arms
           # tests/test_sftp_extra_on_ci_leg.py, which fails if this extra is dropped.
-          # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
-          # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
+          # + the browser ops console as a second editable wheel (Option B) so the tests under tests/
+          # that import messagefoundry_webconsole (test_webconsole_mount.py and others) run on this
+          # full-suite leg. The console's own suite, packaging/messagefoundry-webconsole/tests/, runs
+          # in its own job further down.
           # It is NOT a published extra yet (would break uv lock), so install it by path.
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
 
@@ -1434,9 +1436,9 @@ jobs:
       # correctness rather than speed -- see the next paragraph.
       #
       # THE SPEEDUP HAS A STRUCTURAL CEILING, AND IT IS NOT THE CORE COUNT. `--dist loadfile` cannot
-      # beat total-over-longest-bucket, and `test_webui.py` alone collects 293 of the 644 tests -- 46
-      # percent, counted in-tree. That single bucket is most of the 2:20, which is why `-n 8` bought
-      # nothing: the pole
+      # beat total-over-longest-bucket, and `test_webui.py` alone collected 293 of the 644 tests -- 46
+      # percent, counted in-tree at the time. That single bucket is most of the 2:20, which is why
+      # `-n 8` bought nothing: the pole
       # does not care how many workers are idle beside it. Two consequences. The local box's 20 cores
       # make its 4 workers contention-free, so a 4-vCPU hosted runner realises LESS than 1.563x -- but
       # core count is not the binding constraint, the pole is. And future growth landing in
@@ -1446,6 +1448,11 @@ jobs:
       # So this ratio establishes the DIRECTION and confirms the worker count, never the hosted
       # duration, and no cap below is sized from it.
       #
+      # `test_webui.py` NO LONGER EXISTS. Engine PR 2403 (2026-10-17) split it into nine
+      # `test_webui_*.py` files, and `test_suite_file_balance.py` now fails any one file holding more
+      # than the share of the collected tests that file sets. Every `test_webui.py` count in this note
+      # and the re-derivations describes the one file before that split; none is re-measured here.
+      #
       # `--dist loadfile`, NOT the faster `--dist load`, AND THE GAP IS BOUGHT ON PURPOSE. The measured
       # gap is 38 seconds -- 1:41 against 1:03 -- and it belongs to the FLAGLESS pair above, because
       # `--dist load` was never re-run under this step's own flags once it had been rejected. Do not
@@ -1453,9 +1460,14 @@ jobs:
       #
       # TWO REASONS, AND A THIRD THAT WAS WITHDRAWN UNDER MEASUREMENT. First, parity: `loadfile` is the
       # spelling the engine step already uses, so the two suites cannot drift into two parallelism
-      # models. Second, `loadfile` keeps a file's tests on ONE worker, so any within-file ordering or
-      # shared state a test author relied on still holds -- a class-level safety property, claimed as
-      # nothing more.
+      # models. Second, `loadfile` keeps a file's tests on ONE worker, so any within-file ordering a
+      # test author relied on still holds -- claimed as nothing more. It does NOT isolate state: a
+      # worker runs several files in one process, so a module-level global one file mutates is seen
+      # by the next file on that worker. Engine PR 2403 hit exactly that once `test_webui.py` was
+      # split: registry tests' synthetic `_UI_WRITE_ACTIONS` rows reached
+      # `test_golden_surface.py` on the same worker and turned it red. The console conftest's autouse
+      # snapshot of that registry is the fix; shared state needs that kind of fixture, not a
+      # `--dist` mode.
       #
       # THE WITHDRAWN REASON IS KEPT BECAUSE IT IS THE INSTRUCTIVE ONE. This note first argued that
       # `--dist load` would splinter the SESSION-scoped `rate_table` fixture in
@@ -1851,19 +1863,24 @@ jobs:
       # same fraction reads as suite cost, not one slow image; the gap over the test count says the
       # tests added cost more than the average one. If that pace holds, about 1.7 percent a day,
       # windows-2022's daily p90 (6:11) reaches its 8:28 red line in about 19 days and ubuntu's (5:01)
-      # its 6:56 line about the same time. Both p90s come from the partial day of 2026-10-17. The growth lever is still the one named above,
-      # and nobody has pulled it. One local run on a 20-core box, at this step's flags on main
-      # 679ff8331, says why it is the lever: 1053 passed in 3:02 wall, and `test_webui.py` held 2:53 of
-      # the 8:29 of summed test time, 34 percent, on one worker. So that file is the step's critical
-      # path, and splitting it is what would shorten the wall. One run on a different machine is a
+      # its 6:56 line about the same time. Both p90s come from the partial day of 2026-10-17, and
+      # from the pace before the split, so the projection is not re-measured. The growth lever was
+      # the one named above; engine PR 2403 pulled it the same day, after this note was written. One
+      # local run on a 20-core box, at this step's flags on main 679ff8331, said why it was the lever: 1053 passed in 3:02 wall, and `test_webui.py` held 2:53 of
+      # the 8:29 of summed test time, 34 percent, on one worker. So that file was the step's critical
+      # path, and splitting it was what would shorten the wall. One run on a different machine is a
       # pointer, not a hosted measurement.
       #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
-      # pays rather than one it avoids. `test_webui.py`'s TOTP helper mints a code only when 3s of the
-      # 30s step remain, and `[auth].totp_skew_steps` defaults to 0. Its bucket does not contend with
-      # ITSELF under `--dist loadfile`, but it now contends with three sibling workers on a 4-vCPU
-      # runner. If MFA enrolment starts flaking here, this paragraph is the first place to look, and
-      # the lever is that helper's margin -- not the worker count, which the arithmetic above needs.
+      # pays rather than one it avoids. `test_webui_account.py`'s TOTP helper,
+      # `_totp_not_near_a_step_boundary`, waits out the step before minting a code when fewer than 3s
+      # of the 30s step remain, and `[auth].totp_skew_steps` defaults to 0. Its bucket does not
+      # contend with ITSELF under `--dist loadfile`, but it now contends with three sibling workers on
+      # a 4-vCPU runner. If MFA enrolment starts flaking here, this paragraph is the first place to
+      # look. In that file the lever is that helper's margin -- not the worker count, which the
+      # arithmetic above needs. At least four other console files mint codes another way, by holding
+      # the `totp` clock (`_ui_clients.held_totp_code`, `test_ui_mfa_gate.py`'s `_pin_totp_clock`),
+      # and have no margin to turn; a flake there points at the held-clock helper instead.
       #
       # A ROTTING RECORD NOW LEAVES THE STEP LOG (BACKLOG #1842). The second re-derivation's rows
       # rotted in three days: merge-group run 36531560700 reddened windows-2022 at 4:44 against the
@@ -3013,7 +3030,15 @@ jobs:
     # on push (both halves of the no-per-merge-run guard live there — see its comment) and on
     # schedule, where the first arm below already covers the run.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, NOT ubuntu-latest, which now resolves to Ubuntu 26.04 on some runners. There the
+    # ODBC install step below failed against packages.microsoft.com (curl 403 / apt "no longer
+    # signed"; merge-group job 119911749652). The cause is NOT established on a runner. A dev-box
+    # probe on 2026-10-22 found the 26.04 repo published, and found the step's downloaded key unused:
+    # prod.list names signed-by the image's own /usr/share/keyrings/microsoft-prod.gpg. Unpin only
+    # after this step has gone green on a 26.04 runner. At least load-test-sqlserver here and
+    # baseline-sqlserver in benchmark.yml point here; tests/test_ci_odbc_installer_pipefail.py holds
+    # every job that fetches a Microsoft Ubuntu prod.list on this label.
+    runs-on: ubuntu-24.04
     # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
     # from cancelling the 2022 leg (and vice-versa). The `changes` path-filter still gates this on PRs, so
@@ -3960,7 +3985,8 @@ jobs:
     # Server functional coverage stays in `sqlserver-store` (nightly + server-DB-PR path-gate). NOT
     # required; ci-gate treats skip as pass.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    # ubuntu-24.04 for the ODBC install from packages.microsoft.com; why is at sqlserver-store above.
+    runs-on: ubuntu-24.04
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent. Digest-pinned; why, and how to
     # move a digest, is at the sqlserver-store matrix above.

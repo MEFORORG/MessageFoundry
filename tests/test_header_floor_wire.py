@@ -985,10 +985,6 @@ def _sets_transport(self: Any) -> None:
     self.transport = None
 
 
-def _sets_default_headers(self: Any) -> None:
-    self.default_headers = []
-
-
 def _sets_nothing(self: Any) -> None:
     pass
 
@@ -1001,15 +997,22 @@ async def _sends_500(self: Any) -> None:
     pass
 
 
+#: What uvicorn's request cycle assigns that the floor reads or writes: the 500's headers, and the
+#: three the parser's 400 reads or sets so a running app writes nothing after it.
+_CYCLE_ATTRS = ("default_headers", "disconnected", "message_event", "response_complete")
+
+
 def _fake_http(monkeypatch: pytest.MonkeyPatch, drop: str | None) -> type[Any]:
     """An HTTP protocol shaped like uvicorn's with ``drop`` removed, in a registered module, so the
     floor looks up its cycle class the way it looks up uvicorn's."""
     cycle_members: dict[str, Any] = {
         "__module__": _FAKE_MODULE,
-        "__init__": _sets_nothing if drop == "default_headers" else _sets_default_headers,
+        "__init__": _init_assigning(*(attr for attr in _CYCLE_ATTRS if attr != drop)),
         # uvicorn's is a coroutine; a plain method in its place is the moved hook.
         "send_500_response": _writes if drop == "send_500_response" else _sends_500,
     }
+    if drop != "send":
+        cycle_members["send"] = _sends_500
     module = ModuleType(_FAKE_MODULE)
     if drop != "RequestResponseCycle":
         module.RequestResponseCycle = type("RequestResponseCycle", (), cycle_members)  # type: ignore[attr-defined]
@@ -1131,6 +1134,11 @@ def test_a_sans_io_base_missing_a_hook_is_refused(
         ("RequestResponseCycle", "RequestResponseCycle in its module"),
         ("send_500_response", "send_500_response coroutine"),
         ("default_headers", "default_headers attribute"),
+        ("disconnected", "disconnected attribute"),
+        ("message_event", "message_event attribute"),
+        ("response_complete", "response_complete attribute"),
+        # The anchor the three flags above are checked against.
+        ("send", "send in any class body"),
     ],
 )
 def test_an_http_base_missing_a_hook_is_refused(

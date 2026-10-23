@@ -345,7 +345,7 @@ are not assessed as shipped code, because R8 declined the option that would have
 **`scripts/service/measure-store-access.ps1` is in, by owner ruling of 2026-10-05.** That ruling is
 R1 of `docs/security/ASVS-OWNER-RULINGS-2026-10-05-112.md`, in the vault. It replaced a Manager's
 reading under R3 of the 2026-10-02 file, and that file's R3 text still puts the script out. The
-earlier reading rested on `docs/DANGEROUS-FUNCTIONALITY.md`, which calls the script *"A CI
+earlier reading rested on `docs/DANGEROUS-FUNCTIONALITY.md`, which then called the script *"A CI
 measurement, not a deployment step"*. The option the owner chose said its writer had not read that
 reason. The ruling governs all the same, and reopening it is the owner's call. The script sits
 under `scripts/service/`, so the scope sentence above covers it with no exception. A cell graded

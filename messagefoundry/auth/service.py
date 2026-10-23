@@ -148,7 +148,12 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
-from messagefoundry.store.base import AdminStore, store_call_errors, store_open_errors
+from messagefoundry.store.base import (
+    AdminStore,
+    audit_write_errors,
+    store_call_errors,
+    store_open_errors,
+)
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -247,31 +252,15 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
 
 
 @cache
-def _audit_write_errors() -> tuple[type[Exception], ...]:
-    """What a refused audit write raises, at least on the store backends and key modes named here
-    (BACKLOG #2137).
-
-    :func:`~messagefoundry.store.base.store_call_errors`: the drivers' own errors, ``RuntimeError``
-    for the engine's own refusals (the acquire timeout, a keyless audit append), ``OSError`` for a
-    connection lost at the socket, and ``ValueError``, which aiosqlite raises for a closed
-    connection before sqlite3 is reached. And ``CipherError``, which a ``vault_transit`` store
-    raises when Transit cannot compute the audit-chain MAC (ADR 0138). A caller re-raises
-    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first where a bug must not read as a
-    refusal. Built on first use, because naming a server driver imports it; an ``AuthService`` that
-    runs the reconciler builds it at construction, so that import never runs on the event loop in
-    the middle of a store incident."""
-    return (CipherError, *store_call_errors())
-
-
-@cache
 def _session_write_errors() -> tuple[type[Exception], ...]:
     """What a refused session read or write raises, at least on the store backends named there
     (BACKLOG #3023): :func:`~messagefoundry.store.base.store_open_errors`, which takes the drivers'
     own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
     ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
-    than :func:`_audit_write_errors`, which also takes every ``RuntimeError`` and ``CipherError``: a
-    session row's seal is a local HMAC, so no Transit call can refuse it, and an engine
-    ``RuntimeError`` other than the acquire timeout still reads as a defect."""
+    than :func:`~messagefoundry.store.base.audit_write_errors`, which also takes every
+    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: a session
+    row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
+    other than the acquire timeout still reads as a defect."""
     return store_open_errors()
 
 
@@ -3321,14 +3310,16 @@ class AuthService:
         #: behind it nor another refused row.
         self._reconcile_unkeyed_refused: dict[str, None] = {}
         if self.directory_reconcile_enabled:
-            # Built now, at startup, so a reconciler's first refused audit write does not import
-            # the server drivers on the event loop (see `_audit_write_errors`). The same for the
-            # rename refresh's holder re-read, which catches `_session_write_errors` (#3070).
-            _audit_write_errors()
+            # Built now, at startup, so the rename refresh's first refused holder re-read, which
+            # catches `_session_write_errors` (#3070), does not import the server drivers on the
+            # event loop.
             _session_write_errors()
         # The same for the soft catches that read store_call_errors (a refused enrolment's revoke,
-        # the step-up refusal's session read), whichever plane meets a store fault first.
+        # the step-up refusal's session read), whichever plane meets a store fault first, and for
+        # every audit write that catches `audit_write_errors`, the API's alert-rules row among them
+        # (#3403).
         store_call_errors()
+        audit_write_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -4663,7 +4654,7 @@ class AuthService:
             )
             try:
                 await self._load_user_by_username(username)
-            except _audit_write_errors():
+            except audit_write_errors():
                 _log.exception("sign-in refusal: the account could not be read again to report it")
 
         after_pad.append(report)
@@ -9151,9 +9142,9 @@ class AuthService:
         pass would return no plan, and the lifespan task would raise no alert for the revocations
         already applied, nor for the hold, the breaker, the referral, the probe fault, the
         configuration refusal or a paging refusal. It would also skip every account after this
-        one. So a store refusal of a type :func:`_audit_write_errors` names is logged at ERROR,
-        naming the action and the actor, and the pass goes on. Any other error still raises and
-        ends the pass. The log line is the only record of a refused row: nothing retries it.
+        one. So a store refusal of a type :func:`~messagefoundry.store.base.audit_write_errors`
+        names is logged at ERROR, naming the action and the actor, and the pass goes on. Any other
+        error still raises and ends the pass. The log line is the only record of a refused row: nothing retries it.
 
         A revocation or rename these rows record has already committed; the conflict row records a
         rename that was refused. A revocation's notice is sent inline, so it still goes. **A
@@ -9170,7 +9161,7 @@ class AuthService:
             message="directory reconcile: the %s audit row for %s could not be written; the pass "
             "goes on",
             args=lambda: (action, scrub_log_argument(actor)),
-            errors=_audit_write_errors(),
+            errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
 
@@ -10022,7 +10013,7 @@ class AuthService:
         ref = token_hash[:_SESSION_REF_LEN]
         try:
             await self._store.revoke_session(token_hash)
-        except _audit_write_errors():
+        except audit_write_errors():
             _log.exception("a session row that failed its integrity seal could not be revoked")
         if key_changed:
             _log.info(
@@ -10052,7 +10043,7 @@ class AuthService:
             log=_log,
             message="the %s audit row for a refused authority row could not be written",
             args=(AUTHORITY_SEAL_FAILED_ACTION,),
-            errors=_audit_write_errors(),
+            errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
         if self._integrity_alert is not None:
@@ -12811,7 +12802,7 @@ class AuthService:
             # cancellation can land after the store committed the revoke, and the row then says
             # ``session_ended: false`` for a session that did end.
             rotated = hash_token(elevation.token)
-            refused = (*store_call_errors(), CipherError)
+            refused = audit_write_errors()
             session_ended = False
             try:
                 session_ended = await write_audit_soft(
@@ -14623,7 +14614,7 @@ class AuthService:
                 log=_log,
                 message="could not write the %s audit row for a refused %s by %s",
                 args=(CREDENTIAL_ISSUE_REFUSED_ACTION, op, actor),
-                errors=_audit_write_errors(),
+                errors=audit_write_errors(),
                 defects=(),
             )
             raise
@@ -15807,7 +15798,7 @@ class AuthService:
             log=_log,
             message="could not write the %s audit row for a refused save by %s",
             args=(CHANNEL_SCOPE_CHANGE_REFUSED_ACTION, actor),
-            errors=_audit_write_errors(),
+            errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
 
@@ -15873,9 +15864,9 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self) -> int:
-        """Revoke every unrevoked session held by an enabled directory account, lapsed ones
-        included. Returns the number revoked, which is the ``sessions_revoked`` the two map audit
-        rows record; it counts rows, not live sessions.
+        """Revoke every unrevoked session held by an enabled directory account whose record passes
+        its seal, lapsed ones included. Returns the number revoked, which is the
+        ``sessions_revoked`` the two map audit rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
         the group maps resolve to role sets and to channel scope, which is exactly what an
@@ -15891,11 +15882,15 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Enumerates with ``list_users`` filtered on provider and disabled, then revokes each
-        account's unrevoked rows, so this needs no schema change on any backend. The count it
-        returns includes rows already past their limits, which the revoke ends too. Unlike the
-        reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
-        a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
+        Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
+        :meth:`_load_users`: every enabled directory account whose record passes its seal. An
+        account that fails its seal is reported by :meth:`_verified` and left out, and so are its
+        sessions. On a keyless store there is no seal to check, so no account is left out. Each
+        account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
+        needs no schema change on any backend. The count it returns includes rows already past their
+        limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
+        mass-revoke breaker: that breaker exists to catch a directory the engine cannot read, and
+        this is an administrator's own step-up-gated edit.
         """
         revoked = 0
         for user_id in sorted(await self.sessions_ended_by_ad_map_save()):

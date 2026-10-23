@@ -53,18 +53,29 @@ if ($PSCmdlet.ParameterSetName -eq 'State' -and
 
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 
-function Get-CoordRoot {
-    $c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $c) { throw 'not inside a git repository' }
-    return (Join-Path $c.Trim() 'mefor-coord')
+# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+$coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
+if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was written.")
+    exit 2
 }
+. $coordRootScript
+$thisHost = Get-CoordHost
+
+# Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
+# and an error refuses rather than writing a level into a local copy nobody else reads.
+$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+if ($sharedResolved.Error) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
+    exit 2
+}
+$claimsDirShared = Join-Path $sharedResolved.Path 'claims'
 
 function Get-ClaimHash([string]$Worktree) {
     # Hash of the claim KEYS this worktree holds. Used ONLY to invalidate a stated number when the
     # claim set moves -- never to derive one. The test runs one way: it can make a number stale, and
     # it can never make a stale number look fresh.
-    $coord = Get-CoordRoot
-    $dir = Join-Path $coord 'claims'
+    $dir = $claimsDirShared
     if (-not (Test-Path -LiteralPath $dir)) { return '' }
     $want = $Worktree.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     $keys = @()
@@ -75,6 +86,8 @@ function Get-ClaimHash([string]$Worktree) {
         if (-not $w) { continue }
         $w = $w.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($w -ne $want) { continue }
+        # The same path on another PC is another tree (docs/COORD-SHARED-ROOT.md). No host is this one.
+        if (-not (Test-CoordRecordIsHere $d)) { continue }
         $keys += $f.BaseName
     }
     if ($keys.Count -eq 0) { return 'none' }
@@ -86,16 +99,21 @@ function Get-ClaimHash([string]$Worktree) {
 
 $worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
-$coord    = Get-CoordRoot
-$lanesDir = Join-Path $coord 'lanes'
+$lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
-
-New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $rec = $null
 if (Test-Path -LiteralPath $file) {
     try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
+}
+# THE BOX KEY IS A PATH, AND TWO PCs CAN SHARE A PATH. On a shared root the record at this key may
+# be another machine's lane. Taking it over would overwrite that lane's stated level with this one's,
+# so a write refuses and says so; -Show only reads, so it prints the record as it is. A record with no
+# `host` was written here, as every record before the field was.
+if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $file is the lane record of $(Get-CoordRecordHost $rec), whose worktree has the same path as this one. Nothing was written.")
+    exit 2
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
@@ -109,9 +127,46 @@ if (-not $rec) {
 }
 
 if ($Show) {
-    $rec | ConvertTo-Json -Depth 5
+    # -SHOW IS A STRICT READ. Its callers may hold only read access to the root, so it creates no
+    # directory and writes no file. (The resolver's down cache is the one exception, and it lives in
+    # this clone's own .git, never on the root.) It prints what ONE read of the record found, so the
+    # record and its `absent` reason cannot come from two reads that a restatement landed between.
+    # The read above keeps no reason, which is why this one stands alone. A found record prints as it
+    # is; otherwise the blank record above prints with `absent` saying why, so an unstated lane never
+    # reads as a stated one.
+    $shown = $null
+    $absent = $null
+    try {
+        $shown = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
+            $absent = "the lane record at $file is not a JSON object"
+        }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $absent = if (Test-Path -LiteralPath $lanesDir -PathType Container) { "no lane record at $file" }
+                  else { "no lanes directory found at $lanesDir, so this root holds no lane record" }
+    } catch {
+        $absent = "the lane record at $file could not be read: $($_.Exception.Message)"
+    }
+    if ($absent) {
+        # A FRESH blank record, never $rec: $rec may hold what the earlier read found, so a restatement
+        # between the two reads would print a stated level beside an `absent` reason. The fields
+        # match the blank record above; fold the two together once that read keeps its reason.
+        $shown = [pscustomobject]@{
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            statedFree = $null; statedInFlight = $null; statedUtc = $null
+            statedBySessionId = $null; statedNote = ''
+            tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
+            tipNow = ''; claimHashNow = ''; lastTurnUtc = $null
+            promptedUtc = $null; promptCount = 0; askedByDispatcherUtc = $null
+            absent = $absent
+        }
+    }
+    $shown | ConvertTo-Json -Depth 5
     exit 0
 }
+
+# Made here, on the write path only, so -Show above creates nothing.
+New-Item -ItemType Directory -Force -Path $lanesDir, $tmpDir | Out-Null
 
 $nowUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
@@ -160,6 +215,8 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
+# docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
+$rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
 $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json')
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline

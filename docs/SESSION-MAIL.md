@@ -8,8 +8,11 @@ peer are therefore structurally unreachable by it, not merely hard to reach: a s
 **VS Code extension**, which is never entered into that map at all, and a session under a **different
 login**, whose config root is independent.
 
-Session mail is the async lane for exactly those two cases. It is a **file drop** under
-`<git-common-dir>/mefor-coord/mail/`, written by [`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1)
+Session mail is the async lane for exactly those two cases. It is a **file drop** under the
+coordination root's `mail/`: `<git-common-dir>/mefor-coord/mail/` by default, or the shared root's
+`mail/` when one is configured so that both PCs reach it ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROOT.md);
+[`scripts/coord/coord-root.ps1`](../scripts/coord/coord-root.ps1) resolves it). Paths below that say
+`mefor-coord/mail/` mean that root. It is written by [`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1)
 and delivered into a recipient's context by the [`scripts/hooks/mail-drain.ps1`](../scripts/hooks/mail-drain.ps1)
 hook.
 
@@ -151,6 +154,11 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
 
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
+- `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
+  registry holds a readable record for it. **Use this for a seat on another PC**: its worktree path
+  does not exist here, so the path form cannot reach it. **Not yet handled:** a seat id is derived
+  from the worktree path, so two PCs with a worktree at the SAME path share one seat id and one
+  mailbox, and mail to it reaches whichever PC drains first.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
 - `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
@@ -330,6 +338,15 @@ independently of the thing it bounds is not a bound; `Measure-BodyBytes` now mea
 The metadata caps are not decoration: a cap on the body alone is a cap with an obvious bypass, since an
 unbounded `from.branch` pushes the preamble off the top of the injection just as effectively as an
 unbounded body would.
+
+**A `[SESSION-ANNOUNCE]` broadcast renders as one line.** An audit of 196 mailed messages found 85 were
+announces. The drain puts the claimed worktree, branch, intent, touching and sent time on one `    | `
+line marked `[UNVERIFIED]`. The usual id delimiters stay. Two lines are dropped: the tag line, whose
+worktree and branch the sender fields already carry, and a final `via:` envelope line. Anything the
+shortcut cannot render that way renders in full instead. That covers at least another kind, extra text
+on the tag line, an unknown or repeated field, text after `via:`, a line the line cap cut, a summary
+over 400 characters, and an HL7-shaped line. The
+selection pass still charges the full body, so the caps above stay an upper bound.
 
 **Where the numbers come from.** These anchors were measured in this repo on 2026-08-05. The
 per-injection **total** is not one of them: it is derived from the other caps, `5 * (2000 + 560)`, so

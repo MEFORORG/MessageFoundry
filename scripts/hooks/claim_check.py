@@ -69,11 +69,13 @@ nothing changes: the registry is this repository's own, exactly as it has always
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 # WHICH `#N` IN A SUBJECT IS A BACKLOG CITATION (BACKLOG #1347). `(BACKLOG #71, #72)` is the house
 # form: the prefix appears ONCE and the siblings after it are bare, so a BACKLOG token governs every
@@ -215,6 +217,45 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
 #: including ones sitting beside a different engine tree or none at all.
 _CLAIMS_ROOT_KEY = "mefor.claimsRoot"
 
+# WHERE SHARED COORDINATION STATE LIVES is scripts/coord/coord_root.py, loaded by path. Installed, it
+# sits beside this file in the git hooks directory (install-git-hooks.ps1 copies both); in the repo it
+# is ../coord/coord_root.py. A gate that cannot load it refuses rather than guess a local path.
+_COORD_ROOT_CANDIDATES = (
+    Path(__file__).resolve().with_name("coord_root.py"),
+    Path(__file__).resolve().parent.parent / "coord" / "coord_root.py",
+)
+_coord_root_module: ModuleType | None = None
+
+
+def _coord_root() -> ModuleType:
+    """``coord_root.py``, loaded once by path. Raises ClaimRegistryError when neither copy loads."""
+    global _coord_root_module
+    if _coord_root_module is not None:
+        return _coord_root_module
+    tried: list[str] = []
+    for candidate in _COORD_ROOT_CANDIDATES:
+        tried.append(str(candidate))
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("_mefor_coord_root", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before it runs, because its dataclass looks its own module up while it is defined.
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except (OSError, SyntaxError, ImportError):
+            sys.modules.pop(spec.name, None)
+            continue
+        _coord_root_module = mod
+        return mod
+    raise ClaimRegistryError(
+        "coord_root.py could not be loaded, so the claim registry cannot be located. Tried: "
+        + ", ".join(tried)
+        + ". Re-run scripts/coord/install-git-hooks.ps1."
+    )
+
 
 class GitReadError(RuntimeError):
     """git could not answer, so nothing downstream may treat its silence as an answer."""
@@ -331,8 +372,12 @@ def _claims_dir(repo: str) -> tuple[Path, str | None]:
             raise ClaimRegistryError(str(exc)) from exc
         if not host:
             raise ClaimRegistryError(f"'{shared}' is not a git repository")
-    common = _git("-C", host, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common) / "mefor-coord" / "claims", (host if shared else None)
+    # The hop above decides WHICH clone's configuration names the root; the resolver decides where
+    # that clone's claims live, which may be the shared root. An error refuses, never falls back.
+    resolved = _coord_root().resolve("claims", host)
+    if resolved.error is not None or resolved.path is None:
+        raise ClaimRegistryError(resolved.error or "no claims directory")
+    return resolved.path, (host if shared else None)
 
 
 def _repo() -> str:
@@ -527,10 +572,11 @@ def main() -> int:
             f"  {_safe_for_message(exc)}\n"
             f"  Where this gate looks is decided by {_CLAIMS_ROOT_KEY}: set, it names another\n"
             f"  repository whose registry serves this one; unset, the registry is this repository's\n"
-            f"  own. That read failed. The gate refuses rather than fall back to a registry nothing\n"
-            f"  writes, where every claim would read as absent and a misconfigured pointer would\n"
-            f"  present as an honestly unclaimed item.\n"
-            f"  Check it, then commit again:\n"
+            f"  own. That repository's claims may then live on a shared root, named by\n"
+            f"  MEFOR_COORD_ROOT or by mefor-coord/root.toml (docs/COORD-SHARED-ROOT.md). One of\n"
+            f"  those reads failed, or the shared root did not answer. The gate refuses rather than\n"
+            f"  fall back to a registry nothing writes, where every claim would read as absent.\n"
+            f"  Check them, then commit again:\n"
             f"      git config --get {_CLAIMS_ROOT_KEY}\n"
         )
         return 1
@@ -545,6 +591,20 @@ def main() -> int:
                 f"      Another session may already be building it -- that is the duplicate work this\n"
                 f"      gate exists to stop. Claim it, then commit again:\n"
                 f"          {take}"
+            )
+            continue
+        if not _coord_root().record_is_here(claim):
+            # Another machine's claim, whatever its path says (docs/COORD-SHARED-ROOT.md). This
+            # machine cannot tell whether that holder is alive, so it prints no -Force remedy.
+            problems.append(
+                f"  BACKLOG #{item} is claimed on ANOTHER machine:\n"
+                f"      held by: {_safe_for_message(claim.get('worktree'))} "
+                f"[{_safe_for_message(claim.get('branch'))}] on "
+                f"{_safe_for_message(_coord_root().record_host(claim))}\n"
+                f"      since  : {_safe_for_message(claim.get('claimed'))}\n"
+                f"      note   : {_safe_for_message(claim.get('note'))}\n"
+                f"      Do not build it in parallel. That holder is not checkable from here; ask on\n"
+                f"      that machine, or ask the owner."
             )
             continue
         if _norm(str(claim.get("worktree", ""))) != me:

@@ -14,16 +14,20 @@ on the deny/allow decision, so the contract under test is the one Claude Code ac
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import json
+import re
 import shutil
 import subprocess
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 
-from tests._spawn_lock import run_single
+from tests._spawn_lock import run_single, single_spawn
 
 GATE = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "worktree_gate.ps1"
 
@@ -293,6 +297,70 @@ def test_nested_first_party_worktree_is_allowed(primary: Path, repos_file: Path)
     """git nests `claude --worktree` worktrees INSIDE the primary's path; they are worktrees, not the primary."""
     worktree = primary / ".claude" / "worktrees" / "wt-1" / "src" / "app.py"
     assert run_gate(edit(worktree, cwd=primary), repos_file) is None
+
+
+#: Each is a directory INSIDE the primary, not under its .claude/worktrees/. A culture-sensitive StartsWith
+#: ignores these characters, so it read each one as the nested-worktree prefix and exempted it.
+_INVISIBLE_LOOKALIKES = [
+    ".claude/worktrees\u200b/wt-1",  # zero-width space
+    ".claude/work\u00adtrees/wt-1",  # soft hyphen
+    ".claude\u200d/worktrees/wt-1",  # zero-width joiner
+]
+
+
+def test_the_host_collation_premise_holds() -> None:
+    """The lookalike tests below are only discriminating where PowerShell's culture StartsWith ignores
+    these characters and trips on a combining mark. Without ICU (invariant globalization) culture equals
+    ordinal, every one of them passes against a gate missing either half, and this says so."""
+    probe = (
+        "$z=('c:/r/.claude/worktrees'+[char]0x200b+'/x').StartsWith('c:/r/.claude/worktrees/'); "
+        "$m=('c:/r/'+[char]0x301+'a').StartsWith('c:/r/'); "
+        'Write-Output "$z $m"'
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+        capture_output=True,
+        text=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    if proc.stdout.strip() != "True False":
+        pytest.skip(f"culture comparison on this host is not ICU's ({proc.stdout.strip()!r})")
+
+
+@pytest.mark.parametrize("lookalike", _INVISIBLE_LOOKALIKES)
+def test_an_invisible_character_does_not_reach_the_nested_worktree_exemption(
+    primary: Path, repos_file: Path, lookalike: str
+) -> None:
+    target = primary.joinpath(*lookalike.split("/"), "src", "app.py")
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+@pytest.mark.parametrize("lookalike", _INVISIBLE_LOOKALIKES)
+def test_an_invisible_character_does_not_exempt_a_dispatch_cwd(
+    primary: Path, repos_file: Path, lookalike: str
+) -> None:
+    """Rule 2 asks the same function about the session's cwd."""
+    cwd = primary.joinpath(*lookalike.split("/"))
+    assert_denied(run_gate(dispatch(cwd, "Agent", "general-purpose"), repos_file))
+
+
+def test_a_combining_mark_after_the_root_does_not_hide_a_write_into_the_primary(
+    primary: Path, repos_file: Path
+) -> None:
+    """The culture StartsWith is FALSE here and the ordinal one true, so the governed test needs both.
+    The directory is inside the primary, so the write must be denied."""
+    target = primary / "\u0301a" / "app.py"
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+def test_a_lookalike_of_the_primary_itself_stays_governed(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The culture half of the governed test, kept on purpose: rules 1 and 3 answer through it, and
+    without it a write into a lookalike of the primary, denied today, would be allowed."""
+    _require_culture_premise()
+    lookalike = tmp_path / (primary.name + "\u200b") / "src" / "app.py"
+    assert_denied(run_gate(edit(lookalike, cwd=primary), repos_file))
 
 
 def test_relative_path_is_resolved_against_cwd_then_denied(primary: Path, repos_file: Path) -> None:
@@ -680,10 +748,24 @@ def test_other_dispatches_from_the_primary_stay_denied(
 def test_a_wrong_case_subagent_type_key_is_not_read(primary: Path, repos_file: Path) -> None:
     """A PSCustomObject property read ignores case, so the KEY must be matched ordinally too: the Agent
     tool would ignore SUBAGENT_TYPE and fall back to its default type, which has Bash. This covers a
-    lone wrong-case key only. A payload carrying both spellings makes ConvertFrom-Json throw, and the
-    gate's parse fails open for every rule; that predates this exemption."""
+    lone wrong-case key only; the next test covers both spellings at once."""
     payload = dispatch(primary, "Agent", "web-fetch", key="SUBAGENT_TYPE")
     assert_denied(run_gate(payload, repos_file))
+
+
+@pytest.mark.parametrize(
+    "shadow", [{"SUBAGENT_TYPE": "general-purpose"}, {"Subagent_Type": "web-fetch"}]
+)
+def test_both_spellings_of_subagent_type_are_denied_as_unparseable(
+    primary: Path, repos_file: Path, shadow: dict[str, str]
+) -> None:
+    """PowerShell 7's ConvertFrom-Json refuses keys that differ only by case, and that refusal used to
+    exit 0 for every rule. The gate does not judge such a payload by its rules: it denies it as
+    unparseable, so neither spelling can hide the other."""
+    payload = dispatch(primary, "Agent", "web-fetch")
+    payload["tool_input"].update(shadow)
+    reason = assert_denied(run_gate(payload, repos_file))
+    assert "could not parse" in reason
 
 
 def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -> None:
@@ -844,11 +926,277 @@ def test_missing_allowlist_file_is_off(tmp_path: Path, primary: Path) -> None:
     assert run_gate(edit(primary / "x.py", primary), tmp_path / "nope.txt") is None
 
 
-@pytest.mark.parametrize("junk", ["", "not json", "[]", '{"tool_name": "Edit"}'])
-def test_malformed_input_fails_open(repos_file: Path, junk: str) -> None:
+@pytest.mark.parametrize("junk", ["", "[]", '{"tool_name": "Edit"}'])
+def test_input_that_parses_but_names_nothing_governed_fails_open(
+    repos_file: Path, junk: str
+) -> None:
     """A guardrail that wedges every tool call on a bad payload gets uninstalled, and then it guards
-    nothing. Every error path must allow."""
+    nothing. Input that parses, or is empty, but carries no governed field is allowed. Input that does
+    not parse is an exception, below."""
     assert run_gate(junk, repos_file) is None
+
+
+_UNPARSEABLE = [
+    "not json",
+    '{"tool_name": "Edit", ',
+    '{"tool_name": "Edit"} trailing',
+    '{"tool_name": "Edit", "tool_input": {"": 1}}',  # ConvertFrom-Json refuses an empty key
+]
+
+
+@pytest.mark.parametrize("junk", _UNPARSEABLE)
+def test_unparseable_input_is_denied(repos_file: Path, junk: str) -> None:
+    """The gate cannot tell whether a call it cannot parse is governed, so it must not allow it."""
+    reason = assert_denied(run_gate(junk, repos_file))
+    assert "could not parse" in reason
+
+
+@pytest.mark.parametrize("off", ["comments-only", "missing"])
+def test_unparseable_input_is_allowed_when_the_gate_is_off(
+    tmp_path: Path, empty_repos: Path, off: str
+) -> None:
+    """The allowlist is still the kill switch: with nothing governed, a parse failure denies nothing.
+    Both off-states, since "delete the allowlist" is the documented instant off."""
+    allowlist = empty_repos if off == "comments-only" else tmp_path / "nope.txt"
+    assert run_gate(_UNPARSEABLE[0], allowlist) is None
+
+
+# --- hook input is UTF-8, whatever the console code page -------------------------------------------
+
+#: The byte read's guard, byte for byte. ``console_reader_gate`` turns it off, which leaves the
+#: [Console]::In fallback as the only reader: the gate as it read its input before.
+_BYTE_READ_GUARD = "if ([Console]::IsInputRedirected) {"
+
+#: Named by code point, so no invisible character sits in this file. Each ends, in UTF-8, in a byte
+#: that cp932 reads as a lead byte, except E_ACUTE (C3 A9), which cp932 reads as two single bytes.
+E_ACUTE = chr(0xE9)
+A_ACUTE = chr(0xC1)  # C3 81
+ZWSP = chr(0x200B)  # E2 80 8B
+
+_windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="console code pages are a Windows concept"
+)
+#: Each console case makes two launches, and each can wait in single_spawn before it starts, so the
+#: suite's --timeout=60 would fire before the labelled diagnostic in _run_gate_in_console could.
+_two_launch_budget = pytest.mark.timeout(300)
+#: The ordinal section's tests make up to five launches: the premise probe (once per worker), the
+#: shipped gate, one or two controls, and a further shipped run. Each is bounded by GATE_TIMEOUT_S and
+#: can wait in single_spawn first, so the suite's --timeout=60 would fire before any labelled
+#: diagnostic could. 300s is the console budget, kept rather than re-derived.
+_multi_launch_budget = pytest.mark.timeout(300)
+
+
+def _rebuilt_gate(dst: Path, old: str, new: str, why: str, *more: tuple[str, str]) -> Path:
+    """The shipped gate with ``old`` replaced by ``new``, and each further (old, new) pair in turn,
+    for a control. Each rewrite is ASSERTED to have happened: a pattern that silently matched nothing
+    would produce a control byte-identical to the gate under test, and the pair would then agree for
+    the wrong reason."""
+    src = GATE.read_text(encoding="utf-8")
+    for before, after in ((old, new), *more):
+        assert src.count(before) == 1, f"{why}: {before!r}"
+        src = src.replace(before, after)
+    dst.write_text(src, encoding="utf-8")
+    return dst
+
+
+@pytest.fixture
+def console_reader_gate(tmp_path: Path) -> Path:
+    """The gate reading through [Console]::In alone: the gate as it read its input before."""
+    return _rebuilt_gate(
+        tmp_path / "worktree_gate_console_reader.ps1",
+        _BYTE_READ_GUARD,
+        "if ($false) {",
+        "the byte read's guard moved; fix _BYTE_READ_GUARD rather than deleting the control",
+    )
+
+
+def _gate_stdout_in_console(gate: Path, raw: bytes, repos_file: Path, codepage: int) -> bytes:
+    """Run ``gate`` on raw stdin bytes in a console of its own set to ``codepage``. Returns the
+    gate's stdout bytes, empty for allow.
+
+    The console is private (CREATE_NO_WINDOW), because chcp sets the page of a whole console and
+    pytest's is shared with its xdist siblings; tests/test_coord_alloc_floor.py has the incident. A
+    bare chcp in that console reports its page first: a host that cannot take the page skips, and a
+    launch that never reached it cannot pass for the wrong reason. A launch that never returns is
+    labelled as run_gate labels it (BACKLOG #1304), after its whole process tree is killed, since
+    cmd sits between this process and pwsh."""
+    if sys.platform != "win32":  # the callers' skipif already skips; this line tells mypy
+        pytest.skip("Windows only")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    # shell=True for cmd's own quoting; the list form hands pwsh the quotes as part of the filename.
+    with single_spawn():
+        proc = subprocess.Popen(
+            f"chcp {codepage} >nul && chcp"
+            f' && pwsh -NoProfile -NonInteractive -File "{gate}" -ReposFile "{repos_file}"',
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            stdout, stderr = proc.communicate(raw, timeout=GATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=30
+            )
+            proc.kill()
+            dump: tuple[bytes | None, bytes | None]
+            try:
+                dump = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                dump = (exc.stdout, exc.stderr)
+            raise AssertionError(
+                f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304). A process launch "
+                "that never returned, NOT evidence that the gate's behaviour changed; run_gate's "
+                f"docstring says what to do.\nCHILD STDOUT before the kill: {dump[0]!r}\n"
+                f"CHILD STDERR before the kill: {dump[1]!r}\nLAUNCHED {_pwsh_identity()}"
+            ) from exc
+    after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    # Blame chcp only for a move TO its own page: a sibling worker can move this console too.
+    if any(now == codepage != before for before, now in zip(shared, after, strict=True)):
+        restored = kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1])
+        pytest.fail(
+            f"chcp {codepage} reached pytest's shared console, {shared} -> {after} (output, input); "
+            + (
+                "it was put back"
+                if restored
+                else f"putting it back FAILED, {ctypes.get_last_error()}"
+            )
+        )
+    page, _, decision = stdout.partition(b"\n")
+    # A word match, not a suffix: a localized chcp may end its line with a period.
+    if not re.search(rf"\b{codepage}\b".encode(), page):
+        pytest.skip(f"this host's console did not take cp{codepage}: {stdout!r}")
+    assert proc.returncode == 0, stdout + stderr
+    return decision.strip()
+
+
+def _run_gate_in_console(
+    gate: Path, raw: bytes, repos_file: Path, codepage: int
+) -> dict[str, Any] | None:
+    """``_gate_stdout_in_console``, read as Claude Code reads it: UTF-8. The decision must be ASCII,
+    so no output page can change it. Returns the deny object, or None for allow, as ``run_gate``
+    does."""
+    decision = _gate_stdout_in_console(gate, raw, repos_file, codepage)
+    assert decision.isascii(), f"the decision is not ASCII under cp{codepage}: {decision!r}"
+    return json.loads(decision.decode("utf-8")) if decision else None
+
+
+def _raw(payload: dict[str, Any]) -> bytes:
+    """The payload as Claude Code sends it: UTF-8, non-ASCII written as itself, not as \\u escapes."""
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _governed_non_ascii(tmp_path: Path, char: str) -> tuple[Path, bytes]:
+    """An allowlist naming a primary with ``char`` in its name, and a write into that primary."""
+    primary = tmp_path / f"Repo-{char}"
+    allowlist = tmp_path / "repos.txt"
+    allowlist.write_text(f"{primary}\n", encoding="utf-8")
+    return allowlist, _raw(edit(primary / "x.py", primary))
+
+
+@pytest.mark.parametrize("char", [E_ACUTE, ZWSP])
+def test_a_non_ascii_primary_is_governed_on_raw_utf8_input(tmp_path: Path, char: str) -> None:
+    """On every host, whatever its console: raw UTF-8 bytes on stdin, not json.dumps escapes. The
+    console-page cases below are the ones that tell the old reader from the new one."""
+    allowlist, raw = _governed_non_ascii(tmp_path, char)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GATE), "-ReposFile", str(allowlist)],
+        input=raw,
+        capture_output=True,
+        timeout=GATE_TIMEOUT_S,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip(), f"expected a DENY, got allow (stderr: {proc.stderr!r})"
+    assert "could not parse" not in assert_denied(json.loads(proc.stdout))
+
+
+@_windows_only
+@_two_launch_budget
+@pytest.mark.parametrize("codepage", [437, 932])
+@pytest.mark.parametrize("char", [E_ACUTE, ZWSP])
+def test_a_non_ascii_primary_is_governed_whatever_the_console_code_page(
+    tmp_path: Path, console_reader_gate: Path, codepage: int, char: str
+) -> None:
+    """Read through [Console]::In, the path arrived mangled (cp437 reads U+00E9 as two characters,
+    cp932 as two half-width katakana), never matched its allowlist entry, and the write into the
+    primary was allowed. The control is that console reader, and it allows in every case but one:
+    under cp932, U+200B swallows the next `\\`, so the control denies, for the wrong reason."""
+    allowlist, raw = _governed_non_ascii(tmp_path, char)
+    assert "could not parse" not in assert_denied(
+        _run_gate_in_console(GATE, raw, allowlist, codepage)
+    )
+    control = _run_gate_in_console(console_reader_gate, raw, allowlist, codepage)
+    if codepage == 932 and char == ZWSP:
+        assert "could not parse" in assert_denied(control)
+    else:
+        assert control is None, (
+            "the console-reader control denied, so this case does not discriminate"
+        )
+
+
+@_windows_only
+@_two_launch_budget
+@pytest.mark.parametrize("char", [A_ACUTE, ZWSP])
+def test_a_double_byte_code_page_does_not_wedge_an_ungoverned_call(
+    tmp_path: Path, repos_file: Path, console_reader_gate: Path, char: str
+) -> None:
+    """Each character's last UTF-8 byte is a cp932 lead byte, so a `\\` after it was swallowed, the
+    payload stopped parsing, and the parse deny refused a write nowhere near a governed root. That
+    would wedge every such call in every session. Under cp437 the old reader parsed these too, so
+    only cp932 discriminates."""
+    other = tmp_path / f"Other{char}" / "x.py"
+    raw = _raw(edit(other, other.parent))
+    assert _run_gate_in_console(GATE, raw, repos_file, 932) is None
+    control = _run_gate_in_console(console_reader_gate, raw, repos_file, 932)
+    assert "could not parse" in assert_denied(control)
+
+
+def test_a_stdin_read_that_throws_is_denied_not_retried(tmp_path: Path, repos_file: Path) -> None:
+    """Retried through [Console]::In, a read that failed part-way would decode only what it left
+    behind. The control throws where the byte read starts; the call is ungoverned and well formed,
+    so a gate that fell back and read it would allow it."""
+    gate = _rebuilt_gate(
+        tmp_path / "worktree_gate_read_throws.ps1",
+        _BYTE_READ_GUARD,
+        "if ($true) { throw 'simulated read failure' }\n    if ($false) {",
+        "the byte read's guard moved; fix _BYTE_READ_GUARD rather than deleting the control",
+    )
+    other = tmp_path / "Other" / "x.py"
+    assert run_gate(edit(other, other.parent), repos_file) is None
+    assert "could not parse" in assert_denied(run_gate(edit(other, other.parent), repos_file, gate))
+
+
+KATAKANA_SO = chr(0x30BD)  # cp932 writes it as 83 5C, and the 5C is a backslash
+
+
+@_windows_only
+@_two_launch_budget
+@pytest.mark.parametrize("codepage", [437, 932])
+def test_a_deny_quoting_a_non_ascii_primary_reaches_claude_code_whole(
+    tmp_path: Path, codepage: int
+) -> None:
+    """The deny quotes the primary, and Claude Code reads it as UTF-8. Written in the console's
+    output page, cp932 put a stray backslash in the JSON and the deny did not parse, so it decided
+    nothing; cp437 wrote '?' in place of the name. The control is the gate without the escaping."""
+    allowlist, raw = _governed_non_ascii(tmp_path, KATAKANA_SO)
+    name = f"Repo-{KATAKANA_SO}"
+    assert name in assert_denied(_run_gate_in_console(GATE, raw, allowlist, codepage))
+    control = _rebuilt_gate(
+        tmp_path / "worktree_gate_page_output.ps1",
+        " -EscapeHandling EscapeNonAscii",
+        "",
+        "the deny's escaping moved; fix this control rather than deleting it",
+    )
+    out = _gate_stdout_in_console(control, raw, allowlist, codepage)
+    assert out, "the unescaped control allowed, so it says nothing about the output"
+    try:
+        reason = json.loads(out.decode("utf-8"))["hookSpecificOutput"]["permissionDecisionReason"]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reason = ""
+    assert name not in reason, "the unescaped control reached Claude Code whole; no discrimination"
 
 
 # --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
@@ -953,6 +1301,21 @@ def test_a_config_write_to_a_disarm_key_still_denies(
 # isolates this change as the cause rather than asserting it.
 
 
+def _committed_repo(where: Path) -> Callable[..., None]:
+    """A git repository at ``where`` with one commit on ``main``; returns a ``git`` runner there."""
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=where, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "gate@example.invalid")
+    git("config", "user.name", "gate")
+    (where / "f.txt").write_text("one\n", encoding="utf-8")
+    git("add", "f.txt")
+    git("commit", "-qm", "one")
+    return git
+
+
 class HijackRepo(NamedTuple):
     """A governed primary plus two of its linked worktrees: the session's own, and another session's."""
 
@@ -987,16 +1350,7 @@ NON_HEAD_MOVING_VERBS = [
 def hijack_repo(tmp_path: Path) -> HijackRepo:
     primary = tmp_path / "GateRepo"
     primary.mkdir()
-
-    def git(*args: str) -> None:
-        subprocess.run(["git", *args], cwd=primary, check=True, capture_output=True)
-
-    git("init", "-q", "-b", "main")
-    git("config", "user.email", "gate@example.invalid")
-    git("config", "user.name", "gate")
-    (primary / "f.txt").write_text("one\n", encoding="utf-8")
-    git("add", "f.txt")
-    git("commit", "-qm", "one")
+    git = _committed_repo(primary)
     mine = tmp_path / "GateRepo-mine"
     git("worktree", "add", "-q", "-b", "my-branch", str(mine))
     (mine / "sub").mkdir()
@@ -1031,14 +1385,13 @@ def prefix_gate(tmp_path: Path) -> Path:
     control byte-identical to the gate under test, and the pair would then agree for the wrong reason
     -- which is the failure mode a control exists to rule out.
     """
-    src = GATE.read_text(encoding="utf-8")
-    assert src.count(CLASS_B_ASSIGNMENT) == 1, (
+    return _rebuilt_gate(
+        tmp_path / "worktree_gate_prefix.ps1",
+        CLASS_B_ASSIGNMENT,
+        "$hijackHeadMoveVerbs = @()",
         "the class B verb assignment moved or was reformatted, so this control no longer rebuilds "
-        "the pre-#1359 gate. Fix CLASS_B_ASSIGNMENT rather than deleting the control."
+        "the pre-#1359 gate. Fix CLASS_B_ASSIGNMENT rather than deleting the control.",
     )
-    dst = tmp_path / "worktree_gate_prefix.ps1"
-    dst.write_text(src.replace(CLASS_B_ASSIGNMENT, "$hijackHeadMoveVerbs = @()"), encoding="utf-8")
-    return dst
 
 
 @pytest.mark.parametrize(("verb", "args"), CLASS_B_VERBS)
@@ -1338,3 +1691,744 @@ def test_a_HEAD_move_in_an_isolated_builders_own_nested_tree_is_allowed(
         capture_output=True,
     )
     assert run_gate(bash("git merge main", cwd=own), hijack_repos_file) is None
+
+
+# --- path comparisons are ordinal where ordinal denies at least as much ---------------------------
+#
+# A culture comparison ignores a soft hyphen or a zero-width character, so it reads `<p>-wt1<U+00AD>`
+# as `<p>-wt1`. Each test below runs the shipped gate and a control rebuilt with that one comparison
+# put back as it was, and the control is asserted to answer the other way.
+
+SOFT_HYPHEN = chr(0xAD)
+COMBINING_ACUTE = chr(0x301)
+_ORD = "[System.StringComparison]::Ordinal"
+#: A scanner's two readings as shipped, and the control that keeps only origin/main's culture one.
+_BOTH_READINGS = "${name} = @(" + _ORD + ", [System.StringComparison]::CurrentCulture)"
+_CULTURE_READING = "${name} = @([System.StringComparison]::CurrentCulture)"
+
+
+@functools.cache
+def _host_premises() -> tuple[str, str]:
+    """Why the culture controls, and the git-backed lookalike tests, cannot discriminate on this host:
+    (culture reason, git-output reason), each "" when the premise holds. One pwsh launch measures both.
+
+    The controls need the culture comparison to ignore a soft hyphen and a zero-width space, to miss
+    a colon or a prefix before a combining mark, and to read `.m<U+00AD>d` as `.md` and a leading soft
+    hyphen as absent (`<U+00AD>--` is `--`, `<U+00AD>-x` starts with `-`), as ICU does and
+    invariant globalization does not. The git-backed tests also need pwsh to read git's output as
+    UTF-8: it decodes it with [Console]::OutputEncoding, so under cp437 a non-ASCII path git reports
+    arrives garbled, the lookalike is never seen, and the gate and its control agree. That is a defect
+    of its own in the gate, not a premise this branch fixes."""
+    probe = (
+        "$shy=[char]0xAD; $zw=[char]0x200B; $cm=[char]0x301; "
+        "$ok=(('a'+$shy+'b') -eq 'ab') -and (('a'+$zw+'b') -eq 'ab') -and "
+        "(-not ('c:/r/'+$cm+'a').StartsWith('c:/r/')) -and (('x:'+$cm+'y').IndexOf(':') -eq -1) -and "
+        "(('.m'+$shy+'d') -in @('.md')) -and (($shy+'-x').StartsWith('-')) -and "
+        "(($shy+'--') -eq '--'); "
+        'Write-Output "$ok $([Console]::OutputEncoding.CodePage)"'
+    )
+    try:
+        proc = run_single(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True,
+            text=True,
+            timeout=GATE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Labelled as run_gate labels it, so a hung launch is not read as a gate regression.
+        raise AssertionError(
+            f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304), in the premise probe. "
+            "No gate logic ran; see run_gate for what this is and what to do."
+        ) from exc
+    # A failed probe must not read as a host property: an empty stdout would otherwise skip every
+    # control below as "not ICU's", and the suite would stay green with nothing discriminating.
+    assert proc.returncode == 0, f"the premise probe failed: {proc.returncode} {proc.stderr!r}"
+    assert re.fullmatch(r"(True|False) \d+", proc.stdout.strip()), (
+        f"the premise probe printed {proc.stdout!r}, not '<bool> <code page>'"
+    )
+    culture, _, page = proc.stdout.strip().partition(" ")
+    culture_why = (
+        "" if culture == "True" else f"culture comparison here is not ICU's ({proc.stdout!r})"
+    )
+    page_why = (
+        "" if page == "65001" else f"pwsh decodes git's output with code page {page}, not UTF-8"
+    )
+    return culture_why, page_why
+
+
+def _require_culture_premise() -> None:
+    why = _host_premises()[0]
+    if why:
+        pytest.skip(why)
+
+
+def _require_lookalike_premise() -> None:
+    culture_why, page_why = _host_premises()
+    if culture_why or page_why:
+        pytest.skip(culture_why or page_why)
+
+
+class LookalikeRepo(NamedTuple):
+    """A governed primary with two linked worktrees whose paths differ only by a soft hyphen."""
+
+    primary: Path
+    wt1: Path
+    lookalike: Path
+    repos: Path
+
+
+@pytest.fixture
+def lookalike_repo(tmp_path: Path) -> LookalikeRepo:
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    wt1 = tmp_path / "GateRepo-wt1"
+    git("worktree", "add", "-q", "-b", "wt1-branch", str(wt1))
+    lookalike = tmp_path / f"GateRepo-wt1{SOFT_HYPHEN}"
+    git("worktree", "add", "-q", "-b", "other-branch", str(lookalike))
+    repos = tmp_path / "lookalike_repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    return LookalikeRepo(primary=primary, wt1=wt1, lookalike=lookalike, repos=repos)
+
+
+@_multi_launch_budget
+def test_a_head_move_into_a_lookalike_of_the_session_s_own_worktree_is_denied(
+    tmp_path: Path, lookalike_repo: LookalikeRepo
+) -> None:
+    """Rule 3b's own-worktree test. The culture `-eq` read the lookalike, another session's
+    worktree, as this session's own, and allowed `reset --hard` into it."""
+    _require_lookalike_premise()
+    repo = lookalike_repo
+    payload = bash(f'git -C "{repo.lookalike}" reset --hard main', cwd=repo.wt1)
+    reason = assert_denied(run_gate(payload, repo.repos))
+    assert "could not parse" not in reason
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_own_top.ps1",
+        f"[string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, {_ORD})",
+        "(Get-ComparablePath $ownTopRaw) -eq $selfTop",
+        "rule 3b's own-worktree comparison moved",
+    )
+    assert run_gate(payload, repo.repos, control) is None, "the culture control denied too"
+    # The session's real own worktree is still its own.
+    assert run_gate(bash("git reset --hard main", cwd=repo.wt1), repo.repos) is None
+
+
+#: Test-Governed's comparison as shipped, and with its culture half removed: the step the culture
+#: half is kept against. Used only to build controls.
+_GOVERNED_LINE = 'if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or $Candidate.StartsWith("$c/", $ord)) {'
+_GOVERNED_ORDINAL_ONLY = (
+    'if ([string]::Equals($Candidate, $c, $ord) -or $Candidate.StartsWith("$c/", $ord)) {'
+)
+
+
+@_multi_launch_budget
+def test_a_linked_worktree_at_a_lookalike_of_the_primary_is_not_read_as_the_primary(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree at `<primary><U+200B>`. The shipped gate denies a head move into it from
+    another session through rule 3, because Test-Governed keeps its culture half. Rule 3b's primary
+    test is reached only without that half, so both controls drop it: rule 3b with its culture `-eq`
+    read the lookalike as the primary, left it to rule 3, and the move was allowed; ordinal, it is a
+    linked worktree, and the move is denied."""
+    _require_lookalike_premise()
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    lookalike = tmp_path / f"GateRepo{ZWSP}"
+    git("worktree", "add", "-q", "-b", "lookalike-branch", str(lookalike))
+    elsewhere = tmp_path / "GateRepo-elsewhere"
+    git("worktree", "add", "-q", "-b", "elsewhere-branch", str(elsewhere))
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    payload = bash(f'git -C "{lookalike}" reset --hard main', cwd=elsewhere)
+
+    assert_denied(run_gate(payload, repos))
+    why = "Test-Governed's comparison or rule 3b's primary test moved"
+    ordinal_3b = _rebuilt_gate(
+        tmp_path / "gate_ordinal_3b.ps1", _GOVERNED_LINE, _GOVERNED_ORDINAL_ONLY, why
+    )
+    culture_3b = _rebuilt_gate(
+        tmp_path / "gate_culture_3b.ps1",
+        _GOVERNED_LINE,
+        _GOVERNED_ORDINAL_ONLY,
+        why,
+        (f"[string]::Equals($selfTop, $mainWt, {_ORD})", "$selfTop -eq $mainWt"),
+    )
+    assert_denied(run_gate(payload, repos, ordinal_3b))
+    assert run_gate(payload, repos, culture_3b) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+def test_a_worktree_of_a_repo_behind_a_combining_mark_is_governed_by_rule_3d(
+    tmp_path: Path,
+) -> None:
+    """Rule 3d's governed test. A repository inside the governed root whose directory name starts
+    with a combining mark has a common dir the culture StartsWith does not see under the root, so
+    `git worktree remove` of its linked worktree was allowed. The ordinal half sees it."""
+    _require_lookalike_premise()
+    root = tmp_path / "Governed"
+    nested = root / f"{COMBINING_ACUTE}x"
+    nested.mkdir(parents=True)
+    git = _committed_repo(nested)
+    victim = tmp_path / "nested-wt"
+    git("worktree", "add", "-q", "-b", "victim-branch", str(victim))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{root}\n", encoding="utf-8")
+    payload = bash(f'git worktree remove "{victim}"', cwd=elsewhere)
+
+    assert_denied(run_gate(payload, repos))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_3d.ps1",
+        'if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or\n'
+        f'                $victimCmp.StartsWith("$($r.Compare)/", {_ORD})) {{ $govWt = $r; break }}',
+        'if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) '
+        "{ $govWt = $r; break }",
+        "rule 3d's governed test moved",
+    )
+    assert run_gate(payload, repos, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+def test_moving_a_lookalike_of_the_session_s_own_worktree_is_not_called_its_own(
+    tmp_path: Path, lookalike_repo: LookalikeRepo
+) -> None:
+    """Rule 3d's self test, which picks the text only: both deny. The culture `-eq` told the session
+    the lookalike was the worktree it is running in."""
+    _require_lookalike_premise()
+    repo = lookalike_repo
+    payload = bash(f'git worktree move "{repo.lookalike}" ../elsewhere', cwd=repo.wt1)
+    own = "THE WORKTREE THIS SESSION IS RUNNING IN"
+    assert own not in assert_denied(run_gate(payload, repo.repos))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_isself.ps1",
+        f"[string]::Equals($victimTop, $selfTop, {_ORD})",
+        "($victimTop -eq $selfTop)",
+        "rule 3d's self test moved",
+    )
+    assert own in assert_denied(run_gate(payload, repo.repos, control))
+
+
+@_multi_launch_budget
+def test_enter_worktree_from_a_lookalike_of_the_primary_does_not_name_the_primary(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Get-SessionRoot picks the text only: EnterWorktree is denied either way. The culture `-eq`
+    read a directory at `<primary><U+200B>`, which is no worktree of it, as the primary, and handed
+    the reader a command in that checkout."""
+    _require_culture_premise()
+    cwd = tmp_path / f"{primary.name}{ZWSP}"
+    cwd.mkdir()
+    payload = enter_worktree(cwd)
+    cannot = "CANNOT TELL YOU WHICH CHECKOUT"
+    assert cannot in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_session_root.ps1",
+        f"        if ([string]::Equals($CwdCmp, $r.Compare, {_ORD}) -or\n",
+        "        if ($CwdCmp -eq $r.Compare -or\n",
+        "Get-SessionRoot's comparison moved",
+    )
+    assert cannot not in assert_denied(run_gate(payload, repos_file, control))
+
+
+@_multi_launch_budget
+def test_a_stream_suffix_behind_a_combining_mark_is_still_stripped(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Rule 1b's stream strip. The culture IndexOf did not find a colon followed by a combining mark,
+    so `announce/OFF:<U+0301>x.md` kept its suffix, read as a document, and was allowed; NTFS would
+    then create announce/OFF and arm the repo-wide kill switch."""
+    _require_culture_premise()
+    payload = edit(_coord(primary, f"announce/OFF:{COMBINING_ACUTE}x.md"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_colon.ps1",
+        "$colon = $rest.IndexOf([char]':')",
+        "$colon = $rest.IndexOf(':')",
+        "rule 1b's stream strip moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    ("head", "dest", "comparison", "culture"),
+    [
+        # The other worktree is on `dest` minus the soft hyphen: the no-op bail read them as one.
+        (
+            "feat",
+            f"fe{SOFT_HYPHEN}at",
+            "[string]::Equals($dest, $head, " + _ORD + ")",
+            "$dest -eq $head",
+        ),
+        # The primary has `main` checked out: the checked-out-anywhere bail read them as one.
+        (
+            "feature",
+            f"ma{SOFT_HYPHEN}in",
+            "[string]::Equals([string]$_, $destLine, " + _ORD + ")",
+            "[string]$_ -eq $destLine",
+        ),
+    ],
+)
+def test_a_branch_switch_onto_a_lookalike_branch_name_is_denied(
+    tmp_path: Path, head: str, dest: str, comparison: str, culture: str
+) -> None:
+    """Rule 3b class A's two bails compare branch names, and a match allows. A culture comparison
+    ignores the soft hyphen, so another session's worktree was switched onto a different branch."""
+    _require_culture_premise()
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+    git = _committed_repo(primary)
+    victim = tmp_path / "GateRepo-victim"
+    git("worktree", "add", "-q", "-b", head, str(victim))
+    git("branch", dest)
+    mine = tmp_path / "GateRepo-mine"
+    git("worktree", "add", "-q", "-b", "mine-branch", str(mine))
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    payload = bash(f'git -C "{victim}" checkout {dest}', cwd=mine)
+
+    assert_denied(run_gate(payload, repos))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_branch.ps1",
+        comparison,
+        culture,
+        "a class A branch comparison moved",
+    )
+    assert run_gate(payload, repos, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+def test_a_stream_suffix_the_two_searches_disagree_on_stays_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The ordinal colon search alone would strip `handoff/x.md:<U+0301>y` to a document and allow
+    it; the culture search missed that colon, so it was denied. Where the two disagree, it denies."""
+    _require_culture_premise()
+    payload = edit(_coord(primary, f"handoff/x.md:{COMBINING_ACUTE}y"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_ordinal_only_colon.ps1",
+        "$streamUnclear = $colon -ne $rest.IndexOf(':')",
+        "$streamUnclear = $false",
+        "rule 1b's disagreement test moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the ordinal-only control denied too"
+
+
+@_multi_launch_budget
+def test_an_extension_that_only_collates_as_a_document_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Rule 1b's shape backstop. The culture `-notin` read `.m<U+00AD>d` as `.md` and exempted it."""
+    _require_culture_premise()
+    payload = edit(_coord(primary, f"announce/x.m{SOFT_HYPHEN}d"), cwd=primary)
+    assert "new.ps1" not in assert_denied(run_gate(payload, repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_extension.ps1",
+        '[array]::IndexOf([string[]]@(".md", ".txt", ".tsv"), [System.IO.Path]::GetExtension($rest)) -lt 0',
+        '[System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")',
+        "rule 1b's shape backstop moved",
+    )
+    assert run_gate(payload, repos_file, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+def test_a_destination_branch_behind_a_soft_hyphen_is_not_read_as_a_flag(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Rule 3b class A's destination scanner. A culture StartsWith skipped `<U+00AD>-feat` as a flag,
+    found no destination, and allowed the switch of another session's worktree."""
+    _require_culture_premise()
+    branch = f"{SOFT_HYPHEN}-feat"
+    subprocess.run(
+        ["git", "branch", branch], cwd=hijack_repo.primary, check=True, capture_output=True
+    )
+    payload = bash(f'git -C "{hijack_repo.victim}" checkout {branch}', cwd=hijack_repo.mine)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_dest.ps1",
+        _BOTH_READINGS.format(name="destCmps"),
+        _CULTURE_READING.format(name="destCmps"),
+        "class A's destination scanner moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+def test_a_victim_path_behind_a_soft_hyphen_is_not_read_as_a_flag(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Rule 3d's victim scan. A culture StartsWith skipped a path beginning with a soft hyphen and
+    then '-', so no victim was found and `git worktree remove` of another session's tree was
+    allowed."""
+    _require_culture_premise()
+    (hijack_repo.mine / f"{SOFT_HYPHEN}-").mkdir()
+    victim = f"{SOFT_HYPHEN}-/../../{hijack_repo.victim.name}"
+    payload = bash(f'git worktree remove "{victim}"', cwd=hijack_repo.mine)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_victim.ps1",
+        _BOTH_READINGS.format(name="victimCmps"),
+        _CULTURE_READING.format(name="victimCmps"),
+        "rule 3d's victim scan moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    ("ref", "ordinal", "culture"),
+    [
+        # A culture StartsWith read `<U+00AD>-x` as a flag.
+        (
+            f"{SOFT_HYPHEN}-x",
+            _BOTH_READINGS.format(name="headMoveCmps"),
+            _CULTURE_READING.format(name="headMoveCmps"),
+        ),
+        # A culture `-eq` read `<U+00AD>--` as the separator.
+        (
+            f"{SOFT_HYPHEN}--",
+            f"if ([string]::Equals($t, '--', {_ORD})) {{ return $false }}",
+            "if ($t -eq '--') { return $false }",
+        ),
+    ],
+    ids=["flag", "separator"],
+)
+def test_a_reset_target_behind_a_soft_hyphen_still_moves_the_primary_s_head(
+    tmp_path: Path,
+    hijack_repo: HijackRepo,
+    hijack_repos_file: Path,
+    ref: str,
+    ordinal: str,
+    culture: str,
+) -> None:
+    """Test-VerbMovesHead. A culture comparison read a reset target that begins with a soft hyphen
+    as a flag or as `--`, so the reset was classed as moving no HEAD and `--git-dir=<primary>/.git`
+    from outside was allowed."""
+    _require_culture_premise()
+    subprocess.run(["git", "branch", ref], cwd=hijack_repo.primary, check=True, capture_output=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" reset {ref}', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+    control = _rebuilt_gate(
+        tmp_path / "gate_culture_moves_head.ps1",
+        ordinal,
+        culture,
+        "a Test-VerbMovesHead comparison moved",
+    )
+    assert run_gate(payload, hijack_repos_file, control) is None, "the culture control denied too"
+
+
+# --- an ordinal prefix test must not allow what the culture one denied ----------------------------
+#
+# Ordinal Equals matches only identical strings, so where a match allows, it denies at least as much
+# as the culture `-eq`. ORDINAL StartsWith DOES NOT: a combining mark after the prefix makes the
+# culture StartsWith false and the ordinal one true. So `-<U+0301>x` is a flag to the ordinal scanners
+# and a positional to the culture ones that origin/main ran. Each row below is denied by origin/main
+# and was allowed by the first cut of the ordinal scanners.
+
+#: Each class A shape git reads as a branch switch, and the shipped gate must deny from another
+#: session's seat. ``{b}`` is the free branch.
+_CLASS_A_DOUBLE_DASH_SWITCHES = [
+    # A trailing `--` has no pathspec after it, so git switches (pinned below for switch).
+    "checkout {b} --",
+    "checkout {b} -- 2>&1",
+    "checkout {b} -- # note",
+    # `git switch` takes no pathspec at all: `--` only ends its options.
+    "switch {b} --",
+    "switch -- {b}",
+]
+
+
+@pytest.mark.parametrize("tail", _CLASS_A_DOUBLE_DASH_SWITCHES)
+def test_a_double_dash_does_not_let_a_branch_switch_through_class_A(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """Class A bailed on any `--` after the verb, reading it as a file restore, so `git -C <victim>
+    checkout free-branch --` switched another session's worktree."""
+    cmd = f'git -C "{hijack_repo.victim}" ' + tail.format(b="free-branch")
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@pytest.mark.parametrize(
+    ("tool", "tail"),
+    [
+        ("Bash", "checkout free-branch -- &"),
+        ("PowerShell", "checkout free-branch -- *> $null"),
+        ("PowerShell", "checkout free-branch -- *>&1"),
+    ],
+)
+def test_what_follows_a_double_dash_must_be_a_pathspec(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tool: str, tail: str
+) -> None:
+    """A background `&` and PowerShell's all-stream redirections never reach git, so each of these
+    is `checkout <b> --`, a branch switch. Read as a pathspec, they were allowed as a restore."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine, tool=tool), hijack_repos_file))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'checkout "--detach" free-branch',
+        "switch '--detach' free-branch",
+        # main is live in the primary, and the quoted flag switches off git's guard.
+        'checkout main "--ignore-other-worktrees"',
+    ],
+)
+def test_a_quoted_flag_is_still_a_flag_to_class_A(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """The shell strips the quotes, so git reads each as the bare flag. The destination scan took a
+    quoted flag for the destination, and the flag test did not count it."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@pytest.mark.parametrize("tail", ["checkout main --", "switch -- main"])
+def test_a_double_dash_onto_a_branch_live_elsewhere_is_left_to_git(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tail: str
+) -> None:
+    """`main` is checked out in the primary, so git refuses these itself. `--` switches off no
+    guard, so it is not a flag that stops class A deferring to git; denying would print a
+    `new.ps1 -Branch main` that dies with "already checked out"."""
+    cmd = f'git -C "{hijack_repo.victim}" {tail}'
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+    refused = subprocess.run(
+        ["git", "-C", str(hijack_repo.victim), *tail.split()], capture_output=True, text=True
+    )
+    assert refused.returncode != 0 and "already" in refused.stderr, refused.stderr
+
+
+def test_a_double_dash_with_a_pathspec_after_it_is_still_a_restore(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """The bail kept: `checkout <ref> -- <path>` restores files and leaves HEAD where it was."""
+    cmd = f'git -C "{hijack_repo.victim}" checkout free-branch -- f.txt'
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+def test_git_switch_reads_a_double_dash_as_ending_options(tmp_path: Path) -> None:
+    """Why `switch -- <branch>` is on the deny side: git switches, it does not restore."""
+    repo = tmp_path / "SwitchRepo"
+    repo.mkdir()
+    git = _committed_repo(repo)
+    git("branch", "free")
+    git("switch", "-q", "--", "free")
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert head.stdout.strip() == "free"
+
+
+def test_a_repository_token_switch_after_a_double_dash_moves_the_primary_s_head(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Test-VerbMovesHead read `switch -- <branch>` as a restore, so `--git-dir=<primary>/.git`
+    from outside moved the primary's HEAD unrefused."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" switch -- free-branch', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+
+
+#: Directory names that begin with a dash. `-x` is a flag to both readings, so only the token-after-
+#: `--` rule names it; `-<U+0301>` is a flag to the ordinal reading only.
+_DASH_LEADS = ["-x", f"-{COMBINING_ACUTE}"]
+
+
+@pytest.mark.parametrize("lead", _DASH_LEADS, ids=["plain-dash", "dash-then-combining-mark"])
+@pytest.mark.parametrize(
+    "spelling",
+    ['-- "{lead}/../../{victim}"', '--force -- "{lead}/../../{victim}"'],
+    ids=["separator", "flag-then-separator"],
+)
+def test_the_token_after_a_double_dash_is_the_victim_whatever_it_starts_with(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str, lead: str
+) -> None:
+    """Rule 3d's victim scan skipped `-<U+0301>/../../<victim>` as a flag, found no victim, and
+    allowed a removal git performs: after `--` it reads the token as a path. The `-x` row was allowed
+    on origin/main too, and is the one that fails without the token-after-`--` rule on an ICU host."""
+    (hijack_repo.mine / lead).mkdir()
+    cmd = "git worktree remove " + spelling.format(lead=lead, victim=hijack_repo.victim.name)
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@pytest.mark.parametrize("lead", _DASH_LEADS, ids=["plain-dash", "dash-then-combining-mark"])
+def test_git_removes_the_worktree_named_after_a_double_dash(
+    hijack_repo: HijackRepo, lead: str
+) -> None:
+    """Why the rows above are real removals, not refused commands."""
+    (hijack_repo.mine / lead).mkdir()
+    subprocess.run(
+        ["git", "worktree", "remove", "--", f"{lead}/../../{hijack_repo.victim.name}"],
+        cwd=hijack_repo.mine,
+        check=True,
+        capture_output=True,
+    )
+    assert not hijack_repo.victim.exists()
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        # origin/main's culture scan named this token the victim.
+        '"{cm}/../../{victim}"',
+        # origin/main's culture scan skipped the soft-hyphen token and named the next one.
+        '"{shy}" "{victim_abs}"',
+    ],
+    ids=["combining-mark", "soft-hyphen-then-victim"],
+)
+def test_every_reading_of_the_victim_scan_is_judged(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, spelling: str
+) -> None:
+    """The ordinal scan and the culture scan pick different victims here. Each is denied by one of
+    them, so the rule judges both."""
+    _require_culture_premise()
+    cm = f"-{COMBINING_ACUTE}"
+    (hijack_repo.mine / cm).mkdir()
+    cmd = "git worktree remove " + spelling.format(
+        cm=cm,
+        shy=f"{SOFT_HYPHEN}-x",
+        victim=hijack_repo.victim.name,
+        victim_abs=hijack_repo.victim,
+    )
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    ("branch", "args"),
+    [
+        # origin/main's culture scan named `-<U+0301>x` the destination.
+        (f"-{COMBINING_ACUTE}x", f"-{COMBINING_ACUTE}x"),
+        # origin/main's culture scan skipped `<U+00AD>-x` and named free-branch.
+        (None, f"{SOFT_HYPHEN}-x free-branch"),
+    ],
+    ids=["combining-mark", "soft-hyphen-then-branch"],
+)
+def test_every_reading_of_the_destination_scan_is_judged(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, branch: str | None, args: str
+) -> None:
+    """Class A's destination scanner, the same two readings as rule 3d's victim scan."""
+    _require_culture_premise()
+    if branch:
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{branch}", "HEAD"],
+            cwd=hijack_repo.primary,
+            check=True,
+            capture_output=True,
+        )
+    cmd = f'git -C "{hijack_repo.victim}" checkout {args}'
+    assert_denied(run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file))
+
+
+@_multi_launch_budget
+@pytest.mark.parametrize(
+    "args",
+    [f"-{COMBINING_ACUTE}x", f"--hard #{COMBINING_ACUTE}x"],
+    ids=["flag", "comment"],
+)
+def test_every_reading_of_a_reset_s_arguments_is_judged(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path, args: str
+) -> None:
+    """Test-VerbMovesHead. The ordinal reading took `-<U+0301>x` for a flag and `#<U+0301>x` for a
+    comment, so the reset named no commit and `--git-dir=<primary>/.git` was allowed; origin/main's
+    culture reading named a commit and denied."""
+    _require_culture_premise()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git_dir = hijack_repo.primary / ".git"
+    payload = bash(f'git --git-dir="{git_dir}" reset {args}', cwd=elsewhere)
+    assert_denied(run_gate(payload, hijack_repos_file))
+
+
+# --- Test-Governed's nested-worktree exemption: the culture test AND the composed ordinal one -------
+
+
+def test_a_decomposed_spelling_of_the_primary_still_exempts_its_nested_worktrees(
+    tmp_path: Path,
+) -> None:
+    """The culture comparison reads `Re<U+0301>po` as `R<U+00E9>po`, so the governed test matches a
+    decomposed spelling of an allowlisted primary. The ordinal exemption did not, and denied every
+    write into a nested worktree under that spelling: a false deny, the shape that wedges isolated
+    Builders. Composing both sides first restores origin/main's allow."""
+    _require_culture_premise()
+    composed = tmp_path / f"R{E_ACUTE}po"
+    decomposed = tmp_path / f"Re{COMBINING_ACUTE}po"
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{composed}\n", encoding="utf-8")
+    own = decomposed / ".claude" / "worktrees" / "wt-1"
+    assert run_gate(edit(own / "src" / "app.py", cwd=own), repos) is None
+    # The decomposed primary itself stays governed.
+    assert_denied(run_gate(edit(decomposed / "src" / "app.py", cwd=decomposed), repos))
+
+
+def test_a_combining_mark_after_the_worktrees_slash_is_not_exempted(
+    primary: Path, repos_file: Path
+) -> None:
+    """The culture StartsWith misses the exemption prefix before a combining mark, so origin/main
+    denied this write; the ordinal exemption alone allowed it. The exemption needs both."""
+    _require_culture_premise()
+    target = primary / ".claude" / "worktrees" / f"{COMBINING_ACUTE}x" / "app.py"
+    assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+
+
+# ------------------------------------------- rule 1b on the SHARED coordination root
+# docs/COORD-SHARED-ROOT.md moves seats, mail, claims and allocations onto a share both PCs reach. Rule 1
+# never governed that path, so without this a write tool could hand-write claims/<item>.json there: the
+# transfer rule 1b refuses locally. The control (nothing configured -> ALLOW) is what shows the new
+# check is the thing that fires, rather than some older rule.
+
+
+@pytest.fixture
+def shared_root(tmp_path: Path) -> Path:
+    d = tmp_path / "share" / "mefor-coord"
+    d.mkdir(parents=True)
+    return d
+
+
+@pytest.mark.parametrize("rest", ["claims/1032.json", "alloc/adr/0200.json", "seats/wt-1/s1.json"])
+def test_shared_root_registries_are_denied_when_named_by_env(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    target = shared_root / rest
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    assert run_gate(edit(target, cwd=worktree), repos_file) is None  # control: ungoverned before
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    reason = assert_denied(run_gate(edit(target, cwd=worktree), repos_file))
+    assert "SHARED coordination root" in reason
+    assert "new.ps1" not in reason
+
+
+def test_shared_root_named_by_root_toml_is_governed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_COORD_ROOT", raising=False)
+    local = primary / ".git" / "mefor-coord"
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '{shared_root}'\n", encoding="utf-8")
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert_denied(run_gate(edit(shared_root / "claims" / "7.json", cwd=worktree), repos_file))
+
+
+def test_a_document_on_the_shared_root_is_still_allowed(
+    primary: Path, repos_file: Path, shared_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared_root))
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert (
+        run_gate(edit(shared_root / "handoffs" / "RESUME-HERE.md", cwd=worktree), repos_file)
+        is None
+    )

@@ -232,6 +232,7 @@ from messagefoundry.api.security import (
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
+    StandingRefusal,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -248,6 +249,7 @@ from messagefoundry.api.security import (
     public_route,
     quiet_deliberate_export_stops,
     recheck_standing,
+    recheck_standing_or_refusal,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
@@ -277,7 +279,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -456,7 +458,12 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
-from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.base import (
+    ResendError,
+    Store,
+    audit_write_errors,
+    build_store_cipher,
+)
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
@@ -3466,6 +3473,65 @@ async def _record_control_audit(
         channel_id=name if role == "source" else None,
         detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
         client=client,
+    )
+
+
+async def _audit_alert_rules_withheld(
+    request: Request, identity: Identity, shown: int, withheld: int
+) -> None:
+    """Record that ``GET /alerts/rules`` withheld ``withheld`` rules from a channel-scoped caller
+    (BACKLOG #3403). The detail is the two counts, never a rule's contents.
+
+    Not ``auth.channel_denied``: the read was answered, and that action feeds the security-signal
+    denial count, so routine alerts-page loads could raise a denial-burst alert.
+
+    Written fail-soft. The withheld rules stay withheld whether or not the row lands, so a store
+    refusal, and a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` too, is
+    logged at ERROR with its traceback, and the narrowed answer still returns. A fault outside the
+    catch set, :func:`~messagefoundry.store.base.audit_write_errors`, still escapes as a 500. The
+    auth service's own audit writes catch the same set. A cancel that lands during the write waits a
+    bounded time for the row, and a row that still does not land is logged at ERROR with its counts
+    (:func:`_write_through_cancel`). Why the row is not coalesced is in docs/SECURITY.md.
+
+    The row goes through the auth service's store, the one its own audit rows use: only a
+    channel-scoped caller withholds a rule, such a caller exists only when that service is attached,
+    and the engine may not be."""
+    auth = get_auth(request)
+    actor = identity.username
+    if auth is None:
+        _log.error(
+            "GET /alerts/rules showed %d and withheld %d rules from %s with no auth service to "
+            "audit it",
+            shown,
+            withheld,
+            scrub_log_argument(actor),
+        )
+        return
+    store = auth.store
+    client = client_ip(request)
+    detail = json.dumps({"shown": shown, "withheld": withheld})
+    await write_audit_soft(
+        lambda: _write_through_cancel(
+            store.record_audit("alert_rules_withheld", actor=actor, detail=detail, client=client),
+            lambda: (
+                f"{_lost_row('alert_rules_withheld', actor, detail)} "
+                f"client={scrub_log_argument(client or '-')}"
+            ),
+        ),
+        log=_log,
+        # Not the route: the console's alerts page reads the rules through this handler too.
+        message="a read of the alert rules showed %d and withheld %d rules from %s at %s, but its "
+        "audit row failed",
+        args=lambda: (
+            shown,
+            withheld,
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+        ),
+        # (), as write_audit_soft's docstring asks where a raise would replace the answer the
+        # caller owes. A 500 here would also tell a scoped caller that hidden rules exist.
+        defects=(),
+        errors=audit_write_errors(),
     )
 
 
@@ -8799,14 +8865,18 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
-        access. No secrets: the webhook URL, SMTP password and username are never returned —
-        transports are reported present-or-not. Gated by monitoring:read like /stats.
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
+        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
+        password and username are never returned — transports are reported present-or-not. Gated by
+        monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
-        ``IB_ACME_*``, is withheld."""
+        ``IB_ACME_*``, is withheld.
+
+        A read that withholds at least one rule writes an audit row; see
+        :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
@@ -8818,7 +8888,7 @@ def create_app(
 
         rules = [r for r in alerts.rules if visible(r)]
 
-        return AlertsConfig(
+        config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
             webhook_timeout=alerts.webhook_timeout,
             webhook_allowed_hosts=list(alerts.webhook_allowed_hosts),
@@ -8854,6 +8924,13 @@ def create_app(
                 for r in rules
             ],
         )
+        # After the answer is built, so a fault building it writes no row. Serialization through
+        # response_model runs later, so a fault there still leaves the row. The console renders
+        # after this returns, so the row records what was withheld, not that a page was seen.
+        withheld = len(alerts.rules) - len(rules)
+        if withheld:
+            await _audit_alert_rules_withheld(request, _user, len(rules), withheld)
+        return config
 
     # --- config provenance ---------------------------------------------------
 
@@ -9806,13 +9883,16 @@ def create_app(
 
         # A nested function rather than an inline call: scripts/security/route_gates.py reads a
         # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
-        async def _reauthorize() -> Identity | None:
-            """The caller as it stands now, or ``None`` to close. With no auth enforced
+        async def _reauthorize() -> Identity | StandingRefusal:
+            """The caller as it stands now, or why to close. With no auth enforced
             (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
-            return await recheck_standing(auth, token, Permission.MONITORING_READ)
+            return await recheck_standing_or_refusal(auth, token, Permission.MONITORING_READ)
 
+        frames = 0
+        stopped: StandingRefusal | None = None
+        cancelled = False
         try:
             await websocket.accept()
             while True:
@@ -9823,7 +9903,12 @@ def create_app(
                 # feed too; a scope change that reached the session without a revoke shapes this
                 # frame.
                 current = await _reauthorize()
-                if current is None:
+                if not isinstance(current, Identity):
+                    # Close first; the stop row waits for the `finally` below, after the slot is
+                    # given back. A slow store then neither holds a refused caller's socket open
+                    # nor keeps its slot from a new monitor socket. The exports write their stop
+                    # row first; this feed differs on purpose, so do not line it up with them.
+                    stopped = current
                     await websocket.close(code=1008)
                     return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
@@ -9850,11 +9935,53 @@ def create_app(
                     rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
+                frames += 1
                 await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             state.ws_count = max(0, getattr(state, "ws_count", 1) - 1)
+            if stopped is not None:
+                # One row per feed the re-check stopped, naming the rule and the frames sent
+                # (BACKLOG #3404). The gate audits its own refusals; without this a feed ended by
+                # an unmet second factor or a missing notification address left no trail. The
+                # write sits here so a close that raised still records it. A lost row is logged at
+                # ERROR, not hidden under the close's error. A cancel waits a bounded time for the
+                # row, and logs it if it does not land (BACKLOG #3157).
+                stop_actor = handshake_identity.username
+                stop_detail = json.dumps({"reason": stopped, "frames": frames})
+                await write_audit_soft(
+                    lambda: _write_through_cancel(
+                        engine_obj.store.record_audit(
+                            "ws_stats.stopped",
+                            actor=stop_actor,
+                            detail=stop_detail,
+                            client=client_ip(websocket),
+                        ),
+                        lambda: _lost_row("ws_stats.stopped", stop_actor, stop_detail),
+                    ),
+                    log=_log,
+                    message=(
+                        "ws_stats.stopped audit row not written. Lost row: actor=%s client=%s"
+                        " reason=%s frames=%d"
+                    ),
+                    # Scrubbed for CodeQL py/log-injection, as the other lost-row lines are.
+                    args=lambda: (
+                        scrub_log_argument(stop_actor),
+                        scrub_log_argument(str(client_ip(websocket))),
+                        stopped,
+                        frames,
+                    ),
+                    # Under a cancel that landed before the write, as during the close, a defect is
+                    # logged with the row rather than raised: a raise here would replace the
+                    # CancelledError the `finally` is passing on, so the task would not end as
+                    # cancelled. Otherwise a defect raises, so a bug is not passed over as a store
+                    # refusal.
+                    defects=() if cancelled else AUDIT_WRITE_DEFECTS,
+                )
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).

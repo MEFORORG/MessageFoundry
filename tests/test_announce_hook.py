@@ -349,6 +349,29 @@ def test_the_skip_rule_turns_on_the_cwd_match_and_not_on_isrunning(
     assert "session-registry.ps1" in p.stdout
 
 
+def test_the_fixed_instruction_text_stays_short(repo: Path, tmp_path: Path) -> None:
+    """Every byte of the fixed text is injected on every firing. An audit of 26 transcripts measured
+    the whole block at about 5.3 KB, 3.3 KB of it fixed prose; the reasons now live in
+    docs/WORKTREES.md. The budget is measured with the peer rows and the interpolated paths removed,
+    so it bounds the prose and not the fixture's temp directory."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    top = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    fixed = p.stdout
+    for s in (top, str(sd), SELF_ID):
+        fixed = fixed.replace(s, "")
+    fixed = "\n".join(
+        ln for ln in fixed.splitlines() if not re.match(r"\s+(\[\d+\] |cwd: |claim: )", ln)
+    )
+    assert "[ANNOUNCE YOURSELF" in fixed, "the positive arm: the block was emitted"
+    assert len(fixed.encode("ascii")) <= 1300, f"fixed text grew to {len(fixed)} bytes"
+
+
 def test_the_delivery_receipt_vocabulary_has_no_not_running_token(
     repo: Path, tmp_path: Path
 ) -> None:
@@ -615,6 +638,7 @@ def test_a_scheduled_task_peer_is_dropped_not_targeted_or_mailed(
     The mailed half uses a run on ANOTHER login: without the flag that peer is mailed, so the
     assertion would fail on the old code rather than pass vacuously."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     sched_acct = {**SCHEDULED, "Login": "acct-1"}
     p = run(
@@ -682,6 +706,29 @@ def test_a_peers_claim_note_is_surfaced_and_the_worktree_name_is_deprecated(
     p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
     assert "claim: REBUILDING THE INGEST PATH" in p.stdout
     assert "IGNORE the worktree name" in p.stdout
+
+
+@pytest.mark.parametrize(
+    ("claim_host", "surfaced"),
+    [("OTHER-PC", False), (None, True), (os.environ.get("COMPUTERNAME", "this-pc").lower(), True)],
+    ids=["other-pc", "no-host", "this-host-other-case"],
+)
+def test_a_claim_from_another_machine_at_the_same_path_is_not_this_trees_note(
+    repo: Path, tmp_path: Path, claim_host: str | None, surfaced: bool
+) -> None:
+    """On a shared root a claim's worktree names a path on the machine that took it. The same path
+    string here is a different tree, so another PC's note must not be shown as this peer's intent.
+    No ``host`` is this machine, and the compare ignores case."""
+    sd = tmp_path / "mefor-coord" / "announce"
+    claims = tmp_path / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    rec: dict[str, Any] = {"key": "k", "note": "NOTE FROM SOMEWHERE", "worktree": PEER["Cwd"]}
+    if claim_host is not None:
+        rec["host"] = claim_host
+    (claims / "k.json").write_text(json.dumps(rec), encoding="utf-8")
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "[ANNOUNCE YOURSELF" in p.stdout, p.stdout + p.stderr
+    assert ("claim: NOTE FROM SOMEWHERE" in p.stdout) is surfaced, p.stdout
 
 
 def test_a_missing_claims_directory_is_harmless(repo: Path, tmp_path: Path) -> None:
@@ -1197,10 +1244,53 @@ def acct_peer(i: int) -> dict[str, Any]:
     }
 
 
+MAIL_KEY = ROOT / "scripts" / "coord" / "mail-key.ps1"
+
+
+def declare_self(sd: Path, repo: Path, goal: str = "BUILDING THE THING") -> Path:
+    """Write this session's seat record the way ``seat.ps1 -Declare`` would, beside the injected
+    state dir, so the hook has a declared intent. Without one it mails nothing.
+
+    The box key comes from the REAL ``mail-key.ps1`` by dot-sourcing it, never a copy here: a second
+    definition of the key would drift silently the day the real one changes.
+    """
+    lit = str(MAIL_KEY).replace("'", "''")
+    top = str(repo).replace("'", "''")
+    proc = run_single(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{lit}'; ConvertTo-BoxKey -Path '{top}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    box = sd.parent / "seats" / proc.stdout.strip()
+    box.mkdir(parents=True, exist_ok=True)
+    rec = box / f"{SELF_ID}.json"
+    rec.write_text(
+        json.dumps(
+            {
+                "sessionId": SELF_ID,
+                "worktree": str(repo),
+                "goal": goal,
+                "declaredAt": "2026-10-22T09:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return rec
+
+
 def test_a_cross_login_peer_is_mailed_and_reads_MAILED(repo: Path, tmp_path: Path) -> None:
     """The whole point. A peer on another login is unaddressable by the model's tools no matter how
     well it is instructed, so the hook mails it itself and tells the model there is nothing to do."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     p = run(
         repo,
@@ -1222,6 +1312,7 @@ def test_a_surface_the_mcp_cannot_enumerate_is_mailed_too(repo: Path, tmp_path: 
     """The second of the two cases mail.ps1's own header names. Measured live 2026-09-14: a real peer
     in this repo was unreachable for the surface reason, not the login one, so this is populated."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     run(
         repo,
@@ -1237,6 +1328,7 @@ def test_an_unattended_peer_is_never_mailed(repo: Path, tmp_path: Path) -> None:
     """Deliberately excluded. The Kind filter is flagged UNEXERCISED at the top of the hook, and
     mail's own staleness argument cuts against waking a scheduled run with a stale announce."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     p = run(
         repo,
@@ -1258,6 +1350,7 @@ def test_a_refused_mail_leaves_the_peer_unmailed_and_receipts_the_refusal(
     drain TRUNCATES silently. A refusal must not retire the peer, or one cap violation would silence
     it permanently."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path, exit_code=1)
     p = run(
         repo,
@@ -1278,6 +1371,7 @@ def test_mail_goes_out_even_when_no_mcp_peer_is_reachable(repo: Path, tmp_path: 
     case exactly as silent as before the feature. stdout stays empty because there is nothing for the
     MODEL to do -- the hot path must stay free."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     p = run(
         repo,
@@ -1297,6 +1391,7 @@ def test_mail_is_capped_per_prompt(repo: Path, tmp_path: Path) -> None:
     degraded coordination. Measured 2026-09-14: one send costs 0.76-1.32 s wall clock, so an
     uncapped fan-out to 7 cross-login peers is 8-10 s of that budget."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     peers = [acct_peer(i) for i in range(1, 6)]
     run(
@@ -1313,6 +1408,7 @@ def test_mail_has_a_lifetime_bound_of_its_own(repo: Path, tmp_path: Path) -> Non
     """Separate from $MaxTotal, which caps requests made of the MODEL. Without a bound of its own the
     mail lane is an unbounded arrival process against a 5-per-injection drain cap."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     peers = [acct_peer(i) for i in range(1, 4)]
     for _ in range(3):
@@ -1330,6 +1426,7 @@ def test_a_mailed_peer_is_not_mailed_again(repo: Path, tmp_path: Path) -> None:
     """Announce traffic is unchosen and the hook fires on every prompt, so re-mailing a known peer
     would put a sustained arrival process on a queue shared with real handoffs."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     for _ in range(3):
         run(
@@ -1390,10 +1487,41 @@ def test_the_body_carries_the_claim_note_as_the_intent(repo: Path, tmp_path: Pat
     assert any("WIRING THE MAIL LANE" in ln for ln in body_lines(log)), body_lines(log)
 
 
-def test_an_undeclared_intent_says_so_rather_than_inventing_one(repo: Path, tmp_path: Path) -> None:
-    """A body that reads deliberate and says nothing is worse than an honest blank, because the
-    roster elsewhere instructs readers to PREFER the claim note over the worktree name."""
+def test_an_undeclared_session_sends_no_announce_mail(repo: Path, tmp_path: Path) -> None:
+    """No claim note and no seat goal means there is no intent to announce, so nothing is mailed.
+
+    The body this replaced read "intent: NOT DECLARED": an audit of 196 mailed messages found 62 of
+    those, each costing a reader a drain slot to learn only that a worktree exists. The held peer
+    must stay unmailed, so the second run, after the session declares, is the positive arm: it
+    proves the hold deferred the announce rather than retiring the peer.
+    """
     sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    args: dict[str, Any] = {
+        "tmp_path": tmp_path,
+        "state_dir": sd,
+        "rows": [SELF_ROW, PEER, ACCT],
+        "extra": ("-MailScript", str(stub)),
+    }
+    p = run(repo, **args)
+    assert sends(log) == [], f"an undeclared session mailed an announce: {sends(log)!r}"
+    assert marker_obj(sd)["mailed"] == [], "a held send retired the peer"
+    assert any("mail held: no claim note or seat goal yet" in r for r in receipts(sd)), receipts(sd)
+    # The MCP lane is not gated: there the model writes the intent from the prompt it was given.
+    assert "[ANNOUNCE YOURSELF" in p.stdout
+    declare_self(sd, repo, "WIRING THE SEAT GOAL")
+    run(repo, **args)
+    assert sends(log) == [ACCT["Cwd"]], f"the declared session did not mail: {sends(log)!r}"
+    assert not any("NOT DECLARED" in ln for ln in body_lines(log)), body_lines(log)
+
+
+def test_the_seat_goal_is_the_intent_when_there_is_no_claim_note(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The goal given to ``seat.ps1 -Declare`` is written as deliberately as a claim note, so it is
+    the fallback intent. Its age is labelled as a seat goal, not passed off as a note."""
+    sd = tmp_path / "state"
+    declare_self(sd, repo, "WIRING THE SEAT GOAL")
     stub, log = mail_stub(tmp_path)
     run(
         repo,
@@ -1402,7 +1530,45 @@ def test_an_undeclared_intent_says_so_rather_than_inventing_one(repo: Path, tmp_
         rows=[SELF_ROW, PEER, ACCT],
         extra=("-MailScript", str(stub)),
     )
-    assert any("NOT DECLARED" in ln for ln in body_lines(log)), body_lines(log)
+    intent = [ln for ln in body_lines(log) if ln.startswith("intent: ")]
+    assert intent and "WIRING THE SEAT GOAL" in intent[0], body_lines(log)
+    assert "[seat declared " in intent[0], intent
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"sessionId": "99999999-0000-0000-0000-000000000000"},
+        {"worktree": "D:\\t\\elsewhere"},
+        {"lifecycle": "closed"},
+        {"goal": "   "},
+    ],
+    ids=["another-session", "another-worktree", "closed-seat", "blank-goal"],
+)
+def test_a_seat_record_that_is_not_this_sessions_is_not_its_intent(
+    repo: Path, tmp_path: Path, change: dict[str, str]
+) -> None:
+    """One session id can own records in several boxes, because a subagent shares its parent's id.
+    Only the open record naming this session AND this worktree is this session's goal; a closed
+    seat's goal is finished work."""
+    sd = tmp_path / "state"
+    rec = declare_self(sd, repo)
+    good = rec.read_text(encoding="utf-8")
+    rec.write_text(json.dumps({**json.loads(good), **change}), encoding="utf-8")
+    stub, log = mail_stub(tmp_path)
+    args: dict[str, Any] = {
+        "tmp_path": tmp_path,
+        "state_dir": sd,
+        "rows": [SELF_ROW, PEER, ACCT],
+        "extra": ("-MailScript", str(stub)),
+    }
+    run(repo, **args)
+    assert sends(log) == [], f"another record's goal was mailed as this session's: {sends(log)!r}"
+    # The positive arm in the same fixture: the unaltered record IS found, so the absence above is
+    # the field under test and not a lookup that never finds anything.
+    rec.write_text(good, encoding="utf-8")
+    run(repo, **args)
+    assert sends(log) == [ACCT["Cwd"]], f"the intact record was not found: {sends(log)!r}"
 
 
 def test_the_body_never_carries_the_users_prompt(repo: Path, tmp_path: Path) -> None:
@@ -1410,6 +1576,7 @@ def test_the_body_never_carries_the_users_prompt(repo: Path, tmp_path: Path) -> 
     recipient's transcript, which nothing in this repo can delete. The hook HAS the prompt in its
     payload and must never mail it. run() sends the prompt 'do a thing'."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     stub, log = mail_stub(tmp_path)
     run(
         repo,
@@ -1425,6 +1592,7 @@ def test_a_missing_mail_script_is_harmless(repo: Path, tmp_path: Path) -> None:
     """Fail open, always. Nothing in this hook may block a prompt, and run() already asserts both a
     zero exit and a clean stderr."""
     sd = tmp_path / "state"
+    declare_self(sd, repo)
     p = run(
         repo,
         tmp_path=tmp_path,

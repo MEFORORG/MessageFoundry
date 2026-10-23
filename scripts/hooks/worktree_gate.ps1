@@ -9,7 +9,8 @@
     it governs every session in every worktree the moment it lands -- a project-scoped hook would live on
     one branch and reach the other worktrees only once each merged it.
 
-    It denies two things, and only inside a governed primary checkout:
+    It denies at least these two things, only inside a governed primary checkout; the rules below add
+    more, and hook input it cannot read or parse is denied anywhere while the gate is on (see FAILS OPEN):
 
       1. A Write/Edit/MultiEdit/NotebookEdit whose TARGET PATH is inside the primary checkout -- its working
          tree, AND the shared .git beside it. Those are two different things and the difference is
@@ -30,8 +31,11 @@
     matters. That 29% is a share of those primary-seated sessions' own calls, NOT of every call in
     the repo; the counts and the population are in docs/WORKTREE-GATE.md.
 
-    FAILS OPEN on every error path (bad JSON, missing fields, unreadable allowlist). A guardrail that
-    wedges all work gets uninstalled, and then it protects nothing.
+    FAILS OPEN on error paths such as missing fields and an unreadable allowlist. A guardrail that
+    wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT CANNOT BE READ OR
+    DOES NOT PARSE IS ONE EXCEPTION: while the allowlist governs anything, it is DENIED in every
+    session, governed or not, because the gate cannot tell whether such a call is governed (see the
+    comments above the stdin read and the ConvertFrom-Json call).
 
     This is a guardrail against the ACCIDENTAL primary edit -- the "I forgot to spin up a worktree" case.
     It is NOT a security boundary: it inspects tool arguments, so a file written from a shell command is
@@ -69,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.21.1"
+$GateVersion = "2026.10.22.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -127,7 +131,10 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
             permissionDecisionReason = (Protect-CommandLines $Reason)
         }
     }
-    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    # ASCII, EVERY NON-ASCII CHARACTER AS \uXXXX. [Console]::Out encodes with the console's output
+    # page and Claude Code reads UTF-8: under cp932 a reason quoting U+30BD carried the bytes 83 5C, a
+    # stray `\` in a JSON string, so the deny no longer parsed and decided nothing.
+    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6 -EscapeHandling EscapeNonAscii))
     exit 0
 }
 
@@ -2309,8 +2316,56 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     }
 }
 
-try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { exit 0 }
-if (-not $hook) { exit 0 }
+# A PARSE FAILURE IS RECORDED, NOT ALLOWED. It used to exit 0, which let through any payload
+# ConvertFrom-Json refuses -- for one, PowerShell 7 throws on keys that differ only by case, so a
+# tool_input carrying both `subagent_type` and `SUBAGENT_TYPE` reached no rule at all. The deny waits
+# for the allowlist below, so the kill switch still turns the gate off. It also comes before any cwd
+# or path is known, so it fires in every session while anything is governed. Not -AsHashtable: it
+# accepts such keys, but every read in this file is written for a PSCustomObject (member access,
+# `.PSObject.Properties` in rule 2), and a hashtable answers both differently. Empty stdin and a bare
+# `null` parse to nothing without an error and still exit 0 here: they carry no tool call to judge.
+$hook = $null
+$hookText = ""
+$hookUnparseable = $false
+# UTF-8 BYTES FIRST, [Console]::In ONLY WHEN THEY ARE EMPTY. Claude Code writes UTF-8, and
+# [Console]::In decodes with the console code page, which a hook child does not choose: one started
+# from this box's Bash tool reads cp437 and decodes U+00E9 as two characters (measured 2026-10-21), so
+# a non-ASCII primary never matched its allowlist entry. On a double-byte page (cp932, cp936, cp950) a
+# lead byte also swallows the next `\`, so a valid payload stops parsing, and the parse deny below
+# would refuse every such call in every session.
+# The fallback is for shell-guard-dispatch.ps1, which runs this gate in-process: it has already read
+# stdin to the end and hands the payload over through [Console]::SetIn, so the byte read finds EOF
+# and returns nothing. Reading only the bytes there allowed every Bash and PowerShell call (measured:
+# tests/test_shell_guard_dispatch.py went red). ON THAT PATH THE TEXT IS ONLY AS GOOD AS THE
+# DISPATCHER'S OWN READ: while it reads through [Console]::In, a dispatched call whose payload
+# carries non-ASCII text, on a console whose page is not UTF-8, still meets the defects above.
+# A byte read that throws is denied below, not retried through [Console]::In. Run alone, that
+# reader would decode only what the failed read left behind. Dispatched, it would hold the whole
+# payload, but nothing here tells the two paths apart, so a throw denies on both.
+# Read-CcxHookInput in _hookinput.ps1 is the same byte read for other hooks; this one is inlined
+# because only this file is installed, and it differs on purpose in the fallback and the deny. It
+# has no time bound, as [Console]::In had none: a bound needs a verdict for a read that times out.
+$hookParseError = ""
+$hookRead = $false
+try {
+    if ([Console]::IsInputRedirected) {
+        $hookText = [System.IO.StreamReader]::new(
+            [Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
+    }
+    if (-not $hookText) { $hookText = [Console]::In.ReadToEnd() }
+    $hookRead = $true
+    $hook = $hookText | ConvertFrom-Json -ErrorAction Stop
+} catch {
+    $hookUnparseable = $true
+    # A fixed class for the receipt, never the message: the message can quote the payload.
+    $m = "$($_.Exception.Message)"
+    $hookParseError = if (-not $hookRead) { "read-failed" }
+                      elseif ($m -match 'different casing') { "case-duplicate-key" }
+                      elseif ($m -match 'empty string') { "empty-key" }
+                      elseif ($m -match '(?i)depth') { "depth" }
+                      else { "other" }
+}
+if (-not $hookUnparseable -and -not $hook) { exit 0 }
 
 # The allowlist doubles as the kill switch: no file, no entries => nothing is governed.
 # Each root keeps BOTH forms: a casefolded/slash-normalized one to compare against (Windows paths are
@@ -2326,6 +2381,23 @@ $roots = @(
         }
 )
 if ($roots.Count -eq 0) { exit 0 }
+
+if ($hookUnparseable) {
+    # No tool name, cwd or path is known here, so the message names none. The receipt carries the
+    # error's class and the input's length: enough to tell one payload shape from many, and nothing
+    # the payload says.
+    Write-Deny -Rule "parse" -Detail "unparseable-input class=$hookParseError length=$($hookText.Length)" -Reason @"
+BLOCKED: the worktree gate could not parse this tool call's hook input as JSON, or could not read
+it. It cannot tell whether the call is governed, so it does not allow it.
+
+PowerShell's JSON parser refuses at least these shapes in a tool input:
+  * two keys that differ only by case, such as subagent_type and SUBAGENT_TYPE;
+  * a key that is an empty string;
+  * nesting deeper than 1024 levels.
+If the input has one of them, retry with each key spelled once and none empty. Otherwise, or if the
+retry is blocked too, STOP and tell the user. Do not route around this.
+"@
+}
 
 # WHICH governed root does the SESSION belong to? Every other rule judges a PATH and takes its root from
 # whatever matched. Rule 4 fires on the TOOL NAME alone and has no path to match, so it named $roots[0] --
@@ -2347,7 +2419,7 @@ if ($roots.Count -eq 0) { exit 0 }
 # standing outside every governed checkout.
 function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     foreach ($r in $roots) {
-        if ($CwdCmp -eq $r.Compare -or
+        if ([string]::Equals($CwdCmp, $r.Compare, [System.StringComparison]::Ordinal) -or
             $CwdCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
     }
     if (-not $CwdRaw) { return $null }
@@ -2359,7 +2431,7 @@ function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     $commonCmp = Get-ComparablePath $common $CwdRaw
     if (-not $commonCmp) { return $null }
     foreach ($r in $roots) {
-        if ($commonCmp -eq $r.Compare -or
+        if ([string]::Equals($commonCmp, $r.Compare, [System.StringComparison]::Ordinal) -or
             $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
     }
     return $null
@@ -2377,8 +2449,8 @@ $cwdRaw = [string]$hook.cwd                        # original case: for `git -C`
 #
 # Keys on the TOOL, not the cwd: relocation loses the chat wherever you start it, so once the gate is
 # on (roots non-empty, guarded above) EnterWorktree is denied unconditionally. ExitWorktree is a safe
-# keep and must NOT be caught. Fail-open is preserved: any earlier parse error already exited 0, and
-# only an exact tool match reaches Write-Deny.
+# keep and must NOT be caught. An earlier parse error was already denied (or exited 0 with the gate off),
+# and only an exact tool match reaches Write-Deny.
 #
 # Expressed as `$tool -in @("EnterWorktree")` so tests/test_install_gate_wiring.py SEES this tool as
 # handled -- rule 3 shipped dead once by implementing a rule with no matcher, and that tripwire exists to
@@ -2426,12 +2498,56 @@ $rehome
 
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
+#
+# THE EXEMPTION NEEDS BOTH TESTS; "UNDER A ROOT" NEEDS EITHER. The culture and ordinal comparisons
+# disagree in BOTH directions, measured under ICU. A culture comparison ignores zero-width and
+# soft-hyphen characters, so alone it read `.claude/worktrees<U+200B>/x`, a directory inside the primary,
+# as the exemption. A combining mark after a prefix makes the culture StartsWith false and the ordinal
+# one true, so the ordinal test alone exempted `.claude/worktrees/<U+0301>x`, which origin/main denied.
+# A match here ALLOWS, so the exemption holds only where both match. The governed test DENIES, so either
+# match governs, and dropping either half loses a deny.
+#
+# THE EXEMPTION'S ORDINAL HALF COMPARES COMPOSED (NFC) FORMS. The culture test equates a decomposed
+# spelling with a composed one, so `Re<U+0301>po` is governed under an allowlisted `R<U+00E9>po`. An
+# ordinal test of the raw forms then refused every write into that spelling's nested worktrees: a false
+# deny, aimed at exactly the trees isolated Builders write in. Composing adds no exemption origin/main
+# lacked, because the culture half must match as well. Ordinal on this lowercased form is otherwise the
+# closest the comparison gets to what the filesystem means (a case-sensitive filesystem still differs:
+# `.claude/Worktrees/` folds onto the exemption).
+#
+# RULE 3b NO LONGER LEANS ON THE CULTURE HALF of the governed test: its own comparisons are
+# ordinal, so without this half it would read a linked worktree at `<primary><U+200B>` as a linked
+# worktree. THE HALF STAYS ANYWAY, because this function also answers rules 1 and 3: without it, a write
+# into `<primary><U+200B>/x` and a `git clean` there, both denied today, are allowed (measured
+# 2026-10-21). That is NOT a claim that those denies protect the primary: `<primary><U+200B>` is a
+# different directory on NTFS and ext4. Dropping them would loosen the gate, which a change made for
+# ordinal comparison must not do, so whether they earn their place is left open here.
+#
+# ORDINAL IS NOT "AT LEAST AS STRICT" FOR A PREFIX. Where a match ALLOWS, an ordinal Equals denies at
+# least as much as the culture `-eq`, because only identical strings match it, and identical strings
+# match the culture `-eq` too. An ordinal StartsWith gives no such guarantee: it matches `-<U+0301>x`
+# against `-`, and the culture one does not. So the gate takes both readings, and denies if either
+# denies, at least at the exemption here, class A's destination scan, rule 3d's victim scan and
+# Test-VerbMovesHead's flag and comment tests. Other prefix tests still take one reading, at least
+# rule 1b's ordinal coordination-root match and rule 3's cd-fallback lookahead, which this change did
+# not touch and did not audit. Culture comparisons remain too, at least the deny-on-match ones such as
+# rule 3d's governed test, rule 3c's `-eq` and class A's flag test. This is not a census.
+function ConvertTo-ComposedForm([string]$Text) {
+    # Text that is not valid UTF-16, such as a lone surrogate, throws. Its raw form is compared then,
+    # which exempts nothing the culture half does not.
+    try { return $Text.Normalize([System.Text.NormalizationForm]::FormC) } catch { return $Text }
+}
 function Test-Governed([string]$Candidate) {
     if (-not $Candidate) { return $null }
+    $ord = [System.StringComparison]::Ordinal
+    $composed = ConvertTo-ComposedForm $Candidate
     foreach ($root in $roots) {
         $c = $root.Compare
-        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/")) {
-            if ($Candidate.StartsWith("$c/.claude/worktrees/")) { return $null }
+        # No ordinal Equals: an ordinal match there is always a culture `-eq` match too.
+        if ($Candidate -eq $c -or $Candidate.StartsWith("$c/") -or $Candidate.StartsWith("$c/", $ord)) {
+            $nested = "$c/.claude/worktrees/"
+            if ($Candidate.StartsWith($nested) -and
+                $composed.StartsWith((ConvertTo-ComposedForm $nested), $ord)) { return $null }
             return $root
         }
     }
@@ -2455,6 +2571,10 @@ function Get-RootCommonDirCmp($Root) {
     # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
     $where = $Root.Display
     $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    # CULTURE, LEFT AS IT WAS. Ordinal here would send more roots to rule 3c's path test, which denies
+    # more only while the root's git dir sits under it; a separate git dir breaks that, so the change
+    # is not shown to deny at least as much. Git reports the toplevel of the directory it was handed,
+    # so the two spellings differing by an ignorable character is not a shape this is known to meet.
     if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
         $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
@@ -2522,7 +2642,7 @@ function Get-OwnWorktreeRemedy([string]$CwdRaw, [object[]]$List, [string]$MainWt
             if ("$ln" -notmatch '^worktree\s+(.+)$') { continue }
             $wt = Get-ComparablePath $Matches[1]
             if (-not $wt) { continue }
-            if (($cwdCmp -eq $wt -or $cwdCmp.StartsWith("$wt/", [System.StringComparison]::Ordinal)) -and
+            if (([string]::Equals($cwdCmp, $wt, [System.StringComparison]::Ordinal) -or $cwdCmp.StartsWith("$wt/", [System.StringComparison]::Ordinal)) -and
                 $wt.Length -gt $best.Length) { $best = $wt }
         }
         $prefix = "$MainWt/.claude/worktrees/"
@@ -2647,6 +2767,8 @@ function Test-ScriptDeclaresParameter([string]$GovDisplay, [string]$Script, [str
 # this change is MEASURED (BACKLOG #1229) rather than asserted.
 $hijackSwitchVerbs = @("checkout", "switch")
 $hijackHeadMoveVerbs = @("reset", "rebase", "merge", "cherry-pick", "revert", "am")
+# Class A's destination scan reads its arguments both ways; see the scan.
+$destCmps = @([System.StringComparison]::Ordinal, [System.StringComparison]::CurrentCulture)
 function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [string]$CwdRaw) {
     $isSwitch = $hijackSwitchVerbs -contains $Verb
     $isHeadMove = $hijackHeadMoveVerbs -contains $Verb
@@ -2664,7 +2786,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     # narrows a branch switch. Class B has no destination to read -- `git reset --hard` with no argument
     # and `git rebase --abort` both move the target worktree's HEAD -- so running these bails for it
     # would allow exactly the shapes it exists to catch.
-    $dest = $null
+    $dests = @()
     if ($isSwitch) {
         # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
         # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
@@ -2673,18 +2795,34 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
 
         # Not a branch switch onto an existing branch? Leave it alone.
-        #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
+        #   `--` with a pathspec after it -> file restore (`git checkout -- f`, `git checkout r -- f`)
         #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
-        if ($after -cmatch '(^|\s)--(\s|$)') { return }
+        # THE `--` BAIL ASKS Test-VerbMovesHead, which says no only for checkout with a pathspec after
+        # the `--`. It used to bail on any `--`, so `git -C <victim> checkout free-branch --` and `git
+        # -C <victim> switch -- free-branch`, both branch switches in real git, were allowed.
+        if ($after -cmatch '(^|\s)--(\s|$)' -and -not (Test-VerbMovesHead $Verb $after)) { return }
         if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
 
-        # The destination ref = first positional (non-flag) token after the verb.
-        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-            if ($tok.StartsWith('-')) { continue }
-            $dest = $tok.Trim('"', "'")
-            break
+        # The destination ref = first positional (non-flag) token after the verb, UNDER EACH READING.
+        # A skip here can end in an allow, and the readings skip different tokens: the culture
+        # StartsWith skipped `<U+00AD>-feat`, a branch, as a flag, and the ordinal one skips
+        # `-<U+0301>x`, which origin/main took for the destination. Each candidate is judged below,
+        # and the first that would be denied is. The flag test below stays culture: there a match denies.
+        # A QUOTED FLAG IS A FLAG TOO: the shell strips the quotes, so `checkout "--detach" <b>` detaches
+        # onto <b>. Reading the raw token took `--detach` for the destination, which is no branch, and
+        # allowed it. The unquoted reading is ADDED, not swapped in, so no candidate is lost.
+        foreach ($cmp in $destCmps) {
+            foreach ($unquote in @($false, $true)) {
+                foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+                    $cand = $tok.Trim('"', "'")
+                    if ($(if ($unquote) { $cand } else { $tok }).StartsWith('-', $cmp)) { continue }
+                    if ($cand -and -not @($dests | Where-Object {
+                                [string]::Equals($_, $cand, [System.StringComparison]::Ordinal) })) { $dests += $cand }
+                    break
+                }
+            }
         }
-        if (-not $dest) { return }
+        if ($dests.Count -eq 0) { return }
     }
 
     # Classify $wtRaw against git itself (robust for BOTH nested .claude/worktrees and sibling
@@ -2701,7 +2839,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
 
     $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
-    if (-not $selfTop -or $selfTop -eq $mainWt) { return }        # $wtRaw IS the primary -- Rule 3 owns it
+    if (-not $selfTop -or [string]::Equals($selfTop, $mainWt, [System.StringComparison]::Ordinal)) { return }        # $wtRaw IS the primary -- Rule 3 owns it
 
     if ($isHeadMove) {
         # CLASS B. The target is a governed LINKED worktree; the only remaining question is whether it is
@@ -2725,7 +2863,10 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         if (-not $CwdRaw) { return }
         $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
-        if ((Get-ComparablePath $ownTopRaw) -eq $selfTop) { return }   # the session's OWN worktree
+        # ORDINAL, because a match ALLOWS. A culture `-eq` ignores a soft hyphen or a zero-width
+        # character, so a session in `<p>-wt1` read `<p>-wt1<U+00AD>`, another session's worktree, as
+        # its own and was allowed `reset --hard` into it. The same holds for the primary test above.
+        if ([string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, [System.StringComparison]::Ordinal)) { return }   # the session's OWN worktree
 
         $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
         # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
@@ -2794,37 +2935,57 @@ What to do instead:
         return
     }
 
-    # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
-    & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
-    if ($LASTEXITCODE -ne 0) { return }
     $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
-    if ($dest -eq $head) { return }
+    # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
+    # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
+    # so only `--` itself is excused. A QUOTED flag counts: `checkout <b> "--ignore-other-worktrees"`
+    # switches off the guard as the bare one does.
+    $hasFlag = @($after -split '\s+' | Where-Object {
+            $u = $_.Trim('"', "'")
+            $_ -and ($_.StartsWith('-') -or $u.StartsWith('-')) -and
+                -not [string]::Equals($u, '--', [System.StringComparison]::Ordinal) }).Count -gt 0
+    $denyDest = $null
+    foreach ($dest in $dests) {
+        # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
+        & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
+        if ($LASTEXITCODE -ne 0) { continue }
+        # ORDINAL, here and in the checked-out-nowhere test below, because a match ALLOWS: a culture
+        # comparison read the branch `fe<U+00AD>at` as the HEAD `feat`, and `ma<U+00AD>in` as the
+        # primary's `main`, and let the switch onto another branch through.
+        if ([string]::Equals($dest, $head, [System.StringComparison]::Ordinal)) { continue }
 
-    # And only a branch that is checked out NOWHERE. The deny text below asserts exactly that ("git
-    # allowed it because '$dest' was not checked out anywhere") -- an assertion this rule never actually
-    # made, which is a compensating control resting on an unverified premise. Two things follow from
-    # checking it. If the branch IS checked out somewhere, git's own guard refuses the switch without
-    # us, so there is nothing to protect; and the remediation would print `new.ps1 -Branch $dest`, which
-    # dies with "fatal: '$dest' is already checked out at ...". That is the same defect class this
-    # remediation was just fixed for -- a printed command the receiving side rejects. `git checkout main`
-    # from any linked worktree is the common shape. $list is the porcelain already read above.
-    #
-    # BUT ONLY WITH NO FLAGS AT ALL, and that is an ALLOWLIST on purpose. "git already refuses this" is
-    # a claim about a CONFIGURATION, not about git: a guard you do not own can be switched off by its
-    # own caller. Measured against a branch live in another worktree --
-    #     checkout/switch <b>                        -> fatal, git refuses      (deferring is sound)
-    #     checkout/switch --force / --discard-changes -> fatal                  (deferring is sound)
-    #     checkout/switch --ignore-other-worktrees <b> -> SWITCHES              (guard disabled)
-    #     checkout/switch --detach <b>, and -d <b>    -> SWITCHES               (never takes the lock,
-    #                                                    but still swaps the other session's files)
-    # -- and the dest scanner above skips '-'-prefixed tokens, so every one of those still resolves
-    # $dest normally. A denylist was written twice here and was wrong twice: --detach was missed while
-    # fixing --ignore-other-worktrees, and `-d` would have been missed while fixing --detach. Git may
-    # add a third tomorrow and the gate would silently reopen. So: any flag present means DENY. The cost
-    # is a needless deny on `git checkout --quiet main`, whose remediation line is then the imperfect
-    # one; that is strictly better than a missed hijack, and unlike a flag list it does not decay.
-    $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
-    if (-not $hasFlag -and ($list -contains ("branch refs/heads/" + $dest))) { return }
+        # And only a branch that is checked out NOWHERE. The deny text below asserts exactly that ("git
+        # allowed it because '$dest' was not checked out anywhere") -- an assertion this rule never actually
+        # made, which is a compensating control resting on an unverified premise. Two things follow from
+        # checking it. If the branch IS checked out somewhere, git's own guard refuses the switch without
+        # us, so there is nothing to protect; and the remediation would print `new.ps1 -Branch $dest`, which
+        # dies with "fatal: '$dest' is already checked out at ...". That is the same defect class this
+        # remediation was just fixed for -- a printed command the receiving side rejects. `git checkout main`
+        # from any linked worktree is the common shape. $list is the porcelain already read above.
+        #
+        # BUT ONLY WITH NO FLAGS AT ALL, and that is an ALLOWLIST on purpose. "git already refuses this" is
+        # a claim about a CONFIGURATION, not about git: a guard you do not own can be switched off by its
+        # own caller. Measured against a branch live in another worktree --
+        #     checkout/switch <b>                        -> fatal, git refuses      (deferring is sound)
+        #     checkout/switch --force / --discard-changes -> fatal                  (deferring is sound)
+        #     checkout/switch --ignore-other-worktrees <b> -> SWITCHES              (guard disabled)
+        #     checkout/switch --detach <b>, and -d <b>    -> SWITCHES               (never takes the lock,
+        #                                                    but still swaps the other session's files)
+        # -- and the dest scanner above skips '-'-prefixed tokens, so every one of those still resolves
+        # $dest normally. A denylist was written twice here and was wrong twice: --detach was missed while
+        # fixing --ignore-other-worktrees, and `-d` would have been missed while fixing --detach. Git may
+        # add a third tomorrow and the gate would silently reopen. So: any flag present means DENY. The cost
+        # is a needless deny on `git checkout --quiet main`, whose remediation line is then the imperfect
+        # one; that is strictly better than a missed hijack, and unlike a flag list it does not decay.
+        # $hasFlag is read above the loop, once for every candidate.
+        $destLine = "branch refs/heads/" + $dest
+        if (-not $hasFlag -and @($list | Where-Object {
+                [string]::Equals([string]$_, $destLine, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
+        $denyDest = $dest
+        break
+    }
+    if (-not $denyDest) { return }
+    $dest = $denyDest
 
     $destSlug = ConvertTo-WorktreeSlug $dest
     # EVERY interpolation below goes through one of the two helpers, and which one depends ONLY on
@@ -2938,10 +3099,14 @@ $gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
 # question rule 3b's per-verb ruling asks, and it answers the same way, with two narrowings that are
 # the whole reason this function reads arguments at all:
 #
-#   checkout, switch    MOVE, unless a `--` follows the verb AND a pathspec follows the `--`.
+#   checkout            MOVES, unless a `--` follows the verb AND a pathspec follows the `--`.
 #                       `checkout <ref> -- <path>` restores files and leaves HEAD where it was. A
 #                       TRAILING `--` is not that: `checkout <branch> --` switches branches, measured
 #                       against real git, so it moves HEAD.
+#   switch              MOVES, in every spelling. It takes no pathspec, so its `--` only ends the
+#                       options: `switch -- <branch>` switches, measured against real git. Reading it
+#                       as checkout's restore let a repository token through, and let class A's `--`
+#                       bail, which asks this function, pass a branch switch.
 #   reset               MOVES ONLY WHEN IT NAMES A COMMIT, meaning a positional argument before any
 #                       `--`. `reset --hard` with no argument rewrites the tree and index and leaves
 #                       HEAD alone, and it MUST keep passing: withholding the repository token from rule
@@ -2962,10 +3127,23 @@ $gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
 # quoted argument survives blanking as an empty quote pair, which still counts as a positional, so
 # `reset --hard "main"` keeps its commit. A `#` token ends the arguments (a comment does not run), and
 # a redirection is not an argument: `2>&1`, `>out.txt` and `> out.txt` are all dropped before counting.
+#
+# BOTH READINGS OF A PREFIX ARE TAKEN, and a HEAD move under either one wins. The ordinal StartsWith
+# reads `-<U+0301>x` as a flag and `#<U+0301>x` as a comment; the culture one reads neither so, and
+# reads `<U+00AD>-x` as a flag. A flag or a comment can withhold the repository token from rule 3, so
+# either reading alone allows something the other denies (see the note above Test-Governed).
 # ---------------------------------------------------------------------------------------------------
+$headMoveCmps = @([System.StringComparison]::Ordinal, [System.StringComparison]::CurrentCulture)
 function Test-VerbMovesHead([string]$Verb, [string]$After) {
-    if ($Verb -in @("rebase", "merge", "cherry-pick", "revert", "am")) { return $true }
-    if ($Verb -notin @("checkout", "switch", "reset")) { return $false }
+    if ($Verb -in @("rebase", "merge", "cherry-pick", "revert", "am", "switch")) { return $true }
+    if ($Verb -notin @("checkout", "reset")) { return $false }
+    foreach ($cmp in $headMoveCmps) {
+        if (Test-VerbMovesHeadAs $Verb $After $cmp) { return $true }
+    }
+    return $false
+}
+
+function Test-VerbMovesHeadAs([string]$Verb, [string]$After, [System.StringComparison]$Cmp) {
     $after = ($After -split '(?:&&|\|\||;|\|)', 2)[0]
     $toks = @()
     $skipNext = $false
@@ -2974,7 +3152,8 @@ function Test-VerbMovesHead([string]$Verb, [string]$After) {
     foreach ($t in @($after -split '\s+')) {
         if (-not $t) { continue }
         if ($skipNext) { $skipNext = $false; continue }
-        if ($t.StartsWith('#')) { break }
+        # $Cmp, here and below: the caller takes both readings, for the reason above the caller.
+        if ($t.StartsWith('#', $Cmp)) { break }
         if ($t -match '^(\d*|&)[<>]') {
             # A bare operator (`>`, `2>`, `>>`) takes the NEXT token as its target.
             if ($t -match '^(\d*|&)[<>]+&?$') { $skipNext = $true }
@@ -2983,13 +3162,84 @@ function Test-VerbMovesHead([string]$Verb, [string]$After) {
         $toks += $t
     }
     $dashDash = [array]::IndexOf($toks, '--')
-    $pathAfter = ($dashDash -ge 0 -and $dashDash -lt ($toks.Count - 1))
-    if ($Verb -ne "reset") { return (-not $pathAfter) }
+    if ($Verb -ne "reset") {
+        # A PATHSPEC MUST FOLLOW THE `--`, not merely a token. A lone `&` backgrounds the command, and
+        # PowerShell's `*>`, `*>>` and `*>&1` redirect every stream; none reaches git, so `checkout <b>
+        # -- &` and `checkout <b> -- *> $null` switch branches. They are dropped for this test only:
+        # reset reads them as positionals below, and dropping them there would allow a reset this
+        # function denies today.
+        if ($dashDash -lt 0) { return $true }
+        $skipTarget = $false
+        for ($i = $dashDash + 1; $i -lt $toks.Count; $i++) {
+            $p = $toks[$i]
+            if ($skipTarget) { $skipTarget = $false; continue }
+            if ([string]::Equals($p, '&', [System.StringComparison]::Ordinal)) { continue }
+            if ($p -match '^\*[<>]') {
+                if ($p -match '^\*[<>]+$') { $skipTarget = $true }
+                continue
+            }
+            return $false
+        }
+        return $true
+    }
     foreach ($t in $toks) {
-        if ($t -eq '--') { return $false }
-        if (-not $t.StartsWith('-')) { return $true }
+        # ORDINAL in both readings: a match reads as moving no HEAD, a culture `-eq` read `<U+00AD>--`,
+        # a valid branch name, as the `--` separator, and an ordinal Equals matches nothing it does not.
+        if ([string]::Equals($t, '--', [System.StringComparison]::Ordinal)) { return $false }
+        if (-not $t.StartsWith('-', $Cmp)) { return $true }
     }
     return $false
+}
+
+# ---------------------------------------------------------------------------------------------------
+# RULE 3d's VICTIM: the worktree argument of `git worktree remove|move`, under EVERY reading the gate
+# cannot choose between, so the rule judges each and denies if any is governed. At least these:
+#   * the first token that is not a flag under the ORDINAL StartsWith, which reads `<U+00AD>-x` as a
+#     path and `-<U+0301>x` as a flag;
+#   * the same under the CULTURE StartsWith that origin/main ran, which reads both the other way;
+#   * THE TOKEN AFTER `--`, WHATEVER IT STARTS WITH. Git reads it as a path, so `git worktree remove --
+#     "-<U+0301>/../../<victim>"` really removes the victim; the ordinal reading skipped it as a flag,
+#     found no victim, and allowed it.
+# A token that resolves to no worktree is passed over by the rule, so a spare candidate costs a git
+# call and never an allow.
+$victimCmps = @([System.StringComparison]::Ordinal, [System.StringComparison]::CurrentCulture)
+function Get-WorktreeVictimTokens([string]$After) {
+    # Read QUOTE-AWARE. Why is in the note at the rule's call; these two notes are on the pattern.
+    # THE BARE ALTERNATIVE MUST STOP AT A QUOTE, and the first version of this scan did not. It
+    # was `[^\s"''][^\s]*`, whose tail admits quote characters -- so `git worktree remove
+    # <path>""` carried the trailing `""` into the token, `git -C` failed on it, and the rule
+    # fell through to ALLOW. That is the EXACT fail-open this block exists to close,
+    # reintroduced by its own fix: the `.Trim('"', "'")` being replaced had stripped them.
+    # Measured across three gate versions to separate a regression from an inherited defect:
+    # main DENY, parent DENY, this-before-the-correction ALLOW.
+    #
+    # AND THE FLAG SKIP MUST TEST THE CAPTURED VALUE, not the raw match text. `$m.Value` for a
+    # QUOTED flag begins with the quote character, so `"--force"` was never skipped and became
+    # the victim: `git worktree remove "--force" "<governed wt>"` ALLOWed, with the worktree
+    # really destroyed when the command was run. That one is INHERITED -- it allows on main and
+    # on the parent too -- but the note at the call claimed this scan was "validated against the flag",
+    # and only the UNQUOTED spelling had been.
+    $toks = @(foreach ($m in [regex]::Matches($After, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
+            $m.Groups['q'].Value
+        })
+    # GIT'S OWN READING FIRST -- the token after `--`, then the ordinal one, which matches git's byte
+    # test -- because the rule denies on the first governed candidate, and its text then describes
+    # the path git acts on rather than a spare.
+    $found = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt ($toks.Count - 1); $i++) {
+        if (-not [string]::Equals($toks[$i], '--', [System.StringComparison]::Ordinal)) { continue }
+        if ($toks[$i + 1]) { $found.Add($toks[$i + 1]) }
+        break
+    }
+    foreach ($cmp in $victimCmps) {
+        foreach ($tok in $toks) {
+            if (-not $tok) { continue }
+            if ($tok.StartsWith('-', $cmp)) { continue }
+            if (-not $found.Contains($tok)) { $found.Add($tok) }
+            break
+        }
+    }
+    return $found.ToArray()
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -3455,6 +3705,9 @@ What to do instead:
         # $govCfg IS NOT RE-INITIALISED HERE. It is set once above the candidate loop, because clearing
         # it per candidate would make the chain's answer depend on the LAST candidate walked instead of
         # the first that answered -- the opposite of what the chain is for.
+        # BOTH `-eq` BELOW STAY CULTURE. A match governs the config and so denies; an ordinal-only
+        # equality would stop matching a common dir that differs by an ignorable character, and allow
+        # a write this rule denies today. The prefix halves are ordinal already.
         foreach ($r in $roots) {
             $rootCommon = Get-RootCommonDirCmp $r
             if (-not $rootCommon) {
@@ -3569,12 +3822,17 @@ What to do instead:
     # entirely. Ask git whether the path is a registered worktree of a governed repo instead. Any git
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
-    foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
+    # ONE TARGET PER CANDIDATE VICTIM, not one per segment: Get-WorktreeVictimTokens can name more
+    # than one, and the body below judges each. Its every `continue` therefore moves on to the next
+    # candidate, which is what makes a candidate that resolves to nothing unable to hide another.
+    $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
-        # First positional (non-flag) token after the subcommand is the worktree being acted on, read
+        # The worktree acted on is a positional token after the subcommand, and
+        # Get-WorktreeVictimTokens returns EVERY reading of which one: the token after `--`, and the
+        # first non-flag token under each comparison. Each is judged below. The tokens are read
         # QUOTE-AWARE (BACKLOG #1064, defect A). This was `$after -split '\s+'` followed by
         # `.Trim('"', "'")` -- a tokeniser that never reads the quotes it strips. A quoted path
         # containing a SPACE became two tokens, the first was taken, `git -C` failed on the truncated
@@ -3593,29 +3851,14 @@ What to do instead:
         # unterminated quote and empty input before it was written here.
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
         $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
-        $victimRaw = $null
-        # THE BARE ALTERNATIVE MUST STOP AT A QUOTE, and the first version of this scan did not. It
-        # was `[^\s"''][^\s]*`, whose tail admits quote characters -- so `git worktree remove
-        # <path>""` carried the trailing `""` into the token, `git -C` failed on it, and the rule
-        # fell through to ALLOW. That is the EXACT fail-open this block exists to close,
-        # reintroduced by its own fix: the `.Trim('"', "'")` being replaced had stripped them.
-        # Measured across three gate versions to separate a regression from an inherited defect:
-        # main DENY, parent DENY, this-before-the-correction ALLOW.
-        #
-        # AND THE FLAG SKIP MUST TEST THE CAPTURED VALUE, not the raw match text. `$m.Value` for a
-        # QUOTED flag begins with the quote character, so `"--force"` was never skipped and became
-        # the victim: `git worktree remove "--force" "<governed wt>"` ALLOWed, with the worktree
-        # really destroyed when the command was run. That one is INHERITED -- it allows on main and
-        # on the parent too -- but the note above claimed this scan was "validated against the flag",
-        # and only the UNQUOTED spelling had been.
-        foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
-            $tok = $m.Groups['q'].Value
-            if (-not $tok) { continue }
-            if ($tok.StartsWith('-')) { continue }
-            $victimRaw = $tok
-            break
+        foreach ($victimRaw in @(Get-WorktreeVictimTokens $after)) {
+            [pscustomobject]@{ Seg = $seg; WtVerb = $wtVerb; VictimRaw = $victimRaw }
         }
-        if (-not $victimRaw) { continue }
+    }
+    foreach ($wtTarget in @($wtTargets)) {
+        $seg = $wtTarget.Seg
+        $wtVerb = $wtTarget.WtVerb
+        $victimRaw = $wtTarget.VictimRaw
 
         # BACKLOG #1059 -- resolve a victim named through a shell variable, WHERE THAT IS DECIDABLE.
         # A segment is a LINE, so `p=<path>; git worktree remove "$p"` carries its own assignment.
@@ -3692,8 +3935,11 @@ What to do instead:
         if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
         $victimCmp = Get-ComparablePath $victimCommon $victimAbs
         $govWt = $null
+        # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds denies. The
+        # ordinal half catches a combining mark after the slash, which the culture StartsWith misses.
         foreach ($r in $roots) {
-            if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) { $govWt = $r; break }
+            if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or
+                $victimCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govWt = $r; break }
         }
         if (-not $govWt) { continue }
 
@@ -3717,7 +3963,7 @@ What to do instead:
         if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
-        $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
+        $isSelf = $victimTop -and $selfTop -and [string]::Equals($victimTop, $selfTop, [System.StringComparison]::Ordinal)
 
         # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
         # already does and this one did not. It matters MORE after the quote-aware tokeniser above:
@@ -3814,12 +4060,12 @@ What to do instead:
         # script refuses by its own check; the reverse costs a route.
         $govLeaf = Split-Path $govWt.Display -Leaf
         $sibPrefix = "$($govWt.Compare)-"
-        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
+        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix, [System.StringComparison]::Ordinal) -and
                      -not $victimTop.Substring($sibPrefix.Length).Contains('/')
         $isManaged = $victimTop -and ($victimTop -match '/\.claude/worktrees(/|$)')
         # THE PRIMARY ITSELF IS NOBODY'S TO REMOVE. Git never removes a main worktree and the script
         # refuses it by name, so printing the -Path line for it would hand the reader a dead end.
-        $isPrimary = $victimTop -and ($victimTop -eq $govWt.Compare)
+        $isPrimary = $victimTop -and [string]::Equals($victimTop, $govWt.Compare, [System.StringComparison]::Ordinal)
         $pathRoute = (-not $isManaged) -and (-not $isPrimary) -and
                      (Test-ScriptDeclaresParameter $govWt.Display 'remove.ps1' 'Path')
         # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
@@ -4121,10 +4367,11 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             # a path separator, whitespace, a quote, `;` `&` `|` `)`, a bare trailing dot, or end-of-string
             # -- clears both lookaheads and still matches, so no real primary tree-swap slips through.
             #
-            # THIRD lookahead (BACKLOG #308): honour the SAME `.claude/worktrees/` exemption that
-            # Test-Governed already applies. A linked worktree living UNDER the primary is not the
-            # primary -- a git verb there swaps only its own tree -- but a path separator clears both
-            # lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
+            # THIRD lookahead (BACKLOG #308): honour the `.claude/worktrees/` subpath that Test-Governed
+            # exempts. It is a raw ordinal regex, NOT the same test: it also exempts
+            # `.claude/worktrees/<U+0301>x`, which Test-Governed governs. A linked worktree living
+            # UNDER the primary is not the primary -- a git verb there swaps only its own tree -- but a
+            # path separator clears both lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
             # exactly where the Claude Code harness puts a worktree (both layouts, and which mechanism
             # makes each: the WHICH MECHANISM MADE THIS WORKTREE block above), so `cd <own worktree> &&
             # git rebase ...` -- the
@@ -4468,8 +4715,75 @@ turned off and I need you to do it." Do not disable it yourself.
 # blocked trains people to route around it (rule 3's note above records that happening).
 # ---------------------------------------------------------------------------------------------------
 $targetCmp = Get-ComparablePath $target
+# RULE 1b'S SUBJECTS ARE EVERY COORDINATION ROOT, NOT ONLY THE LOCAL ONE (docs/COORD-SHARED-ROOT.md).
+# Seats, mail, claims and allocations may live on a SHARED root, an SMB share both PCs reach. Rule 1 never
+# governed that path (it is not under any primary checkout), so before this the gate let a write tool
+# hand-write claims/<item>.json there: the exact transfer rule 1b refuses locally. So the shared root is a
+# rule 1b subject too, and ONLY rule 1b's: an unarmed write there falls through to the rest of the gate
+# exactly as before, rather than taking the local root's exit-0 exemption. Every verdict this changes
+# moves ALLOW to DENY.
+#
+# READ LEXICALLY, WITH NO NETWORK CALL: $env:MEFOR_COORD_ROOT, then each governed root's
+# .git/mefor-coord/root.toml (scripts/coord/coord-root.ps1 is the resolver; this copy is inline because
+# the gate runs from a user-scope COPY that cannot dot-source the repo). A mapped drive letter whose
+# DisplayRoot is that share is folded onto it too, so the Z: spelling of a UNC root is caught. NOT
+# covered, stated rather than implied: the same server reached by another name (an IP for a hostname,
+# an FQDN), and a junction pointing into the share.
+$coordRoots = [System.Collections.Generic.List[object]]::new()
 foreach ($r in $roots) {
-    $coordRoot = "$($r.Compare)/.git/mefor-coord/"
+    $coordRoots.Add([pscustomobject]@{ Prefix = "$($r.Compare)/.git/mefor-coord/"; Shared = $false })
+}
+$sharedSpellings = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($env:MEFOR_COORD_ROOT)) { $sharedSpellings.Add($env:MEFOR_COORD_ROOT.Trim()) }
+foreach ($r in $roots) {
+    $rootToml = Join-Path $r.Display '.git/mefor-coord/root.toml'
+    try {
+        if (Test-Path -LiteralPath $rootToml -PathType Leaf) {
+            foreach ($line in [System.IO.File]::ReadAllLines($rootToml)) {
+                if ($line -match "\A\s*shared_root\s*=\s*'([^']+)'") { $sharedSpellings.Add($Matches[1].Trim()); break }
+            }
+        }
+    } catch { }
+}
+# A shared spelling that EQUALS, CONTAINS or sits INSIDE a governed root is a misconfiguration, never a
+# real share: honoured, it would put every worktree's source files under rule 1b's shape backstop and
+# refuse all code writes with a message about coordination state. It is ignored here; the resolver's
+# own refusal is what reports it.
+foreach ($spelling in $sharedSpellings) {
+    $cmp = Get-ComparablePath $spelling
+    if (-not $cmp) { continue }
+    $overlaps = $false
+    foreach ($r in $roots) {
+        if ($cmp -eq $r.Compare -or
+            $r.Compare.StartsWith("$cmp/", [System.StringComparison]::Ordinal) -or
+            $cmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $overlaps = $true; break }
+    }
+    if (-not $overlaps) { $coordRoots.Add([pscustomobject]@{ Prefix = "$cmp/"; Shared = $true }) }
+}
+$targetSpellings = [System.Collections.Generic.List[string]]::new()
+if ($targetCmp) { $targetSpellings.Add($targetCmp) }
+# The UNC spelling can only match a Shared entry, so with none there is no drive to look up.
+if (@($coordRoots | Where-Object { $_.Shared }).Count -gt 0 -and $targetCmp -match '^([a-z]):/') {
+    try {
+        $drive = Get-PSDrive -Name $Matches[1] -PSProvider FileSystem -ErrorAction Stop
+        if ($drive.DisplayRoot -and $drive.DisplayRoot.StartsWith('\\')) {
+            $unc = Get-ComparablePath ($drive.DisplayRoot.TrimEnd('\') + '\' + $targetCmp.Substring(3))
+            if ($unc) { $targetSpellings.Add($unc) }
+        }
+    } catch { }
+}
+$coordMatch = $null
+foreach ($cr in $coordRoots) {
+    foreach ($tc in $targetSpellings) {
+        if ($tc.StartsWith($cr.Prefix, [System.StringComparison]::Ordinal)) {
+            $coordMatch = [pscustomobject]@{ Root = $cr; Rest = $tc.Substring($cr.Prefix.Length) }
+            break
+        }
+    }
+    if ($coordMatch) { break }
+}
+
+if ($coordMatch) {
     # ORDINAL, EXPLICITLY, on both this match and the denylist's below. The one-argument
     # String.StartsWith overload compares under the CURRENT CULTURE, which SKIPS collation-ignorable
     # characters -- measured on this host, "<root>/.git/mefor-coord`u{200D}/evil".StartsWith("<root>/.git/
@@ -4478,8 +4792,7 @@ foreach ($r in $roots) {
     # and the comment above earns the word "required" only under it. It matters most on rule 1b: a
     # culture-sensitive denylist decides membership of a SECURITY list by collation, which is not a
     # property anyone auditing this file would think to check.
-    if (-not $targetCmp.StartsWith($coordRoot, [System.StringComparison]::Ordinal)) { continue }
-    $rest = $targetCmp.Substring($coordRoot.Length)
+    $rest = $coordMatch.Rest
 
     # CLASSIFY THE FILE THE WRITE LANDS ON, NOT THE SPELLING. `foo.json:bar.md` names an NTFS ALTERNATE
     # DATA STREAM of foo.json, and every classifier below would otherwise read the STREAM's name instead of
@@ -4500,8 +4813,9 @@ foreach ($r in $roots) {
     # be a stream separator. Strip from there and judge the base: a registry keeps its real extension and
     # denies, while a stream on a genuine document stays a document.
     #
-    # THE COLON IS ONE MEMBER OF A SET, AND THREE LAYERS COVER THE SET -- record which does what, because
-    # they fail independently and this line is only one of them. Win32 maps MANY spellings onto ONE file:
+    # THE COLON IS ONE MEMBER OF A SET, AND AT LEAST THE FOUR LAYERS BELOW COVER IT -- record which does
+    # what, because they fail independently and this line is only one of them. This is not a census of
+    # the set: tests/test_worktree_gate.py pins the spellings each layer is known to deny. Win32 maps MANY spellings onto ONE file:
     # measured on this box, `OFF.`, `OFF` with a trailing space, `OFF::$DATA` and `OFF:x.md` each create the
     # single file `OFF`, and announce-session.ps1 arms its kill switch on that file's existence alone.
     #
@@ -4520,6 +4834,16 @@ foreach ($r in $roots) {
     #   a stream named like a doc      THIS LINE, and only this line. `OFF:x.md` is the one spelling that
     #                                  flips to ALLOW when the strip is removed, because GetExtension then
     #                                  reports `.md` and the backstop waves it through.
+    #   a colon the searches disagree on  THE DISAGREEMENT TEST ($streamUnclear) below, and only it. The
+    #                                  ordinal search finds a colon before a combining mark that the
+    #                                  culture search misses, so `handoff/x.md:<U+0301>y` strips to a
+    #                                  document and the backstop below would ALLOW it. The culture search
+    #                                  left it whole and it was denied, so the disagreement denies it.
+    #                                  THIS LAYER PROTECTS NO REGISTRY that is known: its one measured
+    #                                  spelling is a stream on a document, the shape the strip allows
+    #                                  for `handoff/x.md:y`. It exists so that making the search ordinal
+    #                                  removes no deny the culture search gave, not because the deny is
+    #                                  shown to guard anything.
     #
     # The split was MEASURED by reverting each layer, not reasoned about, and the first draft of this comment
     # got it wrong in the safe-looking direction: it credited the strip with the `::$DATA` cases, which it
@@ -4536,7 +4860,14 @@ foreach ($r in $roots) {
     # This is "what turns off the thing I am deferring to" applied to GetExtension. The question came from a
     # sibling session that had just found `--ignore-other-worktrees` disabling the git guard its own rule
     # deferred to; the same question against this rule's classifier produced the spelling above.
-    $colon = $rest.IndexOf(':')
+    # The [char] overload, which is ordinal. The string overload is culture, and a colon followed by
+    # a combining mark is not found by it, so `announce/OFF:<U+0301>x.md` kept its stream suffix and
+    # read as a document (measured 2026-10-21).
+    $colon = $rest.IndexOf([char]':')
+    # WHERE THE TWO SEARCHES DISAGREE, THE BACKSTOP DENIES. Ordinal alone would also strip the colon in
+    # `handoff/x.md:<U+0301>y`, which the culture search missed and the backstop therefore denied, and
+    # read it as `.md`. Denying every remainder they disagree on keeps both denies.
+    $streamUnclear = $colon -ne $rest.IndexOf(':')
     if ($colon -ge 0) { $rest = $rest.Substring(0, $colon) }
 
     # Name is matched as the WHOLE remainder or as a prefix ending in a separator, so `alloc` catches
@@ -4597,24 +4928,28 @@ foreach ($r in $roots) {
     # -- all 9 logged coord denies are `.md` or `.tsv` -- and it means the NEXT registry added here is denied
     # the day it appears rather than the day somebody remembers to update a list. Add it to the list anyway,
     # for the precise remedy; the shape rule is what holds until then.
-    if (-not $armed -and
-        [System.IO.Path]::GetExtension($rest) -notin @(".md", ".txt", ".tsv")) {
+    # ORDINAL membership (Array.IndexOf): a match exempts, and the culture `-notin` read `.m<U+00AD>d`
+    # as `.md`.
+    if (-not $armed -and ($streamUnclear -or
+        [array]::IndexOf([string[]]@(".md", ".txt", ".tsv"), [System.IO.Path]::GetExtension($rest)) -lt 0)) {
         $armed = @{
-            What = "a file under .git\mefor-coord\ that is not a handoff document or a delivery receipt," +
+            What = "a file under $(if ($coordMatch.Root.Shared) { 'the shared coordination root' } else { '.git\mefor-coord\' }) that is not a handoff document or a delivery receipt," +
                    " so this gate treats it as machine-read coordination state"
             Fix  = "if you meant to leave a NOTE, name it .md (or .txt); if you meant to append a delivery" +
                    " receipt, that is announce\sent\<session-id>.tsv"
         }
     }
 
-    if (-not $armed) { exit 0 }
+    # The local root's unarmed documents keep rule 1's exemption. The shared root never had one to keep.
+    if (-not $armed -and -not $coordMatch.Root.Shared) { exit 0 }
 
-    Write-Deny -Rule "1b" -Detail $target -Reason @"
-BLOCKED: this writes $($armed.What), which another gate on this machine reads as AUTHORITY ($(Get-SafeForMessage $target)).
+    if ($armed) { Write-Deny -Rule "1b" -Detail $target -Reason @"
+BLOCKED: this writes $($armed.What), which $(if ($coordMatch.Root.Shared) { 'another gate, on this PC or on any other PC sharing this root,' } else { 'another gate on this machine' }) reads as AUTHORITY ($(Get-SafeForMessage $target)).
 
-Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
-exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is
-neither. It lives in the git COMMON dir -- ONE file, shared by every
+$(if ($coordMatch.Root.Shared) { "Handoff documents and delivery receipts on the shared coordination root are allowed, but only by SHAPE:
+a .md or .txt document, or a .tsv receipt. This path is" } else { "Handoff documents and delivery receipts under .git\mefor-coord\ ARE exempt from rule 1 -- that is what the
+exemption is for -- but they are exempt by SHAPE: a .md or .txt document, or a .tsv receipt. This path is" })
+neither. It lives in $(if ($coordMatch.Root.Shared) { 'the SHARED coordination root, read by every session on every PC' } else { 'the git COMMON dir' }) -- ONE file, shared by every
 worktree at once -- and the gate that reads it decides from a single field, or from the file merely
 existing, so a hand-written copy is indistinguishable from a real one. That is how a write here forges an
 allocation the allocator never issued, transfers a claim whose holder still believes it is theirs, or turns
@@ -4628,7 +4963,7 @@ Do this instead:
 If the state itself is WRONG -- a stale claim, a ratchet left high by an earlier accident -- say so and let
 the user decide, naming the file and the change you want. Do not hand-edit it, and do not route around this
 with a shell command; that only removes the record of which session did it.
-"@
+"@ }
 }
 
 $root = Test-Governed $targetCmp
@@ -4653,7 +4988,7 @@ try {
             # "REUSE one if it is yours", displacing a real worktree off the 8-item cap below. The one part
             # of this hook whose entire job is steering the next action was steering it back at the tree we
             # had just refused. Compare against the canonicalised form.
-            Where-Object { (Get-ComparablePath $_) -ne $root.Compare }
+            Where-Object { -not [string]::Equals((Get-ComparablePath $_), $root.Compare, [System.StringComparison]::Ordinal) }
     )
 } catch { $worktrees = @() }
 

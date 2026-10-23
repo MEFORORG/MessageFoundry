@@ -68,11 +68,12 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
         op_id = await _uid(service, "op")
         other_id = hash_token(other.token or "")
         path = f"/ui/account/sessions/{other_id}/revoke"
-        # No ungranted arm here, deliberately: test_sessions_revoke_one already asserts that
-        # refusal under a DEFAULT window, which is also the proof that the -1 above changed nothing
-        # before this mint existed. Do not re-add a grant-less POST. Why the grant is evidenced by
-        # the re-auth response rather than read back, and why both halves are checked:
-        # test_stale_reauth_only_bounces_to_reauth.
+        # No ungranted arm here, deliberately: test_webui_search_sso.py::test_sessions_revoke_one
+        # already asserts that refusal under a DEFAULT window, which is also the proof that the -1
+        # above changed nothing before this mint existed. Do not re-add a grant-less POST. Why the
+        # grant is evidenced by the re-auth response rather than read back, and why both halves are
+        # checked:
+        # test_webui_account.py::test_stale_reauth_only_bounces_to_reauth.
         minted = await _mint_action(c, path)
         assert minted.status_code == 200
         assert f'action="{path}"' in minted.text
@@ -97,7 +98,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         path = "/ui/account/sessions/revoke-others"
-        # Ungranted arm: test_sessions_revoke_others, under a default window. See the twin above.
+        # Ungranted arm: test_webui_search_sso.py::test_sessions_revoke_others, under a default
+        # window. See the twin above.
         minted = await _mint_action(c, path)
         assert minted.status_code == 200
         assert f'action="{path}"' in minted.text
@@ -988,7 +990,8 @@ async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) ->
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it this unenrolled fixture session is refused first with the SAME 303 and
     # the window measured nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
-    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # unpinned: the docstring of
+    # test_webui_monitoring.py::test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     # -1 replaces a 0 that sat exactly on has_recent_step_up's `elapsed <= max_age` boundary.
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()

@@ -164,7 +164,8 @@
     version-controlled document; reading a doc is not running a command.
 
     MESSAGE CONTENT CANNOT REACH COLUMN 0. Every line derived from a message carries the prefix
-    '    | ', applied by Format-Body, which is the only place in this script where a body becomes lines.
+    '    | ', applied by Format-Body and by Format-AnnounceLine, the two places in this script where a body
+    becomes lines. Audit both when the prefix or the sanitiser changes.
     Every other line in the injection was written here. That single structural rule is what stops a body
     forging this script's own delimiter, a system-reminder opener, or any framing nobody has invented yet
     -- and it is why there is deliberately no list of forbidden strings to keep up to date.
@@ -436,6 +437,12 @@ function Get-CleanLines {
 $BODY_PREFIX = '    | '
 $BODY_PREFIX_BYTES = $BODY_PREFIX.Length
 
+# The paste backstop's one pattern, shared by Format-Body and Format-AnnounceLine. Two copies would
+# let a segment added to one slip past the other.
+$HL7_SEGMENT_START = '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|'
+# The longest one-line announce render. A longer one renders in full through Format-Body instead.
+$MAX_ANNOUNCE_CHARS = 400
+
 function Measure-BodyBytes {
     # Bytes, not characters, and measured on the SANITISED text. Get-Clean has already substituted
     # every non-ASCII code point, so one character is one byte here -- which is the only reason a
@@ -452,7 +459,8 @@ function Measure-BodyBytes {
 }
 
 function Format-Body {
-    # THE ONLY PLACE A MESSAGE BODY BECOMES LINES. Every line gets the prefix '    | '. The prefix is
+    # WHERE A MESSAGE BODY BECOMES LINES, with Format-AnnounceLine as the only other place, for the
+    # one-line announce. Every line gets the prefix '    | '. The prefix is
     # the containment: a body line can no longer start at column 0, so it cannot forge this script's
     # '--- message' delimiter, a '<system-reminder>'-shaped opener, a 'Human:'/'Assistant:' turn
     # marker, or any framing the surrounding harness has not invented yet.
@@ -475,7 +483,7 @@ function Format-Body {
     # body". This is a backstop
     # for the realistic accident, and its presence is not evidence that the queue is PHI-safe.
     foreach ($l in $Lines) {
-        if ($l -cmatch '\A(MSH|PID|PV1|OBR|OBX|EVN|NK1|IN1)\|') {
+        if ($l -cmatch $HL7_SEGMENT_START) {
             return [pscustomobject]@{
                 Lines     = @(
                     "    | [mefor-mail: body withheld -- it contains a line shaped like an HL7 segment, and"
@@ -522,6 +530,55 @@ function Format-Body {
         $out += "    |  The whole message is on disk at $DiskPath.]"
     }
     return [pscustomobject]@{ Lines = @($out); Withheld = $false; Truncated = $truncated }
+}
+
+function Format-AnnounceLine {
+    # A [SESSION-ANNOUNCE] BROADCAST RENDERS AS ONE LINE. An audit of 196 mailed messages found 85
+    # were announces, each about 600 bytes framed, and the reader needs five facts from one: who,
+    # which branch, what they intend, what they touch, and when it was sent. Two lines are dropped:
+    # the tag line, whose worktree and branch repeat the from fields, and a final `via:` envelope line.
+    #
+    # NOTHING ELSE IS DROPPED. $null means "render it in full through Format-Body", and the shortcut
+    # returns $null for at least: a kind other than broadcast, extra text on the tag line, a field it
+    # does not know or that repeats, text after `via:`, a line the line cap already cut, a summary
+    # longer than $MAX_ANNOUNCE_CHARS, and a line Format-Body would withhold. So the HL7 backstop and
+    # the truncation markers are never bypassed, and the tag cannot hide the rest of a body.
+    #
+    # This is the second place a body becomes lines, beside Format-Body. The line is message content,
+    # so it carries $BODY_PREFIX, and every field went through Get-Fold. Only the frame delimiters
+    # stay at column 0.
+    param([string[]]$Lines, [string]$Kind, [bool]$LineCapped, [string]$FromCwd, [string]$FromBranch, [string]$Sent)
+    if ($Kind -ne 'broadcast' -or $LineCapped) { return $null }
+    if (-not $Lines -or -not ([string]$Lines[0]).StartsWith('[SESSION-ANNOUNCE]')) { return $null }
+    # The header must be exactly the hook's '<tag> <worktree> (<branch>)', which repeats the from
+    # fields. Any other text on it is content this line would not show.
+    if ([string]$Lines[0] -cnotmatch '\A\[SESSION-ANNOUNCE\] \S+ \(\S*\)\z') { return $null }
+    foreach ($l in $Lines) { if ($l -cmatch $HL7_SEGMENT_START) { return $null } }
+    # Get-CleanLines has trimmed every line, so a wrapped field's continuation lines arrive as bare
+    # text. A known key followed by ': ' starts a field. Any other 'word: ' line is a field this
+    # shortcut does not know, so the message renders in full. A wrapped 'https://...' or 'D:\...'
+    # has no space after its colon, so it stays a continuation.
+    # A repeated field would overwrite the first copy, and `via:` must be the last line, because its
+    # text is dropped and anything after it would be dropped with it.
+    $f = @{ intent = ''; touching = ''; via = '' }
+    $seen = @{}
+    $cur = ''
+    foreach ($l in @($Lines | Select-Object -Skip 1)) {
+        if (-not $l) { continue }
+        if ($cur -eq 'via') { return $null }
+        if ($l -cmatch '\A([a-z][a-z-]*):(?:\z| (.*)\z)') {
+            if (-not $f.ContainsKey($Matches[1]) -or $seen.ContainsKey($Matches[1])) { return $null }
+            $cur = $Matches[1]; $seen[$cur] = $true; $f[$cur] = [string]$Matches[2]; continue
+        }
+        if (-not $cur) { return $null }
+        $f[$cur] = "$($f[$cur]) $l"
+    }
+    $intent = if ($f.intent) { $f.intent } else { '(none given)' }
+    $text = "announce: $FromCwd (branch $FromBranch); intent: $intent"
+    if ($f.touching) { $text += "; touching: $($f.touching)" }
+    $text = Get-Fold "$text; sent $Sent"
+    if ($text.Length -gt $MAX_ANNOUNCE_CHARS) { return $null }
+    return "$BODY_PREFIX$text  [UNVERIFIED]"
 }
 
 function Write-MailReceipt {
@@ -762,6 +819,8 @@ try {
     # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
     # anchor; say nothing and go.
     $common = & git -C $cwd rev-parse --path-format=absolute --git-common-dir 2>$null
+    # The directory git answered for, so the shared-root lookup below asks the same repository.
+    $coordFrom = $cwd
     if ($LASTEXITCODE -ne 0 -or -not $common) {
         # A FAILED PROBE IS NOT PROOF OF "NOT A REPO", so three things must hold before the anchor is
         # honoured. Each one closes a measured way a REAL worktree fails this probe, and the whole
@@ -781,11 +840,36 @@ try {
         if ($LASTEXITCODE -ne 0) { exit 0 }
         $common = & git -C $AnchorRepo rev-parse --path-format=absolute --git-common-dir 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+        $coordFrom = $AnchorRepo
+    }
+    # mail/ is a SHARED kind, so the queue is coord-root.ps1's answer (docs/COORD-SHARED-ROOT.md); with
+    # nothing configured it is <common>/mefor-coord/mail, as before. The box KEY is unchanged: it is
+    # still this session's own cwd, so the same box is read on whichever root holds it.
+    #
+    # A ROOT THAT DOES NOT ANSWER IS NOT AN EMPTY BOX, AND THIS HOOK MUST NOT HANG OR BLOCK. The
+    # resolver answers a dead share in one bounded probe and caches the verdict, and on Error the drain
+    # reads nothing and says so ONCE in a line -- as context at SessionStart, on stderr at Stop, because
+    # output at Stop re-wakes the model. It never falls back to the local queue: mail sent from the
+    # other PC is not there, so a local read would render "no mail" for mail that exists.
+    $localCoordRoot = Join-Path $common.Trim() 'mefor-coord'
+    # A missing resolver is the same skip as a dead root: never a read of a local copy of a shared kind.
+    $coordRootLib = "$PSScriptRoot\..\coord\coord-root.ps1"
+    $mr = @{ Path = $null; Error = "$coordRootLib is missing" }
+    if (Test-Path -LiteralPath $coordRootLib -PathType Leaf) {
+        . $coordRootLib
+        $mr = Resolve-CoordSharedRoot -From $coordFrom -LocalRoot $localCoordRoot
+    }
+    if ($mr.Error) {
+        $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
+            "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
+        if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
+        else { Write-Injection -Event $eventName -Text $note }
+        exit 0
     }
     # The coordination root is named in its own variable because the receipt sweep's citation guard
-    # reads the coordination tree OUTSIDE mail/. Deriving it back out of $root with Split-Path would
-    # be a second spelling of the same path; two Join-Paths is one.
-    $coordRoot = Join-Path $common.Trim() 'mefor-coord'
+    # reads the coordination tree OUTSIDE mail/. On a shared root that is the share (seats/, handoffs/)
+    # AND the local tree, which still holds anything written before the move; see Get-CitedStems.
+    $coordRoot = $mr.Path
     $root = Join-Path $coordRoot 'mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
@@ -1082,7 +1166,23 @@ try {
             # tree, 2026-09-17 -- so a drain with nothing to sweep must not pay for it, and that is the
             # only reason the two passes exist.
             $citedStems = $null
-            try { $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX }
+            try {
+                if ([System.IO.Path]::GetFullPath($coordRoot).TrimEnd('\', '/') -ieq [System.IO.Path]::GetFullPath($localCoordRoot).TrimEnd('\', '/')) {
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
+                } else {
+                    # Both trees, when the shared root is not the local one. A citation in either
+                    # protects a receipt; a walk of only one would delete a receipt the other still
+                    # quotes. The share is walked WHOLE, minus its mail/, exactly as the local tree was
+                    # before the move: handoff documents land at the root and under handoff/ as well as
+                    # handoffs/, and a walk narrowed to named kinds deletes receipts cited elsewhere.
+                    # The local walk skips the local mail/ tree, whose own names would otherwise read
+                    # as citations.
+                    $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX
+                    if (Test-Path -LiteralPath $localCoordRoot -PathType Container) {
+                        $citedStems.UnionWith((Get-CitedStems -CoordRoot $localCoordRoot -MailRoot (Join-Path $localCoordRoot 'mail') -ExcludedPrefix $CITATION_EXCLUDED_PREFIX))
+                    }
+                }
+            }
             catch { $citedStems = $null; $sweepFailed = $true }
             if ($null -eq $citedStems) { $receiptSweepSkipped = $true }
             else {
@@ -1641,6 +1741,14 @@ try {
         #
         # The rule is now literally true: message-derived text cannot reach column 0 anywhere.
         $lines += "--- message id=$($d.Item.Id)"
+        $ann = Format-AnnounceLine -Lines $d.Item.CleanLines -Kind $kind -LineCapped $d.Item.LineCapped `
+            -FromCwd $fromCwd -FromBranch $fromBr -Sent $sent
+        if ($ann) {
+            $lines += $ann
+            $lines += "--- end message id=$($d.Item.Id)"
+            $lines += ""
+            continue
+        }
         # [UNVERIFIED] sits at the POINT OF USE so the reader does not have to carry the preamble down
         # thirty lines to a message header.
         $lines += "    | claimed-from: $fromCwd  (branch $fromBr)  [UNVERIFIED]"
