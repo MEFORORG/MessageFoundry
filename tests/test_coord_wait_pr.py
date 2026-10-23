@@ -1139,8 +1139,8 @@ def test_a_required_context_is_matched_ordinally(tmp_path: Path) -> None:
     assert "met:" not in run.out
 
 
-def test_an_empty_base_ref_still_reads_the_required_set(tmp_path: Path) -> None:
-    """An empty base must not pass for the base already read, or one run would meet the wait."""
+def test_an_empty_base_ref_is_refused_before_any_required_set_read(tmp_path: Path) -> None:
+    """`branches/` with no name is the list endpoint, so an empty base is refused, never read."""
     lint = {"name": "lint", "status": "completed", "conclusion": "success"}
     run = wait_pr(
         tmp_path,
@@ -1151,9 +1151,11 @@ def test_an_empty_base_ref_still_reads_the_required_set(tmp_path: Path) -> None:
             STATUS_PATH: NO_STATUSES,
         },
     )
-    assert run.code != 0
+    assert run.code == 1
+    assert "the PR names no base branch, so its required contexts cannot be read" in run.err
     assert "met:" not in run.out
-    assert f"repos/{REPO}/branches/" in run.paths()
+    assert "resume:" not in run.out
+    assert not [p for p in run.paths() if "branches/" in p]
 
 
 def test_a_retarget_reads_the_required_set_again(tmp_path: Path) -> None:
