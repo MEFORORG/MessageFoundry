@@ -658,8 +658,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
     # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
     # is a posture decision on the scheme, and it calls no cipher or context.
+    # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the once-per-
+    # proxy disclosure, so the dedupe set holds no proxy credential. A dedupe key, not a security
+    # control: nothing is verified against it and no key is involved.
     "messagefoundry/transports/strict_requests.py": frozenset(
-        {"messagefoundry.config.tls_policy", "ssl"}
+        {"hashlib", "messagefoundry.config.tls_policy", "ssl"}
     ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -1725,7 +1728,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # StrictReplyAdapter.__init__, so no "via" token reaches the Vault callers' rows, and the
     # CERT_NONE refusal in connect() is a posture decision with no crypto-shaped call.
     "messagefoundry/transports/strict_requests.py": frozenset(
-        {"tls_context:.load_verify_locations()"}
+        {
+            "hash:hashlib.sha256",  # Vault BACKLOG #4028: the ambient proxy disclosure's dedupe key
+            "tls_context:.load_verify_locations()",
+        }
     ),
     # BACKLOG #3414: the SHA-224 narrowing, moved here from config/tls_policy.py (BACKLOG #1171).
     "messagefoundry/tls_sigalgs.py": frozenset({"tls_context:.set_server_sigalgs()"}),

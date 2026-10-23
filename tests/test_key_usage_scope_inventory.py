@@ -116,6 +116,8 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "harness process holds the pair only long enough to hand it to the child it spawned, in a "
     "per-run temp directory, and nothing about it is engine-held or persisted",
     "Engine-shard lane ownership": "a coordination record, not cryptographic material",
+    "Vault hop ambient-proxy disclosure dedupe": "an unkeyed digest of a configuration value, "
+    "held in memory as a log dedupe key (vault BACKLOG #4028)",
     "Private-key passphrase wraps": "a check on the wrap of keys other rows already scope (TLS "
     "private keys, outbound signing, the SMART client assertion, DIRECT); it reads a wrap and "
     "decides, and holds no key of its own (BACKLOG #1352, #1171)",
