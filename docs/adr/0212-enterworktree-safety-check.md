@@ -46,7 +46,7 @@ SAFE requires all of these:
 | c | It is under this session's own scratchpad, by segments: `<temp>\claude\<one segment>\<session id>\scratchpad\<more>`, the session id a uuid matched exactly at that position. `.claude/worktrees/` is never allowed: another session's subagent trees live there, and the session registry cannot see them. The path given must already be canonical: one through a link is refused, because the session can repoint its own link after the check while the harness keeps the path it was given. |
 | d | The session neither is nor was launched in the primary checkout of a fleet repository. Relocating from a primary re-files the transcript, which is why `worktree_gate.ps1` rule 4 exists, so that case reads UNSAFE. A `cd` moves the hook input's `cwd`, so two reads: the `cwd`, and the project directory of `transcript_path`, which is where the transcript is filed. A slug maps a separator and a `-` alike, so only an exact match with a primary's slug counts; a launch in a primary's subdirectory is caught only while the session's cwd stays in that primary. The transcript's records are not read: measured on 2026-10-21, a desktop-app worktree session's first recorded `cwd` is the primary while its transcript is filed under the worktree's slug. |
 | e | The worktree is not locked. Its `.git` file names its own admin dir under the repository's `worktrees/`, and that dir names it back, so a repointed `.git` cannot choose the state e and f read. That dir shows no rebase, merge, cherry-pick, revert, sequencer or bisect in progress. |
-| f | Its HEAD is a commit of the remote's `main`: an ancestor of, or equal to, the commit `git ls-remote <pinned URL> refs/heads/main` names, read with no repository and no user or system config. Neither a local ref nor `origin` is the anchor: any session can move `origin/main` or shadow it with a branch or tag of that name, and can repoint `origin` (or add a `url.*.insteadOf`) in the clone's shared config. So every tracked file, settings, hook code and instructions alike, is one that merged. The clone's shared state may not stand in for an object either: replace refs and the commit-graph are turned off, an `info/grafts` file fails f, and the HEAD the verified admin dir names must be the commit git listed for the worktree, before and after the reads. Its working tree is HEAD byte for byte: no tracked path carries a `filter`, `ident` or `working-tree-encoding` attribute, whose rules `.git/info/attributes` and the shared config can set (a clean filter made an edited file hash as its HEAD blob, measured); every tracked file's on-disk hash equals its HEAD blob, because `git status` trusts a stat cache that a same-size edit with restored timestamps fools (measured); no index entry is flagged assume-unchanged or skip-worktree; nothing is modified or untracked; no ignored file sits under `.claude` or is a `.mcp.json`, `CLAUDE.md` or `CLAUDE.local.md`, at any depth and in any case; ignored means ignored by the tree's own `.gitignore` files, never by `info/exclude` or `core.excludesFile`; and the tree holds no symlink or submodule. The remote's `main` must already be fetched. |
+| f | Its HEAD is a commit of the remote's `main`: an ancestor of, or equal to, the commit `git ls-remote <pinned URL> refs/heads/main` names, read with no repository and no user or system config. Neither a local ref nor `origin` is the anchor: any session can move `origin/main` or shadow it with a branch or tag of that name, and can repoint `origin` (or add a `url.*.insteadOf`) in the clone's shared config. So every tracked file, settings, hook code and instructions alike, is one that merged. The clone's shared state may not stand in for an object either: replace refs and the commit-graph are turned off, an `info/grafts` file fails f, and the HEAD the verified admin dir names must be the commit git listed for the worktree, before and after the reads. Its working tree is HEAD up to git's line-ending conversion, not byte for byte: `hash-object --stdin-paths` hashes each file through the eol conversion git applies on add, so a file that differs from its blob only in line endings passes. `--no-filters` would compare raw bytes, but under `core.autocrlf=true`, the Git for Windows installer's default, a clean checkout would then differ. Beyond that: no tracked path carries a `filter`, `ident` or `working-tree-encoding` attribute, whose rules `.git/info/attributes` and the shared config can set (a clean filter made an edited file hash as its HEAD blob, measured); every tracked file's on-disk hash equals its HEAD blob, because `git status` trusts a stat cache that a same-size edit with restored timestamps fools (measured); no index entry is flagged assume-unchanged or skip-worktree; nothing is modified or untracked; no ignored file sits under `.claude` or is a `.mcp.json`, `CLAUDE.md` or `CLAUDE.local.md`, at any depth and in any case; ignored means ignored by the tree's own `.gitignore` files, never by `info/exclude` or `core.excludesFile`; and the tree holds no symlink or submodule. The remote's `main` must already be fetched. |
 When `<engine git common dir>/mefor-coord/enter-check/OFF` exists, the check runs none of these,
 prints `OFF`, and exits 2. It reads that file before anything else, the sanitiser included. A read
 that fails means only that the machine is not silenced, and costs no reason line.
@@ -78,9 +78,16 @@ and the normal prompt shows unannotated.
 
 ### 3. Two ways to silence it
 
-- **This machine:** create the OFF file, and delete it to turn the annotation back on:
+- **This machine:** create the OFF file, and delete it to turn the annotation back on. Put this
+  machine's name for `<HOST>`. The git call is checked before `New-Item` runs. Without that
+  check, a failed git call would leave an empty path prefix, and `New-Item -Force` would create
+  the file at the drive root and report success:
 
-      New-Item -ItemType File -Force -Path "$(git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir)/mefor-coord/enter-check/OFF"
+      if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+          $common = git -C D:/Code/MessageFoundry rev-parse --path-format=absolute --git-common-dir
+          if ($LASTEXITCODE -ne 0 -or -not $common) { Write-Host "STOP     git did not name the engine's git common dir; nothing ran" }
+          else { New-Item -ItemType File -Force -Path (Join-Path $common 'mefor-coord/enter-check/OFF') }
+      }
 
 - **Permanently:** remove the `EnterWorktree` entry from `.claude/settings.json`.
 
@@ -122,7 +129,18 @@ check's run time and a child process.
   9. `git status` can still run a clean filter for an index entry HEAD does not hold. The verdict
      is UNSAFE, but a command has already run.
 
-  The tenth, a relative `-Path` joined to the session's cwd, is closed: check a refuses any path
+  The review of PR 2483's head found at least five more open findings. Of these, 12 and 13 can
+  let a SAFE verdict name an unsafe worktree; the other three withhold a verdict or spoil one:
+
+  10. Any `.claude` then `worktrees` segment pair anywhere in the path makes the hook return no
+      decision, not only the repository's own `.claude/worktrees/`.
+  11. One listed worktree that does not canonicalise makes every verdict UNSAFE.
+  12. f cannot detect a tracked file that is a hard link to a file outside the worktree.
+  13. A tracked path with a leading quote or a trailing CR makes `hash-object --stdin-paths` hash
+      a different file.
+  14. On macOS, a temp root under `/var` canonicalises to `/private/var`, and check c fails.
+
+  The tenth of the third pass's findings, a relative `-Path` joined to the session's cwd, is closed: check a refuses any path
   that is not fully qualified.
 - The hook adds no prompt where the harness's recorded rule shows none. If that rule changes,
   the hook's own copy of it goes stale; that is not measured here. With no `path`, nothing
