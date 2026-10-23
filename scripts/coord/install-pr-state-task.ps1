@@ -32,7 +32,7 @@
 
 .PARAMETER ExpectedHost
     The machine this run is meant for, as [Environment]::MachineName prints it. Required unless
-    -WhatIf or -Json is given.
+    -WhatIf, or -Json without -Uninstall, is given.
 
 .PARAMETER Python
     The pythonw.exe the task runs. Default: the first pythonw.exe on PATH. pr_state.py needs 3.11+.
@@ -124,7 +124,9 @@ $logonType = 'Interactive'
 # A kill at this limit is safe: the poller's OS lock is released when its process dies.
 $timeLimitMinutes = 10
 $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
-$coordDir = Join-Path (& git -C $primary rev-parse --path-format=absolute --git-common-dir).Trim() 'mefor-coord'
+$commonDir = & git -C $primary rev-parse --path-format=absolute --git-common-dir 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $commonDir) { Stop-Install "git could not name the common dir for $primary" }
+$coordDir = Join-Path "$commonDir".Trim() 'mefor-coord'
 $cache = Join-Path $coordDir 'pr-state.json'
 # --coord-dir spares the poller a git process, which would open a console window under pythonw.
 $argument = "-I `"$poller`" --coord-dir `"$coordDir`""

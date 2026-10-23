@@ -743,10 +743,9 @@ It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_che
 unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
 handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releases it when the
 process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
-means another poll is running, so the run exits. Only the lock holder writes the cache, with one
-exception. A run that cannot open or lock the file at all exits 4. It records that error in the cache
-only when nothing has written the cache for five minutes, so it never overwrites a fresh poll. A run
-that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
+cannot open or lock the file at all exits 4 and writes nothing, so a broken lock shows as an ageing
+`fetchedAt` and in the log. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
 `mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
 
 ```powershell
@@ -759,8 +758,10 @@ pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <thi
 The task runs `pythonw.exe -I` on the primary checkout's copy, so no window opens. It runs as you, at
 run level Limited, because gh reads its token from your keyring. Every 2 minutes it runs whatever
 `pr_state.py`, `coord_root.py`, `_pr_checks.py` and `required_contexts.py` the primary checkout holds,
-with your token. That is the same trust the checkout's `.claude/settings.json` hooks already get,
-and nothing checks those files first. The installer refuses inside Claude Code and on any machine
+with your token, whether or not any session is running, and nothing checks those files first. That
+is more exposure than the checkout's `.claude/settings.json` hooks, which run only when a session
+starts there. A change to any of those files in the primary checkout runs, unattended, within two
+minutes. The installer refuses inside Claude Code and on any machine
 other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
 [`tests/test_pr_state.py`](../tests/test_pr_state.py).
 

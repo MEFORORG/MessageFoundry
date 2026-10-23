@@ -500,8 +500,8 @@ def test_truncated_context_page_never_reads_green(tmp_path: Path) -> None:
 
 
 def test_unlisted_verdict_is_pending_not_green(tmp_path: Path) -> None:
-    # STALE is a real CheckRun conclusion that no list named; _pr_checks now allowlists passes.
-    contexts = [_run("CI gate"), _run("cla"), _run("test", "STALE")]
+    # A conclusion no list names reads as unsettled, never green.
+    contexts = [_run("CI gate"), _run("cla"), _run("test", "SOMETHING_NEW")]
     _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}))
     assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
 
@@ -631,11 +631,15 @@ def test_a_failure_keeps_what_the_poll_learned(tmp_path: Path) -> None:
 # --- The third fix brief of 2026-10-22 ------------------------------------------------------------
 
 
-def test_a_lock_error_that_is_not_contention_is_exit_4_with_the_error_cached(
+def test_a_lock_error_that_is_not_contention_is_exit_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CONTROL (fails on 3eb3bbc19, which read every OSError as "held" and exited 0)."""
+    """CONTROL (fails on 3eb3bbc19, which read every OSError as "held" and exited 0).
+
+    Nothing is written: only the lock holder writes the cache. The log says why.
+    """
     _main(tmp_path, FakeGh([_pr(1)], {1: _green()}))
+    before = (tmp_path / "pr-state.json").read_bytes()
 
     def broken(*args: object) -> None:
         raise OSError(errno.EIO, "I/O error")
@@ -649,10 +653,9 @@ def test_a_lock_error_that_is_not_contention_is_exit_4_with_the_error_cached(
 
         monkeypatch.setattr(fcntl, "flock", broken)
     gh = FakeGh([_pr(1)], {1: _green()})
-    rc, doc = _main(tmp_path, gh, NOW + timedelta(minutes=10))
+    rc, _ = _main(tmp_path, gh, NOW + timedelta(minutes=10))
     assert rc == 4 and gh.calls == []
-    assert doc["error"] and "cannot lock" in doc["error"] and doc["errorPart"] == "lock"
-    assert [p["number"] for p in doc["data"]["pullRequests"]] == [1]
+    assert (tmp_path / "pr-state.json").read_bytes() == before
 
 
 def test_a_contexts_failure_keeps_the_main_querys_budget(tmp_path: Path) -> None:
@@ -688,10 +691,12 @@ def test_a_truncated_page_still_lists_github_required_names() -> None:
     assert "new-required" in verdict["unknown"]
 
 
-def test_a_stale_required_run_is_not_green(tmp_path: Path) -> None:
+def test_a_stale_required_run_reads_failing_not_pending(tmp_path: Path) -> None:
+    """GitHub never re-runs a STALE check, so waiting on it is wrong: it needs a re-run."""
     contexts = [_run("CI gate"), _run("cla"), _run("test", "STALE")]
     _, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}))
-    assert doc["data"]["pullRequests"][0]["required"]["pending"] == ["test"]
+    required = doc["data"]["pullRequests"][0]["required"]
+    assert required["state"] == "FAILURE" and required["failing"] == ["test"]
 
 
 # --- Review round 1 of the third fix brief -----------------------------------------------------------
@@ -742,3 +747,42 @@ def test_messages_go_to_a_log_file_when_there_is_no_stderr(
 def test_a_bad_head_sha_never_reaches_the_query() -> None:
     with pytest.raises(ps.PollError):
         ps.contexts_query({1: 'abc") { x } y: object(oid: "'})
+
+
+# --- Review round 2 of the third fix brief -----------------------------------------------------------
+
+
+def test_equal_stamps_break_toward_the_worse_verdict(tmp_path: Path) -> None:
+    same = "2026-10-22T10:00:00Z"
+    green = {**_run("test"), "startedAt": same}
+    red = {**_run("test", "FAILURE"), "startedAt": same}
+    for order in ([green, red], [red, green]):
+        _, doc = _main(
+            tmp_path, FakeGh([_pr(1)], {1: [_run("CI gate"), _run("cla"), *order]}), NOW, "--force"
+        )
+        assert doc["data"]["pullRequests"][0]["required"]["failing"] == ["test"]
+
+
+def test_a_pr_without_a_valid_head_sha_does_not_fail_the_poll(tmp_path: Path) -> None:
+    broken = {**_pr(2), "headRefOid": None}
+    rc, doc = _main(tmp_path, FakeGh([_pr(1), broken], {1: _green()}))
+    assert rc == 0 and doc["error"] is None
+    one, two = doc["data"]["pullRequests"]
+    assert one["required"]["state"] == "SUCCESS" and two["required"]["state"] == "UNKNOWN"
+
+
+def test_a_failed_required_refresh_is_retried_at_most_every_ten_minutes(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        calls.append(args)
+        if args[-1].startswith("repos/"):
+            raise ps.GhError("HTTP 403")
+        return FakeGh([_pr(1)], {1: _green()})(args, stdin)
+
+    _main(tmp_path, gh)
+    first = sum(c[-1].startswith("repos/") for c in calls)
+    _main(tmp_path, gh, NOW + timedelta(minutes=2))
+    assert sum(c[-1].startswith("repos/") for c in calls) == first  # not retried yet
+    _main(tmp_path, gh, NOW + timedelta(minutes=11))
+    assert sum(c[-1].startswith("repos/") for c in calls) > first

@@ -22,8 +22,7 @@ WHY THE LOCK IS AN OS LOCK, NOT lock.ps1. lock.ps1's lock is a file whose existe
 kill (the task's time limit, a logoff, a shutdown) leaves it behind, and recovering it needs a
 liveness guess. This poller holds a byte-range lock on an open handle instead (``msvcrt.locking``;
 ``fcntl.flock`` elsewhere), and the kernel releases it when the process dies, however it dies. A held
-lock means another poll is running, so the run exits. Only the lock holder writes the cache; the
-one exception is in main() and in the doc.
+lock means another poll is running, so the run exits. Only the lock holder writes the cache.
 docs/WORKTREES.md, *A PR-state cache for read-only panes*, is where the lock is described for readers.
 
 A FAILED READ NEVER WRITES AN EMPTY LIST. On any failure the previous good ``data`` block is kept with
@@ -66,6 +65,9 @@ CONTEXT_CHUNK = 20
 CONTEXT_PAGE = 100
 #: How often the live required-context list is re-read. It changes when branch protection does.
 REQUIRED_REFRESH_SECONDS = 3600
+#: After a failed refresh, the next try waits this long, so a persistent 403 costs a few calls an
+#: hour, not two every poll.
+REQUIRED_RETRY_SECONDS = 600
 #: The GraphQL budget is 5000 points an hour, shared by every seat. A poll costs about 4. Below
 #: RATE_LOW the poller is the consumer that should yield, so it drops to one poll in RATE_LOW_DELAY.
 #: Below RATE_FLOOR it stops until the window resets, leaving the rest for seats doing real work.
@@ -82,8 +84,6 @@ RATE_LIMIT_FALLBACK_SECONDS = 900
 #: Two hours, so a reset an hour out read by a clock running behind GitHub still counts.
 MAX_BACKOFF = timedelta(seconds=max(FAIL_MAX_DELAY, 3600) * 2)
 START_SLACK = timedelta(seconds=15)
-#: A lock failure is written into the cache only when nothing wrote it for this long.
-LOCK_FAILURE_QUIET = timedelta(minutes=5)
 #: Where messages go when there is no stderr (pythonw). Capped, so it cannot grow without bound.
 LOG_NAME = "pr-state.log"
 LOG_MAX_BYTES = 256 * 1024
@@ -339,9 +339,6 @@ def required_verdict(
     if contexts is None:
         out["reason"] = "required-context query returned nothing for this PR"
         return out
-    if head_oid and contexts.get("oid") and contexts["oid"] != head_oid:
-        out["reason"] = "head moved between the two queries"
-        return out
     nodes = [n for n in contexts.get("nodes", []) if n is not None]
     req = set(required)
     flagged = {
@@ -366,8 +363,11 @@ def required_verdict(
             out["unknown" if named else "missing"].append(name)
             continue
         speaker = _speaker(matching)
-        # stale_settled=False: for a REQUIRED check an abandoned (STALE) run is not green.
-        failing, unsettled = pr_checks.counts([speaker], stale_settled=False)
+        failing, unsettled = pr_checks.counts([speaker])
+        if pr_checks.verdict_of(speaker) == pr_checks.STALE:
+            # GitHub abandoned this run and never re-runs it, so waiting is wrong: it needs a
+            # re-run, as a failure does.
+            failing = 1
         if failing:
             out["failing"].append(name)
         elif unsettled:
@@ -389,14 +389,18 @@ def _speaker(runs: list[Any]) -> Any:
     A run still IN PROGRESS beats a finished one outright; a head can carry two concurrent runs of
     a name and the earlier-started one can finish last. Among finished runs the latest start wins,
     whatever its conclusion, so a COMPLETED run with a STALE or null conclusion does not outrank a
-    newer SUCCESS. A run with no timestamp loses. List order is never used.
+    newer SUCCESS. A run with no timestamp loses. On a tie the worse verdict wins, so list order
+    is never used.
     """
 
-    def key(run: Any) -> tuple[int, str]:
+    def key(run: Any) -> tuple[int, str, int]:
         if not isinstance(run, dict):
-            return (0, "")
+            return (0, "", 1)
         stamp = run.get("startedAt") or run.get("createdAt")
-        return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""))
+        failing, unsettled = pr_checks.counts([run])
+        # Ties go to the worse verdict, so equal stamps never leave the answer to list order.
+        worse = 2 if failing else 1 if unsettled else 0
+        return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""), worse)
 
     return max(runs, key=key)
 
@@ -488,11 +492,18 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
     fetched = parse_iso(required_at)
     if fetched is not None and fetched > now:
         fetched = None  # a future stamp is a skewed clock, so refresh rather than trust it
-    if (
+    tried = parse_iso(prev.get("requiredContextsTriedAt"))
+    if tried is not None and tried > now:
+        tried = None
+    due = (
         required is None
         or fetched is None
         or (now - fetched).total_seconds() >= REQUIRED_REFRESH_SECONDS
-    ):
+    )
+    retry_ok = tried is None or (now - tried).total_seconds() >= REQUIRED_RETRY_SECONDS
+    tried_at = prev.get("requiredContextsTriedAt")
+    if due and retry_ok:
+        tried_at = iso(now)
         try:
             required = fetch_required(gh, repo)
             required_at = iso(now)
@@ -503,7 +514,7 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
     progress: dict[str, Any] = {"part": "pulls", "rate": None}
     try:
         return _poll_rest(
-            gh, repo, owner, name, now, required, required_at, required_error, progress
+            gh, repo, owner, name, now, required, required_at, required_error, tried_at, progress
         )
     except (KeyError, TypeError, ValueError, AttributeError) as shape:
         # A reply shape this code did not expect, recorded against the request that returned it.
@@ -514,6 +525,7 @@ def poll(gh: Gh, repo: str, previous: dict[str, Any] | None, now: datetime) -> d
         "requiredContexts": required,
         "requiredContextsFetchedAt": required_at if required is not None else None,
         "requiredContextsError": required_error,
+        "requiredContextsTriedAt": tried_at,
     }
     if progress["rate"]:
         learned["rateLimit"] = progress["rate"]  # the main query succeeded; its budget is current
@@ -532,6 +544,7 @@ def _poll_rest(
     required: list[str] | None,
     required_at: Any,
     required_error: str | None,
+    tried_at: Any,
     progress: dict[str, Any],
 ) -> dict[str, Any]:
     repo_doc, rate = graphql(
@@ -550,10 +563,13 @@ def _poll_rest(
         or (isinstance(total, int) and total > len(prs))
     )
 
+    # A PR without a valid head SHA gets no context reply, and so reads UNKNOWN on its own.
     heads = {
-        p["number"]: str(p.get("headRefOid") or "")
+        p["number"]: str(p.get("headRefOid"))
         for p in prs
-        if isinstance(p.get("number"), int) and p.get("baseRefName") == BASE_BRANCH
+        if isinstance(p.get("number"), int)
+        and p.get("baseRefName") == BASE_BRANCH
+        and _OID.match(str(p.get("headRefOid")))
     }
     rates = [rate]
     ctx: dict[int, dict[str, Any]] = {}
@@ -603,6 +619,7 @@ def _poll_rest(
             "requiredContexts": required,
             "requiredContextsFetchedAt": required_at if required is not None else None,
             "requiredContextsError": required_error,
+            "requiredContextsTriedAt": tried_at,
             "data": {
                 "fetchedAt": iso(now),
                 "openPullRequestCount": total if isinstance(total, int) else None,
@@ -676,6 +693,7 @@ def failed(
             "requiredContexts": prev.get("requiredContexts"),
             "requiredContextsFetchedAt": prev.get("requiredContextsFetchedAt"),
             "requiredContextsError": prev.get("requiredContextsError"),
+            "requiredContextsTriedAt": prev.get("requiredContextsTriedAt"),
             # What this failing poll did learn (a fresh required list, the error reply's rate).
             **(fresh or {}),
             # The previous good block, with its own fetchedAt, or null. Never a fresh empty list.
@@ -710,20 +728,21 @@ def write_cache(path: Path, doc: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
-    except OSError:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(doc, indent=1) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())  # so a power loss after the rename cannot leave an empty cache
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows refuses the rename while a reader holds the file open, briefly.
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
-    for attempt in range(5):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            # Windows refuses the rename while a reader holds the file open. Readers hold it briefly.
-            if attempt == 4:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(0.1)
 
 
 class LockUnavailable(OSError):
@@ -797,6 +816,7 @@ def lock_path(local: Path) -> Path:
 
 
 _log_path: Path | None = None
+_log_failures: list[str] = []
 
 
 def _say(message: str) -> None:
@@ -812,8 +832,10 @@ def _say(message: str) -> None:
             _log_path.replace(_log_path.with_suffix(".log.1"))
         with _log_path.open("a", encoding="utf-8") as fh:
             fh.write(line)
-    except OSError:
-        pass  # the log is the last place anything can be said; there is nowhere left to say this
+    except OSError as exc:
+        # R8: no handler drops an error unlogged. The log is what failed, so the one channel left is
+        # the task's exit code, which main() still returns; this records the cause in memory.
+        _log_failures.append(f"{line.strip()} [log write failed: {exc!r}]")
 
 
 def main(
@@ -856,18 +878,9 @@ def main(
     try:
         fd = acquire_lock(local)
     except LockUnavailable as exc:
+        # Not written to the cache: only the lock holder writes it. Every unlocked write tried here
+        # could overwrite a fresh poll or a pending back-off, so the log and the exit code say it.
         _say(str(exc))
-        # Written without the lock, so only when the cache shows no healthy poller is writing:
-        # nothing fresher than LOCK_FAILURE_QUIET. A failure local to this one run (a sharing
-        # violation, say) then never overwrites a holder's fresh poll.
-        previous = _previous(out, args.repo)
-        stamp = parse_iso((previous or {}).get("fetchedAt"))
-        current = now()
-        if stamp is None or not current - LOCK_FAILURE_QUIET < stamp <= current:
-            try:
-                write_cache(out, failed(args.repo, previous, str(exc), current, part="lock"))
-            except OSError as werr:
-                _say(f"could not record the lock failure in the cache either: {werr!r}")
         return 4  # a non-zero task result, so a broken lock is not a silent success
     if fd is None:
         return 0  # another poll is running; it will write the cache
