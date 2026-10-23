@@ -1059,11 +1059,19 @@ def test_transient_failures_before_any_read_with_no_bar_say_no_id_is_known(
     assert "id=" not in line
 
 
-def test_a_permanent_failure_prints_no_resume_line(tmp_path: Path) -> None:
+def test_a_spent_rate_budget_prints_the_resume_line(tmp_path: Path) -> None:
+    """GitHub resets the budget, so the next wait must start from this wait's bar."""
     spent = {"status": 403, "headers": ["X-Ratelimit-Remaining: 0"], "body": {"message": "x"}}
     run = wait_comment(tmp_path, {COMMENTS: [ok([OLD])], SINCE: [spent]})
     assert run.code == 1
     assert "X-Ratelimit-Remaining 0" in run.err
+    assert resume_lines(run.out) == [resume(1)]
+
+
+def test_a_permanent_failure_prints_no_resume_line(tmp_path: Path) -> None:
+    run = wait_comment(tmp_path, {PR_PATH: [ok({**pr(), "user": None})], COMMENTS: [ok([OLD])]})
+    assert run.code == 1
+    assert "the PR names no author login" in run.err
     assert resume_lines(run.out) == []
     assert "wait again" not in run.out + run.err
 
@@ -1119,6 +1127,35 @@ def test_a_required_context_is_matched_ordinally(tmp_path: Path) -> None:
         "2",
     )
     assert run.code == 2, run.err
+    assert "required not reported=1" in run.out
+    assert "met:" not in run.out
+
+
+def test_two_required_contexts_that_differ_by_an_invisible_character_are_both_required(
+    tmp_path: Path,
+) -> None:
+    """A culture-aware dedupe folds the pair into one, so the run that reports would meet both."""
+    lookalike = "CI \N{ZERO WIDTH SPACE}gate"
+    gate = {"name": "CI gate", "status": "completed", "conclusion": "success"}
+    protected = {
+        "protected": True,
+        "protection": {"required_status_checks": {"contexts": ["CI gate", lookalike]}},
+    }
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok(protected)],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [ok({"total_count": 1, "check_runs": [gate]})],
+            STATUS_PATH: NO_STATUSES,
+        },
+        "-MaxMinutes",
+        "2",
+    )
+    assert run.code == 2, run.err
+    assert "required contexts on main: 2" in run.out
     assert "required not reported=1" in run.out
     assert "met:" not in run.out
 
