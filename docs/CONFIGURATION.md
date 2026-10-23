@@ -1571,7 +1571,7 @@ the connection for a send, after its own refusals at that point, it names the pr
 picked, in one WARNING. A refusal later in the same send, before or at connect time, can still
 follow it, so the WARNING says the proxy was picked, not that the request reached Vault. It names
 the proxy as the start WARNING does, and names it "an unreadable value" where the parser that dials
-the proxy reads a different host from it. The engine gives these clients no proxy setting, so any
+the proxy reads a different scheme, host or port from it. The engine gives these clients no proxy setting, so any
 proxy they pick came from the environment or the system settings.
 
 It logs once per hop and distinct proxy value in a process. A value the hop has not named before is

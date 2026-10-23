@@ -152,6 +152,15 @@ def test_a_proxy_the_two_parsers_read_differently_is_named_unreadable(
     assert "corp-proxy.example" not in text and "proxy.dialled.example" not in text
 
 
+def test_an_explicit_port_zero_is_named_not_unreadable(caplog: pytest.LogCaptureFixture) -> None:
+    """Both parsers read port 0, so the labels agree. Mutation: test the port for truth rather
+    than for None; red, the dialled side drops the port and the proxy is named unreadable."""
+    with caplog.at_level(logging.WARNING):
+        _disclose(_KV, "http://proxy.example:0")
+    text = _disclosures(caplog)[0].getMessage()
+    assert f"{_PICKED}http://proxy.example:0." in text
+
+
 # --- the shipped Vault clients --------------------------------------------------------------------
 
 

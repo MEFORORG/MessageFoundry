@@ -953,7 +953,9 @@ def _dialled_proxy_label(proxy: str) -> str:
         parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))
     except (ValueError, urllib3.exceptions.LocationParseError):
         return UNREADABLE_PROXY_LABEL
-    dialled = f"{parsed.scheme}://{parsed.host}" + (f":{parsed.port}" if parsed.port else "")
+    dialled = f"{parsed.scheme}://{parsed.host}" + (
+        f":{parsed.port}" if parsed.port is not None else ""
+    )
     return label if label.lower() == dialled.lower() else UNREADABLE_PROXY_LABEL
 
 
