@@ -696,6 +696,78 @@ Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_
 parse the script and fail on any git verb outside a read-only list, with a positive control. They
 also drive it against a temp repository with a fake gh.
 
+## A PR-state cache for read-only panes — `pr_state.py`
+
+One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads
+that file and makes no API call of its own. Every Claude account on a box shares one GitHub token,
+so eleven panes polling for themselves would spend the shared budget eleven times over.
+
+[`scripts/coord/pr_state.py`](../scripts/coord/pr_state.py) does one poll per run and exits. A
+scheduled task runs it every 2 minutes. It writes `<git common dir>/mefor-coord/pr-state.json`, on
+the local root, never the shared one. Measured 2026-10-22 with 13 open PRs: one poll cost 4 GraphQL
+points in two queries, took about 4.4 seconds end to end, and wrote about 18 KB.
+
+**A reader must check `error` and the data's `fetchedAt` before it trusts anything else.** A failed
+poll keeps the last good data and marks it stale. The fields:
+
+| Field | What it holds |
+|---|---|
+| `schemaVersion` | `1`. A reader that sees another number should not guess. |
+| `repo`, `fetchedAt`, `host` | Which repository, when this poll ran (UTC), and on which machine. |
+| `error`, `errorPart`, `stale` | Why the last poll failed and which request failed, or null. `stale` is true whenever `error` is set. |
+| `consecutiveFailures`, `nextPollNotBefore` | The back-off. A run before that time exits without a call. |
+| `rateLimit` | `cost`, `remaining`, `limit`, `resetAt` and `queries`, read from the queries themselves. After a failed poll it is the failing poll's main-query reading if that query ran, else the last good poll's; it can be older than `fetchedAt`. |
+| `requiredContexts`, `requiredContextsFetchedAt`, `requiredContextsError` | The live required list: branch protection plus rulesets, re-read about hourly. The error is the last refresh attempt's, carried until the next attempt, and can sit beside an older list. |
+| `data` | The last good poll, or null if there never was one. |
+| `data.fetchedAt` | When that data was read. It differs from the top-level `fetchedAt` after a failure. |
+| `data.openPullRequestCount` | GitHub's count of open PRs, which can exceed the list when it is truncated. |
+| `data.truncated` | True when the PR page came back full, or GitHub reports more open PRs than it sent. |
+| `data.pullRequests[]` | Per PR: number, title, base and head branch, head SHA, draft, labels, queue entry, auto-merge time, `allChecks` (with `forHead`) and `required`. |
+| `...mergeable`, `...mergeStateStatus`, `...mergeStateKnown` | GitHub's merge answers per PR, null while GitHub has not computed them. |
+| `data.mergeQueue[]`, `data.mergeQueueTruncated` | Queue entries: position, state, enqueuedAt, PR number. Null if GitHub returned no queue. |
+
+Four reading rules, each one a mistake the file is shaped to prevent:
+
+1. `data: null` means unknown. Only `data.pullRequests: []` with `data.truncated: false` means GitHub
+   said no PR is open.
+2. `required.state` is the merge-relevant red or green, not `allChecks.state`. A required context with
+   no check run yet reads `PENDING` and is named in `required.missing`. `UNKNOWN` has several
+   causes, and `required.reason` always names the one that fired. A FAILURE can carry a reason too,
+   such as a STALE run that needs a re-run. Read the reason, not a list of
+   causes. At the time of writing they include a base other than `main`, no required list, and a
+   truncated context page.
+3. `mergeable` and `mergeStateStatus` are null when GitHub had not computed them yet
+   (`mergeStateKnown: false`). That is no state at all.
+4. The `ci-red` label is sticky, so a label is not current red. Read `required.state`.
+
+It classifies each check with [`scripts/ci/_pr_checks.py`](../scripts/ci/_pr_checks.py), so an
+unrecognised node reads as unsettled, never green. Its lock is an OS byte-range lock held on an open
+handle to `locks/pr-state.oslock`, not a `lock.ps1` lock file. The kernel releases it when the
+process dies, so a kill, a logoff or a shutdown leaves nothing to clean up or steal. A held lock
+means another poll is running, so the run exits. Only the lock holder writes the cache. A run that
+cannot open or lock the file at all exits 4 and writes nothing, so a broken lock shows as an ageing
+`fetchedAt`, and in the log when the log can be written. If it cannot, the signals left include at
+least the exit code and that ageing `fetchedAt`. A run that cannot write the cache exits 5. Without a console (`pythonw`), messages go to
+`mefor-coord/pr-state.log`, capped at 256 KB with one older copy kept.
+
+```powershell
+python scripts\coord\pr_state.py          # one poll by hand; it obeys the real cache's back-off
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -WhatIf        # show the task, register nothing
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC>             # from a plain terminal
+pwsh -NoProfile -File scripts\coord\install-pr-state-task.ps1 -ExpectedHost <this PC> -Uninstall
+```
+
+The task runs `pythonw.exe -I` on the primary checkout's copy, so no window opens. It runs as you, at
+run level Limited, because gh reads its token from your keyring. Every 2 minutes it runs whatever
+poller files the primary checkout holds, at least `pr_state.py`, `coord_root.py`, `_pr_checks.py` and
+`required_contexts.py`, with your token, whether or not any session is running. Nothing checks those
+files first. That
+is more exposure than the checkout's `.claude/settings.json` hooks, which run only when a session
+starts there. A change to any of those files in the primary checkout runs, unattended, within two
+minutes. The installer refuses inside Claude Code and on any machine
+other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
+[`tests/test_pr_state.py`](../tests/test_pr_state.py).
+
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 
 `prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and

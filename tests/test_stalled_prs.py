@@ -71,6 +71,14 @@ def test_the_exact_stall_shape_is_detected() -> None:
     assert found[0].armed is True
 
 
+def test_an_optional_stale_run_does_not_hide_a_stall() -> None:
+    """A run GitHub abandoned (STALE) is settled. It must not make a green, BEHIND PR read pending."""
+    stale = {"status": "COMPLETED", "conclusion": "STALE", "name": "optional"}
+    rollup = [{"status": "COMPLETED", "conclusion": "SUCCESS", "name": "t"}, stale]
+    found = sp.scan([_pr(75, rollup=rollup)])
+    assert [s.number for s in found] == [75]
+
+
 def test_an_unarmed_stall_is_still_reported() -> None:
     """Unarmed is still unmergeable — it just isn't lying to its author about it."""
     found = sp.scan([_pr(60, armed=False)])
