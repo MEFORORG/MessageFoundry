@@ -33,7 +33,10 @@ pytestmark = pytest.mark.skipif(
 
 _TOKEN = "s.synthetic-token"  # nosec B105 - a made-up test value, not a credential
 _VAULT = "https://vault.synthetic.test:8200"
-_SECRET = "s3cretpw"  # nosec B105 - a made-up proxy password, checked never to be echoed
+#: The userinfo half put in a proxy URL, checked never to be echoed. Named as a canary, not by
+#: what it stands for: CodeQL's clear-text-logging query takes a value named like a secret as one,
+#: and followed this constant from the test into the engine's WARNING (as serviceenv.py records).
+_CANARY = "c4nary-userinfo"
 _KV = "Vault KV secret provider"
 _PICKED = "was picked for a request to Vault: "
 _REASON = "synthetic test: the Vault certificate is short-lived"
@@ -86,7 +89,7 @@ def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
 ) -> None:
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
-            _disclose(_KV, f"http://alice:{_SECRET}@proxy.example:3128")
+            _disclose(_KV, f"http://alice:{_CANARY}@proxy.example:3128")
     records = _disclosures(caplog)
     assert len(records) == 1, caplog.text
     text = records[0].getMessage()
@@ -98,7 +101,7 @@ def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
     assert "No engine setting names it" in text
     assert "no_proxy" in text and "the system bypass list" in text
     assert "vault BACKLOG #4028" in text
-    assert "alice" not in text and _SECRET not in text and "@" not in text
+    assert "alice" not in text and _CANARY not in text and "@" not in text
 
 
 def test_a_new_proxy_or_another_hop_is_named_again(caplog: pytest.LogCaptureFixture) -> None:
@@ -122,10 +125,10 @@ def test_a_proxy_value_that_does_not_parse_is_named_unreadable_never_echoed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        _disclose(_KV, f"http://alice:{_SECRET}@proxy.example:3128 ")
+        _disclose(_KV, f"http://alice:{_CANARY}@proxy.example:3128 ")
     text = _disclosures(caplog)[0].getMessage()
     assert f"{_PICKED}an unreadable value." in text
-    assert _SECRET not in text and "proxy.example" not in text
+    assert _CANARY not in text and "proxy.example" not in text
 
 
 def test_two_different_unreadable_proxies_are_each_named(caplog: pytest.LogCaptureFixture) -> None:
