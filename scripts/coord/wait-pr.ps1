@@ -91,8 +91,9 @@
     -AfterCommentId is exit 1, and -AfterCommentId starts at 1, so a $null or '' from a caller whose
     parse failed is refused rather than read as "every comment". ALWAYS wait again from what the
     last wait printed: exit 0 prints the met line's `id=`; exit 2, and exit 1 after three transient
-    failures in a row, print a `resume:` line naming this wait's own bar, or -FromStart when the bar
-    is 0. Every other exit 1 is permanent and prints no resume line. A wait with neither option takes
+    failures in a row or on a spent rate budget (which GitHub resets), print a `resume:` line naming
+    this wait's own bar, or -FromStart when the bar is 0. Every other exit 1, such as bad arguments,
+    a PR with no author login or the page cap, is permanent and prints no resume line. A wait with neither option takes
     the newest comment at its own start as the bar, so it skips every comment posted before it
     started, including those since the last wait's final read. LIMIT: delivery rests on the bar, and
     only a met line moves it, to the id it reports. A comment read above the bar but not reported is
@@ -404,6 +405,9 @@ function Get-Rest {
         return , $script:Bodies[$Path]
     }
     if (($status -eq 403 -or $status -eq 429) -and $head -match '(?im)^x-ratelimit-remaining:[ \t]*0[ \t]*$') {
+        # Recoverable once GitHub resets the budget, so the comment bar must survive this exit.
+        $resume = Get-Resume
+        if ($resume) { Say $resume }
         Fail "gh api $Path answered HTTP $status with X-Ratelimit-Remaining 0: the rate budget every seat shares is spent, so this wait stops rather than poll it."
     }
     if ($status -ge 500 -or $status -eq 429) {
@@ -447,7 +451,7 @@ function Test-Merged($p) {
 # missing value are GitHub still computing, so they neither count nor reset. The header says why
 # `behind` resets rather than counts.
 function Measure-DirtyReads([string]$State, [string]$Mergeable, [string]$Key) {
-    if ($Key -cne $script:DirtyKey) {
+    if (-not [string]::Equals($Key, $script:DirtyKey, [System.StringComparison]::Ordinal)) {
         $script:DirtyKey = $Key
         $script:DirtyReads = 0
     }
@@ -527,7 +531,10 @@ function Read-Required([string]$Base) {
             ForEach-Object { $checks = Prop (Prop $_ 'parameters') 'required_status_checks'; $checks } |
             ForEach-Object { [string](Prop $_ 'context') }
     )
-    @($classic + $ruleset | Sort-Object -Unique -CaseSensitive)
+    # Ordinal and in order: Sort-Object -Unique is culture-aware, and would fold two names that
+    # differ only by an invisible character into one requirement.
+    $unique = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    @($classic + $ruleset | Where-Object { $unique.Add($_) })
 }
 
 # Every paged read stops before page $MaxPages + 1, so a server that ignores `page` cannot keep a
@@ -554,7 +561,7 @@ function Read-Pages([string]$Path) {
 function Test-Pr {
     $p = Get-Rest "repos/$Repo/pulls/$Pr"
     $prBase = [string]$p.base.ref
-    if ($Until -eq 'checks-complete' -and $prBase -cne $script:Base) {
+    if ($Until -eq 'checks-complete' -and -not [string]::Equals($prBase, $script:Base, [System.StringComparison]::Ordinal)) {
         # The base moves only once the read has finished, so a read cut short is read again.
         $script:Required = @(Read-Required $prBase)
         $script:Base = $prBase
