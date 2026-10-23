@@ -140,11 +140,19 @@ jobs:
     name: pip-audit (dependency vulnerabilities)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Wheels only (vault BACKLOG #3861): pip, the auditor's dry-runs included, builds no pinned sdist
+    # in this job. uv reads no PIP_* variable, so `uv lock --check` may still build one to re-resolve.
+    env:
+      PIP_ONLY_BINARY: ":all:"
     # HARD-FAILING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
     # red (the intended forcing function) — bump the lockfile, or append `--ignore-vuln <ID>` to
     # that lock's audit line to accept a triaged advisory.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Store no job token from the checkout, where code a dependency install or audit runs
+          # could read it (vault BACKLOG #3861).
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
@@ -188,7 +196,7 @@ jobs:
           # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
           python -m venv /tmp/lockcheck
           # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
-          /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
+          /tmp/lockcheck/bin/pip install --require-hashes --only-binary :all: -r requirements.lock
       - name: Audit the locked dependencies (DEP-1)
         run: |
           # HASH-PINNED from the lock, not merely `==`-pinned: a version pin does not satisfy Scorecard
@@ -202,7 +210,7 @@ jobs:
           # job's posture improves for the AUDITOR, not for the exporter. The `uv` bootstrap is circular
           # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
           # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
-          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          python -m pip install --require-hashes --only-binary :all: -r ci/locks/ci-scanners.lock
           # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
           # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
           # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
@@ -324,6 +332,9 @@ jobs:
     # Above the floor: this one resolves and installs a PUBLISHED release's pinned runtime rather than
     # auditing the checked-out lockfile, so it pays a network install the scan jobs above do not.
     timeout-minutes: 15
+    # Wheels only for pip here: see the pip-audit job's `env:` (vault BACKLOG #3861).
+    env:
+      PIP_ONLY_BINARY: ":all:"
     # WHAT THIS ANSWERS, and why the `pip-audit` job above does not. That job audits the CHECKED-OUT
     # tree, so on the daily cron it audits `main`. "Is what we would ship next current" is the right
     # question and it is a DIFFERENT question from "does the version we already shipped carry a known
@@ -426,7 +437,8 @@ jobs:
               exit 2
             fi
             # Every pin, whatever its marker: the pip-audit job's comment on the same script says why.
-            python scripts/security/audit_all_platforms.py "core-$tag.lock"
+            # GH_TOKEN is for `gh` above; pip and pip-audit have no use for it (vault BACKLOG #3861).
+            env -u GH_TOKEN python scripts/security/audit_all_platforms.py "core-$tag.lock"
             echo "$tag: CLEAN -- $pinned pinned requirements of the CORE RUNTIME closure, no known advisory"
             examined=$((examined + 1))
           done
@@ -1604,9 +1616,14 @@ jobs:
     # an audit verdict). So the steady state this is sized against is pip-audit at 79 seconds plus
     # that worst case plus a full-history secret scan.
     timeout-minutes: 20
+    # Wheels only for pip here: see the pip-audit job's `env:` (vault BACKLOG #3861).
+    env:
+      PIP_ONLY_BINARY: ":all:"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # No stored job token: see the pip-audit job's checkout (vault BACKLOG #3861).
+          persist-credentials: false
           # `fetch-depth: 0` IS THE GITLEAKS REQUIREMENT AND IT NOW GOVERNS THE WHOLE JOB. The scan
           # walks every ancestor of HEAD, which a shallow clone has not fetched, so dropping this
           # silently reduces a secret gate to one commit -- the coupling recorded at the original
@@ -1663,7 +1680,7 @@ jobs:
           # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
           python -m venv /tmp/lockcheck
           # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
-          /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
+          /tmp/lockcheck/bin/pip install --require-hashes --only-binary :all: -r requirements.lock
       - name: Audit the locked dependencies (DEP-1)
         if: ${{ !cancelled() }}
         run: |
@@ -1678,7 +1695,7 @@ jobs:
           # job's posture improves for the AUDITOR, not for the exporter. The `uv` bootstrap is circular
           # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
           # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
-          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          python -m pip install --require-hashes --only-binary :all: -r ci/locks/ci-scanners.lock
           # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
           # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
           # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
