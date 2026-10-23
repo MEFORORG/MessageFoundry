@@ -87,50 +87,105 @@ if ($modes.Count -ne 1) {
 }
 
 . (Join-Path $PSScriptRoot '_decisionlog.ps1')
+# seat.ps1's root resolver and box keys, so the seat lookup reads where seat.ps1 writes.
+. (Join-Path $PSScriptRoot 'coord-root.ps1')
+. (Join-Path $PSScriptRoot 'mail-key.ps1')
 $coord = Get-DecisionCoordRoot
 
+function ConvertTo-SeatRecordInstant($Value) {
+    # A record's asOf as a UTC instant, or MinValue when it is absent or will not parse. A bad sort
+    # key ranks the record last; it never drops the seat the record names.
+    # ConvertFrom-Json hands an ISO stamp back as a [datetime]. One with an offset arrives as Local and
+    # converts; one with no offset arrives as Unspecified, and ToUniversalTime() would read that as
+    # local time and shift it by the offset (the trap lane.ps1 documents at statedUtc). Such a stamp
+    # is UTC, so its Kind is set, not converted.
+    try {
+        if ($null -eq $Value) { return [datetime]::MinValue }
+        if ($Value -is [datetime]) {
+            if ($Value.Kind -eq [System.DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+            return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        $text = [string]$Value
+        if (-not $text.Trim()) { return [datetime]::MinValue }
+        return [datetime]::Parse($text, [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+    } catch {
+        return [datetime]::MinValue
+    }
+}
+
 function Resolve-SeatFromRegistry([string]$Sid) {
-    # The seat this session declared: <coord>/seats/<box>/<key>.json, where the key is seat.ps1's
-    # Get-SessionKey of the id (keep the two in step). Sanitised to a file name, so an id cannot
-    # widen the match.
+    # The seat this session declared, read where seat.ps1 writes it and picked by seat.ps1's rules.
+    # The file name is seat.ps1's Get-SessionKey of the id (keep the two in step), sanitised so an id
+    # cannot widen the match.
+    #
+    # WHERE. seats/ is a shared kind, so seat.ps1 writes it on the resolved shared root, and this reads
+    # it there, resolved from the same worktree (this cwd's top level, as seat.ps1 resolves it). A
+    # Codex seat's records stay on the local root. A root that does not resolve names no seat; it
+    # never falls back to the local copy, which the other PC never sees.
+    #
+    # WHICH BOX. Only this worktree's two boxes: the host-keyed one seat.ps1 writes, and the path-only
+    # legacy one a session that declared before docs/COORD-SHARED-ROOT.md step 4 still has. A legacy
+    # record stamped by another host is that PC's seat and is skipped, as seat.ps1 skips it.
+    #
+    # WHICH RECORD. A declared seat beats a derived one (seat.ps1: "declared wins, derived fills only a
+    # vacuum"). Among equals the record written LAST wins, by its own asOf and then its write count,
+    # which is how seat.ps1 picks its prior. Listing order decides nothing.
+    #
+    # This mirrors seat.ps1 rather than calling it: seat.ps1's prior picker is inline in its main body,
+    # which writes, and it does not weigh seatSource, because it only carries a prior forward.
     if (-not $Sid) { return '' }
     if ($env:KORUS_AGENT -eq 'codex') { $Sid = "codex-$Sid" }
     $Sid = $Sid -replace '[^A-Za-z0-9._-]', '-'
     if ($Sid.Length -gt 80) { $Sid = $Sid.Substring(0, 80) }
     if ($Sid -match '^\.+$') { return '' }
-    # seat.ps1 keeps a Codex session's records in their own directory.
-    $seats = Join-Path $coord $(if ($env:KORUS_AGENT -eq 'codex') { 'codex-seats' } else { 'seats' })
-    if (-not [System.IO.Directory]::Exists($seats)) { return '' }
-    # ONE SESSION CAN HAVE A RECORD IN TWO BOXES. Since the box key hashes the host as well as the
-    # path (docs/COORD-SHARED-ROOT.md, step 4), a session that declared before that change keeps a
-    # frozen record under the path-only key, and seat.ps1 writes on under the host-keyed one. The
-    # directory listing order says nothing about which is current, so take the record written LAST,
-    # by its own asOf and then its write count: the rule seat.ps1 uses to pick its prior.
-    $best = $null
-    foreach ($box in [System.IO.Directory]::EnumerateDirectories($seats)) {
-        $f = Join-Path $box "$Sid.json"
-        if (-not [System.IO.File]::Exists($f)) { continue }
-        try {
-            $r = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
-            $s = if ($r.PSObject.Properties.Name -contains 'seat') { [string]$r.seat } else { '' }
+    try {
+        $top = & git -C (Get-Location).Path rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $top) { return '' }
+        $wt = (Resolve-Path -LiteralPath ([string]$top).Trim() -ErrorAction Stop).Path
+        $localRoot = Get-CoordLocalRoot -From $wt
+        if ($env:KORUS_AGENT -eq 'codex') {
+            $res = Resolve-CoordDir -From $wt -Kind 'codex-seats' -LocalRoot $localRoot
+            $seats = $res.Path
+        } else {
+            $res = Resolve-CoordSharedRoot -From $wt -LocalRoot $localRoot
+            $seats = if ($res.Path) { Join-Path $res.Path 'seats' } else { $null }
+        }
+        if ($res.Error -or -not $seats) {
+            [Console]::Error.WriteLine("decision.ps1: the seat registry did not resolve, so no seat was read from it: $($res.Error)")
+            return ''
+        }
+        $hosted = ConvertTo-BoxKey -Path $wt
+        $legacy = ConvertTo-LegacyBoxKey -Path $wt
+        $best = $null
+        foreach ($box in @($hosted, $legacy)) {
+            $f = Join-Path (Join-Path $seats $box) "$Sid.json"
+            if (-not [System.IO.File]::Exists($f)) { continue }
+            try { $r = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ($r -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            if ($box -eq $legacy -and -not (Test-CoordRecordIsHere $r)) { continue }
+            $names = $r.PSObject.Properties.Name
+            $s = if ($names -contains 'seat' -and $r.seat) { [string]$r.seat } else { '' }
             if (-not $s) { continue }
-            $at = [datetime]::MinValue
-            if ($r.PSObject.Properties.Name -contains 'asOf' -and $r.asOf) {
-                $at = if ($r.asOf -is [datetime]) { $r.asOf.ToUniversalTime() }
-                      else { [datetime]::Parse([string]$r.asOf, [cultureinfo]::InvariantCulture,
-                              [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal) }
+            $declared = ($names -contains 'seatSource') -and ([string]$r.seatSource -eq 'declared')
+            $at = if ($names -contains 'asOf') { ConvertTo-SeatRecordInstant $r.asOf } else { [datetime]::MinValue }
+            $n = 0
+            if ($names -contains 'writes') { try { $n = [int]$r.writes } catch { $n = 0 } }
+            $cand = [pscustomobject]@{ Seat = $s; Declared = $declared; At = $at; Writes = $n }
+            if (-not $best) { $best = $cand; continue }
+            if ($cand.Declared -ne $best.Declared) {
+                if ($cand.Declared) { $best = $cand }
+                continue
             }
-            $n = if ($r.PSObject.Properties.Name -contains 'writes') { [int]$r.writes } else { 0 }
-        } catch {
-            # An unreadable record names no seat; another box may still hold a readable one.
-            continue
+            if ($cand.At -gt $best.At -or ($cand.At -eq $best.At -and $cand.Writes -gt $best.Writes)) { $best = $cand }
         }
-        if (-not $best -or $at -gt $best.At -or ($at -eq $best.At -and $n -gt $best.Writes)) {
-            $best = [pscustomobject]@{ Seat = $s; At = $at; Writes = $n }
-        }
+        if ($best) { return $best.Seat }
+        return ''
+    } catch {
+        # An I/O error on the registry (an SMB share dropping, say) costs the default seat, not -Log.
+        [Console]::Error.WriteLine("decision.ps1: the seat registry could not be read, so no seat was read from it: $($_.Exception.Message)")
+        return ''
     }
-    if ($best) { return $best.Seat }
-    return ''
 }
 
 function Write-Flushed($Result) {
