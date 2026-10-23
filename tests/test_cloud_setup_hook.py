@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The cloud-only SessionStart hook: wired once, gated on CLAUDE_CODE_REMOTE, and inert locally.
 
-The hook installs pwsh and Python 3.14 in a Claude Code cloud VM. The property that matters most
-is the one nobody would notice breaking: on a LOCAL session it must do nothing at all. It is wired
-in the tracked settings file, so every session on every account runs its command, and a broken
-gate would run apt-get on a developer box. So the gate is tested as wired, with a control proving
-the same command DOES run the script once the variable is set.
+The hook installs pwsh and Python 3.14 in a Claude Code cloud VM, and the git hooks a local clone
+has. The property that matters most is the one nobody would notice breaking: on a LOCAL session it
+must do nothing at all. It is wired in the tracked settings file, so every session on every account
+runs its command, and a broken gate would run apt-get on a developer box, or write over the shared
+.git/hooks every local worktree commits through. So the gate is tested as wired, with a control
+proving the same command DOES run the script once the variable is set.
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +52,20 @@ def _run(
     bash: Path, args: list[str], env_extra: dict[str, str], cwd: Path
 ) -> subprocess.CompletedProcess[str]:
     # The script must set DEBIAN_FRONTEND and LC_ALL itself, so an inherited value cannot stand in.
-    unset = ("CLAUDE_CODE_REMOTE", "DEBIAN_FRONTEND", "LC_ALL")
+    # The leak-gate settings decide whether pre-commit can run, so only a test may set them. A
+    # GIT_* variable from the caller would point git, and the real hook installer, at another repo.
+    unset = (
+        "CLAUDE_CODE_REMOTE",
+        "DEBIAN_FRONTEND",
+        "LC_ALL",
+        "MEFOR_FORBIDDEN_TOKENS",
+        "MEFOR_MIN_DETECTORS",
+        "MEFOR_REQUIRE_TOKENS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    )
     env = {k: v for k, v in os.environ.items() if k not in unset}
     env.update(env_extra)
     return subprocess.run(
@@ -122,35 +138,104 @@ def test_the_script_refuses_loudly_without_a_checkout_and_installs_nothing(
     assert "guard" in result.stdout
 
 
+def _write_stub(path: Path, body: str) -> None:
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8", newline="\n")
+    path.chmod(0o755)
+
+
 def _write_stubs(tmp_path: Path, bodies: dict[str, str]) -> dict[str, str]:
     """Bash stand-ins, one executable per name in ``bodies``; returns the PATH that finds them."""
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     for name, body in bodies.items():
-        f = stubs / name
-        f.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8", newline="\n")
-        f.chmod(0o755)
+        _write_stub(stubs / name, body)
     return {"PATH": str(stubs) + os.pathsep + os.environ.get("PATH", "")}
 
 
-def _stub_tools(tmp_path: Path, gh_output: str | None) -> dict[str, str]:
-    """`pwsh`, `uv` and `gh` stand-ins, so the cloud path runs with no install and no network."""
-    gh_body = f"printf '%s\\n' '{gh_output}'" if gh_output is not None else "exit 1"
-    return _write_stubs(
-        tmp_path,
-        {
-            "pwsh": "exit 0",
-            "uv": '[ "$1 $2" = "python find" ] && echo /stub/python3.14; exit 0',
-            "gh": gh_body,
-        },
+# `python` stand-ins. The script asks `python` two questions: does it run 3.14 (`-c ...`), and can
+# the leak gate run (scan_forbidden.py, exit 2 when it has no full token source).
+PY_READY = "exit 0"
+PY_NO_TOKENS = (
+    '[ "$1" = scripts/security/scan_forbidden.py ] && { echo "scanner: no token source"; exit 2; }'
+    "\nexit 0"
+)
+PY_OLD = "exit 1"
+PY_REAL = f'exec "{Path(sys.executable).as_posix()}" "$@"'
+
+
+def _stub_tools(
+    tmp_path: Path,
+    gh_output: str | None = "12345\tjdoe\tJane Doe",
+    *,
+    pwsh_rc: int | None = 0,
+    uv_tool_rc: int = 0,
+    install_hooks_rc: int = 0,
+    install_rc: int = 0,
+    python: str = PY_READY,
+    py_found: bool = True,
+) -> dict[str, str]:
+    """`pwsh`, `uv`, `gh`, `python` and `pre-commit` stand-ins, so the cloud path runs with no
+    install and no network. `pwsh`, `uv` and `pre-commit` append their argv to the file _calls reads.
+
+    ``pwsh_rc=None`` leaves `pwsh` unstubbed, so the real one runs.
+    """
+    # An old `python` and a 3.14 to link would make the script link one into the real
+    # /usr/local/bin, which a root runner lets it do.
+    assert not (python == PY_OLD and py_found), "pair PY_OLD with py_found=False"
+    log = 'printf "%s\\n" "$(basename "$0") $*" >>"$STUB_LOG"'
+    uv_bin = tmp_path / "uv-bin"
+    uv_bin.mkdir()
+    _write_stub(
+        uv_bin / "pre-commit",
+        f'{log}\ncase "$1" in\n  install-hooks) exit {install_hooks_rc} ;;\n'
+        f"  install) exit {install_rc} ;;\nesac\nexit 0",
     )
+    find = "echo /stub/python3.14" if py_found else ":"
+    bodies = {
+        "uv": (
+            f"{log}\n"
+            'case "$1 $2" in\n'
+            f'  "python find") {find} ;;\n'
+            f'  "tool install") exit {uv_tool_rc} ;;\n'
+            f'  "tool dir") echo "{uv_bin.as_posix()}" ;;\n'
+            "esac\nexit 0"
+        ),
+        "gh": f"printf '%s\\n' '{gh_output}'" if gh_output is not None else "exit 1",
+        "python": python,
+    }
+    if pwsh_rc is not None:
+        bodies["pwsh"] = (
+            f'{log}\n[ {pwsh_rc} = 0 ] || echo "installer: refused" >&2\nexit {pwsh_rc}'
+        )
+    return {**_write_stubs(tmp_path, bodies), "STUB_LOG": (tmp_path / "calls.log").as_posix()}
+
+
+def _calls(tmp_path: Path) -> list[str]:
+    """Each stubbed call, as `<tool> <args>`, in the order the script made them."""
+    log = tmp_path / "calls.log"
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+_INSTALLER_CALL = "pwsh -NoProfile -NonInteractive -File scripts/coord/install-git-hooks.ps1"
+_ARM = "--arm-pre-commit"
+_ARM_HINT = "Before your first commit, run: bash scripts/hooks/cloud-setup.sh --arm-pre-commit ("
+
+
+def _git_isolation(tmp_path: Path) -> dict[str, str]:
+    """No global or system git config, so a caller's hooks directory or init template cannot steer
+    `git init` or the real installer out of the sandbox."""
+    empty = tmp_path / "empty.gitconfig"
+    empty.touch()
+    return {"GIT_CONFIG_GLOBAL": str(empty), "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def _checkout(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "pyproject.toml").write_text("", encoding="utf-8")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(_git_isolation(tmp_path))
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
     return repo
 
 
@@ -164,14 +249,23 @@ def _local_git_config(repo: Path, key: str) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+def _cloud_env(
+    repo: Path, tmp_path: Path, *, remote: str | None = "true", **stubs: Any
+) -> dict[str, str]:
+    """A session's environment over stub tools; ``remote=None`` leaves CLAUDE_CODE_REMOTE unset."""
+    env = {
+        "CLAUDE_PROJECT_DIR": repo.as_posix(),
+        **_git_isolation(tmp_path),
+        **_stub_tools(tmp_path, **stubs),
+    }
+    if remote is not None:
+        env["CLAUDE_CODE_REMOTE"] = remote
+    return env
+
+
 def test_the_identity_is_the_pushing_accounts_own_noreply(bash: Path, tmp_path: Path) -> None:
     repo = _checkout(tmp_path)
-    env = {
-        "CLAUDE_CODE_REMOTE": "true",
-        "CLAUDE_PROJECT_DIR": repo.as_posix(),
-        **_stub_tools(tmp_path, "12345\tjdoe\tJane Doe"),
-    }
-    result = _run(bash, [str(_SCRIPT)], env, repo)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path), repo)
     assert result.returncode == 0, result.stderr
     assert _local_git_config(repo, "user.name") == "Jane Doe", result.stdout
     assert _local_git_config(repo, "user.email") == "12345+jdoe@users.noreply.github.com"
@@ -187,12 +281,7 @@ def test_no_venv_instruction_once_the_venv_exists(bash: Path, tmp_path: Path) ->
     venv_py.parent.mkdir(parents=True)
     venv_py.write_bytes(b"#!/bin/sh\n")
     venv_py.chmod(0o755)
-    env = {
-        "CLAUDE_CODE_REMOTE": "true",
-        "CLAUDE_PROJECT_DIR": repo.as_posix(),
-        **_stub_tools(tmp_path, "12345\tjdoe\tJane Doe"),
-    }
-    result = _run(bash, [str(_SCRIPT)], env, repo)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path), repo)
     assert result.returncode == 0, result.stderr
     assert "no venv yet" not in result.stdout
     # Control: the same run reached the end, so the absence above is the gate, not an early exit.
@@ -201,15 +290,297 @@ def test_no_venv_instruction_once_the_venv_exists(bash: Path, tmp_path: Path) ->
 
 def test_a_failed_account_lookup_sets_no_identity_and_says_so(bash: Path, tmp_path: Path) -> None:
     repo = _checkout(tmp_path)
-    env = {
-        "CLAUDE_CODE_REMOTE": "true",
-        "CLAUDE_PROJECT_DIR": repo.as_posix(),
-        **_stub_tools(tmp_path, None),
-    }
-    result = _run(bash, [str(_SCRIPT)], env, repo)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path, gh_output=None), repo)
     assert result.returncode == 0, result.stderr
     assert "gh api user failed" in result.stdout
     assert _local_git_config(repo, "user.email") is None
+
+
+def _installed_hooks(repo: Path) -> list[str]:
+    """What is in .git/hooks beyond git's own samples (a git with no templates makes no dir)."""
+    hooks = repo / ".git" / "hooks"
+    return (
+        sorted(p.name for p in hooks.iterdir() if p.suffix != ".sample") if hooks.is_dir() else []
+    )
+
+
+def _off_line(stdout: str, what: str) -> str:
+    """The one line saying `what` is NOT INSTALLED."""
+    off = [ln for ln in stdout.splitlines() if f"{what} NOT INSTALLED" in ln]
+    assert len(off) == 1, stdout
+    return off[0]
+
+
+@pytest.mark.parametrize("args", [[], [_ARM]], ids=["session-start", "arm"])
+@pytest.mark.parametrize("remote", [None, "false"])
+def test_outside_the_cloud_nothing_is_installed(
+    bash: Path, tmp_path: Path, remote: str | None, args: list[str]
+) -> None:
+    """.git/hooks is shared by every local worktree of a clone, so a local run must write nothing.
+    The controls are the cloud runs below, which do install. Asked to arm, it says it did not."""
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT), *args], _cloud_env(repo, tmp_path, remote=remote), repo)
+    assert result.returncode == (1 if args else 0), result.stderr
+    assert ("nothing was armed" in result.stderr) is bool(args), result.stderr
+    assert result.stdout == ""
+    assert _calls(tmp_path) == []
+    assert _installed_hooks(repo) == []
+
+
+def test_a_session_start_installs_the_git_hooks_and_says_how_to_arm_pre_commit(
+    bash: Path, tmp_path: Path
+) -> None:
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path), repo)
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path)
+    assert _INSTALLER_CALL in calls, calls
+    # Arming builds hook environments, which can outrun the hook's timeout, so it is not done here.
+    assert not [c for c in calls if c.startswith(("uv tool", "pre-commit"))], calls
+    assert "GIT HOOKS NOT INSTALLED" not in result.stdout, result.stdout
+    off = _off_line(result.stdout, "PRE-COMMIT HOOKS")
+    assert "the ledger gate and the leak gate among them" in off
+    assert _ARM_HINT in off
+    # The arming step outlasts the Bash tool's default timeout, so the hint says how to give it room.
+    assert "10-minute timeout, or in the background" in off
+
+
+def test_an_unknown_argument_is_refused_rather_than_run_as_a_session_start(
+    bash: Path, tmp_path: Path
+) -> None:
+    """A typo of --arm-pre-commit must not rerun the whole session start and exit 0."""
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT), "--arm"], _cloud_env(repo, tmp_path), repo)
+    assert result.returncode == 2, result.stderr
+    assert "usage: cloud-setup.sh [--arm-pre-commit]" in result.stderr
+    assert _calls(tmp_path) == []
+
+
+def test_a_session_start_installs_the_git_hooks_once_per_clone(bash: Path, tmp_path: Path) -> None:
+    """The installer copies the gates from the branch it runs on. A resume or compact runs this
+    script again, by when the branch may carry the Builder's own edit to a gate."""
+    repo = _checkout(tmp_path)
+    (repo / ".git" / "hooks").mkdir(exist_ok=True)
+    (repo / ".git" / "hooks" / "commit-msg").write_text(
+        "#!/bin/sh\n# MessageFoundry claim gate -- INSTALLED COPY.\n", encoding="utf-8"
+    )
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path), repo)
+    assert result.returncode == 0, result.stderr
+    assert _INSTALLER_CALL not in _calls(tmp_path)
+    assert "GIT HOOKS NOT INSTALLED" not in result.stdout
+    # Control: the same run reached the end, so the absence above is the check, not an early exit.
+    assert "[cloud-setup] cloud session." in result.stdout
+
+
+def test_a_session_start_says_nothing_once_pre_commit_is_armed(bash: Path, tmp_path: Path) -> None:
+    """A resumed VM keeps .git/hooks, so the advice to arm would only be noise there."""
+    repo = _checkout(tmp_path)
+    (repo / ".git" / "hooks").mkdir(exist_ok=True)
+    (repo / ".git" / "hooks" / "pre-commit").write_text(
+        "#!/usr/bin/env bash\n# File generated by pre-commit: https://pre-commit.com\n",
+        encoding="utf-8",
+    )
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path), repo)
+    assert result.returncode == 0, result.stderr
+    assert "PRE-COMMIT" not in result.stdout, result.stdout
+    # Control: the same run reached the end, so the silence above is the check, not an early exit.
+    assert "[cloud-setup] cloud session." in result.stdout
+
+
+@pytest.mark.parametrize("args", [[], [_ARM]], ids=["session-start", "arm"])
+@pytest.mark.parametrize(
+    ("python", "py_found", "reason"),
+    [
+        pytest.param(PY_NO_TOKENS, True, "the leak gate's scanner refuses to run", id="no-tokens"),
+        pytest.param(PY_OLD, False, "python does not run Python 3.14", id="no-python-3.14"),
+    ],
+)
+def test_pre_commit_is_not_offered_where_its_hooks_cannot_run(
+    bash: Path, tmp_path: Path, python: str, py_found: bool, reason: str, args: list[str]
+) -> None:
+    """A shim whose hooks cannot start refuses every commit, so neither run moves toward one, and
+    one line says why. Neither row links a `python`: one has 3.14, the other finds none to link."""
+    repo = _checkout(tmp_path)
+    env = _cloud_env(repo, tmp_path, python=python, py_found=py_found)
+    result = _run(bash, [str(_SCRIPT), *args], env, repo)
+    assert result.returncode == (1 if args else 0), result.stderr
+    off = _off_line(result.stdout, "PRE-COMMIT HOOKS")
+    assert reason in off
+    assert _ARM_HINT not in off
+    assert not [c for c in _calls(tmp_path) if c.startswith(("uv tool", "pre-commit"))]
+    if python == PY_NO_TOKENS:
+        # The scanner's own words come first, so the line's "as its output above says" holds.
+        assert "[cloud-setup]   scanner: no token source" in result.stdout
+        assert off.endswith("set MEFOR_FORBIDDEN_TOKENS on the cloud environment.")
+
+
+@pytest.mark.parametrize("tokens", [False, True])
+def test_the_scanner_itself_decides_whether_the_leak_gate_can_run(
+    bash: Path, tmp_path: Path, tokens: bool
+) -> None:
+    """The real scan_forbidden.py, so the script's question is the hook's own. The synthetic example
+    fills every section the floor reads, so it stands in for the private list here."""
+    repo = _checkout(tmp_path)
+    security = repo / "scripts" / "security"
+    security.mkdir(parents=True)
+    # Only these: the worktree may hold the real, git-ignored token list beside them.
+    for name in ("scan_forbidden.py", "scan-allowlist.txt", "scan-tokens.local.txt.example"):
+        shutil.copy2(_ROOT / "scripts" / "security" / name, security / name)
+    env = _cloud_env(repo, tmp_path, python=PY_REAL)
+    if tokens:
+        env["MEFOR_FORBIDDEN_TOKENS"] = (security / "scan-tokens.local.txt.example").as_posix()
+    result = _run(bash, [str(_SCRIPT)], env, repo)
+    assert result.returncode == 0, result.stderr
+    off = _off_line(result.stdout, "PRE-COMMIT HOOKS")
+    assert (_ARM_HINT in off) is tokens, off
+    # The example passes the floor and matches nothing real, so a pass on it must say so.
+    assert ("blind to every real customer token" in result.stdout) is tokens, result.stdout
+
+
+def test_arming_installs_pre_commit_builds_every_environment_then_the_shim(
+    bash: Path, tmp_path: Path
+) -> None:
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT), _ARM], _cloud_env(repo, tmp_path), repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _calls(tmp_path) == [
+        "uv tool install pre-commit==4.7.0",
+        "uv tool dir --bin",
+        "pre-commit install-hooks",
+        "pre-commit install",
+    ]
+    assert result.stdout.endswith(
+        "[cloud-setup] pre-commit hooks installed: the hooks in .pre-commit-config.yaml now run"
+        " on each commit.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("stubs", "reason", "last_call"),
+    [
+        pytest.param(
+            {"uv_tool_rc": 1},
+            "uv tool install pre-commit==4.7.0 failed",
+            "uv tool install pre-commit==4.7.0",
+            id="uv-tool",
+        ),
+        # The shim must not go in: a hook that cannot start would refuse every commit.
+        pytest.param(
+            {"install_hooks_rc": 1},
+            "a hook environment did not build",
+            "pre-commit install-hooks",
+            id="install-hooks",
+        ),
+        pytest.param(
+            {"install_rc": 1}, "pre-commit install failed", "pre-commit install", id="install"
+        ),
+    ],
+)
+def test_a_failed_arming_step_is_reported_and_stops_there(
+    bash: Path, tmp_path: Path, stubs: dict[str, Any], reason: str, last_call: str
+) -> None:
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT), _ARM], _cloud_env(repo, tmp_path, **stubs), repo)
+    assert result.returncode == 1, result.stderr
+    assert f": {reason}" in _off_line(result.stdout, "PRE-COMMIT HOOKS")
+    assert _calls(tmp_path)[-1] == last_call
+    assert "pre-commit hooks installed" not in result.stdout
+
+
+def test_a_failed_hook_installer_is_reported_and_the_rest_still_runs(
+    bash: Path, tmp_path: Path
+) -> None:
+    repo = _checkout(tmp_path)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path, pwsh_rc=1), repo)
+    assert result.returncode == 0, result.stderr
+    assert _off_line(result.stdout, "GIT HOOKS") == (
+        "[cloud-setup] GIT HOOKS NOT INSTALLED: scripts/coord/install-git-hooks.ps1 failed, so the"
+        " claim gate (commit-msg) and the push guard (pre-push) are OFF. Fix what its output above"
+        " names, then run: pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1"
+    )
+    # The failing step's own output is shown, not swallowed.
+    assert "[cloud-setup]   installer: refused" in result.stdout
+    assert "[cloud-setup] cloud session." in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="runs the real installer under pwsh")
+def test_the_real_installer_writes_its_hooks_in_a_cloud_session(bash: Path, tmp_path: Path) -> None:
+    """install-git-hooks.ps1 carries no cloud refusal, and this is the run that shows it: the real
+    script, under CLAUDE_CODE_REMOTE=true, into a clone carrying its own copy of the scripts."""
+    repo = _checkout(tmp_path)
+    for sub in ("coord", "hooks"):
+        shutil.copytree(_ROOT / "scripts" / sub, repo / "scripts" / sub)
+    result = _run(bash, [str(_SCRIPT)], _cloud_env(repo, tmp_path, pwsh_rc=None), repo)
+    assert result.returncode == 0, result.stderr
+    assert "GIT HOOKS NOT INSTALLED" not in result.stdout, result.stdout
+    hooks = repo / ".git" / "hooks"
+    markers = {
+        "commit-msg": "MessageFoundry claim gate",
+        "pre-push": "MessageFoundry push guard",
+        "post-commit": "MessageFoundry durability hook",
+        "post-merge": "MessageFoundry durability hook",
+    }
+    for name, marker in markers.items():
+        assert marker in (hooks / name).read_text(encoding="utf-8"), name
+    payloads = ["claim_check.py", "coord_root.py", "push_guard.py"]
+    # Also the positive control for _installed_hooks, which the outside-the-cloud rows read as [].
+    assert _installed_hooks(repo) == sorted([*markers, *payloads])
+    # Inert: nothing names a remote for the durability hook to push to.
+    assert _local_git_config(repo, "mefor.durabilityRemote") is None
+
+
+def _python_definitions() -> str:
+    """`say`, `python_ok` and the script's python block, so ensure_python runs alone."""
+    text = _SCRIPT.read_text(encoding="utf-8")
+    one_liners = [ln for ln in text.splitlines() if ln.startswith(("say()", "python_ok()"))]
+    start, end = text.index("\npython_dir="), text.index('\nensure_python "$py"')
+    return "\n".join([*one_liners, text[start:end]])
+
+
+@pytest.mark.parametrize(
+    ("python_is_new", "has_target", "target_works", "dangling", "linked"),
+    [
+        pytest.param(True, True, True, False, False, id="already-3.14"),
+        pytest.param(False, True, True, False, True, id="links-3.14"),
+        pytest.param(False, False, True, False, False, id="no-interpreter"),
+        pytest.param(False, True, False, False, False, id="link-does-not-help"),
+        pytest.param(False, True, True, True, True, id="replaces-a-dangling-link"),
+    ],
+)
+def test_ensure_python_links_a_3_14_python_only_where_one_is_missing(
+    bash: Path,
+    tmp_path: Path,
+    python_is_new: bool,
+    has_target: bool,
+    target_works: bool,
+    dangling: bool,
+    linked: bool,
+) -> None:
+    """The git hooks run `python`, which a stock Ubuntu image may not have."""
+    link_dir = tmp_path / "local-bin"
+    link_dir.mkdir()
+    if dangling:
+        try:
+            (link_dir / "python").symlink_to(tmp_path / "gone" / "python3.14")
+        except OSError:
+            pytest.skip("this box cannot make a symlink")
+    # The `python` already on PATH: 3.14 or not, which its exit code stands for.
+    stubs = _write_stubs(tmp_path, {"python": PY_READY if python_is_new else PY_OLD})
+    py = tmp_path / "python3.14"
+    _write_stub(py, PY_READY if target_works else PY_OLD)
+    program = (
+        f"{_python_definitions()}\npython_dir='{link_dir.as_posix()}'\n"
+        f"ensure_python '{py.as_posix() if has_target else ''}'; echo rc=$?\n"
+    )
+    env = {"PATH": str(link_dir) + os.pathsep + stubs["PATH"]}
+    result = _run(bash, ["-c", program], env, tmp_path)
+    rc = 0 if python_is_new or linked else 1
+    assert f"rc={rc}" in result.stdout, (result.stdout, result.stderr)
+    assert (link_dir / "python").exists() is linked, list(link_dir.iterdir())
+    assert ("[cloud-setup] linked " in result.stdout) is linked, result.stdout
+    # A link that could not help is reported; a missing interpreter was reported where it failed.
+    not_linked = has_target and rc == 1
+    assert ("[cloud-setup] PYTHON NOT LINKED:" in result.stdout) is not_linked, result.stdout
 
 
 def _code_lines() -> list[str]:
