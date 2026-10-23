@@ -13,15 +13,21 @@ Known gaps after step 3, at least:
 - **The batch skill's `read_batch.py` lives outside this repository** and still builds
   `<git-common-dir>/mefor-coord/seats`. It should import `scripts/coord/coord_root.py`. That edit is
   outside the worktree, so it is the owner's.
-- **CLAUDE.md section 5's wiki command** passes `-StateRoot` as the local root. Once a root is
-  configured, it must name the shared root instead. That edit lands with step 7.
+- **CORRECTED 2026-10-22: CLAUDE.md section 5's wiki command** now runs
+  `scripts/coord/wiki-query.ps1`, which resolves and probes `-StateRoot` through `coord-root.ps1`
+  and stops on a fault. This bullet said it passed the local root and would change with step 7.
+- **The wiki cycle task names its state root when it is registered.** On ALIENWARE it names
+  `<clone>/.git/mefor-coord`, read 2026-10-22 from Task Scheduler. After step 7 it would compile a
+  local inbox nobody writes. Once MEFORORG/korus PR 236 merges, korus `cycle.ps1` will refuse a
+  state root whose `root.toml` names another root. Until then it does not refuse, and it compiles
+  that stale inbox without a warning. Step 7 re-registers it, on one PC only.
 
 Owner answers, 2026-10-21:
 
 - Design approved as written.
-- Host: Nucbox01 is always on. **Use the existing `Shared` share**, so the root is
-  `\\Nucbox01\Shared\mefor-coord`, not a dedicated share. MEFORDEV01 and the MEFORHV01 server are
-  also always on, and stay the fallback hosts if Nucbox01 proves unreliable. The access-list caveat
+- Host: `<share-host>` is always on. **Use the existing `Shared` share**, so the root is
+  `\\<share-host>\Shared\mefor-coord`, not a dedicated share. MEFORDEV01 and the MEFORHV01 server are
+  also always on, and stay the fallback hosts if `<share-host>` proves unreliable. The access-list caveat
   under *PHI and secrets* still applies to a subfolder of `Shared`.
 - MEFORDEV01 signs in to all the accounts and has its own clones. Its details come from a probe
   session there, which drops results under `Z:\mefor-coord-probe\`.
@@ -30,7 +36,7 @@ Owner answers, 2026-10-21:
 
 ## The recommendation: one shared root on a dedicated SMB share, named by UNC path, split by class
 
-Put the SHARED part of `mefor-coord/` on an SMB share on Nucbox01, named by its UNC path in one
+Put the SHARED part of `mefor-coord/` on an SMB share on `<share-host>`, named by its UNC path in one
 setting every script reads. Keep the LOCAL part where it is. Exclusive operations fail closed when
 the share is down; advisory reads fail open fast. Confidence: about 80 percent that this is the
 right shape, and lower on the details that need the owner's answers below.
@@ -61,7 +67,7 @@ that worked was a PR comment. Two lessons for the design:
 | Fact | Reading | Instrument |
 |---|---|---|
 | Backing | An SMB share on the LAN, NTFS on a Windows host, mapped by IP address | `Get-PSDrive Z`, `Win32_LogicalDisk` |
-| Host | The address reverse-resolves to `Nucbox01`, a third box, not MEFORDEV01 | `Dns.GetHostEntry` |
+| Host | The address reverse-resolves to `<share-host>`, a third box, not MEFORDEV01 | `Dns.GetHostEntry` |
 | Kind | A real share, not a sync folder (no OneDrive or Offline Files layer found) | `net use`, `Win32_OfflineFilesCache` empty |
 | Round trip | ping under 1 ms; 20 x (exists + listing) took 76 ms, the same as 20 local listings of `seats/` | `Measure-Command` |
 | Client caches | directory cache 10 s, file-info cache 10 s, not-found cache 5 s, session timeout 60 s | `Get-SmbClientConfiguration` |
@@ -81,7 +87,7 @@ A session on MEFORDEV01 ran the probe the owner asked for. Its report is
 |---|---|
 | User and paths | A separate LOCAL account that has the same name as ALIENWARE's, not one shared identity. The profile's `Code` folder is a junction to `D:\Code`, so every common dir is on D:. Worktrees there report `D:\Code\...` paths. |
 | Mapping | Z: is the same share, mapped by IP, persistent. `EnableLinkedConnections` is not set, so an elevated shell does not see Z:. That confirms the UNC-path rule. |
-| Host | `Nucbox01` resolves by mDNS (`Nucbox01.local`), not by DNS, and TCP 445 answers. Forward resolution from ALIENWARE was not measured. |
+| Host | `<share-host>` resolves by mDNS (`<share-host>.local`), not by DNS, and TCP 445 answers. Forward resolution from ALIENWARE was not measured. |
 | Tools | git 2.55.0, gh 2.102.0, pwsh 7.6.7, Python 3.14.7, uv 0.13.1. The same Claude accounts are signed in as on ALIENWARE. |
 | Power | Sleep on AC is never. |
 | Latency | 1 to 3 ms per round on Z:. The share was faster than a local temp folder. |
@@ -96,15 +102,19 @@ What this changes:
    record write), `lane.ps1` and `handoff.ps1 -Replace` do this on shared kinds; `claim.ps1`'s
    refresh already retries.
    This is a new precondition of step 7.
-2. **The cross-PC race is still unmeasured.** The race above ran two processes on one client. Run
-   it again with one process on each PC before step 7, because the two clients' caches are the
-   part no single-client test sees.
+2. **The cross-PC race holds (measured 2026-10-22).** The race above ran two processes on one
+   client, which cannot see the two clients' caches. The rerun put one process on each PC: 100
+   slots with 50 ms gates, 36 and 64 wins, **no double winners, no empty slots and no content
+   mismatches.** `coord-race.ps1 -Compare` judged it a valid race, with both sides starting within
+   a millisecond of the shared time by their own clocks. Before it, both PCs were set to sync from
+   the same time server, because ALIENWARE ran on its local clock. Their offsets against the file
+   server then agreed within about 20 ms.
 3. **Merging MEFORDEV01 is a large step, not a footnote.** It copies live folders only, never the
    retired or backup trees. Each of its ADR allocation records (`alloc/adr/`) gets checked against
    the share. The retired backlog allocator's records and tombstones are not live numbers, so they
    get their own disposition rather than a collision check.
-4. **Reserve Nucbox01's address in DHCP**, because an IP mapping breaks silently if it changes.
-   Name the share by IP in `root.toml` until forward resolution of `Nucbox01` is measured from both
+4. **Reserve `<share-host>`'s address in DHCP**, because an IP mapping breaks silently if it changes.
+   Name the share by IP in `root.toml` until forward resolution of `<share-host>` is measured from both
    PCs: every probe resolves the name first, and the name resolves only by mDNS.
 
 ## Why not the drive letter
@@ -130,6 +140,7 @@ cross-PC false sharing, or both.
 | `locks/` | FOLLOWS ITS RESOURCE | A lock lives on the same root as the thing it guards. `lock.ps1` callers must be sorted one by one. |
 | `handoffs/` | SHARED | A seat can be resumed from either PC. |
 | `wiki/` (inbox) | SHARED | Korus `scripts/wiki/*.ps1` take `-StateRoot`; point it at the shared root. |
+| `wiki-cycle/` | FOLLOWS ITS RESOURCE | Korus `cycle.ps1` keeps its lock and log beside the inbox it compiles. Only one PC runs the cycle: two compile jobs drop each other's events from the open pull request, and two imports give one memory store the same label. |
 | `announce/` | LOCAL | Per-session delivery receipts for the `list_sessions` lane, which is itself per-PC. |
 | `wiki-prompt/` | LOCAL | Per-session Stop-hook state. |
 | `overlap-cache/`, `overlap-terms.json` | LOCAL | A cache, about 190 MB measured. Rebuildable; never worth a network hop. |
@@ -208,21 +219,23 @@ secret, and the engine's rules (CLAUDE.md section 9) already forbid both. Two ex
 because the share is reachable from more than one machine:
 
 - **Restrict the folder.** The owner chose the general `Shared` share, which already holds
-  unrelated and possibly sensitive files and whose access list is unknown. So set an NTFS access
-  list on `\\Nucbox01\Shared\mefor-coord` that grants only the accounts the two PCs present to
-  Nucbox01, with inheritance off. Those are two separate local accounts that share a name, so name
-  each one. A dedicated share remains the stronger option.
+  unrelated and possibly sensitive files, and whose access list lets any account that signs in to
+  `<share-host>` change them. So set an NTFS access list on the `mefor-coord` folder that grants only
+  the accounts the two PCs present to `<share-host>`, with inheritance off. Each PC presents its own,
+  differently named account, so name each one. Done 2026-10-22 and tested from both PCs. A
+  dedicated share remains the stronger option.
 - Mail bodies are free text. `mail.ps1` should refuse a body that matches the leak gate's secret
   patterns, the same patterns the pre-commit gate uses. That is a follow-up, not a precondition.
 
 ## The contract every script reads
 
 One resolver, `scripts/coord/coord-root.ps1` (dot-sourced) plus a Python twin for the git hooks and
-`read_batch.py`. Two functions:
+`read_batch.py`. At least these functions:
 
 | Function | Returns |
 |---|---|
-| `Get-CoordSharedRoot` | `$env:MEFOR_COORD_ROOT` if set, else the `shared_root` value in `<git-common-dir>/mefor-coord/root.toml`, else `<git-common-dir>/mefor-coord` (today's behaviour). Probes reachability as above. |
+| `Get-CoordSharedRoot` | `$env:MEFOR_COORD_ROOT` if set, else the `shared_root` value in `<git-common-dir>/mefor-coord/root.toml`, else `<git-common-dir>/mefor-coord` (today's behaviour). It does not probe. |
+| `Resolve-CoordSharedRoot` | The same root, after probing a configured one for reachability as above. A root that is missing or unreachable comes back as an error. |
 | `Get-CoordLocalRoot` | Always `<git-common-dir>/mefor-coord`. |
 
 Rules:
@@ -234,8 +247,9 @@ Rules:
 3. `root.toml` is per-clone and untracked, so each PC sets its own UNC path.
 4. A cloud session (`CLAUDE_CODE_REMOTE=true`) still refuses, unchanged.
 5. A test pins both roots to temp directories through the env var.
-6. Korus wiki scripts get `-StateRoot (Get-CoordSharedRoot)`. The batch skill's `seats_dir()` calls
-   the Python twin.
+6. Korus wiki scripts get the probed root as `-StateRoot`. A query goes through
+   `scripts/coord/wiki-query.ps1`, which stops rather than pass an empty one. The batch skill's
+   `seats_dir()` calls the Python twin.
 
 ## Alternatives weighed
 
@@ -247,12 +261,12 @@ Rules:
 | Per-PC state plus a sync (robocopy, Syncthing) | Rejected for claims and allocations: sync cannot give exclusion, so both PCs win the same item. Fine only for read-mostly data, which does not need it. |
 | Shared root by setting, local fallback | **Chosen**, with one change: no fallback for exclusive operations. |
 
-Single point of failure: Nucbox01. If it is down, nobody can claim or allocate on either PC, by
+Single point of failure: `<share-host>`. If it is down, nobody can claim or allocate on either PC, by
 design. Reads and builds keep working.
 
 ## Migration
 
-1. Create `\\Nucbox01\Shared\mefor-coord` and restrict its access list as above.
+1. Create `\\<share-host>\Shared\mefor-coord` and restrict its access list as above.
 2. On each PC, in a desktop shell, an elevated shell and a scheduled task, a probe script measures:
    UNC reachability, exclusive create (two processes race 100 times, exactly one wins each time),
    rename-over, and per-call latency. Results go into this note. Any failure stops the migration.
@@ -267,7 +281,8 @@ design. Reads and builds keep working.
    lands, two PCs with a worktree at the same path share one seat id and one mailbox. This is a
    precondition of step 7, and a separate change, because it moves both ends of the mail contract.
    Also before step 7: the rename-retry change for writers and readers of shared kinds, and the
-   CreateNew race rerun with one process on each PC (see *What MEFORDEV01 measured*).
+   CreateNew race rerun with one process on each PC, which passed on 2026-10-22 (see *What
+   MEFORDEV01 measured*).
 5. Pick a quiet window. Announce it on the old mail lane.
 6. Copy `seats/`, `mail/`, `claims/`, `alloc/`, `handoffs/` and the wiki inbox to the share, with
    `robocopy /E /COPY:DT`. Leave the originals in place. **Then stamp `host = ALIENWARE` on every
@@ -279,7 +294,13 @@ design. Reads and builds keep working.
    stamp in one pass, in place of robocopy. It is a dry run unless `-Apply`. It copies only the
    shared kinds, skips retired, backup, temp and cache trees, and never overwrites. Exit 3 means at
    least one finding needs a person. Its `.NOTES` block lists every exit case.
-7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share.
+7. Write `root.toml` on ALIENWARE. Every new hook call now uses the share. Then register the wiki
+   cycle again with korus `register-cycle-task.ps1`, on this PC only. It replaces the whole task,
+   so pass every argument the task was first registered with, and change only `-StateRoot` to the
+   shared root. Read those arguments from the existing task first, and run with `-WhatIf` to
+   compare before you drop it. Once MEFORORG/korus PR 236 merges, the cycle refuses its old local root until this
+   re-registration, so nothing compiles. Before that PR merges it does not refuse: it compiles the
+   old local inbox and reports nothing wrong.
 8. Verify: declare a seat, send a mail to yourself, take and release a test claim, and read each
    back from a second account.
 9. Rename the old local copies to `*.pre-share` so nothing reads them by accident. **Keep the
@@ -292,7 +313,9 @@ design. Reads and builds keep working.
     allocated is a collision the owner rules on, not one the copy may overwrite.
     Tools: `coord-migrate.ps1 -SourceHost MEFORDEV01` stamps that host and lists each collision
     under its own heading. The retired backlog allocator's records and tombstone are reported apart
-    and stay behind unless `-IncludeRetiredBacklog`.
+    and stay behind unless `-IncludeRetiredBacklog`. Copy its `wiki/inbox/*.json` too: each name
+    is a random id, so a copy never meets an existing file. A `KORUS-Wiki-Cycle` task is
+    registered there (read 2026-10-22). Unregister it, so one PC runs the cycle.
 
 ## Rollback
 
@@ -300,6 +323,12 @@ design. Reads and builds keep working.
 2. Copy back anything written to the share since step 7 that the fleet still needs, at least open
    claims and unread mail.
 3. Rename the `*.pre-share` copies back.
+4. Undo step 7's re-registration: run korus `register-cycle-task.ps1` again on ALIENWARE with the
+   same arguments, and `-StateRoot` back on the local root. Until then the cycle compiles the
+   share, which nothing writes once step 1 is done.
+5. Undo step 10 on MEFORDEV01: register its `KORUS-Wiki-Cycle` task again with the arguments it
+   had before step 10, if each PC should run its own cycle again. Record those arguments before
+   step 10 unregisters it, because nothing else keeps them.
 
 The resolver keeps today's behaviour when nothing is configured, so rollback never needs a code
 revert.

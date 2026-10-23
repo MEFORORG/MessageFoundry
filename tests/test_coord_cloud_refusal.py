@@ -176,6 +176,7 @@ def _run(
         pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
         pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
         pytest.param("coord/digest.ps1", (), id="digest"),
+        pytest.param("coord/wiki-query.ps1", ("-KorusCheckout", "no-korus"), id="wiki-query"),
         *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
         pytest.param(PRESENCE, ("-Json",), id="presence"),
     ],
@@ -445,6 +446,8 @@ GUARDED = (
     "coord/claim-adjudicate.ps1",
     "coord/claim-reconcile.ps1",
     "coord/fleet.ps1",
+    # The wiki query wrapper: a VM's empty inbox would answer `no note`, a clean-looking miss.
+    "coord/wiki-query.ps1",
 )
 PY_GUARDED = "coord/owner_log.py"
 
