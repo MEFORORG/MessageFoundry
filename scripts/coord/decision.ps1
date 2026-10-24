@@ -142,7 +142,9 @@ function Get-SeatCandidate([string]$File) {
     # A record that exists but cannot be READ throws to the caller, which then names no seat: it may
     # be the newer record, so the other box's older one is not the seat.
     if (-not [System.IO.File]::Exists($File) -and -not [System.IO.Directory]::Exists($File)) { return $null }
-    $text = [System.IO.File]::ReadAllText($File)
+    # Read-CoordText retries an SMB sharing violation, then rethrows it, so an unreadable record still
+    # throws to the caller as above.
+    $text = Read-CoordText $File
     try {
         $r = $text | ConvertFrom-Json -ErrorAction Stop
         if ($r -isnot [System.Management.Automation.PSCustomObject]) { return $null }

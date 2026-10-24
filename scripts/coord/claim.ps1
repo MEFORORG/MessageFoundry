@@ -254,7 +254,7 @@ function ConvertTo-Stamp($Value) {
 }
 
 function Get-Mine([string]$Path) {
-    $c = Get-Content $Path -Raw | ConvertFrom-Json
+    $c = Read-CoordText $Path | ConvertFrom-Json
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
     $me = ($holder -replace '\\', '/').TrimEnd('/')
     # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
@@ -270,10 +270,8 @@ function Get-Mine([string]$Path) {
 # git-bash on the same clone, and a mixed-newline JSONL file is one of those things nothing complains
 # about until a parser splits differently from the writer.
 #
-# The catch is deliberately UNTYPED, for the reason written out at the claim-refresh Move below:
-# PowerShell wraps an exception thrown by a .NET METHOD in a MethodInvocationException, so a typed
-# `catch [System.IO.IOException]` here would never match and the failure would escape to
-# $ErrorActionPreference = "Stop" instead of being retried.
+# The catch is deliberately UNTYPED: every failure here has the same answer, retry, and one that
+# escaped a typed catch would reach $ErrorActionPreference = "Stop" instead.
 function Add-HistoryLine([string]$Line) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`n")
     foreach ($attempt in 1..5) {
@@ -753,7 +751,7 @@ function Show-List {
         # Rows are now printed after every one is built, so one unreadable file would otherwise hide the
         # whole listing instead of only the rows after it. Say so in its own row and carry on.
         try {
-            $c = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            $c = Read-CoordText $f.FullName | ConvertFrom-Json
             if ($null -eq $c) { throw "the file is empty" }
         }
         catch {
@@ -1017,8 +1015,17 @@ try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
     # sibling session got here first, and that throw IS the mutual exclusion.
     $fs = [System.IO.File]::Open($file, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-} catch [System.IO.IOException] {
-    $info = Get-Mine $file
+} catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+    # Access denied is the same contention on an SMB share: a claim file that is delete-pending, mid
+    # -Release or mid-replace, refuses CreateNew that way rather than as "already exists". It is
+    # never success, and the read below can fail on that same name, so a failed read refuses too.
+    try { $info = Get-Mine $file } catch {
+        Write-Host ""
+        Write-Host "BLOCKED: '$Take' could not be taken -- its claim file could not be created or read." -ForegroundColor Red
+        Write-Host "  reason: $($_.Exception.Message)"
+        Write-Host "  Another session may be releasing or replacing it. Nothing was written. Retry in a moment."
+        exit 1
+    }
     if ($info.IsMine) {
         # Re-taking your own claim is not an error: a session should be able to re-assert freely. It was
         # also, until now, not a REFRESH -- despite the -Take parameter documenting one. A new -Note was
@@ -1071,23 +1078,23 @@ try {
             # like one refresh per invocation but is cheap to absorb. Failing is the SAFE direction: the
             # old note survives and the claim stays ours. Losing the lock is not.
             #
-            # The catch is deliberately UNTYPED. PowerShell wraps an exception thrown by a .NET METHOD in
-            # a MethodInvocationException, so `catch [System.IO.IOException]` around this call never
-            # matches -- the failure escapes to $ErrorActionPreference = "Stop", the cleanup below never
-            # runs, and the temp file is orphaned in the claim registry. (Written typed first; the
-            # orphaned-temp assertion is what caught it.) Every failure here has the same right answer
-            # anyway: leave the old note, keep the claim, say so.
-            $moved = $false
-            foreach ($attempt in 1..5) {
-                try { [System.IO.File]::Move($tmp, $file, $true); $moved = $true; break }
-                catch { Start-Sleep -Milliseconds (20 * $attempt) }
-            }
-            if (-not $moved) {
+            # The catch is deliberately UNTYPED: a failure of any type that escaped it would reach
+            # $ErrorActionPreference = "Stop", the cleanup below would never run, and the temp file
+            # would be orphaned in the claim registry. Every failure here has the same right answer:
+            # leave the old note, keep the claim, say so.
+            #
+            # Move-CoordFileReplace (coord-root.ps1) is that same overwrite Move, retried with a bounded
+            # backoff on a sharing violation or access denied, which an SMB share also raises.
+            try { Move-CoordFileReplace -Source $tmp -Destination $file }
+            catch {
+                $why = $_.Exception.Message
                 # Never orphan the temp: this directory is the claim registry, and a k.json.<pid>.tmp
                 # nothing ever removes accumulates in it for the life of the repo.
                 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
                 Write-Host ""
-                Write-Host "Could NOT refresh the note on '$Take' -- the file was locked by another process." -ForegroundColor Yellow
+                # Usually locked by another process; a read-only claim file is refused too, never replaced.
+                Write-Host "Could NOT refresh the note on '$Take' -- the file was locked by another process, or is read-only." -ForegroundColor Yellow
+                Write-Host "  reason: $why"
                 Write-Host "  Your claim is UNCHANGED and still yours; only the note was not updated."
                 Write-Host "  Retry in a moment. Do NOT -Release: that would drop a claim you still hold."
                 exit 1

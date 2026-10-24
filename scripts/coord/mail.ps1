@@ -212,7 +212,7 @@ function Resolve-SeatRecipient {
     $best = $null
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -EA SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending)) {
-        try { $best = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop; break } catch { }
+        try { $best = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop; break } catch { }
     }
     # A directory with no readable record is not evidence a seat exists; refuse rather than mint.
     if ($null -eq $best) { return $null }
@@ -343,7 +343,7 @@ function Get-BoxMessages {
     $out = @()
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue | Sort-Object Name)) {
         try {
-            $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
+            $m = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
             $out += [pscustomobject]@{ Message = $m; File = $f.FullName }
         }
         catch {

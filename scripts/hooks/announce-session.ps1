@@ -181,7 +181,7 @@ function Get-ClaimNotes {
         if (-not (Test-Path -LiteralPath $ClaimsDir)) { return $map }
         foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
-                $c = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                $c = Read-CoordText $f.FullName | ConvertFrom-Json
                 if (-not ($c.worktree -and $c.note)) { continue }
                 if (-not (Test-CoordRecordIsHere $c)) { continue }
                 $hrs = $null
@@ -224,7 +224,7 @@ function Get-SeatGoal {
         $f = Join-Path (Join-Path $SeatsDir (ConvertTo-BoxKey -Path $Top)) "$SessionId.json"
         # One read, no Test-Path first: on a shared root each is a network round trip, and a missing
         # file throws into the catch below, which is the same "no goal".
-        $r = Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json
+        $r = Read-CoordText $f | ConvertFrom-Json
         if (-not $r.goal -or [string]$r.sessionId -ne $SessionId) { return $null }
         # A closed or handed-back seat's goal is finished work, not current intent.
         if ($r.lifecycle -and [string]$r.lifecycle -ne 'open') { return $null }

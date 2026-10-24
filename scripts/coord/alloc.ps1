@@ -214,7 +214,7 @@ if ($List) {
     foreach ($k in @("adr", "backlog")) {
         $dir = Join-Path $allocRoot $k
         $mine = @(Get-ChildItem $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
-                $c = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                $c = Read-CoordText $_.FullName | ConvertFrom-Json
                 if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-CoordRecordIsHere $c)) { $c }
             })
         Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
@@ -341,7 +341,7 @@ if (-not $ShowFloor) {
         if (-not [int]::TryParse($f.BaseName, [ref]$number)) { continue }
         $rec = $null
         try {
-            $rec = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            $rec = Read-CoordText $f.FullName | ConvertFrom-Json
         } catch {
             $rec = $null
         }
@@ -549,7 +549,7 @@ function Get-Floor {
     $watermark = Join-Path $alloc ".floor-highwater"
     $computed = [int](($seen | Measure-Object -Maximum).Maximum)
     $previous = 0
-    if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
+    if (Test-Path $watermark) { [void][int]::TryParse((Read-CoordText $watermark).Trim(), [ref]$previous) }
 
     # NAME THE CAUSE, AND DO NOT SEND THE OPERATOR AFTER A REMEDY THAT CANNOT WORK. This used to end
     # "re-fetch them before trusting any number-space reasoning here", which is wrong twice over now:

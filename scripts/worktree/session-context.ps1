@@ -295,7 +295,7 @@ if ($root) {
             $unreadable = 0
             $rows = @(foreach ($cf in $claimFiles) {
                 $c = $null
-                try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { }
+                try { $c = Read-CoordText $cf.FullName | ConvertFrom-Json } catch { }
                 if ($null -eq $c -or -not $c.key) { $unreadable++; continue }
                 $heldNorm = ("$($c.worktree)" -replace '\\', '/').TrimEnd('/')
                 # A claim from another machine names that machine's path, so it is never THIS session.

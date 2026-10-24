@@ -203,7 +203,89 @@ def test_a_refresh_that_cannot_be_written_leaves_the_old_claim_intact(repo: Path
             "the claim file was unlinked -- a peer could take the key in that window"
         )
     assert proc.returncode != 0 or read_claim(repo, "k")["note"] in {"first", "second"}
+    # The hold blocks only the rename, so the run must reach the designed refusal, not die earlier on
+    # the read of the claim it is refreshing.
+    if proc.returncode != 0:
+        assert "Could NOT refresh" in proc.stdout, (proc.stdout, proc.stderr)
     # Whatever happened, the file is still parseable -- that is the property the gate depends on.
     assert read_claim(repo, "k")["key"] == "k"
     # And nothing was orphaned: this directory is the claim registry, not a scratch space.
     assert not list(path.parent.glob("*.tmp")), "a failed refresh left a temp file behind"
+
+
+def test_a_read_only_claim_file_is_not_overwritten_by_a_refresh(repo: Path) -> None:
+    """A read-only claim file refuses the refresh, as ``[IO.File]::Move`` did before the retry helper.
+
+    The helper once cleared the mark and replaced the file; the refresh must not do that.
+    """
+    assert claim(repo, "-Take", "k", "-Note", "first").returncode == 0
+    path = claim_file(repo, "k")
+    before = path.read_bytes()
+    path.chmod(0o444)
+    try:
+        proc = claim(repo, "-Take", "k", "-Note", "second")
+        still_read_only = not os.access(path, os.W_OK)
+    finally:
+        path.chmod(0o644)
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    assert "Could NOT refresh" in proc.stdout, (proc.stdout, proc.stderr)
+    assert path.read_bytes() == before, "a read-only claim file was overwritten"
+    assert still_read_only, "the read-only mark was cleared"
+    assert not list(path.parent.glob("*.tmp")), "a refused refresh left a temp file behind"
+
+
+# Marks a file delete-pending with the classic (non-POSIX) disposition, so its name stays while the
+# handle is open. CreateNew on that name then raises access denied, not "already exists", which is
+# what an SMB share can return for a claim file mid-release or mid-replace.
+_DELETE_PENDING = r"""
+param([string]$Target, [string]$Claim, [string]$Key)
+Add-Type -Namespace ClaimTest -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle h, int cls, ref byte info, uint size);
+'@
+# DELETE | FILE_READ_DATA, share read, write and delete, OPEN_EXISTING.
+$h = [ClaimTest.Native]::CreateFileW($Target, [uint32]0x00010001, 7, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+if ($h.IsInvalid) { throw "open failed" }
+$one = [byte]1
+if (-not [ClaimTest.Native]::SetFileInformationByHandle($h, 4, [ref]$one, 1)) { throw "disposition failed" }
+$control = try { [System.IO.File]::Open($Target, 'CreateNew', 'Write', 'None').Dispose(); 'created' }
+           catch { $e = $_.Exception; if ($e.InnerException) { $e = $e.InnerException }; $e.GetType().FullName }
+$out = & pwsh -NoProfile -NonInteractive -File $Claim -Take $Key -Note 'mine' 2>&1 | Out-String
+$rc = $LASTEXITCODE
+$h.Dispose()
+[ordered]@{ control = $control; rc = $rc; out = $out } | ConvertTo-Json -Compress
+"""
+
+
+def test_take_on_a_delete_pending_claim_file_is_contended_not_a_crash(
+    repo: Path, tmp_path: Path
+) -> None:
+    path = claim_file(repo, "k")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"key": "k", "note": "peer", "worktree": "D:/elsewhere", "claimed": "x"}),
+        encoding="utf-8",
+    )
+    script = tmp_path / "delete-pending.ps1"
+    script.write_text(_DELETE_PENDING, encoding="utf-8")
+    proc = subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(script),
+            "-Target", str(path), "-Claim", str(repo / "scripts" / "coord" / "claim.ps1"),
+            "-Key", "k",
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    # The control: the delete-pending name must raise access denied, or this proves nothing.
+    assert out["control"] == "System.UnauthorizedAccessException", out
+    assert out["rc"] == 1, out
+    assert "CLAIMED" not in out["out"], out
+    assert "BLOCKED" in out["out"] and "Retry in a moment" in out["out"], out

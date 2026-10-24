@@ -267,3 +267,46 @@ def record_is_here(record: object) -> bool:
     """True when a record is this machine's to judge: it names no host, or names this one."""
     recorded = record_host(record)
     return not recorded or recorded.casefold() == host().casefold()
+
+
+# The read half of the SMB retry, with the same numbers as Read-CoordText in coord-root.ps1, whose
+# header says why it exists. Python only reads shared records, so the rename half has no twin here.
+RETRY_TRIES = 8
+RETRY_FIRST_SECONDS = 0.025
+RETRY_MAX_SLEEP_SECONDS = 0.25
+# ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+_SHARING_WINERRORS = frozenset({32, 33})
+
+
+def transient_io_error(exc: OSError) -> bool:
+    """True for a sharing or lock violation. Never for a missing file.
+
+    The same set Read-CoordText retries, with one difference Python cannot avoid. ``open()`` goes
+    through the C runtime, which reports a sharing violation as a bare ``PermissionError(13)`` with no
+    ``winerror`` (measured 2026-10-21). That is indistinguishable from a real denial, so on Windows a
+    PermissionError with no winerror is retried too; a real denial costs one bounded wait.
+    """
+    if isinstance(exc, FileNotFoundError | NotADirectoryError):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _SHARING_WINERRORS
+    return os.name == "nt" and isinstance(exc, PermissionError)
+
+
+def read_text(path: str | os.PathLike[str], encoding: str = "utf-8") -> str:
+    """A file's text, retrying the transient errors above briefly.
+
+    A missing file raises FileNotFoundError at once. When the tries run out, the last error
+    propagates, so a caller never reads a held file as "missing" or "torn" without trying first.
+    """
+    sleep = RETRY_FIRST_SECONDS
+    for _ in range(RETRY_TRIES - 1):
+        try:
+            return Path(path).read_text(encoding=encoding)
+        except OSError as exc:
+            if not transient_io_error(exc):
+                raise
+        time.sleep(sleep)
+        sleep = min(sleep * 2, RETRY_MAX_SLEEP_SECONDS)
+    return Path(path).read_text(encoding=encoding)

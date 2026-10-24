@@ -1320,7 +1320,7 @@ try {
         }
 
         $m = $null
-        try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { }
+        try { $m = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { }
         # A NULL CHECK IS NOT A SHAPE CHECK. `[1,2,3]` and `"just a string"` are both valid JSON and
         # both non-null, so a bare `-not $m` admitted them: each rendered as a full message frame with
         # blank kind and sent and a body of "(empty body)", got a receipt, moved to seen/, and was

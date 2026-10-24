@@ -80,7 +80,7 @@ function Get-ClaimHash([string]$Worktree) {
     $want = $Worktree.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     $keys = @()
     foreach ($f in (Get-ChildItem -LiteralPath $dir -Filter *.json -Recurse -File -ErrorAction SilentlyContinue)) {
-        try { $d = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        try { $d = Read-CoordText $f.FullName | ConvertFrom-Json } catch { continue }
         $w = ''
         if ($d.PSObject.Properties.Name -contains 'worktree' -and $d.worktree) { $w = [string]$d.worktree }
         if (-not $w) { continue }
@@ -104,8 +104,28 @@ $tmpDir   = Join-Path $lanesDir '.tmp'
 $file     = Join-Path $lanesDir "$boxKey.json"
 
 $rec = $null
+$recFault = $null
 if (Test-Path -LiteralPath $file) {
-    try { $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $rec = $null }
+    try {
+        $rec = Read-CoordText $file | ConvertFrom-Json -NoEnumerate
+        # An empty file, or JSON that is not an object (0, null, "", [], 1, [1, 2]), is not a lane
+        # record, and nor is {}: an object with no fields records nothing to judge or keep.
+        if ($rec -isnot [System.Management.Automation.PSCustomObject]) {
+            $recFault = 'it is not a JSON object'
+        } elseif (@($rec.PSObject.Properties).Count -eq 0) {
+            $recFault = 'it is an empty JSON object'
+        }
+    }
+    catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { $rec = $null }
+    catch { $recFault = $_.Exception.Message }
+}
+# FAIL CLOSED. The host refusal below needs the record read, so a record file that exists but cannot
+# be read, parsed, or taken as a record must not be taken as no record and replaced. Only a missing
+# file means no record. A record with fields but no `host` is still this machine's, as below.
+# -Show reads it again on its own.
+if (-not $Show -and $recFault) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- the lane record at $file exists but could not be read ($recFault). Nothing was written. Read it with -Show; if it is damaged rather than busy, move it out of $lanesDir by hand and state this lane's level again.")
+    exit 2
 }
 # The box key hashes this host as well as the path (mail-key.ps1), so another PC's lane at the same
 # path writes its own file, not this one. A record under the old path-only key is not
@@ -140,11 +160,11 @@ if ($Show) {
     $shown = $null
     $absent = $null
     try {
-        $shown = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        $shown = Read-CoordText $file | ConvertFrom-Json -NoEnumerate
         if ($shown -isnot [System.Management.Automation.PSCustomObject]) {
             $absent = "the lane record at $file is not a JSON object"
         }
-    } catch [System.Management.Automation.ItemNotFoundException] {
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
         $absent = if (Test-Path -LiteralPath $lanesDir -PathType Container) { "no lane record at $file" }
                   else { "no lanes directory found at $lanesDir, so this root holds no lane record" }
     } catch {
@@ -223,7 +243,9 @@ $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
 $tmp = Join-Path $tmpDir ("$boxKey." + [guid]::NewGuid().ToString('n') + '.json')
 ($rec | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline
-Move-Item -LiteralPath $tmp -Destination $file -Force
+# One atomic rename, retried on an SMB sharing violation (coord-root.ps1). Not Move-Item -Force,
+# which deletes first, so the lane hook could read the level as missing.
+Move-CoordFileReplace -Source $tmp -Destination $file -ReplaceReadOnly
 
 if ($Asked) {
     Write-Host "lane: recorded that a dispatcher asked. No number written."

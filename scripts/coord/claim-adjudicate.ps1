@@ -294,7 +294,7 @@ $rows = @()
 $files = @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)
 foreach ($f in $files) {
     $k = $f.BaseName
-    try { $c = Get-Content -LiteralPath $f.FullName -Raw -Encoding utf8 -EA Stop | ConvertFrom-Json -EA Stop }
+    try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
     catch {
         # An unreadable claim belongs to the registry, not to any worktree. claim_check.py reads a
         # malformed claim as UNCLAIMED, so the key is ALREADY ungated -- deleting the file would hide

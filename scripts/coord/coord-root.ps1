@@ -37,8 +37,18 @@
       1. NO top-level param() block.
       2. NO assignment to a preference variable.
       3. NO I/O and NO pipeline output at load time.
-      4. NEVER THROWS from a function. Errors come back in the result's Error field.
+      4. NEVER THROWS from a resolver function. Errors come back in the result's Error field. The file
+         helpers at the end (Invoke-CoordIoRetry and the two that use it) are the exception, by
+         design: each stands in for a .NET call that throws, so after its retries it rethrows that
+         call's own exception for the caller's catch.
     Its Python twin is scripts/coord/coord_root.py; tests/test_coord_root.py holds both to one answer.
+
+    SMB SHARING VIOLATIONS. On the share, a rename over a file another process is reading, and a read
+    of a file being replaced, can fail for a few milliseconds (docs/COORD-SHARED-ROOT.md, *What
+    MEFORDEV01 measured*). Move-CoordFileReplace and Read-CoordText retry those, briefly and
+    boundedly; a missing file is never retried. A writer must not use `Move-Item -Force` instead: it
+    is delete-then-rename, so a reader can find the name missing in between. The read twin is
+    read_text in coord_root.py; tests/test_coord_smb_retry.py holds both.
 
 .EXAMPLE
     . (Join-Path $PSScriptRoot 'coord-root.ps1')
@@ -54,6 +64,14 @@ $script:CoordRootFile = 'root.toml'
 $script:CoordDownFile = 'coord-root-down.json'
 $script:CoordDownTtlSeconds = 60
 $script:CoordProbeTimeoutMs = 1500
+
+# The SMB retry: 8 tries, sleeping 25 ms and doubling, each sleep capped at 250 ms, so about 1.1 s in
+# all. The Python twin carries the same numbers.
+$script:CoordRetryTries = 8
+$script:CoordRetryFirstMs = 25
+$script:CoordRetryMaxSleepMs = 250
+# ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION, as HRESULTs.
+$script:CoordSharingHResults = @([int]0x80070020, [int]0x80070021)
 
 # A TOML literal string, and nothing else, on a `shared_root` key. An optional trailing comment.
 # ASCII space and tab only, never \s: .NET's \s and Python's differ on \x1c-\x1f and \x85, and the twins
@@ -266,4 +284,115 @@ function Test-CoordRecordIsHere {
     param($Record)
     $h = Get-CoordRecordHost $Record
     return (-not $h) -or ($h -ieq (Get-CoordHost))
+}
+
+function Get-CoordInnerException {
+    # PowerShell wraps an exception a .NET method throws in a MethodInvocationException.
+    param($Exception)
+    if ($Exception -is [System.Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
+        return $Exception.InnerException
+    }
+    return $Exception
+}
+
+function Test-CoordTransientIoError {
+    # True for a sharing or lock violation, the error a file raises while another process holds it.
+    # -AllowAccessDenied adds access denied, which is what a RENAME onto an open file raises; a read
+    # leaves it out, so a real denial on a read fails at once. A missing file is never transient.
+    param($Exception, [switch]$AllowAccessDenied)
+    $e = Get-CoordInnerException $Exception
+    if ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) { return $false }
+    if ($AllowAccessDenied -and $e -is [System.UnauthorizedAccessException]) { return $true }
+    return ($e -is [System.IO.IOException] -and $script:CoordSharingHResults -contains $e.HResult)
+}
+
+function Invoke-CoordIoRetry {
+    # Runs $Action, retrying the transient errors above with a short bounded backoff. When the tries run
+    # out, or the error is not transient, it rethrows the .NET exception itself, so a caller's typed
+    # catch still matches.
+    # A caller under SilentlyContinue with no try suppresses the rethrow and execution goes on past it,
+    # so the flag set first makes the helper return nothing at once, as `Get-Content` would there.
+    # The locals carry a prefix because $Action runs in this scope: a name it shares with a local would
+    # read the local, not the caller's variable.
+    param([scriptblock]$Action, [switch]$AllowAccessDenied)
+    $coordIoSleep = $script:CoordRetryFirstMs
+    $coordIoDone = $false
+    for ($coordIoTry = 1; $coordIoTry -le $script:CoordRetryTries; $coordIoTry++) {
+        try { return (& $Action) } catch {
+            $coordIoEx = Get-CoordInnerException $_.Exception
+            if ($coordIoTry -ge $script:CoordRetryTries -or
+                -not (Test-CoordTransientIoError $coordIoEx -AllowAccessDenied:$AllowAccessDenied)) {
+                $coordIoDone = $true
+                throw $coordIoEx
+            }
+        }
+        if ($coordIoDone) { return }
+        Start-Sleep -Milliseconds $coordIoSleep
+        $coordIoSleep = [Math]::Min($coordIoSleep * 2, $script:CoordRetryMaxSleepMs)
+    }
+}
+
+function ConvertTo-CoordFullPath {
+    # .NET resolves a relative path, and a drive-relative one such as `C:x`, against the process's own
+    # cwd, not against PowerShell's location. PowerShell's own resolver gets both right.
+    param([string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Move-CoordFileReplace {
+    # Renames $Source onto $Destination in one step, retrying a sharing violation or access denied.
+    # -NoOverwrite keeps an existing destination and throws IOException, which is never retried.
+    # A read-only destination is refused at once with UnauthorizedAccessException, as File.Move refuses
+    # it, and is left as it was: the mark is not transient, so it is checked before any retry.
+    # -ReplaceReadOnly replaces it instead, as `Move-Item -Force` did, for the writers that used that.
+    # If that replace still fails, the read-only mark is put back.
+    param([string]$Source, [string]$Destination, [switch]$NoOverwrite, [switch]$ReplaceReadOnly)
+    $src = ConvertTo-CoordFullPath $Source
+    $dst = ConvertTo-CoordFullPath $Destination
+    $overwrite = -not $NoOverwrite
+    if ($overwrite -and -not $ReplaceReadOnly) {
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
+        if ($null -ne $attrs -and ($attrs -band [System.IO.FileAttributes]::ReadOnly)) {
+            throw [System.UnauthorizedAccessException]::new("$dst is read-only, so it was not replaced.")
+        }
+    }
+    try {
+        Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $overwrite) }
+    } catch [System.UnauthorizedAccessException] {
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($dst) } catch { }
+        if (-not ($overwrite -and $ReplaceReadOnly) -or $null -eq $attrs -or -not ($attrs -band [System.IO.FileAttributes]::ReadOnly)) { throw }
+        [System.IO.File]::SetAttributes($dst, $attrs -band -bnot [System.IO.FileAttributes]::ReadOnly)
+        try {
+            Invoke-CoordIoRetry -AllowAccessDenied -Action { [System.IO.File]::Move($src, $dst, $true) }
+        } catch {
+            try { [System.IO.File]::SetAttributes($dst, $attrs) } catch { }
+            throw
+        }
+    }
+}
+
+function Read-CoordText {
+    # A file's whole text, retrying a sharing violation. A missing file throws FileNotFoundException at
+    # once, so a caller's "missing" path is unchanged. An empty file emits nothing, exactly as
+    # `Get-Content -Raw` does, so a pipeline into ConvertFrom-Json behaves as before.
+    # It opens sharing read, write and delete, at least what `Get-Content` shares, so it reads a file
+    # another process holds open for writing. File.ReadAllText shares read only and would fail there.
+    # A reader still blocks a rename onto the file it holds; the writer's retry covers that.
+    # With no -Encoding it reads UTF-8 and honours a byte-order mark; an explicit -Encoding is taken
+    # as given, with no detection.
+    param([string]$Path, [System.Text.Encoding]$Encoding)
+    $full = ConvertTo-CoordFullPath $Path
+    $text = Invoke-CoordIoRetry -Action {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        try {
+            $reader = if ($Encoding) { [System.IO.StreamReader]::new($stream, $Encoding, $false) }
+                      else { [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true) }
+            try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally { $stream.Dispose() }
+    }
+    if ($text.Length -eq 0) { return }
+    return $text
 }
