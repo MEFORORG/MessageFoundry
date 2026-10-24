@@ -7,10 +7,14 @@ that bundle would be reported. A gate whose success cannot be distinguished from
 thing to avoid here.* So most tests below are controls: each plants one failure the gate exists to
 catch and requires the gate to name it.
 
-NO NETWORK. The report the gate judges is a real ``npm audit --json`` reading taken on 2026-10-07
-with npm 11.5.2 against the vendored lockfile, recorded under ``tests/fixtures/cla_action_audit/``.
-It replaced the 2026-09-30 reading when two advisories were acknowledged. The live call is replaced
-by an injected runner, so nothing here needs npm.
+NO NETWORK. The report the gate judges is npm's verbatim stdout from ``npm audit --json``. It was
+taken on 2026-10-24 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
+It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-07 reading, taken with
+npm 11.5.2, after GitHub withdrew two advisories that reading reported. The findings the gate
+compares differ by exactly those two. Other fields differ too. Some follow from the withdrawals,
+such as the braces and js-yaml ranges and js-yaml's ``via``. The rest, such as some ``effects``
+and ``fixAvailable`` values, were not traced to a cause. The live call is replaced by an injected
+runner, so nothing here needs npm.
 
 THE FALSE CLEAN IS A RECORDED READING, NOT A GUESS. :data:`_NO_MANIFEST_REPORT` is npm's verbatim
 output with the lockfile and no ``package.json``. The gate must fail it even with an EMPTY baseline,
@@ -33,7 +37,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-07.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-24.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -372,9 +376,10 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     )
 
 
-#: Identifiers of every package on the braces and sprintf-js chains, which two acknowledgements were
-#: triaged as ABSENT from the bundle on (cla-action-advisories.toml, the 2026-10-07 block). Each
-#: must count 0 in ``dist/index.js``. Removing one needs that triage redone, not just this edit.
+#: Identifiers of at least these packages on the braces and js-yaml chains, measured ABSENT from the
+#: bundle. What the reading settles is stated once, in cla-action-advisories.toml, in the header
+#: paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT". Each must count 0 in ``dist/index.js``. Removing one
+#: needs that reading redone, not just this edit.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -388,12 +393,12 @@ _ABSENT_FROM_BUNDLE = (
 _PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
 
 
-def test_the_triaged_bundle_reading_still_holds() -> None:
-    """The braces and sprintf-js acknowledgements rest on their code being absent from the bundle.
+def test_the_recorded_bundle_reading_still_holds() -> None:
+    """The baseline's recorded bundle reading of the braces and js-yaml chains still holds.
 
     The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
-    re-vendored bundle could carry that code while both entries kept suppressing the advisories.
-    This reds instead, and the fix is a re-triage, not a new probe list.
+    re-vendored bundle could carry that code while the baseline still said it was absent. This reds
+    instead, and the fix is taking the reading again, not a new probe list.
     """
     bundle = (REPO_ROOT / ".github/actions/cla-assistant-lite/dist/index.js").read_text(
         encoding="utf-8"
@@ -401,11 +406,11 @@ def test_the_triaged_bundle_reading_still_holds() -> None:
 
     # One check per input the probe walk reads, so a zero below cannot come from walking nothing:
     # the control shows the probes can find code in this bundle text, and the probe list is
-    # non-empty. Which probes the list must hold is the triage's call, recorded in the baseline.
+    # non-empty. Which probes the list must hold is the recorded reading's call, in the baseline.
     assert len(_PRESENT_IN_BUNDLE.findall(bundle)) == 2, "the control no longer finds @actions/core"
     assert _ABSENT_FROM_BUNDLE, "no probes left, so the absence below would check nothing"
     present = [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(bundle)]
-    assert not present, f"triaged as absent from the bundle, now present: {present}"
+    assert not present, f"recorded as absent from the bundle, now present: {present}"
 
 
 def test_the_advice_matches_the_kind_of_failure(
