@@ -358,6 +358,17 @@ ENCRYPTION_HEADER_SCOPE = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
 )
+#: The tail of every private-key PEM label OpenSSL writes, lower-cased: ``PRIVATE KEY``,
+#: ``ENCRYPTED PRIVATE KEY``, ``RSA PRIVATE KEY``, ``EC PRIVATE KEY`` and the rest (BACKLOG #3745).
+#: :mod:`messagefoundry.keywrap` reads a key block by the same suffix.
+_PEM_PRIVATE_KEY_LABEL = "private key-----"
+#: What :func:`has_private_key_label` matches, in the words every refusal of it uses (BACKLOG
+#: #3745). Like :data:`ENCRYPTION_HEADER_SCOPE`, ``strict_requests`` keeps an identical literal and
+#: ``tests/test_trust_anchors.py`` compares the two exactly.
+PRIVATE_KEY_SCOPE = (
+    "names a PEM label ending in PRIVATE KEY somewhere after the first -----BEGIN in its PEM text, "
+    "even outside a block, as in a comment"
+)
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
@@ -384,6 +395,40 @@ def has_encryption_header_bytes(data: bytes) -> bool:
     TLS stack by path (BACKLOG #3090). latin-1 maps every byte, and the check looks only for ASCII
     header names, so no byte is lost or refused on the way."""
     return has_encryption_header(data.decode("latin-1"))
+
+
+def has_private_key_label(text: str) -> bool:
+    """Whether a PEM label ending in ``PRIVATE KEY`` appears anywhere after the first
+    ``-----BEGIN `` in ``text`` (BACKLOG #3745).
+
+    A trust anchor is public trust material, so a private key of any kind, plain, PKCS#8
+    ``ENCRYPTED PRIVATE KEY`` or a legacy ``RSA PRIVATE KEY``, does not belong in one. It errs wide
+    for the reason :func:`has_encryption_header` gives: no line model, since OpenSSL finds a BEGIN
+    mid-line, so the label in a comment between two blocks refuses too. A key block always starts
+    with a BEGIN, so the search from the first one cannot miss a key."""
+    begin = text.find("-----BEGIN ")
+    if begin < 0:
+        return False
+    return _PEM_PRIVATE_KEY_LABEL in text[begin:].lower()
+
+
+def has_private_key_label_bytes(data: bytes) -> bool:
+    """:func:`has_private_key_label` on a file's raw bytes, decoded as
+    :func:`has_encryption_header_bytes` decodes them."""
+    return has_private_key_label(data.decode("latin-1"))
+
+
+def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
+    """Refuse an anchor whose bytes hold a private-key label (BACKLOG #3745). It reads the raw
+    bytes, not the text :func:`anchor_cadata` keeps, so a key on a non-ASCII line it drops still
+    refuses. The refusal names the setting and the path, never the content."""
+    if has_private_key_label_bytes(data):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} {PRIVATE_KEY_SCOPE}. A trust anchor "
+            "is public trust material and needs only certificate blocks, so a private key, "
+            "encrypted or not, does not belong in it. Move the key to its own file, readable only "
+            "by the account that uses it, and keep only the CA certificates here"
+        )
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -444,10 +489,19 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
     block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
     and refuses here, and so does the header name in a comment between two blocks or after the
-    last one. A PKCS#8 ``ENCRYPTED PRIVATE KEY`` block has no such header and is not refused. The
+    last one. The
     same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
     anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
-    ASCII, dropped above, is not checked."""
+    ASCII, dropped above, is not checked.
+
+    **A private-key label after the first BEGIN refuses, after the header check and before the
+    load** (BACKLOG #3745, a Manager decision to refuse rather than warn). ``cadata=`` skips a key
+    block and loads the certificate beside it, so without this a key of any label, a plain
+    ``PRIVATE KEY``, a PKCS#8 ``ENCRYPTED PRIVATE KEY`` with no RFC 1421 header, or an ``RSA`` or
+    ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
+    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
+    non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
+    header check first, with that check's text."""
     kept: list[bytes] = []
 
     inside = False
@@ -492,6 +546,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "password. Remove the encrypted block and any comment that names one of those headers, "
             "or export the CA certificate as a plain CERTIFICATE block"
         )
+    _refuse_a_private_key(data, spec)
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
@@ -1813,7 +1868,10 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
-    for one, so refusing it here would refuse what the build accepts.
+    for one, so refusing it here would refuse what the build accepts. It takes the private-key
+    check alone (BACKLOG #3745), since no build needs a key in its CA file. That check reads the
+    bytes this preflight read; the hop reads the file again, so the gap the docs name for a swapped
+    file holds for a key too.
 
     **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
     ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
@@ -1824,9 +1882,12 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     shape_error: TrustAnchorError | None = None
     try:
         verdict = await asyncio.to_thread(evaluate_anchor, spec)
-        if verdict.pin_ok is not False and spec.loads_verified_bytes:
+        if verdict.pin_ok is not False:
+            # A cafile= consumer takes only the private-key check (BACKLOG #3745): the rest of the
+            # shape check would refuse a TRUSTED CERTIFICATE block its build accepts.
+            check = anchor_cadata if spec.loads_verified_bytes else _refuse_a_private_key
             try:
-                await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+                await asyncio.to_thread(check, verdict.data, spec)
             except TrustAnchorError as exc:
                 shape_error = exc
     except (OSError, ValueError) as exc:
