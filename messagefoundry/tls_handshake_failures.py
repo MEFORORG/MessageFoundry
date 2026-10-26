@@ -40,10 +40,12 @@ protocol class is replaced.
   with no alert, as asyncio's own client does, looks like a hang-up and is not counted.
 * **A peer that closes or resets the socket mid-handshake. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 8).** That is what a load balancer's TCP health check does.
-  The decline keeps main's counting and adds none. So the loop's hook counts each ``SSLError``
-  from ``do_handshake``, as on main, a close_notify after the ClientHello among them, and a
-  listener running its own handshakes leaves out only :data:`HUNG_UP`. Where the loop runs the
-  handshake, a closed socket ends it without ``do_handshake`` raising, so nothing counts it.
+  The decline keeps the counting that came before #3785 and adds none. So the loop's hook counts
+  each ``SSLError`` from ``do_handshake``, a close_notify after the ClientHello among them. The
+  MLLP listener, running its own handshakes, leaves out only :data:`HUNG_UP`. The DICOM SCP
+  leaves out the same peer acts as its blocking socket reports them (``_HUNG_UP`` in
+  ``transports/dicom.py``). Where the loop runs the handshake, a closed socket ends it without
+  ``do_handshake`` raising, so nothing counts it.
 * **A failure outside ``do_handshake``**, such as one in ``wrap_bio`` itself, and any context driven
   through ``wrap_socket`` rather than by an event loop. The DICOM SCP drives its handshakes that way,
   so the hook never sees them; its ``_handshake`` counts them itself, on the connection's thread,
@@ -115,9 +117,8 @@ _AGAIN = (ssl.SSLWantReadError, ssl.SSLSyscallError)
 #: of a peer that closed or reset the socket mid-handshake, which is what a load balancer's TCP
 #: health check does (vault BACKLOG #2613). A reset is how the Windows Proactor reports that
 #: hang-up, and the stdlib loop reports a close the same way (``asyncio/sslproto.py``,
-#: ``eof_received``). This is main's set. The owner's item 8 decline (ruling 2026-10-26, vault
-#: BACKLOG #3785) adds no hang-up counting and removes none, so a close_notify after the
-#: ClientHello, which raises ``SSLZeroReturnError``, is still counted everywhere main counted it.
+#: ``eof_received``). A close_notify after the ClientHello raises ``SSLZeroReturnError``, which is
+#: not in this set and is counted. The module docstring says why (vault BACKLOG #3785 item 8).
 HUNG_UP: tuple[type[OSError], ...] = (ConnectionResetError, BrokenPipeError)
 
 #: An OpenSSL reason mnemonic such as ``WRONG_VERSION_NUMBER``. Matched in full before it is kept,

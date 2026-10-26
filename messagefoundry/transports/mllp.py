@@ -2021,7 +2021,7 @@ class MLLPSource(SourceConnector):
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
-            # Not counted: a peer that hung up before finishing one (`HUNG_UP`), nor stop()
+            # Not counted: a peer that closed or reset the socket (`HUNG_UP`), nor stop()
             # aborting a handshake, which `HandshakeFailures.close` covers. A TLS error and the
             # handshake bound count.
             if not isinstance(exc, HUNG_UP):

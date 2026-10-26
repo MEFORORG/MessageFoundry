@@ -229,14 +229,15 @@ _REFUSAL_LOG_MAX_PER_WINDOW = REFUSAL_LOG_MAX_PER_WINDOW
 #: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
 _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 
-#: What this blocking handshake leaves uncounted: the same peer acts main's MLLP listener leaves
+#: What this blocking handshake leaves uncounted: the same peer acts the MLLP listener leaves
 #: uncounted (:data:`HUNG_UP`), as this socket reports them. A peer that closes the socket
 #: mid-handshake raises ``SSLEOFError`` here, where the event loop reports that close to MLLP as
 #: ``ConnectionResetError`` (measured 2026-10-26, CPython 3.14 for Windows). A close_notify after
 #: the ClientHello raises ``SSLZeroReturnError``, which MLLP counts, so it is counted here too.
-#: ``ConnectionAbortedError`` (WinError 10053) is what this side sees when a client closes as soon
-#: as its side of a COMPLETED handshake is done (measured 2026-10-26 on Windows), so it is no
-#: failed handshake. On the MLLP listener it is that listener's own bound, and counted there.
+#: ``ConnectionAbortedError`` (WinError 10053) is left out because a client that closes as soon
+#: as its own side of the handshake is done raises it here (measured 2026-10-26 on Windows). It is
+#: left out at every stage, so a peer that aborts earlier in the handshake is not counted either.
+#: On the MLLP listener it is that listener's own bound, and counted there.
 _HUNG_UP = (*HUNG_UP, ssl.SSLEOFError, ConnectionAbortedError)
 
 

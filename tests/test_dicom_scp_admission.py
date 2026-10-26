@@ -644,8 +644,8 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
             # The control: a completed handshake is no failure.
             completed, _ = await asyncio.to_thread(_tls_handshake, port, budget=5.0)
             assert completed
-            # The second control: a peer that hangs up mid-handshake is not counted (owner ruling
-            # 2026-10-26, vault BACKLOG #3785 item 8), as on MLLP.
+            # The second control: a peer that connects and closes at once, as a health check
+            # does, is not counted, as on MLLP (vault BACKLOG #3785 item 8).
             await asyncio.to_thread(_hang_up, port)
             await _until(lambda: _handshakes_in_flight(scp) == 0)
             await asyncio.sleep(0.2)  # a counted failure would reach the loop well inside this
@@ -696,9 +696,10 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
 
 
 async def test_the_scp_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
-    """The SCP counts what main's MLLP listener counts when it runs its own handshake: a peer that
-    sends close_notify after its ClientHello raises ``SSLZeroReturnError``, which is counted. A
-    bare connect and close, the health check above, is not (vault BACKLOG #3785, #3784)."""
+    """The SCP counts what the MLLP listener counts when it runs its own handshake: a peer that
+    sends close_notify after its ClientHello is counted. A bare connect and close, the health
+    check above, is not (vault BACKLOG #3785, #3784). The bound is 10 s, longer than this wait,
+    so the count cannot come from it."""
     captured: list[bytes] = []
     async with _running_scp(_tls_settings(tmp_path), captured=captured) as scp:
         await _close_notify_peer(scp.sockport)
