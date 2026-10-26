@@ -60,6 +60,7 @@ from typing import Any
 
 __all__ = [
     "EVENT_SECONDS",
+    "HUNG_UP",
     "HandshakeFailures",
     "handshake_cause",
     "watch_loop_handshakes",
@@ -73,20 +74,21 @@ _recorder_fault_logged = False
 
 #: Seconds between two reports from one listener. Per listener, not per peer: the peer's address
 #: is the caller's choice, so a per-peer window would let one host rotating addresses write a row
-#: per address. Read when a :class:`HandshakeFailures` is built, so a test shortens it for every
-#: surface by patching it here (vault BACKLOG #3785 item 4).
+#: per address. Read at each failure, so a test shortens it for every surface by patching it
+#: here (vault BACKLOG #3785 item 4).
 EVENT_SECONDS = 60.0
 
 
 def _weakly[**P, R](fn: Callable[P, R]) -> Callable[P, R | None]:
-    """``fn``, held weakly when it is a bound method, so a context or a counter it is handed to does
-    not keep the method's object alive (vault BACKLOG #3785 item 1).
+    """``fn``, held weakly when it is a bound method, so the counter it is handed to does not keep
+    the method's object, its listener, alive (vault BACKLOG #3785 item 1).
 
-    Without it, a listener and its context made a reference cycle (context, its hooked class, the
-    bound method, the listener, the context), and so did a listener and its counter. Only the
-    cyclic collector freed either. A plain function owns no object, and ``weakref.WeakMethod``
-    refuses one, so it is held as it is. Once the object is gone the call does nothing and returns
-    ``None``, so a stale hook never raises into the loop's handshake."""
+    Without it, a listener and its counter made a reference cycle (listener, counter, bound emit,
+    listener), and so did a listener and its context (context, hooked class, a bound method of the
+    listener). Only the cyclic collector freed either. The context's hook now holds the counter
+    (:meth:`HandshakeFailures.watch`), so with this no cycle runs through the listener. A plain
+    function owns no object, and ``weakref.WeakMethod`` refuses one, so it is held as it is.
+    Once the object is gone the call does nothing and returns ``None``."""
     if not inspect.ismethod(fn):
         return fn
     ref = weakref.WeakMethod(fn)
@@ -101,6 +103,20 @@ def _weakly[**P, R](fn: Callable[P, R]) -> Callable[P, R | None]:
 #: What both event loops treat as "call do_handshake again" rather than as a failed handshake. The
 #: same tuple as CPython's ``asyncio.sslproto.SSLAgainErrors`` and uvloop's ``ssl_SSLAgainErrors``.
 _AGAIN = (ssl.SSLWantReadError, ssl.SSLSyscallError)
+
+#: What a listener running its own handshakes sees when the peer hangs up before finishing one,
+#: which is what a load balancer's TCP health check does. Not counted on any surface (vault
+#: BACKLOG #2613; owner ruling 2026-10-26, #3785 item 8). A reset is how the Windows Proactor
+#: reports a hang-up to the MLLP listener. A blocking handshake, the DICOM SCP's, sees a close as
+#: ``SSLEOFError`` and a reset as ``ConnectionResetError`` (measured 2026-10-26, CPython 3.14 for
+#: Windows). The loop's hook never sees a hang-up, since neither loop raises one from
+#: ``do_handshake``.
+HUNG_UP: tuple[type[OSError], ...] = (
+    ConnectionResetError,
+    BrokenPipeError,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+)
 
 #: An OpenSSL reason mnemonic such as ``WRONG_VERSION_NUMBER``. Matched in full before it is kept,
 #: so a cause can never carry anything a peer chose.
@@ -127,7 +143,8 @@ class HandshakeFailures:
 
     ``emit(peer_host, reason)`` sends one report: a coroutine function for a connection event, or a
     plain function for a log line, which then runs at once rather than on a task a closing loop
-    could cancel. It is held weakly when it is a bound method (see :func:`_weakly`). The reason is
+    could cancel. It is held weakly when it is a bound method (see :func:`_weakly`), so the
+    listener keeps its counter alive and not the other way round. The reason is
     a count and a cause from :func:`handshake_cause`, never the peer's bytes.
 
     Every method runs on the listener's event loop. A caller on another thread hands a failure
@@ -136,7 +153,6 @@ class HandshakeFailures:
 
     def __init__(self, emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None]) -> None:
         self._emit = _weakly(emit)
-        self._window = EVENT_SECONDS
         # Between close() and open(): a listener's stop(). Nothing is counted then, so no report
         # outlives stop() (vault BACKLOG #3785 item 5: this guard lived in each listener).
         self._closed = False
@@ -160,12 +176,12 @@ class HandshakeFailures:
         self._last = (peer_host, cause)
         now = time.monotonic()
         last = self._reported_at
-        if last is None or now - last >= self._window:
-            self.cancel()
+        if last is None or now - last >= EVENT_SECONDS:
+            self._disarm()
             return True
         if self._timer is None:
             self._timer = asyncio.get_running_loop().call_later(
-                last + self._window - now, self._on_timer
+                last + EVENT_SECONDS - now, self._on_timer
             )
         return False
 
@@ -199,8 +215,15 @@ class HandshakeFailures:
 
     def watch(self, ctx: ssl.SSLContext) -> None:
         """Count each handshake the event loop fails on ``ctx``. The peer is not known there. The
-        hook holds this object weakly, so ``ctx`` does not keep it alive."""
+        hook holds this counter, never the listener, since this counter holds its listener only
+        weakly. So ``ctx`` and the listener form no cycle."""
         watch_loop_handshakes(ctx, self._note_loop_failure)
+
+    def unwatch(self, ctx: ssl.SSLContext) -> None:
+        """Count nothing more on ``ctx`` through the loop: the listener runs its handshakes itself
+        now and counts them there. Left hooked, its context would count each failure twice, since
+        ``loop.start_tls`` builds its TLS object from the same context."""
+        ctx.sslobject_class = ssl.SSLObject
 
     def _note_loop_failure(self, cause: str) -> None:
         self.note_soon(None, cause)
@@ -214,7 +237,7 @@ class HandshakeFailures:
         no failure and no report outlives stop(), and disarm the trailing timer. What that timer
         held stays held for :meth:`flush`. Nothing can arm a new one until :meth:`open`."""
         self._closed = True
-        self.cancel()
+        self._disarm()
 
     def _on_timer(self) -> None:
         """The trailing report's timer."""
@@ -241,7 +264,7 @@ class HandshakeFailures:
             if sent is not None:
                 await sent
 
-    def cancel(self) -> None:
+    def _disarm(self) -> None:
         """Disarm the trailing timer. What it held stays held, for :meth:`flush` or :meth:`take_held`."""
         if self._timer is not None:
             self._timer.cancel()
@@ -260,7 +283,6 @@ class HandshakeFailures:
         this class would depend on its caller's ordering."""
         if not self._closed:
             return
-        self.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.report()
@@ -271,20 +293,21 @@ def watch_loop_handshakes(ctx: ssl.SSLContext, on_failure: Callable[[str], None]
 
     ``ctx`` must be a server context this caller owns, since it is changed in place. A second call
     replaces the first callback. ``on_failure`` runs inside the loop's handshake, so it must not
-    block; a fault in it is logged and never changes the handshake's outcome. A bound method is
-    held weakly (see :func:`_weakly`), so the caller keeps its object alive itself.
+    block; a fault in it is logged and never changes the handshake's outcome. ``ctx`` holds
+    ``on_failure`` for as long as it lives, so a callback that holds ``ctx``'s owner makes a
+    reference cycle; :meth:`HandshakeFailures.watch` hands it a counter, which holds none.
     """
     ctx.sslobject_class = type(
         "_WatchedSSLObject",
         (_WatchedSSLObject,),
-        {"_on_failure": staticmethod(_weakly(on_failure))},
+        {"_on_failure": staticmethod(on_failure)},
     )
 
 
 class _WatchedSSLObject(ssl.SSLObject):
     """An ``SSLObject`` that reports a failed handshake before the loop sees it."""
 
-    _on_failure: Callable[[str], object]
+    _on_failure: Callable[[str], None]
 
     def do_handshake(self) -> None:
         try:

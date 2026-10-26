@@ -231,7 +231,7 @@ async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
     failures.note_soon(None, "SSLError")  # inside the new window: a new timer
     fresh = failures._timer
     assert fresh is not None and fresh is not stale
-    failures.cancel()
+    failures.close()
     assert fresh.cancelled() and failures._timer is None
     assert len(sent) == 2
 
@@ -269,17 +269,17 @@ async def test_a_closed_counter_counts_nothing_and_flushes_only_while_closed() -
     assert failures.count == 3
 
 
-# --- the hook and the counter hold their listener weakly (vault BACKLOG #3785 item 1) ----------
+# --- a listener is freed by refcounting (vault BACKLOG #3785 item 1) ---------------------------
 
 
 class _Owner:
-    """An object whose bound method is a hook's callback, as a listener's is."""
+    """An object whose bound method is a counter's emitter, as a listener's is."""
 
     def __init__(self) -> None:
-        self.seen: list[str] = []
+        self.sent: list[str] = []
 
-    def note(self, cause: str) -> None:
-        self.seen.append(cause)
+    def emit(self, _peer_host: str | None, reason: str) -> None:
+        self.sent.append(reason)
 
 
 def _fail_in_memory(ctx: ssl.SSLContext) -> None:
@@ -306,14 +306,14 @@ def _freed_by_refcount(make: Callable[[], object]) -> bool:
 
 def test_no_listener_is_kept_alive_by_its_hook_or_its_counter(tmp_path: Path) -> None:
     """Before #3785 each listener sat in two cycles: its context's hooked class held a bound method
-    of it, and so did its own counter. Only the cyclic collector freed one. With both held weakly,
-    dropping a listener frees it at once."""
+    of it, and so did its own counter. Only the cyclic collector freed one. Now the hook holds the
+    counter and the counter holds its listener weakly, so dropping a listener frees it at once."""
 
     def mllp() -> object:
         source, _cert_path = _tls_source(tmp_path / "mllp")
         # What start() does where the loop runs the handshake.
         assert source._ssl is not None
-        watch_loop_handshakes(source._ssl, source._note_loop_tls_failure)
+        source._tls_failures.watch(source._ssl)
         return source
 
     def http() -> object:
@@ -335,31 +335,33 @@ def _cyclic() -> object:
     return owner
 
 
-def test_a_dead_hook_does_nothing_and_never_changes_the_handshake_error(
+async def test_a_counter_whose_listener_is_gone_reports_nothing_and_never_raises(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     ctx, _cert_path = _server_ctx(tmp_path)
     owner = _Owner()
-    watch_loop_handshakes(ctx, owner.note)
+    failures = HandshakeFailures(owner.emit)
+    failures.watch(ctx)
     _fail_in_memory(ctx)
-    assert len(owner.seen) == 1  # the control: alive, it is called
+    assert len(owner.sent) == 1  # the control: alive, it is reported
     gone = weakref.ref(owner)
     del owner
-    assert gone() is None, "the hook kept its owner alive"
+    assert gone() is None, "the counter kept its listener alive"
+    failures._reported_at = None  # so the next failure is due at once, not held for the window
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
         _fail_in_memory(ctx)
+    assert failures.count == 2  # counted, then the report went nowhere
     assert not [r for r in caplog.records if "recording a failed" in r.getMessage()]
 
 
-def test_a_plain_function_is_held_as_it_is(tmp_path: Path) -> None:
+async def test_a_plain_function_emitter_is_held_as_it_is() -> None:
     """``weakref.WeakMethod`` refuses a plain function, and one owns no object, so it is held
-    strongly: a callback with no other reference still runs."""
-    ctx, _cert_path = _server_ctx(tmp_path)
-    seen: list[str] = []
-    watch_loop_handshakes(ctx, lambda cause: seen.append(cause))
+    strongly: an emitter with no other reference still runs. The API's is one."""
+    sent: list[str] = []
+    failures = HandshakeFailures(lambda _peer, reason: sent.append(reason))
     gc.collect()
-    _fail_in_memory(ctx)
-    assert len(seen) == 1
+    failures.note_soon(None, "SSLError")
+    assert len(sent) == 1
 
 
 # --- the HTTP intake listener -----------------------------------------------------------------
@@ -502,13 +504,30 @@ def test_mllp_records_a_failed_handshake_on_uvloop(tmp_path: Path) -> None:
     asyncio.run(_mllp_loop_run_scenario(tmp_path), loop_factory=uvloop.new_event_loop)
 
 
-def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_path: Path) -> None:
+async def test_a_listener_running_its_own_handshake_does_not_count_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On the stdlib loop the MLLP listener upgrades each socket itself and counts a failure in
-    `_start_tls`, with the peer. The context hook must stay out of that count."""
+    `_start_tls`, with the peer. ``loop.start_tls`` builds its TLS object from the same context, so
+    a context an earlier start() hooked would count that failure a second time. start() unhooks it
+    on that path."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: True)
     source, _cert_path = _tls_source(tmp_path)
-    source._upgrade_tls = True
-    source._note_loop_tls_failure("SSLError")
-    assert source.tls_handshake_failures == 0
+    assert source._ssl is not None
+    source._tls_failures.watch(source._ssl)  # as a loop-run start() left it
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        assert source._ssl.sslobject_class is ssl.SSLObject
+        await _plaintext_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures >= 1, "the failure was not counted")
+        await asyncio.sleep(0.1)
+        assert source.tls_handshake_failures == 1
+        (_kind, peer, _reason) = events.seen[0]
+        assert peer == "127.0.0.1"  # counted by `_start_tls`, which knows the peer
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
 # --- the API ------------------------------------------------------------------------------------

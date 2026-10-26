@@ -86,9 +86,9 @@ from messagefoundry.parsing.message import emit_raw_separators, reencode_with_se
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
+    HUNG_UP,
     HandshakeFailures,
     handshake_cause,
-    watch_loop_handshakes,
 )
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
@@ -1881,7 +1881,7 @@ class MLLPSource(SourceConnector):
         self._upgrade_tls = False
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
         # #2613), on every loop since #3302: `_start_tls` counts where this listener runs the
-        # handshake, and the context's hook (`_note_loop_tls_failure`) where the loop does.
+        # handshake, and the context's hook (`HandshakeFailures.watch`) where the loop does.
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
@@ -1920,6 +1920,8 @@ class MLLPSource(SourceConnector):
             asyncio.get_running_loop()
         )
         if self._ssl is None or self._upgrade_tls:
+            if self._ssl is not None:  # a context an earlier start() hooked counts nothing
+                self._tls_failures.unwatch(self._ssl)
             self._server = await asyncio.start_server(
                 self._on_tls_accept if self._upgrade_tls else self._on_client, self.host, self.port
             )
@@ -1928,7 +1930,7 @@ class MLLPSource(SourceConnector):
         # the TLS socket's life are bounded here instead: the handshake, and the close_notify
         # exchange after writer.close(). Read at start() so a test can shorten them. A failed
         # handshake never reaches `_on_client` either, so the context reports it (vault #3302).
-        watch_loop_handshakes(self._ssl, self._note_loop_tls_failure)
+        self._tls_failures.watch(self._ssl)
         self._server = await asyncio.start_server(
             self._on_client,
             self.host,
@@ -2019,12 +2021,10 @@ class MLLPSource(SourceConnector):
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
-            # Not counted: a peer that hung up before finishing one, which is what a load
-            # balancer's TCP health check does. A reset is how the Windows Proactor reports that
-            # hang-up. Nor is stop() aborting a handshake: `HandshakeFailures.close` covers that.
-            # A TLS error and the handshake bound count.
-            hung_up = isinstance(exc, ConnectionResetError | BrokenPipeError)
-            if not hung_up:
+            # Not counted: a peer that hung up before finishing one (`HUNG_UP`), nor stop()
+            # aborting a handshake, which `HandshakeFailures.close` covers. A TLS error and the
+            # handshake bound count.
+            if not isinstance(exc, HUNG_UP):
                 await self._tls_failures.note(_peer_host(writer), handshake_cause(exc))
             return False
         except AttributeError:
@@ -2047,13 +2047,6 @@ class MLLPSource(SourceConnector):
         """Failed TLS handshakes this listener has seen since it was built, outside its stop()s
         (vault BACKLOG #2613)."""
         return self._tls_failures.count
-
-    def _note_loop_tls_failure(self, cause: str) -> None:
-        """A handshake the LOOP ran failed (vault BACKLOG #3302, #2613 item 3). The peer is not
-        known there. Ignored where this listener runs handshakes itself, which `_start_tls` already
-        counts: the loop's TLS object on this context still sees that handshake."""
-        if not self._upgrade_tls:
-            self._tls_failures.note_soon(None, cause)
 
     async def _emit_tls_failure(self, peer_host: str | None, reason: str) -> None:
         await self._emit_event("tls_handshake_failed", peer_host=peer_host, reason=reason)

@@ -43,6 +43,7 @@ from tests.test_dicom_scp import (  # noqa: E402
     _scu_cstore,
     _server_cert,
 )
+from tests.test_tls_handshake_failures import _plaintext_peer, _refuse_the_certificate  # noqa: E402
 
 _LOG = "messagefoundry.transports.dicom"
 #: An allowlist that does not contain the loopback address every test client connects from.
@@ -608,34 +609,9 @@ async def test_an_mtls_listener_still_refuses_a_peer_with_no_client_certificate(
 # --- A failed handshake leaves a record above DEBUG (vault BACKLOG #3784) -------------------------
 
 
-_PLAINTEXT = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
-
-
-def _send_plaintext(port: int) -> None:
-    """Send plaintext where a ClientHello belongs, then wait for the SCP to drop the socket."""
-    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
-        sock.sendall(_PLAINTEXT)
-        with contextlib.suppress(OSError):
-            while sock.recv(1024):
-                pass
-
-
 def _hang_up(port: int) -> None:
     """Connect and close at once, as a load balancer's TCP health check does."""
     socket.create_connection(("127.0.0.1", port), timeout=5.0).close()
-
-
-def _refuse_the_certificate(port: int) -> bool:
-    """A client that does not trust the SCP's certificate, so the SCP's handshake fails on its
-    alert. True when the client refused, as it must."""
-    ctx = ssl.create_default_context()
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # stated floor; see _unverified_client_context
-    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw:
-        try:
-            with ctx.wrap_socket(raw, server_hostname="127.0.0.1"):
-                return False
-        except ssl.SSLCertVerificationError:
-            return True
 
 
 def _handshake_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -672,7 +648,7 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
             assert scp.tls_handshake_failures == 0
             assert _handshake_lines(caplog) == []
 
-            await asyncio.to_thread(_send_plaintext, port)
+            await _plaintext_peer(port)
             await _until(lambda: scp.tls_handshake_failures == 1)
             assert _handshake_lines(caplog) == [
                 f"TLS handshake failed on DICOM server (SCP) {_SCP_AE} from 127.0.0.1: 1 failed "

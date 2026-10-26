@@ -106,7 +106,7 @@ from messagefoundry.parsing.dicom._inflate import (
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.redaction import safe_exc
-from messagefoundry.tls_handshake_failures import HandshakeFailures, handshake_cause
+from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
     REFUSAL_LOG_WINDOW_SECONDS,
@@ -229,20 +229,12 @@ _REFUSAL_LOG_MAX_PER_WINDOW = REFUSAL_LOG_MAX_PER_WINDOW
 #: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
 _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 
-#: What a blocking server handshake raises when the peer hangs up before finishing it, which is
-#: what a load balancer's TCP health check does. Measured 2026-10-26 on CPython 3.14 for Windows:
-#: a peer that closes raises ``SSLEOFError``, and one that resets raises ``ConnectionResetError``.
-#: The MLLP listener counts none of these either (vault BACKLOG #2613), and the owner ruled on
-#: 2026-10-26 that a mid-handshake hang-up is not counted (vault BACKLOG #3785 item 8).
-#: ``ConnectionAbortedError`` is here too: on a plain socket it is the OS reporting the connection
-#: gone, not a bound this listener set, which is what it means on MLLP.
-_HUNG_UP = (
-    ssl.SSLEOFError,
-    ssl.SSLZeroReturnError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    BrokenPipeError,
-)
+#: A peer hanging up mid-handshake, which no surface counts (:data:`HUNG_UP` says why), plus
+#: ``ConnectionAbortedError``. On this plain socket that is the OS reporting the connection gone,
+#: for example when a client closes as soon as its side of the handshake is done (measured
+#: 2026-10-26 on Windows, WinError 10053). On the MLLP listener it is that listener's own
+#: handshake bound, and is counted there.
+_HUNG_UP = (*HUNG_UP, ConnectionAbortedError)
 
 
 def _address_host(client_address: Any) -> str:
@@ -484,8 +476,8 @@ def _admitting_server_class() -> type[Any]:
                     safe_exc(exc),
                 )
                 # A ValueError is a socket this thread could not wrap, not a peer's handshake.
-                counted = isinstance(exc, OSError) and not isinstance(exc, _HUNG_UP)
-                if counted and not self._stopping.is_set():
+                # A failure the stop caused is dropped by the counter, which stop() closes first.
+                if isinstance(exc, OSError) and not isinstance(exc, _HUNG_UP):
                     self._handshake_failed(host, handshake_cause(exc))
             with contextlib.suppress(OSError):
                 (plain if tls is None else tls).close()
@@ -1247,6 +1239,9 @@ class DicomScpSource(SourceConnector):
         # Release any association thread parked on the pacing wait FIRST, so shutdown never waits out
         # a rate debt (BACKLOG #1114). A no-op when pacing is off, and idempotent.
         self._stopping.set()
+        # In the same loop step, so a failure a connection thread hands over from here on, the
+        # ones the stop causes among them, is not counted (vault BACKLOG #3784).
+        self._tls_failures.close()
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
         # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
         server = self._server
@@ -1254,12 +1249,7 @@ class DicomScpSource(SourceConnector):
             await asyncio.to_thread(server.shutdown)
             self._server = None
         self._ae = None
-        # Report the handshake failures the trailing line still held (vault BACKLOG #3784). Closed
-        # here, not first as the socket listeners close theirs: the connection threads hand a
-        # failure over through the loop, and shutdown() has joined them, so whatever they handed
-        # over before it returned has run by now. `_stopping` already keeps a failure that the stop
-        # caused out of the count.
-        self._tls_failures.close()
+        # Report the handshake failures the trailing line still held (vault BACKLOG #3784).
         await self._tls_failures.flush()
 
 
