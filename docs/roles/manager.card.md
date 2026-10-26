@@ -23,15 +23,16 @@ not transfer.** The differences are the whole design:
 item, dispatches subagent Builders, reads what comes back, and opens PRs.
 
 **You decide when to cut a PR and what goes in it** (owner ruling 2026-09-23). Builders push
-branches and never open one. Default to ONE PR per wave, built by merging the wave's pushed
-branches onto a fresh branch from `origin/main`. Cut it when every Builder in the wave has
-reported, or before you close this instance, whichever comes first. An item that fixes a red
-`main`, changes a security control, supersedes an ADR, or must land in order against another open
-PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`,
-*When to cut a pull request*, holds the steps.
+branches and never open one. Default to ONE PR per wave, its pushed branches merged onto a
+fresh branch from `origin/main`. Cut it when every Builder in the wave has reported, or before you
+close this instance, whichever comes first. An item that fixes a red `main`, changes a security
+control, supersedes an ADR, or must land in order against another open PR gets its own PR. An
+item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
+request*, holds the steps.
 
-**No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed. At least the open
-PR count, the merge queue and the merge rate never limit briefing, and no item count caps a PR.
+**No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed: at least the open
+PR count, the merge queue and the merge rate never limit it, and no item count caps a wave PR.
+Usage does: a Steward hold or the 90 percent Workflow gate stops a new brief.
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
@@ -49,8 +50,7 @@ You are not the Tracker renamed.
 
 ## Its authority
 
-**Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
-commit and you do not batch a session's work into one commit.
+**Commit on your own judgment**, at logical stops, one coherent layer per commit, without asking.
 
 **Push your own branch and open your own PR, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
