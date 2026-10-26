@@ -824,7 +824,10 @@ It runs the commands of this step. It differs from them in at least the ways nam
   runs the `Get-TlsCipherSuite` the imported module exports, never one looked up by name. Given a path,
   `Import-Module` loads from that path and does not search the module path, which is where a
   module in the account's Documents folder would be found. That is read from the command, not
-  measured: no run planted a same-named module in a Documents folder. No command it runs is
+  measured: no run planted a same-named module in a Documents folder. The PowerShell it starts
+  also gets a `PSModulePath` fixed to the system modules folder, and a `PATH` fixed to the system
+  folders. Given that `PSModulePath`, Windows PowerShell 5.1 leaves the Documents folder off its
+  module path (measured 2026-10-26). No command it runs is
   looked up by a bare name, so a program or script of that name on the `PATH`, such as a
   `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
   `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.

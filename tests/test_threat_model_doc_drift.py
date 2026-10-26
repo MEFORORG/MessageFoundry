@@ -1147,7 +1147,7 @@ def _shell_sites(code: dict[str, str]) -> set[str]:
     return {key for key, text in code.items() if any(token in text for token in _SHELL_TOKENS)}
 
 
-#: The programs whose upper-case ``-C`` is ``-Command``, by file name without ``.exe``.
+#: The programs whose upper-case ``-C`` is ``-Command``, by the start of the file name.
 _POWERSHELL_PROGRAMS = frozenset({"powershell", "pwsh"})
 
 
@@ -1156,7 +1156,9 @@ def _literal(item: ast.expr) -> str | None:
 
 
 def _is_powershell(text: str) -> bool:
-    return re.split(r"[\\/]", text)[-1].lower().removesuffix(".exe") in _POWERSHELL_PROGRAMS
+    """By the file name's start, so ``pwsh-preview``, ``pwsh.dll`` (run by ``dotnet``) and
+    ``powershell_ise`` count as well."""
+    return re.split(r"[\\/]", text)[-1].lower().startswith(tuple(_POWERSHELL_PROGRAMS))
 
 
 def _names_another_program(head: ast.expr) -> bool:
@@ -1203,8 +1205,9 @@ def _passes_script_text(source: str) -> bool:
     texts = code_strings(tree)
     if any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in texts if text != "-C"):
         return True
-    # A spared "-C" is an item of an argument list, never prose, so it is among ``texts``. The
-    # walk is skipped where no "-C" is.
+    # A spared "-C" is an item of an argument list, never prose, so it is among ``texts``, and
+    # each such literal has one parent list, so it is spared at most once. The walk is skipped
+    # where no "-C" is.
     dash_c = texts.count("-C")
     return dash_c > 0 and dash_c > _another_programs_dash_c(tree)
 
@@ -1280,6 +1283,8 @@ def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
         'ARGS = ("-C", text)',
         'run(["git", "-C", repo, "-c", text])',
         'run(["env", "pwsh", "-C", text])',
+        'run(["pwsh-preview", "-C", text])',
+        'run(["dotnet", "pwsh.dll", "-C", text])',
         'run(["sudo", shell, "-C", text])',
         'run(["tar", "-xf", archive, "-C", folder])',
         "run('git -C repo status')",

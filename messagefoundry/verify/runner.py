@@ -159,9 +159,10 @@ def _odbc_hops(
                 "--service-config, and set MEFOR_STORE_BACKEND as the service sets it"
             )
         return OdbcHops(
-            unknown=f"the service config sets the store backend to {settings.store.backend.value}, "
-            "but MEFOR_STORE_BACKEND, which overrides it, is not set in this shell, and the "
-            "service's own environment may set it to sqlserver; set it here as the service sets it"
+            unknown=f"the store backend reads {settings.store.backend.value} from the service "
+            "config or its defaults, but MEFOR_STORE_BACKEND, which overrides both, is not set in "
+            "this shell, and the service's own environment may set it to sqlserver; set it here "
+            "as the service sets it"
         )
     return OdbcHops(judged=f"the service settings and the graph in {config_dir!r}")
 

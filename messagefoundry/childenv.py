@@ -8,10 +8,11 @@ connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what
 through one of the four builders here, and ``tests/test_child_process_environment.py`` fails a
 process start whose environment does not come from one of them.
 
-* :func:`system_tool_environment` is the platform's start-up names and **nothing else**, for a
-  fixed operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
-  (vault BACKLOG #2716). Such a tool reads no engine setting, so it gets no ``MEFOR_*`` variable,
-  no interpreter variable and nothing an operator added.
+* :func:`system_tool_environment` is the platform's start-up names, for a fixed
+  operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
+  (vault BACKLOG #2716), and for ``openssl``. Such a tool reads no engine setting, so it gets no
+  ``MEFOR_*`` variable and no interpreter variable. A caller may add only the tool's own
+  variables, by name, and fixed values that replace inherited ones (BACKLOG #3803).
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
@@ -350,8 +351,10 @@ def worker_environment(
     )
     present = {_key(name) for name in env}
     for name, value in (defaults or {}).items():
-        # The worker's import path is the inherited one, filtered above, and nothing else.
-        if _ordinary_key(name, "defaults") not in present:
+        # Refuses an engine or interpreter name: the worker's import path is the inherited one,
+        # filtered above, and nothing else.
+        key = _ordinary_key(name, "defaults")
+        if key not in present:
             env[name] = value
     return env
 
@@ -373,7 +376,8 @@ def system_tool_environment(
     extra_names: Collection[str] = (),
     pinned: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """The environment for a fixed operating-system tool: the platform's start-up names only.
+    """The environment for a fixed operating-system tool: the platform's start-up names, plus
+    what ``extra_names`` and ``pinned`` add.
 
     For a tool the engine runs with an argument list and no shell, that reads none of the
     engine's settings: ``icacls`` and ``sc`` by their absolute paths (vault BACKLOG #2716), and

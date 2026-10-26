@@ -364,8 +364,9 @@ def _powershell_start_environment(
 def test_the_powershell_start_gets_a_fixed_path_and_module_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """BACKLOG #3803 S1, the root cause of the PATH-spoof class: the operator's ``PATH`` and
-    module path do not reach the probe's PowerShell. Both are pinned to the system folders."""
+    """BACKLOG #3803 S1, the root cause of the PATH-spoof class for the PowerShell start: the
+    operator's ``PATH`` and module path do not reach it. Both are pinned to the system folders.
+    The Linux ``openssl`` start is still found on the operator's ``PATH``, by design."""
     from messagefoundry.service_status import _system_exe
 
     env = {
@@ -388,15 +389,20 @@ def test_the_pinned_module_path_holds_no_account_folder(
     administrator to write. ``PSModulePath`` as that PowerShell itself reports it."""
     from messagefoundry.service_status import _system_exe
 
-    # The overlay keeps every pin: each is a name the start-up names hold, or one they lack.
-    done = _run_powershell(
-        "$env:PSModulePath", _powershell_start_environment(monkeypatch, tmp_path)
-    )
-    assert done.returncode == 0, done.stderr[:300]
-    entries = [entry for entry in done.stdout.strip().split(";") if entry]
     roots = (_system_exe(), os.environ.get("PROGRAMFILES", r"C:\Program Files"))
-    outside = [e for e in entries if not any(e.lower().startswith(r.lower()) for r in roots)]
-    assert entries and not outside, done.stdout
+
+    def outside_the_roots(env: dict[str, str]) -> list[str]:
+        done = _run_powershell("$env:PSModulePath", env)
+        assert done.returncode == 0, done.stderr[:300]
+        entries = [entry for entry in done.stdout.strip().split(";") if entry]
+        assert entries, done.stdout
+        return [e for e in entries if not any(e.lower().startswith(r.lower()) for r in roots)]
+
+    # Positive control: unpinned, the same reading shows a folder outside the roots, the
+    # account's Documents one, so a clean reading below is the pin and not an empty account.
+    assert outside_the_roots({})
+    # The overlay keeps every pin: each is a name the start-up names hold, or one they lack.
+    assert outside_the_roots(_powershell_start_environment(monkeypatch, tmp_path)) == []
 
 
 def test_the_openssl_start_gets_its_own_variables_and_no_python_one(
@@ -512,9 +518,12 @@ def test_the_pinned_path_keeps_a_plant_from_answering_a_bare_name(
     """BACKLOG #3803 S1, end to end: the text as it stood at the hold, whose bare names the test
     above shows a plant answering, with the pin in place. No plant runs, because the operator's
     ``PATH`` does not reach the probe's PowerShell."""
+    real = cipher_policy._windows_enabled_suites()
     ran = _plant_on_path(monkeypatch, tmp_path, keep_the_pin=True)
     monkeypatch.setattr(cipher_policy, "_SUITES_COMMAND", _SHADOWABLE_COMMAND)
-    _suites_or_refused()
+    # Not refused: the bare names were looked up, through the pinned PATH and module path, and
+    # found the real cmdlets, so the old text reads what the guarded text reads.
+    assert cipher_policy._windows_enabled_suites() == real
     assert sorted(p.name for p in ran.iterdir()) == [], "a command planted on PATH ran"
 
 

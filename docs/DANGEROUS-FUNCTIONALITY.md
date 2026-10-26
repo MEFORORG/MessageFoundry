@@ -355,10 +355,12 @@ and the builders, and a test checks that each module named calls each builder na
 
 - The `icacls.exe` starts in `auth/trust_anchors.py` and `store/store.py`, the `sc.exe` starts in
   `service.py` and `service_status.py`, and the `powershell.exe` start in
-  `verify/cipher_policy.py` get the platform's start-up names and nothing else
-  (`system_tool_environment`, vault BACKLOG #2716). The `powershell.exe` start's `PATH` and
-  `PSModulePath` are fixed to the system folders rather than the operator's, so a program or
-  module planted in a folder the operator can write is not found through either.
+  `verify/cipher_policy.py` get the platform's start-up names (`system_tool_environment`, vault
+  BACKLOG #2716). The `powershell.exe` start's `PATH` is fixed to the system folders rather than
+  the operator's, and it also gets a `PSModulePath` fixed to the system modules folder. So a
+  program or module planted in a folder writable without administrator rights is not found
+  through either.
+  No other variable reaches these starts.
 - The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
   platform's start-up names, the interpreter's own variables, the engine switches its own code
   reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
