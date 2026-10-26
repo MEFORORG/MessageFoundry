@@ -1303,9 +1303,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
   instance. A login with a `password` never takes the escape: its unknown host key is refused in
   every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
-  The engine only reads the `known_hosts` file. A key the escape accepts is trusted for that one
-  login and never written there, so a password login sharing the file does not inherit it (vault
-  BACKLOG #3533).
+  The connector only reads the `known_hosts` file; it never writes a key into it (vault BACKLOG
+  #3533). A key the escape accepts is pinned in memory for that connection's later logins. A
+  password login that names the same file does not inherit it. After a restart, the escape accepts
+  the server's key again.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
