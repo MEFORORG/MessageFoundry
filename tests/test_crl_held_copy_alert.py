@@ -704,8 +704,7 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-#: The line the CA-file check logs when it fails for a reason that is no verdict on the file.
-_COULD_NOT_CHECK = "could not check the CRL in a CA file"
+_UNCHECKED_LATER_CRL = "could not check the signature of a later CRL"
 
 
 def _blocks_then(first: str, error: type[Exception]) -> Any:
@@ -721,7 +720,7 @@ def _blocks_then(first: str, error: type[Exception]) -> Any:
 @pytest.mark.parametrize(
     ("first", "error", "lead"),
     [
-        ("unproven", ValueError, "Replace the CRL in the CA file with one the engine can judge"),
+        ("unproven", ValueError, "Check that the CRL in the CA file is one its CA signed"),
         ("unproven", RuntimeError, "Check the CRL in the CA file before restarting: the scan"),
         ("verified", ValueError, "Replace the CRL in the CA file with one the engine can judge"),
         ("verified", RuntimeError, "Check the CRL in the CA file before restarting: the scan"),
@@ -729,7 +728,7 @@ def _blocks_then(first: str, error: type[Exception]) -> Any:
         ("bad", RuntimeError, "Replace the CRL in the CA file with one its CA signed"),
     ],
 )
-def test_a_signature_check_that_raises_takes_the_ca_file_check_s_own_handlers(
+def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
     ca: _Ca,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -738,10 +737,12 @@ def test_a_signature_check_that_raises_takes_the_ca_file_check_s_own_handlers(
     error: type[Exception],
     lead: str,
 ) -> None:
-    # BACKLOG #3512: judge_crl_bytes has already parsed every block, so a raise from the signature
-    # check is unexpected. It keeps no earlier block's verdict: a ValueError reads as a file the
-    # engine cannot judge, and any other type as a scan that could not check, logged with its
-    # cause. A ``bad`` block stops the check, so a later raise is never reached.
+    # BACKLOG #3512: before it, the check stopped at the first unconfirmed block, so a later block
+    # that does not parse (ValueError, the failure judge_crl_signatures documents) never cost that
+    # verdict. Draining every block must not change that, and the kept verdict is logged with its
+    # cause, naming the CA file. Any other type is unexpected and takes the outer path, as before.
+    # Controls: a verified block before the raise leaves nothing to keep, and a ``bad`` block stops
+    # the check, so a later raise is never reached.
     hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
     monkeypatch.setattr(
         "messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _blocks_then(first, error)
@@ -754,13 +755,48 @@ def test_a_signature_check_that_raises_takes_the_ca_file_check_s_own_handlers(
     # The held-copy line is always logged here, so the walk below reads a log that has lines.
     assert caplog.records
     assert any("still holds a copy" in r.getMessage() for r in caplog.records), caplog.records
-    unchecked = [r for r in caplog.records if _COULD_NOT_CHECK in r.getMessage()]
-    if error is RuntimeError and first != "bad":
-        assert len(unchecked) == 1, unchecked
-        assert unchecked[0].levelno == logging.WARNING
-        assert unchecked[0].exc_info is not None and unchecked[0].exc_info[0] is RuntimeError
+    kept = [r for r in caplog.records if _UNCHECKED_LATER_CRL in r.getMessage()]
+    if (first, error) == ("unproven", ValueError):
+        assert len(kept) == 1, kept
+        assert kept[0].levelno == logging.WARNING
+        # A held-crl row spells the path in key form, which folds case on Windows.
+        assert str(bundle).lower() in kept[0].getMessage().lower(), kept[0].getMessage()
+        assert kept[0].exc_info is not None and kept[0].exc_info[0] is ValueError
     else:
-        assert unchecked == [], unchecked
+        assert kept == [], kept
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_later_unchecked_crl_is_logged_once_a_pass_for_the_rows_sharing_its_ca_file(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #3512: two rows name one CA file, and each judges it. The kept verdict's line is
+    # folded as the held-copy line is: once a pass for the file, naming the other row. Each row
+    # still gets its own alert with the kept verdict.
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.cert_expiry.judge_crl_signatures",
+        _blocks_then("unproven", ValueError),
+    )
+    rows = [
+        MonitoredCert("a.crl_file", str(bundle), kind="crl"),
+        MonitoredCert("b.crl_file", str(bundle), kind="crl"),
+    ]
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(lambda: rows, CertMonitorSettings(warn_days=30), alert_sink=sink)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        runner.run_once(now=time.time())
+        runner.run_once(now=time.time())
+
+    assert [c[0] for c in sink.crl_calls] == ["a.crl_file", "b.crl_file"] * 2
+    assert all(
+        note[1].startswith("Check that the CRL in the CA file is one its CA signed")
+        for note in sink.crl_notes
+    ), sink.crl_notes
+    kept = [r.getMessage() for r in caplog.records if _UNCHECKED_LATER_CRL in r.getMessage()]
+    assert len(kept) == 2, kept  # one a pass, two passes
+    assert all("'a.crl_file'" in m and "b.crl_file" in m and str(bundle) in m for m in kept), kept
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -998,7 +1034,7 @@ def _alert_list_reason(detail: str) -> str:
     ],
 )
 @pytest.mark.parametrize("ca_file_only", [True, False], ids=["ca-file-only", "crl-setting-too"])
-def test_the_ca_file_step_and_its_reason_fit_inside_the_alert_list_s_cut(
+def test_the_ca_file_step_survives_the_alert_list_s_cut(
     ca: _Ca,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1009,7 +1045,7 @@ def test_the_ca_file_step_and_its_reason_fit_inside_the_alert_list_s_cut(
 ) -> None:
     # BACKLOG #3512 (vault #4150, #4155): the alert list keeps about 200 characters, and the
     # held-copy marker takes the first 51. The CA-file step's first sentence, its action and its
-    # reason, must survive the cut. What follows it, such as the reload's steps where a CRL setting
+    # reason, must survive the cut, but for the not-in-effect step's reason (below). What follows it, such as the reload's steps where a CRL setting
     # names the file too, may fall past it. An earlier draft cut the proven-bad step at "before
     # restarting: a hands". The not-in-effect step is unchanged by #3512, wait included, and the
     # end of its reason falls past the cut, as before; its action and its wait survive.

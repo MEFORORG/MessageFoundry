@@ -952,7 +952,11 @@ def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
 
 def _judge_ca_file(pem: bytes) -> tuple[str, str] | None:
     """The expiry monitor's CA-file check of ``pem``, for a CA-file-only row (BACKLOG #3512)."""
-    return _ca_file_crl_refusal(pem, time.time(), None, ca_file_only=True)
+    return _ca_file_crl_refusal(pem, time.time(), None, ca_file_only=True, on_unchecked=_no_log)
+
+
+def _no_log() -> None:
+    """The expiry monitor's log of a later CRL it could not check, which these tests ignore."""
 
 
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
