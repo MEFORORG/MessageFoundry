@@ -422,6 +422,58 @@ def test_a_static_api_key_header_over_verify_off_is_refused(
 
 
 @pytest.mark.parametrize("cell", _CELLS)
+def test_a_neutral_named_static_header_over_verify_off_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 7: a secret under a name the redaction screen does not read as a
+    credential, such as ``X-Session``, crossed a verify-off hop until then. A static header off the
+    allowlist now refuses it, whatever its name or value."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"X-Session": _SECRET}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, extra)
+    assert "X-Session header, which is not on the verify-off header allowlist" in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_allowlisted_static_headers_over_verify_off_still_cross_on_the_escape(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control arm for the allowlist: every allowlisted name, in any case, still crosses."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    headers = {
+        "ACCEPT": "application/json",
+        "Content-Type": "application/json",
+        "user-agent": "MessageFoundry",
+        "X-Request-ID": "req-1",
+    }
+    with active_hop_posture(_STAGING):
+        assert _build_raw(cell, {"verify_tls": False, "headers": headers}) is not None
+
+
+def test_a_credential_value_under_an_allowlisted_name_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The allowlist reads names only, so the redaction screen's value test still runs first."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"User-Agent": f"Bearer {_SECRET}"}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("REST", extra)
+    assert "User-Agent header" in str(exc.value)
+    assert "allowlist" not in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+def test_the_verify_off_header_allowlist_is_pinned() -> None:
+    """Widening the list loosens a no-escape refusal, so it is a reviewed change, never a drift."""
+    from messagefoundry.transports.rest import VERIFY_OFF_STATIC_HEADER_ALLOWLIST
+
+    pinned = frozenset({"accept", "content-type", "user-agent", "x-request-id"})
+    assert pinned == VERIFY_OFF_STATIC_HEADER_ALLOWLIST
+
+
+@pytest.mark.parametrize("cell", _CELLS)
 def test_a_url_query_credential_over_verify_off_is_refused(
     cell: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

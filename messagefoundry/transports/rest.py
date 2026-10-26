@@ -1057,25 +1057,40 @@ def refuse_cleartext_egress(
     )
 
 
+#: The static header names a ``verify_tls = false`` hop may still send, in lower case (vault
+#: BACKLOG #3533 item 7, owner ruling 2026-10-26). Any other static header refuses that hop, so a
+#: secret under a neutral name such as ``X-Session`` cannot cross it. The list fails closed and
+#: needs no secret recognition. Each entry is defined to hold a media type, a product token or a
+#: correlation id, never a secret: ``accept`` and ``content-type`` name media types,
+#: ``user-agent`` names the client, and ``x-request-id`` tags a request for tracing. Widen it only
+#: by a reviewed change; the value test in :func:`http_credentials_sent` still refuses a
+#: credential-shaped value under one of these names.
+VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
+    {"accept", "content-type", "user-agent", "x-request-id"}
+)
+
+
 def http_credentials_sent(
     ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
 ) -> list[str]:
-    """The credentials an HTTP-family hop sends, by name, for :func:`refuse_verify_off` (vault
-    BACKLOG #3230). Empty when it sends none.
+    """What an HTTP-family hop sends that :func:`refuse_verify_off` refuses on a verify-off hop,
+    by name (vault BACKLOG #3230, #3533). Empty when it sends none.
 
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
     static-credential inventory's own reader, so the two agree on every auth setting. The two
     additions below are this refusal's alone; the inventory does not count them yet. A
-    static ``headers`` entry is a credential when the redaction screen
-    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
-    screen leans toward a false positive, which here refuses a verify-off hop that a header name
-    such as ``X-Routing-Key`` merely resembles; on a hop that already turned verification off, that
-    is the cheaper error. A credential-looking query parameter in ``url`` counts too, by the reader
-    ``query_credential_hops`` uses. A ``Proxy-Authorization`` from the proxy settings is not one: it
-    goes to the proxy, inside the CONNECT, not across this hop.
+    static ``headers`` entry counts when the redaction screen (``config.wiring._is_secret_header``)
+    would mask it, by name or by value, or when its name is not on
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`. That over-refuses on purpose: a header whose name
+    and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
+    hop that already turned verification off that is the cheaper error. A credential-looking query
+    parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses. A
+    ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
+    CONNECT, not across this hop.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here; docs/SECURITY-LOOSENING.md lists that among the hops the rule does not reach."""
+    not seen here, nor a secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists both among
+    the hops the rule does not reach."""
     # Lazy: both import config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
     from messagefoundry.config.wiring import _is_secret_header
@@ -1083,11 +1098,11 @@ def http_credentials_sent(
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
     if isinstance(static, Mapping):
-        sent += [
-            f"{name} header"
-            for name, value in static.items()
-            if _is_secret_header(str(name), value)
-        ]
+        for name, value in static.items():
+            if _is_secret_header(str(name), value):
+                sent.append(f"{name} header")
+            elif str(name).strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+                sent.append(f"{name} header, which is not on the verify-off header allowlist")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
