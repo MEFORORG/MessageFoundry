@@ -158,8 +158,9 @@ class HandshakeFailures:
 
     def __init__(self, emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None]) -> None:
         self._emit = _weakly(emit)
-        # Between close() and open(): a listener's stop(). Nothing is counted then, so no report
-        # outlives stop() (vault BACKLOG #3785 item 5: this guard lived in each listener).
+        # Between close() and open(): a listener's stop(). Nothing is counted then, so no new
+        # report starts after stop() begins. A report already in flight may finish after a
+        # cancelled stop() (vault BACKLOG #3785 item 5: this guard lived in each listener).
         self._closed = False
         #: Failed handshakes seen since this object was built, outside its listener's stop()s.
         self.count = 0
@@ -249,8 +250,9 @@ class HandshakeFailures:
 
     def close(self) -> None:
         """First thing in a listener's stop(): count nothing more, so stop() aborting a handshake is
-        no failure and no report outlives stop(), and disarm the trailing timer. What that timer
-        held stays held for :meth:`flush`. Nothing can arm a new one until :meth:`open`."""
+        no failure and no new report starts, and disarm the trailing timer. What that timer held
+        stays held for :meth:`flush`. Nothing can arm a new one until :meth:`open`. A report
+        already in flight is not cancelled, so after a cancelled stop() it can still finish."""
         self._closed = True
         self._disarm()
 

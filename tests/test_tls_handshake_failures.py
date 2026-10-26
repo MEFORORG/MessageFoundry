@@ -296,8 +296,8 @@ async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
 
 
 async def test_a_closed_counter_counts_nothing_and_flushes_only_while_closed() -> None:
-    """Vault BACKLOG #3785 item 5: the "no report outlives stop()" guard lives in the counter. A
-    listener closes it first in stop(), and opens it again at start()."""
+    """Vault BACKLOG #3785 item 5: the guard that keeps a stop() from starting new reports lives in
+    the counter. A listener closes it first in stop(), and opens it again at start()."""
     sent: list[tuple[str | None, str]] = []
 
     async def emit(peer_host: str | None, reason: str) -> None:
@@ -646,7 +646,8 @@ async def test_mllp_running_its_own_handshake_counts_a_close_notify(
         await _close_notify_peer(source.sockport)
         await _until(lambda: source.tls_handshake_failures == 1, "the close_notify not counted")
         (_kind, _peer, reason) = events.seen[0]
-        assert reason is not None and "TimeoutError" not in reason  # not the bound, later
+        # Not the bound, whose cause on MLLP is ConnectionAbortedError.
+        assert reason is not None and "ConnectionAbortedError" not in reason
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 

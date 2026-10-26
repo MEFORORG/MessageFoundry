@@ -1255,12 +1255,13 @@ class DicomScpSource(SourceConnector):
         try:
             if server is not None:
                 await asyncio.to_thread(server.shutdown)
-        finally:
-            # Even when the shutdown raises or is cancelled: drop the server, so a later stop()
-            # does not shut it down again, and report the handshake failures the trailing line
-            # still held (vault BACKLOG #3784).
+            # Only once the shutdown returned: one that raised or was cancelled keeps the server,
+            # so the next stop() shuts it down again.
             self._server = None
             self._ae = None
+        finally:
+            # Even when the shutdown raised or was cancelled, report the handshake failures the
+            # trailing line still held (vault BACKLOG #3784).
             await self._tls_failures.flush()
 
 

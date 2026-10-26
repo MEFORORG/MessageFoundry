@@ -695,11 +695,11 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
         await scp.stop()
 
 
-async def test_a_failing_shutdown_still_clears_the_server_and_logs_what_was_held(
+async def test_a_failing_shutdown_is_retried_and_still_logs_what_was_held(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """If the pynetdicom shutdown raises, stop() still drops the server and logs the failure the
-    trailing line held, rather than skipping both (vault BACKLOG #3784)."""
+    """If the pynetdicom shutdown raises, stop() still logs the failure the trailing line held, and
+    keeps the server, so a second stop() shuts it down again as before #3784."""
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
@@ -712,20 +712,31 @@ async def test_a_failing_shutdown_still_clears_the_server_and_logs_what_was_held
         server = scp._server
         assert server is not None
         real_shutdown = server.shutdown
+        calls: list[int] = []
 
-        def shutdown_then_fail() -> None:
-            real_shutdown()  # the threads are joined, so nothing leaks past the test
-            raise RuntimeError("synthetic shutdown fault")
+        def shutdown_failing_once() -> None:
+            calls.append(1)
+            if len(calls) == 1:  # fails before it shuts anything down, so a retry has work to do
+                raise RuntimeError("synthetic shutdown fault")
+            real_shutdown()  # pynetdicom's shutdown is not safe to run twice on one server
 
-        server.shutdown = shutdown_then_fail
-        await _plaintext_peer(scp.sockport)
-        await _plaintext_peer(scp.sockport)  # inside the window: held
-        await _until(lambda: scp.tls_handshake_failures == 2)
-        assert len(_handshake_lines(caplog)) == 1
-        with pytest.raises(RuntimeError, match="synthetic"):
+        server.shutdown = shutdown_failing_once
+        try:
+            await _plaintext_peer(scp.sockport)
+            await _plaintext_peer(scp.sockport)  # inside the window: held
+            await _until(lambda: scp.tls_handshake_failures == 2)
+            assert len(_handshake_lines(caplog)) == 1
+            with pytest.raises(RuntimeError, match="synthetic"):
+                await scp.stop()
+            assert scp._server is server  # kept, so the next stop() retries
+            assert len(_handshake_lines(caplog)) == 2
             await scp.stop()
-    assert scp._server is None
-    assert len(_handshake_lines(caplog)) == 2
+            assert len(calls) == 2
+            assert scp._server is None
+        finally:
+            if scp._server is not None:
+                server.shutdown = real_shutdown
+                await scp.stop()
 
 
 async def test_the_scp_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
