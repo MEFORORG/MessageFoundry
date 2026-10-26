@@ -81,6 +81,34 @@
     refusal on the session's own tree, under the three conditions docs\WORKTREES.md "Remove one"
     lists (owner approval 2026-10-22).
 
+    -Discard PARKS WHAT A REMOVAL WOULD LOSE, INSTEAD OF REFUSING OR DISCARDING IT (docs/AUTONOMY-PLAN.md
+    6.3). It takes both routes, and it is not -Force and implies nothing of it. It runs after every
+    refusal above and below, as the last step before the removal, so whatever refuses without it
+    still refuses with it: the claim, the session registry, a lock, the nested repositories, ignored
+    files outside the tolerated caches on -Path, and files flagged skip-worktree or assume-unchanged.
+    THE SIX-HOUR FENCE STILL HOLDS: a tree a session has just finished cannot be discarded for six
+    hours, because its git state, its working tree or its uncommitted work is too recent.
+    What it parks is every tracked change and untracked file older than that, the ones -Force would
+    otherwise discard, and on -Name the untracked files that route lets go. A temporary index file,
+    set on the snapshot's own git calls only and never left set, takes `read-tree HEAD`, `add -A` and
+    `write-tree`; the shared stash is never touched. `commit-tree -p HEAD` makes one commit, with a
+    second parent holding the index when what was staged differs from both HEAD and the files on
+    disk, so a staged version is parked too. The commit goes on refs/attic/<UTC date>-<name>, <name>
+    being the -Name or the directory's leaf cut to [A-Za-z0-9._-], created only if it does not exist
+    yet, with -2, -3 and on after a clash. refs/attic is in the clone's SHARED ref namespace, so it
+    outlives the tree, and push_guard refuses pushing it, so it stays in this clone. Nothing sweeps it.
+    A clean tree parks nothing, makes no ref, and is removed as without -Discard. When something was
+    parked, git's own --force is passed to the removal at that point and nothing is read again in
+    between, so a file written after the snapshot is lost.
+    NOT PARKED, at least: ignored files, which go with the tree on -Name and refuse on -Path; the
+    content of a nested repository, which -Force alone discards; and an index with unmerged entries,
+    which refuses. Any GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE set refuses on -Name
+    too under -Discard, since the snapshot sets one of them.
+    A COST TO EVERY LATER REMOVAL: the "held by no ref" checks above read --glob=refs/*, and a parked
+    commit's parent is the HEAD it was taken on. So refs/attic now holds that commit, and a later
+    removal of a tree detached at it, or whose reflog holds it, is no longer refused for it. Kept on
+    purpose: the commit IS held, by a ref only this clone has.
+
     WHAT ONLY -AllowOrphanedAllocations OVERRIDES, on both removal routes: a target that owns a
     ledger number (alloc.ps1) whose item is not on origin/main, or an allocation record that cannot
     be read or names no worktree. It is the operator's switch too. The one ownerless record that does
@@ -124,6 +152,7 @@
     .\remove.ps1 -Name alerts
     .\remove.ps1 -Name alerts -DeleteBranch
     .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes older than six hours too
+    .\remove.ps1 -Name alerts -Discard      # park them on refs/attic/<date>-alerts instead
     .\remove.ps1 -List
     .\remove.ps1 -Path C:\Users\me\AppData\Local\Temp\claude\x\y\scratchpad\wt
 #>
@@ -153,6 +182,13 @@ param(
     [Parameter(ParameterSetName = 'ByName')]
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$Force,
+
+    # Park uncommitted tracked changes and untracked files on refs/attic before the removal, rather
+    # than refuse or discard them. DELIBERATELY NOT -Force, which it never sets; the header says what
+    # it parks and what still refuses.
+    [Parameter(ParameterSetName = 'ByName')]
+    [Parameter(ParameterSetName = 'ByPath')]
+    [switch]$Discard,
 
     # Also delete the local branch. -Name ONLY, ON PURPOSE: -Path reaches checkouts this session did
     # not make, so "it removes the directory, never the branch" has to hold by construction there.
@@ -185,10 +221,11 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName' -and -not $Name) {
 $byPath = $PSCmdlet.ParameterSetName -eq 'ByPath'
 $listing = $PSCmdlet.ParameterSetName -eq 'List'
 
-if ($byPath -or $listing) {
+if ($byPath -or $listing -or $Discard) {
     # Refused rather than cleared: a script run as `.\remove.ps1` shares the caller's process, so
     # clearing them would change the operator's shell. Each one makes `git -C <path>` answer for a
-    # checkout other than the one named.
+    # checkout other than the one named. -Discard sets GIT_INDEX_FILE for its snapshot and removes it
+    # after, so a caller's own value would be lost; it refuses on -Name too.
     $gitRedirects = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE') |
         Where-Object { [Environment]::GetEnvironmentVariable($_) }
     if ($gitRedirects) {
@@ -957,10 +994,17 @@ if ($byPath) {
         throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
     }
     $pending += @($flagged | ForEach-Object { "flagged $($_.Substring(2))" })
+    # -Discard parks tracked changes and untracked files: exactly the status lines that are not
+    # ignored. Named by what may be parked, so a line of any other kind, added later or not, refuses.
+    if ($Discard) {
+        $parkable = @($statusLines | Where-Object { $_ -and $_ -notlike '!! *' })
+        $pending = @($pending | Where-Object { $parkable -notcontains $_ })
+    }
     if ($pending.Count -gt 0 -and -not $Force) {
         $pending | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
         if ($pending.Count -gt 20) { Write-Host "... and $($pending.Count - 20) more" }
-        $what = 'uncommitted changes, untracked files, or ignored files outside the cache directories this route tolerates'
+        $what = 'ignored files outside the cache directories this route tolerates'
+        $what = if ($Discard) { "$what, which -Discard does not park" } else { "uncommitted changes, untracked files, or $what" }
         if ($flagged.Count -gt 0) { $what += ', or files flagged skip-worktree or assume-unchanged' }
         throw ("Worktree has $what. Commit and push what matters. -Force discards the rest, and it is " +
             "the operator's switch. Nothing was removed.")
@@ -979,9 +1023,9 @@ else {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
-    if ($tracked -and -not $Force) {
+    if ($tracked -and -not $Force -and -not $Discard) {
         Write-Host ($tracked -join "`n")
-        throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Force."
+        throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Discard or -Force."
     }
 }
 
@@ -1091,16 +1135,90 @@ if ($DeleteBranch) {
 # Read before the removal, only to say afterwards which branch was left alone.
 $keptBranch = if ($byPath -and -not $entry.Detached) { [string]$entry.Branch } else { '' }
 
+# --- -Discard: PARK THE WORK, THEN REMOVE (docs/AUTONOMY-PLAN.md 6.3) ------------------------------
+#
+# LAST, ON PURPOSE: every refusal above has already run, so nothing is parked for a tree that is not
+# going. A snapshot that fails throws before the removal, and nothing is removed.
+function Invoke-GitOrThrow([string]$Dir, [string]$What, [string[]]$GitArgs) {
+    $out = @(& git -C $Dir @GitArgs 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "-Discard could not $What in '$WorktreePath' (git $($GitArgs[0]) exit $LASTEXITCODE). Nothing was removed."
+    }
+    return "$($out -join "`n")".Trim()
+}
+
+$parkedRef = ''
+if ($Discard) {
+    $headSha, $headTree = (Invoke-GitOrThrow $WorktreePath 'read HEAD and its tree' @('rev-parse', 'HEAD^{commit}', 'HEAD^{tree}')) -split "`n"
+    if ("$headSha`n$headTree" -notmatch '\A[0-9a-f]{40,64}\n[0-9a-f]{40,64}\z') {
+        throw "-Discard could not read HEAD and its tree in '$WorktreePath'. Nothing was removed."
+    }
+    # What is staged. A version staged and then edited again on disk lives only here. An index with
+    # unmerged entries has no tree, and refuses.
+    $indexTree = Invoke-GitOrThrow $WorktreePath 'write the index as a tree (unmerged entries?)' @('write-tree')
+    # THE TEMPORARY INDEX IS SET FOR THESE THREE CALLS ONLY. Every git call before and after this block
+    # reads the tree's own index, so the variable is removed in the finally, whatever happened.
+    $tempIndex = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-attic-$([guid]::NewGuid().ToString('N')).index"
+    try {
+        $env:GIT_INDEX_FILE = $tempIndex
+        $null = Invoke-GitOrThrow $WorktreePath 'read HEAD into a temporary index' @('read-tree', $headSha)
+        $null = Invoke-GitOrThrow $WorktreePath 'add the working files to a temporary index' @('add', '-A')
+        $snapTree = Invoke-GitOrThrow $WorktreePath 'write the temporary index as a tree' @('write-tree')
+    }
+    finally {
+        Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempIndex, "$tempIndex.lock" -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($snapTree -eq $headTree -and $indexTree -eq $headTree) {
+        Write-Host "-Discard: '$WorktreePath' holds nothing to park, so no ref was made."
+    }
+    else {
+        $when = [DateTime]::UtcNow
+        $message = "remove.ps1 -Discard: the uncommitted work of '$WorktreePath', parked $($when.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+        $parents = @('-p', $headSha)
+        if ($indexTree -ne $headTree -and $indexTree -ne $snapTree) {
+            $indexCommit = Invoke-GitOrThrow $GitRoot 'commit the staged index' @('commit-tree', $indexTree, '-p', $headSha, '-m', "$message (the index)")
+            $parents += @('-p', $indexCommit)
+        }
+        $snapCommit = Invoke-GitOrThrow $GitRoot 'commit the snapshot' (@('commit-tree', $snapTree) + $parents + @('-m', $message))
+
+        $leaf = if ($byPath) { Split-Path $WorktreePath -Leaf } else { $Name }
+        $safe = (($leaf -replace '[^A-Za-z0-9._-]', '-') -replace '\.{2,}', '.').TrimEnd('.')
+        if ($safe -match '\.lock\z') { $safe += '-' }
+        $base = "refs/attic/$($when.ToString('yyyy-MM-dd'))-$safe"
+        # The old value is all zeros, so update-ref creates the ref and never moves one that exists.
+        $zero = '0' * $snapCommit.Length
+        for ($n = 1; ; $n++) {
+            $ref = if ($n -eq 1) { $base } else { "$base-$n" }
+            & git -C $GitRoot update-ref $ref $snapCommit $zero 2>$null
+            if ($LASTEXITCODE -eq 0) { $parkedRef = $ref; break }
+            & git -C $GitRoot show-ref --verify --quiet $ref
+            if ($LASTEXITCODE -ne 0 -or $n -ge 100) {
+                throw ("-Discard could not create $ref. The work is in commit $snapCommit, which no ref holds; " +
+                    "keep it with:  git -C `"$GitRoot`" branch <name> $snapCommit. Nothing was removed.")
+            }
+        }
+        Write-Host "-Discard: parked the uncommitted work of '$WorktreePath' as $parkedRef ($snapCommit)." -ForegroundColor Green
+        Write-Host "It is in this clone only. Look at it with:  git -C `"$GitRoot`" show --stat $parkedRef"
+    }
+}
+
 # -Name passes --force regardless: an untracked .venv makes git consider the worktree non-empty, and
 # that route lets untracked files go.
 # -Path WITHOUT -Force PASSES NO --force, so git makes its own check at the moment it deletes: it
 # refuses a tree with modified or untracked files. That closes the gap between the status read above
 # and the removal, for those two kinds. Git's check does not list ignored files, so the tolerated
 # cache directories still go, and so would an ignored file written in that gap.
+# -Path -Discard that parked something passes --force: git's check would refuse the very files just
+# parked. That reopens the gap for a file written after the snapshot, which goes unparked.
 $removeArgs = @('worktree', 'remove')
-if (-not $byPath -or $Force) { $removeArgs += '--force' }
+if (-not $byPath -or $Force -or $parkedRef) { $removeArgs += '--force' }
 & git -C $GitRoot @removeArgs $WorktreePath
 $removeCode = $LASTEXITCODE
+if ($removeCode -ne 0 -and $parkedRef) {
+    Write-Host "-Discard: the removal failed, and $parkedRef still holds the work it parked." -ForegroundColor Yellow
+}
 # git can drop the registration and leave files behind, on either exit code. On a failure, because
 # another process holds a file open and git had already deleted the rest and dropped the
 # registration (vault BACKLOG #2985, item 19): that order is git's own, and nothing here can make it

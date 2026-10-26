@@ -287,6 +287,20 @@ Without `-Force` the script also passes no `--force` to git. So git makes its ow
 moment it deletes, and refuses a tree with modified or untracked files. That covers a file written
 between the script's check and the removal. Git's check does not list ignored files.
 
+### `-Discard` parks the work instead of losing it
+
+`-Discard` works on both routes and is not `-Force`. After every refusal has run, it snapshots the
+tree's uncommitted tracked changes and untracked files into a commit, through a temporary index and
+`commit-tree`, never the shared stash. It parks that commit on `refs/attic/<UTC date>-<name>` in the
+clone's shared refs, with a numeric suffix after a same-day clash, and then removes the tree. A
+clean tree parks nothing and makes no ref. Whatever refuses without it still refuses with it: the
+six-hour fence, so a tree a session has just finished cannot be discarded for six hours; claims,
+the session registry and locks; nested repositories; and on `-Path`, ignored files outside the
+tolerated caches and flagged files. Ignored files are never parked, which is what keeps `.env` and
+`*.db` out. `push_guard` refuses pushing `refs/attic`, so the work stays in this clone, and nothing
+sweeps the attic. The script header lists what is parked and what is not (docs/AUTONOMY-PLAN.md
+6.3).
+
 ### What `-Path` does not reach, and what it does not see
 
 **It does not reach a tree under `.claude/worktrees`.** That is where the Claude Code harness puts
