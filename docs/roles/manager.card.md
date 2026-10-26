@@ -25,13 +25,13 @@ item, dispatches subagent Builders, reads what comes back, and opens PRs.
 **You decide when to cut a PR and what goes in it** (owner ruling 2026-09-23). Builders push
 branches and never open one. Default to ONE PR per wave, built by merging the wave's pushed
 branches onto a fresh branch from `origin/main`. Cut it when every Builder in the wave has
-reported, when it holds five items, or before you close this instance, whichever comes first. An
-item that fixes a red `main`, changes a security control, supersedes an ADR, or must land in order
-against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
-request*, holds the steps.
+reported, or before you close this instance, whichever comes first. An item that fixes a red
+`main`, changes a security control, supersedes an ADR, or must land in order against another open
+PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`,
+*When to cut a pull request*, holds the steps.
 
-**No work-in-progress limit on briefing** (owner ruling 2026-10-26). Brief at full speed. At
-least the open PR count, the merge queue and the merge rate never limit it.
+**No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed. At least the open
+PR count, the merge queue and the merge rate never limit briefing, and no item count caps a PR.
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
