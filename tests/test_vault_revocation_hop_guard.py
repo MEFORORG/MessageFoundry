@@ -1054,11 +1054,33 @@ def test_verify_reports_a_hop_serve_would_cross_as_manual_and_still_dials_nothin
         return
     assert result.status is Status.MANUAL, result.detail
     assert result.evidence == refusal
-    assert "`serve` would cross it" in result.detail
-    assert "with a WARNING" in result.detail
+    assert "`serve` would dial it" in result.detail
+    assert "log a WARNING" in result.detail
     assert TLS_REVOCATION_ATTESTED_ENV in result.detail
     assert "cannot say whether the reference resolves" in result.detail
     assert "[secrets].vault_revocation_attested pair" in result.detail
+
+
+def test_a_classification_that_raises_keeps_the_reads_own_fail(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """The classification must not raise out of the check, nor hide the read's failure behind its
+    own. Mutation: let the classifier's exception propagate, or report it in place of the refusal.
+    """
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    def broken(exc: BaseException | None, section: str) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    monkeypatch.setattr(strict_requests, "is_unrevoked_vault_hop_refusal", broken)
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    result = _client_credential_row(_verify_settings("warn", False, str(tmp_path / "s.db")))
+    assert result.status is Status.FAIL
+    assert "[secrets].vault_revocation_attested = true" in result.detail
+    assert "synthetic classifier fault" in (result.evidence or "")
+    assert dials == []
 
 
 def test_any_other_refusal_of_the_hop_stays_a_fail_on_warn(

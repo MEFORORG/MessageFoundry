@@ -1146,8 +1146,9 @@ def is_unrevoked_vault_hop_refusal(
     and no other refusal of the hop (vault BACKLOG #3619).
 
     It takes the exact type, :class:`VaultHopRefused`, and the whole fixed text after the
-    connector label, which no connector label contains. A refusal of the address, the proxy or the
-    TLS leg answers ``False``, and so does a subclass, as :func:`vault_failure_text` reads one.
+    connector label, which no connector label contains. Any other refusal of the hop answers
+    ``False``, at least of its address, its proxy, its TLS leg or its pool, and so does a
+    subclass, as :func:`vault_failure_text` reads one.
 
     That refusal means the hop was off the box, not attested and not CRL-checked, and was judged
     enforcing. So ``tls_policy.revocation_hop_disposition`` on those inputs, with another posture,
@@ -1155,8 +1156,8 @@ def is_unrevoked_vault_hop_refusal(
     relies on that, so a new input to the guard's decision must reach it too."""
     if type(exc) is not VaultHopRefused:
         return False
-    _connector, sep, reason = str(exc).partition(": ")
-    return bool(sep) and reason == _UNREVOKED_VAULT_HOP_REASONS[section]
+    _connector, _sep, reason = str(exc).partition(": ")
+    return reason == _UNREVOKED_VAULT_HOP_REASONS[section]
 
 
 def _prepared_vault_hop(

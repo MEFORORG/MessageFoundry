@@ -1217,8 +1217,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
   `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,
   on a hop `serve` crosses with a WARNING. Its `fed.client_secret` or `fed.client_key` row reads
-  the posture only to classify that refusal: on `warn` it is MANUAL, says `serve` would cross,
-  and leaves the credential unchecked (vault BACKLOG #3619). `warn`
+  the posture only to classify that refusal. On `warn` that row is MANUAL and says `serve` would
+  cross, and the credential stays unchecked (vault BACKLOG #3619). `warn`
   alone therefore does not make an off-box Vault usable by every command: set the pair. This
   bullet is the one place the docs name callers. `tests/test_vault_posture_census.py` is the list itself: what
   each call passes.
