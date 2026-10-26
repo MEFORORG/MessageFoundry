@@ -136,12 +136,17 @@ _WS = " \t\r"
 #: below. Measured on OpenSSL 3.5.7, one other character in a name or a section name, in any
 #: section, made it apply none of the file. A backslash, which OpenSSL reads as an escape, is
 #: refused before this is matched (:func:`_config_sections`).
-_NAME = r"[A-Za-z0-9_!%&*+,\-./;?@^|~]+"
+_NAME_CHARS = r"A-Za-z0-9_!%&*+,\-./;?@^|~"
+_NAME = rf"[{_NAME_CHARS}]+"
 #: What follows a ``$`` in a value: ``name``, ``section::name``, or either in braces or brackets.
 _REFERENCE = re.compile(r"([{(]?)([A-Za-z0-9_]*)(?:::([A-Za-z0-9_]*))?")
 #: The quote characters of OpenSSL's default character table; the backtick is one (measured).
 _QUOTES = "\"'`"
-_SECTION_HEADER = re.compile(rf"\[[{_WS}]*((?:{_NAME}(?:[{_WS}]+{_NAME})*)?)[{_WS}]*\]")
+#: A section header: name words and whitespace between brackets. Its name is the group stripped
+#: of :data:`_WS`. One flat class keeps the pattern free of a nested quantifier, which
+#: ``tests/test_security_static.py`` refuses; the words and the whitespace that separates them are
+#: the same characters either way.
+_SECTION_HEADER = re.compile(rf"\[([{_WS}{_NAME_CHARS}]*)\]")
 _ASSIGNMENT = re.compile(rf"({_NAME}(?:::{_NAME})?)[{_WS}]*=(.*)")
 #: OpenSSL reads a name that starts with ``.include`` as that directive, so ``.include_x path``
 #: includes ``path`` (measured on OpenSSL 3.5.7, BACKLOG #3803 T5). ``.pragma`` is refused the same
@@ -468,7 +473,7 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
         if "\\" in line or not line.isascii():
             raise _not_followed(f"a backslash or a non-ASCII character on line {number}")
         if header := _SECTION_HEADER.match(stripped):
-            current_name = header[1]
+            current_name = header[1].strip(_WS)
             current = sections.setdefault(current_name, [])
         elif assignment := _ASSIGNMENT.fullmatch(stripped):
             if "::" in assignment[1]:
