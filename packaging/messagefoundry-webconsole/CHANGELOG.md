@@ -34,7 +34,8 @@ this line.**
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its
   Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
   for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
-  changed outside the engine, and Reject (or Withdraw) with no Approve. Needs the engine seam that
+  changed outside the engine or sealed under a key the engine does not hold, and Reject with no
+  Approve. Needs the engine seam that
   carries the `seal_failed` value. (BACKLOG #3638, #3639)
 
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the

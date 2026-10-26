@@ -379,6 +379,7 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     entry = await h.flagged(failing)
     assert entry is not None and entry["params"] is None and "IB_TAMPERED" not in json.dumps(entry)
     reported, alerted = await h.seal_failures(failing), h.alerted(failing)
+    original_seal = (await h.row(failing)).seal
     rejected = await h.gate.reject(failing, approver=_APPROVER)
     assert rejected["rejected_by"] == _APPROVER and rejected["operation"] == _OP
     after = await h.row(failing)
@@ -398,6 +399,14 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     assert json.loads(after.params) == {"channel_id": "IB_TAMPERED"}  # left as it was found
     assert await h.seal_failures(failing) == reported + 1  # unthrottled, in the reject's write
     assert h.alerted(failing) == alerted + 1
+    # What the tombstone overwrote is kept, as read, on the seal-failure row the reject wrote.
+    failures = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=500)
+    [kept] = [
+        d
+        for d in (json.loads(str(r["detail"])) for r in failures)
+        if d.get("approval_id") == failing and d.get("act") == "reject"
+    ]
+    assert kept["prior"] == {"approver": None, "decided_at": None, "seal": original_seal}
     rows = await store.list_audit(action="approval.rejected", limit=500)
     mine = [json.loads(str(r["detail"])) for r in rows if failing in str(r["detail"])]
     assert mine == [{"approval_id": failing, "seal_failed": True}]

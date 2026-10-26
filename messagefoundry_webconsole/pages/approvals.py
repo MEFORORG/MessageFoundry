@@ -124,9 +124,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
     ),
     "seal_failed": (
-        "FLAGGED: this request failed its integrity check, so it was changed outside the engine. "
-        "Its details may not be what was requested, and its parameters are withheld. It can never "
-        "be approved. {verb} it to close it, and request the operation again if it is still needed."
+        "FLAGGED: this request failed its integrity check. It was changed outside the engine, or "
+        "sealed under a store key this engine does not hold. Its details may not be what was "
+        "requested, and its parameters are withheld. It can never be approved. {verb} it to close "
+        "it, and request the operation again if it is still needed."
     ),
 }
 

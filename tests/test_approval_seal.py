@@ -319,6 +319,34 @@ async def test_a_cancelled_claim_the_store_refuses_on_its_seal_is_reported_not_p
         assert sink.lost == ["approval.release_attempted"] and sink.reasons == []
 
 
+@pytest.mark.parametrize("planted", ["nan", "1e999", -5.0, 1e20])
+async def test_a_seal_failed_time_no_page_can_render_does_not_break_the_queue(
+    keyed: tuple[MessageStore, Path], planted: object
+) -> None:
+    """BACKLOG #3639: a failing row's times are shown as stored only when a page can render them.
+    NaN and infinity would fail the JSON reply, and a negative or far-future time fails the
+    console's time conversion on Windows, so each is shown as no time at all. The control is the
+    sound request beside it, whose time is its own."""
+    from messagefoundry.api.models import PendingApprovalInfo
+
+    store, path = keyed
+    gate = _gate(store)
+    sound = await _request(gate, "sound")
+    failing = await _request(gate, "failing")
+    # The expiry is a far-future time, so the queue's own unexpired filter still keeps the row.
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET requested_at=?, expires_at=? WHERE id=?",
+        (planted, 1e20, failing),
+    )
+    listing = await gate.list_pending()
+    by_id = {e["id"]: e for e in listing}
+    assert by_id[sound]["requested_at"] > 0  # control
+    entry = by_id[failing]
+    assert entry["release_blocked"] == "seal_failed"
+    assert entry["requested_at"] == 0.0 and entry["expires_at"] is None
+    PendingApprovalInfo(**entry).model_dump_json()  # the reply encodes
+
+
 async def test_a_seal_failed_reject_whose_audit_append_fails_moves_nothing(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

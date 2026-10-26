@@ -2739,17 +2739,26 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
   Approve. RBAC is unchanged: the queue and the reject still need `approvals:approve`.
 - The reject is a narrow store write on SQLite, SQL Server and PostgreSQL. It reads the row in the
   write and moves it only while it reads `pending` and fails its seal. Its SQL writes the status
-  `rejected` as a literal, guarded on `status = 'pending'`, so it cannot move a row to `executing`
-  or `approved`. It writes a tombstone seal, under a kind of its own, over the id, the status, the
-  approver and the decision time. It never seals the changed values in, so the row keeps failing
-  its approval seal.
+  `rejected` as a literal, guarded on `status = 'pending'` and on the seal it read, so it cannot
+  move a row to `executing` or `approved`. It writes a tombstone seal, under a kind of its own,
+  over the id, the status, the approver and the decision time. It never seals the changed values
+  in, so the row keeps failing its approval seal. The params stay in the row as found.
 - The move, an unthrottled `integrity.authority_seal_failed` row and an `approval.rejected` row
-  holding only the id and `seal_failed` commit in one transaction. The `integrity_drift` alert is
-  raised after the commit, because an alert sink cannot join a transaction.
-- `rotate-key`'s re-seal pass counts a tombstone sealed under the old key as a row that failed and
-  leaves it as it is. It acts on nothing.
+  holding only the id and `seal_failed` commit in one transaction. The first keeps the
+  `approver`, `decided_at` and seal the tombstone overwrote, as read, under `prior`. The
+  `integrity_drift` alert is raised after the commit, because an alert sink cannot join a
+  transaction.
+- A seal also fails for a row sealed under a store key this engine does not hold, so a flag is not
+  proof of tampering. The page says so.
 
-A failing `interrupted` release is still left out of its list, and its resolve answers 409.
+At least these limits remain:
+
+- `rotate-key`'s re-seal pass counts a tombstone sealed under the old key as a row that failed,
+  and logs it at WARNING on every later rotation. The tombstone acts on nothing;
+- a row no honest write leaves can be listed flagged and still not be rejectable: one whose id the
+  routes refuse (not 32 lowercase hex), or, on SQL Server, one whose status matches `pending` only
+  under the column's case-insensitive collation. Its reject answers 422 or 409;
+- a failing `interrupted` release is still left out of its list, and its resolve answers 409.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves

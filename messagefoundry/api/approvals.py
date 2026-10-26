@@ -159,13 +159,24 @@ _SEAL_REFUSAL = (
 )
 
 
+#: The latest time a seal-failed row's value is shown as (BACKLOG #3639): the start of the year
+#: 3000, in epoch seconds. Past it, or below the epoch, the platform's time conversion can raise
+#: (Windows refuses a negative or a very large timestamp), so the page would fail to render.
+_LATEST_SHOWN_TIME = 32503680000.0
+
+
 def _unverified_float(value: Any) -> float | None:
-    """A seal-failed row's value as a float for display, or ``None`` when it is not one. The row
-    failed its check, so nothing decides on this (BACKLOG #3639)."""
+    """A seal-failed row's time as a float for display, or ``None`` when it is not one a page can
+    render: not a number, not finite (a JSON reply refuses NaN and infinity), or outside the epoch
+    to :data:`_LATEST_SHOWN_TIME`. The row failed its check, so nothing decides on this (BACKLOG
+    #3639)."""
     try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
+        number = None if value is None else float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    if number is None or not math.isfinite(number) or not 0.0 <= number <= _LATEST_SHOWN_TIME:
+        return None
+    return number
 
 
 @dataclass(frozen=True)
@@ -985,7 +996,7 @@ class ApprovalGate:
             "label": self._label(operation),
             "params": None,
             "requester": str(found["requester"]),
-            # A time no reader can type is shown as the epoch rather than failing the whole page.
+            # A time no page can render is shown as the epoch rather than failing the whole page.
             "requested_at": 0.0 if requested_at is None else requested_at,
             "expires_at": _unverified_float(found["expires_at"]),
             "status": "pending",
@@ -2287,24 +2298,38 @@ class ApprovalGate:
         reject is an operator's act on one request, not a read repeated by every page load. The
         ``integrity_drift`` alert is raised once the write has committed. It cannot join the
         transaction, because an alert sink is not a store; raised after, it never reports a
-        rejection that rolled back.
+        rejection that rolled back. The write and the alert run as one shielded unit, so a
+        cancelled caller cannot leave a committed rejection without its alert.
 
         The expiry is not tested, because ``expires_at`` is one of the unverified values; the
-        store still moves only a row it reads ``pending`` and failing. Nothing the row holds is
-        written into the audit rows but its id: its other values are unverified. The answer names
-        the stored operation and requester, unverified, for the caller's page. A row that moved or
-        was settled since the read answers 409; a store fault answers 503 and pages the lost
-        audit rows. Both still report the seal failure, throttled, as any read of the row does."""
+        store still moves only a row it reads ``pending`` and failing, carrying the seal it read.
+        The tombstone overwrites the row's ``approver``, ``decided_at`` and seal, so the
+        ``integrity.authority_seal_failed`` row keeps them as this read found them, under
+        ``prior``, for whoever investigates; the params are left in the row as found and are
+        never copied. ``approval.rejected`` holds only the id. The answer names the stored
+        operation and requester, unverified, for the caller's page.
+
+        A row that moved or was settled since the read answers 409 and reports nothing: the call
+        that moved it reported it, or it no longer fails. A store fault answers 503, pages the
+        lost audit rows and still reports the seal failure, throttled, as any read of it does. A
+        defect in the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is not answered as
+        an outage to retry."""
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and was rejected"
             f" (approval {scrub_log_argument(approval_id)})"
         )
+        prior = {name: found[name] for name in ("approver", "decided_at", "seal")}
         audits = (
             AuditAppend(
                 AUTHORITY_SEAL_FAILED_ACTION,
                 actor="system",
-                detail=json.dumps(
-                    {"kind": APPROVAL_KIND, "approval_id": approval_id, "act": "reject"}
+                detail=_audit_detail(
+                    {
+                        "kind": APPROVAL_KIND,
+                        "approval_id": approval_id,
+                        "act": "reject",
+                        "prior": prior,
+                    }
                 ),
                 client=None,
             ),
@@ -2315,10 +2340,20 @@ class ApprovalGate:
                 client=client,  # ADR 0150: the rejecting approver's address
             ),
         )
-        try:
+
+        async def _write_then_alert() -> bool:
             moved = await self._store.reject_seal_failed_approval(
                 approval_id, approver=approver, decided_at=self._clock(), audits=audits
             )
+            if moved:
+                log.warning("%s", reason)
+                authority_seal_alert(self._alert_sink)(reason)
+            return moved
+
+        try:
+            moved = await self._shielded(_write_then_alert(), approval_id)
+        except _READ_DEFECTS:
+            raise  # a defect in the write path, not an outage
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             await self._approval_seal_failed(approval_id)
             raise self._store_fault(
@@ -2330,10 +2365,7 @@ class ApprovalGate:
                 "accepts writes",
             ) from exc
         if not moved:
-            await self._approval_seal_failed(approval_id)
             raise ApprovalError(409, "request was already decided, or changed since it was read")
-        log.warning("%s", reason)
-        authority_seal_alert(self._alert_sink)(reason)
         return {
             "operation": str(found["operation"]),
             "requested_by": str(found["requester"]),

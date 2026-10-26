@@ -569,7 +569,8 @@ class PendingApprovalInfo(BaseModel):
     an ``interrupted`` row.
 
     ``seal_failed`` (BACKLOG #3639; owner ruling 2026-10-26) marks a ``pending`` row that failed
-    its integrity seal: it was changed outside the engine. It is never released, and the reject
+    its integrity seal: it was changed outside the engine, or sealed under a store key this engine
+    does not hold. It is never released, and the reject
     closes it (BACKLOG #3638). Its ``params`` are ALWAYS ``None``, withheld rather than
     unreadable, and its other values are shown as stored, unverified; ``caller_is_requester`` is
     False on it. ``ApprovalGate._seal_failed_entry`` is the source of record."""

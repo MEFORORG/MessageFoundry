@@ -843,6 +843,7 @@ _MSSQL_APPROVAL_UPDATE: Final = (
 _MSSQL_APPROVAL_TOMBSTONE: Final = (
     "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
     " OUTPUT inserted.id WHERE id = ? AND status = 'pending'"
+    " AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -12974,7 +12975,11 @@ class SqlServerStore:
                             and str(found[0]["status"]) == "pending"
                             and approval_fails_seal(self._row_sealer, found[0])
                             and await self._tombstone_approval(
-                                cur, approval_id, approver=approver, decided_at=decided_at
+                                cur,
+                                approval_id,
+                                approver=approver,
+                                decided_at=decided_at,
+                                seal_read=str(found[0]["seal"]),
                             )
                         )
                         appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
@@ -12988,7 +12993,7 @@ class SqlServerStore:
         return moved
 
     async def _tombstone_approval(
-        self, cur: Any, approval_id: str, *, approver: str, decided_at: float
+        self, cur: Any, approval_id: str, *, approver: str, decided_at: float, seal_read: str
     ) -> bool:
         """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE` (BACKLOG #3638); store.py's
         ``MessageStore._tombstone_approval`` states the contract."""
@@ -13001,6 +13006,7 @@ class SqlServerStore:
                     self._row_sealer, approval_id, approver=approver, decided_at=decided_at
                 ),
                 approval_id,
+                seal_read,
             ),
         )
         return bool(await cur.fetchall())

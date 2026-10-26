@@ -6419,10 +6419,12 @@ _SQLITE_APPROVAL_UPDATE = (
 #: The seal-failed reject (BACKLOG #3638): a ``pending`` row that fails its seal, moved to
 #: ``rejected`` with a tombstone seal. The target status is a literal and the guard is
 #: ``status = 'pending'`` in the SQL itself, so this statement can move no row to ``executing`` or
-#: ``approved`` and touches no row already decided. Binds approver, decided_at, tombstone, id.
+#: ``approved`` and touches no row already decided. It is a compare-and-set on the seal read too,
+#: so it tombstones only the row the check refused. Binds approver, decided_at, tombstone, id and
+#: the seal read.
 _SQLITE_APPROVAL_TOMBSTONE = (
     "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
-    " WHERE id = ? AND status = 'pending'"
+    " WHERE id = ? AND status = 'pending' AND seal = ?"
 )
 
 
@@ -14935,7 +14937,10 @@ class MessageStore:
                 and str(found["status"]) == "pending"
                 and approval_fails_seal(self._row_sealer, found)
                 and await self._tombstone_approval(
-                    approval_id, approver=approver, decided_at=decided_at
+                    approval_id,
+                    approver=approver,
+                    decided_at=decided_at,
+                    seal_read=str(found["seal"]),
                 )
             )
             appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
@@ -14945,12 +14950,12 @@ class MessageStore:
         return moved
 
     async def _tombstone_approval(
-        self, approval_id: str, *, approver: str, decided_at: float
+        self, approval_id: str, *, approver: str, decided_at: float, seal_read: str
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE` (BACKLOG #3638). Call it inside an
-        open write, on a row :func:`approval_fails_seal` refused. Writes the tombstone of
-        :func:`approval_tombstone`, never an approval seal, so the row's other columns stay as
-        unverified as they were."""
+        open write, on a row :func:`approval_fails_seal` refused, with the seal it read. Writes the
+        tombstone of :func:`approval_tombstone`, never an approval seal, so the row's other columns
+        stay as unverified as they were, and lands only while the row still carries ``seal_read``."""
         cur = await self._db.execute(
             _SQLITE_APPROVAL_TOMBSTONE,
             (
@@ -14960,6 +14965,7 @@ class MessageStore:
                     self._row_sealer, approval_id, approver=approver, decided_at=decided_at
                 ),
                 approval_id,
+                seal_read,
             ),
         )
         return cur.rowcount > 0
