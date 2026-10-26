@@ -512,14 +512,19 @@ def test_bounded_address_text_keeps_addresses_and_bounds_the_rest() -> None:
 async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_record(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """RED when: ``_new_ip_seen`` holds the raw caller text, or the past-cap row, its client column
-    or the past-cap log line carries it unbounded (BACKLOG #3772). The texts share a long prefix, so
-    the test also fails if the bound folds distinct texts into one key."""
+    """RED when: ``_new_ip_seen`` holds the raw caller text, or the rows (seen_ip, known_ip, the
+    client column), the notices or the past-cap log line carry it unbounded (BACKLOG #3772). The
+    texts share a long prefix, so the test also fails if the bound folds distinct texts into one key.
+    The session itself is anchored at long text too, which is what ``known_ip`` carries."""
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
+        )
         await service.initialize()
-        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        anchor = "a" * 200
+        token, _ = await _enabled_admin(service, client=anchor)
         texts = [_long_address(n) for n in range(_NEW_IP_PER_SESSION_MAX + 2)]
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             for seen in texts:
@@ -537,6 +542,13 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             texts[_NEW_IP_PER_SESSION_MAX]
         )
         assert all(len(str(r["client"])) <= _BOUNDED_TEXT_CEILING for r in rows)
+        assert {json.loads(str(r["detail"]))["known_ip"] for r in rows} == {
+            _bounded_address_text(anchor)
+        }
+        sent = [e for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY]
+        assert len(sent) == _NEW_IP_PER_SESSION_MAX + 1
+        assert {e.client_ip for e in sent} == seen_ips
+        assert {e.detail["known_ip"] for e in sent} == {_bounded_address_text(anchor)}
         over = [
             r.getMessage()
             for r in caplog.records

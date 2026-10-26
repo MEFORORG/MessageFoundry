@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -125,7 +126,6 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     credential_id_hash_scheme,
-    hash_bytes,
     hash_token,
     mint_token,
 )
@@ -477,12 +477,13 @@ _NEW_IP_DEDUP_MAX = 4096
 _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
-# keys, its audit row and its past-cap log line. Every IPv4 or IPv6 address without a zone id fits,
-# the longest being 45 characters; only text that does not parse, or an IPv6 address with a long zone
-# id, is longer. That text is caller-supplied on a proxied hop, and without a bound each session could
-# hold nine copies of it. Longer text keeps a short prefix and gains the SHA-256 of the whole, so two
-# long strings that share the prefix stay distinct. The replacement is longer than this bound, so it
-# can never equal text kept as it is.
+# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
+# not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
+# proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
+# short prefix and gains the SHA-256 of the whole, so two long strings that share the prefix stay
+# distinct. The replacement is longer than this bound, so it can never equal text kept as it is.
+# Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
 
@@ -568,9 +569,9 @@ def _bounded_address_text(address: str) -> str:
     and :meth:`AuthService._same_host` compare by it."""
     if len(address) <= _NEW_IP_TEXT_MAX:
         return address
-    # surrogatepass: an ASGI client string may carry a lone surrogate, which plain UTF-8 refuses.
-    # The encoding is injective, so distinct text still gives distinct digests.
-    digest = hash_bytes(address.encode("utf-8", "surrogatepass"))
+    # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
+    # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
+    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
     return f"{address[:_NEW_IP_TEXT_PREFIX]}...sha256:{digest}"
 
 
@@ -12211,9 +12212,6 @@ class AuthService:
         # Bounded at intake (BACKLOG #3772), so the dedupe sets hold bounded text. The same value is
         # added below and discarded in the ``finally``.
         seen_key = _bounded_address_text(_host_key(client_ip))
-        # What the row and the past-cap log line carry: a valid address unchanged, so a search by
-        # address still finds the row (vault BACKLOG #3197), and anything longer bounded.
-        seen_text = _bounded_address_text(client_ip)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
         # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
@@ -12226,6 +12224,10 @@ class AuthService:
                 path,
             )
             return True
+        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
+        # which is every address without a long zone id, is unchanged, so a search by address still
+        # finds the row (vault BACKLOG #3197); longer text is bounded.
+        seen_text = _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop.
@@ -12237,9 +12239,10 @@ class AuthService:
                 scrub_log_argument(seen_text),
             )
             return True
+        known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
             "path": path,
-            "known_ip": session.client,
+            "known_ip": known_text,
             "seen_ip": seen_text,
         }
         if flag == "audit_cap_reached":
@@ -12267,14 +12270,14 @@ class AuthService:
                 flagged = self._new_ip_seen.get(token_hash)
                 if flagged is not None:
                     flagged.discard(seen_key)
-        notice: dict[str, object] = {"known_ip": session.client}
+        notice: dict[str, object] = {"known_ip": known_text}
         if flag == "audit_cap_reached":
             notice["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         await self._notify_security(
             NEW_ADDRESS_REVERIFY,
             username=username,
             email=user.notify_email if user is not None else None,
-            client=client_ip,
+            client=seen_text,
             detail=notice,
         )
         return True
