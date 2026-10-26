@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes, and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -293,12 +293,14 @@ between the script's check and the removal. Git's check does not list ignored fi
 tree's uncommitted tracked changes and untracked files into a commit, through a temporary index and
 `commit-tree`, never the shared stash. It parks that commit on `refs/attic/<UTC date>-<name>` in the
 clone's shared refs, with a numeric suffix after a same-day clash, and then removes the tree. A
-clean tree parks nothing and makes no ref. Whatever refuses without it still refuses with it: the
-six-hour fence, so a tree a session has just finished cannot be discarded for six hours; claims,
-the session registry and locks; nested repositories; and on `-Path`, ignored files outside the
-tolerated caches and flagged files. Ignored files are never parked, which is what keeps `.env` and
-`*.db` out. `push_guard` refuses pushing `refs/attic`, so the work stays in this clone, and nothing
-sweeps the attic. The script header lists what is parked and what is not (docs/AUTONOMY-PLAN.md
+clean tree parks nothing and makes no ref. It lifts only the refusal of tracked changes and
+untracked files. At least these still refuse: the six-hour fence, so a tree a session has just
+finished cannot be discarded for six hours; claims; on `-Path`, the session registry and locks;
+nested repositories; flagged files; and on `-Path`, ignored files outside the tolerated caches.
+Ignored files are never parked, which is what keeps `.env` and `*.db` out; anything else untracked
+is parked whatever its size. `push_guard` refuses a push to a remote `refs/attic` ref, but pushing
+the parked commit to a branch is an ordinary push it does not stop. Nothing sweeps the attic. The
+script header is the source of record for what is parked and what refuses (docs/AUTONOMY-PLAN.md
 6.3).
 
 ### What `-Path` does not reach, and what it does not see
@@ -358,7 +360,8 @@ pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts  
 ```
 
 The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes and a git repository inside the tree block removal. Uncommitted work
+uncommitted **tracked** changes and a git repository inside the tree block removal; `-Discard`
+parks the tracked changes instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
 

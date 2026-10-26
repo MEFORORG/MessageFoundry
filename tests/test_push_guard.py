@@ -196,7 +196,8 @@ def test_a_remote_tracking_ref_is_refused() -> None:
         "refs/replace/1234567890123456789012345678901234567890",
         "refs/stash",
         "refs/keep-around/abc",
-        # Where remove.ps1 -Discard parks a tree's uncommitted work; it stays in the clone.
+        # Where remove.ps1 -Discard parks a tree's uncommitted work. This pins a push TO that
+        # namespace; pushing a parked commit to a branch is an ordinary branch push.
         "refs/attic/2026-10-26-alerts",
     ],
 )

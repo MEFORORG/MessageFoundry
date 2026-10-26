@@ -13,8 +13,10 @@ Same rig and rules as ``tests/test_worktree_remove_in_use.py``: synthetic reposi
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -93,7 +95,10 @@ def test_discard_parks_tracked_and_untracked_work_and_removes_the_tree(
     assert _git(rig.primary, "stash", "list").strip() == ""
 
 
-def test_a_staged_version_that_differs_from_disk_is_parked_as_a_second_parent(rig: Rig) -> None:
+@pytest.mark.parametrize("route", ROUTES)
+def test_a_staged_version_that_differs_from_disk_is_parked_as_a_second_parent(
+    rig: Rig, route: str
+) -> None:
     """The snapshot reads the files on disk. A version staged and then edited again lives only in
     the tree's index, which the removal deletes, so it is parked as the commit's second parent."""
     wt = _sibling(rig, "staged")
@@ -101,7 +106,7 @@ def test_a_staged_version_that_differs_from_disk_is_parked_as_a_second_parent(ri
     _git(wt, "add", "seed.txt")
     (wt / "seed.txt").write_text("disk version\n", encoding="utf-8")
 
-    proc = rig.run("-Name", "staged", "-Discard")
+    proc = rig.run(*_target(route, wt), "-Discard")
 
     assert proc.returncode == 0, _out(proc)
     (ref,) = _attic(rig)
@@ -161,7 +166,7 @@ def test_an_ignored_file_still_refuses_path_under_discard(rig: Rig) -> None:
     proc = rig.run("-Path", str(wt), "-Discard")
 
     assert proc.returncode != 0, _out(proc)
-    assert "!! run.log" in _out(proc) and "which -Discard does not park" in _out(proc), _out(proc)
+    assert "!! run.log" in _out(proc) and "does not park" in _out(proc), _out(proc)
     assert "?? work.txt" not in _out(proc), _out(proc)
     assert (wt / "run.log").is_file() and (wt / "work.txt").is_file()
     assert _attic(rig) == []
@@ -174,17 +179,108 @@ def test_an_ignored_file_still_refuses_path_under_discard(rig: Rig) -> None:
     assert _show(rig, f"{ref}:work.txt") == "untracked work\n"
 
 
-def test_a_nested_repository_still_refuses_name_under_discard(rig: Rig) -> None:
-    """A nested repository's content cannot be parked, so -Discard leaves its refusal alone."""
+def test_a_nested_repository_still_refuses_name_under_discard_even_with_force(rig: Rig) -> None:
+    """A nested repository's content cannot be parked, so -Discard leaves its refusal alone, and
+    with -Force it refuses too rather than park a gitlink with none of the files. -Force alone
+    discards it, as before."""
     wt = _sibling(rig, "nest")
     (wt / "nested").mkdir()
     _git(wt / "nested", "init", "-q", "-b", "main")
 
-    proc = rig.run("-Name", "nest", "-Discard")
+    for extra in ([], ["-Force"]):
+        proc = rig.run("-Name", "nest", "-Discard", *extra)
+        assert proc.returncode != 0, (extra, _out(proc))
+        assert "an untracked git repository inside the tree" in _out(proc), _out(proc)
+        assert (wt / "nested" / ".git").exists() and _attic(rig) == []
+
+    proc = rig.run("-Name", "nest", "-Force")
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_flagged_file_refuses_name_under_discard(rig: Rig) -> None:
+    """The snapshot's temporary index carries no flags, so a sparse checkout's skip-worktree files
+    would be parked as deletions. -Name does not refuse a flagged file without -Discard; with it,
+    it does, and the plain run is the control."""
+    wt = _sibling(rig, "sparse")
+    (wt / "seed.txt").write_text("hidden local edit\n", encoding="utf-8")
+    _git(wt, "update-index", "--skip-worktree", "seed.txt")
+
+    proc = rig.run("-Name", "sparse", "-Discard")
 
     assert proc.returncode != 0, _out(proc)
-    assert "an untracked git repository inside the tree" in _out(proc), _out(proc)
-    assert (wt / "nested" / ".git").exists() and _attic(rig) == []
+    assert "flagged seed.txt" in _out(proc) and "skip-worktree" in _out(proc), _out(proc)
+    assert wt.exists() and _attic(rig) == []
+
+    proc = rig.run("-Name", "sparse")
+    assert proc.returncode == 0, _out(proc)
+
+
+def test_an_unmerged_index_refuses_under_discard(rig: Rig) -> None:
+    """A conflicted merge leaves an index with no tree, so there is nothing to park it as."""
+    wt = _sibling(rig, "conflict")
+    (wt / "seed.txt").write_text("ours\n", encoding="utf-8")
+    _git(wt, "commit", "-q", "-am", "ours")
+    (rig.primary / "seed.txt").write_text("theirs\n", encoding="utf-8")
+    _git(rig.primary, "commit", "-q", "-am", "theirs")
+    merged = subprocess.run(
+        ["git", "-C", str(wt), "merge", "-q", "main"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_ENV,
+    )
+    assert merged.returncode != 0, merged.stdout + merged.stderr
+
+    proc = rig.run("-Name", "conflict", "-Discard")
+
+    assert proc.returncode != 0, _out(proc)
+    assert "unmerged" in _out(proc), _out(proc)
+    assert wt.exists() and _attic(rig) == []
+
+
+def test_an_untracked_junction_refuses_path_under_discard(rig: Rig) -> None:
+    """Git would park the link, and a removal through one leaves the directory behind, so an
+    untracked link stays a refusal on -Path. The content outside survives."""
+    wt = rig.add(rig.scratch("junction"))
+    outside = rig.root / "elsewhere-data"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("lives outside every worktree\n", encoding="utf-8")
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(wt / "data"), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if made.returncode != 0:
+        pytest.skip(f"could not create a junction: {made.stderr or made.stdout}")
+    # settle_worktrees does not follow a link, and Python cannot date one on Windows; .NET dates the
+    # junction itself, so only the -Discard refusal is left to fire.
+    settle_worktrees(rig.primary)
+    # git status reads through a junction as a folder, so what is behind it is dated too.
+    then = time.time() - 2 * 24 * 3600
+    for p in (outside / "precious.txt", outside):
+        os.utime(p, (then, then))
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"[System.IO.Directory]::SetLastWriteTimeUtc('{wt / 'data'}', "
+            "[DateTime]::UtcNow.AddDays(-2))",
+        ],
+        check=True,
+        capture_output=True,
+        env=_ENV,
+    )
+
+    proc = rig.run("-Path", str(wt), "-Discard", settle=False)
+
+    assert proc.returncode != 0, _out(proc)
+    assert "?? data" in _out(proc) and "untracked links" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt) and _attic(rig) == []
+    assert (outside / "precious.txt").is_file()
 
 
 @pytest.mark.parametrize("route", ROUTES)
