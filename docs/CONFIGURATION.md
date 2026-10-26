@@ -2172,10 +2172,13 @@ its issuer. In at least these cases `detail` says to fix the CRL in the CA file 
 it is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL not
 yet in effect it may say to wait instead. For a proven bad signature it says what a start says of
 a CRL setting: a handshake OpenSSL judges by that CRL fails. The engine may still be unable to
-confirm the signature, short of that proof. Then `detail` asks you to check the CRL and then
-restart, and claims no failure. The start's WARNING cases above say why (BACKLOG #3512). The
-reload may also have refused the file for a hop that loads it as its CRL setting. Then `detail`
-gives the reload's remedy after the CA-file fix, which comes first. Put a CRL in
+confirm the signature, short of that proof. Then `detail` asks you to check the CRL, and claims no
+failure. The start's WARNING cases above say why (BACKLOG #3512). Where only CA files load it,
+`detail` then says to restart. Where a hop also loads the file as its CRL setting, it gives no
+restart order: the reload judges the file first, and a start could refuse it there. The reload
+may also have refused the file for that hop. Then `detail` gives the reload's remedy after the
+CA-file step, which comes first, and that remedy alone says whether to fix, wait or restart. Put
+a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.
