@@ -2332,10 +2332,13 @@ def _alternating_growth[T](
     multiplies both endpoints by k, and k cancels. Load that is not uniform does not cancel.
 
     A KNOWN LIMIT, LEFT ON PURPOSE: this is the simpler sampler the access arm already used.
-    ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py`` adds equal windows, a random
-    order per round and a sampling-time floor, after measuring reds this form can show under a
-    co-tenant on a 0.07 ms subject. They are not ported: the samples here cost 0.5 ms and up, and
-    every reading recorded for these arms sat well inside the bound."""
+    ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py`` adds equal windows and a
+    random order per round, after measuring reds this form can show under a co-tenant on a 0.07 ms
+    subject. The access arm's short emit costs only about 0.3 to 0.7 ms, so it is exposed to the
+    same failure: a co-tenant that interrupts every long sample but lets short ones finish inflates
+    the ratio. That was weighed and accepted as a documented limit rather than ported; the readings
+    recorded for these arms, including under CPU-spinner load, sat well inside the bound. The
+    read-back arm gets a sampling floor from its CPU clock instead."""
     samples = [(sample(short), sample(long)) for _ in range(rounds)]
     best_short = [
         min(column) for column in zip(*(on_short for on_short, _ in samples), strict=True)
@@ -2356,7 +2359,9 @@ def _access_growth(rounds: int) -> tuple[float, float]:
     WALL CLOCK, ON PURPOSE, where the read-back arm below moved to CPU time. A loop gap is the time
     a waiting coroutine spends not running, and that is wall time by definition: a CPU clock stops
     while the runner is away, which is exactly the delay a waiting client still pays. The growth
-    ratio is what keeps it sound on a loaded runner, as :func:`_alternating_growth` says.
+    ratio cancels a UNIFORM slowdown only. Load that is not uniform still reaches a wall-clock ratio,
+    which is the reason the CPU-time arms exist, so this arm stays exposed to it; that is the accepted
+    cost of measuring what a client waits, and :func:`_alternating_growth` records the limit.
     """
     with asyncio.Runner() as runner:
         emit_growth, gap_growth = _alternating_growth(
@@ -2624,9 +2629,10 @@ def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
     Each file is read and split once, OUTSIDE the clock, and each sample times
     ``redact_log_record`` over its lines, the per-line redaction ``_read_log_tail`` applies. The
     directory walk, the stat and the file read are a near-constant cost added to both endpoints,
-    and an added constant does not cancel in a ratio: timed with them, the read-back read about 6x
-    where the redaction alone read about 9x on a dev box, so a super-linear pass would have needed
-    to grow far past the bound before this arm saw it. The count arm in the test proves
+    and an added constant does not cancel in a ratio. On the wall clock, before this arm moved to CPU
+    time, the read-back with the file read inside the clock grew about 6x where the redaction alone
+    grew about 9x on a dev box, so a super-linear pass would have needed to grow far past the bound
+    before this arm saw it. On the CPU clock the redaction alone reads about 5x to 8x there. The count arm in the test proves
     ``_read_log_tail`` reaches the twin on the same stored line.
 
     CPU TIME, NOT WALL TIME. What is timed here is a pure CPU cost, and a wall-clock ratio of that
@@ -2740,15 +2746,19 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     )
     hidden = f"postgres://svc:{support_redact.REDACTION_PLACEHOLDER}@db.invalid"
     (raw_line,) = _read_back(raw_dir)
-    assert sentinel not in raw_line and hidden in raw_line, "the read-back printed the password"
+    assert sentinel not in raw_line, "the read-back printed the password"
+    assert hidden in raw_line, "the password is hidden, but the scheme, user or host went with it"
     with monkeypatch.context() as m:
         m.setattr(support_redact, "scrub_credentials", lambda text, **_: text)
         (twin_only,) = _read_back(raw_dir)
         m.setattr(support_redact, "_DSN_PASSWORD", re.compile(r"(?!)"))
         (neither,) = _read_back(raw_dir)
-    assert sentinel not in twin_only and hidden in twin_only, (
+    assert sentinel not in twin_only, (
         "with the secretscrub second layer off, the twin alone no longer hides a DSN password "
         "stored behind the hostile run"
+    )
+    assert hidden in twin_only, (
+        "with the second layer off, the twin hid the password but lost the scheme, user or host"
     )
     assert sentinel in neither, (
         "with both the twin and the second layer off, another pass still hid the password, so the "
@@ -2757,7 +2767,9 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
 
     with monkeypatch.context() as m:
         m.setattr(support_redact, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
-        before_growth = _read_back_growth(short_dir, long_dir, rounds=3)
+        # Fewer rounds than the access arm: each sample already averages every call made in its
+        # ``CPU_SAMPLE_FLOOR_SECONDS`` of CPU time, so more rounds mostly add runtime.
+        before_growth = _read_back_growth(short_dir, long_dir, rounds=2)
     assert before_growth > _ACCESS_MAX_GROWTH, (
         f"with the pre-#1547 pattern swapped into the twin, the log read-back grew only "
         f"{before_growth:.1f}x across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x "
@@ -2765,7 +2777,7 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
         "harness, not the bound."
     )
 
-    growth = _read_back_growth(short_dir, long_dir, rounds=5)
+    growth = _read_back_growth(short_dir, long_dir, rounds=3)
     assert growth <= _ACCESS_MAX_GROWTH, (
         f"reading back one stored access line grew {growth:.1f}x for 8x the request-target length, "
         f"over the {_ACCESS_MAX_GROWTH}x bound; the pre-#1547 twin measured {before_growth:.0f}x in "

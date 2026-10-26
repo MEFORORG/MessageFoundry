@@ -30,7 +30,8 @@ def cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
     two sizes timed back to back, under one load, rather than a fixed number of seconds. A wall-clock ratio was built and
     withdrawn in PR 2000, red 12 times in 25 on a shared Linux core; this is not that instrument.
 
-    The MINIMUM over samples: a scheduling hiccup can only inflate a sample, never deflate one."""
+    The MINIMUM over samples, the statistic load inflates least. The coarse tick can read a sample up
+    to one tick LOW as well as high, and the floor is what caps that error at about 8%."""
     best = float("inf")
     for _ in range(reps):
         calls = 0
