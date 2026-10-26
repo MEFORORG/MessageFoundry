@@ -1246,9 +1246,14 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reviewed (BACKLOG #299). **On an instance at `enforcement = warn` it does change something:**
   where the posture reaches the guard, it turns the warning into a silent crossing, and no line
   is logged. The shared rule every revocation guard decides by ranks it so.
-- **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
-  proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
-  claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
+- **The proxy leg is guarded too, and this attestation covers it (vault BACKLOG #3561):** through
+  an `https://` proxy the hop has a second TLS leg, to the proxy. The Vault leg's own TLS, inside
+  the tunnel, still protects the token. But proxy credentials and the Vault host name cross the
+  proxy leg, and nothing on the wire checks revocation of the proxy's certificate either. That
+  leg is judged under the same rule as the Vault leg, before its socket opens. So when you set
+  the flag on a hop that goes through an `https://` proxy, the reason must cover the proxy's
+  certificate as well as the Vault server's. A proxy on a loopback address needs no attestation.
+  Under `warn` the leg crosses with a WARNING of its own.
 - **How it is reported:** at least five ways. `security_loosenings()` names it as
   `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
   `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening

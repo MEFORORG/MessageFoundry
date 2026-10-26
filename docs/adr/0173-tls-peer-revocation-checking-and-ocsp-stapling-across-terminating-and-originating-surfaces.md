@@ -1061,9 +1061,9 @@ of the list above:
 | DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
-| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
-| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
+| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
+| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
+| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
 **The ODBC hops are a named gap by owner ruling, and the driver test is still owed.** BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
@@ -1204,7 +1204,8 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
 search for other hops of the same shape, and it did not grade the Vault proxy leg. *(§12 records
-that leg as a named gap.)*
+that leg as a named gap.)* *(Since 2026-10-26 §12 records a guard on that leg instead, under vault
+BACKLOG #3561, so it is no longer a named gap.)*
 
 ## 8. Sources that are stale, and must not be cited as current
 
@@ -1365,10 +1366,36 @@ carries the reason, because a Vault hop can be dialled before any store is open.
    log nothing:** an attested hop, and a hop crossed on the process-wide variable.
 4. `messagefoundry check` lists each set pair on its `vault-revocation-attested` line.
 
-**Named gap: the proxy leg.** Through an `https://` proxy a Vault hop has a second TLS leg, to the
-proxy. Nothing checks revocation of the proxy's certificate, no guard judges that leg, and the
-attestation does not claim it. The Vault leg's own TLS, inside the tunnel, is what protects the
-token. This leg has no tracking item.
+**The proxy leg is guarded as of 2026-10-26 (vault BACKLOG #3561).** Through an `https://` proxy
+a Vault hop has a second TLS leg, to the proxy. The Vault leg's own TLS, inside the tunnel, still
+protects the token. But proxy credentials cross that leg, because a credentialed `https://` proxy
+is allowed, and so does the Vault host name in the `CONNECT`. On 2026-10-26 the owner ruled, in
+the batch 342 Manager's session, to build a guard on that leg rather than close the row with a
+note (decision log `d20261026T140954228-ff8cff`).
+
+- The guard is `_refuse_an_unrevoked_proxy_leg` in `transports/strict_requests.py`. Each
+  tunnelled connection runs it in `connect`, before its socket opens, so before `CONNECT` and
+  before any proxy credentials cross.
+- It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
+  on the hop's posture and attestation, as the Vault leg's guard does. A proxy on a loopback
+  address is on the box, decided without DNS. A proxy that takes no credentials is judged the
+  same way, because the host name still crosses.
+- **The hop's attestation now claims the proxy's certificate too.** Both legs are on the one path
+  to Vault, so a hop crosses only when both are covered. A second settings pair would let nothing
+  new cross. The proxy leg's refusal asks for a reason that covers both certificates.
+- Under `warn` the leg crosses with a WARNING of its own. An attested crossing under an enforcing
+  or unknown posture logs a line of its own. Each is written once per process for each hop.
+- **Under an enforcing or unknown posture the Vault leg's guard refuses first, today.** A proxied
+  hop is never on the box, and both legs' contexts come from one factory. So an unattested
+  proxied hop is refused before any connection opens. The proxy leg's refusal fires on its own
+  only when the two legs' contexts differ, for example a CRL check that reached one leg and not
+  the other. It is the guard that reads the proxy leg's own context.
+- It adds no check on the wire. `tests/test_vault_revocation_hop_guard.py` holds its tests.
+
+*Until 2026-10-26 this paragraph read:* "**Named gap: the proxy leg.** Through an `https://`
+proxy a Vault hop has a second TLS leg, to the proxy. Nothing checks revocation of the proxy's
+certificate, no guard judges that leg, and the attestation does not claim it. The Vault leg's own
+TLS, inside the tunnel, is what protects the token. This leg has no tracking item."
 
 **What vault BACKLOG #2983's closing items map to.**
 
