@@ -842,8 +842,8 @@ def test_a_refusal_that_already_says_restart_gets_no_second_restart(
 
 def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_path: Path) -> None:
     # BACKLOG #3512: the CA-file arm outranked a recorded refusal and dropped the reload's remedy,
-    # which changelog.d/3176.fixed.md promised. The CA-file fix still leads, because a refusal's
-    # remedy can be a restart, which would load this CRL into the CA-file hop unjudged. The reason
+    # which the 0.5.2 CHANGELOG.md entry for #3176 promised. The CA-file fix still leads, as a
+    # refusal's remedy can be a restart, which would load this CRL into the CA-file hop. The reason
     # stays out: it quotes CRL issuers, and the reload's ERROR line holds it (vault BACKLOG #2904).
     hops, both = _shared_as_crl_and_ca_file(
         ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2)
@@ -857,42 +857,37 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
         clear_reload_refusal(both)
 
     assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
-    assert ". Do that first. The reload also refused the file for a hop that loaded it" in detail
+    assert (
+        ". Do that first. The reload refused the file for a hop that loads it as its CRL" in detail
+    )
     assert f": {remedy}. Held by: " in detail
     assert reason not in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
 @pytest.mark.parametrize(
     "remedy",
     [
-        None,
-        crl_reload.FIX,
-        crl_reload.WAIT,
-        crl_reload.LAPSES_FIRST,
-        crl_reload.RESTART,
-        crl_reload.BAD_SIGNATURE,
-        crl_reload.NO_ISSUER,
-        crl_reload.RETRY,
-    ],
-    ids=[
-        "no-refusal",
-        "fix",
-        "wait",
-        "lapses-first",
-        "restart",
-        "bad-signature",
-        "no-issuer",
-        "retry",
+        pytest.param(None, id="no-refusal"),
+        pytest.param(crl_reload.FIX, id="fix"),
+        pytest.param(crl_reload.WAIT, id="wait"),
+        pytest.param(crl_reload.LAPSES_FIRST, id="lapses-first"),
+        pytest.param(crl_reload.RESTART, id="restart"),
+        pytest.param(crl_reload.BAD_SIGNATURE, id="bad-signature"),
+        pytest.param(crl_reload._NOT_PROVABLE, id="not-provable"),
+        pytest.param(crl_reload.NO_ISSUER, id="no-issuer"),
+        pytest.param(crl_reload.RETRY, id="retry"),
     ],
 )
-def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_orders_no_restart_first(
+def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_restarts_after_the_reload(
     ca: _Ca, tmp_path: Path, remedy: str | None
 ) -> None:
     # BACKLOG #3512: hop A loads the file as its CRL setting and hop B as its CA file, and the new
-    # CRL's signature is unconfirmed (no key identifier, another key). A restart before the reload
-    # has judged the file can stop the engine, since a start judges hop A's CRL setting. So the
-    # CA-file step orders no restart, and a refused reload's own remedy alone says whether to fix,
-    # wait or restart, once. Before the fix the lead said "then restart the engine".
+    # CRL's signature is unconfirmed (no key identifier, another key). The CA-file step orders no
+    # restart, because the restart comes after the reload's verdict (#3176). Then either the
+    # restart once the reload applies the file, or a refused reload's remedy and, unless that
+    # remedy is a restart, the CA-file hop's restart after it. Exactly one restart order, after any
+    # fix or wait. Before the fix the lead said "then restart the engine", ahead of both.
     hops, both = _shared_as_crl_and_ca_file(
         ca, tmp_path, ca.crl(days=80, number=3, key=_another_ca().key)
     )
@@ -907,16 +902,38 @@ def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_orders_no_resta
     assert detail.startswith(
         "Check that the CRL in the CA file is one its CA signed before restarting: "
     ), detail
-    lead, _, rest = detail.partition(" The reload also refused the file")
-    assert "restart the engine" not in lead.lower(), detail
+    lead, _, rest = detail.partition(". Do that first. ")
+    assert rest, detail
+    assert "restart" not in lead.lower().replace("before restarting", ""), detail
+    orders = detail.lower().count("restart the engine") + detail.count("still needs a restart")
+    assert orders == 1, detail
     if remedy is None:
-        assert not rest, detail
+        assert rest.startswith("Restart the engine once the reload has applied the file"), detail
     else:
-        assert f": {remedy}. Held by: " in rest, detail
-    expected = 0 if remedy is None else remedy.lower().count("restart the engine")
-    assert detail.lower().count("restart the engine") == expected, detail
+        assert rest.startswith("The reload refused the file for a hop that loads it"), detail
+        assert remedy in rest, detail
+        if "Restart the engine" not in remedy:
+            # The fix or the wait comes first, then the CA-file hop's restart.
+            assert rest.index(remedy) < rest.index("still needs a restart"), detail
+    assert "synthetic reason" not in detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
-    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
+def test_a_crl_setting_row_whose_hop_holds_no_stale_copy_still_waits_for_the_reload(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # BACKLOG #3512: only the CA-file hop holds a stale copy, but a CRL setting names the file, as
+    # [store].ssl_crl_file can, which records no held copy. A start judges that setting, so the
+    # restart still waits for the reload's verdict. Before the fix the stale copies alone decided,
+    # and the row read "then restart the engine to apply the CA file".
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=_another_ca().key))
+
+    detail = _row_detail(bundle)
+
+    assert detail.startswith("Check that the CRL in the CA file is one its CA signed before")
+    assert "then restart the engine to apply the CA file" not in detail
+    assert ". Do that first. Restart the engine once the reload has applied the file" in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
 # --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------
