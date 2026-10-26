@@ -1026,10 +1026,10 @@ def test_verify_reports_a_hop_serve_would_cross_as_manual_and_still_dials_nothin
     tmp_path: Any,
 ) -> None:
     """Vault BACKLOG #3619. On ``warn`` the credential row is MANUAL, says ``serve`` would cross
-    the hop with a WARNING, and keeps the guard's refusal as evidence, the convention
-    ``fed.idp_revocation`` uses. ``MEFOR_TLS_REVOCATION_ATTESTED`` turns ``serve``'s WARN into an
-    ALLOW there, and the row stays MANUAL. Under ``enforce`` the variable crosses nothing, so the
-    row stays FAIL with the refusal. ``verify`` dials the unattested Vault in no case.
+    the hop, names the hop's own pair, and keeps the guard's refusal as evidence. Under
+    ``enforce`` it stays FAIL with the refusal. ``MEFOR_TLS_REVOCATION_ATTESTED``, set in
+    ``verify``'s own process, moves neither: ``verify``'s read is strict, so the variable crosses
+    nothing there. ``verify`` dials the unattested Vault in no case.
     RED before the repair on ``warn``: the row was FAIL with the raw refusal and no word on
     ``serve``. Mutation: return ``None`` from ``_serve_crossing``, or drop its posture read."""
     from messagefoundry.transports import strict_requests
@@ -1058,6 +1058,7 @@ def test_verify_reports_a_hop_serve_would_cross_as_manual_and_still_dials_nothin
     assert "with a WARNING" in result.detail
     assert TLS_REVOCATION_ATTESTED_ENV in result.detail
     assert "cannot say whether the reference resolves" in result.detail
+    assert "[secrets].vault_revocation_attested pair" in result.detail
 
 
 def test_any_other_refusal_of_the_hop_stays_a_fail_on_warn(
