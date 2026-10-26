@@ -95,8 +95,6 @@ from tests._encrypted_pem_probe import (
     LoopbackServer,
     Trial,
     assert_the_control_reaches_the_prompt,
-    client_port,
-    run_trial,
     subject_hash,
     tls_server,
     write_shapes,
@@ -106,16 +104,14 @@ from tests._encrypted_pem_probe import (
 # first assertion fails. The suite's default cap is 60 s.
 pytestmark = pytest.mark.timeout(300)
 
-#: Seconds a handshake may take after the child is ready. It measured under 0.4 s. This is the
-#: shortest deadline ``run_trial`` takes: any shorter could not tell a stalled server from a wait
-#: for a password.
+#: Seconds a handshake may take after the child is ready. It measured under 0.4 s.
 _ANSWER_WITHIN = CAPATH_MIN_WAIT
 #: Seconds the control is left before it is counted as waiting for a password.
 _CONTROL_WAIT = 3.0
 
 _REFUSED_THE_PEER = "SSLCertVerificationError"
-#: What the server's line for a handshake must say, by the client's outcome.
-_SERVER_SAYS = {"VERIFIED": "handshake ok", "RAISED": "handshake failed"}
+#: Whether the server must say the handshake finished, by the client's outcome.
+_SERVER_FINISHED = {"VERIFIED": True, "RAISED": False}
 
 
 @pytest.fixture(scope="module")
@@ -160,16 +156,13 @@ def _handshake(
 ) -> Trial:
     """One handshake trial. Where the client connected and got an answer, the server's own line
     for that connection must agree with it, so the server's errors are read, not dropped."""
-    before = len(server.lines())
-    trial = run_trial(mode, shapes / shape, condition, wait=_ANSWER_WITHIN, port=server.port)
-    client = client_port(trial)
-    expected = _SERVER_SAYS.get(trial.outcome)
-    if client is not None and expected is not None:
-        seen = server.answer_to(client, skip=before)
-        assert seen is not None and expected in seen.split(":", 1)[0], (
+    trial = server.handshake(mode, shapes / shape, condition, wait=_ANSWER_WITHIN)
+    expected = _SERVER_FINISHED.get(trial.outcome)
+    if trial.client_port is not None and expected is not None:
+        assert trial.server_finished is expected, (
             f"the client's {trial.outcome} through {shape} ({mode}, {condition!r}) does not match "
-            f"the server's line for port {client}: {seen!r}. Client: {trial}. Server lines since "
-            f"the trial began: {server.lines()[before:]}. Server stderr: {server.errors()!r}"
+            f"the server's line for its connection. Saw: {trial}. "
+            f"Server stderr: {server.errors()!r}"
         )
     return trial
 

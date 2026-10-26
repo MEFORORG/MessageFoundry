@@ -44,7 +44,7 @@ handshakes. The trial child sets a socket timeout, and :func:`run_trial` refuses
 than :data:`CAPATH_MIN_WAIT`: two of them, one to connect and one to handshake, and a margin. So a
 server that stalls shows as a ``TimeoutError``, and only a child stuck outside the socket shows as
 ``WAITING``. The server writes one line per connection, naming the client's port and whether the
-handshake finished, and :meth:`LoopbackServer.answer_to` reads it back for one trial.
+handshake finished, and :meth:`LoopbackServer.handshake` hands it back with the trial.
 
 :func:`subject_hash` works the file name out with ``hashlib``, so the probe needs no ``openssl``
 program. Two directory shapes prove the name: the plain CA under that name verifies the server,
@@ -62,7 +62,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 __all__ = [
@@ -84,7 +84,6 @@ __all__ = [
     "LoopbackServer",
     "Trial",
     "assert_the_control_reaches_the_prompt",
-    "client_port",
     "run_trial",
     "subject_hash",
     "tls_server",
@@ -141,7 +140,7 @@ _SOCKET_TIMEOUT = 8.0
 #: The shortest deadline :func:`run_trial` takes for a capath mode: both socket waits, and 4 s for
 #: the child to load the directory and print its result on a busy runner.
 CAPATH_MIN_WAIT = 2 * _SOCKET_TIMEOUT + 4.0
-#: Seconds :meth:`LoopbackServer.answer_to` waits for the server's line about one handshake.
+#: Seconds :meth:`LoopbackServer.handshake` waits for the server's line about one handshake.
 _SERVER_LINE_WAIT = 5.0
 
 # The child. Standard library only, and it must run on any Python 3 this is measured on.
@@ -320,11 +319,26 @@ class Trial:
     #: Whether OpenSSL's password prompt text was seen. On Windows a console prompt is not visible
     #: to the caller, so ``False`` there does not prove no prompt was written.
     prompted: bool
+    #: The local port a ``capath`` trial's client connected from, or ``None`` if it never did.
+    client_port: int | None = None
+    #: The loopback server's line for that connection, with the port left off: ``handshake ok``,
+    #: or ``handshake failed:`` and the error. ``None`` if no line came. Only
+    #: :meth:`LoopbackServer.handshake` sets it.
+    server: str | None = None
 
     @property
     def reached_the_prompt(self) -> bool:
         """The child waited for a password, or wrote the prompt for one."""
         return self.outcome == "WAITING" or self.prompted
+
+    @property
+    def server_finished(self) -> bool | None:
+        """Whether the server said the handshake finished. ``None`` if it said neither."""
+        if self.server == "handshake ok":
+            return True
+        if self.server is not None and self.server.startswith("handshake failed"):
+            return False
+        return None
 
 
 def _child_python() -> str:
@@ -343,7 +357,11 @@ def _trial_from(text: str, *, waited: bool) -> Trial:
     done = ("RAISED", "LOADED", "VERIFIED")
     result = next((line for line in after if line.startswith(done)), None)
     if result is not None:
-        return Trial(result.split(" ", 1)[0], result, prompted)
+        # The capath child writes "; client port N;" into its result line once it has connected.
+        _, connected, rest = result.partition("; client port ")
+        port = rest.split(";", 1)[0].strip()
+        client = int(port) if connected and port.isdigit() else None
+        return Trial(result.split(" ", 1)[0], result, prompted, client_port=client)
     return Trial("WAITING" if waited else "BROKEN", " | ".join(after), prompted)
 
 
@@ -466,45 +484,46 @@ def assert_the_control_reaches_the_prompt(
     )
 
 
-def client_port(trial: Trial) -> int | None:
-    """The local port a ``capath`` trial's client connected from, or ``None`` if it never
-    connected. :meth:`LoopbackServer.answer_to` finds the server's line for the handshake by it."""
-    _, found, rest = trial.detail.partition("; client port ")
-    port = rest.split(";", 1)[0].strip()
-    return int(port) if found and port.isdigit() else None
-
-
 @dataclass(frozen=True)
 class LoopbackServer:
-    """The loopback TLS server :func:`tls_server` started. Read it only inside that block."""
+    """The loopback TLS server :func:`tls_server` started. Use it only inside that block."""
 
     port: int
     _out_path: Path
     _err_path: Path
 
-    def lines(self) -> list[str]:
-        """The server's line for each connection so far, oldest first. A line still being written
-        is left out, and so is the ``PORT`` line."""
-        text = self._out_path.read_text("ascii", "replace")
-        # The child's stdout is in text mode, so on Windows each line ends in CR LF.
-        return [line.rstrip("\r") for line in text.split("\n")[1:-1]]
-
-    def answer_to(self, client: int, *, skip: int) -> str | None:
-        """The server's line for the connection from port ``client``, among the lines after the
-        first ``skip``. ``None`` if none came within a few seconds. Pass ``skip`` as the count of
-        :meth:`lines` before the trial, so an earlier connection from the same port is not read."""
-        deadline = time.monotonic() + _SERVER_LINE_WAIT
-        while True:
-            seen = [line for line in self.lines()[skip:] if line.startswith(f"{client} ")]
-            if seen:
-                return seen[-1]
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.02)
+    def handshake(
+        self, mode: str, path: str | os.PathLike[str], condition: str, *, wait: float
+    ) -> Trial:
+        """:func:`run_trial` for a ``capath`` mode against this server. Where the client connected,
+        the result carries the server's own line for that connection as :attr:`Trial.server`."""
+        before = len(self._lines())
+        trial = run_trial(mode, path, condition, wait=wait, port=self.port)
+        if trial.client_port is None:
+            return trial
+        return replace(trial, server=self._line_for(trial.client_port, skip=before))
 
     def errors(self) -> str:
         """What the server wrote to stderr, which is empty unless it crashed."""
         return self._err_path.read_text("ascii", "replace")
+
+    def _lines(self) -> list[str]:
+        # One line per connection, oldest first, leaving out the PORT line and a line still being
+        # written. The child's stdout is in text mode, so on Windows each line ends in CR LF.
+        text = self._out_path.read_text("ascii", "replace")
+        return [line.rstrip("\r") for line in text.split("\n")[1:-1]]
+
+    def _line_for(self, client: int, *, skip: int) -> str | None:
+        # Only lines after the first `skip` count, so an earlier connection from a reused port is
+        # never read as this one.
+        deadline = time.monotonic() + _SERVER_LINE_WAIT
+        while True:
+            seen = [line for line in self._lines()[skip:] if line.startswith(f"{client} ")]
+            if seen:
+                return seen[-1].split(" ", 1)[1]
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
 
 
 @contextlib.contextmanager
@@ -711,14 +730,10 @@ def _print_table(directory: Path, wait: float) -> None:
                 print(f"capath rows skipped: no {SERVER_CHAIN} here. Run `write` again.")
                 continue
             for shape, mode in capath_rows:
-                before = len(server.lines())
-                trial = run_trial(
-                    mode, directory / shape, condition, wait=handshake_wait, port=server.port
-                )
+                trial = server.handshake(mode, directory / shape, condition, wait=handshake_wait)
                 _print_row(shape, mode, trial)
-                client = client_port(trial)
-                if client is not None:
-                    print(f"{'':47} server: {server.answer_to(client, skip=before)}")
+                if trial.client_port is not None:
+                    print(f"{'':47} server: {trial.server}")
 
 
 def _print_row(shape: str, mode: str, trial: Trial) -> None:
