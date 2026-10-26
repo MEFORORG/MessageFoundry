@@ -843,6 +843,15 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
     ),
+    "messagefoundry/verify/cipher_policy.py::_openssl_default_file": Site(
+        1,
+        INTERNAL,
+        "The fixed `openssl.cnf` name under the OPENSSLDIR the `openssl` on the operator's PATH "
+        "prints. Read only; a PASS from that file alone is capped at MANUAL.",
+    ),
+    "messagefoundry/verify/cipher_policy.py::_powershell_pins": Site(
+        1, INTERNAL, "The fixed `Modules` name under the system's Windows PowerShell directory."
+    ),
     "messagefoundry_toolkit/adr_analyze.py::_criteria": Site(
         1,
         GUARDED,
