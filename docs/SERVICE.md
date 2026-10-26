@@ -567,9 +567,9 @@ environment.
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
-  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. So the
-  service's first start after a rotation runs without the retired key, and the secret-rotation
-  watcher then keeps each secret's older date and logs a warning ([PHI.md](PHI.md) §3).
+  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
+  service's first start after a rotation needs no retired key: `rotate-key` re-seals the
+  secret-rotation watcher's fingerprints under the new key (BACKLOG #3472, [PHI.md](PHI.md) §3).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
