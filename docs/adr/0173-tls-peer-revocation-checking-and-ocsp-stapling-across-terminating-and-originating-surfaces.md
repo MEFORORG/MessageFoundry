@@ -1377,14 +1377,16 @@ note (decision log `d20261026T140954228-ff8cff`).
   tunnelled connection runs it in `connect`, before its socket opens, so before `CONNECT` and
   before any proxy credentials cross.
 - It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
-  on the hop's posture and attestation, as the Vault leg's guard does. A proxy on a loopback
-  address is on the box, decided without DNS. A proxy that takes no credentials is judged the
-  same way, because the host name still crosses.
+  on the hop's posture and attestation, as the Vault leg's guard does. For this leg a proxy on
+  a loopback address is on the box, decided without DNS, but the Vault leg's guard still counts
+  any proxied hop as off the box. A proxy that takes no credentials is judged the same way,
+  because the host name still crosses.
 - **The hop's attestation now claims the proxy's certificate too.** Both legs are on the one path
   to Vault, so a hop crosses only when both are covered. A second settings pair would let nothing
-  new cross. The proxy leg's refusal asks for a reason that covers both certificates.
-- Under `warn` the leg crosses with a WARNING of its own. An attested crossing under an enforcing
-  or unknown posture logs a line of its own. Each is written once per process for each hop.
+  new cross. Both legs' refusals ask for a reason that covers both certificates.
+- Under `warn` an unattested leg crosses with a WARNING of its own, unless
+  `MEFOR_TLS_REVOCATION_ATTESTED` makes it silent. An attested crossing under an enforcing or
+  unknown posture logs a line of its own. Each is written once per process for each hop.
 - **Under an enforcing or unknown posture the Vault leg's guard refuses first, today.** A proxied
   hop is never on the box, and both legs' contexts come from one factory. So an unattested
   proxied hop is refused before any connection opens. The proxy leg's refusal fires on its own

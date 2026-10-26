@@ -416,6 +416,9 @@ def _narrowed_pool_classes(
             ):
                 return None
             context = factory()
+            # Vault BACKLOG #3561: before the socket opens, so before CONNECT and any proxy
+            # credentials cross. The CRL flag it reads does not depend on the CA load below.
+            judge_proxy_leg(context, self.proxy.host)
             # The Vault anchor; the docstring above says why the connection loads it here.
             if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
                 try:
@@ -434,9 +437,6 @@ def _narrowed_pool_classes(
                     ) from exc
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
-            # Vault BACKLOG #3561: before the socket opens, so before CONNECT and any proxy
-            # credentials cross.
-            judge_proxy_leg(context, self.proxy.host)
             return context
 
         def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
@@ -652,11 +652,11 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 
         **That build is one more per client build, on a hop that warns or refuses** (vault
         BACKLOG #3565). The suite assertion already builds one and drops it, and reusing it needs
-        a change in ``config/tls_policy.py``. Measured 2026-10-26 on Windows, CPython 3.14.6,
-        OpenSSL 3.5.7 and urllib3 2.8.0: one factory build took 0.13 ms at the median of 200, and
-        an unattested client build on a ``warn`` instance built 2 contexts before any send,
-        against 1 for an attested one. *(This read "about 11 ms (a review agent's measurement,
-        2026-10-13)" until that measurement.)*"""
+        a change in ``config/tls_policy.py``. It was measured on 2026-10-26, on Windows with
+        CPython 3.14.6, OpenSSL 3.5.7 and urllib3 2.8.0. One factory build took 0.13 ms, the
+        median of 200. An unattested client build on a ``warn`` instance built 2 contexts before
+        any send, and an attested one built 1. *(This read "about 11 ms (a review agent's
+        measurement, 2026-10-13)" until then.)*"""
         if self._crl_checked is None:
             self._crl_checked = context_checks_revocation(self._ssl_context_factory())
         return self._crl_checked
@@ -994,14 +994,18 @@ _UNREVOKED_VAULT_HOP = (
     "revocation (no CRL and no OCSP), and no CRL lever is built for it. Only a loopback Vault "
     "reached with no proxy crosses without an attestation."
 )
-#: The one lever each refusal offers: the hop's own settings pair, and nothing else.
+#: The one lever each refusal offers: the hop's own settings pair, and nothing else. Through an
+#: ``https://`` proxy the pair covers the proxy's certificate too (vault BACKLOG #3561), and this
+#: refusal fires first, so it is the one that says so.
 _STORE_REVOCATION_LEVER = (
-    "If revocation of that certificate is covered outside the engine, set "
+    "If revocation of that certificate is covered outside the engine, and of an https:// proxy's "
+    "certificate where the hop goes through one, set "
     "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason; "
     "refusing (vault BACKLOG #2983)"
 )
 _SECRETS_REVOCATION_LEVER = (
-    "If revocation of that certificate is covered outside the engine, set "
+    "If revocation of that certificate is covered outside the engine, and of an https:// proxy's "
+    "certificate where the hop goes through one, set "
     "[secrets].vault_revocation_attested = true with a "
     "[secrets].vault_revocation_attested_reason; refusing (vault BACKLOG #2983)"
 )
@@ -1181,7 +1185,8 @@ def _refuse_an_unrevoked_vault_hop(
         unchecked=_UNCHECKED_VAULT_HOP,
         under_enforce=(
             f"this hop is refused unless {_REVOCATION_PAIR[attestation_section]} is true with its "
-            "reason"
+            "reason, which must also cover the proxy's certificate where the hop goes through an "
+            "HTTPS proxy"
         ),
     ):
         return
@@ -1293,8 +1298,7 @@ def is_unrevoked_vault_hop_refusal(
 _UNREVOKED_PROXY_LEG = (
     "the TLS leg to this hop's https:// proxy would be verified, but it checks no certificate "
     "revocation (no CRL and no OCSP), and no CRL lever is built for it. Proxy credentials and the "
-    "Vault host name cross that leg. Only a proxy on a loopback address crosses without an "
-    "attestation."
+    "Vault host name cross that leg."
 )
 _STORE_PROXY_LEG_LEVER = (
     "If revocation of the proxy's certificate is covered outside the engine, as well as the Vault "
@@ -1347,20 +1351,17 @@ def _refuse_an_unrevoked_proxy_leg(
     certificates says that. A second settings pair would let nothing new cross. The refusal
     text says the reason must cover the proxy's certificate.
 
-    **Today the Vault leg's guard refuses first.** Under an enforcing or unknown posture a
-    proxied hop is off the box, so it refuses before any connection unless it is attested, and
-    both legs' contexts come from one factory. So this refusal fires only on a hop whose two
-    legs differ: at least a proxy leg whose context checks no CRL beside a Vault leg whose
-    context does. It is the guard that reads the proxy leg's own context, so it fails closed if
-    a later change splits them. Under a posture that is not enforcing it warns for this leg,
-    once per process for each hop. An attested crossing under an enforcing or unknown posture
-    logs a line for this leg, also once.
+    **When this refusal can fire on its own is in ADR 0173 §12.** Today the Vault leg's guard
+    refuses the same hops first, and its refusal names the proxy's certificate too. Its crossing
+    lines are written once per process for each hop, under the kinds :func:`_first_crossing`
+    names.
 
     Runs once per new tunnelled connection, before its socket opens. Raises
     :class:`VaultHopRefused` with fixed text."""
     if _crossed_unrevoked(
         connector=connector,
-        on_box=_stays_on_the_box((proxy_host or "").strip("[]"), None),
+        # The leg ends at the proxy, so only the proxy's own host decides it, without DNS.
+        on_box=bool(host := (proxy_host or "").strip("[]")) and is_loopback_hop_host(host),
         checks_revocation=lambda: context_checks_revocation(context),
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,

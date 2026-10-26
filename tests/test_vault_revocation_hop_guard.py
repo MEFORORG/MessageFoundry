@@ -1199,19 +1199,39 @@ def test_an_unattested_proxy_leg_is_refused_with_fixed_text(
     assert not strict_requests.is_unrevoked_vault_hop_refusal(caught.value, section)
 
 
-def test_the_proxy_leg_under_every_posture(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_proxy_leg_under_every_posture(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     """The decision table, on the proxy leg's guard: the hop's attestation crosses it under any
-    posture, a posture that is not enforcing warns, and the blanket variable crosses only there.
-    Mutation: pass ``enforcing=True`` to the authority (the warn row refuses)."""
+    posture, a posture that is not enforcing warns, and the blanket variable crosses only there,
+    silently. Mutations: pass ``enforcing=True`` to the authority (the warn row refuses); pass
+    ``blanket_attested=False`` (the blanket row warns)."""
     from messagefoundry.transports.strict_requests import VaultHopRefused
 
-    _proxy_leg(posture=_NOT_ENFORCING)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _proxy_leg(posture=_NOT_ENFORCING, connector="warned hop")
+    assert any("warned hop" in line for line in _proxy_leg_lines(caplog))
     for posture in (None, _ENFORCING, _NOT_ENFORCING):
         _proxy_leg(posture=posture, revocation_attested=True)
+    caplog.clear()
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    _proxy_leg(posture=_NOT_ENFORCING)
+    _proxy_leg(posture=_NOT_ENFORCING, connector="blanket hop")
+    assert _proxy_leg_lines(caplog) == []
     with pytest.raises(VaultHopRefused):
         _proxy_leg(posture=_ENFORCING)
+
+
+@pytest.mark.parametrize("section", ["store", "secrets"])
+def test_the_vault_legs_refusal_names_the_proxys_certificate(section: Any) -> None:
+    """The Vault leg's guard refuses a proxied hop first, so its lever is the one an operator
+    reads, and it must say the attestation covers the proxy's certificate too. Mutation: drop
+    the proxy clause from ``_STORE_REVOCATION_LEVER``."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    with pytest.raises(VaultHopRefused) as caught:
+        _refuse(_OFF_BOX, _HTTPS_PROXY, attestation_section=section)
+    assert "https:// proxy's certificate" in str(caught.value)
+    assert _PROXY_HOST not in str(caught.value)
 
 
 @pytest.mark.parametrize("truthy", ["true", 1, object()])

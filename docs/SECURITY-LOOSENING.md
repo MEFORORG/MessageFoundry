@@ -1252,8 +1252,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   proxy leg, and nothing on the wire checks revocation of the proxy's certificate either. That
   leg is judged under the same rule as the Vault leg, before its socket opens. So when you set
   the flag on a hop that goes through an `https://` proxy, the reason must cover the proxy's
-  certificate as well as the Vault server's. A proxy on a loopback address needs no attestation.
-  Under `warn` the leg crosses with a WARNING of its own.
+  certificate as well as the Vault server's. A proxy on a loopback address does not lift this:
+  the Vault leg still counts any proxied hop as off the box. Under `warn` an unattested leg
+  crosses with a WARNING of its own, unless `MEFOR_TLS_REVOCATION_ATTESTED` is set, which makes
+  that crossing silent.
 - **How it is reported:** at least five ways. `security_loosenings()` names it as
   `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
   `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening
