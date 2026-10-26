@@ -976,6 +976,12 @@ def test_exposure_protected_property() -> None:
 
 # --- BACKLOG #2116, ADR 0068 section 7: the WebAuthn rp_id never comes from a proxied Host ---------
 
+#: Vault BACKLOG #3538: under `enforce` a proxy in `trusted_proxies` now meets the ASVS 12.1.1 probe,
+#: which refuses with no public address and dials one that is set. The two tests below are about
+#: the rp_id and the console, not the probe, so they run under `warn`, where the probe does not run.
+#: Every arm takes it, so each control arm still differs from its proxied arm only by the proxy.
+_PROXY_PROBE_OFF = 'security.enforcement = "warn"\n'
+
 #: The Host a proxy in front of the bind would forward. A client can set it, so an rp_id taken from it
 #: anchors a passkey to whatever origin the client named.
 _FORWARDED_HOST = "attacker.example.test"
@@ -1042,7 +1048,8 @@ def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
     warns: bool,
 ) -> None:
     """BACKLOG #2116. A loopback bind with an operator certificate and ``trusted_proxies`` set is an
-    accepted posture since #2055, and nothing in it declares a terminator. The Host such a proxy
+    accepted posture since #2055, and nothing in it declares a terminator. Under ``enforce`` it also
+    needs the public address since vault BACKLOG #3538, so these arms run under ``warn``. The Host such a proxy
     forwards is client-controllable, so a passkey ceremony must fail closed, not take its rp_id
     from it, and ``serve`` says so.
 
@@ -1051,6 +1058,7 @@ def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
     cert, key = _self_signed(tmp_path)
     toml = (
         _SYNTHETIC_LOOPBACK_TOML
+        + _PROXY_PROBE_OFF
         + top_extra
         + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
         + api_extra
@@ -1106,6 +1114,7 @@ def test_a_trusted_proxy_on_a_loopback_bind_counts_as_exposure(
     cert, key = _self_signed(tmp_path)
     toml = (
         _SYNTHETIC_LOOPBACK_TOML
+        + _PROXY_PROBE_OFF
         + ("security.serve_web_console = true\n" if explicit else "")
         + "auth.admin_new_ip_step_up = false\n"
         + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
@@ -1356,20 +1365,21 @@ def _posture_b_toml(
     public_origin: str | None = "https://mefor.example.org",
     ack: bool = True,
     cert: tuple[Path, Path] | None = None,
+    terminator: bool = True,
 ) -> None:
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
-    attestations are under test. ``intra``/``floor`` toggle the two Posture-B knobs."""
-    lines = [
-        "[api]",
-        "tls_terminated_upstream = true",
-        'trusted_proxies = ["10.0.0.9"]',
-        f'proxy_intra_service_auth = "{intra}"',
-    ]
+    attestations are under test. ``intra``/``floor`` toggle the two Posture-B knobs. ``terminator=False``
+    leaves out the terminator, the intra-service attestation and the hop acknowledgement (the loader
+    refuses that without a terminator): the trusted_proxies-only shape (vault BACKLOG #3538), which
+    loads only with ``cert`` set."""
+    lines = ["[api]", 'trusted_proxies = ["10.0.0.9"]']
+    if terminator:
+        lines += ["tls_terminated_upstream = true", f'proxy_intra_service_auth = "{intra}"']
     # PRE-SATISFIED by default for the same reason as public_origin below: BACKLOG #1179 made the
     # plaintext-hop acknowledgement a precondition of this topology in every mode. `ack=False`
     # puts that precondition itself under test.
-    if ack:
+    if ack and terminator:
         lines.append("plaintext_upstream_hop_acknowledged = true")
     # An operator certificate beside the terminator: the engine then serves the proxy-to-engine hop
     # over TLS, so there is no plaintext hop to acknowledge. POSIX spelling because a TOML basic
@@ -1445,7 +1455,12 @@ class _PassingProbe:
 
 
 def _run_posture_b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, env: str, key: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env: str,
+    key: bool = True,
+    probe: Callable[[str], Any] = lambda origin: _PassingProbe(),
 ) -> int:
     monkeypatch.chdir(tmp_path)
     if key:
@@ -1461,10 +1476,7 @@ def _run_posture_b(
     # cases test CONFIG gates, and the probe's own network behaviour is covered by
     # tests/test_tls_floor_probe.py. A test that stubbed it to FAIL would be asserting the probe,
     # not the ladder.
-    monkeypatch.setattr(
-        "messagefoundry.config.tls_probe.probe_tls_floor",
-        lambda origin: _PassingProbe(),
-    )
+    monkeypatch.setattr("messagefoundry.config.tls_probe.probe_tls_floor", probe)
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
 
 
@@ -3490,6 +3502,163 @@ def test_the_refusal_names_a_key_the_loader_actually_accepts() -> None:
         "the refusal still names the relocated spelling, which the loader rejects as file or env "
         "input. Name the [security] key instead."
     )
+
+
+# --- vault BACKLOG #3538: a re-encrypting proxy is probed and owes the floor attestation ----------
+#
+# The shape: [api].trusted_proxies set, no declared terminator, and an operator tls_cert_file. The
+# loader refuses trusted_proxies without one of the other two (BACKLOG #2055), so a fixture with no
+# operator certificate fails at load and proves nothing about these gates. The browser's TLS ends at
+# that proxy just as it does behind a terminator. The batch 253 Manager decided, under the driver
+# rule, that the ASVS 12.1.1 probe and the proxy_tls_min_version attestation cover it too (#3475
+# question 1). That is a Manager decision, not an owner ruling on the substance.
+
+
+class _RecordingProbe:
+    """A TlsFloorProbe stand-in that records the origin it was asked to dial."""
+
+    def __init__(self, ok: bool) -> None:
+        self.ok = ok
+        self.dialled: list[str] = []
+
+    def __call__(self, origin: str) -> _RecordingProbe:
+        self.dialled.append(origin)
+        return self
+
+    def describe(self) -> str:
+        return "stubbed probe (test)" if self.ok else "stubbed probe (test): TLS 1.0 accepted"
+
+
+def _reencrypting_proxy_toml(
+    tmp_path: Path,
+    *,
+    floor: str | None,
+    loopback: bool = False,
+    enforcement: str | None = None,
+    public_origin: str | None = "https://mefor.example.org",
+) -> None:
+    """The trusted_proxies-only shape, every other exposure gate pre-satisfied as in
+    ``_posture_b_toml``."""
+    _posture_b_toml(
+        tmp_path,
+        floor=floor,
+        loopback=loopback,
+        enforcement=enforcement,
+        public_origin=public_origin,
+        cert=_self_signed(tmp_path),
+        terminator=False,
+    )
+
+
+def _run_reencrypting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: _RecordingProbe
+) -> int:
+    # An off-loopback bind serving an operator certificate with no terminator in front meets the ADR
+    # 0078 revocation gate first. Attested here so that gate is not the one under test.
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    return _run_posture_b(tmp_path, monkeypatch, env="prod", probe=probe)
+
+
+def test_reencrypting_proxy_shape_loads_without_a_terminator(tmp_path: Path) -> None:
+    """The precondition for every test below: the fixture is the shape the row names."""
+    from messagefoundry.config.settings import load_settings
+
+    _reencrypting_proxy_toml(tmp_path, floor="1.2")
+    api = load_settings(config_path=tmp_path / "messagefoundry.toml", environ={}).api
+    assert api.trusted_proxies and not api.tls_terminated_upstream and api.tls_enabled
+
+
+def test_reencrypting_proxy_off_loopback_refuses_without_the_floor_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _reencrypting_proxy_toml(tmp_path, floor=None)
+    probe = _RecordingProbe(ok=True)
+    assert _run_reencrypting(tmp_path, monkeypatch, probe) == 2
+    err = capsys.readouterr().err
+    # Other gates also exit 2; the message pins that THIS one refused.
+    assert "without [api].proxy_tls_min_version" in err
+    assert "[api].trusted_proxies" in err
+    # It refuses before the probe dials anything: cheap config refusals come first.
+    assert probe.dialled == []
+
+
+@pytest.mark.parametrize(
+    ("loopback", "enforcement"), [(True, None), (False, "warn")], ids=["loopback", "warn"]
+)
+def test_reencrypting_proxy_warns_without_the_floor_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+    enforcement: str | None,
+) -> None:
+    # Same split as the terminator gate: on loopback or under warn it warns, and only off loopback
+    # under enforce does it refuse.
+    _reencrypting_proxy_toml(tmp_path, floor=None, loopback=loopback, enforcement=enforcement)
+    assert _run_reencrypting(tmp_path, monkeypatch, _RecordingProbe(ok=True)) == 0
+    err = capsys.readouterr().err
+    assert "warning:" in err and "without [api].proxy_tls_min_version" in err
+    assert "refusing to serve" not in err
+
+
+_LOOPBACK_ARMS = pytest.mark.parametrize("loopback", [False, True], ids=["offloopback", "loopback"])
+
+
+@_LOOPBACK_ARMS
+def test_reencrypting_proxy_is_probed_at_its_public_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+) -> None:
+    # The attestation is declared and the intra-service attestation is not: this shape owes only
+    # the floor, so it starts. The probe must have dialled the public address, on loopback too.
+    _reencrypting_proxy_toml(tmp_path, floor="1.2", loopback=loopback)
+    probe = _RecordingProbe(ok=True)
+    assert _run_reencrypting(tmp_path, monkeypatch, probe) == 0
+    assert probe.dialled == ["https://mefor.example.org"]
+    err = capsys.readouterr().err
+    assert "TLS-floor probe passed" in err
+    assert "proxy_intra_service_auth" not in err
+
+
+def test_reencrypting_proxy_refuses_when_the_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _reencrypting_proxy_toml(tmp_path, floor="1.2")
+    assert _run_reencrypting(tmp_path, monkeypatch, _RecordingProbe(ok=False)) == 2
+    err = capsys.readouterr().err
+    assert "whose TLS floor does not verify" in err and "TLS 1.0 accepted" in err
+
+
+@_LOOPBACK_ARMS
+def test_reencrypting_proxy_refuses_without_a_public_address(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+) -> None:
+    # The #1026 rule carries over: an unset origin would silently disable the probe, so it refuses,
+    # on loopback too, and the remediation names the key the loader accepts.
+    _reencrypting_proxy_toml(tmp_path, floor="1.2", public_origin=None, loopback=loopback)
+    probe = _RecordingProbe(ok=True)
+    assert _run_reencrypting(tmp_path, monkeypatch, probe) == 2
+    err = capsys.readouterr().err
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    assert _RELOCATED_TO_SECURITY[("api", "public_origin")] in err
+    assert "12.1.1" in err and "[api].trusted_proxies" in err
+    assert probe.dialled == []
+
+
+def test_reencrypting_proxy_under_warn_needs_no_public_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The scope control: the probe and its origin refusal are `enforce`-only, as behind a terminator.
+    _reencrypting_proxy_toml(tmp_path, floor="1.2", public_origin=None, enforcement="warn")
+    probe = _RecordingProbe(ok=True)
+    assert _run_reencrypting(tmp_path, monkeypatch, probe) == 0
+    assert probe.dialled == []
 
 
 # --- BACKLOG #1276: the engine always serves TLS -----------------------------------------------

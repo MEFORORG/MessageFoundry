@@ -484,7 +484,11 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    - **In-process TLS** also needs `MEFOR_TLS_REVOCATION_ATTESTED=1` — your attestation that the PKI
      behind the cert enforces revocation, because the engine performs no OCSP/CRL
      ([ADR 0078](adr/0078-certificate-revocation-posture.md)). The alternative is to terminate at a
-     revocation-checking proxy instead (which is branch B).
+     revocation-checking proxy instead (which is branch B). If you name a proxy that re-encrypts to
+     your certificate in `[api].trusted_proxies`, you also need `[api].proxy_tls_min_version` and
+     `[security].web_console_public_address`, which the startup TLS-floor probe dials. The
+     `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) says when each one refuses
+     (vault BACKLOG #3538).
    - **The terminator branch** also needs `[api].proxy_intra_service_auth`
      (`mtls` / `network` / `shared_secret`) **and** `[api].proxy_tls_min_version` (`1.2` / `1.3`) — the
      engine can verify neither the proxy→engine internal hop nor the proxy's negotiated TLS floor, so it
