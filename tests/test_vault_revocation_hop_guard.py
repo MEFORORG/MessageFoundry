@@ -931,9 +931,23 @@ def test_the_serve_path_upload_cipher_is_built_under_the_instance_posture(
     assert dials == ([(_HOST, 8200)] if crosses else [])
 
 
-def _verify_settings(enforcement: str, attested: bool, store_path: str) -> ServiceSettings:
-    """An instance whose OIDC client secret and store key are both held in an off-box Vault."""
-    return ServiceSettings.model_validate(
+#: The OIDC client credential held in the Vault, by the row that reads it.
+_CREDENTIALS: dict[str, dict[str, str]] = {
+    "fed.client_secret": {"oidc_client_secret_ref": "mefor/oidc"},
+    "fed.client_key": {
+        "oidc_token_endpoint_auth_method": "private_key_jwt",
+        "oidc_client_private_key_ref": "mefor/oidc-key",
+        "oidc_client_assertion_algorithm": "ES256",
+    },
+}
+
+
+def _verify_settings(
+    enforcement: str, attested: bool, store_path: str, row: str = "fed.client_secret"
+) -> ServiceSettings:
+    """An instance whose OIDC client credential and store key are both held in an off-box Vault.
+    ``row`` picks the credential: the client secret, or the ``private_key_jwt`` signing key."""
+    settings = ServiceSettings.model_validate(
         {
             "security": {"enforcement": enforcement},
             "secrets": {"provider": "vault", **_pair(attested)},
@@ -949,15 +963,17 @@ def _verify_settings(enforcement: str, attested: bool, store_path: str) -> Servi
                 "oidc_enabled": True,
                 "oidc_issuer": "https://idp.synthetic.test",
                 "oidc_client_id": "mefor-console",
-                "oidc_client_secret_ref": "mefor/oidc",
                 "oidc_authorization_endpoint": "https://idp.synthetic.test/authorize",
                 "oidc_token_endpoint": "https://idp.synthetic.test/token",
                 "oidc_jwks_uri": "https://idp.synthetic.test/jwks",
                 "oidc_allowed_endpoints": ["idp.synthetic.test"],
+                **_CREDENTIALS[row],
             },
             "api": {"public_origin": "https://ops.synthetic.test"},
         }
     )
+    assert bool(settings.auth.oidc_private_key_jwt) is (row == "fed.client_key")
+    return settings
 
 
 @pytest.mark.parametrize("enforcement", ["warn", "enforce"])
@@ -965,12 +981,12 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     enforcement: str, monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
 ) -> None:
     """``verify`` holds no posture for its store opens (vault BACKLOG #2354), so it holds none for
-    its secrets read either: one command judges both Vault hops by one rule. A ``warn`` instance
-    is not a way across here, as it is in ``serve``; only the hop's own pair is.
-    RED before the repair, on ``warn`` only: the client-credential row derived the serve posture.
-    So the secrets hop crossed with a WARNING and dialled the Vault, while the store row refused.
-    ``[enforce]`` is the control: both versions refuse there. Mutation: pass ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
-    ``_client_credential_row``."""
+    its secrets read either: one command dials neither unattested off-box Vault. A ``warn``
+    instance is not a way across here, as it is in ``serve``; only the hop's own pair is.
+    The store row FAILs on both postures. The credential row FAILs under ``enforce`` and is MANUAL
+    under ``warn``, where ``serve`` would cross (vault BACKLOG #3619). Mutation: pass
+    ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
+    ``_client_credential_row``; the ``warn`` case then dials."""
     from messagefoundry.verify.federation import _client_credential_row
     from messagefoundry.verify.model import Status
     from messagefoundry.verify.smoke import check_store_connectivity
@@ -983,9 +999,11 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     refused = _verify_settings(enforcement, False, str(store))
     secret = _client_credential_row(refused)
     opened = check_store_connectivity(refused.store)
-    for row, section in ((secret, "secrets"), (opened, "store")):
-        assert row.status is Status.FAIL, (row.id, row.detail)
-        assert f"[{section}].vault_revocation_attested = true" in row.detail, row.id
+    expected = Status.MANUAL if enforcement == "warn" else Status.FAIL
+    assert secret.status is expected, secret.detail
+    assert "[secrets].vault_revocation_attested = true" in (secret.evidence or secret.detail)
+    assert opened.status is Status.FAIL, opened.detail
+    assert "[store].vault_revocation_attested = true" in opened.detail
     assert dials == []
 
     # The control, on the same address: the hop's own pair, with its reason, is the way across.
@@ -994,3 +1012,107 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     assert secret.status is Status.FAIL
     assert "vault_revocation_attested" not in secret.detail
     assert dials == [(_HOST, 8200)]
+
+
+@pytest.mark.parametrize("row", sorted(_CREDENTIALS))
+@pytest.mark.parametrize("blanket", [False, True], ids=["no-env", "blanket-env"])
+@pytest.mark.parametrize("enforcement", ["warn", "enforce"])
+def test_verify_reports_a_hop_serve_would_cross_as_manual_and_still_dials_nothing(
+    enforcement: str,
+    blanket: bool,
+    row: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    tmp_path: Any,
+) -> None:
+    """Vault BACKLOG #3619. On ``warn`` the credential row is MANUAL, says ``serve`` would cross
+    the hop with a WARNING, and keeps the guard's refusal as evidence, the convention
+    ``fed.idp_revocation`` uses. ``MEFOR_TLS_REVOCATION_ATTESTED`` turns ``serve``'s WARN into an
+    ALLOW there, and the row stays MANUAL. Under ``enforce`` the variable crosses nothing, so the
+    row stays FAIL with the refusal. ``verify`` dials the unattested Vault in no case.
+    RED before the repair on ``warn``: the row was FAIL with the raw refusal and no word on
+    ``serve``. Mutation: return ``None`` from ``_serve_crossing``, or drop its posture read."""
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    if blanket:
+        monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    result = _client_credential_row(
+        _verify_settings(enforcement, False, str(tmp_path / "s.db"), row)
+    )
+    refusal = (
+        f"Vault KV secret provider: {strict_requests._UNREVOKED_VAULT_HOP} "
+        f"{strict_requests._SECRETS_REVOCATION_LEVER}"
+    )
+    assert result.id == row
+    assert dials == []
+    if enforcement == "enforce":
+        assert result.status is Status.FAIL
+        assert result.detail == refusal
+        return
+    assert result.status is Status.MANUAL, result.detail
+    assert result.evidence == refusal
+    assert "`serve` would cross it" in result.detail
+    assert "with a WARNING" in result.detail
+    assert TLS_REVOCATION_ATTESTED_ENV in result.detail
+    assert "cannot say whether the reference resolves" in result.detail
+
+
+def test_any_other_refusal_of_the_hop_stays_a_fail_on_warn(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """Only the revocation refusal is one ``serve`` would cross on ``warn``. A cleartext off-box
+    Vault is refused at every posture, so its row stays FAIL. The control is the same instance on
+    ``https``, which is MANUAL. Mutation: treat every ``VaultHopRefused`` as the revocation one."""
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    settings = _verify_settings("warn", False, str(tmp_path / "s.db"))
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", f"http://{_HOST}:8200")
+    cleartext = _client_credential_row(settings)
+    assert cleartext.status is Status.FAIL, cleartext.detail
+    assert "vault_revocation_attested" not in cleartext.detail
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    assert _client_credential_row(settings).status is Status.MANUAL
+    assert dials == []
+
+
+def test_the_revocation_refusal_is_told_apart_by_type_and_whole_text() -> None:
+    """The classifier takes the exact type and the whole fixed text after the label, for one
+    section. Each section's real refusal, raised by the guard, is it, and only for its own
+    section. A substring, a subclass or another refusal is not it. Mutation: compare with ``in``
+    rather than ``==``, use ``isinstance``, or let the two raise texts drift from the table."""
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.transports.strict_requests import (
+        VaultAttestationSection,
+        VaultHopRefused,
+        is_unrevoked_vault_hop_refusal,
+    )
+
+    pairs: tuple[tuple[VaultAttestationSection, VaultAttestationSection], ...] = (
+        ("secrets", "store"),
+        ("store", "secrets"),
+    )
+    for section, wrong in pairs:
+        with pytest.raises(VaultHopRefused) as raised:
+            _refuse(_OFF_BOX, attestation_section=section)
+        assert is_unrevoked_vault_hop_refusal(raised.value, section), section
+        assert not is_unrevoked_vault_hop_refusal(raised.value, wrong), section
+
+    reason = strict_requests._UNREVOKED_VAULT_HOP_REASONS
+    exact = VaultHopRefused(f"Vault KV secret provider: {reason['secrets']}")
+
+    class _Elsewhere(VaultHopRefused):
+        pass
+
+    for other in (
+        _Elsewhere(str(exact)),
+        InsecureHopRefused(str(exact)),
+        VaultHopRefused(f"{exact} and more"),
+        VaultHopRefused(f"label: prefix {reason['secrets']}"),
+        VaultHopRefused(reason["secrets"]),
+        VaultHopRefused(f"label: {strict_requests._CLEARTEXT_VAULT_HOP}"),
+    ):
+        assert not is_unrevoked_vault_hop_refusal(other, "secrets"), str(other)

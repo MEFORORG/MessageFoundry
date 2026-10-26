@@ -220,10 +220,14 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
     **That read is judged strictly, whatever** ``[security].enforcement`` **says.** The provider is
     built with no posture, and the Vault revocation guard reads ``None`` as enforcing (vault
     BACKLOG #2983). ``verify``'s store opens pass no posture either (vault BACKLOG #2354). So one
-    command judges both Vault hops by one rule. An off-box Vault crosses here only on its own
-    ``[secrets].vault_revocation_attested`` pair. On a ``warn`` instance ``serve`` would cross it
-    with a WARNING, so this row can FAIL where ``serve`` starts. :func:`_revocation_row` does take
-    the posture, because it reports the decision ``serve`` would make and dials nothing."""
+    command judges both Vault hops by one rule, and dials an off-box Vault only on its own
+    ``vault_revocation_attested`` pair.
+
+    **The posture only classifies that refusal** (vault BACKLOG #3619). :func:`_serve_crossing`
+    asks what ``serve`` would decide for the hop the guard refused. Where ``serve`` would cross it,
+    on a ``warn`` instance, the row is MANUAL and says so, the convention :func:`_revocation_row`
+    uses. The reference is then not checked, because nothing was read. Any other failure, and that
+    refusal on an ``enforce`` instance, stays FAIL."""
     from messagefoundry.auth.oidc.client_auth import ClientSecretPost
     from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
@@ -245,7 +249,10 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
     # SigningError is a ValueError; catching the base keeps this module off the signing seam.
     except (SecretProviderError, ValueError) as exc:
-        return CheckResult(rid, title, Status.FAIL, str(exc))
+        crossing = _serve_crossing(settings, exc)
+        if crossing is None:
+            return CheckResult(rid, title, Status.FAIL, str(exc))
+        return CheckResult(rid, title, Status.MANUAL, crossing, evidence=str(exc))
     except Exception as exc:  # never raise out of a check
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
     if isinstance(credential, ClientSecretPost):
@@ -258,6 +265,56 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         f"aud={credential.audience}"
         + (", with an x5t#S256 certificate thumbprint" if auth.oidc_client_certificate else "")
         + " (key not shown; confirm the IdP holds its public half)",
+    )
+
+
+def _serve_crossing(settings: ServiceSettings, exc: Exception) -> str | None:
+    """The MANUAL detail for a client-credential read the Vault revocation guard refused where
+    ``serve`` would cross the hop, or ``None`` to keep the FAIL (vault BACKLOG #3619).
+
+    Only that guard's own refusal qualifies, told apart by type and fixed text, never by a
+    substring. It means the hop was off the box, not attested and not CRL-checked, so the posture
+    is the one input ``serve`` would judge it on differently. :func:`revocation_hop_disposition`
+    on those inputs, with the posture ``serve`` derives, is ``serve``'s answer.
+
+    Under ``enforce`` that answer is REFUSE, so the row stays FAIL. Under ``warn`` it is WARN.
+    ``MEFOR_TLS_REVOCATION_ATTESTED`` can only turn that WARN into an ALLOW, and under ``enforce``
+    it changes nothing (BACKLOG #299), so it is not read here. Both crossings are MANUAL, as in
+    :func:`_revocation_row`, and the detail names both. The variable ``serve`` reads is the
+    service's, not the one ``verify`` runs in. Nothing here dials: the hop stays refused."""
+    from messagefoundry.config.secretprovider import SecretProviderError
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.config.tls_policy import (
+        TLS_REVOCATION_ATTESTED_ENV,
+        HopDisposition,
+        revocation_hop_disposition,
+    )
+
+    if not isinstance(exc, SecretProviderError):
+        return None
+    try:
+        from messagefoundry.transports.strict_requests import is_unrevoked_vault_hop_refusal
+    except ImportError:  # no [vault] extra, so no Vault hop was built to refuse
+        return None
+    if not is_unrevoked_vault_hop_refusal(exc.__cause__, "secrets"):
+        return None
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    disposition = revocation_hop_disposition(
+        enforcing=posture.enforcing is not False,
+        is_loopback_hop=False,
+        proxy_proven=False,
+        attested=False,
+        crl_checked=False,
+    )
+    if disposition is not HopDisposition.WARN:
+        return None
+    return (
+        "not read: this Vault hop is off the box, checks no certificate revocation and is not "
+        "attested, and verify refuses it at any [security].enforcement, so nothing was dialled. "
+        "At this enforcement `serve` would cross it and read the credential, with a WARNING, or "
+        f"with none where {TLS_REVOCATION_ATTESTED_ENV} is set in the service's environment. So "
+        "this row cannot say whether the reference resolves: confirm it by hand, or on the first "
+        "`serve` start"
     )
 
 
