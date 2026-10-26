@@ -3383,7 +3383,8 @@ _SIGN_IN_LEGS = (
 
 #: Sign-in described as something that can be off: "auth disabled", "sign-in is optional",
 #: "authentication may be switched off", "auth is not required", "auth is enabled by default",
-#: "disable auth", "turn off auth", "without auth", "with no auth", "no-auth". Only the words
+#: "disable auth", "turn off auth", "without auth", "with no auth", "no-auth", and "requires
+#: authentication by default", which makes it a default that can be changed. Only the words
 #: listed may stand between the subject and its state, so a denial there ("sign-in cannot be
 #: turned off") does not match at all. "off-loopback" and "off-box" are not the state.
 _NOT_ONE_LEG = "".join(rf"(?<!\b{leg} )" for leg in _SIGN_IN_LEGS)
@@ -3393,6 +3394,7 @@ _SIGN_IN_OFF = re.compile(
     r"(?:disabled|optional|opt-in|off(?![-\w])|not (?:required|needed)|(?:enabled|on) by default)"
     rf"|\b(?:disabl\w+|turn\w* off|switch\w* off) (?:the |any )?{_SIGN_IN}\b"
     rf"|\b(?:without|with no) {_SIGN_IN}\b"
+    rf"|\brequires? {_SIGN_IN} by default\b"
     r"|\bno-auth\b",
     re.IGNORECASE,
 )
@@ -3472,6 +3474,8 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Authentication is opt-in.",
         "Auth is enabled by default, and the engine creates no account on its own.",
         "The console prompts for sign-in (authentication is on by default).",
+        # docs/USER-GUIDE.md's network paragraph, as engine PR 2303 left it (vault BACKLOG #3477).
+        "The API binds 127.0.0.1:8765, serves HTTPS, and requires authentication by default.",
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
@@ -3493,6 +3497,8 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "`intake_auth` defaults to `none`, so the listener checks no credential.",
         "Off-box log forwarding needs a collector on another host.",
         "Two-factor authentication is on by default.",
+        "The API serves HTTPS, and always requires sign-in: no setting turns it off.",
+        "The API binds 127.0.0.1:8765 by default and requires auth.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3537,13 +3543,22 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
 
 @pytest.mark.parametrize(
     ("name", "floor"),
-    [("docs/EARLY-ADOPTER-GUIDE.md", 300), ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150)],
+    [
+        ("docs/EARLY-ADOPTER-GUIDE.md", 300),
+        ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150),
+        ("docs/CLOUD-DEPLOYMENT.md", 250),
+        ("docs/CLOUD-PHI-HIPAA.md", 110),
+        ("docs/CONFIGURATION.md", 5000),
+    ],
 )
 def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, floor: int) -> None:
     """The early-adopter guide told the reader to set `[store].require_encryption` to get the
     keyless refusal, and engine PR 2015 retired that. docs/CONTAINER-EXPOSURE-EVALUATION.md said
     the same in three places, and no guard read that file for it (vault BACKLOG #2993, items 5 and
-    6). A keyless start is refused by default. The key keeps the refusal past the audited opt-out."""
+    6). docs/CLOUD-DEPLOYMENT.md, docs/CLOUD-PHI-HIPAA.md and docs/CONFIGURATION.md said it too, and
+    no guard read them either (vault BACKLOG #3477). A keyless start is refused by default. The key
+    keeps the refusal past the audited opt-out. Each floor sits below the file's count on
+    2026-10-26."""
     units = _clauses_and_rows(_doc(name))
     assert len(units) >= floor, (
         f"{name} cut into {len(units)} clause(s) and row(s), floor {floor}: the require_encryption "
@@ -3555,6 +3570,77 @@ def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, f
     assert not credited, (
         f"{name} says require_encryption creates the keyless refusal again: {credited}. A keyless "
         "start is refused by default; the key keeps that refusal past the audited opt-out."
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "floor"),
+    [
+        ("docs/USER-GUIDE.md", 600),
+        ("docs/CLOUD-DEPLOYMENT.md", 250),
+        ("docs/CLOUD-PHI-HIPAA.md", 110),
+    ],
+)
+def test_these_docs_do_not_say_sign_in_can_be_off(name: str, floor: int) -> None:
+    """docs/USER-GUIDE.md said the API requires authentication "by default" and that it is "on by
+    default", and no guard read that file for it (vault BACKLOG #3477). `serve` always requires
+    sign-in: the load refuses both keys that once turned it off (the second-round probe above). The
+    two cloud guides are read too, since they restate the API posture. docs/CONFIGURATION.md is left
+    out: it holds a true sentence the scan reds, the limit ``_says_sign_in_can_be_off`` states. Each
+    floor sits below the file's clause count on 2026-10-26."""
+    clauses = _clauses(_doc(name))
+    assert len(clauses) >= floor, (
+        f"{name} cut into {len(clauses)} clause(s), floor {floor}: the sign-in scan reads too little "
+        "to clear it."
+    )
+    disabled = _says_sign_in_can_be_off(clauses)
+    assert not disabled, (
+        f"{name} says sign-in can be off, or is only a default, again: {disabled}. `serve` always "
+        "requires sign-in."
+    )
+
+
+def test_phi_egress_and_the_feature_map_forwarding_row_state_what_the_code_does() -> None:
+    """docs/PHI.md section 4 called the `[egress]` allowlist opt-in, empty meaning unrestricted, and
+    docs/FEATURE-MAP.md section 8 marked JSON logs and off-box forwarding deferred (vault BACKLOG
+    #3477). Egress is deny-by-default, and both log features are built; only structlog is not."""
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.logging_setup import SyslogForward
+
+    assert settings_module.EgressSettings.model_fields["deny_by_default"].default is True, (
+        "egress is not deny-by-default any more; restate docs/PHI.md section 4."
+    )
+    # The paragraph, not the section: the section's MLLP row says "opt-in mTLS", which is true.
+    egress = [
+        p
+        for p in re.split(r"\n\s*\n", _doc_section("docs/PHI.md", "## 4. Data in transit"))
+        if "Outbound destination allowlist" in p
+    ]
+    assert len(egress) == 1, f"docs/PHI.md section 4 must hold one egress paragraph: {egress}"
+    clauses = _clauses(egress[0])
+    assert len(clauses) >= 4, f"docs/PHI.md's egress paragraph cut into {len(clauses)}, floor 4"
+    assert "(CONFIGURATION.md#egress)" in egress[0], (
+        "docs/PHI.md's egress paragraph must link to CONFIGURATION.md#egress, which states the rule"
+    )
+    opt_in = [c for c in clauses if re.search(r"\bopt-in\b|\bunrestricted\b", c, re.IGNORECASE)]
+    assert not opt_in, f"docs/PHI.md section 4 calls the egress allowlist opt-in again: {opt_in}"
+
+    assert settings_module.LogFormat("json") is settings_module.LogFormat.JSON
+    assert inspect.isclass(SyslogForward)
+    section = _doc_section("docs/FEATURE-MAP.md", "## 8. PHI / Compliance")
+    rows = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in section.splitlines()
+        if line.lstrip().startswith("|") and re.search(r"off-box|JSON log", line, re.IGNORECASE)
+    ]
+    assert rows, "docs/FEATURE-MAP.md section 8 no longer has its off-box forwarding row"
+    # The legend's shipped mark, or its word. The word keeps the new-glyph hook level, since the hook
+    # counts a swap of one glyph for another as an added codepoint.
+    shipped = {"\u2705", "Shipped"}
+    stale = [row for row in rows if row[1] not in shipped]
+    assert not stale, (
+        f"docs/FEATURE-MAP.md section 8 marks JSON logs or off-box forwarding other than shipped: "
+        f"{stale}. Both are built (`[logging].format`, `SyslogForward`)."
     )
 
 

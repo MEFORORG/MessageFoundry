@@ -127,7 +127,7 @@ python -P -X disable-remote-debug -m messagefoundry serve --config samples/confi
 
 When the engine runs from somewhere other than the repo root (e.g. under the service), anchor the value files with `--project-root <repo-root>` so `env()` values don't silently resolve empty — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
 
-**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **requires authentication** by default. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. On the shipped posture, exposing the API takes your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
+**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **always requires sign-in**: no setting turns it off. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. On the shipped posture, exposing the API takes your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
 
 **Store encryption.** Every instance carries patient data, so `serve` **refuses to start** with no store encryption key configured — on `dev` as much as on `prod`. Mint one with `messagefoundry gen-key` (set it as `MEFOR_STORE_ENCRYPTION_KEY`), or on Windows DPAPI-protect it to a file with `messagefoundry protect-key --generate --out <file>` and point `[store].encryption_key_file` at it. To run keyless anyway, set `[security].allow_unencrypted_phi = true` — and under the shipped `[security].enforcement = enforce`, `allow_unencrypted_phi_under_strict_enforcement = true` as well. The dial alone does not clear this refusal. Both acks are audited at every start. The full key story is in [PHI.md](PHI.md).
 
@@ -166,7 +166,7 @@ https://127.0.0.1:8765/ui
 
 The engine always serves HTTPS. With no `[api].tls_cert_file`, it mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`, so the browser warns until you import that file into the trust store or configure your own certificate. The engine renews that certificate by itself at startup once less than a third of its lifetime is left (about 122 of its 365 days), and audits the renewal. The renewed certificate is a new one, so import it again, and replace any copy you pass to `--cacert`.
 
-The web console prompts for sign-in (authentication is on by default). Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
+The web console prompts for sign-in, which is always required. Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
 
 ### 6. Run as a Windows service (NSSM)
 

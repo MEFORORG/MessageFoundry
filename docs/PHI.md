@@ -1302,12 +1302,15 @@ the tray probe's client contexts, since BACKLOG #3414. That function's docstring
 statement of what it does, what else it changes, and what it cannot reach.
 
 **Outbound destination allowlist `[BUILT]` (WP-11c).** The `[egress]` section
-([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed** allowlist for where the engine
-sends: `allowed_mllp` (host / host:port) and `allowed_file_dirs` (directory prefixes). Enforced at
-config **load/reload + start** against the resolved (`env()`-substituted) destination — a non-allowed
-destination is refused (`WiringError` → 422 / refused reload, logged), so a fat-fingered or hostile
-destination can't exfiltrate PHI. Opt-in (empty = unrestricted). The webhook/SMTP alert sinks (no PHI
-bodies) keep their own `[alerts]` host allowlists.
+([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed**, **deny-by-default** allowlist for
+where the engine sends, one list per transport (at least `allowed_mllp` and `allowed_file_dirs`;
+CONFIGURATION.md names them all). Enforced at config **load/reload + start** against the resolved
+(`env()`-substituted) destination — a non-allowed destination is refused (`WiringError` → 422 /
+refused reload, logged), so a fat-fingered or hostile destination can't exfiltrate PHI. A transport
+whose list is empty refuses every destination of its type, unless the operator writes the audited
+opt-out `[security].block_unlisted_outbound = false`; [CONFIGURATION.md](CONFIGURATION.md#egress)
+states that rule and `serve`'s startup gate. The webhook/SMTP alert sinks (no PHI bodies) keep their
+own `[alerts]` host allowlists.
 
 ---
 

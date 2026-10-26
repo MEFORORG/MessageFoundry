@@ -61,18 +61,15 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
    revoke. *(NPRM-anticipated: encryption at rest becomes mandatory rather than "addressable.")*
 2. **Application layer (the engine):** MessageFoundry **also** encrypts PHI columns with **AES-256-GCM** in
    the store, independent of the DB's at-rest encryption, so a DB-file or backup exposure does not yield
-   cleartext PHI. Make it **fail-closed**:
-   - `[store].require_encryption = true` (env `MEFOR_STORE_REQUIRE_ENCRYPTION=true`) — `serve` **refuses to
-     start** without a key, in any environment ([`config/settings.py`](../messagefoundry/config/settings.py),
-     [`__main__.py`](../messagefoundry/__main__.py)).
+   cleartext PHI. It is **fail-closed by default**: running with no key is refused unless the audited
+   opt-out is taken ([PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule).
    - Supply the key via **`MEFOR_STORE_ENCRYPTION_KEY`** (base64 of 32 random bytes —
      `messagefoundry gen-key`), sourced from the secret store (§4); **or** via
-     `[store].encryption_key_file` (a path, e.g. a mounted secret file). These two — `require_encryption`
-     and `MEFOR_STORE_ENCRYPTION_KEY` / `encryption_key_file` — are the **real** controls. (`MEFOR_STORE_REQUIRE_ENCRYPTION=true`
-     IS a real env var — it maps to `[store].require_encryption` — but it does **not** encrypt anything on its
-     own: it only forces a **keyless-start refusal**. You must **also** supply the key var. Earlier drafts
-     implied the boolean alone sufficed; the boolean **and** the key var are both required, names verified
-     against `config/settings.py`.)
+     `[store].encryption_key_file` (a path, e.g. a mounted secret file).
+   - Also set `[store].require_encryption = true` (env `MEFOR_STORE_REQUIRE_ENCRYPTION=true`), so the
+     audited opt-out (`[security].allow_unencrypted_phi`) cannot lift the refusal either. It does
+     **not** encrypt anything on its own, and it does not create the refusal, which is already the
+     default: you must **also** supply the key.
    - Rotate the engine key with `messagefoundry rotate-key` (retired keys via `encryption_keys_retired`).
 
 ---
@@ -179,8 +176,9 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 - [ ] **BAA signed** with the CSP; every PHI-path service is on the provider's **HIPAA-eligible list**.
 - [ ] **KMS CMEK** on the managed DB, block storage, backups/snapshots, and the secret store.
-- [ ] Engine at-rest fail-closed: `MEFOR_STORE_REQUIRE_ENCRYPTION=true` **and** `MEFOR_STORE_ENCRYPTION_KEY`
-      (or `[store].encryption_key_file`) supplied from the secret manager.
+- [ ] Engine at-rest key: `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`) supplied from
+      the secret manager, **and** `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so the audited opt-out
+      (`[security].allow_unencrypted_phi`) cannot start the engine keyless.
 - [ ] **TLS in transit** everywhere: API TLS, MLLP-over-TLS (or edge-relay), DB `encrypt=true` /
       `trust_server_certificate=false`; **`MEFOR_ALLOW_INSECURE_TLS` is NOT set**.
 - [ ] raw-TCP/X12 are loopback/segmented (the gate refuses a public bind) — none published publicly.
