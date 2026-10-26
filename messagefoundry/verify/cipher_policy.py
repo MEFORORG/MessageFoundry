@@ -114,7 +114,9 @@ _OPENSSL_CNF_NAME = "openssl.cnf"
 #: The system file, at the fixed path the row read before BACKLOG #3803 item 2. Without
 #: ``OPENSSL_CONF`` it is read as well as the binary's own file, and the worse reading stands. The
 #: binary is found on ``PATH``, so a planted one can name any ``OPENSSLDIR``. Reading this file too
-#: keeps a planted binary from turning its FAIL into a PASS.
+#: keeps a planted binary from hiding this file's floor FAIL. It does not stop one from supplying
+#: the suite verdict, which comes from the binary's own output, and the file check counts
+#: ``CipherString`` lines without judging what they allow.
 _SYSTEM_CNF = Path("/etc/ssl/openssl.cnf")
 #: The variables OpenSSL reads to find its configuration file and the provider modules and engines
 #: it loads. They cross to the probe on top of the platform's start-up names, which on POSIX hold
@@ -659,10 +661,15 @@ def _linux_policy_readings() -> list[_Reading]:
     it; set but empty, which file ``openssl`` read is not known. Otherwise two files are read: the
     system file at ``_SYSTEM_CNF``, as before BACKLOG #3803 item 2, and ``openssl.cnf`` in the
     ``OPENSSLDIR`` the binary prints (:func:`_openssl_default_file`). The worse reading stands,
-    so a planted ``openssl`` naming a healthy file elsewhere cannot hide a system file's FAIL. One
-    file under both names is read once. With no system file, the binary's file is read alone,
-    unless it sits under a folder on ``PATH``, where a planted binary could have put it; that is
-    MANUAL."""
+    so a planted ``openssl`` naming a healthy file elsewhere cannot hide a system file's floor
+    FAIL. The plant still supplies the suite verdict, from its own output. One file under both
+    names is read once.
+
+    The system file is absent only where ``lstat`` finds nothing there. A link to nothing reads
+    MANUAL and any other error ERROR, as before item 2. With no system file, the binary's file is
+    read: its FAIL stands, but its PASS is capped at MANUAL, because the ``openssl`` on ``PATH``
+    chose that file and nothing checks it. So no planted binary gives a PASS the system file's
+    reading alone would not."""
     named = os.environ.get("OPENSSL_CONF")
     if named == "":
         return [
@@ -674,21 +681,36 @@ def _linux_policy_readings() -> list[_Reading]:
         ]
     if named:
         return [_policy_reading(Path(named))]
-    system = [_policy_reading(_SYSTEM_CNF)] if _SYSTEM_CNF.exists() else []
-    own = _taken("OpenSSL file", _openssl_default_file, _BY_HAND)
-    if isinstance(own, _Reading):
-        return [*system, own]
-    if system:
-        return system if _same_file(own, _SYSTEM_CNF) else [*system, _policy_reading(own)]
-    if holder := _path_folder_holding(own):
-        return [
+    system: list[_Reading] | None  # None: no system file is there
+    try:
+        _SYSTEM_CNF.lstat()
+    except FileNotFoundError:
+        system = None
+    except OSError as exc:
+        system = [
             _Reading(
-                Status.MANUAL,
-                f"OpenSSL file not read ({own} is under {holder}, a folder on PATH, and there is "
-                f"no {_SYSTEM_CNF} to check it against){_BY_HAND}",
+                Status.ERROR,
+                f"OpenSSL file not read: {_SYSTEM_CNF} could not be read: {codec_safe_str(exc)}",
             )
         ]
-    return [_policy_reading(own)]
+    else:
+        system = [_policy_reading(_SYSTEM_CNF, missing=Status.MANUAL)]
+    own = _taken("OpenSSL file", _openssl_default_file, _BY_HAND)
+    if isinstance(own, _Reading):
+        return [*(system or []), own]
+    if system is not None:
+        return system if _same_file(own, _SYSTEM_CNF) else [*system, _policy_reading(own)]
+    reading = _policy_reading(own)
+    if reading.status is not Status.PASS:
+        return [reading]
+    return [
+        _Reading(
+            Status.MANUAL,
+            f"{reading.text}, but there is no {_SYSTEM_CNF} to check it against, and the openssl "
+            f"on PATH chose this file, so its PASS is not taken{_BY_HAND}",
+            evidence=reading.evidence,
+        )
+    ]
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -698,20 +720,15 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
-def _path_folder_holding(path: Path) -> str | None:
-    """The first ``PATH`` folder, as this process has it and the probe gets it, that holds
-    ``path``. An empty entry is the working folder, as a POSIX shell reads it."""
-    target = Path(os.path.realpath(path))
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if target.is_relative_to(os.path.realpath(entry or ".")):
-            return entry or "."
-    return None
-
-
-def _policy_reading(path: Path) -> _Reading:
+def _policy_reading(path: Path, missing: Status = Status.FAIL) -> _Reading:
+    """The reading of one file. ``missing`` is the status where no file is there: FAIL for a file
+    ``openssl`` loads, since OpenSSL then applies no policy, and MANUAL for the system file, which
+    it may not load."""
     try:
         taken = _taken("OpenSSL file", partial(_openssl_policy_lines, path), _BY_HAND)
     except FileNotFoundError as exc:
+        if missing is not Status.FAIL:
+            return _Reading(missing, f"OpenSSL file not read (no file at {exc.filename}){_BY_HAND}")
         return _Reading(
             Status.FAIL, f"no file at {exc.filename}, so openssl applies no system-default policy"
         )

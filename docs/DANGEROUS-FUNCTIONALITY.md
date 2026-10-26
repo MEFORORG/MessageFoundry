@@ -322,8 +322,10 @@ Three argument-list starts are not pinned that way:
   [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
   `verify` with picks the copy. That copy names the folder of the file the floor is read from. So
   without `OPENSSL_CONF`, the row also reads `/etc/ssl/openssl.cnf` itself, and the worse reading
-  stands: a planted `openssl` cannot hide that file's FAIL. On Windows it runs Windows PowerShell
-  by its system-directory path.
+  stands, so a planted `openssl` cannot hide that file's floor FAIL. Where that file is absent, a
+  PASS on the file `openssl` named reads MANUAL. A planted `openssl` still supplies the suite
+  verdict, from its own output. On Windows it runs Windows PowerShell by its system-directory
+  path.
 - `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
   batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
   command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks

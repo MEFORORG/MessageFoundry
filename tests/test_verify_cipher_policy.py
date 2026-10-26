@@ -62,10 +62,9 @@ def _windows(
 @pytest.fixture(autouse=True)
 def _no_system_cnf(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test reads this host's real ``/etc/ssl/openssl.cnf``: the seam names a path that is never
-    there, and a test that wants a system file points it at its own. ``raising=False`` lets the
-    tests run red against code without the seam."""
+    there, and a test that wants a system file points it at its own."""
     absent = Path(__file__).parent / "no-such-folder" / "openssl.cnf"
-    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", absent, raising=False)
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", absent)
 
 
 def _linux(
@@ -1064,14 +1063,13 @@ def test_without_openssl_conf_the_binarys_own_file_is_read(
 ) -> None:
     """BACKLOG #3803 item 2: without ``OPENSSL_CONF``, ``openssl`` loads ``openssl.cnf`` in the
     ``OPENSSLDIR`` it was built with, which need not be ``/etc/ssl``. Before, the row read
-    ``/etc/ssl/openssl.cnf`` whatever the binary loaded, and could judge the floor from it."""
+    ``/etc/ssl/openssl.cnf`` whatever the binary loaded, and could judge the floor from it. With
+    no system file here, the file is read but its PASS is capped at MANUAL (below)."""
     cnf = tmp_path / "openssl.cnf"
     cnf.write_bytes((_CHAIN + _HEALTHY_SECTION).encode("utf-8"))
     monkeypatch.delenv("OPENSSL_CONF", raising=False)
-    monkeypatch.setenv("PATH", str(tmp_path / "bin"))  # a PATH that does not hold the file
     argvs = _openssl_returns(monkeypatch, f'OPENSSLDIR: "{tmp_path}"\n')
     r = _linux_row(monkeypatch)
-    assert r.status is Status.PASS, r.detail
     assert f"{cnf} [system_default_sect]: one CipherString line" in r.detail
     assert argvs == [["openssl", "version", "-d"]]
 
@@ -1098,7 +1096,7 @@ def _system_cnf_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str) -
     system = tmp_path / "etc-ssl" / "openssl.cnf"
     system.parent.mkdir(exist_ok=True)
     system.write_bytes(text.encode("utf-8"))
-    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system, raising=False)
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system)
     return system
 
 
@@ -1110,10 +1108,8 @@ def _system_and_own(
     own_dir: Path | None = None,
 ) -> CheckResult:
     """The row without ``OPENSSL_CONF``. The system file holds ``system`` (``None``: there is
-    none), and ``openssl version -d`` names ``own_dir``, whose ``openssl.cnf`` holds ``own``. PATH
-    is one ``bin`` folder that holds neither, unless ``own_dir`` is put under it."""
+    none), and ``openssl version -d`` names ``own_dir``, whose ``openssl.cnf`` holds ``own``."""
     monkeypatch.delenv("OPENSSL_CONF", raising=False)
-    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
     own_dir = own_dir or tmp_path / "planted"
     own_dir.mkdir(parents=True, exist_ok=True)
     (own_dir / "openssl.cnf").write_bytes(own.encode("utf-8"))
@@ -1162,15 +1158,76 @@ def test_one_file_under_both_names_is_read_once(
     assert r.detail.count(str(tmp_path / "etc-ssl" / "openssl.cnf")) == 1
 
 
-def test_with_no_system_file_a_binary_file_under_path_is_manual(
+def test_with_no_system_file_a_healthy_binary_file_is_manual(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A planted binary can write its own file next to itself, and no system file is there to check
-    it against, so the row does not PASS on it."""
-    healthy = _CHAIN + _HEALTHY_SECTION
-    r = _system_and_own(monkeypatch, tmp_path, None, healthy, own_dir=tmp_path / "bin" / "ssl")
+    """Round-4 findings 1, 3 and 6: the openssl on PATH chose this file and no system file checks
+    it, so a planted binary naming a healthy file anywhere gets no PASS. Main read MANUAL here."""
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
     assert r.status is Status.MANUAL, r.detail
-    assert "a folder on PATH" in r.detail
+    assert "so its PASS is not taken" in r.detail
+
+
+def test_with_no_system_file_a_failing_binary_file_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The file is still read, so a real FAIL in it is not hidden behind a MANUAL."""
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _TLSV1_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
+
+
+def test_a_system_file_that_cannot_be_stat_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-4 finding 5: only nothing there is absent. Any other ``lstat`` error is an ERROR, as
+    an unreadable file was on main, never a reason to read the binary's file alone."""
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION)
+    real_lstat = Path.lstat
+
+    def lstat(self: Path) -> os.stat_result:
+        if self == system:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.ERROR, r.detail
+    assert f"{system} could not be read" in r.detail
+
+
+def test_a_system_file_that_cannot_be_read_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control for the test above at the read, which main also made an ERROR."""
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION)
+    real_read = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self == system:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.ERROR, r.detail
+    assert f"{system} could not be read" in r.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a symbolic link needs a privilege on Windows")
+def test_a_system_file_linking_to_nothing_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-4 finding 5: a link to nothing is there to ``lstat``, so it is not read as absent and
+    the binary's file does not stand alone. It reads MANUAL, as main read it."""
+    system = tmp_path / "etc-ssl" / "openssl.cnf"
+    system.parent.mkdir()
+    system.symlink_to(tmp_path / "nowhere" / "openssl.cnf")
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.MANUAL, r.detail
+    assert "OpenSSL file not read (no file at" in r.detail
+    assert "its PASS is not taken" not in r.detail
 
 
 def test_without_openssl_the_system_file_is_still_read(
