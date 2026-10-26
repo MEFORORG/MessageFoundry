@@ -1775,16 +1775,18 @@ class _SftpClient(_RemoteClient):
         client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
         )
+        if self._accept_unknown and not self._password:
+            # Replaces the AutoAddPolicy above, which saves an accepted key into any save target.
+            # This one pins it in memory only (vault BACKLOG #3533 item 8). Kept apart from the call
+            # above for the CodeQL reason the password branch below gives.
+            client.set_missing_host_key_policy(_PinEscapeHostKey(self._pin_escape_key))
         if self._password:
             # __init__ never sets _accept_unknown for a password login, so the policy above is
             # RejectPolicy. This one refuses the same keys, with text that names the connection
-            # and the fix (vault BACKLOG #3230). Kept apart from the call above so that call reads
-            # as it did before, which CodeQL's dismissed alert 13 is matched against.
+            # and the fix (vault BACKLOG #3230). It is set last, so it wins whatever the flags say.
+            # Kept apart from the call above so that call reads as it did before, which CodeQL's
+            # dismissed alert 13 is matched against.
             client.set_missing_host_key_policy(_RefuseUnknownHostKey(paramiko, name=self._name))
-        if self._accept_unknown:
-            # Replaces the AutoAddPolicy above, which saves an accepted key into any save target.
-            # This one pins it in memory only. Kept apart for the CodeQL reason given above.
-            client.set_missing_host_key_policy(_PinEscapeHostKey(self._pin_escape_key))
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
         # its own approved set. Both are passed on every connect, not behind a setting: a control an
