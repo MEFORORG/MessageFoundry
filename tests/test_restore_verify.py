@@ -23,6 +23,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import (
@@ -30,9 +32,15 @@ from messagefoundry.pipeline.dr_backup import (
     _verify_archive_blocking,
     run_restore_verify,
 )
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    CipherError,
+    UnauthenticatedCipherError,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.store import Stage
 
 
@@ -517,6 +525,29 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
     reason = without_a.reason or ""
     assert reason.startswith("full restore-verify:") and "CipherError" in reason, reason
     assert not live.exists()
+
+
+def test_a_decrypt_miss_renders_the_cipher_error_token_restore_verify_reads() -> None:
+    """The token rule, pinned directly (BACKLOG #3605). A full verify's reason is
+    ``safe_exc`` of the decrypt error, so it names the exception's CLASS, and operators and the
+    rotation test above match the ``CipherError`` token in it. BACKLOG #2593 gave the decrypt miss
+    its own subclass, and the first name it took dropped the token. Nothing failed except that
+    end-to-end match.
+
+    Covered here: the miss a wrong key really raises, and a plain ``CipherError`` (the corrupt-row
+    arms). NOT every subclass: ``CellTagError``, ``QueueTagError`` and
+    ``AuditKeyVersionRefusedError`` deliberately do not end in the token, and none of them reaches
+    restore-verify's per-cell decrypt."""
+    sealed = make_cipher(generate_key()).encrypt("PID|1||SYNTH-0001")
+    with pytest.raises(CipherError) as raised:
+        make_cipher(generate_key()).decrypt(sealed)
+    # The class the miss raises today, so the token below is read off the real raise.
+    assert type(raised.value) is UnauthenticatedCipherError
+    corrupt = CipherError("decrypted value is not valid UTF-8; the row is corrupt")
+    for err in (raised.value, corrupt):
+        rendered = safe_exc(err)
+        assert rendered.startswith(f"{type(err).__name__}: "), rendered
+        assert "CipherError" in rendered, rendered
 
 
 def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(
