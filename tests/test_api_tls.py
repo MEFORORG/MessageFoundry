@@ -1048,7 +1048,8 @@ def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
     warns: bool,
 ) -> None:
     """BACKLOG #2116. A loopback bind with an operator certificate and ``trusted_proxies`` set is an
-    accepted posture since #2055, and nothing in it declares a terminator. The Host such a proxy
+    accepted posture since #2055, and nothing in it declares a terminator. Under ``enforce`` it also
+    needs the public address since vault BACKLOG #3538, so these arms run under ``warn``. The Host such a proxy
     forwards is client-controllable, so a passkey ceremony must fail closed, not take its rp_id
     from it, and ``serve`` says so.
 
@@ -1369,15 +1370,16 @@ def _posture_b_toml(
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
     attestations are under test. ``intra``/``floor`` toggle the two Posture-B knobs. ``terminator=False``
-    leaves out the terminator and the intra-service attestation: the trusted_proxies-only shape
-    (vault BACKLOG #3538), which loads only with ``cert`` set."""
+    leaves out the terminator, the intra-service attestation and the hop acknowledgement (the loader
+    refuses that without a terminator): the trusted_proxies-only shape (vault BACKLOG #3538), which
+    loads only with ``cert`` set."""
     lines = ["[api]", 'trusted_proxies = ["10.0.0.9"]']
     if terminator:
         lines += ["tls_terminated_upstream = true", f'proxy_intra_service_auth = "{intra}"']
     # PRE-SATISFIED by default for the same reason as public_origin below: BACKLOG #1179 made the
     # plaintext-hop acknowledgement a precondition of this topology in every mode. `ack=False`
     # puts that precondition itself under test.
-    if ack:
+    if ack and terminator:
         lines.append("plaintext_upstream_hop_acknowledged = true")
     # An operator certificate beside the terminator: the engine then serves the proxy-to-engine hop
     # over TLS, so there is no plaintext hop to acknowledge. POSIX spelling because a TOML basic
@@ -3543,7 +3545,6 @@ def _reencrypting_proxy_toml(
         loopback=loopback,
         enforcement=enforcement,
         public_origin=public_origin,
-        ack=False,
         cert=_self_signed(tmp_path),
         terminator=False,
     )
@@ -3600,12 +3601,19 @@ def test_reencrypting_proxy_warns_without_the_floor_attestation(
     assert "refusing to serve" not in err
 
 
+_LOOPBACK_ARMS = pytest.mark.parametrize("loopback", [False, True], ids=["offloopback", "loopback"])
+
+
+@_LOOPBACK_ARMS
 def test_reencrypting_proxy_is_probed_at_its_public_origin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
 ) -> None:
     # The attestation is declared and the intra-service attestation is not: this shape owes only
-    # the floor, so it starts. The probe must have dialled the public address.
-    _reencrypting_proxy_toml(tmp_path, floor="1.2")
+    # the floor, so it starts. The probe must have dialled the public address, on loopback too.
+    _reencrypting_proxy_toml(tmp_path, floor="1.2", loopback=loopback)
     probe = _RecordingProbe(ok=True)
     assert _run_reencrypting(tmp_path, monkeypatch, probe) == 0
     assert probe.dialled == ["https://mefor.example.org"]
@@ -3623,12 +3631,16 @@ def test_reencrypting_proxy_refuses_when_the_probe_fails(
     assert "whose TLS floor does not verify" in err and "TLS 1.0 accepted" in err
 
 
+@_LOOPBACK_ARMS
 def test_reencrypting_proxy_refuses_without_a_public_address(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
 ) -> None:
     # The #1026 rule carries over: an unset origin would silently disable the probe, so it refuses,
-    # and the remediation names the key the loader accepts.
-    _reencrypting_proxy_toml(tmp_path, floor="1.2", public_origin=None)
+    # on loopback too, and the remediation names the key the loader accepts.
+    _reencrypting_proxy_toml(tmp_path, floor="1.2", public_origin=None, loopback=loopback)
     probe = _RecordingProbe(ok=True)
     assert _run_reencrypting(tmp_path, monkeypatch, probe) == 2
     err = capsys.readouterr().err

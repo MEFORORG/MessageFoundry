@@ -317,11 +317,14 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
   operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
-  `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` only behind a declared
-  terminator (`[api].tls_terminated_upstream`). With an operator certificate, no declared terminator and no
-  address, this check only warns: the `/ui` origin checks then use the request Host, and passkeys fail closed until the
-  address is set. Other gates can still refuse that start, at least the in-process TLS revocation
-  gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and MFA-at-exposure.
+  `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
+  terminator (`[api].tls_terminated_upstream`). Under `enforce` it also refuses one behind a proxy named
+  in `[api].trusted_proxies` alone, for the ASVS 12.1.1 probe (vault BACKLOG #3538; the
+  `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) has the rule). With an operator
+  certificate, no proxy and no address, this check only warns: the `/ui` origin checks then use the
+  request Host, and passkeys fail closed until the address is set. Other gates can still refuse that
+  start, at least the in-process TLS revocation gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and
+  MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The

@@ -1708,8 +1708,10 @@ class ApiSettings(_Section):
         cannot see the floor that proxy negotiates (vault BACKLOG #3538). Two shapes count: a
         declared terminator, and a proxy named in ``trusted_proxies`` that re-encrypts to an
         operator ``tls_cert_file``. The validator makes a terminator imply ``trusted_proxies``, so
-        this reads that list alone. A proxy that forwards ``X-Forwarded-For`` reads the request,
-        so it has ended the browser's TLS. ``serve`` reads this for the ASVS 12.1.1 probe and the
+        this reads that list alone. It assumes browsers come through a listed proxy, as the
+        exposure rules already do (vault BACKLOG #2251). Where browsers reach the engine directly
+        and the proxy fronts other clients only, the probe dials the engine before it listens and
+        the start refuses. ``serve`` reads this for the ASVS 12.1.1 probe and the
         ``proxy_tls_min_version`` attestation."""
         return bool(self.trusted_proxies)
 

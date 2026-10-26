@@ -3392,10 +3392,9 @@ def _serve(args: argparse.Namespace) -> int:
         # ruling on the substance. The split is the terminator gate's: refuse when enforcing and off
         # loopback, warn otherwise.
         #
-        # `proxy_intra_service_auth` stays terminator-only. The decision covers the floor alone, and
-        # that attestation's premise (#200) is a PLAINTEXT proxy-to-engine segment. Here the engine
-        # serves that hop over TLS on the operator's certificate. Whether the engine should also ask
-        # how it knows its TLS peer is the proxy is not decided here.
+        # `proxy_intra_service_auth` stays terminator-only, because the decision covers the floor
+        # alone. It is not because the hop is TLS here: a terminator with an operator certificate
+        # has the same TLS hop and still owes it. Whether this shape should owe it too is open.
         if not settings.api.proxy_tls_floor_declared:
             if enforcing and not settings.api.is_loopback:
                 print(
@@ -3982,7 +3981,9 @@ def _serve(args: argparse.Namespace) -> int:
     #     ask for `proxy_tls_min_version`: the terminator gate and the `trusted_proxies` arm beside it.
     # The cost is the terminator case's: a start refusal for an unset origin on this shape, and a
     # start that depends on the proxy being reachable. There are no running sites to pay it (CLAUDE.md
-    # section 0), and that is not the reason for the decision either.
+    # section 0), and that is not the reason for the decision either. One limit is this shape's own:
+    # nothing in it says browsers come through the listed proxy. Where they reach the engine directly,
+    # the origin is the engine's, and the probe dials it before uvicorn listens, so the start refuses.
     if settings.api.browser_tls_ends_at_proxy and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 

@@ -2454,8 +2454,8 @@ def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
     prelude = _EXPOSURE_PRELUDE.replace("security.memory_encryption_operator_declared = true\n", "")
     assert prelude != _EXPOSURE_PRELUDE
     # Vault BACKLOG #3538: under `enforce` this shape now meets the ASVS 12.1.1 probe before the
-    # ADR 0152 arm. It gets the public address and floor the probe asks for, and the probe is
-    # stubbed to pass, so the ADR 0152 arm is still the one that refuses.
+    # ADR 0152 arm. It gets the public address the probe dials, and the probe is stubbed to pass, so
+    # the ADR 0152 arm is still the one that refuses.
     monkeypatch.setattr(
         "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
     )
@@ -2468,8 +2468,7 @@ def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
         + 'security.web_console_public_address = "https://mefor.example.org"\n'
         + "approvals.enabled = true\n"
         + _EXPOSURE_TAIL
-        + _trusted_proxy_only_api(tmp_path)
-        + 'proxy_tls_min_version = "1.2"\n',
+        + _trusted_proxy_only_api(tmp_path),
         env="prod",
     )
     assert rc == 2
