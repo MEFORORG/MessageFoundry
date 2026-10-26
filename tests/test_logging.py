@@ -18,14 +18,15 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from messagefoundry import __main__, logging_setup, secretscrub
+from messagefoundry.api.app import _read_log_tail
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
@@ -45,6 +46,7 @@ from messagefoundry.logging_setup import (
 )
 from messagefoundry.redaction import clamp_untrusted, redact
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
+from messagefoundry.support import redact as support_redact
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -2276,29 +2278,77 @@ def _timed_emit(target: str) -> float:
     return time.perf_counter() - start
 
 
-def _access_growth(rounds: int) -> float:
-    """Emit time at the long target over emit time at the short one, both with the DSN marker.
+async def _emit_beside_ticker(target: str) -> tuple[float, float]:
+    """One access record on ``target``, emitted from its own task beside a ticker task on one loop.
 
-    The emits run inside a coroutine on a running event loop, the way uvicorn's own emit does. A
-    ``logging`` emit is synchronous, so every handler filter runs on the loop thread and nothing else
-    on that loop runs until it returns: its duration IS the stall a waiting coroutine sees. That is
-    why this times the emit rather than a sleeping ticker, whose scheduler jitter on Windows swamps
-    the short length.
+    Returns the emit's duration and the LOOP GAP: the longest interval the ticker saw between two
+    consecutive wake-ups, which is how long a waiting coroutine was kept from running. The ticker
+    yields with ``asyncio.sleep(0)``, which puts it straight back on the ready queue with no timer, so
+    neither the Windows timer resolution nor a timed sleep's scheduler jitter enters the reading.
+    Between two of its wake-ups the loop ran only the other ready callbacks, here the emitter's.
 
-    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long emits
-    alternate so load that comes and goes lands on both endpoints rather than on one block."""
-    short_target = _request_target(_ACCESS_GROWTH_LENGTHS[0])
-    long_target = _request_target(_ACCESS_GROWTH_LENGTHS[1])
+    The emitter yields once before it emits, so the ticker has taken its first reading by then and
+    the interval spanning the emit is one the ticker measures."""
+    stop = asyncio.Event()
+    largest_gap = 0.0
 
-    async def measure() -> tuple[float, float]:
-        short = long_ = float("inf")
-        for _ in range(rounds):
-            short = min(short, _timed_emit(short_target))
-            long_ = min(long_, _timed_emit(long_target))
-        return short, long_
+    async def ticker() -> None:
+        nonlocal largest_gap
+        last = time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(0)
+            now = time.perf_counter()
+            largest_gap = max(largest_gap, now - last)
+            last = now
 
-    short, long_ = asyncio.run(measure())
-    return long_ / short
+    async def emitter() -> float:
+        await asyncio.sleep(0)
+        try:
+            return _timed_emit(target)
+        finally:
+            stop.set()
+
+    ticking = asyncio.create_task(ticker())
+    emit_seconds = await asyncio.create_task(emitter())
+    await ticking
+    return emit_seconds, largest_gap
+
+
+def _alternating_growth[T](
+    sample: Callable[[T], Sequence[float]], short: T, long: T, rounds: int
+) -> tuple[float, ...]:
+    """For each reading ``sample`` returns: its minimum on ``long`` over its minimum on ``short``.
+
+    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long samples
+    alternate so load that comes and goes lands on both endpoints rather than on one block. The
+    ratio divides the same work at two lengths, so a box that runs everything k times slower
+    multiplies both endpoints by k, and k cancels."""
+    samples = [(sample(short), sample(long)) for _ in range(rounds)]
+    best_short = map(min, *(on_short for on_short, _ in samples))
+    best_long = map(min, *(on_long for _, on_long in samples))
+    return tuple(lg / sh for sh, lg in zip(best_short, best_long, strict=True))
+
+
+def _access_growth(rounds: int) -> tuple[float, float]:
+    """The growth of the emit time and of the loop gap, long target over short, both with the marker.
+
+    Each sample runs on its own running event loop, the way uvicorn's own emit does. A ``logging``
+    emit is synchronous, so every handler filter runs on the loop thread and nothing else on that loop
+    runs until it returns: its duration should BE the stall a waiting coroutine sees, and the loop gap
+    of :func:`_emit_beside_ticker` measures that stall directly rather than inferring it. The two
+    readings should agree to within the microseconds a loop iteration costs.
+
+    A loop gap is wall-clock time by definition, since what a waiting client pays is wall time, so it
+    is not moved to a CPU-time clock the way some redaction cost arms were; the growth ratio is what
+    keeps it sound on a loaded runner, as :func:`_alternating_growth` says.
+    """
+    emit_growth, gap_growth = _alternating_growth(
+        lambda target: asyncio.run(_emit_beside_ticker(target)),
+        _request_target(_ACCESS_GROWTH_LENGTHS[0]),
+        _request_target(_ACCESS_GROWTH_LENGTHS[1]),
+        rounds,
+    )
+    return emit_growth, gap_growth
 
 
 class _CountingPattern:
@@ -2336,18 +2386,26 @@ class _CountingPattern:
         return counted
 
 
-def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
-    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``.
+def _dsn_passes(
+    monkeypatch: pytest.MonkeyPatch, module: ModuleType, target: str, action: Callable[[], object]
+) -> int:
+    """How many times ``module._DSN_PASSWORD`` was applied to text holding ``target`` during
+    ``action()``.
 
-    ``secretscrub._run`` reads the pattern from the module global on every call, so swapping the
-    global reaches the object the installed filter applies. The needle is the target's first 64
-    characters, all inside the hostile run, which no filter rewrites."""
+    Both ``secretscrub._run`` and ``support.redact.redact_log_line`` read the pattern from their
+    module global on every call, so swapping the global reaches the object they apply. The needle is
+    the target's first 64 characters, all inside the hostile run, which no filter rewrites."""
     seen: list[str] = []
-    recorder = _CountingPattern(secretscrub._DSN_PASSWORD, target[:64], seen)
+    recorder = _CountingPattern(module._DSN_PASSWORD, target[:64], seen)
     with monkeypatch.context() as m:
-        m.setattr(secretscrub, "_DSN_PASSWORD", recorder)
-        _emit_access(target)
+        m.setattr(module, "_DSN_PASSWORD", recorder)
+        action()
     return len(seen)
+
+
+def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
+    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``."""
+    return _dsn_passes(monkeypatch, secretscrub, target, lambda: _emit_access(target))
 
 
 def _credential_pass_inputs(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
@@ -2386,15 +2444,17 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     a file or forwarder here would time a different chain from the one this arm names, and a second
     handler's filters read a record the first one already rewrote.
 
-    One measurement covers both halves of the item. The emit runs on a running event loop and is
-    synchronous there, so its growth across lengths is the growth of the loop stall a client could
-    cause without authenticating, on first deployment. The arm bounds that GROWTH and not the stall's
-    size: an absolute budget is a reading about the runner as much as the code, and a cost-share arm
-    built that way went red on a hosted Windows runner and was deleted.
+    One measurement covers both halves of the item. The emit runs from its own task on a running
+    event loop, beside a ticker task, and returns two readings: how long the emit took, and the
+    longest the ticker waited between two wake-ups, which is the loop stall itself. The arm checks
+    that the wait spans the emit, then bounds the wait's GROWTH across lengths, which is the growth
+    of the stall a client could cause without authenticating, on first deployment. It bounds growth
+    and not the stall's size: an absolute budget is a reading about the runner as much as the code,
+    and a cost-share arm built that way went red on a hosted Windows runner and was deleted.
 
     THE POSITIVE CONTROL runs in the same test: the pre-#1547 pattern is swapped into the module the
-    filter reads, and the same harness must then break the growth bound. Without it, a fast box would
-    pass whatever the pattern did.
+    filter reads, and the same harness must then break the growth bound. Without it, a fast box
+    would pass whatever the pattern did.
 
     THE NEGATIVE ARM IS A COUNT, NOT A CLOCK. The unmarked target still costs every other filter its
     time, so a timing ratio between the two would measure the other filters. Instead the DSN pass is
@@ -2404,12 +2464,13 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     thing between it and the scan. The marked count also proves the growth readings are about a
     chain in which the DSN pass actually ran.
 
-    NOT COVERED HERE, ON PURPOSE: ``messagefoundry/support/redact.py`` carries a twin of this pattern.
-    No logging handler applies it; ``redact_log_line`` does, at READ time, over log text already
-    stored, such as a log tail or a support bundle. A stored access line DOES reach it that way, so the
-    same hostile target is scanned by the twin when the log is read back, off this emit path. Its
-    growth is covered by the growth arm in ``tests/test_log_redaction_secret_domain.py``, and the same
-    file pins the two copies as identical.
+    NOT COVERED HERE, BECAUSE IT IS NOT ON THIS PATH: ``messagefoundry/support/redact.py`` carries a
+    twin of this pattern. No logging handler applies it; ``redact_log_line`` does, at READ time, over
+    log text already stored, such as a log tail or a support bundle. A stored access line reaches it
+    that way, off this emit path, and
+    ``test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time`` drives that path.
+    ``tests/test_log_redaction_secret_domain.py`` times the twin directly and pins the two copies as
+    identical.
     """
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     configure_logging("INFO")
@@ -2477,25 +2538,165 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
             "access lines without one now pay for the scan."
         )
 
+    # The stall premise, read rather than argued: the ticker's longest wait spans the whole emit, so
+    # a waiting coroutine was held off the loop for at least as long as the filters ran.
+    emit_seconds, gap_seconds = asyncio.run(_emit_beside_ticker(_request_target(longest)))
+    assert gap_seconds >= emit_seconds, (
+        f"the ticker's longest wait was {gap_seconds * 1e3:.3f} ms, shorter than the "
+        f"{emit_seconds * 1e3:.3f} ms emit, so the ticker ran during the emit. The loop-gap readings "
+        "below are not measuring the stall; check _emit_beside_ticker's ordering."
+    )
+
     with monkeypatch.context() as m:
         m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
         # Three rounds, against five for the arm under test: the control only has to clear the bound.
-        # Measured 2026-10-13 on a dev box, it read 70x in 2.0 s at three rounds and 112x in 0.6 s at
-        # one. Each endpoint keeps the minimum of three samples, so one slow short emit under load is
-        # discarded rather than pulling the reading under the bound and redding a sound harness.
-        before_growth = _access_growth(rounds=3)
-    assert before_growth > _ACCESS_MAX_GROWTH, (
-        f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
-        f"across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x bound. This harness is not "
-        "exercising the scan, so the assertion below cannot fail. Fix the harness, not the bound."
+        # Measured 2026-10-13 on a dev box, the emit read 70x in 2.0 s at three rounds and 112x in
+        # 0.6 s at one. Each endpoint keeps the minimum of three samples, so one slow short emit under
+        # load is discarded rather than pulling the reading under the bound and redding a sound harness.
+        before_emit, before_gap = _access_growth(rounds=3)
+    # The bound is on the loop gap, the reading the row asks for. The emit time contains no signal
+    # the gap lacks, since the gap spans it, so it rides along in the messages rather than in a
+    # second assertion that would double the chance of a timing red.
+    assert before_gap > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped in, the access chain's loop gap grew only "
+        f"{before_gap:.1f}x (emit time {before_emit:.1f}x) across {_ACCESS_GROWTH_LENGTHS}, under "
+        f"the {_ACCESS_MAX_GROWTH}x bound. This harness is not exercising the scan, so the assertion "
+        "below cannot fail. Fix the harness, not the bound."
     )
 
-    growth = _access_growth(rounds=5)
+    emit_growth, gap_growth = _access_growth(rounds=5)
+    assert gap_growth <= _ACCESS_MAX_GROWTH, (
+        f"one access record held the event loop {gap_growth:.1f}x longer (emit time "
+        f"{emit_growth:.1f}x) for 8x the request-target length, over the {_ACCESS_MAX_GROWTH}x bound; "
+        f"the pre-#1547 pattern measured {before_gap:.0f}x in this run. Something in the installed "
+        "chain scans this target in more than linear time, and the emit holds the loop for all of it."
+    )
+
+
+def _store_access_log(sink: io.StringIO, target: str, log_dir: Path) -> Path:
+    """Emit one access record on ``target`` through the installed chain, and store what the stdout
+    sink received as ``log_dir / "engine.log"``, the way the supervisor's stdout capture stores it.
+
+    The sink is emptied first, so the file holds this one record and nothing logged before it."""
+    sink.seek(0)
+    sink.truncate()
+    _emit_access(target)
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text(sink.getvalue(), encoding="utf-8")
+    return log_dir
+
+
+def _read_back(log_dir: Path) -> list[str]:
+    """One ``GET /logs/tail`` page of ``log_dir``, redaction included."""
+    lines, _, _ = _read_log_tail(str(log_dir), limit=50, offset=0)
+    return lines
+
+
+def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
+    """Read-back time of ``long_dir`` over that of ``short_dir``, as :func:`_alternating_growth`
+    takes it."""
+
+    def timed(log_dir: Path) -> tuple[float]:
+        start = time.perf_counter()
+        _read_back(log_dir)
+        return (time.perf_counter() - start,)
+
+    (growth,) = _alternating_growth(timed, short_dir, long_dir, rounds)
+    return growth
+
+
+def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #1547's ``support/redact.py`` twin, driven end to end through the log read-back path.
+
+    No logging handler applies the twin. ``redact_log_line`` applies it when stored log text is read
+    back: ``GET /logs/tail`` through ``api.app._read_log_tail``, and the support bundle through
+    ``support.bundle._log_tail``, both one ``redact_log_record`` per line. So the hostile target is
+    emitted through the chain production installs, exactly as the arm above does, the stdout it
+    produced is stored as the newest log file, and ``_read_log_tail`` reads it back. Since BACKLOG
+    #2694 that read runs BOTH patterns: the twin first, then ``secretscrub.scrub_credentials`` as a
+    second layer, and this arm times the two together, as the reader runs them.
+
+    The read runs in a worker thread, off the event loop (the route hands it to
+    ``asyncio.to_thread``), so this arm bounds the cost a client can make one request's worker pay,
+    not a loop stall. Like the arm above, it bounds GROWTH across the same two lengths.
+
+    THE POSITIVE CONTROL swaps the pre-#1547 pattern into ``support.redact._DSN_PASSWORD`` ONLY. The
+    fixed ``secretscrub`` copy still runs as the second layer, so the swap isolates the twin, and the
+    same harness must then break the bound.
+
+    THERE IS NO NO-MARKER NEGATIVE ARM HERE, AND THAT IS THE SURFACE, NOT AN OMISSION. The twin is not
+    admission-gated: ``support/redact.py`` says above it that nothing there gates on it, so it scans
+    every line it reads, marker or no marker. A count of zero on an unmarked line would fail against
+    the shipped code. What this arm counts instead is that the twin ran on the stored line, once per
+    read, for a marked AND an unmarked line, which proves the timings are about a path in which the
+    twin actually scanned the hostile run. The row's no-marker control belongs to the gated
+    ``secretscrub`` copy, and the arm above carries it.
+    """
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", sink)
+    configure_logging("INFO")
+
+    # The stored text and the page read back must both still hold the hostile run, or the timings
+    # below are about some other text.
+    short_dir, long_dir = (
+        _store_access_log(sink, _request_target(length), tmp_path / f"len-{length}")
+        for length in _ACCESS_GROWTH_LENGTHS
+    )
+    for length, log_dir in zip(_ACCESS_GROWTH_LENGTHS, (short_dir, long_dir), strict=True):
+        stored = (log_dir / "engine.log").read_text(encoding="utf-8")
+        assert f"GET {_request_target(length)} HTTP/1.1" in stored, (
+            f"the {length}-character target did not reach the stored log intact: {stored[:120]!r}"
+        )
+        lines = _read_back(log_dir)
+        assert len(lines) == 1, f"read back {len(lines)} line(s) from one stored record"
+        assert _hostile_run(length) in lines[0], "the read-back redaction rewrote the hostile run"
+
+    long_len = _ACCESS_GROWTH_LENGTHS[1]
+    count_dirs = {_MARKED_QUERY: long_dir}
+    for number, query in enumerate(("x=nothing", "token=nothing")):
+        target = _request_target(long_len, query)
+        count_dirs[query] = _store_access_log(sink, target, tmp_path / f"count-{number}")
+    for query, log_dir in count_dirs.items():
+        target = _request_target(long_len, query)
+        passes = _dsn_passes(monkeypatch, support_redact, target, partial(_read_back, log_dir))
+        assert passes == 1, (
+            f"reading back the stored line with ?{query} applied the twin {passes} times. One "
+            "redact_log_line call per stored line should apply it once: zero means the read-back "
+            "never reached the twin, so the timings below would be about other passes; more means "
+            "the twin now runs repeatedly."
+        )
+
+    # A DSN password behind the hostile run, in a stored line the write-time chain never saw (an
+    # older line, or one another tool wrote), is still hidden when it is read back.
+    sentinel = "not-a-real-pw-1547"
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "engine.log").write_text(
+        f'2026-10-26T00:00:00Z INFO     uvicorn.access: 127.0.0.1:50123 - "GET /x?next='
+        f'{_hostile_run(long_len)}postgres://svc:{sentinel}@db.invalid:5432/mefor HTTP/1.1" 401\n',
+        encoding="utf-8",
+    )
+    (raw_line,) = _read_back(raw_dir)
+    assert sentinel not in raw_line
+    assert f"postgres://svc:{support_redact.REDACTION_PLACEHOLDER}@db.invalid" in raw_line
+
+    with monkeypatch.context() as m:
+        m.setattr(support_redact, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        before_growth = _read_back_growth(short_dir, long_dir, rounds=3)
+    assert before_growth > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped into the twin, the log read-back grew only "
+        f"{before_growth:.1f}x across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x "
+        "bound. This harness is not exercising the twin, so the assertion below cannot fail. Fix the "
+        "harness, not the bound."
+    )
+
+    growth = _read_back_growth(short_dir, long_dir, rounds=5)
     assert growth <= _ACCESS_MAX_GROWTH, (
-        f"one access record grew {growth:.1f}x for 8x the request-target length, over the "
-        f"{_ACCESS_MAX_GROWTH}x bound; the pre-#1547 pattern measured {before_growth:.0f}x in this "
-        "run. Something in the installed chain scans this target in more than linear time, and the "
-        "emit holds the event loop for all of it."
+        f"reading back one stored access line grew {growth:.1f}x for 8x the request-target length, "
+        f"over the {_ACCESS_MAX_GROWTH}x bound; the pre-#1547 twin measured {before_growth:.0f}x in "
+        "this run. Something on the read-back path scans this line in more than linear time."
     )
 
 
