@@ -3402,7 +3402,7 @@ _SIGN_IN_OFF = re.compile(
 #: default says a setting can change it, which no setting can (vault BACKLOG #3477). A denial makes
 #: it worse, not true ("does not require auth by default"), so no denial clears this pattern.
 _SIGN_IN_DEFAULT = re.compile(
-    rf"\b{_NOT_ONE_LEG}(?:an? )?{_SIGN_IN}\b(?: (?:is|are|be))? required,? by default\b"
+    rf"\b(?:an? )?{_SIGN_IN}\b(?: (?:is|are|be))? required,? by default\b"
     rf"|\brequire[sd]? (?:an? )?{_SIGN_IN}\b,? by default\b"
     # One subject between: "binds 127.0.0.1 by default and requires auth" ties the default to the bind.
     rf"|\bby default,? (?:the |an? )?(?!(?:and|or|but)\b)\w+ requires? (?:an? )?{_SIGN_IN}\b",
@@ -3531,7 +3531,9 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "The API serves HTTPS, and always requires sign-in: no setting turns it off.",
         "The API binds 127.0.0.1:8765 by default and requires auth.",
         "The SMTP relay requires authentication by default.",
-        "By default the LDAP server requires authentication.",
+        # Each matches ``_SIGN_IN_DEFAULT``, and the named system exempts it.
+        "The LDAP server requires authentication by default.",
+        "By default LDAP requires authentication.",
         "Two-factor authentication is required by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
@@ -3620,9 +3622,10 @@ def test_these_docs_do_not_say_sign_in_can_be_off(name: str, floor: int) -> None
     default", and no guard read that file for it (vault BACKLOG #3477). `serve` always requires
     sign-in: the load refuses both keys that once turned it off (the second-round probe above).
 
-    The two cloud guides state no sign-in posture today, so for them this is a floor against a
-    claim arriving, not a reading of one; a table row is read whole, so a claim split across cells
-    still shows. docs/CONFIGURATION.md is left out: it holds at least one true sentence the scan
+    docs/CLOUD-PHI-HIPAA.md section 6 states the posture; docs/CLOUD-DEPLOYMENT.md states none, so
+    for it this is a floor against a claim arriving. A table row is read whole, but the patterns
+    need their words side by side, so a claim split across cells ("| Sign-in | optional |") still
+    passes. docs/CONFIGURATION.md is left out: it holds at least one true sentence the scan
     reds, and a stale "required by default" in its `[auth]` section, both outside what vault BACKLOG
     #3477 was briefed to edit. Each floor sits below the file's count on 2026-10-26."""
     clauses = _clauses_and_rows(_doc(name))
@@ -3674,6 +3677,7 @@ def test_phi_egress_and_the_feature_map_forwarding_row_state_what_the_code_does(
     # The row names `[logging].format` and `[logging].forward_host`, and says serve forwards.
     assert settings_module.LogFormat("json") is settings_module.LogFormat.JSON
     assert {"format", "forward_host"} <= set(settings_module.LoggingSettings.model_fields)
+    assert "allowed_syslog" in settings_module.EgressSettings.model_fields
     main_tree = ast.parse((_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8"))
     assert inspect.isclass(SyslogForward) and _called(main_tree, "SyslogForward"), (
         "serve no longer builds the SyslogForward handler; docs/FEATURE-MAP.md section 8 says "
@@ -3687,9 +3691,10 @@ def test_phi_egress_and_the_feature_map_forwarding_row_state_what_the_code_does(
     ]
     assert rows, "docs/FEATURE-MAP.md section 8 no longer has its off-box forwarding row"
     # The legend's shipped mark, or its word. The word keeps the new-glyph hook level, since the hook
-    # counts a swap of one glyph for another as an added codepoint.
+    # counts a swap of one glyph for another as an added codepoint. Read the cell's first word, so a
+    # trailing "(PR #N)", as section 9 writes it, still reads as shipped.
     shipped = {"\u2705", "Shipped"}
-    stale = [row for row in rows if row[1] not in shipped]
+    stale = [row for row in rows if (row[1].split() or [""])[0] not in shipped]
     assert not stale, (
         f"docs/FEATURE-MAP.md section 8 marks JSON logs or off-box forwarding other than shipped: "
         f"{stale}. Both are built (`[logging].format`, `SyslogForward`)."

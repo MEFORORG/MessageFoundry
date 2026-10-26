@@ -50,7 +50,7 @@ the compliance overlay on top of it.
 
 ## 2. Encryption at rest — KMS CMEK layered with the engine cipher
 
-PHI at rest is protected in **two layers**, and the engine layer is made **fail-closed**:
+PHI at rest is protected in **two layers**, and the engine layer is **fail-closed by default**:
 
 1. **Infrastructure layer (the CSP, under a customer-managed KMS key):** enable **KMS CMEK** (customer
    master / customer-managed key) on:
@@ -137,8 +137,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
   states which accounts owe a factor. An instance is exposed when it has an off-loopback bind, a
   declared TLS-terminating proxy, or a set `[api].trusted_proxies` (vault BACKLOG #2251). An exposed instance with `require_mfa=false` **refuses** to start
   under the shipped `enforce`, unless `[security].allow_single_factor_admin_when_exposed` is set.
-- **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
-  transform can only send to approved destinations — a fail-closed exfiltration guard.
+- **Deny-by-default egress.** Egress denies by default; populate the `MEFOR_EGRESS_ALLOWED_*` lists
+  ([CONFIGURATION.md](CONFIGURATION.md#egress) states the rule), so a transform can only send to approved destinations — a fail-closed exfiltration guard.
 - **Full audit, off-box to your SIEM.** Every PHI access (raw view, summary) is audited with the acting
   user ([`docs/SECURITY.md`](SECURITY.md)). Ship audit + operational logs to your SIEM using the
   **native TLS-syslog forwarder** (`[logging].forward_protocol = "tls"`, RFC 5425 — ADR 0080), which
@@ -183,7 +183,7 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 - [ ] **Private subnets + PrivateLink**; DB not publicly reachable; **no public MLLP ingress** (edge-relay
       or internal NLB only).
 - [ ] **Region-pinned**: DB, compute, KMS keys, backups, secrets all in the approved region.
-- [ ] **Auth + MFA** on; **deny-by-default egress** with populated allow-lists.
+- [ ] **MFA** left on (sign-in is always on); egress allow-lists populated (egress denies by default).
 - [ ] **Audit + logs to the SIEM** over **TLS** — the native TLS-syslog forwarder
       (`[logging].forward_protocol = "tls"` + `forward_tls_ca_file`, RFC 5425) or a TLS-terminating
       collector; **not** the plaintext UDP/TCP forwarder as-is.
