@@ -905,35 +905,91 @@ def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_restarts_after_
     lead, _, rest = detail.partition(". Do that first. ")
     assert rest, detail
     assert "restart" not in lead.lower().replace("before restarting", ""), detail
-    orders = detail.lower().count("restart the engine") + detail.count("still needs a restart")
+    low = detail.lower()
+    orders = sum(
+        low.count(o) for o in ("restart the engine", "still needs", "a restart applies the file")
+    )
     assert orders == 1, detail
     if remedy is None:
         assert rest.startswith("Restart the engine once the reload has applied the file"), detail
     else:
         assert rest.startswith("The reload refused the file for a hop that loads it"), detail
         assert remedy in rest, detail
-        if "Restart the engine" not in remedy:
+        if remedy not in crl_reload._SAYS_RESTART:
             # The fix or the wait comes first, then the CA-file hop's restart.
             assert rest.index(remedy) < rest.index("still needs a restart"), detail
+        else:
+            # A sticky refusal never applies the file, so nothing waits for an apply (#3512).
+            assert "still needs a restart" not in rest, detail
     assert "synthetic reason" not in detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
-def test_a_crl_setting_row_whose_hop_holds_no_stale_copy_still_waits_for_the_reload(
+def test_a_crl_setting_row_whose_hop_holds_no_stale_copy_restarts_with_no_reload_wait(
     ca: _Ca, tmp_path: Path
 ) -> None:
-    # BACKLOG #3512: only the CA-file hop holds a stale copy, but a CRL setting names the file, as
-    # [store].ssl_crl_file can, which records no held copy. A start judges that setting, so the
-    # restart still waits for the reload's verdict. Before the fix the stale copies alone decided,
-    # and the row read "then restart the engine to apply the CA file".
+    # BACKLOG #3512: only the CA-file hop holds a stale copy, and a CRL setting names the file, as
+    # [store].ssl_crl_file can, which records no held copy. The reload judges stale CRL-setting
+    # copies alone (crl_reload._held_by_path), so no verdict comes: the step is a restart, as on
+    # main. A start judges that setting, so the step checks the CRL before restarting rather than
+    # ordering "then restart the engine to apply the CA file" (review round one of #3512).
     hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=_another_ca().key))
 
     detail = _row_detail(bundle)
 
-    assert detail.startswith("Check that the CRL in the CA file is one its CA signed before")
+    assert detail.startswith(
+        "Check that the CRL in the CA file is one its CA signed before restart"
+    )
     assert "then restart the engine to apply the CA file" not in detail
-    assert ". Do that first. Restart the engine once the reload has applied the file" in detail
+    assert "Do that first" not in detail
+    assert "once the reload has applied" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_current_crl_setting_copy_beside_a_stale_ca_file_copy_waits_for_no_reload(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # BACKLOG #3512: hop A already holds the file's CRL through its CRL setting, and hop B a stale
+    # copy through its CA file. No stale CRL-setting copy means no reload verdict to wait for, so
+    # the step is a restart. Hop A still names the file as a CRL setting, so it checks first.
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(ca.pem)
+    both = tmp_path / "ca-and-crl.pem"
+    both.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    stale = _hop(both, crl)
+    both.write_bytes(ca.pem + ca.crl(days=80, number=3, key=_another_ca().key))
+    current = _hop(ca_file, both)
+
+    detail = _row_detail(both)
+
+    assert detail.startswith(
+        "Check that the CRL in the CA file is one its CA signed before restart"
+    )
+    assert "Do that first" not in detail
+    assert "once the reload has applied" not in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in (stale, current))
+
+
+def test_every_reload_remedy_gets_the_ca_file_restart_by_the_reload_s_own_list(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # BACKLOG #3512: cert_expiry adds the CA-file hop's restart after a refused reload's remedy
+    # unless crl_reload counts that remedy as a restart. Both read crl_reload._SAYS_RESTART, so a
+    # renamed or a new remedy is classified once. Before the fix a substring test told
+    # _NOT_PROVABLE, a sticky refusal, to wait for an apply that never comes.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+    fp = crl_fingerprint(both.read_bytes())
+    for remedy in crl_reload._PRECEDENCE:
+        record_reload_refusal(both, ReloadRefusal(fp, "synthetic reason", remedy))
+        try:
+            detail = _row_detail(both)
+        finally:
+            clear_reload_refusal(both)
+        says_restart = remedy in crl_reload._SAYS_RESTART
+        assert ("still needs a restart" in detail) is not says_restart, (remedy, detail)
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
 # --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------
