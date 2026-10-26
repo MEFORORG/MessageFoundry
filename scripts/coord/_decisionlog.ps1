@@ -66,10 +66,23 @@ function New-DecisionId {
     return 'd' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '-' + [Convert]::ToHexString($bytes).ToLowerInvariant()
 }
 
+function Get-DecisionInstant([string]$Id) {
+    # The UTC instant a record id carries, to the millisecond, or $null for a string that is not one.
+    # The gate reads it rather than `ts`, which reads back as a DateTime whose Kind depends on its text.
+    if ($Id -cnotmatch '^d(\d{8}T\d{9})-[0-9a-f]{6}$') { return $null }
+    try {
+        return [DateTime]::ParseExact($Matches[1], 'yyyyMMddTHHmmssfff', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+    } catch {
+        return $null
+    }
+}
+
 function Get-DecisionIdDay([string]$Id) {
     # The id carries its UTC day, so a rating can find its decision by reading one day.
-    if ($Id -cmatch '^d(\d{4})(\d{2})(\d{2})T\d{9}-[0-9a-f]{6}$') { return "$($Matches[1])-$($Matches[2])-$($Matches[3])" }
-    return $null
+    $at = Get-DecisionInstant $Id
+    if ($null -eq $at) { return $null }
+    return $at.ToString('yyyy-MM-dd')
 }
 
 function Invoke-DecisionGh {
@@ -109,7 +122,7 @@ function Format-DecisionComment($Record) {
 $script:DecisionFields = [ordered]@{
     v = 1; id = ''; ts = ''; kind = ''; item = ''; seat = ''; session = ''; account = ''; host = ''; class = ''
     predicates = @(); recommendation = ''; alternatives = @(); undo = ''; confidence = $null; reviewed = 'no'
-    reviewedBy = ''; outcome = ''; ref = ''; rating = ''; note = ''
+    reviewedBy = ''; outcome = ''; ref = ''; rating = ''; note = ''; buildsOn = @(); gate = ''
 }
 
 function Complete-DecisionRecord($Record) {
@@ -346,4 +359,300 @@ function Read-DecisionLog {
 function Get-DecisionDayRange([string]$Day, [int]$Count) {
     $end = [DateTime]::ParseExact($Day, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
     return @(0..($Count - 1) | ForEach-Object { $end.AddDays(-$_).ToString('yyyy-MM-dd') })
+}
+
+# --- What the class B gate reads (docs/AUTONOMY-PLAN.md 4.2 and 4.5-4.7) ---------------------------
+#
+# decision.ps1 -Gate and digest.ps1 both call these, so the digest's tables and the gate's answer are
+# one computation, not two that agree by luck.
+
+function Get-DecisionKillSwitch {
+    # afk-kill.ps1 -Status's word, ON or OFF. Its reason goes to stderr. ON unless the read says OFF.
+    return [string](@(& (Join-Path $script:DecisionHere 'afk-kill.ps1') -Status 2>$null) | Select-Object -Last 1)
+}
+
+function Get-DecisionLatest($Records, [string]$Kind) {
+    # The latest record of a kind per decision it refers to. Ordered by id, which is the UTC write
+    # time to the millisecond with a random tail: `ts` reads back as a DateTime, whose string form
+    # sorts month first and drops the milliseconds.
+    $map = @{}
+    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref } | Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
+    return $map
+}
+
+function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
+    # A decision's outcome: its latest `outcome` record's, else the one it was logged with.
+    if ($Outcomes.ContainsKey([string]$Record.id)) { return [string]$Outcomes[[string]$Record.id].outcome }
+    return [string]$Record.outcome
+}
+
+function Get-DecisionCalibration {
+    <#
+      One seat and class's calibration, plan section 4.2: the owner's disagreement on the trailing 60
+      rated decisions (calibrated at 60 with 3 or fewer; after a breach, 60 ratings newer than it must
+      pass), and the reversal rate over the decisions logged on -RecentDays (a breach above 5
+      percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
+      reads Calibrated.
+    #>
+    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays)
+    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
+    # the latest one, 60 newer ratings must pass before the class is calibrated again.
+    $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
+            Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
+    $n = $verdicts.Count
+    $lastBreach = -1
+    for ($i = 59; $i -lt $n; $i++) {
+        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
+    }
+    $rated = [Math]::Min($n, 60)
+    $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
+    $since = $n - 1 - $lastBreach
+    $blindOk = $false
+    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
+    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    else { $blindOk = $true; 'calibrated' }
+    $recent = @($Decisions | Where-Object { $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
+    $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
+    $revRate = if ($recent.Count) { $revd / $recent.Count } else { 0 }
+    $breach = $revRate -gt 0.05
+    # Invariant culture, so the table reads the same on every machine.
+    $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
+    $rateText = if ($recent.Count) { $pct + $(if ($breach) { ' BREACH' } else { '' }) } else { 'n/a' }
+    return [pscustomobject]@{
+        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $recent.Count; Reversed = $revd
+        RateText = $rateText; Calibrated = ($blindOk -and -not $breach)
+    }
+}
+
+function Get-DecisionReversals($Records) {
+    <#
+      Each reversed decision once: an `outcome` record with outcome `reversed`, deduplicated by its
+      ref, and the earliest such record is when it was reversed. Seat and Item are the DECISION's,
+      joined through the ref, never the seat that logged the outcome. A ref the records do not hold
+      has no Seat, and its Item is the outcome record's own, which may be empty.
+    #>
+    $byId = @{}
+    foreach ($r in @($Records | Where-Object { $_.kind -eq 'decision' })) { $byId[[string]$r.id] = $r }
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and [string]$_.outcome -eq 'reversed' -and $_.ref } | Sort-Object { [string]$_.id })) {
+        $ref = [string]$o.ref
+        if (-not $seen.Add($ref)) { continue }
+        $d = if ($byId.ContainsKey($ref)) { $byId[$ref] } else { $null }
+        $out.Add([pscustomobject]@{
+                Ref  = $ref
+                At   = Get-DecisionInstant ([string]$o.id)
+                Seat = $(if ($d) { [string]$d.seat } else { $null })
+                Item = $(if ($d) { [string]$d.item } else { [string]$o.item })
+            })
+    }
+    return $out.ToArray()
+}
+
+function Get-DecisionBudget {
+    <#
+      Plan 4.5's reversal budget: -Limit reversals inside any 24 hours closes the scope's no-review
+      path for 24 hours from the one that reached the limit. Returns Limit, the reversals in the
+      trailing 24 hours (Count), and ClosedUntil, $null while open. With -Seat it is that seat's
+      budget, limit 2, over the reversals of its own decisions and of every decision the log does
+      not hold (no seat, so charged to all). Without, it is the fleet's, limit 3, over all of them.
+    #>
+    param($Reversals, [datetime]$Now, [string]$Seat = '')
+    $Limit = 3
+    if ($Seat) {
+        $Limit = 2
+        $Reversals = @($Reversals | Where-Object { $_.Seat -eq $Seat -or $null -eq $_.Seat })
+    }
+    $day = [TimeSpan]::FromHours(24)
+    # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
+    # before it can count toward it; a future-dated one is not counted.
+    $times = @($Reversals | Where-Object { $null -ne $_.At -and $_.At -le $Now -and $_.At -gt $Now - $day - $day } | ForEach-Object { $_.At } | Sort-Object)
+    $closedUntil = $null
+    for ($i = $Limit - 1; $i -lt $times.Count; $i++) {
+        if ($times[$i] - $times[$i - $Limit + 1] -lt $day -and $times[$i] + $day -gt $Now) { $closedUntil = $times[$i] + $day }
+    }
+    return [pscustomobject]@{ Limit = $Limit; Count = @($times | Where-Object { $_ -gt $Now - $day }).Count; ClosedUntil = $closedUntil }
+}
+
+function Format-DecisionInstant([datetime]$At) { return $At.ToString('yyyy-MM-ddTHH:mm:ssZ') }
+
+function Test-DecisionUnsampledB($Record, [hashtable]$Ratings) {
+    # A Class B decision the owner has not rated. Plan 4.6 counts these, whoever logged them.
+    return ($Record.kind -eq 'decision' -and [string]$Record.class -eq 'B' -and -not $Ratings.ContainsKey([string]$Record.id))
+}
+
+function Get-DecisionChain {
+    <#
+      Plan 4.6's chain depth for a Class B decision on -Item that builds on -BuildsOn: the larger of
+      the unsampled Class B decisions on -Item reachable through buildsOn links (Walked), and the
+      unsampled Class B decisions on -Item logged in the 24 hours before -Now (Floor). The floor is
+      there because buildsOn is self-reported: a session that names nothing still meets it. Missing
+      lists each linked id the records do not hold; a caller fails closed on it.
+    #>
+    param($Records, [string]$Item, [string[]]$BuildsOn, [datetime]$Now, [hashtable]$Ratings)
+    $byId = @{}
+    foreach ($r in @($Records | Where-Object { $_.kind -eq 'decision' })) { $byId[[string]$r.id] = $r }
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($b in @($BuildsOn | Where-Object { $_ })) { $queue.Enqueue([string]$b) }
+    $walked = 0
+    $missing = [System.Collections.Generic.List[string]]::new()
+    while ($queue.Count) {
+        $id = $queue.Dequeue()
+        if (-not $seen.Add($id)) { continue }
+        if (-not $byId.ContainsKey($id)) { $missing.Add($id); continue }
+        $r = $byId[$id]
+        if ([string]$r.item -eq $Item -and (Test-DecisionUnsampledB $r $Ratings)) { $walked++ }
+        foreach ($p in @($r.buildsOn | Where-Object { $_ })) { $queue.Enqueue([string]$p) }
+    }
+    $floor = @(Get-DecisionRecentUnsampledB -Records $byId.Values -Now $Now -Ratings $Ratings | Where-Object { [string]$_.item -eq $Item }).Count
+    return [pscustomobject]@{ Walked = $walked; Floor = $floor; Depth = [Math]::Max($walked, $floor); Missing = $missing.ToArray() }
+}
+
+function Get-DecisionRecentUnsampledB {
+    # The unsampled Class B decisions logged in the 24 hours before -Now: plan 4.6's floor, per item.
+    param($Records, [datetime]$Now, [hashtable]$Ratings)
+    $since = $Now.AddHours(-24)
+    return @($Records | Where-Object {
+            (Test-DecisionUnsampledB $_ $Ratings) -and ($at = Get-DecisionInstant ([string]$_.id)) -and $at -gt $since -and $at -le $Now
+        })
+}
+
+function Test-DecisionLanderSeat([string]$Seat) {
+    # The Lander, or a roster alias of it (docs/roles/seats.json). An unreadable roster is no
+    # exemption: this only ever relaxes the cost rung, so a fault must not grant it.
+    if (-not $Seat) { return $false }
+    $s = $Seat.Trim().ToLowerInvariant()
+    if ($s -eq 'lander') { return $true }
+    try {
+        $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
+        $alias = ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties[$s]
+        return [bool]($alias -and [string]$alias.Value -eq 'lander')
+    } catch {
+        return $false
+    }
+}
+
+function Get-DecisionJsonValue($Object, [string]$Name) {
+    # A property's value, or $null when the object is not one or lacks it: strict mode throws on a
+    # missing property, and usage.ps1 leaves keys out on some paths on purpose.
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Get-DecisionUsageScript { return (Join-Path $script:DecisionHere 'usage.ps1') }
+
+function Get-DecisionThresholdsFile {
+    # Beside the Steward's watch.py, which reads it from its own directory: <home>\.claude\mefor-usage,
+    # whatever config root this session runs under.
+    $home_ = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    return (Join-Path (Join-Path (Join-Path $home_ '.claude') 'mefor-usage') 'thresholds.json')
+}
+
+function Get-DecisionRungLevels([string]$ThresholdsFile) {
+    <#
+      The session (5-hour) window's start-nothing rung: the HOLD NEW WORK percentage and its
+      time-to-cutoff in minutes. The defaults are korus roles/STEWARD.md section 3's table, the row
+      `| **1. HOLD NEW WORK** | 20 minutes | 80 percent | 90 percent | Start nothing new. ...`
+      (line 444 at korus origin/main 8940b3d): 20 minutes, and the Session column's 80. The weekly
+      column is not read, because only the 5-hour window carries the stop (STEWARD.md 3a; the owner's
+      2026-08-14 ruling quoted there).
+
+      The Steward's thresholds.json overrides them the way its watch.py does: `levels."5-hour"` and
+      `minutes`, each three numbers, HOLD first. The key is "5-hour", as watch.py names the window.
+      A missing file keeps the defaults. A file that cannot be read, or is malformed in a way
+      watch.py would also refuse, throws: the gate then fails closed rather than grade against a
+      guess.
+    #>
+    $holdAt = 80.0
+    $holdMin = 20.0
+    $source = 'korus roles/STEWARD.md section 3 defaults'
+    if (-not [System.IO.File]::Exists($ThresholdsFile)) { return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source } }
+    $doc = [System.IO.File]::ReadAllText($ThresholdsFile) | ConvertFrom-Json -ErrorAction Stop
+    if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile is not a JSON object" }
+    function Get-Triple($Raw, [string]$What) {
+        $vals = @($Raw)
+        if ($Raw -isnot [array] -or $vals.Count -ne 3 -or @($vals | Where-Object { $_ -isnot [int] -and $_ -isnot [long] -and $_ -isnot [double] -and $_ -isnot [decimal] }).Count) {
+            throw "$ThresholdsFile $What is not three numbers"
+        }
+        return @($vals | ForEach-Object { [double]$_ })
+    }
+    $levels = Get-DecisionJsonValue $doc 'levels'
+    if ($null -ne $levels) {
+        if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
+        foreach ($p in $levels.PSObject.Properties) {
+            if ($p.Name -cnotin @('5-hour', 'weekly')) { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
+            $t = Get-Triple $p.Value "levels[$($p.Name)]"
+            if ($p.Name -ceq '5-hour') { $holdAt = $t[0]; $source = $ThresholdsFile }
+        }
+    }
+    $minutes = Get-DecisionJsonValue $doc 'minutes'
+    if ($null -ne $minutes) { $holdMin = (Get-Triple $minutes 'minutes')[0]; $source = $ThresholdsFile }
+    return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source }
+}
+
+function Get-DecisionCostRung {
+    <#
+      Plan 4.7's cost rung, for the account this session runs on: State HIT (at or past the
+      start-nothing rung), OK, or UNKNOWN, and why.
+
+      It reads usage.ps1 -Json, the one reader of the statusLine's published files, in a child pwsh:
+      usage.ps1 runs without strict mode, and an in-process call would inherit the caller's.
+      THE SESSION (5-HOUR) WINDOW ONLY: a weekly rung names a severity and stops nobody (korus
+      roles/STEWARD.md 3a). RATE GOVERNS (STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn
+      rate, the rung is hit when the window is projected to run out within HoldMin minutes and
+      before it resets, whatever the level. Only with no rate is the level the backstop.
+
+      UNKNOWN when the reading is missing, stale, refused, or usage.ps1 calls it UNKNOWN overall (its
+      overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
+      5-hour state does not). A Desktop session that runs no statusLine reads UNKNOWN here; the
+      Steward's status.json fallback that usage-headroom-inject.ps1 prints is not read, because it
+      would be a third copy of watch.py's pool rules.
+    #>
+    param([string]$UsageScript, [string]$ThresholdsFile)
+    function New-DecisionRung([string]$State, [string]$Reason) { [pscustomobject]@{ State = $State; Reason = $Reason } }
+    try { $lv = Get-DecisionRungLevels $ThresholdsFile }
+    catch { return (New-DecisionRung 'UNKNOWN' "the rung levels could not be read: $($_.Exception.Message)") }
+    if (-not [System.IO.File]::Exists($UsageScript)) {
+        return (New-DecisionRung 'UNKNOWN' "the usage reader $UsageScript does not exist")
+    }
+    try {
+        $text = (@(& ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $UsageScript -Json 2>$null) -join "`n").Trim()
+        $j = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return (New-DecisionRung 'UNKNOWN' "usage.ps1 -Json gave no reading: $($_.Exception.Message)")
+    }
+    $overall = [string](Get-DecisionJsonValue $j 'state')
+    if ($overall -eq 'UNAVAILABLE') {
+        return (New-DecisionRung 'HIT' 'usage.ps1 reads UNAVAILABLE: this account has no subscription, so there is no pool to spend')
+    }
+    $five = Get-DecisionJsonValue $j 'five_hour'
+    $pct = Get-DecisionJsonValue $five 'used_percentage'
+    $fiveState = [string](Get-DecisionJsonValue $five 'state')
+    if ($null -eq $five -or $null -eq $pct -or $fiveState -notin @('OK', 'WARN', 'CRITICAL')) {
+        $why = [string](Get-DecisionJsonValue $five 'reason')
+        if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }
+        return (New-DecisionRung 'UNKNOWN' "the 5-hour window is UNKNOWN: $why")
+    }
+    if ($overall -notin @('OK', 'WARN', 'CRITICAL')) {
+        return (New-DecisionRung 'UNKNOWN' "usage.ps1 reads '$overall' overall: $(Get-DecisionJsonValue $j 'statusline_state')")
+    }
+    $pct = [double]$pct
+    $rate = Get-DecisionJsonValue $five 'rate_pct_per_hr'
+    $toEmpty = Get-DecisionJsonValue $five 'minutes_to_empty'
+    $toReset = Get-DecisionJsonValue $five 'minutes_to_reset'
+    $at = "5-hour at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
+    if ($null -ne $rate) {
+        $cut = [double]$rate -gt 0 -and $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
+        if ($cut -and [double]$toEmpty -le $lv.HoldMin) {
+            return (New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets")
+        }
+        return (New-DecisionRung 'OK' "$at. The burn rate governs, and it does not reach the rung")
+    }
+    if ($pct -ge $lv.HoldAt) {
+        return (New-DecisionRung 'HIT' "$at. No burn rate, so the level is the backstop, and it is reached")
+    }
+    return (New-DecisionRung 'OK' "$at. No burn rate; below the level backstop")
 }
