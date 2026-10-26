@@ -186,7 +186,9 @@ fewer. After a breach, any trailing 60 with more than 3, the class stays on the 
 breach above 5 percent. A rating older than the window is not read.
 
 **An unread vault is said aloud.** The digest is marked INCOMPLETE and exits 4, and `decision.ps1
--List` does the same, because an empty answer from an unread log looks like a quiet day.
+-List` does the same, because an empty answer from an unread log looks like a quiet day. A local
+spool file of a day read that cannot be read counts the same way, and the gate then answers
+REVIEW.
 
 ### 6. Cloud sessions
 

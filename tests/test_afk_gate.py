@@ -757,7 +757,7 @@ def test_an_unreadable_spool_file_fails_the_gate_closed(sb: Sandbox) -> None:
     code, doc = gate(sb)
     assert code == REVIEW and "not fully read" in why(doc), why(doc)
     assert "unreadable spool file" in why(doc)
-    listed = sb.run(DECISION, "-List", "-Json")
+    listed = sb.run(DECISION, "-List", "-Json", "-Days", "2")
     assert listed.returncode == 4 and "INCOMPLETE" in listed.stderr, listed.stderr
 
 
@@ -776,6 +776,18 @@ def test_a_pending_record_whose_post_failed_is_not_held_again(sb: Sandbox) -> No
     sb.set_state(fail_post=False)
     second = sb.run(DECISION, "-Flush")
     assert "FLUSHED posted=1 failed=0 held=0" in second.stdout, (second.stdout, second.stderr)
+
+
+def test_the_hold_takes_a_fresh_unreadable_file_and_not_a_far_future_one(sb: Sandbox) -> None:
+    """A fresh file that cannot be read may be a PENDING record a moment from its answer, so it
+    is held. One whose id a clock a day fast minted is not held for a day."""
+    _spool_write(sb, rec(at=ago(minutes=1), item="4242")).write_text("{", encoding="utf-8")
+    _spool_write(sb, rec(at=ago(hours=-24), item="4242", gate="PENDING"))
+    flush = sb.run(DECISION, "-Flush")
+    assert "FLUSHED posted=1 failed=0 held=1 skipped=0" in flush.stdout, (
+        flush.stdout,
+        flush.stderr,
+    )
 
 
 def test_a_spool_file_that_cannot_be_claimed_is_reported(sb: Sandbox) -> None:

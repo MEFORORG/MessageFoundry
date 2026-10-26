@@ -112,6 +112,8 @@ if ($Rate) {
     }
     $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days @($rday)
     $rec = @($res.Records | Where-Object { [string]$_.id -eq $Rate -and $_.kind -eq 'decision' }) | Select-Object -First 1
+    # Found or not, a part of the log that could not be read is said aloud.
+    if ($rec) { foreach ($e in $res.Errors) { [Console]::Error.WriteLine("digest.ps1: WARNING, the log was not fully read: $e") } }
     if (-not $rec) {
         $why = if ($res.Complete) { 'is not in the log' } else { 'could not be read: ' + ($res.Errors -join '; ') }
         [Console]::Error.WriteLine("digest.ps1: decision $Rate $why. Nothing was recorded.")

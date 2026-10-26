@@ -286,10 +286,11 @@ function Read-DecisionSpoolFile([string]$Dir, [string]$Path) {
     throw "it moved each time it was read"
 }
 
-function Read-DecisionSpool([string]$CoordRoot) {
+function Read-DecisionSpool([string]$CoordRoot, [string[]]$Days = @()) {
     <#
       Every spooled record, and an error per file that could not be read. A caller counts an error
-      as an incomplete read: the file may hold a record the gate must count.
+      as an incomplete read: the file may hold a record the gate must count. With -Days, a file
+      whose name dates it to another day is not read, so a bad file fails only the reads of its day.
     #>
     $out = [System.Collections.Generic.List[object]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
@@ -300,6 +301,8 @@ function Read-DecisionSpool([string]$CoordRoot) {
         catch { $errors.Add("the spool $dir could not be listed: $($_.Exception.Message)") }
     }
     foreach ($f in @($files | Where-Object { Test-DecisionSpoolName $_ })) {
+        $day = Get-DecisionIdDay (Get-DecisionSpoolId ([System.IO.Path]::GetFileName($f)))
+        if ($Days.Count -and $day -and $Days -notcontains $day) { continue }
         try {
             $raw = Read-DecisionSpoolFile $dir $f
             if ($null -eq $raw) { continue }
@@ -379,13 +382,16 @@ function Test-DecisionSpoolPending([System.IO.FileInfo]$File) {
       A record whose -Log is still waiting on its gate: PENDING, and minted in the last ten minutes.
       Posting it now would post PENDING for good. Older, its gate crashed or hung, and it is posted
       as it stands. The age is the id's own instant, never the file's write time, which a claim
-      stamps and a failed post carries back. A file this cannot read is not held: the claim takes
-      it, and the claim or the post reports it if it still cannot be read.
+      stamps and a failed post carries back. An id dated past the hold ahead of now came from a
+      clock since corrected, and is not held. A fresh file this cannot read is held, since it may
+      be a PENDING record a moment from its answer; once its id is old, the claim takes it and the
+      claim or the post reports it.
     #>
     $at = Get-DecisionInstant (Get-DecisionSpoolId $File.Name)
-    if ($null -eq $at -or $at -lt [DateTime]::UtcNow.AddMinutes(-$script:DecisionHoldMinutes)) { return $false }
+    $now = [DateTime]::UtcNow
+    if ($null -eq $at -or $at -lt $now.AddMinutes(-$script:DecisionHoldMinutes) -or $at -gt $now.AddMinutes($script:DecisionHoldMinutes)) { return $false }
     try { return [string](Read-DecisionSpoolText $File.FullName | ConvertFrom-Json -ErrorAction Stop).gate -eq 'PENDING' }
-    catch { return $false }
+    catch { return $true }
 }
 
 function Send-DecisionSpool {
@@ -393,13 +399,15 @@ function Send-DecisionSpool {
       Posts every spooled record to its day's issue, oldest first. Returns the count Posted, an
       error per record left (Errors), the count Held, still waiting on its gate
       (Test-DecisionSpoolPending) for the next -Log or -Flush to post, and an entry per file Skipped
-      because it could not be claimed, such as one another process holds open. A file another
-      flusher claimed first is that flusher's to post, and is none of these.
+      because it could not be claimed, such as one another process holds open. Warnings names a
+      record posted whose claim could not be removed. A file another flusher claimed first is
+      that flusher's to post, and is none of these.
     #>
     param([string]$Repo, [string]$CoordRoot)
     $posted = 0; $held = 0
     $errors = [System.Collections.Generic.List[string]]::new()
     $skipped = [System.Collections.Generic.List[string]]::new()
+    $warnings = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
     $stale = [DateTime]::UtcNow.AddMinutes(-$script:DecisionHoldMinutes)
     $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
@@ -421,11 +429,13 @@ function Send-DecisionSpool {
         $claim = Join-Path $dir "$id.json.$PID.posting"
         # A reader holding the file for a moment blocks the rename on Windows, so a refusal is
         # retried briefly; one that outlasts the retries is a lasting lock, reported as Skipped.
-        $taken = $false; $gone = $false; $why = ''
-        for ($try = 1; $try -le 5 -and -not $taken -and -not $gone; $try++) {
+        $taken = $false; $gone = $false; $why = $null
+        for ($try = 1; -not $taken -and -not $gone -and $null -eq $why; $try++) {
             try { [System.IO.File]::Move($f.FullName, $claim); $taken = $true }
             catch [System.IO.FileNotFoundException] { $gone = $true }
-            catch { $why = $_.Exception.Message; Start-Sleep -Milliseconds 100 }
+            catch [System.IO.IOException] {
+                if ($try -ge 5) { $why = [string]$_.Exception.Message } else { Start-Sleep -Milliseconds 100 }
+            } catch { $why = [string]$_.Exception.Message }
         }
         if ($gone) { continue }
         if (-not $taken) { $skipped.Add("$($f.Name): could not be claimed to post: $why"); continue }
@@ -455,14 +465,17 @@ function Send-DecisionSpool {
                 }
                 throw "post failed: $($r.Err)"
             }
-            [System.IO.File]::Delete($claim)
             $posted++
+            # Posted: a claim that cannot be removed now is left as it is, never renamed back, or
+            # the next flush would post the record again at once. A retaken stale claim reads once.
+            try { [System.IO.File]::Delete($claim) }
+            catch { $warnings.Add("$id`: posted, but its claim $claim could not be removed: $($_.Exception.Message)") }
         } catch {
             $errors.Add("$id`: $($_.Exception.Message)")
             try { [System.IO.File]::Move($claim, (Join-Path $dir "$id.json")) } catch { $null = $_ }
         }
     }
-    return [pscustomobject]@{ Posted = $posted; Errors = $errors; Held = $held; Skipped = $skipped }
+    return [pscustomobject]@{ Posted = $posted; Errors = $errors; Held = $held; Skipped = $skipped; Warnings = $warnings }
 }
 
 function Read-DecisionLog {
@@ -472,11 +485,14 @@ function Read-DecisionLog {
       post is answered, so a record that leaves the spool after this read is in the vault before
       the vault read starts. Read the other way round, a record posted between the two reads
       would be in neither, and the gate would count one record too few. A spool file that cannot
-      be read makes the read incomplete, as a vault read that fails does.
+      be read makes the read incomplete, as a vault read that fails does. ONE WINDOW STAYS OPEN: a
+      directory listing is no snapshot, so a file renamed (claimed, or put back after a failed
+      post) while the spool is being listed can be listed under neither name. Closing it needs a
+      claim that does not rename the record; that is not built.
     #>
     param([string]$Repo, [string]$CoordRoot, [string[]]$Days)
     $byId = [ordered]@{}
-    $spooled = Read-DecisionSpool $CoordRoot
+    $spooled = Read-DecisionSpool $CoordRoot -Days $Days
     $errors = [System.Collections.Generic.List[string]]::new()
     foreach ($e in $spooled.Errors) { $errors.Add($e) }
     try {

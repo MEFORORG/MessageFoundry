@@ -15,7 +15,8 @@
 
     -List reads records by day (-Day, default today UTC, and -Days for a range ending there), and
     filters them by -Seat or -Item. It reads the vault and the local spool, and marks a record that
-    is still only spooled. A vault that cannot be read is said aloud and exits 4: an empty answer
+    is still only spooled. A vault, or a spool file of a day read, that cannot be read is said
+    aloud and exits 4: an empty answer
     from an unread log would look like a quiet day.
 
     -Flush posts whatever is spooled, except a record whose -Log is still waiting on its gate (gate
@@ -102,7 +103,8 @@ param(
     [string]$ThresholdsFile = '',
     # How long the cost rung waits on the usage reader before it reads UNKNOWN. A test that holds
     # the reader open names a longer wait, so its checks do not race the default. Capped at five
-    # minutes, well inside the ten a flusher leaves a PENDING record to its gate.
+    # minutes, half the ten a flusher leaves a PENDING record to its gate. That bounds this one
+    # wait only: the gate's gh reads have no timeout of their own.
     [ValidateRange(1, 300)][int]$UsageTimeoutSeconds = 30,
     [ValidateSet('decision', 'tripwire', 'rating', 'outcome')][string]$Kind = 'decision',
     [string]$Item = '',
@@ -303,6 +305,7 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
 
 function Write-Flushed($Result) {
     foreach ($e in @($Result.Errors) + @($Result.Skipped)) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
+    foreach ($e in $Result.Warnings) { [Console]::Error.WriteLine("decision.ps1: WARNING: $e") }
 }
 
 function New-GateAnswer([string]$Result, $Why) {
