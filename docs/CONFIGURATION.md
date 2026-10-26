@@ -2169,12 +2169,12 @@ file, so a refreshed CRL inside one needs a restart, and the expiry alert's `det
 not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
 start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
 its issuer. If the new CRL is expired, not yet in effect, a delta CRL, or unreadable, `detail` says
-to fix it in the CA file before restarting. It says the same for a CRL proven badly signed, and
-that every handshake it judges would fail. Where the engine could not confirm the signature,
-`detail` asks you to check the CRL before restarting and claims no failure: a CA that renewed its
-key can read this way while handshakes still pass (BACKLOG #3512). When the reload has also
+to fix it in the CA file before restarting. It says the same for a CRL proven badly signed, the
+case a start refuses, and that every handshake it judges would fail. Where the engine could not
+confirm the signature, `detail` asks you to check the CRL before restarting and claims no failure,
+for the reasons the start's WARNING cases above give (BACKLOG #3512). When the reload has also
 refused the file for a hop that loads it as its CRL setting, `detail` gives the reload's remedy and
-reason after the CA-file fix. Put a CRL in
+reason after the CA-file fix, which comes first. Put a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.

@@ -58,6 +58,7 @@ from messagefoundry.pipeline.cert_expiry import (
     held_crl_label,
 )
 from messagefoundry.pipeline.crl_reload import reload_replaced_crls
+from messagefoundry.pki import CrlSignature
 from tests.test_cert_expiry import _RecordingSink
 
 
@@ -659,9 +660,37 @@ def test_a_ca_file_crl_from_a_renewed_ca_key_is_unconfirmed_not_failing(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Check that the CRL in the CA file is one its CA signed")
-    assert "could not confirm" in detail
-    assert "where that key did not sign it, every handshake" in detail
+    assert "could not confirm its signature" in detail
+    assert "handshake" not in detail
     assert "Restart the engine" not in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize(
+    ("states", "lead"),
+    [
+        ({"uncheckable"}, "Check that the CRL in the CA file"),
+        ({"unproven", "verified"}, "Check that the CRL in the CA file"),
+        ({"bad", "unproven"}, "Replace the CRL in the CA file with one its CA signed"),
+        ({"unlisted", "verified"}, "Restart the engine to apply the CA file"),
+    ],
+)
+def test_the_ca_file_remedy_follows_the_strongest_signature_state(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, states: set[Any], lead: str
+) -> None:
+    # BACKLOG #3512: the states a CA file's CRLs give, merged. ``bad`` leads over the unconfirmed
+    # two, and only it claims that handshakes fail. ``uncheckable`` has no CRL of its own here.
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
+
+    def _states(pem: bytes, cas: object) -> list[CrlSignature]:
+        return [CrlSignature(f"CRL block {i}", s) for i, s in enumerate(sorted(states), 1)]
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _states)
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith(lead), detail
+    assert ("every handshake it judges would fail" in detail) == ("bad" in states), detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -826,6 +855,7 @@ def test_a_refused_reload_keeps_its_reason_beside_a_ca_file_fix(ca: _Ca, tmp_pat
         clear_reload_refusal(both)
 
     assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
+    assert ". Do that first. The reload also refused the file for a hop that loaded it" in detail
     assert f": {remedy}. Reason: {reason}. Held by: " in detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
