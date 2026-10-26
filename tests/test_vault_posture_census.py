@@ -77,9 +77,9 @@ _LINKS: dict[str, int | None] = {
     "mount_strict_reply_adapter": None,
     "StrictReplyAdapter": None,
     "_refuse_an_unrevoked_vault_hop": None,
-    # the proxy leg's guard, and the pool classes that run it (vault BACKLOG #3561)
-    "_narrowed_pool_classes": None,
+    # the proxy leg's guard, and the decision both guards share (vault BACKLOG #3561)
     "_refuse_an_unrevoked_proxy_leg": None,
+    "_crossed_unrevoked": None,
     # check-privileges
     "probe_vault": None,
     "store_vault_client": None,
@@ -371,18 +371,24 @@ _CENSUS: list[Row] = sorted(
             "StrictReplyAdapter",
             "posture",
         ),
-        # The proxy leg's guard (vault BACKLOG #3561): the adapter hands its posture to its pool
-        # classes, and each tunnelled connection runs the guard before its socket opens.
+        # The proxy leg's guard (vault BACKLOG #3561): the adapter binds its posture into the
+        # guard it hands its pool classes, and both guards decide through one shared function.
         (
             "transports/strict_requests.py",
             "StrictReplyAdapter.__init__",
-            "_narrowed_pool_classes",
+            "_refuse_an_unrevoked_proxy_leg",
             "posture",
         ),
         (
             "transports/strict_requests.py",
-            "_narrowed_pool_classes.NarrowedHTTPSConnection.connect",
             "_refuse_an_unrevoked_proxy_leg",
+            "_crossed_unrevoked",
+            "posture",
+        ),
+        (
+            "transports/strict_requests.py",
+            "_refuse_an_unrevoked_vault_hop",
+            "_crossed_unrevoked",
             "posture",
         ),
         ("verify/checks.py", "check_lockable_accounts._census", "open_store", "-"),

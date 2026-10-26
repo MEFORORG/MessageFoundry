@@ -41,9 +41,6 @@ class _Stopped(Exception):
 class _RecordingContext:
     """Stands in for the TLS context, and records what it was asked to load."""
 
-    #: No CRL flag, which the proxy leg's revocation guard (#3561) reads off the context.
-    verify_flags = 0
-
     def __init__(self) -> None:
         self.loads: list[tuple[object, ...]] = []
 
@@ -89,12 +86,9 @@ def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
     from urllib3.connection import ProxyConfig
     from urllib3.util import parse_url
 
-    # Attested, so the proxy leg's revocation guard (#3561) lets the leg reach the socket stop.
+    # The proxy leg's revocation guard (#3561) has tests of its own; here it lets every leg pass.
     classes = _strict()._narrowed_pool_classes(
-        factory,
-        connector="Vault test hop",
-        revocation_attested=True,
-        attestation_section="secrets",
+        factory, connector="Vault test hop", judge_proxy_leg=lambda _context, _host: None
     )
     cls = classes["https"].ConnectionCls
     conn: Any

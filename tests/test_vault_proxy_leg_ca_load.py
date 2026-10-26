@@ -59,9 +59,6 @@ class _MeasuredPathLoad:
     """Stands in for the TLS context. A CA file with an encryption header raises what the real
     load raised for one; anything else is recorded as loaded."""
 
-    #: No CRL flag, which the proxy leg's revocation guard (#3561) reads off the context.
-    verify_flags = 0
-
     def __init__(self) -> None:
         self.loads: list[tuple[object, ...]] = []
 

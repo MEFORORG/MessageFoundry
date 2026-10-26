@@ -1147,6 +1147,12 @@ def test_the_revocation_refusal_is_told_apart_by_type_and_whole_text() -> None:
 # on the hop's own posture and attestation, off the leg's own context, before its socket opens.
 
 _HTTPS_PROXY = f"https://{_PROXY_HOST}:3128"
+#: The proxy leg guard's arguments, unless a test overrides one: unattested, unknown posture.
+_PROXY_LEG_GUARD: dict[str, Any] = {
+    "connector": "Vault test hop",
+    "revocation_attested": False,
+    "attestation_section": "store",
+}
 
 
 def _proxy_leg(
@@ -1158,15 +1164,10 @@ def _proxy_leg(
     """One call of the proxy leg's guard, on an unchecked context unless one is given."""
     from messagefoundry.transports.strict_requests import _refuse_an_unrevoked_proxy_leg
 
-    arguments: dict[str, Any] = {
-        "connector": "Vault test hop",
-        "revocation_attested": False,
-        "attestation_section": "store",
-    }
     _refuse_an_unrevoked_proxy_leg(
         context if context is not None else _unchecked(),
         proxy_host,
-        **{**arguments, **overrides},
+        **{**_PROXY_LEG_GUARD, **overrides},
     )
 
 
@@ -1255,19 +1256,21 @@ def test_a_proxy_leg_answer_the_guard_does_not_know_refuses(
 
 
 def _proxied_connection(**overrides: Any) -> Any:
-    """A narrowed connection to the Vault through an https proxy, as the adapter's pool opens it."""
+    """A narrowed connection to the Vault through an https proxy, as the adapter's pool opens it,
+    with the real proxy leg guard bound as the adapter binds it."""
+    import functools
+
     from urllib3.connection import ProxyConfig
     from urllib3.util import parse_url
 
     from messagefoundry.transports import strict_requests
 
-    arguments: dict[str, Any] = {
-        "connector": "Vault test hop",
-        "revocation_attested": False,
-        "attestation_section": "store",
-    }
     classes = strict_requests._narrowed_pool_classes(
-        ssl.create_default_context, **{**arguments, **overrides}
+        ssl.create_default_context,
+        connector=_PROXY_LEG_GUARD["connector"],
+        judge_proxy_leg=functools.partial(
+            strict_requests._refuse_an_unrevoked_proxy_leg, **{**_PROXY_LEG_GUARD, **overrides}
+        ),
     )
     # As urllib3's proxy pool builds it: the connection dials the proxy and tunnels to Vault.
     conn = classes["https"].ConnectionCls(
@@ -1287,7 +1290,8 @@ def _proxied_connection(**overrides: Any) -> Any:
 
 def test_the_proxy_leg_is_refused_before_its_socket_opens(dials: list[object]) -> None:
     """The guard runs in the connection's ``connect``, before the socket, so before ``CONNECT``
-    and any proxy credentials cross. Mutation: drop the guard's call from ``connect``."""
+    and any proxy credentials cross. Mutation: drop the guard's call from
+    ``_narrow_the_proxy_leg``."""
     from urllib3.exceptions import NewConnectionError
 
     from messagefoundry.transports.strict_requests import VaultHopRefused
@@ -1310,8 +1314,8 @@ def test_each_proxy_leg_crossing_is_logged_once_for_the_hop(
 ) -> None:
     """Warned and attested crossings of the leg each log one line per process for the hop,
     however many connections cross, and neither names an address. A leg that checks a CRL logs
-    nothing. Mutations: drop either ``_first_crossing`` (three lines of a kind); drop
-    ``not crl_checked`` from the attested line's condition."""
+    no warning. Mutations: drop either ``_first_crossing`` (three lines of a kind); drop
+    ``kind`` from the kinds (the proxy leg shares the Vault leg's line)."""
     from urllib3.exceptions import NewConnectionError
 
     from messagefoundry.secretscrub import scrub_credentials
@@ -1338,11 +1342,11 @@ def test_each_proxy_leg_crossing_is_logged_once_for_the_hop(
         for absent in (_HOST, _PROXY_HOST, "8200", "3128", _TOKEN):
             assert absent not in line, absent
         assert scrub_credentials(line) == line
-    # A leg whose own context checks a CRL crosses on that, with no line.
+    # An unattested leg whose own context checks a CRL crosses on that, with no warning.
     caplog.clear()
     checking = ssl.create_default_context()
     checking.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
-    _proxy_leg(context=checking, posture=_ENFORCING, revocation_attested=True, connector="other")
+    _proxy_leg(context=checking, posture=_NOT_ENFORCING, connector="other")
     assert _proxy_leg_lines(caplog) == []
 
 
@@ -1354,9 +1358,9 @@ def test_each_entry_point_hands_its_posture_to_the_proxy_leg(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Through an https proxy on a warn instance, both legs cross with a line each, and the hop
-    dials the proxy. The posture reaches the proxy leg only if the adapter hands it to its pool
-    classes. Mutation: pass ``posture=None`` to ``_narrowed_pool_classes`` in the adapter (the
-    leg is refused)."""
+    dials the proxy. The posture reaches the proxy leg only if the adapter binds it into the
+    guard it hands its pool classes. Mutation: bind ``posture=None`` there (the leg is
+    refused)."""
     caplog.set_level(logging.WARNING, logger=_LOGGER)
     monkeypatch.setenv("HTTPS_PROXY", _HTTPS_PROXY)
     with pytest.raises(_FAIL_CLOSED) as caught:
