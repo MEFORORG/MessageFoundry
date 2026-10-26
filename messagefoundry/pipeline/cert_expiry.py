@@ -613,8 +613,8 @@ def _ca_file_crl_refusal(
     *,
     ca_file_only: bool,
     held_lapse: datetime.datetime,
-) -> tuple[str, str] | None:
-    """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy)``, or
+) -> tuple[str, str, str] | None:
+    """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy, last)``, or
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
     signature the engine could not confirm (BACKLOG #3512).
 
@@ -627,7 +627,9 @@ def _ca_file_crl_refusal(
     one the engine could not confirm asks for a check (BACKLOG #3512). With ``ca_file_only``, that
     remedy then says to restart. Otherwise a CRL setting names the file too. The caller then orders
     the restart, after the reload's verdict. A CRL not yet in effect is offered a wait only when
-    ``held_lapse``, the soonest a stale held copy lapses, is no earlier than it takes effect. A CRL
+    ``held_lapse``, the soonest a stale held copy lapses, is no earlier than it takes effect. That
+    wait, or the word not to wait, is ``last``: it ends the alert's steps, after any the caller adds
+    for the reload, so a "Do that first" there names the fix. ``last`` is "" otherwise. A CRL
     whose issuer this file does not hold is not refused: the issuer can be an intermediate the peer
     sends, which the reload treats the same way. ``file_facts`` is the lenient reading, which tells
     an expired CRL from one that cannot be judged. Each remedy leads, because the alert instance
@@ -638,6 +640,7 @@ def _ca_file_crl_refusal(
         "whose CA file now holds a CRL the engine cannot judge",
         "Replace the CRL in the CA file with one the engine can judge before restarting: a "
         "restart loads the CA file whole",
+        "",
     )
     try:
         # As the reload does: the time a CRL takes effect is asked below, for its own remedy.
@@ -648,6 +651,7 @@ def _ca_file_crl_refusal(
                 "whose CA file now holds an expired CRL",
                 "Replace the CRL in the CA file with a current one before restarting: a restart "
                 "would load the expired one",
+                "",
             )
         return unjudged
     # No clock skew allowed, unlike a CRL setting's start: nothing at start refuses this CRL, and
@@ -656,16 +660,14 @@ def _ca_file_crl_refusal(
         # The wait is its own sentence, after the fix and its reason, so the alert list's cut
         # keeps both. A hop's copy that lapses before the CRL takes effect refuses every peer in
         # between, wait or restart, so then no wait is offered: the reload's LAPSES_FIRST rule,
-        # read from the held copies' soonest nextUpdate (BACKLOG #3512).
-        wait = (
-            f". Or wait until {log_timestamp(early.this_update)} to restart"
-            if held_lapse >= early.this_update
-            else ". Do not wait: the hop's copy lapses before it takes effect"
-        )
+        # read from the stale held copies' soonest CRL (BACKLOG #3512).
         return (
             "whose CA file now holds a CRL that is not yet in effect",
             "Replace the CRL in the CA file with one in effect now before restarting: until it "
-            f"takes effect it refuses every peer under its issuer{wait}",
+            "takes effect it refuses every peer under its issuer",
+            f". Or wait until {log_timestamp(early.this_update)} to restart"
+            if held_lapse >= early.this_update
+            else ". Do not wait: the hop's copy lapses before it takes effect",
         )
     try:
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
@@ -677,11 +679,18 @@ def _ca_file_crl_refusal(
         try:
             for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True)):
                 states.add(sig.state)
-        except ValueError:
+                if sig.state == "bad":
+                    break  # proven: no later block changes the remedy
+        except Exception:
             # main's check stopped at the first unconfirmed block, so a later block it cannot
-            # read never cost that verdict. Keep the verdict the earlier blocks gave.
+            # check never cost that verdict. Keep the verdict the earlier blocks gave, and log.
             if not states - {"verified", "unlisted"}:
                 raise
+            log.warning(
+                "cert_expiry: could not check a later CRL in a CA file; the earlier CRL's "
+                "signature verdict stands",
+                exc_info=True,
+            )
     except ValueError:
         return unjudged  # OpenSSL loads other CRLs than were judged
     except ssl.SSLError as exc:
@@ -689,6 +698,7 @@ def _ca_file_crl_refusal(
         return (
             "whose CA file OpenSSL cannot load",
             f"Fix the CA file before restarting: OpenSSL cannot load it ({exc.reason or exc})",
+            "",
         )
     except Exception as exc:
         # Not a verdict on the file, such as a disk that refuses the private copy. Said, rather
@@ -698,6 +708,7 @@ def _ca_file_crl_refusal(
             "whose CA file the scan could not check",
             "Check the CRL in the CA file before restarting: the scan could not check it "
             f"({type(exc).__name__}), and tries again each pass",
+            "",
         )
     if "bad" in states:
         # The claim and the fix a start gives a CRL setting in the proven case
@@ -708,6 +719,7 @@ def _ca_file_crl_refusal(
             "Replace the CRL in the CA file with one its CA signed before restarting: a handshake "
             "OpenSSL judges by it fails. If a good CRL from that issuer is already in the file, "
             "remove this one instead",
+            "",
         )
     if states & {"unproven", "uncheckable"}:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
@@ -722,6 +734,7 @@ def _ca_file_crl_refusal(
             f"{check}, then restart the engine to apply the CA file: {unconfirmed}"
             if ca_file_only
             else f"{check} before restarting: {unconfirmed}",
+            "",
         )
     return None
 
@@ -850,6 +863,9 @@ def _judge_crl(
                         now,
                         file_facts,
                         ca_file_only=not crl_setting_too,
+                        # The soonest CRL of any stale copy. The reload's own rule takes the
+                        # newest CRL per issuer, but a CA-file copy records no blocks to apply
+                        # it to, so this can withhold a wait that was safe (BACKLOG #3512).
                         held_lapse=datetime.datetime.fromisoformat(oldest.next_update_iso),
                     )
                 )
@@ -858,13 +874,14 @@ def _judge_crl(
                 # BACKLOG #3176: nothing judges a CA file's CRL at start, so a restart would load
                 # this one, which refuses peers under its issuer or, unconfirmed, might (#3512).
                 # Fix or check it first.
-                why, remedy = unsafe
+                why, remedy, last = unsafe
                 if not bundle_only:
                     # BACKLOG #3512: a stale copy from a CRL setting is what the reload judges
                     # (crl_reload._held_by_path skips CA-file copies), so only then does a restart
                     # wait for its verdict. The CA-file step leads, then the reload's remedy and
                     # the CA-file hop's restart after it, or the restart after the verdict.
                     remedy += f". Do that first. {_after_the_reload(refused)}"
+                remedy += last
             elif bundle_only:
                 # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
                 # A CA file whose CRL was moved out still starts, so a restart is safe then too.

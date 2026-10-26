@@ -708,14 +708,21 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
 
 
 @pytest.mark.parametrize(
-    ("first", "lead"),
+    ("first", "error", "lead"),
     [
-        ("unproven", "Check that the CRL in the CA file"),
-        ("verified", "Replace the CRL in the CA file with one the engine can judge"),
+        ("unproven", ValueError, "Check that the CRL in the CA file is one its CA signed"),
+        ("unproven", RuntimeError, "Check that the CRL in the CA file is one its CA signed"),
+        ("verified", ValueError, "Replace the CRL in the CA file with one the engine can judge"),
+        ("verified", RuntimeError, "Check the CRL in the CA file before restarting: the scan"),
     ],
 )
 def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
-    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: Any, lead: str
+    ca: _Ca,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first: Any,
+    error: type[Exception],
+    lead: str,
 ) -> None:
     # BACKLOG #3512: main's check stopped at the first unconfirmed block, so a later block that
     # raised never cost that verdict. Draining every block must not change that. The control: a
@@ -724,7 +731,7 @@ def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
 
     def _states(pem: bytes, cas: object) -> Iterator[CrlSignature]:
         yield CrlSignature("CRL block 1", first)
-        raise ValueError("synthetic unreadable issuer")
+        raise error("synthetic unreadable issuer")
 
     monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _states)
 
@@ -908,7 +915,9 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     assert (
         ". Do that first. The reload refused the file for a hop that loads it as its CRL" in detail
     )
-    assert f": {remedy}. Reason: {reason}. {_CA_FILE_HOP_RESTARTS}. Held by: " in detail, detail
+    assert f": {remedy}. Reason: {reason}. {_CA_FILE_HOP_RESTARTS}. Or wait " in detail, detail
+    # "Do that first" names the fix, so the wait comes after every step, never between (#3512).
+    assert detail.index(". Or wait until ") > detail.index(". Do that first. "), detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
