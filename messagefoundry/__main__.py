@@ -4728,6 +4728,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls=settings.tls,
             alerts=settings.alerts,
             log_settings=settings.logging,
+            store=settings.store,  # the SQL Server pin (vault BACKLOG #3714)
         ),
         trust_anchors_enforcing=enforcing,
     )

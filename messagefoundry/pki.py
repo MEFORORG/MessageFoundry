@@ -829,12 +829,20 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     A reason string rather than an exception, so a caller raises its own refusal outside any
     handler. The phrase holds an OS error's ``strerror``, a :class:`PinRefused` reason, or the
     type name of a parser error, never the parser's text or the file's bytes."""
-    reason: str
     try:
         with open(path, "rb") as fh:
-            return load_pinned_server_certificate(fh.read())
+            data = fh.read()
     except OSError as exc:
-        reason = f"could not be read: {exc.strerror or type(exc).__name__}"
+        return f"could not be read: {exc.strerror or type(exc).__name__}"
+    return pinned_server_certificate(data)
+
+
+def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
+    """:func:`read_pinned_server_certificate` over bytes already read, for a caller that has read
+    the file once for another check (vault BACKLOG #3714)."""
+    reason: str
+    try:
+        return load_pinned_server_certificate(data)
     except PinRefused as exc:
         reason = f"is not a usable SQL Server pin: {exc}"
     except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like

@@ -21,7 +21,7 @@ controls below, and is **dormant when no anchor is configured** — zero anchors
 byte-identical behaviour (no preflight runs, no audit rows, no new settings effects):
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
-   substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
+   substitute the anchor and defeat the TLS check that trusts it) is **refused** at ``[security].enforcement = enforce``
    and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
    *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
@@ -126,6 +126,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     preflight, so an alert sent during startup, or the forwarder's first records, use a CA not yet
     checked. ``supervise`` builds its own forwarder and runs no preflight. The offline security
     notifier of the recovery commands builds an SMTP hop with no check.
+11. **The SQL Server store pin** (vault BACKLOG #3714). ``[store].ssl_root_cert`` on SQL Server is
+    sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
+    only trust anchor. :func:`collect_anchor_specs` adds it under the label
+    ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
+    items 1 to 4 at start and at every reload. The store checks it too, unaudited, at each open.
+    **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
+    checked bytes are not the loaded bytes.
 """
 
 from __future__ import annotations
@@ -166,6 +173,7 @@ if TYPE_CHECKING:
         ApiSettings,
         AuthSettings,
         LoggingSettings,
+        StoreSettings,
         TlsSettings,
     )
     from messagefoundry.config.wiring import Registry, WiringError
@@ -213,7 +221,8 @@ class AnchorSpec:
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
     ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
-    ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
+    ``"store_sqlserver_pin"`` / ``"inbound:<connection>"`` / ``"outbound:<connection>"`` /
+    ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
     is the optional configured pin, as :func:`parse_anchor_pin` reads it; ``pin_setting``
     names where that pin is set, so a refusal can name the escape.
@@ -924,8 +933,8 @@ def _acl_message(spec: AnchorSpec) -> str:
     rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
-        "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
-        "authentication. Restrict it to owner-only write."
+        "world principal can write it). Anyone who can modify it can substitute the anchor and "
+        "defeat the TLS check that trusts it. Restrict it to owner-only write."
     ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
@@ -1019,7 +1028,7 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} can be replaced through its path, and "
-        "anyone who replaces it can substitute the CA and defeat authentication:"
+        "anyone who replaces it can substitute the anchor and defeat the TLS check that trusts it:"
     ]
     lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=True)]
     check = verdict.path_check
@@ -1091,16 +1100,16 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     if verdict.acl_ok is False:
         if enforcing:
             raise TrustAnchorError(
-                _acl_message(spec) + "\n[security].enforcement=enforce refuses to start"
+                _acl_message(spec) + "\n[security].enforcement=enforce refuses it"
             )
-        log.warning("%s\n[security].enforcement=warn, starting anyway", _acl_message(spec))
+        log.warning("%s\n[security].enforcement=warn, using it anyway", _acl_message(spec))
     if verdict.path_ok is False:
         if enforcing:
             raise TrustAnchorError(
-                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses to start"
+                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses it"
             )
         log.warning(
-            "%s\n[security].enforcement=warn, starting anyway", _path_message(spec, verdict)
+            "%s\n[security].enforcement=warn, using it anyway", _path_message(spec, verdict)
         )
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
@@ -1116,8 +1125,8 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
         return
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
-        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses to start")
-    log.warning("%s\n%s\n[security].enforcement=warn, starting anyway", unknown, fix)
+        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses it")
+    log.warning("%s\n%s\n[security].enforcement=warn, using it anyway", unknown, fix)
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1125,9 +1134,19 @@ def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
     fingerprint. It loads nothing. A consumer that loads the anchor into a context calls
     :func:`verified_anchor_cadata` instead and loads what that returns: calling this and then loading
     the file by path reopens the check-then-load gap BACKLOG #1142, slice 2 closed."""
+    return enforced_anchor_bytes(spec, enforcing=enforcing)[0]
+
+
+def enforced_anchor_bytes(spec: AnchorSpec, *, enforcing: bool) -> tuple[str, bytes]:
+    """:func:`enforce_anchor`, also returning the bytes it checked: ``(fingerprint, data)``.
+
+    For a caller that inspects the file's content itself, so it reads the file once rather than
+    twice, such as the SQL Server pin's validity check (vault BACKLOG #3714). It loads nothing,
+    and it does not make the checked bytes the loaded ones: a consumer that reads the file again
+    by path, as the ODBC driver reads that pin, still reads it again."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return verdict.fingerprint
+    return verdict.fingerprint, verdict.data
 
 
 def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1566,6 +1585,23 @@ def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
     )
 
 
+def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
+    """The SQL Server ``[store].ssl_root_cert`` pin's anchor spec, or ``None`` when the store sends
+    no pin (vault BACKLOG #2223, #3714): another backend, an unset file, or a weakened posture,
+    as :meth:`~messagefoundry.config.settings.StoreSettings.sqlserver_pin_path` decides.
+
+    Under ``Encrypt=strict`` a pin match stands in for the driver's chain, host-name and expiry
+    checks, so this file is the store hop's only trust anchor. The driver reads it by path at each
+    connect, so the spec carries ``loads_verified_bytes=False`` and no fingerprint pin. A
+    PostgreSQL ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not here."""
+    path = store.sqlserver_pin_path()
+    if path is None:
+        return None
+    return AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+
+
 def collect_anchor_specs(
     auth: AuthSettings,
     api: ApiSettings,
@@ -1573,14 +1609,23 @@ def collect_anchor_specs(
     tls: TlsSettings,
     alerts: AlertsSettings,
     log_settings: LoggingSettings,
+    store: StoreSettings,
 ) -> list[AnchorSpec]:
     """Every configured operator-supplied trust anchor in the settings, in a stable order: the OIDC,
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
-    (module item 10). An anchor with no path set is omitted, and so is a dialling CA its hop does
-    not read, so an install with none yields an empty list: the dormant, byte-identical path.
+    (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
+    (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
+    its hop does not read, so an install with none yields an empty list: the dormant,
+    byte-identical path.
 
-    The three dialling sections are keyword arguments with no default on purpose. A caller that
-    left one out would leave its CA unchecked with nothing to say so.
+    The store pin is checked unaudited at each store open, before any connect, because the store
+    that holds the audit rows is not open yet. Here it takes the audited preflight at start and
+    at every reload. As with module item 10, a reload checks the file on disk and changes no hop:
+    the driver reads the file again at each connect, so a changed pin is used by the next connect
+    and audited by the next reload, and no ``restart_required`` row is written for it.
+
+    The four section keywords have no default on purpose. A caller that left one out would leave
+    its anchor unchecked with nothing to say so.
 
     The per-connection inbound CAs are not here: ``serve`` calls this before any graph is loaded.
     :func:`registry_anchor_specs` collects them each time a graph is loaded, at start and at
@@ -1593,6 +1638,7 @@ def collect_anchor_specs(
         internal_ca_anchor_spec(tls),
         alerts_email_anchor_spec(alerts, auth),
         log_forward_anchor_spec(log_settings),
+        store_pin_anchor_spec(store),
     )
     return [spec for spec in candidates if spec is not None]
 

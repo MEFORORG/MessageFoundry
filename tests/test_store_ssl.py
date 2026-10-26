@@ -24,9 +24,11 @@ from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
 
 
-def _ca_file(tmp_path: object) -> str:
-    """A real (empty) file to satisfy the load-time existence validator; contents are never read here."""
-    p = tmp_path / "db-ca.pem"  # type: ignore[operator]
+def _stub_file(tmp_path: object) -> str:
+    """A real file holding only a PEM header: it satisfies the load-time existence validator and is
+    never a usable certificate. Not named for a CA, since SQL Server reads ``ssl_root_cert`` as a
+    server-certificate pin and a CA certificate is refused there (vault BACKLOG #3714 item 13)."""
+    p = tmp_path / "stub.pem"  # type: ignore[operator]
     p.write_text("-----BEGIN CERTIFICATE-----\n")
     return str(p)
 
@@ -158,7 +160,7 @@ def test_build_ssl_default_uses_the_same_call_asyncpg_makes_for_true(
 
 
 def test_build_ssl_pins_ssl_root_cert(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
-    ca = _ca_file(tmp_path)
+    ca = _stub_file(tmp_path)
     captured: dict[str, object] = {}
     real = ssl.create_default_context
 
@@ -373,8 +375,10 @@ def test_connection_string_pin_does_not_lift_the_weakened_refusal(
 ) -> None:
     """A pin is no way around the weakened-TLS refusal: with no escape the string is still refused."""
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    # Load refuses this shape (BACKLOG #3714), so build it past validation, as an embedder could.
+    settings = _ss(ssl_root_cert=_leaf_file(tmp_path)).model_copy(update=overrides)
     with pytest.raises(ValueError, match="SQL Server TLS is weakened"):
-        connection_string(_ss(ssl_root_cert=_leaf_file(tmp_path), **overrides))
+        connection_string(settings)
 
 
 @pytest.mark.parametrize(
@@ -394,7 +398,10 @@ def test_connection_string_escaped_posture_sends_no_pin_and_no_strict(
     """On an escaped dev posture the pin is dropped and strict is not sent. Microsoft documents that
     strict ignores ``TrustServerCertificate``, so sending it would quietly re-enable verification the
     operator switched off, and plaintext cannot be strict at all."""
-    dsn = connection_string(_ss(ssl_root_cert=_leaf_file(tmp_path), **overrides))
+    # Load refuses this shape (BACKLOG #3714), so this is the store's second guard, built past
+    # validation as an embedder could.
+    settings = _ss(ssl_root_cert=_leaf_file(tmp_path)).model_copy(update=overrides)
+    dsn = connection_string(settings)
     assert ";ServerCertificate=" not in dsn
     assert "Encrypt=strict" not in dsn
     assert dsn.rstrip(";").endswith(tail)
@@ -466,14 +473,14 @@ def test_a_file_that_is_not_a_certificate_is_refused_as_a_sqlserver_pin_at_load(
     tmp_path: object,
 ) -> None:
     with pytest.raises(ValidationError, match="not a usable SQL Server pin"):
-        _ss(ssl_root_cert=_ca_file(tmp_path))
+        _ss(ssl_root_cert=_stub_file(tmp_path))
 
 
 # --- backend / existence gating ----------------------------------------------
 
 
 def test_ssl_root_cert_accepted_for_postgres(tmp_path: object) -> None:
-    ca = _ca_file(tmp_path)
+    ca = _stub_file(tmp_path)
     assert _pg(ssl_root_cert=ca).ssl_root_cert == ca
 
 
@@ -484,7 +491,7 @@ def test_ssl_root_cert_accepted_for_sqlserver(tmp_path: object) -> None:
 
 def test_ssl_root_cert_rejected_for_sqlite(tmp_path: object) -> None:
     # SQLite uses no TLS at all → fail loud, not a silent no-op.
-    ca = _ca_file(tmp_path)
+    ca = _stub_file(tmp_path)
     with pytest.raises(ValidationError, match="ssl_root_cert"):
         StoreSettings(backend=StoreBackend.SQLITE, ssl_root_cert=ca)
 
@@ -571,12 +578,61 @@ def test_a_self_signed_ca_true_server_certificate_is_accepted(tmp_path: object) 
     check_pinned_certificate(_ss(ssl_root_cert=pin))
 
 
-def test_the_escaped_posture_does_not_validate_a_pin_it_never_sends(
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"trust_server_certificate": True}, id="verify-off"),
+        pytest.param({"encrypt": False}, id="plaintext"),
+    ],
+)
+def test_a_sqlserver_pin_beside_a_weakened_posture_is_refused_at_load(
+    tmp_path: object, overrides: dict[str, object]
+) -> None:
+    """Vault BACKLOG #3714 item 9: the store sends no pin on a weakened posture, so the pin would be
+    dropped with nothing said. Load refuses it, as ``ssl_crl_file`` refuses its own silent no-op.
+    The controls: the same pin loads on the verifying posture, and PostgreSQL, whose refusal this
+    is not, still loads the weakened shape."""
+    pin = _leaf_file(tmp_path)
+    assert _ss(ssl_root_cert=pin).ssl_root_cert == pin
+    with pytest.raises(ValidationError, match=r"ssl_root_cert requires a verifying SQL Server hop"):
+        _ss(ssl_root_cert=pin, **overrides)
+    assert _pg(ssl_root_cert=pin, **overrides).ssl_root_cert == pin
+
+
+def test_the_escaped_posture_does_not_check_a_pin_it_never_sends(
     tmp_path: object, escape_at_warn: None
 ) -> None:
+    """The store's second guard: settings built past validation with a pin beside a weakened
+    posture send no pin, so the open checks none, not even a CA certificate it would refuse."""
     ca = _ca_cert_file(tmp_path)
-    settings = _ss(ssl_root_cert=ca, trust_server_certificate=True)  # no refusal at load
-    check_pinned_certificate(settings)  # and none at open
+    settings = _ss().model_copy(update={"ssl_root_cert": ca, "trust_server_certificate": True})
+    check_pinned_certificate(settings)
+
+
+def test_the_store_open_check_reads_the_pin_once(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3714 item 3: the certificate checks read the bytes the anchor checks read, so
+    the open reads the file once. Before, it read it twice: once for the certificate and once for
+    the anchor checks, so a file swapped between the two had each half judge a different file."""
+    import builtins
+    import io
+    import os
+
+    pin = _leaf_file(tmp_path)
+    settings = _ss(ssl_root_cert=pin)
+    real_open = io.open
+    opened: list[str] = []
+
+    def counting_open(file: object, *args: object, **kwargs: object) -> object:
+        if isinstance(file, (str, os.PathLike)) and os.fspath(file) == pin:
+            opened.append(pin)
+        return real_open(file, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    monkeypatch.setattr(io, "open", counting_open)
+    check_pinned_certificate(settings, posture=HopPosture(enforcing=True))
+    assert opened == [pin]
 
 
 async def test_store_open_refuses_an_expired_pin_before_any_connect(tmp_path: object) -> None:

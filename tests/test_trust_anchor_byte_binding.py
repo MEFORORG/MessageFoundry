@@ -795,7 +795,7 @@ def test_an_unjudged_inbound_ca_follows_the_construction_posture(
         build(s)  # no posture stamped
     with active_hop_posture(HopPosture(enforcing=False)):
         assert _subjects(build(s)) == ["good-ca"]
-    assert "starting anyway" in caplog.text
+    assert "using it anyway" in caplog.text
     pinned = _inbound(good, anchor, pin=hashlib.sha256(good.pem).hexdigest())
     with active_hop_posture(HopPosture(enforcing=True)):
         assert _subjects(build(pinned)) == ["good-ca"]
