@@ -10,12 +10,15 @@ These tests fail if a default cap of 4 comes back in either script:
 
 1. a statement records ``capacity`` as null, with no upper bound on its counts, and prints no
    ceiling; a 4 carried on an old record is replaced with null on the next write. The key stays,
-   because an older lane.ps1 on another branch assigns it and throws under StrictMode without it;
+   because an older lane.ps1 on another branch assigns it, and that throws when the key is missing;
 2. ``-Capacity`` is not a parameter any more, so a caller cannot reintroduce a cap by passing one;
 3. the dispatcher arm of the hook reports a lane that states 0 free and 4 in flight, on a record
    still naming capacity 4, with its counts and with no capacity verdict. Against the scripts before
    this change it printed ``AT-CAPACITY`` and ``of 4``;
-4. the hook's own self-test passes.
+4. the hook's own self-test passes;
+5. a builder lane whose level is 45 minutes old is asked to restate. Its age is how a level stated
+   under the old ceiling ages out, and the hook read every stamp hours in the future on a machine
+   west of UTC until this change.
 """
 
 from __future__ import annotations
@@ -223,9 +226,31 @@ def test_the_dispatcher_report_has_no_capacity_verdict(tmp_path: Path) -> None:
     assert "capacity" not in text.lower(), text
     assert "of 4" not in text, text
     assert "4 in flight, 0 free by work" in text, text
+    # A level stated just now is not in the future. West of UTC the old age read said -300m here.
+    assert "stated -" not in text, text
 
 
 def test_the_hook_self_test_passes(tmp_path: Path) -> None:
     proc = _ps(HOOK, tmp_path, "-SelfTest")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "none of them can read a lane as full" in proc.stdout, proc.stdout
+
+
+NAG = "Your lane level is unstated or stale"
+
+
+@pytest.mark.parametrize(("minutes_ago", "nags"), [(0, False), (45, True)])
+def test_a_builder_lane_is_asked_again_once_its_level_ages(
+    tmp_path: Path, minutes_ago: int, nags: bool
+) -> None:
+    """The 0-minute case is the control: the nag below is the age's, not the record's shape's."""
+    shared = tmp_path / "shared" / "mefor-coord"
+    (shared / "lanes").mkdir(parents=True)
+    builder = _git_repo(tmp_path / "builder-lane")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes_ago * 60))
+    lane = {"v": 1, "statedFree": 0, "statedInFlight": 1, "statedUtc": stamp, "turnsSinceStated": 0}
+    (shared / "lanes" / f"{_box_key(builder)}.json").write_text(json.dumps(lane), encoding="utf-8")
+
+    proc = _ps(HOOK, builder, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
+    assert proc.returncode == 0, proc.stderr
+    assert (NAG in proc.stdout) is nags, proc.stdout

@@ -10,8 +10,8 @@
     Nothing else in the fleet may write those numbers -- not a Manager, not a hook, not an inference
     from claims.
 
-    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). This is the one place the tooling states
-    it; lane-level.ps1 and tests/test_coord_lane_no_ceiling.py point here. The four-item lane
+    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). This header is the tooling's record of the
+    ruling; lane-level.ps1 and tests/test_coord_lane_no_ceiling.py cite it. The four-item lane
     ceiling, the start-throttle by burn, any WIP limit on briefing, and the -Capacity parameter
     that defaulted to 4 are retired. Builders and Managers work at full speed; usage is governed by
     the Steward's holds and the korus Workflow gate, never by this script. Nothing it records is a
@@ -28,7 +28,8 @@
     condition is FREE. A claim you are not currently able to progress is FREE work wearing an
     occupied label, and that mislabelling is the outage. With no ceiling there are no empty slots,
     so -Free counts those held items and nothing else. A level stated before 2026-10-26 may also
-    count empty slots under the retired ceiling; the hook asks for a fresh level within 15 minutes.
+    count empty slots under the retired ceiling. lane-level.ps1 asks a lane in a worktree named
+    builder* for a fresh level after 15 minutes; a lane in a worktree named otherwise is never asked.
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
@@ -250,11 +251,12 @@ if ($Asked) {
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
 # `capacity` IS WRITTEN AS NULL, NEVER DROPPED. An older lane.ps1, run from another worktree's branch,
-# assigns $rec.capacity on every statement, and under StrictMode that throws when the property is
-# missing, so that lane could not restate. Null is a value that names no cap; a record written before
-# the ceiling was retired holds 4 there until this next write replaces it. This branch's
-# lane-level.ps1 reads none of it. An older copy of that hook falls back to 4 whatever this field
-# holds, so only replacing that reader retires the ceiling there.
+# assigns $rec.capacity on every statement, and assigning a property a PSCustomObject lacks throws,
+# so that lane could not restate. Null is a value that names no cap; a record written before the
+# ceiling was retired holds 4 there until this next write replaces it. This branch's lane-level.ps1
+# reads none of it. An older copy of that hook falls back to 4 whatever this field holds, and reads
+# 0 free with 2 or more in flight as full, which under the new meaning of -Free it does sooner. Only
+# replacing that reader, wherever it is installed, retires the ceiling there.
 $rec | Add-Member -NotePropertyName capacity -NotePropertyValue $null -Force
 # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
 $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force

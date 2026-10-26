@@ -67,8 +67,22 @@ function Read-Json([string]$Path) {
 }
 
 function Get-AgeMin($utc) {
+    # ConvertFrom-Json hands back statedUtc as a [datetime] with Kind=Utc. [datetime]::Parse on that
+    # stringifies it with no zone, re-reads it as local, and adds the offset again, so a stamp 45
+    # minutes old read as hours in the future and the STALE and re-prompt checks never fired.
+    # lane.ps1 documents the same trap at its statedUtc guard; this mirrors its fix.
     if (-not $utc) { return $null }
-    try { return [math]::Round(([datetime]::UtcNow - ([datetime]::Parse($utc)).ToUniversalTime()).TotalMinutes, 0) }
+    try {
+        $at = if ($utc -is [datetime]) {
+            if ($utc.Kind -eq 'Local') { $utc.ToUniversalTime() }
+            else { [datetime]::SpecifyKind($utc, [System.DateTimeKind]::Utc) }
+        } else {
+            [datetime]::Parse([string]$utc, [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        }
+        return [math]::Round(([datetime]::UtcNow - $at).TotalMinutes, 0)
+    }
     catch { return $null }
 }
 
@@ -124,10 +138,11 @@ function Get-LaneVerdict($rec, [string]$boxKey) {
 }
 
 $BLIND = @'
-  CANNOT SEE: whether the number is right, whether an item concluded since it was typed, or anything
-  about a lane that writes no record. Every number above is a QUOTE from that lane, never a
-  measurement, and never derived from claims. A number changes when the LANE RESTATES, not when you
-  dispatch. There is no item ceiling, so no count above is a reason to stop briefing.
+  CANNOT SEE: whether the number is right, whether an item concluded since it was typed, whether a
+  Steward hold is in force, or anything about a lane that writes no record. Every number above is a
+  QUOTE from that lane, never a measurement, and never derived from claims. A number changes when the
+  LANE RESTATES, not when you dispatch. There is no item ceiling, so no count above is a reason to
+  stop briefing; a hold is, and this hook does not read holds.
 '@
 
 if ($SelfTest) {
@@ -313,7 +328,8 @@ foreach ($c in $cands) {
     # so a lane silent for hours is one nobody is dispatching to. Measured today the live lanes sat at
     # 0.1h and 0.2h and the next candidate at 10.2h -- a real gap, not a threshold fitted to noise.
     # If this ever DROPS a live lane, `discovered` falls below `expected` and the ROSTER DRIFT block
-    # fires. Narrowing can therefore cost noise; it can never hide a lane silently.
+    # fires. Narrowing can therefore cost noise; while the expected count is right, it cannot hide
+    # a lane silently.
     if (((([datetime]::UtcNow) - $c.at).TotalHours) -gt 6) { continue }
     $lanes += $c
 }
@@ -353,7 +369,7 @@ $unknownLive = @($verdicts | Where-Object { $unknownBoxes -contains $_.box }).Co
 
 # NO VERDICT OF FULLNESS, AND NO SILENCE BOUGHT BY ONE. There is no item ceiling (see the header), so
 # the counts are reported as quoted and the hook speaks on every dispatcher turn.
-Say "[lane] $discovered LANES, EACH NUMBER BY ITS OWN STATEMENT. There is no item ceiling."
+Say "[lane] $discovered LANES, EACH NUMBER BY ITS OWN STATEMENT."
 foreach ($v in ($verdicts | Sort-Object box)) {
     $lbl = ("$($v.occ) $($v.conf)").Trim()
     $pad = '{0,-28} {1,-20}' -f $v.box, $lbl
@@ -366,7 +382,7 @@ foreach ($v in ($verdicts | Sort-Object box)) {
             Say "  $pad prompted on its own turns and never answered. The hook runs"
             Say ('  {0,-28} {1,-20} there; the number is not coming. Ask the lane directly.' -f '', '') }
         'UNREADABLE' {
-            Say "  $pad its level file did not parse. NO verdict for this lane, and"
+            Say "  $pad its level file did not parse, or lacks a count. NO verdict, and"
             Say ('  {0,-28} {1,-20} this is NOT a pass.' -f '', '') }
         default {
             $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
@@ -381,10 +397,8 @@ foreach ($v in ($verdicts | Sort-Object box)) {
         Say ('  {0,-28} {1,-20} cannot say this lane is alive. An unevaluated fence is not a' -f '', '')
         Say ('  {0,-28} {1,-20} passed one, and any level above may be from a session that is gone.' -f '', '') }
 }
-Say "  coverage: $discovered lanes discovered, at least $EXPECTED_LANES expected, $unknownLive with liveness unknown."
-# A FLOOR, NOT A CAP. A shortfall is what a lane invisible to discovery looks like. More lanes than
-# that is ordinary at full speed and says nothing about a missing one.
-if ($discovered -lt $EXPECTED_LANES) {
+Say "  coverage: $discovered lanes discovered, $EXPECTED_LANES expected, $unknownLive with liveness unknown."
+if ($discovered -ne $EXPECTED_LANES) {
     Say '  ROSTER DRIFT: a lane with every hook off writes no seat record and no level, so it is'
     Say "  invisible to discovery too. Do not read '$discovered of $discovered' as healthy."
 }
