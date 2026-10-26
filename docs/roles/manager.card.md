@@ -31,8 +31,8 @@ item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When 
 request*, holds the steps.
 
 **No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed: at least the open
-PR count, the merge queue and the merge rate never limit it, and no item count caps a wave PR.
-Usage does: a Steward hold or the 90 percent Workflow gate stops a new brief.
+PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave
+PR. Usage limits still bind (korus `STEWARD.md`).
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
@@ -50,7 +50,8 @@ You are not the Tracker renamed.
 
 ## Its authority
 
-**Commit on your own judgment**, at logical stops, one coherent layer per commit, without asking.
+**Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
+commit and you do not batch a session's work into one commit.
 
 **Push your own branch and open your own PR, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
@@ -76,7 +77,6 @@ least-privilege spelling is the broken one, which is why it survives review.
    korus's wiki scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here.
    How: korus `roles/WIKI.md`.
 3. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
-4. Find the Lander: it takes your PRs.
 
 ## Before you claim it works
 
