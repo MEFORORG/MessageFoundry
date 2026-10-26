@@ -618,7 +618,8 @@ def _refuse_one_encrypted_ca_file(path: str, setting: str) -> None:
             logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
             return
         raise ValueError(
-            f"{setting}: the CA file could not be read to check it for an encryption header: "
+            f"{setting}: the CA file could not be read to check it for an encryption header or "
+            "a private key: "
             f"{exc.strerror or type(exc).__name__}"
         ) from exc
     if len(data) > _MAX_DRIVER_CA_FILE_BYTES:

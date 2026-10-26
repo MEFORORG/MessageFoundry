@@ -98,7 +98,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    re-checks the file on disk, not the bytes a live hop loaded, and rebuilds only a connection
    whose config changed. For that reason the spec carries ``loads_verified_bytes=False``: a
    matching pin is NOT the item 6 escape here, and the PEM shape checks are skipped, since
-   ``cafile=`` loads what ``cadata=`` refuses. Item 5 closed the same gap for the inbound CAs.
+   ``cafile=`` loads what ``cadata=`` refuses. Only the private-key refusal runs (BACKLOG
+   #3745, :func:`_refuse_a_private_key`), on the bytes the check read. Item 5 closed the same gap for the inbound CAs.
    A CA the hop never reads, such as one behind ``use_tls=False`` or an ``http://`` url, is not
    checked, and a pin beside it is refused (:func:`unread_ca_reason`).
 10. **The dialling settings CAs** (vault BACKLOG #3188). At least three settings name a CA that an
@@ -111,7 +112,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **Not covered**, as in item 9: these hops load the file by path with ``cafile=``, so the
     checked bytes are not the loaded bytes. The specs carry ``loads_verified_bytes=False`` and no
-    pin, so no pin can stand in for an unjudged read, and the PEM shape checks are skipped. The
+    pin, so no pin can stand in for an unjudged read, and the PEM shape checks are skipped but
+    for the private-key refusal (BACKLOG #3745). The
     hops read the file on their own schedule, not at the check. The SMTP hop reads it at every
     send, so a file swapped between reloads is trusted by the next send, and this check finds the
     swap at the next reload. A connection that falls back to the internal CA reads it when it is
@@ -179,7 +181,9 @@ log = logging.getLogger(__name__)
 #: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
 #: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
-#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025), and
+#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
+#: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
+#: every anchor), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -187,7 +191,7 @@ AUDIT_ACTION = "auth.trust_anchor"
 
 class TrustAnchorError(Exception):
     """An operator-supplied trust anchor failed its integrity preflight: a configured SHA-256 pin
-    mismatch, a file that holds no loadable PEM block, or, under ``[security].enforcement = enforce``,
+    mismatch, a file that holds no loadable PEM block or names a private-key label, or, under ``[security].enforcement = enforce``,
     an ACL or path that lets another principal replace it or that could not be read. Raised at
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
@@ -360,7 +364,7 @@ ENCRYPTION_HEADER_SCOPE = (
 )
 #: The tail of every private-key PEM label OpenSSL writes, lower-cased: ``PRIVATE KEY``,
 #: ``ENCRYPTED PRIVATE KEY``, ``RSA PRIVATE KEY``, ``EC PRIVATE KEY`` and the rest (BACKLOG #3745).
-#: :mod:`messagefoundry.keywrap` reads a key block by the same suffix.
+#: :mod:`messagefoundry.keywrap` also treats a block whose label ends in ``PRIVATE KEY`` as a key.
 _PEM_PRIVATE_KEY_LABEL = "private key-----"
 #: What :func:`has_private_key_label` matches, in the words every refusal of it uses (BACKLOG
 #: #3745). Like :data:`ENCRYPTION_HEADER_SCOPE`, ``strict_requests`` keeps an identical literal and
@@ -405,7 +409,9 @@ def has_private_key_label(text: str) -> bool:
     ``ENCRYPTED PRIVATE KEY`` or a legacy ``RSA PRIVATE KEY``, does not belong in one. It errs wide
     for the reason :func:`has_encryption_header` gives: no line model, since OpenSSL finds a BEGIN
     mid-line, so the label in a comment between two blocks refuses too. A key block always starts
-    with a BEGIN, so the search from the first one cannot miss a key."""
+    with a BEGIN, so the search from the first one sees every such label. It matches the label
+    OpenSSL writes and reads, ending ``PRIVATE KEY-----``; a shape it does not read as a key, such
+    as ``PGP PRIVATE KEY BLOCK`` or a space before the dashes, is not matched."""
     begin = text.find("-----BEGIN ")
     if begin < 0:
         return False
@@ -1929,7 +1935,8 @@ async def run_anchor_preflight(
     caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
     install with no OIDC/AD/mTLS anchor is byte-identical.
 
-    On a fatal violation (a pin mismatch, a file with no loadable PEM block, or under ``enforce`` an
+    On a fatal violation (a pin mismatch, a file with no loadable PEM block, a private-key label,
+    or under ``enforce`` an
     anchor another principal can replace or whose ACL or path could not be read, unless module item
     6's pin escape applies) it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
     the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""

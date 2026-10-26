@@ -303,7 +303,9 @@ def _narrowed_pool_classes(
             connected comes out of requests as a ``ProxyError``. The providers would then report a
             type name only.
 
-            **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
+            **A CA file is not checked, because the load itself refuses it.** That holds for the
+            encryption header only: a CA file holding a private key loads, and nothing here
+            refuses it (BACKLOG #3745 covers the CA text alone). ``ca_certs`` is a
             path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
             ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
             ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions

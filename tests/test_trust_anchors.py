@@ -2259,6 +2259,7 @@ def test_the_vault_hop_states_the_same_scope() -> None:
 
 _PRIVATE = "PRIVATE" + " KEY"
 _KEY_LABELS = [_PRIVATE, "ENCRYPTED " + _PRIVATE, "RSA " + _PRIVATE, "EC " + _PRIVATE]
+_NON_ASCII = b"\xc3\xa9 "  # a UTF-8 e-acute and a space
 
 
 def _key_block(label: str) -> bytes:
@@ -2296,9 +2297,14 @@ def test_a_private_key_block_in_an_anchor_refuses(
             lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
             id="label in a comment after the last END",
         ),
-        # A non-ASCII comment line is dropped from the cadata= text, but the check reads the bytes.
+        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
+        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
         pytest.param(
-            lambda: _real_ca("crl-test-ca")[0] + "é ".encode() + _key_block(_PRIVATE),
+            lambda: (
+                _real_ca("crl-test-ca")[0]
+                + _NON_ASCII
+                + _key_block(_PRIVATE).replace(b"-----END", _NON_ASCII + b"-----END")
+            ),
             id="key on a non-ASCII line",
         ),
         pytest.param(lambda: _real_ca("crl-test-ca")[0] + _key_block(_PRIVATE.lower()), id="lower"),
@@ -2315,9 +2321,13 @@ def test_a_private_key_label_refuses_in_the_shapes_a_line_check_misses(
 
 
 def test_a_certificate_only_anchor_still_loads() -> None:
-    """The control: two plain certificates, and a key-like word that is not a label, still load."""
+    """The control: two plain certificates, with a key-like word that is not a label above and
+    between them, still load."""
     data = (
-        b"# the CA, not its PRIVATE KEY\n" + _real_ca("crl-test-ca")[0] + _real_ca("second-ca")[0]
+        b"# the CA, not its PRIVATE KEY\n"
+        + _real_ca("crl-test-ca")[0]
+        + f"# the second CA; its {_PRIVATE} stays with its owner\n".encode()
+        + _real_ca("second-ca")[0]
     )
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
     assert ta.anchor_cadata(data, spec) == data.decode()

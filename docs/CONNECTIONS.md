@@ -1743,7 +1743,9 @@ file with its own TLS library, which can wait for a password on an encrypted blo
 runs when the connection is built, not at each connect, so a file replaced afterwards is not
 checked. At least these cases are left to the driver unchecked: a file that does not exist, a
 directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
-read, or one over 16 MiB, is refused. An `SSLCERT` file is not checked this way.
+read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
+`PRIVATE KEY` after its first `-----BEGIN` is refused the same way (BACKLOG #3745), since a CA
+file is public trust material. An `SSLCERT` file is not checked this way.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
@@ -3319,6 +3321,7 @@ checks.
 | An account other than the owner can write the file, or replace it through a folder on its path | Refused under `[security].enforcement = enforce`. A WARNING under `warn`. |
 | The engine cannot read the file's permissions or its path | Refused under `enforce`, **even with a matching pin**. A WARNING under `warn`. Move the file into a folder whose permissions the engine can read. |
 | The file cannot be read at all | Refused, naming the connection and the path. |
+| The file names a PEM label ending in `PRIVATE KEY` anywhere after its first `-----BEGIN ` (BACKLOG #3745) | Refused, whatever `[security].enforcement` says, with a `pem_refused` audit row. A CA file is public trust material; keep the key in its own file. |
 | The file's SHA-256 differs from the one the last check saw | An `auth.trust_anchor` audit row with `event` set to `changed`. |
 
 Each check writes its `auth.trust_anchor` rows under `outbound:<connection name>`,
@@ -3338,7 +3341,8 @@ unchecked until that connection is built again. A restart rebuilds it. A reload 
 when its config changed. A later reload checks and audits the file on disk, not the bytes the live
 hop loaded. So a `changed` row does not mean the hop now trusts the new file. A pin would vouch for
 bytes the hop never loaded. For the same reason the check does not refuse a file the hop itself can
-load, such as one holding a `TRUSTED CERTIFICATE` block.
+load, such as one holding a `TRUSTED CERTIFICATE` block. The one exception is a private key, which
+no hop needs in its CA file (BACKLOG #3745).
 
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
 is empty or whitespace; leave it out for no pin. On the eight factories above, a literal pin that

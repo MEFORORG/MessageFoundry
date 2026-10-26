@@ -6451,12 +6451,15 @@ engine cannot read, refuses the start or the reload. These settings take no pin.
 refuse rather than warn). Every anchor the engine checks at start and reload takes it, the dialling
 CAs above and a connection's own `tls_ca_file` included, and so do at least the SQL Server
 `[store].ssl_root_cert` pin, a generic DATABASE connection's `odbc_params` `sslca` file and a Vault
-hop's CA text. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
+hop's CA text. Not covered: at least the Vault CA file (`MEFOR_STORE_VAULT_CA_FILE`,
+`MEFOR_SECRETS_VAULT_CA_FILE`) and the PostgreSQL `[store].ssl_root_cert`, which their hops load
+by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
 `-----BEGIN `, of any kind: plain, PKCS#8 encrypted, `RSA` or `EC`. A TLS load skips a key block and
 trusts the certificate beside it, so before this a key passed every check and sat in a file the
 engine treats as public trust material. The refusal names the setting, never the content. For an
-anchor whose hop reads the file again by path, the gap above holds: a key swapped in after the
-check reaches the hop unchecked until the next start or reload.
+anchor whose hop reads the file again by path, the swap gap above holds for a key too: a key
+swapped in after the check reaches the hop unchecked, and a reload does not catch it for a
+connection it does not read or rebuild.
 
 **The engine finds a swapped file at the next start or reload, not when a hop reads it.** Each hop
 reads the file again by path, on its own schedule. The SMTP hop reads it at every send, so a file
