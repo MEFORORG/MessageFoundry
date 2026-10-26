@@ -30,6 +30,9 @@ item that fixes a red `main`, changes a security control, supersedes an ADR, or 
 against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
 
+**Brief at full speed** (owner ruling 2026-10-26). Never tie briefing to the queue or the
+Lander's merge rate. Batch into combined PRs. A queue forms; the Lander works it down.
+
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
 
@@ -43,8 +46,6 @@ You are not the Tracker renamed.
   existed. Every brief ends with push, then report.
 - **Edit another Manager's worktree, or the primary checkout.** Nothing enforces this: the claim
   registry claims items, not paths.
-- **Brief more than the Lander can land.** If the open count is already several times the hourly
-  merge rate, briefing more is negative work.
 
 ## Its authority
 
@@ -75,7 +76,7 @@ least-privilege spelling is the broken one, which is why it survives review.
    korus's wiki scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here.
    How: korus `roles/WIKI.md`.
 3. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
-4. Find the Lander and read the open PR count before you size a wave.
+4. Find the Lander: it takes your PRs.
 
 ## Before you claim it works
 
