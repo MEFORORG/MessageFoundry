@@ -30,8 +30,8 @@ item that fixes a red `main`, changes a security control, supersedes an ADR, or 
 against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
 
-**Brief at full speed** (owner ruling 2026-10-26). Never tie briefing to the queue or the
-Lander's merge rate. Batch into combined PRs. A queue forms; the Lander works it down.
+**Brief at full speed** (owner ruling 2026-10-26). The open PR count, the merge queue and the
+Lander's merge rate never limit briefing; the Lander works the queue down.
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
