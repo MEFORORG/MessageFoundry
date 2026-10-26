@@ -139,6 +139,7 @@ __all__ = [
     "StrictReplyAdapter",
     "VaultAttestationSection",
     "VaultHopRefused",
+    "is_unrevoked_vault_hop_refusal",
     "mount_strict_reply_adapter",
     "vault_failure_text",
 ]
@@ -1185,6 +1186,34 @@ def _refuse_an_unrevoked_vault_hop(
     if attestation_section == "store":
         raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}")
     raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}")
+
+
+#: The text after the connector label of each revocation refusal above, by the section it names.
+_UNREVOKED_VAULT_HOP_REASONS: dict[VaultAttestationSection, str] = {
+    "store": f"{_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}",
+    "secrets": f"{_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}",
+}
+
+
+def is_unrevoked_vault_hop_refusal(
+    exc: BaseException | None, section: VaultAttestationSection
+) -> bool:
+    """Whether ``exc`` is :func:`_refuse_an_unrevoked_vault_hop`'s refusal for ``section``'s pair,
+    and no other refusal of the hop (vault BACKLOG #3619).
+
+    It takes the exact type, :class:`VaultHopRefused`, and the whole fixed text after the
+    connector label, which no connector label contains. Any other refusal of the hop answers
+    ``False``, at least of its address, its proxy, its TLS leg or its pool, and so does a
+    subclass, as :func:`vault_failure_text` reads one.
+
+    That refusal means the hop was off the box, not attested and not CRL-checked, and was judged
+    enforcing. So ``tls_policy.revocation_hop_disposition`` on those inputs, with another posture,
+    says what that posture would have done with the same hop. ``verify``'s ``_serve_crossing``
+    relies on that, so a new input to the guard's decision must reach it too."""
+    if type(exc) is not VaultHopRefused:
+        return False
+    _connector, _sep, reason = str(exc).partition(": ")
+    return reason == _UNREVOKED_VAULT_HOP_REASONS[section]
 
 
 def _prepared_vault_hop(
