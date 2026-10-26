@@ -53,6 +53,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
+    _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
@@ -2162,6 +2163,15 @@ _UnansweredKind = Literal["referred", "faulted", "misconfigured"]
 _UNANSWERED_KINDS: tuple[_UnansweredKind, ...] = get_args(_UnansweredKind)
 
 
+def test_the_unanswered_outcomes_are_the_unjudged_ones_less_unavailable() -> None:
+    """BACKLOG #3844. ``service._UNANSWERED_OUTCOMES`` is written out by hand beside
+    ``reconcile._UNJUDGED``. An unjudged outcome added there and not here would not be carried.
+
+    RED when: the two sets drift apart."""
+    expected = reconcile._UNJUDGED - {reconcile.ProbeOutcome.UNAVAILABLE}
+    assert expected == _UNANSWERED_OUTCOMES
+
+
 def _leave_unanswered(ldap: _FakeLdap, name: str, kind: _UnansweredKind) -> None:
     """Make every probe of ``name`` go unanswered, as a referral, a fault or a refusal."""
     if kind == "referred":
@@ -2262,8 +2272,8 @@ async def test_an_unanswered_account_is_marked_by_a_pass_that_raises_after_its_p
 ) -> None:
     """BACKLOG #3844. A pass stamps each probed account to the back of the rotation as it probes.
     One that raises after its probes, on a store read for instance, must still have marked
-    ``cdoe`` unanswered, or the next sample, which the stamp steers away from ``cdoe``, reads its
-    older answer as current.
+    ``cdoe`` unanswered, or a next sample that misses ``cdoe``, as the stamp makes likely, reads
+    its older answer as current. The helper picks that sample by hand; the mark is the subject.
 
     RED when: the mark is written only once the pass has planned, after the stamp."""
     store = await MessageStore.open(":memory:")
@@ -2276,9 +2286,11 @@ async def test_an_unanswered_account_is_marked_by_a_pass_that_raises_after_its_p
 
         healthy = service._ad_map
         service._ad_map = _refused  # type: ignore[method-assign]
-        with pytest.raises(RuntimeError, match="store read refused"):
-            await _sampled_pass(service, ids, {"alice", "cdoe"})
-        service._ad_map = healthy  # type: ignore[method-assign]
+        try:
+            with pytest.raises(RuntimeError, match="store read refused"):
+                await _sampled_pass(service, ids, {"alice", "cdoe"})
+        finally:
+            service._ad_map = healthy  # type: ignore[method-assign]
         assert service._reconcile_unanswered == {ids["cdoe"]}
 
         missed = await _sampled_pass(service, ids, {"alice", "bwong"})

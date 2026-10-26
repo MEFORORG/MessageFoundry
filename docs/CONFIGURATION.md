@@ -848,21 +848,23 @@ three on its own, until it restarts again.
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
   resolves none of these alerts.
-- For the breaker's and the hold's alerts, that carries across passes (BACKLOG #3844). While an
-  account whose probe was referred, faulted or refused is signed in, neither alert resolves until
-  a later pass reads that account with an answer. A later pass whose probe sample leaves the
-  account out does not read its older answer as current. Any answer counts here, an absent or held
-  one too, and the rules above then judge it. A probe that cannot reach the directory does not
-  count as an answer, and it does not hold either alert open. The referral's alert carries its
-  own accounts by the rule below. An account that signs out still unanswered stops counting, and
-  this rule gives up no resolve for it. Every give-up rule in this list still applies: a referred
-  account that signs out before it reads in full still gives up the referral's resolve. A restart
-  forgets these accounts, along with every answer the engine would have judged them on.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
   before it reads in full. The reconciler revoking the account counts as leaving, including on the
   pass that saw the referral. The engine then resolves no referral until its next restart.
+- For the breaker's and the hold's alerts, a referral, probe fault or configuration refusal also
+  carries across passes (BACKLOG #3844). While an account whose probe was referred, faulted or
+  refused is signed in, neither alert resolves until a later pass reads that account with an
+  answer. A later pass whose probe sample leaves the account out does not read its older answer as
+  current. Any answer counts here, an absent or held one too, and the rules above then judge it.
+  A probe that cannot reach the directory is not an answer: it neither starts nor ends this wait.
+  Until the hold's alert resolves, the hold's give-up rule above still applies. The referral's
+  alert does not wait on this: it waits on its own accounts, by the rules above. An account that
+  signs out still unanswered stops counting, and this rule gives up no resolve for it. Every
+  give-up rule in this list still applies: a referred account that signs out before it reads in
+  full still gives up the referral's resolve. A restart forgets these accounts, along with every
+  answer the engine would have judged them on.
 - A search base changes only on a restart, and a restarted engine resolves no alert its last run
   left open. So once you fix a referring base and restart, you resolve the referral's alert
   yourself. The engine resolves a referral on its own only when it clears without a restart, such

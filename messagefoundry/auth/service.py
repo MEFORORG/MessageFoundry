@@ -8117,8 +8117,12 @@ class AuthService:
           its older answer as current. Any answer a later pass records ends its part, not only
           PRESENT: this test asks only whether the answer on record postdates the probe that went
           unanswered, and the tests below then judge that answer as they judge any other. An
-          unavailable probe neither marks nor ends a part: it alerts nobody, and on its own pass
-          it stops no clear either (left open). The referral's own clear does not read this
+          unavailable probe is not an answer, so it neither marks nor ends a part; on its own
+          pass it stops no clear, and the older answer it leaves on record still counts (left
+          open, outside BACKLOG #3844, as is a pass that raises after its probes, whose judged
+          answers are never recorded). Until the hold's clear is marked the hold is not settled,
+          so a departure that forfeits an unsettled hold still forfeits it meanwhile: a missed
+          clear. The referral's own clear does not read this
           set. Its accounts are carried by ``_reconcile_referred``, which marks every candidate
           at a referral and lets one go only on a PRESENT read, and a fault or a refusal is not
           its cause, so a faulting account would only keep its message naming a referral that is
