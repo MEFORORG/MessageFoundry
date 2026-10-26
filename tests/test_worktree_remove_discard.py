@@ -235,19 +235,68 @@ def test_an_unmerged_index_refuses_under_discard(rig: Rig) -> None:
     proc = rig.run("-Name", "conflict", "-Discard")
 
     assert proc.returncode != 0, _out(proc)
-    assert "unmerged" in _out(proc), _out(proc)
+    # git's own line, not the script's wording.
+    assert "seed.txt: unmerged" in _out(proc), _out(proc)
     assert wt.exists() and _attic(rig) == []
 
 
-def test_an_untracked_junction_refuses_path_under_discard(rig: Rig) -> None:
-    """Git would park the link, and a removal through one leaves the directory behind, so an
-    untracked link stays a refusal on -Path. The content outside survives."""
-    wt = rig.add(rig.scratch("junction"))
+def test_a_tracked_deletion_is_parked_on_path(rig: Rig) -> None:
+    """A deleted tracked file is a parkable status line like any other change, on -Path too."""
+    wt = rig.add(rig.scratch("deleted"))
+    _commit(wt, "gone.txt")
+    (wt / "gone.txt").unlink()
+
+    proc = rig.run("-Path", str(wt), "-Discard")
+
+    assert proc.returncode == 0, _out(proc)
+    (ref,) = _attic(rig)
+    assert "gone.txt" not in _git(rig.primary, "ls-tree", "--name-only", ref).split()
+
+
+def test_a_force_added_ignored_file_is_parked_with_its_disk_version(rig: Rig) -> None:
+    """A file force-added past .gitignore is tracked in the tree's index. The snapshot starts from a
+    copy of that index, so the file's later edit on disk is parked, not only its staged version."""
+    wt = _sibling(rig, "forced")
+    (wt / "build.log").write_text("staged version\n", encoding="utf-8")
+    _git(wt, "add", "-f", "build.log")
+    (wt / "build.log").write_text("disk version\n", encoding="utf-8")
+
+    proc = rig.run("-Name", "forced", "-Discard")
+
+    assert proc.returncode == 0, _out(proc)
+    (ref,) = _attic(rig)
+    assert _show(rig, f"{ref}:build.log") == "disk version\n"
+    assert _show(rig, f"{ref}^2:build.log") == "staged version\n"
+
+
+def test_a_locked_tree_refuses_name_under_discard_before_anything_is_parked(rig: Rig) -> None:
+    wt = _sibling(rig, "held")
+    (wt / "work.txt").write_text("untracked work\n", encoding="utf-8")
+    _git(rig.primary, "worktree", "lock", str(wt))
+
+    proc = rig.run("-Name", "held", "-Discard")
+
+    assert proc.returncode != 0, _out(proc)
+    assert "is locked" in _out(proc), _out(proc)
+    assert wt.exists() and _attic(rig) == []
+
+
+@pytest.mark.parametrize(
+    ("route", "link"), [("-Path", "data"), ("-Name", "pkg/link")], ids=["top-path", "nested-name"]
+)
+def test_an_untracked_junction_refuses_under_discard(rig: Rig, route: str, link: str) -> None:
+    """git reads through a junction, so `add -A` would park what lies outside the tree, and a
+    removal through one leaves the directory behind. A junction at the top, or inside an untracked
+    folder where git lists only the folder, refuses on either route. The content outside survives."""
+    wt = _sibling(rig, "junction")
     outside = rig.root / "elsewhere-data"
     outside.mkdir()
     (outside / "precious.txt").write_text("lives outside every worktree\n", encoding="utf-8")
+    (wt / link).parent.mkdir(parents=True, exist_ok=True)
+    if "/" in link:
+        (wt / link).parent.joinpath("own.txt").write_text("own work\n", encoding="utf-8")
     made = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(wt / "data"), str(outside)],
+        ["cmd", "/c", "mklink", "/J", str(wt / link), str(outside)],
         capture_output=True,
         text=True,
         check=False,
@@ -267,7 +316,7 @@ def test_an_untracked_junction_refuses_path_under_discard(rig: Rig) -> None:
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            f"[System.IO.Directory]::SetLastWriteTimeUtc('{wt / 'data'}', "
+            f"[System.IO.Directory]::SetLastWriteTimeUtc('{wt / link}', "
             "[DateTime]::UtcNow.AddDays(-2))",
         ],
         check=True,
@@ -275,10 +324,11 @@ def test_an_untracked_junction_refuses_path_under_discard(rig: Rig) -> None:
         env=_ENV,
     )
 
-    proc = rig.run("-Path", str(wt), "-Discard", settle=False)
+    proc = rig.run(*_target(route, wt), "-Discard", settle=False)
 
     assert proc.returncode != 0, _out(proc)
-    assert "?? data" in _out(proc) and "untracked links" in _out(proc), _out(proc)
+    assert f"{link}  (a link)" in _out(proc), _out(proc)
+    assert "cannot park untracked links" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt) and _attic(rig) == []
     assert (outside / "precious.txt").is_file()
 

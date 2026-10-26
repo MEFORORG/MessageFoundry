@@ -93,12 +93,13 @@
     What it parks is every tracked change and untracked file older than that, the ones -Force would
     otherwise discard, and on -Name the untracked files that route lets go, at any size: whatever
     the tree's .gitignore does not ignore lands in the object store and stays there while the ref
-    does. A temporary index file, set on the snapshot's own git calls only and never left set, takes
-    `read-tree HEAD`, `add -A` and `write-tree`; the shared stash is never touched. `commit-tree -p
-    HEAD` makes one commit, with a second parent holding the index when what was staged differs from
-    both HEAD and the files on disk, so a staged version is parked too. commit-tree needs a
-    committer identity and follows commit.gpgSign, so a clone with no identity refuses, and one that
-    signs may prompt. The commit goes on refs/attic/<UTC date>-<name>, <name> being the -Name or the
+    does. A temporary index file, a copy of the tree's own index set on the snapshot's own git calls
+    only and never left set, takes `add -A` and `write-tree`; the shared stash is never touched.
+    A copy rather than `read-tree HEAD`, because it keeps a file force-added past .gitignore
+    tracked, so its disk version is parked too, and its stat cache spares re-hashing. `commit-tree -p HEAD`
+    makes one commit, with a second parent holding the index when what was staged differs from both
+    HEAD and the files on disk, so a staged version is parked too. commit-tree needs a committer
+    identity, so a clone with none refuses; it does not sign. The commit goes on refs/attic/<UTC date>-<name>, <name> being the -Name or the
     directory's leaf cut to [A-Za-z0-9._-], created only if it does not exist yet, with -2, -3 and on
     after a clash. refs/attic is in the clone's SHARED ref namespace, so it outlives the tree.
     push_guard refuses a push whose REMOTE ref is under refs/attic; pushing the parked commit to a
@@ -106,10 +107,11 @@
     A clean tree parks nothing, makes no ref, and is removed as without -Discard. When something was
     parked, git's own --force is passed to the removal at that point and nothing is read again in
     between, so a file written after the snapshot is lost.
-    NOT PARKED, and refused under -Discard, at least: an untracked link on -Path, an untracked git
-    repository even with -Force (which alone discards it), a flagged file on either route, since the
-    snapshot's index has no flags, and an index with unmerged entries. NOT PARKED and not refused:
-    ignored files, which go with the tree on -Name. GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+    NOT PARKED, and refused under -Discard whatever -Force says, at least: a link among the pending
+    paths, which git reads through; an untracked git repository (-Force alone discards it); a
+    flagged file, whose disk version `add -A` does not read; a locked tree, on -Name too; and an index
+    with unmerged entries. NOT PARKED and not refused: ignored files, which go with the tree on -Name,
+    unless one was force-added to the index, which makes it tracked and parked. GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
     GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY or GIT_ALTERNATE_OBJECT_DIRECTORIES set refuses on both
     routes under -Discard, since the snapshot sets the index and writes objects.
     A COST TO EVERY LATER REMOVAL: the "held by no ref" checks above read --glob=refs/*, and a parked
@@ -850,6 +852,7 @@ for ($i = 0; $i -lt $fields.Count; $i++) {
 }
 $rootLength = $WorktreePath.TrimEnd('\', '/').Length
 $datedFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$pendingLinks = [System.Collections.Generic.List[string]]::new()
 foreach ($p in $toDate) {
     $full = Join-Path $WorktreePath $p.Rel
     $stamps = @()
@@ -872,6 +875,11 @@ foreach ($p in $toDate) {
         throw "Pending work of unknown age. Nothing was removed."
     }
     foreach ($s in $stamps) {
+        # Read by -Discard, which cannot park through a link: git reads through a junction and would
+        # park what lies outside the tree.
+        if ($s.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            $pendingLinks.Add([System.IO.Path]::GetRelativePath($WorktreePath, $s.FullName).Replace('\', '/'))
+        }
         $age = [DateTime]::UtcNow - $s.LastWriteTimeUtc
         if ($age.TotalHours -ge $quietHours) { continue }
         $by = [System.IO.Path]::GetRelativePath($WorktreePath, $s.FullName).Replace('\', '/')
@@ -1015,26 +1023,18 @@ if ($byPath) {
     $pending += @($flagged | ForEach-Object { "flagged $($_.Substring(2))" })
     # -Discard parks tracked changes and untracked files: exactly the status lines that are not
     # ignored. Named by what may be parked, so a line of any other kind, added later or not, refuses.
-    # An untracked link is not parkable: git would record the link, and its removal through one leaves
-    # the directory behind (measured above). Its path is read as git printed it, so a quoted one
-    # cannot be found, and refuses too.
+    # Named by what may be parked, so a line of any other kind refuses. A link among the pending
+    # paths refuses in the -Discard block below, on both routes.
     if ($Discard) {
-        $parkable = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-        foreach ($line in $statusLines) {
-            if (-not $line -or $line -like '!! *') { continue }
-            if ($line -like '?? *') {
-                $item = Get-Item -LiteralPath (Join-Path $WorktreePath $line.Substring(3).TrimEnd('/')) -Force -ErrorAction SilentlyContinue
-                if (-not $item -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
-            }
-            $null = $parkable.Add($line)
-        }
+        $parkable = [System.Collections.Generic.HashSet[string]]::new([string[]]@($statusLines | Where-Object {
+                    $_ -and -not $_.StartsWith('!! ') }), [System.StringComparer]::Ordinal)
         $pending = @($pending | Where-Object { -not $parkable.Contains($_) })
     }
     if ($pending.Count -gt 0 -and -not $Force) {
         $pending | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
         if ($pending.Count -gt 20) { Write-Host "... and $($pending.Count - 20) more" }
         $what = 'ignored files outside the cache directories this route tolerates'
-        $what = if ($Discard) { "$what, or untracked links, which -Discard does not park" } else { "uncommitted changes, untracked files, or $what" }
+        $what = if ($Discard) { "$what, which -Discard does not park" } else { "uncommitted changes, untracked files, or $what" }
         if ($flagged.Count -gt 0) { $what += ', or files flagged skip-worktree or assume-unchanged' }
         throw ("Worktree has $what. Commit and push what matters. -Force discards the rest, and it is " +
             "the operator's switch. Nothing was removed.")
@@ -1169,29 +1169,47 @@ $keptBranch = if ($byPath -and -not $entry.Detached) { [string]$entry.Branch } e
 #
 # LAST, ON PURPOSE: every refusal above has already run, so nothing is parked for a tree that is not
 # going. A snapshot that fails throws before the removal, and nothing is removed.
-function Invoke-GitOrThrow([string]$Dir, [string]$What, [string[]]$GitArgs) {
-    # stderr is kept for the refusal only: an unset identity or a signing failure says so there.
+function Invoke-GitOrThrow([string]$Dir, [string]$What, [string[]]$GitArgs, [switch]$Oid) {
+    # stderr is kept for the refusal only: an unset identity, or the path an unmerged entry sits at.
     $all = @(& git -C $Dir @GitArgs 2>&1)
     $code = $LASTEXITCODE
     $said = @($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
     if ($code -ne 0) {
         $why = if ($said) { ": $($said[0])" } else { '' }
-        throw "-Discard could not $What in '$WorktreePath' (git $($GitArgs[0]) exit $code$why). Nothing was removed."
+        throw "-Discard could not $What in '$Dir' (git $($GitArgs[0]) exit $code$why). Nothing was removed."
     }
-    return "$(@($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n")".Trim()
+    $text = "$(@($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n")".Trim()
+    if ($Oid -and $text -notmatch '\A[0-9a-f]{40,64}\z') {
+        throw "-Discard could not $What in '$Dir': git $($GitArgs[0]) printed no object id. Nothing was removed."
+    }
+    return $text
 }
 
 $parkedRef = ''
 if ($Discard) {
-    # A FLAGGED FILE CANNOT BE PARKED FAITHFULLY, so it refuses on both routes under -Discard. The
-    # snapshot's temporary index carries no flags, so an assume-unchanged edit would be parked but a
-    # sparse checkout's skip-worktree files, absent on disk, would be parked as deletions. -Path
-    # refused these above already, unless -Force.
-    $flaggedFiles = @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
-    if ($LASTEXITCODE -ne 0) {
-        throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
+    # A LOCKED TREE IS NOT PARKED. -Path refused it above; -Name reads no lock, and git would refuse
+    # the removal only after the work was parked, so each retry would park it again.
+    if (-not $byPath) {
+        $nameEntry = @($nameRegistered | Where-Object { (ConvertTo-Norm $_.Path) -eq (ConvertTo-Norm $WorktreePath) })
+        if ($nameEntry.Count -ne 1) {
+            throw "-Discard could not find '$WorktreePath' among the registered worktrees. Nothing was removed."
+        }
+        if ($nameEntry[0].Locked) { throw "'$WorktreePath' is locked. That is git's own in-use flag. Nothing was removed." }
     }
-    if ($flaggedFiles.Count -gt 0) {
+    # A LINK AMONG THE PENDING PATHS IS NOT PARKED, whatever -Force says. git reads through a junction,
+    # so `add -A` would park what lies outside the tree, and git's removal does not delete through
+    # one, so the directory would be left behind.
+    if ($pendingLinks.Count -gt 0) {
+        $pendingLinks | Select-Object -First 20 | ForEach-Object { Write-Host "$_  (a link)" }
+        throw "-Discard cannot park untracked links, which git reads through. Nothing was removed."
+    }
+    # A FLAGGED FILE IS NOT PARKED, whatever -Force says: `add -A` does not read the disk version of
+    # one flagged assume-unchanged or skip-worktree, so an edit to it would go unparked.
+    $flaggedFiles = if ($byPath) { $flagged } else {
+        @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
+        if ($LASTEXITCODE -ne 0) { throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed." }
+    }
+    if (@($flaggedFiles).Count -gt 0) {
         $flaggedFiles | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
         throw ("-Discard cannot park a tree with files flagged skip-worktree or assume-unchanged, a sparse " +
             "checkout among them. Nothing was removed.")
@@ -1202,15 +1220,20 @@ if ($Discard) {
     }
     # What is staged. A version staged and then edited again on disk lives only here. An index with
     # unmerged entries has no tree, and refuses.
-    $indexTree = Invoke-GitOrThrow $WorktreePath 'write the index as a tree (unmerged entries?)' @('write-tree')
-    # THE TEMPORARY INDEX IS SET FOR THESE THREE CALLS ONLY. Every git call before and after this block
+    $indexTree = Invoke-GitOrThrow $WorktreePath 'write the index as a tree' @('write-tree') -Oid
+    # THE SNAPSHOT STARTS FROM A COPY OF THE TREE'S OWN INDEX, not from HEAD: a file force-added past
+    # .gitignore stays tracked there, so `add -A` still reads its disk version, and the stat cache
+    # spares re-hashing every unchanged file. The copy is taken with nothing writing the index: the
+    # six-hour fence has just held.
+    $realIndex = Invoke-GitOrThrow $WorktreePath 'find the index' @('rev-parse', '--path-format=absolute', '--git-path', 'index')
+    # THE TEMPORARY INDEX IS SET FOR THESE TWO CALLS ONLY. Every git call before and after this block
     # reads the tree's own index, so the variable is removed in the finally, whatever happened.
     $tempIndex = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-attic-$([guid]::NewGuid().ToString('N')).index"
     try {
+        Copy-Item -LiteralPath $realIndex -Destination $tempIndex -ErrorAction Stop
         $env:GIT_INDEX_FILE = $tempIndex
-        $null = Invoke-GitOrThrow $WorktreePath 'read HEAD into a temporary index' @('read-tree', $headSha)
         $null = Invoke-GitOrThrow $WorktreePath 'add the working files to a temporary index' @('add', '-A')
-        $snapTree = Invoke-GitOrThrow $WorktreePath 'write the temporary index as a tree' @('write-tree')
+        $snapTree = Invoke-GitOrThrow $WorktreePath 'write the temporary index as a tree' @('write-tree') -Oid
     }
     finally {
         Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
@@ -1222,19 +1245,21 @@ if ($Discard) {
     }
     else {
         $when = [DateTime]::UtcNow
-        $message = "remove.ps1 -Discard: the uncommitted work of '$WorktreePath', parked $($when.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+        # Invariant: another culture's calendar would put another year in the ref name.
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $message = "remove.ps1 -Discard: the uncommitted work of '$WorktreePath', parked $($when.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv))"
         $parents = @('-p', $headSha)
         if ($indexTree -ne $headTree -and $indexTree -ne $snapTree) {
-            $indexCommit = Invoke-GitOrThrow $GitRoot 'commit the staged index' @('commit-tree', $indexTree, '-p', $headSha, '-m', "$message (the index)")
+            $indexCommit = Invoke-GitOrThrow $GitRoot 'commit the staged index' @('commit-tree', $indexTree, '-p', $headSha, '-m', "$message (the index)") -Oid
             $parents += @('-p', $indexCommit)
         }
-        $snapCommit = Invoke-GitOrThrow $GitRoot 'commit the snapshot' (@('commit-tree', $snapTree) + $parents + @('-m', $message))
+        $snapCommit = Invoke-GitOrThrow $GitRoot 'commit the snapshot' (@('commit-tree', $snapTree) + $parents + @('-m', $message)) -Oid
 
         $leaf = if ($byPath) { Split-Path $WorktreePath -Leaf } else { $Name }
         # -creplace: the case-insensitive -replace lets through a character that folds into A-Z.
         $safe = (($leaf -creplace '[^A-Za-z0-9._-]', '-') -replace '\.{2,}', '.').TrimEnd('.')
         if ($safe -match '\.lock\z') { $safe += '-' }
-        $base = "refs/attic/$($when.ToString('yyyy-MM-dd'))-$safe"
+        $base = "refs/attic/$($when.ToString('yyyy-MM-dd', $inv))-$safe"
         # The old value is all zeros, so update-ref creates the ref and never moves one that exists.
         $zero = '0' * $snapCommit.Length
         for ($n = 1; ; $n++) {

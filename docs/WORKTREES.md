@@ -289,16 +289,18 @@ between the script's check and the removal. Git's check does not list ignored fi
 
 ### `-Discard` parks the work instead of losing it
 
-`-Discard` works on both routes and is not `-Force`. After every refusal has run, it snapshots the
-tree's uncommitted tracked changes and untracked files into a commit, through a temporary index and
-`commit-tree`, never the shared stash. It parks that commit on `refs/attic/<UTC date>-<name>` in the
+`-Discard` works on both routes and is not `-Force`. The session rule above is unchanged by it:
+`-Discard` is not among the switches a session runs on its own, and that grant is the owner's to
+make. After every refusal has run, it snapshots the tree's uncommitted tracked changes and
+untracked files into a commit, through a temporary index and `commit-tree`, never the shared stash. It parks that commit on `refs/attic/<UTC date>-<name>` in the
 clone's shared refs, with a numeric suffix after a same-day clash, and then removes the tree. A
 clean tree parks nothing and makes no ref. It lifts only the refusal of tracked changes and
 untracked files. At least these still refuse: the six-hour fence, so a tree a session has just
-finished cannot be discarded for six hours; claims; on `-Path`, the session registry and locks;
-nested repositories; flagged files; and on `-Path`, ignored files outside the tolerated caches.
-Ignored files are never parked, which is what keeps `.env` and `*.db` out; anything else untracked
-is parked whatever its size. `push_guard` refuses a push to a remote `refs/attic` ref, but pushing
+finished cannot be discarded for six hours; claims; on `-Path`, the session registry; locks;
+nested repositories; links among the pending paths; flagged files; and on `-Path`, ignored files
+outside the tolerated caches. An ignored file is parked only if it was force-added to the index,
+and `.gitignore` is otherwise what keeps `.env` and `*.db` out; anything else untracked is parked
+whatever its size. `push_guard` refuses a push to a remote `refs/attic` ref, but pushing
 the parked commit to a branch is an ordinary push it does not stop. Nothing sweeps the attic. The
 script header is the source of record for what is parked and what refuses (docs/AUTONOMY-PLAN.md
 6.3).
