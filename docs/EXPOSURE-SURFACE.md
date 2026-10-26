@@ -69,7 +69,7 @@ engine's own update check makes no network call: `[update_check].mode` accepts o
 | Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR`. With one unset, the Vault client falls back to its own `VAULT_ADDR` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer`. The syslog collector is also limited by `[egress].allowed_syslog` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
+| Startup TLS-floor probe, behind a declared TLS terminator or a proxy named in `[api].trusted_proxies`, under `enforce` | One target, `[security].web_console_public_address` | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
 | Backup to a network share | `[backup].destination` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 
 What an empty or unset list permits differs by setting and by `[security].block_unlisted_outbound`.
@@ -93,11 +93,12 @@ Each one is in `_serve` in `messagefoundry/__main__.py`.
 | Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator |
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
-| Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
+| Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version`. Behind a proxy named in `[api].trusted_proxies` with no declared terminator, the same bind refuses when it lacks `[api].proxy_tls_min_version` (vault BACKLOG #3538) |
+| Proxy TLS-floor probe | Under `enforce`, behind a declared TLS terminator or a proxy named in `[api].trusted_proxies`: an unset `[security].web_console_public_address`, or a front door at that address that the startup probe cannot reach, that accepts TLS 1.0 or 1.1, or that does not negotiate TLS 1.3 (ASVS 12.1.1). On a loopback bind too. The proxy shape without a terminator joined in vault BACKLOG #3538 |
 | Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. The `egress_open` expression in `_serve` holds the rule |
 
-Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
-operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
+Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, the probe
+guard does not run, and the operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
 plaintext-hop guards refuse under `warn` too.
 
 `serve` refuses on more than this table, so clearing one guard does not mean `serve` starts. The

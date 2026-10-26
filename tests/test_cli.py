@@ -2453,15 +2453,23 @@ def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
     # The prelude's memory declaration is dropped and the opt-in set; nothing else refuses first.
     prelude = _EXPOSURE_PRELUDE.replace("security.memory_encryption_operator_declared = true\n", "")
     assert prelude != _EXPOSURE_PRELUDE
+    # Vault BACKLOG #3538: under `enforce` this shape now meets the ASVS 12.1.1 probe before the
+    # ADR 0152 arm. It gets the public address and floor the probe asks for, and the probe is
+    # stubbed to pass, so the ADR 0152 arm is still the one that refuses.
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
         prelude
         + "security.require_mfa = true\n"
         + "security.require_memory_encryption_declaration = true\n"
+        + 'security.web_console_public_address = "https://mefor.example.org"\n'
         + "approvals.enabled = true\n"
         + _EXPOSURE_TAIL
-        + _trusted_proxy_only_api(tmp_path),
+        + _trusted_proxy_only_api(tmp_path)
+        + 'proxy_tls_min_version = "1.2"\n',
         env="prod",
     )
     assert rc == 2

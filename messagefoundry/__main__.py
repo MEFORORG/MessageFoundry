@@ -3381,6 +3381,41 @@ def _serve(args: argparse.Namespace) -> int:
                 "an attestation either way — the engine enforces nothing on this hop.",
                 file=sys.stderr,
             )
+    elif settings.api.browser_tls_ends_at_proxy:
+        # --- vault BACKLOG #3538: a re-encrypting proxy owes the floor attestation too -----------
+        # `trusted_proxies` with no declared terminator. The loader admits that only with an operator
+        # tls_cert_file (BACKLOG #2055), so the proxy re-encrypts to the engine. The browser's TLS
+        # still ends at the proxy, and `[api].tls_min_version` governs only the proxy-to-engine hop,
+        # so the engine sees the browser-facing floor no better than behind a terminator. The batch
+        # 253 Manager decided, under the driver rule, that this shape owes the same attestation (vault
+        # PR 2404 comment 6152823165, #3475 question 1). That is a Manager decision, not an owner
+        # ruling on the substance. The split is the terminator gate's: refuse when enforcing and off
+        # loopback, warn otherwise.
+        #
+        # `proxy_intra_service_auth` stays terminator-only. The decision covers the floor alone, and
+        # that attestation's premise (#200) is a PLAINTEXT proxy-to-engine segment. Here the engine
+        # serves that hop over TLS on the operator's certificate. Whether the engine should also ask
+        # how it knows its TLS peer is the proxy is not decided here.
+        if not settings.api.proxy_tls_floor_declared:
+            if enforcing and not settings.api.is_loopback:
+                print(
+                    f"error: refusing to serve on a {'production ' if production else ''}PHI instance "
+                    f"({env_name!r}) behind a reverse proxy named in [api].trusted_proxies without "
+                    "[api].proxy_tls_min_version (attested proxy TLS floor). The browser's TLS ends "
+                    "at that proxy, so [api].tls_min_version governs only the proxy-to-engine hop "
+                    "and the engine cannot see the floor the proxy negotiates with browsers. Declare "
+                    "[api].proxy_tls_min_version (1.2/1.3) as the lowest version the proxy permits. "
+                    "See docs/CONFIGURATION.md, [api] (vault BACKLOG #3538).",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                "warning: reverse proxy named in [api].trusted_proxies in a PHI-carrying environment "
+                f"({env_name!r}) without [api].proxy_tls_min_version. Declare it before exposure: "
+                "the browser's TLS ends at that proxy, and the engine cannot see its floor for "
+                "itself (attestation).",
+                file=sys.stderr,
+            )
 
     # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
     # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with
@@ -3900,7 +3935,7 @@ def _serve(args: argparse.Namespace) -> int:
     # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
     # the only end where the control measures its own posture instead of measuring whether someone
     # happened to configure an unrelated console setting.
-    if settings.api.tls_terminated_upstream and enforcing and not settings.api.public_origin:
+    if settings.api.browser_tls_ends_at_proxy and enforcing and not settings.api.public_origin:
         # THE REMEDIATION NAMES THE KEY THE LOADER ACCEPTS, NOT THE FIELD THIS CODE READS
         # (BACKLOG #1026). `[api].public_origin` is the INTERNAL field; ADR 0118 relocated the
         # operator-facing key to `[security].web_console_public_address` and REJECTS the old
@@ -3913,8 +3948,9 @@ def _serve(args: argparse.Namespace) -> int:
         # gate itself. tests/test_api_tls.py pins the remediation string AGAINST the relocation map
         # so the two cannot drift apart again.
         print(
-            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
-            "terminator under `enforce` without an external origin — the ASVS 12.1.1 TLS-floor "
+            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a reverse proxy "
+            "([api].tls_terminated_upstream or [api].trusted_proxies) under `enforce` without an "
+            "external origin — the ASVS 12.1.1 TLS-floor "
             "probe dials that origin, so leaving it unset silently disables the check rather than "
             "failing it. Set [security].web_console_public_address to the origin the browser uses "
             '(e.g. "https://mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
@@ -3922,8 +3958,9 @@ def _serve(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Scope is the posture the requirement is about: a declared terminator, PHI, and `enforce`. Every
-    # other posture never reaches here and is byte-identical.
+    # Scope is the posture the requirement is about: a reverse proxy ending the browser's TLS (a
+    # declared terminator, or since vault BACKLOG #3538 a re-encrypting proxy in `trusted_proxies`),
+    # PHI, and `enforce`. Every other posture never reaches here and is byte-identical.
     #
     # `public_origin` appears as a fourth condition and is NOT a fourth scope narrowing: the refusal
     # directly above guarantees it is set for exactly this posture, so the two agree by construction
@@ -3932,22 +3969,21 @@ def _serve(args: argparse.Namespace) -> int:
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
     #
-    # NOT EVERY EXPOSED POSTURE IS PROBED (vault BACKLOG #3102). `instance_exposed` also counts a
+    # THE RE-ENCRYPTING PROXY IS PROBED TOO (vault BACKLOG #3538). `instance_exposed` also counts a
     # set `trusted_proxies` with no declared terminator (vault BACKLOG #2251): a proxy that
-    # re-encrypts to an operator certificate. This gate and the refusal above it read
-    # `tls_terminated_upstream`, not `instance_exposed`, so that shape is never probed and may leave
-    # `public_origin` unset. Two facts, and neither says the gap is safe:
+    # re-encrypts to an operator certificate. This gate read `tls_terminated_upstream` alone until
+    # #3538, so that shape was never probed and could leave `public_origin` unset. Vault BACKLOG #3102
+    # item 9 raised it. The batch 253 Manager decided, under the driver rule, that the probe covers it
+    # (#3475 question 1); that is a Manager decision, not an owner ruling on the substance. Two facts:
     #  1. On the hop the engine serves there, its own listener enforces the floor: api/tls.py sets
-    #     `minimum_version` from `[api].tls_min_version`, which the loader holds to 1.2 or 1.3.
-    #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
-    #     start measures that proxy's floor, and that shape owes no attestation of it either:
-    #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
-    # Widening this gate is a new control: it would add a start refusal for an unset origin on this
-    # shape, and make that start depend on the proxy being reachable. The terminator case took an
-    # owner ruling (BACKLOG #1026). No ruling covers this shape, so the gate is not widened in
-    # passing here; vault BACKLOG #3102 is where the question was raised. The cost to a running site
-    # is not the reason: there are none (CLAUDE.md section 0).
-    if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
+    #     `minimum_version` from `[api].tls_min_version`. That hop is proxy-to-engine, not the
+    #     browser's, so it is no reason to skip the probe.
+    #  2. The browser's hop ends at the proxy, as it does behind a terminator. At least two gates now
+    #     ask for `proxy_tls_min_version`: the terminator gate and the `trusted_proxies` arm beside it.
+    # The cost is the terminator case's: a start refusal for an unset origin on this shape, and a
+    # start that depends on the proxy being reachable. There are no running sites to pay it (CLAUDE.md
+    # section 0), and that is not the reason for the decision either.
+    if settings.api.browser_tls_ends_at_proxy and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
         try:
@@ -3963,8 +3999,8 @@ def _serve(args: argparse.Namespace) -> int:
             # would never run — a gate that is trivially defeated is not a gate. The cost is real
             # and is stated in the message rather than left for an assessor to find.
             print(
-                f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared "
-                f"upstream TLS terminator whose TLS floor does not verify — {probe.describe()}. "
+                f"error: refusing to serve on a PHI instance ({env_name!r}) behind a reverse "
+                f"proxy whose TLS floor does not verify — {probe.describe()}. "
                 "The browser hop is the operator's proxy, so the engine measures it at startup "
                 "rather than trusting [api].proxy_tls_min_version (ASVS 12.1.1). Required: the "
                 "front door must refuse TLS 1.0 and 1.1 and negotiate TLS 1.3 with a "
