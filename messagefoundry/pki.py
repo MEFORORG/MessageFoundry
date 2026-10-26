@@ -832,8 +832,9 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     completes a sentence starting with the setting and the path (vault BACKLOG #2223).
 
     A reason string rather than an exception, so a caller raises its own refusal outside any
-    handler. The phrase holds an OS error's ``strerror``, a :class:`PinRefused` reason, or the
-    type name of a parser error, never the parser's text or the file's bytes.
+    handler. The phrase holds at least an OS error's ``strerror``, a :class:`PinRefused` reason,
+    the size refusal, or the type name of a parser error, never the parser's text or the file's
+    bytes.
 
     It reads at most :data:`PIN_FILE_MAX_BYTES` and one byte more, so a huge or endless file is
     refused as too large rather than read whole (BACKLOG #3714)."""
@@ -842,8 +843,6 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
             data = fh.read(PIN_FILE_MAX_BYTES + 1)
     except (OSError, ValueError, TypeError) as exc:  # what open() raises for a bad path
         return unreadable_pin_reason(exc)
-    if len(data) > PIN_FILE_MAX_BYTES:
-        return _TOO_LARGE
     return pinned_server_certificate(data)
 
 
@@ -879,7 +878,10 @@ def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
 
 def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
     """:func:`read_pinned_server_certificate` over bytes already read, for a caller that has read
-    the file once for another check (vault BACKLOG #3714)."""
+    the file once for another check (vault BACKLOG #3714). Bytes past
+    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand."""
+    if len(data) > PIN_FILE_MAX_BYTES:
+        return _TOO_LARGE
     reason: str
     try:
         return load_pinned_server_certificate(data)

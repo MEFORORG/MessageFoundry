@@ -641,6 +641,9 @@ def test_a_pin_file_too_large_is_refused_at_load_and_at_open(tmp_path: object) -
     settings = _ss().model_copy(update={"ssl_root_cert": str(big)})
     with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*larger than \d+ bytes"):
         check_pinned_certificate(settings)
+    at_cap_settings = _ss().model_copy(update={"ssl_root_cert": str(at_cap)})
+    with pytest.raises(ValueError, match="not a certificate"):  # the store open's boundary too
+        check_pinned_certificate(at_cap_settings)
 
 
 def test_a_pin_read_that_runs_out_of_memory_is_refused_naming_the_setting(

@@ -2721,6 +2721,8 @@ def check_pinned_certificate(
       principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
       and no posture counts as enforcing. The driver reads the file by path, so the spec carries
       ``loads_verified_bytes=False`` (:func:`~messagefoundry.auth.trust_anchors.store_pin_anchor_spec`);
+    * it must be no larger than :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, judged by its size
+      on disk before the anchor checks read it, and again on the bytes they read;
     * the file must be one server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`);
     * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
       still counts as valid, as RFC 5280 reads it.
@@ -2762,7 +2764,9 @@ def check_pinned_certificate(
         checked = str(exc)  # the anchor module's own message, which names the setting and the fix
     except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
         checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
-    except MemoryError:  # a file with no size on disk, such as a device, that never ends
+    except MemoryError:
+        # Most likely a file that grew past the size check before the anchor checks read it. Not a
+        # guard for a FIFO or an endless device: such a read blocks, or the OS ends the process.
         checked = f"[store].ssl_root_cert {path!r} could not be read: it is too large to read"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
         raise ValueError(checked)
