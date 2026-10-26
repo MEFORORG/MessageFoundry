@@ -2170,7 +2170,7 @@ not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It appli
 start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
 its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
 The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
-not yet in effect, `detail` offers a wait too, unless the hop's copy lapses first. For a proven bad
+not yet in effect, `detail` offers a wait too. For a proven bad
 signature it says what a start says of a CRL setting: a handshake OpenSSL judges by that CRL fails.
 The engine may still be unable to confirm the signature, short of that proof. Then `detail` asks
 you to check the CRL, and claims no failure. The start's WARNING cases above say why (BACKLOG
