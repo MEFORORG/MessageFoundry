@@ -348,12 +348,11 @@ def test_installer_checks_the_environment_with_the_python_text() -> None:
     expected = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
     checks = [i for i, ln in enumerate(lines) if ln == expected]
     assert len(checks) == 1, f"expected exactly one live line {expected!r}, found {len(checks)}"
-    # Any other live -Environment pattern test would be a second, unpinned copy.
-    others = [
-        ln
-        for ln in lines
-        if ln.startswith("if ($Environment -") and "match" in ln and ln != expected
-    ]
+    # Any other live -Environment pattern test would be a second, unpinned copy. The candidates
+    # include the expected line, so a filter that matched nothing fails here, not vacuously below.
+    candidates = [ln for ln in lines if ln.startswith("if ($Environment -") and "match" in ln]
+    assert len(candidates) >= 1, "CONTROL FAILED: no live -Environment pattern check was found"
+    others = [ln for ln in candidates if ln != expected]
     assert others == [], others
     uses = [
         i for i, ln in enumerate(lines) if "--env $Environment" in ln and not ln.startswith("#")
@@ -371,9 +370,13 @@ def test_environment_guard_matches_the_engine_charset() -> None:
     one side only, fails (BACKLOG #1680)."""
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
+    # 26 + 26 letters, 10 digits, and `.`, `_`, `-`; and the whole BMP is what the walk asks.
+    assert len(_ENV_NAME_ALLOWED) >= 65, sorted(_ENV_NAME_ALLOWED)
+    code_points = range(0x10000)
+    assert len(code_points) >= 0x10000
     differ = [
         hex(cp)
-        for cp in range(0x10000)
+        for cp in code_points
         if is_safe_environment(chr(cp)) != (chr(cp) in _ENV_NAME_ALLOWED)
     ]
     assert differ == []
