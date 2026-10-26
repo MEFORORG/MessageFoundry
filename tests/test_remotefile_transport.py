@@ -35,7 +35,7 @@ from _phi_log_capture import (
 )
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
@@ -1385,8 +1385,8 @@ class _FakeSSHClient:
     def load_system_host_keys(self) -> None:
         pass
 
-    def load_host_keys(self, path: str) -> None:
-        pass
+    def get_host_keys(self) -> Any:
+        return SimpleNamespace(load=lambda path: None)
 
     def set_missing_host_key_policy(self, policy: Any) -> None:
         self.policy = policy
@@ -1815,6 +1815,69 @@ def _real_paramiko() -> Any:
     )
 
 
+def _loopback_sftp_server(
+    paramiko: Any,
+    *,
+    logins: int = 1,
+    ciphers: tuple[str, ...] | None = None,
+    macs: tuple[str, ...] | None = None,
+) -> tuple[int, Any, list[str], Any]:
+    """Start a loopback SSH server that takes ``logins`` connections in turn and accepts any public
+    key or password. It offers only ``ciphers`` and ``macs`` when given, else paramiko's defaults.
+
+    Returns its port, its host key (in no known_hosts file, so a client meets an unknown server
+    unless the caller pins it), a list it appends ``"publickey"`` or ``"password:<value>"`` to for
+    each login it accepts, and the thread, which the caller joins.
+    """
+    import socket
+    import threading
+
+    host_key = paramiko.ECDSAKey.generate()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(logins)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+    accepted: list[str] = []
+
+    class _Server(paramiko.ServerInterface):  # type: ignore[misc]
+        def get_allowed_auths(self, username: str) -> str:
+            return "publickey,password"
+
+        def check_auth_publickey(self, username: str, key: Any) -> int:
+            accepted.append("publickey")
+            return int(paramiko.AUTH_SUCCESSFUL)
+
+        def check_auth_password(self, username: str, password: str) -> int:
+            accepted.append(f"password:{password}")
+            return int(paramiko.AUTH_SUCCESSFUL)
+
+    def serve() -> None:
+        with listener:
+            for _ in range(logins):
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                with paramiko.Transport(conn) as transport:
+                    transport.add_server_key(host_key)
+                    if ciphers is not None:
+                        transport.get_security_options().ciphers = ciphers
+                    if macs is not None:
+                        transport.get_security_options().digests = macs
+                    try:
+                        transport.start_server(server=_Server())
+                    except (paramiko.SSHException, EOFError, OSError):
+                        continue  # the refusal cases end here, and the client side asserts them
+                    # Hold the session until the client has read what it needs and hung up.
+                    while transport.is_active():
+                        transport.join(0.05)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return port, host_key, accepted, thread
+
+
 def _sftp_server_offering(
     paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path, macs: tuple[str, ...] | None = None
 ) -> tuple[int, Path, Any]:
@@ -1824,53 +1887,12 @@ def _sftp_server_offering(
     Returns its port, a ``known_hosts`` file naming its host key (so the client's ``RejectPolicy``
     stays on), and the thread, which the caller joins.
     """
-    import socket
-    import threading
-
-    host_key = paramiko.ECDSAKey.generate()
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    listener.settimeout(10)
-    port = listener.getsockname()[1]
+    port, host_key, _accepted, thread = _loopback_sftp_server(paramiko, ciphers=ciphers, macs=macs)
     tmp_path.mkdir(parents=True, exist_ok=True)
     known_hosts = tmp_path / "known_hosts"
     known_hosts.write_text(
         f"[127.0.0.1]:{port} {host_key.get_name()} {host_key.get_base64()}\n", encoding="ascii"
     )
-
-    class _Server(paramiko.ServerInterface):  # type: ignore[misc]
-        def get_allowed_auths(self, username: str) -> str:
-            return "password"
-
-        def check_auth_password(self, username: str, password: str) -> int:
-            return int(paramiko.AUTH_SUCCESSFUL)
-
-    def serve() -> None:
-        try:
-            conn, _ = listener.accept()
-        except OSError:
-            listener.close()
-            return
-        transport = paramiko.Transport(conn)
-        try:
-            transport.add_server_key(host_key)
-            transport.get_security_options().ciphers = ciphers
-            if macs is not None:
-                transport.get_security_options().digests = macs
-            try:
-                transport.start_server(server=_Server())
-            except (paramiko.SSHException, EOFError, OSError):
-                return  # the refusal cases end here, and the client side asserts them
-            # Hold the session open until the client has read what it negotiated and hung up.
-            while transport.is_active():
-                transport.join(0.05)
-        finally:
-            transport.close()
-            listener.close()
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
     return port, known_hosts, thread
 
 
@@ -1965,6 +1987,53 @@ def test_sftp_real_handshake_refuses_ctr_only_and_aes128_only_servers(
         _connector_handshake(paramiko, offered, tmp_path, monkeypatch)
     assert isinstance(caught.value.__cause__, paramiko.SSHException)
     assert caught.value.permanent and not caught.value.credential_fault
+
+
+def _rsa_private_key_pem() -> str:
+    """A fresh unencrypted RSA-2048 client key, at the connector's floor (BACKLOG #1352)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def test_sftp_key_only_escape_login_does_not_teach_a_shared_known_hosts_file(
+    escape_at_warn: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 8. Under the escape a key-only login accepts an unknown host key.
+    paramiko's ``AutoAddPolicy`` also SAVES that key into the file ``load_host_keys`` named. So a
+    password login naming the same known_hosts file then trusted the server and sent it the
+    password, although a password login never takes the escape (BACKLOG #3230). The connector now
+    reads that file without becoming its writer, so the escape's trust ends with its own login."""
+    paramiko = _real_paramiko()
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("", encoding="ascii")
+    port, _host_key, accepted, thread = _loopback_sftp_server(paramiko, logins=2)
+    shared = {
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "svc",
+        "known_hosts": str(known_hosts),
+        "connect_timeout": 10,
+    }
+    try:
+        key_login = _SftpClient({**shared, "private_key": _rsa_private_key_pem()}, name="OB_KEY")
+        # CONTROL: the key-only login takes the escape and logs in to the unknown server, so the
+        # refusal below is the password login's, not a server that refuses every client.
+        assert key_login._accept_unknown is True
+        key_login._connect().close()
+        assert accepted == ["publickey"]
+        assert known_hosts.read_text(encoding="ascii") == ""
+        password_login = _SftpClient({**shared, "password": "synthetic"}, name="OB_PASSWORD")
+        with pytest.raises(_RemoteError, match="with no escape"):
+            password_login._connect()
+    finally:
+        thread.join(10)
+    assert accepted == ["publickey"]  # the password never reached the server
+    assert not thread.is_alive(), "the loopback SSH server did not shut down"
 
 
 # === egress allowlist ([egress].allowed_remote) ==============================

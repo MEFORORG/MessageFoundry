@@ -1738,7 +1738,11 @@ class _SftpClient(_RemoteClient):
         exception is :meth:`_connect`'s to map."""
         client.load_system_host_keys()
         if self._known_hosts:
-            client.load_host_keys(str(self._known_hosts))
+            # Read the named file without making it the client's save target, as load_host_keys
+            # would. AutoAddPolicy saves a key it accepts into that target, and a password login
+            # naming the same file then trusted the server (vault BACKLOG #3533 item 8). So the
+            # escape's trust ends with the login that took it, and the engine never writes the file.
+            client.get_host_keys().load(str(self._known_hosts))
         # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Only
         # fall back to AutoAddPolicy behind the explicit insecure escape (set in __init__, logged).
         client.set_missing_host_key_policy(
