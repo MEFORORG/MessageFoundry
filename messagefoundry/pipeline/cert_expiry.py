@@ -48,10 +48,7 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_expiry_detail
-
-# _SAYS_RESTART is private to crl_reload, and no public form exists: one list of the remedies
-# that are a restart keeps the two modules from disagreeing (BACKLOG #3512).
-from messagefoundry.pipeline.crl_reload import _SAYS_RESTART, RELOAD_INTERVAL_SECONDS
+from messagefoundry.pipeline.crl_reload import NO_ISSUER, RELOAD_INTERVAL_SECONDS, RESTART, RETRY
 from messagefoundry.pki import (
     CertFacts,
     CrlFacts,
@@ -471,20 +468,37 @@ class CertExpiryRunner:
 
 
 def _rows_by_crl_file(
-    rows: Sequence[MonitoredCert], keys: Mapping[str, str]
-) -> dict[str, tuple[str, ...]]:
-    """The labels of the CRL rows naming each file, keyed as held copies are (vault BACKLOG #2319).
-    ``keys`` holds each CRL row's path in that form.
+    rows: Sequence[MonitoredCert],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+    """The labels of the CRL rows naming each file, keyed as held copies are (vault BACKLOG #2319),
+    and each CRL row's path in that key form.
 
     Several settings or connections can name one CRL file, and each gets its own row, since each
-    hop depends on it. A held copy is matched by its file, so each of those rows reports it."""
+    hop depends on it. A held copy is matched by its file, so each of those rows reports it.
+
+    BACKLOG #3512: one pass builds both, so they cannot disagree. A path ``crl_path_key`` cannot
+    key is logged and left out of both, so it shares with no row, and the other rows still group."""
+    keys: dict[str, str] = {}
+    unkeyed: set[str] = set()
     by_file: dict[str, list[str]] = {}
     for row in rows:
-        if row.kind == "crl":
-            labels = by_file.setdefault(keys[row.path], [])
-            if row.label not in labels:
-                labels.append(row.label)
-    return {key: tuple(labels) for key, labels in by_file.items()}
+        if row.kind != "crl" or row.path in unkeyed:
+            continue
+        if row.path not in keys:
+            try:
+                keys[row.path] = crl_path_key(row.path)
+            except Exception:
+                log.error(
+                    "cert_expiry: could not key CRL %s, so its rows share with none",
+                    row.path,
+                    exc_info=True,
+                )
+                unkeyed.add(row.path)
+                continue
+        labels = by_file.setdefault(keys[row.path], [])
+        if row.label not in labels:
+            labels.append(row.label)
+    return {key: tuple(labels) for key, labels in by_file.items()}, keys
 
 
 @dataclass(frozen=True)
@@ -525,10 +539,9 @@ class _HeldCopyLog:
     def for_rows(cls, rows: Sequence[MonitoredCert]) -> _HeldCopyLog:
         """One pass's log over ``rows``, grouped by file. A failed grouping is logged and folds
         nothing: BACKLOG #3176 loses only the alerts' ``shared_with``, not the scan or an alert.
-        That holds when ``crl_path_key`` itself raises, too (BACKLOG #3512)."""
+        A path that cannot be keyed costs only its own rows that (BACKLOG #3512)."""
         try:
-            keys = {row.path: crl_path_key(row.path) for row in rows if row.kind == "crl"}
-            return cls(_rows_by_crl_file(rows, keys), keys)
+            return cls(*_rows_by_crl_file(rows))
         except Exception:
             log.error("cert_expiry: could not group the CRL rows by file", exc_info=True)
             return cls({}, {})
@@ -594,7 +607,7 @@ def held_crl_label(path: str) -> str:
 
 
 def _ca_file_crl_refusal(
-    pem: bytes, now: float, file_facts: CrlFacts | None, *, ca_file_only: bool
+    pem: bytes, now: float, file_facts: CrlFacts | None, *, ca_file_only: bool, may_wait: bool
 ) -> tuple[str, str] | None:
     """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy)``, or
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
@@ -608,7 +621,8 @@ def _ca_file_crl_refusal(
     from this file for its issuer. Only a signature proven bad says handshakes fail;
     one the engine could not confirm asks for a check (BACKLOG #3512). With ``ca_file_only``, that
     remedy then says to restart. Otherwise a CRL setting names the file too. The caller then orders
-    the restart, after the reload's verdict. A CRL
+    the restart, after the reload's verdict. Without ``may_wait``, a CRL not yet in effect is
+    offered no wait: a refused reload stands beside it. A CRL
     whose issuer this file does not hold is not refused: the issuer can be an intermediate the peer
     sends, which the reload treats the same way. ``file_facts`` is the lenient reading, which tells
     an expired CRL from one that cannot be judged. Each remedy leads, because the alert instance
@@ -634,11 +648,14 @@ def _ca_file_crl_refusal(
     # No clock skew allowed, unlike a CRL setting's start: nothing at start refuses this CRL, and
     # OpenSSL allows none, so a restart before it takes effect refuses peers until then.
     if (early := crl_not_in_effect(blocks, now=now, skew=0.0)) is not None:
+        # The wait is its own sentence, after the fix and its reason, so the alert list's cut
+        # keeps both (BACKLOG #3512). It is left out beside a refused reload, whose remedy can
+        # say that waiting refuses every peer, as LAPSES_FIRST does.
+        wait = f". Or wait until {log_timestamp(early.this_update)} to restart" if may_wait else ""
         return (
             "whose CA file now holds a CRL that is not yet in effect",
-            f"Replace the CRL in the CA file with one in effect now, or wait until "
-            f"{log_timestamp(early.this_update)}, before restarting: until then it refuses every "
-            "peer under its issuer",
+            "Replace the CRL in the CA file with one in effect now before restarting: until it "
+            f"takes effect it refuses every peer under its issuer{wait}",
         )
     try:
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
@@ -669,21 +686,21 @@ def _ca_file_crl_refusal(
     if "bad" in states:
         # The claim and the fix a start gives a CRL setting in the proven case
         # (tls_policy._check_crl_signatures). OpenSSL can prefer a newer good CRL from the issuer.
+        # The fix and its claim are one sentence, short enough for the alert list's cut (#3512).
         return (
             "whose CA file now holds a CRL its issuer's key does not verify",
-            "Replace the CRL in the CA file with one its CA signed, or remove it if a good one "
-            "from that issuer is already in the file, before restarting: a handshake OpenSSL "
-            "judges by it fails",
+            "Replace the CRL in the CA file with one its CA signed before restarting: a handshake "
+            "OpenSSL judges by it fails. If a good CRL from that issuer is already in the file, "
+            "remove this one instead",
         )
     if states & {"unproven", "uncheckable"}:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
-        # So the remedy asks for a check and claims no failure.
-        unconfirmed = (
-            "the engine could not confirm its signature with the CA the file lists for its issuer"
-        )
+        # So the remedy asks for a check and claims no failure. ``why`` says which CA was tried.
+        unconfirmed = "the engine could not confirm its signature"
         check = "Check that the CRL in the CA file is one its CA signed"
         return (
-            "whose CA file now holds a CRL whose signature the engine could not confirm",
+            "whose CA file now holds a CRL whose signature the engine could not confirm with the "
+            "CA the file lists for its issuer",
             # Only a restart applies a CA file. Where a CRL setting names the file too, the
             # restart waits for the reload's verdict, as #3176 orders it (BACKLOG #3512).
             f"{check}, then restart the engine to apply the CA file: {unconfirmed}"
@@ -700,14 +717,21 @@ _CA_FILE_HOP_RESTARTS = (
 )
 
 
+#: The reload's remedies that order a plain restart of the engine, which applies the file to the
+#: CA-file hop too, so no second restart follows them. ``_NOT_PROVABLE`` is not one: its restart
+#: is conditional, on the CRL-setting hop's trust, and says nothing of the CA-file hop. This is the
+#: set main's "Restart the engine" substring test chose, named so a new remedy is a decision here
+#: (BACKLOG #3512).
+_RESTARTS_THE_ENGINE = frozenset({RESTART, NO_ISSUER, RETRY})
+
+
 def _after_the_reload(refused: ReloadRefusal | None) -> str:
     """The steps for a changed file that a CRL setting names and a hop loaded as its CA file.
 
     BACKLOG #3176: the reload applies the file to the CRL-setting hops, but only a restart applies
     it to the CA-file hop. The restart comes after the reload's verdict, which can find the file
-    one a start would refuse. A refused reload's remedy leads, then the CA-file hop's restart
-    unless that remedy is one. BACKLOG #3512: the CA-file arm ends with these too. The refusal's
-    reason stays out, as the CA-file arm needs: it quotes CRL issuers and dates (#2904)."""
+    one a start would refuse. A refused reload's steps (:func:`_refused_steps`) follow. BACKLOG
+    #3512: the CA-file arm ends with these too."""
     if refused is None:
         return (
             "Restart the engine once the reload has applied the file, within "
@@ -715,16 +739,22 @@ def _after_the_reload(refused: ReloadRefusal | None) -> str:
             "it as its CA file. If the reload refuses it, this alert says why"
         )
     return (
-        f"The reload refused the file for a hop that loads it as its CRL setting: {refused.remedy}"
-        f"{_ca_file_hop_restart(refused)}"
+        "The reload refused the file for a hop that loads it as its CRL setting: "
+        f"{_refused_steps(refused, ca_file_hop=True)}"
     )
 
 
-def _ca_file_hop_restart(refused: ReloadRefusal) -> str:
-    """The CA-file hop's restart after a refused reload's remedy, or ``""`` when that remedy is a
-    restart already. The reload's own list decides (``crl_reload._SAYS_RESTART``), so a sticky
-    refusal such as ``_NOT_PROVABLE`` is not told to wait for an apply (BACKLOG #3512)."""
-    return "" if refused.remedy in _SAYS_RESTART else f". {_CA_FILE_HOP_RESTARTS}"
+def _refused_steps(refused: ReloadRefusal, *, ca_file_hop: bool) -> str:
+    """A refused reload's remedy, its reason, then with ``ca_file_hop`` the CA-file hop's restart
+    unless the remedy is a plain restart (:data:`_RESTARTS_THE_ENGINE`). Every arm of the
+    ``crl_expiry`` alert formats a refusal here, so they keep one policy (BACKLOG #3512).
+
+    This alert keeps the reason, as ``docs/CONFIGURATION.md`` says, unlike ``crl_reload_refused``
+    (#2904). It trails the remedy, so the alert list's cut keeps the remedy first."""
+    steps = f"{refused.remedy}. Reason: {refused.reason}"
+    if ca_file_hop and refused.remedy not in _RESTARTS_THE_ENGINE:
+        steps += f". {_CA_FILE_HOP_RESTARTS}"
+    return steps
 
 
 def _judge_crl(
@@ -800,7 +830,11 @@ def _judge_crl(
                 some_bundle
                 and (
                     unsafe := _ca_file_crl_refusal(
-                        pem, now, file_facts, ca_file_only=not crl_setting_too
+                        pem,
+                        now,
+                        file_facts,
+                        ca_file_only=not crl_setting_too,
+                        may_wait=refused is None,
                     )
                 )
                 is not None
@@ -832,9 +866,7 @@ def _judge_crl(
             elif refused is not None:
                 why = "that differs from the file, which the engine refused to apply to it"
                 # The remedy leads: the alert instance keeps only the start of it (#2319).
-                remedy = f"{refused.remedy}. Reason: {refused.reason}"
-                if some_bundle:
-                    remedy += _ca_file_hop_restart(refused)
+                remedy = _refused_steps(refused, ca_file_hop=some_bundle)
             elif some_bundle:
                 why, remedy = (
                     "that differs from the file, which a hop loaded as its CA file",

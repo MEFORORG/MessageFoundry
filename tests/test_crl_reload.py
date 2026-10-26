@@ -957,9 +957,16 @@ def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_re
     so a restart into this CA file is not refused. The control is a future CRL from another name."""
     current = pki.crl.read_bytes()
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
-    assert _ca_file_crl_refusal(pki.ca_pem + current + future, time.time(), None) is None
+    assert (
+        _ca_file_crl_refusal(
+            pki.ca_pem + current + future, time.time(), None, ca_file_only=True, may_wait=True
+        )
+        is None
+    )
     stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
-    refusal = _ca_file_crl_refusal(pki.ca_pem + current + stray, time.time(), None)
+    refusal = _ca_file_crl_refusal(
+        pki.ca_pem + current + stray, time.time(), None, ca_file_only=True, may_wait=True
+    )
     assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
 
