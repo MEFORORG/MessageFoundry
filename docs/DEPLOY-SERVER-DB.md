@@ -806,12 +806,14 @@ what it read, so a host that only has `pyodbc` installed does not fail on a poli
 uses.
 
 The answer is unknown where at least one of these holds: the graph did not load or there is no
-`--config` directory; the service settings did not load; they came from the defaults alone, with
-no `--service-config`, no `./messagefoundry.toml` and no `MEFOR_STORE_BACKEND`, because the store
-could then be SQL Server; or every DATABASE connection found uses the generic dialect, whose
-driver brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
-MANUAL with the reading in its detail. Run `verify` with `--config` and `--service-config` naming
-the deployment's own, to get a FAIL that counts. Without `--config` the answer is unknown too,
+`--config` directory; the service settings did not load; the shell that runs `verify` does not set
+`MEFOR_STORE_BACKEND`; or every DATABASE connection found uses the generic dialect, whose driver
+brings its own TLS. That variable overrides the service config file, and the service's own
+environment may set it where your shell does not, so a file that says `sqlite` does not show the
+store the service opens, which could be SQL Server. The row then still reads the policy, but
+reports a FAIL or ERROR reading as MANUAL with the reading in its detail. Run `verify` with
+`--config` and `--service-config` naming the deployment's own, and with `MEFOR_STORE_BACKEND` set
+as the service sets it, to get a FAIL that counts. Without `--config` the answer is unknown too,
 because the default, `samples/config`, is the sample graph.
 
 It runs the commands of this step. It differs from them in at least the ways named here:

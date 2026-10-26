@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from messagefoundry.childenv import system_tool_environment, worker_environment
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _NO_WINDOW, _system_exe
 from messagefoundry.verify.model import CheckResult, Status
@@ -107,9 +107,9 @@ _OPENSSL_SUITE_LINE = re.compile(r"\S+\s+\S+\s+Kx=\S+\s+Au=\S+\s+Enc=\S+\s+Mac=\
 
 _OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
 #: The variables OpenSSL reads to find its configuration file and the provider modules and engines
-#: it loads. They cross to the probe on top of what
-#: ``worker_environment`` passes to any child, which is the platform's start-up names and the
-#: Python interpreter's own variables; ``openssl`` is not Python, so it reads none of the latter.
+#: it loads. They cross to the probe on top of the platform's start-up names, which on POSIX hold
+#: ``LD_LIBRARY_PATH``. No Python variable crosses, because ``openssl`` is not Python and reads
+#: none (BACKLOG #3803 item 5).
 _OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES")
 _POLICY_KEYS = {key.lower(): key for key in ("CipherString", "Ciphersuites", "MinProtocol")}
 #: The policy lines the verdict rests on. ``Ciphersuites`` is read for the evidence only.
@@ -186,7 +186,26 @@ def _every_entry_shaped(
 
 # Each probe makes its own subprocess.run call rather than sharing one helper that takes an
 # environment: tests/test_child_process_environment.py trusts env= only as a builder call at the
-# start itself, and the two probes need different builders.
+# start itself, and the two probes pass that builder different arguments.
+
+
+#: The Windows PowerShell folder under the system directory, which ``$PSHOME`` names.
+_POWERSHELL_HOME = ("WindowsPowerShell", "v1.0")
+
+
+def _powershell_pins() -> dict[str, str]:
+    """The fixed ``PATH`` and ``PSModulePath`` of the PowerShell start (BACKLOG #3803 S1).
+
+    The operator's ``PATH`` would let a program planted on it answer for a command PowerShell looks
+    up by a bare name. With ``PSModulePath`` unset, Windows PowerShell 5.1 adds the account's
+    Documents modules folder to the module path, so a module planted there could be autoloaded.
+    Given this value, it adds the Program Files modules folder only (measured 2026-10-26). Every
+    folder named here, and that one, takes an administrator to write."""
+    shell_home = _system_exe(*_POWERSHELL_HOME)
+    return {
+        "PATH": os.pathsep.join((_system_exe(), shell_home)),
+        "PSModulePath": os.path.join(shell_home, "Modules"),
+    }
 
 
 def _windows_enabled_suites() -> list[str]:
@@ -195,20 +214,21 @@ def _windows_enabled_suites() -> list[str]:
     ``(Get-TlsCipherSuite).Name`` and not a pipe into ``Where-Object Name``: section 5.4 measured
     that pipe passing the whole list through unfiltered. The filtering happens here, in Python.
     PowerShell is a fixed system tool run by its pinned path, so it takes the start-up names only
-    (vault BACKLOG #2716); it finds the TLS module without the operator's ``PSModulePath``. A host
-    without the cmdlet is :class:`ProbeUnavailable`, as a host without PowerShell is. A line not
+    (vault BACKLOG #2716), with ``PATH`` and ``PSModulePath`` pinned (:func:`_powershell_pins`).
+    A host without the cmdlet is :class:`ProbeUnavailable`, as a host without PowerShell is. A line not
     shaped like a suite name, such as a stream line the command did not silence, is
     :class:`ProbeFailed`: it is neither counted as a suite nor dropped."""
     with _probe_errors("powershell.exe"):
         proc = subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
             [
-                _system_exe("WindowsPowerShell", "v1.0", "powershell.exe"),
+                _system_exe(*_POWERSHELL_HOME, "powershell.exe"),
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 _SUITES_COMMAND,
             ],
-            env=system_tool_environment(),  # the platform's start-up names only (#2716)
+            # The platform's start-up names only (#2716), PATH and PSModulePath pinned (#3803).
+            env=system_tool_environment(pinned=_powershell_pins()),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -277,16 +297,15 @@ def _schannel_policy_order() -> list[str] | None:
 def _openssl_suites() -> list[str]:
     """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows.
 
-    Found on ``PATH`` by bare name, as section 5.4's own command is. It gets what
-    ``worker_environment`` gives any child, the start-up names and the interpreter's variables, and
-    the variables OpenSSL reads to find its configuration, providers and engines: section 5.4 asks
-    for the check to run
-    with the engine's environment, and without ``OPENSSL_CONF`` it would read a different policy
-    from the one the driver takes."""
+    Found on ``PATH`` by bare name, as section 5.4's own command is. It gets the platform's
+    start-up names and the variables OpenSSL reads to find its configuration, providers and
+    engines (``_OPENSSL_ENV``): section 5.4 asks for the check to run with the engine's
+    environment, and without ``OPENSSL_CONF`` it would read a different policy from the one the
+    driver takes."""
     with _probe_errors("openssl"):
         proc = subprocess.run(  # nosec B603 B607 - argv list (no shell), fixed arguments
             ["openssl", "ciphers", "-s", "-v"],
-            env=worker_environment(extra_names=_OPENSSL_ENV),
+            env=system_tool_environment(extra_names=_OPENSSL_ENV),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

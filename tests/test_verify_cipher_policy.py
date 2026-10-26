@@ -13,7 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +333,89 @@ def test_the_powershell_command_runs_on_this_host() -> None:
     assert cipher_policy._windows_enabled_suites()
 
 
+def _start_environment(
+    monkeypatch: pytest.MonkeyPatch, probe: Callable[[], list[str]], stdout: str
+) -> dict[str, str]:
+    """The ``env=`` the probe's start is given, with the start itself stubbed to print ``stdout``."""
+    seen: dict[str, str] = {}
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "run", run)
+        assert probe()
+    return seen
+
+
+def _powershell_start_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> dict[str, str]:
+    """The probe's PowerShell environment, taken from a shell whose ``PATH`` and
+    ``PSModulePath`` lead with folders under ``tmp_path``."""
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("PSModulePath", str(tmp_path / "Modules"))
+    return _start_environment(
+        monkeypatch, cipher_policy._windows_enabled_suites, "TLS_AES_256_GCM_SHA384\n"
+    )
+
+
+def test_the_powershell_start_gets_a_fixed_path_and_module_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 S1, the root cause of the PATH-spoof class: the operator's ``PATH`` and
+    module path do not reach the probe's PowerShell. Both are pinned to the system folders."""
+    from messagefoundry.service_status import _system_exe
+
+    env = {
+        name.upper(): value
+        for name, value in _powershell_start_environment(monkeypatch, tmp_path).items()
+    }
+    shell_home = _system_exe(*_POWERSHELL[:2])
+    assert env["PATH"] == os.pathsep.join((_system_exe(), shell_home))
+    assert env["PSMODULEPATH"] == os.path.join(shell_home, "Modules")
+    assert not [value for value in env.values() if str(tmp_path) in value]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_the_pinned_module_path_holds_no_account_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Given a ``PSModulePath``, Windows PowerShell 5.1 adds the Program Files folder to it and
+    not the account's Documents folder, which it adds when the variable is unset (measured
+    2026-10-26). So every folder the probe's PowerShell can autoload a module from takes an
+    administrator to write. ``PSModulePath`` as that PowerShell itself reports it."""
+    from messagefoundry.service_status import _system_exe
+
+    # The overlay keeps every pin: each is a name the start-up names hold, or one they lack.
+    done = _run_powershell(
+        "$env:PSModulePath", _powershell_start_environment(monkeypatch, tmp_path)
+    )
+    assert done.returncode == 0, done.stderr[:300]
+    entries = [entry for entry in done.stdout.strip().split(";") if entry]
+    roots = (_system_exe(), os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+    outside = [e for e in entries if not any(e.lower().startswith(r.lower()) for r in roots)]
+    assert entries and not outside, done.stdout
+
+
+def test_the_openssl_start_gets_its_own_variables_and_no_python_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3803 item 5: ``openssl`` is not Python, so no ``PYTHON*`` name crosses to it.
+    The ``OPENSSL_*`` names do, and so does ``LD_LIBRARY_PATH`` on POSIX, which picks the
+    ``libssl`` the probe loads, as it picks the one the engine's ODBC driver loads."""
+    monkeypatch.setenv("OPENSSL_CONF", "/etc/ssl/probe.cnf")
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.setenv("PYTHONPATH", os.path.abspath("probe-path"))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/ssl/lib")
+    env = _start_environment(monkeypatch, cipher_policy._openssl_suites, _SSL_AEAD[0] + "\n")
+    names = {name.upper() for name in env}
+    assert "OPENSSL_CONF" in names
+    assert not [name for name in names if name.startswith("PYTHON")]
+    assert ("LD_LIBRARY_PATH" in names) is (sys.platform != "win32")
+
+
 _PLANTED_SUITE = "TLS_PLANTED_AES_256_GCM_SHA384"
 #: At least the two helpers the Lander found shadowed, and the cmdlet the probe exists to run.
 #: ``Import-Module`` is planted too, though a Core cmdlet always wins over a ``PATH`` external.
@@ -347,10 +430,16 @@ _SHADOWABLE_COMMAND = (
 )
 
 
-def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def _plant_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, keep_the_pin: bool = False
+) -> Path:
     """Put ``.cmd`` files named for the probe's commands first on ``PATH``, each of which writes a
     marker into the returned folder when it runs, so a run is seen whatever this host's execution
-    policy does to the planted module the ``Join-Path`` one points at."""
+    policy does to the planted module the ``Join-Path`` one points at.
+
+    The probe pins its PowerShell's ``PATH`` (BACKLOG #3803 S1), which keeps every plant from
+    being seen. So unless ``keep_the_pin``, the pin is given this ``PATH`` instead, and the
+    command text is tested on its own, as it stood before the pin."""
     fake_module = tmp_path / "fake" / "TLS"
     fake_module.mkdir(parents=True)
     (fake_module / "TLS.psm1").write_text(
@@ -374,6 +463,11 @@ def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
             encoding="oem",  # cmd.exe reads a batch file in the OEM code page
         )
     monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
+    if not keep_the_pin:
+        pins = cipher_policy._powershell_pins()
+        monkeypatch.setattr(
+            cipher_policy, "_powershell_pins", lambda: {**pins, "PATH": os.environ["PATH"]}
+        )
     return ran
 
 
@@ -409,6 +503,19 @@ def test_the_plants_run_where_a_bare_name_is_looked_up(
     monkeypatch.setattr(cipher_policy, "_SUITES_COMMAND", _SHADOWABLE_COMMAND)
     _suites_or_refused()
     assert {"Join-Path", "Test-Path"} <= {p.name for p in ran.iterdir()}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="plants .cmd files for Windows PowerShell")
+def test_the_pinned_path_keeps_a_plant_from_answering_a_bare_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 S1, end to end: the text as it stood at the hold, whose bare names the test
+    above shows a plant answering, with the pin in place. No plant runs, because the operator's
+    ``PATH`` does not reach the probe's PowerShell."""
+    ran = _plant_on_path(monkeypatch, tmp_path, keep_the_pin=True)
+    monkeypatch.setattr(cipher_policy, "_SUITES_COMMAND", _SHADOWABLE_COMMAND)
+    _suites_or_refused()
+    assert sorted(p.name for p in ran.iterdir()) == [], "a command planted on PATH ran"
 
 
 _A, _B = _WIN_AEAD
@@ -988,12 +1095,34 @@ def test_verify_on_a_host_with_pyodbc_and_no_hop_does_not_fail(
     from messagefoundry.verify.runner import run_verify
 
     service = _isolate_settings(monkeypatch, tmp_path)
+    # The shell carries the service's own store backend, which overrides the file (R1 below).
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
     graph = tmp_path / "config"
     graph.mkdir()
     _with_pyodbc(monkeypatch, Status.FAIL)
     results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
     row = _host_ciphers_row(results)
     assert row.status is Status.SKIP, row.detail
+
+
+def test_a_sqlite_file_without_the_services_store_variable_reports_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 R1, a fail-open: ``MEFOR_STORE_BACKEND`` overrides the file, and the shell
+    running ``verify`` need not carry the service's own environment. A file that says sqlite,
+    with no such variable here, does not show the service's store, which may be SQL Server. So
+    a FAIL reading is not pinned on the host, and neither is it hidden behind a SKIP."""
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    service.write_text('[store]\nbackend = "sqlite"\n', encoding="utf-8")
+    graph = tmp_path / "config"
+    graph.mkdir()
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
+    row = _host_ciphers_row(results)
+    assert row.status is Status.MANUAL, row.detail
+    assert "MEFOR_STORE_BACKEND" in row.detail and "sqlite" in row.detail
 
 
 def test_verify_without_a_service_config_reports_manual(
@@ -1096,21 +1225,25 @@ def test_a_generic_dialect_connection_alone_is_unknown(
 
 
 def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No hop in the graph: "none" when the settings were read from a file, unknown when they did
-    not load or came from the defaults alone, because the store could then be SQL Server."""
+    """No hop in the graph: "none" only when this shell sets ``MEFOR_STORE_BACKEND``, which
+    overrides the file. Unknown when the settings did not load, came from the defaults alone, or
+    came from a file with no such variable here, because the service's own environment could make
+    the store SQL Server (BACKLOG #3803 R1)."""
     from messagefoundry.config.settings import ServiceSettings
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
     _registry_with(monkeypatch)
-    hops = _hops(tmp_path, settings=ServiceSettings())
-    assert (hops.found, hops.unknown) == ((), None)
-    assert repr(str(tmp_path)) in hops.judged
+    unknown = _hops(tmp_path, settings=ServiceSettings()).unknown
+    assert unknown is not None and "MEFOR_STORE_BACKEND" in unknown and "sqlite" in unknown
     unknown = _hops(tmp_path).unknown
     assert unknown is not None and "settings did not load" in unknown
     unknown = _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown
     assert unknown is not None and "no service config was read" in unknown
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    hops = _hops(tmp_path, settings=ServiceSettings())
+    assert (hops.found, hops.unknown) == ((), None)
+    assert repr(str(tmp_path)) in hops.judged
     assert _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown is None
 
 
