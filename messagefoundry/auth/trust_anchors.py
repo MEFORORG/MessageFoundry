@@ -124,9 +124,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     **The hops built before this preflight take the checks first** (BACKLOG #3470), through
     :func:`anchor_refusal`, which writes no audit row. At least four are covered:
 
-    * ``serve`` and ``supervise`` check ``[logging].forward_tls_ca_file`` before they build the
-      log forwarder. A refusal stops the start on stderr. No store is open yet, so no row is
-      written. ``supervise`` runs no other anchor check.
+    * ``serve`` checks ``[logging].forward_tls_ca_file`` before it builds the log forwarder. A
+      refusal builds no forwarder and logs a WARNING that forwarding is off. ``serve`` hands the
+      refusal to the API lifespan, which refuses the start once this preflight has run, with its
+      rows, or marked ``unaudited`` if this preflight passed. At least these run first: the API
+      TLS pair is minted or renewed, the store is created and migrated, and the startup
+      attestation runs and may alert. No listener binds, since uvicorn binds after the lifespan.
+    * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
+      before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
       notifier with an email transport. It checks only a CA this preflight is given. A refusal
       builds the notifier without its email transport, so the webhook still pages the alerts sent

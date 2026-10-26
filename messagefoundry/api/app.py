@@ -10997,6 +10997,7 @@ def create_managed_app(
     configured_log_level: str | None = None,
     trust_anchor_specs: Sequence[AnchorSpec] = (),
     trust_anchors_enforcing: bool = True,
+    prestore_anchor_refusals: Sequence[TrustAnchorError] = (),
 ) -> FastAPI:
     """Build an app that owns its engine for its whole lifespan (CLI server / sync tests).
 
@@ -11223,17 +11224,20 @@ def create_managed_app(
         # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
         # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
         # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
-        if trust_anchor_specs:
+        # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
+        early_refusal = smtp_anchor_refusal or next(iter(prestore_anchor_refusals), None)
+        if trust_anchor_specs or early_refusal is not None:
             try:
-                await run_anchor_preflight(
-                    trust_anchor_specs, store, enforcing=trust_anchors_enforcing
-                )
-                if smtp_anchor_refusal is not None:
-                    # The CA passed here after it was refused above: it changed, or a read
-                    # failed once. The notifier sends no email, so the engine does not start.
-                    # No row records this refusal.
-                    smtp_anchor_refusal.unaudited = True
-                    raise smtp_anchor_refusal
+                if trust_anchor_specs:
+                    await run_anchor_preflight(
+                        trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+                    )
+                if early_refusal is not None:
+                    # The CA passed here after it was refused before the store opened: it
+                    # changed, or a read failed once. Its hop was built without it, so the engine
+                    # does not start. No row records this refusal.
+                    early_refusal.unaudited = True
+                    raise early_refusal
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()

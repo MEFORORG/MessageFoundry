@@ -3058,6 +3058,64 @@ async def test_a_notifier_with_no_email_transport_is_not_held_back_by_the_ca(
     assert len(built) == 1
 
 
+def _forwarder_app(tmp_path: Path) -> tuple[Any, TrustAnchorError]:
+    """A managed app as ``serve`` builds it after ``_start_logging`` refused the collector's CA:
+    the forwarder CA's spec, and that early refusal."""
+    from messagefoundry.api.app import create_managed_app
+
+    specs = _dialling_specs(str(_pem(tmp_path)), log_settings=_SYSLOG_TLS)
+    refusal = ta.anchor_refusal(specs[0], enforcing=True)
+    assert refusal is not None
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=specs,
+        trust_anchors_enforcing=True,
+        prestore_anchor_refusals=(refusal,),
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    return app, refusal
+
+
+async def test_a_forwarder_ca_serve_refused_early_refuses_the_start_with_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``serve`` builds no forwarder for a refused collector CA and hands the refusal on. The
+    lifespan's audited check then refuses the start and writes the row. Red before the fix: the
+    lifespan took no such refusal."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, early = _forwarder_app(tmp_path)
+    with pytest.raises(TrustAnchorError, match=r"\[logging\]\.forward_tls_ca_file") as err:
+        async with app.router.lifespan_context(app):
+            pass
+    assert err.value is not early and not err.value.unaudited
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        events = [r["event"] for r in await _rows(reopened, "logging_forward_ca")]
+    finally:
+        await reopened.close()
+    assert "acl_insecure" in events, events
+
+
+async def test_a_forwarder_ca_serve_refused_early_still_refuses_if_the_check_then_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine runs without its forwarder only on the way to a refusal. When the audited check
+    passes after the early refusal, the early refusal is raised, marked ``unaudited``."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    verdicts = iter([False, True])
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
+    app, early = _forwarder_app(tmp_path)
+    with pytest.raises(TrustAnchorError) as err:
+        async with app.router.lifespan_context(app):
+            pass
+    assert err.value is early and err.value.unaudited
+
+
 def _offline_settings(ca: str, *, tls: dict[str, Any] | None = None) -> Any:
     """Service settings whose offline security notifier dials a verified relay, with ``ca`` as
     ``[alerts].email_tls_ca_file``, or as the internal CA when ``tls`` is given."""

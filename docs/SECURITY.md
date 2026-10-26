@@ -6461,13 +6461,15 @@ are covered:
 
 | Hop | When its CA is checked | What a refusal does |
 |---|---|---|
-| The `serve` syslog forwarder | Before the forwarder is built | Refuses the start on stderr, with no audit row: no store is open yet |
-| The `supervise` syslog forwarder | Before the forwarder is built | The same; `supervise` runs no other anchor check |
+| The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start and writes its rows, before any listener binds |
+| The `supervise` syslog forwarder | Before the forwarder is built | Refuses the start on stderr before any engine shard spawns, with no audit row: that process has no audited check |
 | The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds the notifier without email, so the webhook still pages startup alerts. The audited check then refuses the start. It writes its rows when it can read the file |
 | The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |
 
 Under `warn`, each warns and goes on, as the start check does. A file that cannot be read refuses
-at either setting. Each hop still reads the file by path after its check, the gap the paragraph
+at either setting. When `serve` defers a refusal to the audited check, some start work runs
+first. At least the API TLS pair is minted or renewed, the store is created and migrated, and the
+startup attestation runs. Each hop still reads the file by path after its check, the gap the paragraph
 above describes. The [trust anchors module](../messagefoundry/auth/trust_anchors.py), item 10,
 holds the detail.
 
