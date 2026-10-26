@@ -56,7 +56,8 @@
     PENDING, then the gate runs, skipping that record, and its answer replaces PENDING in the spooled
     copy before the lock is given up. So a gate that crashes or hangs loses no record; one left
     PENDING counts toward the chain floor. No flusher posts the record while this -Log runs, and
-    once it has exited, the lock is stale and the record is posted as it stands. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
+    once it has exited, however it exits, the operating system lets the lock go and the record is
+    posted as it stands. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
     `GATE <word>` and why, and exits with the gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
     LOGGED line still says whether the record was posted or is still spooled. Under -NoPost the gate
     reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. -Log stops an act only
@@ -551,9 +552,11 @@ function Complete-Log([string]$How, [int]$Code) {
 
 # EVERY RECORD IS SPOOLED BEFORE ANYTHING ELSE RUNS, the gate included, so a gate that crashes or
 # hangs cannot lose it. A gated record is locked first and stays locked until the gate's answer is
-# written into it, so no flusher posts it PENDING while this -Log runs. The gate skips its own id.
+# written into it, so no flusher posts it PENDING while this -Log runs; if this process dies, the
+# operating system lets the lock go and the record is posted as it stands. The gate skips its own id.
 if ($gated) {
-    if (-not (Lock-DecisionSpool -CoordRoot $coord -Id $record.id)) { throw "the lock of the new record $($record.id) is already held" }
+    $lock = Lock-DecisionSpool -CoordRoot $coord -Id $record.id
+    if ($null -eq $lock) { throw "the lock of the new record $($record.id) is already held" }
     try {
         Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
         $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
@@ -566,7 +569,7 @@ if ($gated) {
             [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten (its new copy could not be written: $($_.Exception.Message)), so the record says gate PENDING.")
         }
     } finally {
-        Unlock-DecisionSpool -CoordRoot $coord -Id $record.id
+        Unlock-DecisionSpool $lock $coord $record.id
     }
 } else {
     Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)

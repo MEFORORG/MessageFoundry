@@ -860,6 +860,8 @@ def test_a_post_whose_delete_fails_is_not_posted_again(sb: Sandbox) -> None:
 def test_a_log_whose_spool_file_outlives_its_post_reports_posted(sb: Sandbox) -> None:
     """The post is answered but the spool file cannot be removed. -Log reports the record posted
     and exits 0, rather than say it is still spooled."""
+    if sys.platform != "win32" and os.geteuid() == 0:
+        pytest.skip("root deletes in a read-only directory; nothing is shown")
     stop = sb.state_path.parent / "hold-stop"
     sb.set_state(hold_spool={"dir": str(sb.spool_dir), "stop": str(stop)})
     try:
@@ -873,51 +875,61 @@ def test_a_log_whose_spool_file_outlives_its_post_reports_posted(sb: Sandbox) ->
     assert "WARNING" in proc.stderr, proc.stderr
 
 
-def test_a_lock_that_cannot_be_made_is_skipped_and_named(sb: Sandbox) -> None:
+def test_a_lock_that_cannot_be_opened_is_skipped_and_named(sb: Sandbox) -> None:
     """A directory holds the lock's name, as a spool it cannot write would refuse it."""
     path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
     (sb.spool_dir / f"{path.stem}.lock").mkdir()
     flush = sb.run(DECISION, "-Flush")
     assert flush.returncode == 4, (flush.stdout, flush.stderr)
     assert "FLUSHED posted=0 failed=0 held=0 skipped=1" in flush.stdout, flush.stdout
-    assert f"{path.stem}: its lock could not be made" in flush.stderr, flush.stderr
+    assert f"{path.stem}: its lock could not be opened" in flush.stderr, flush.stderr
     assert path.exists()
 
 
-def _this_process(pid: int) -> tuple[str, str]:
-    """This host's name and a process's start time, as _decisionlog.ps1 reads them."""
-    proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"[Environment]::MachineName; (Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-    )
-    host, ticks = proc.stdout.split()
-    return host, ticks
+_LOCK_HOLDER = (
+    "import sys, time, pathlib\n"
+    "lock, stop, ready = (pathlib.Path(a) for a in sys.argv[1:4])\n"
+    "f = lock.open('a+b')\n"
+    "if sys.platform != 'win32':\n"
+    "    import fcntl\n"
+    "    fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+    "ready.write_text('ready')\n"
+    "end = time.monotonic() + 120\n"
+    "while not stop.exists() and time.monotonic() < end:\n"
+    "    time.sleep(0.05)\n"
+)
 
 
 @pytest.mark.parametrize("hours", [-24, 24], ids=["clock-stepped-back", "clock-stepped-forward"])
-@pytest.mark.parametrize("live", [True, False], ids=["holder-runs", "pid-reused"])
+@pytest.mark.parametrize("alive", [True, False], ids=["holder-runs", "holder-exited"])
 def test_a_records_hold_is_its_lock_holder_never_the_clock(
-    sb: Sandbox, hours: int, live: bool
+    sb: Sandbox, tmp_path: Path, hours: int, alive: bool
 ) -> None:
-    """A -Log still running its gate holds its record however far its id is from the clock, so
-    a PENDING record is never posted for good while the gate runs. A lock whose pid now names a
-    later process (another start time) is stale, and the record is posted as it stands."""
+    """A process holding a record's lock open holds the record however far its id is from the
+    clock, so a PENDING record is never posted for good while its gate runs. Once the holder has
+    exited, its lock file is left but held by nobody, and the record is posted as it stands."""
     path = _spool_write(sb, rec(at=ago(hours=hours), item="4242", gate="PENDING"))
-    host, ticks = _this_process(os.getpid())
-    lock = {"host": host, "pid": os.getpid(), "started": ticks if live else "1"}
-    (sb.spool_dir / f"{path.stem}.lock").write_text(json.dumps(lock), encoding="utf-8")
-    flush = sb.run(DECISION, "-Flush")
+    lock = sb.spool_dir / f"{path.stem}.lock"
+    stop, ready = tmp_path / "holder-stop", tmp_path / "holder-ready"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER, str(lock), str(stop), str(ready)],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.exists(), "the lock holder never started"
+        if not alive:
+            stop.write_text("stop", encoding="utf-8")
+            holder.wait(timeout=30)
+            assert lock.exists()
+        flush = sb.run(DECISION, "-Flush")
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        holder.wait(timeout=30)
     assert flush.returncode == 0, (flush.stdout, flush.stderr)
-    if live:
+    if alive:
         assert "FLUSHED posted=0 failed=0 held=1 skipped=0" in flush.stdout, flush.stdout
         assert f"HELD, still spooled: {path.stem}" in flush.stderr, flush.stderr
         assert path.exists()
@@ -937,19 +949,19 @@ def _in_module(body: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_a_spool_file_that_refuses_access_for_a_moment_is_retried(tmp_path: Path) -> None:
+def test_a_spool_file_that_refuses_access_for_a_moment_is_retried() -> None:
     """Windows refuses to open a file deleted but still pending deletion with access denied, and
-    the file is gone a moment later: a posted record, which the vault holds. A directory under
-    the record's name refuses the same way until it is removed."""
-    target = tmp_path / "d20261026T000000000-abcdef.json"
-    target.mkdir()
+    the file is gone a moment later. The spool's retry outlasts that: here a stand-in refuses
+    twice and then reports the file gone, and the read returns it as gone rather than throw."""
     proc = _in_module(
-        f"$j = Start-ThreadJob {{ Start-Sleep -Milliseconds 150; [IO.Directory]::Delete('{target}') }}; "
-        f"$r = Read-DecisionSpoolFile '{target}'; $null = Wait-Job $j; "
-        "if ($null -eq $r) { 'GONE' } else { 'READ' }"
+        "$script:tries = 0; "
+        "$r = Invoke-DecisionSpoolIo { $script:tries++; "
+        "if ($script:tries -lt 3) { throw [UnauthorizedAccessException]::new('delete pending') }; "
+        "'read' }; "
+        '"$r $($script:tries)"'
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "GONE", proc.stdout
+    assert proc.stdout.split() == ["read", "3"], proc.stdout
 
 
 def test_a_spool_read_with_no_days_reads_every_day(tmp_path: Path) -> None:

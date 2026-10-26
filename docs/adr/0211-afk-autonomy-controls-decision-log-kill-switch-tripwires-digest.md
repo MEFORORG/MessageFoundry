@@ -42,9 +42,11 @@ script creates the day's issue on first use. A posted record leaves the spool. A
 cannot be posted stays there, and the script says so and exits 4; the next `-Log` or `-Flush`
 posts it. A flush leaves alone a record whose lock another worker holds, such as a `-Log` whose
 gate is still running (*Where it is enforced* below); `-Flush` counts it as `held`, and a later
-`-Log` or `-Flush` posts it. No worker renames a record, and a record already posted is never
-posted again; `scripts/coord/_decisionlog.ps1`, *The spool*, says how the lock and the posted mark
-do that. `-NoPost` spools with no network at all, which the tripwire hook needs.
+`-Log` or `-Flush` posts it. No worker renames a record, and a record whose post was answered is
+marked posted before its spool file is deleted, so a delete that fails does not post it again; a
+flusher that dies between a post and that mark leaves a record the next flush posts again, which a
+reader reads once, by id. `scripts/coord/_decisionlog.ps1`, *The spool*, says how the lock and the
+posted mark work. `-NoPost` spools with no network at all, which the tripwire hook needs.
 
 A day's issue number never changes, so it is cached in `decisions/issues.json` and the listing
 is asked only on a miss; a record then costs one REST request. A cached number that answers 404

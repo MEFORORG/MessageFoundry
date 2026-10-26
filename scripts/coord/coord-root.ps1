@@ -382,9 +382,11 @@ function Read-CoordText {
     # A reader still blocks a rename onto the file it holds; the writer's retry covers that.
     # With no -Encoding it reads UTF-8 and honours a byte-order mark; an explicit -Encoding is taken
     # as given, with no detection.
-    param([string]$Path, [System.Text.Encoding]$Encoding)
+    # -AllowAccessDenied retries access denied too, for a caller whose files are deleted while it
+    # reads them: Windows refuses to open a file that is deleted but not yet gone with access denied.
+    param([string]$Path, [System.Text.Encoding]$Encoding, [switch]$AllowAccessDenied)
     $full = ConvertTo-CoordFullPath $Path
-    $text = Invoke-CoordIoRetry -Action {
+    $text = Invoke-CoordIoRetry -AllowAccessDenied:$AllowAccessDenied -Action {
         $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
         $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
         try {

@@ -257,54 +257,45 @@ function Read-DecisionIssue {
 # A RECORD IS <id>.json AND THAT NAME NEVER CHANGES until a flusher deletes it, after its post is
 # answered. Nothing renames a record, so a reader that lists *.json cannot miss one by listing it
 # mid-rename. Beside it a spool may hold:
-#   <id>.lock    a worker's exclusive use of the record, made with CreateNew, so only one worker
-#                holds it. -Log holds it from before the record is spooled until its gate has
-#                answered and the answer is written in; a flusher holds it while it posts.
+#   <id>.lock    a worker's exclusive use of the record: a file the worker holds OPEN, which no
+#                other worker can open while it does (Lock-DecisionSpool). -Log holds it from before
+#                the record is spooled until its gate's answer is written in; a flusher holds it
+#                while it posts. The operating system lets go when the holder exits, however it
+#                exits, so no pid, start time or clock decides whether a holder still runs. A
+#                holder deletes the name as it lets go (Unlock-DecisionSpool).
 #   <id>.posted  the record is in the vault. A flusher writes it as soon as a post is answered and
-#                before it deletes <id>.json, so a delete that fails can never post the record again.
+#                before it deletes <id>.json, so a delete that fails does not post the record again.
 #   <id>.json.<pid>.tmp  a part file, which no reader or flusher takes.
 # A reader takes <id>.json names only. The rest are the workers' own.
 
 function Get-DecisionSpoolId([string]$Name) {
-    # The record id a spool file name starts with, or '' for a name that is not one.
-    $at = $Name.IndexOf('.')
-    if ($at -lt 1) { return '' }
-    return $Name.Substring(0, $at)
+    # The record id a spool name carries: the name less its .json, .lock or .posted, or '' for any
+    # other name, a part file included.
+    foreach ($ext in '.json', '.lock', '.posted') {
+        if ($Name.EndsWith($ext) -and $Name.Length -gt $ext.Length) { return $Name.Substring(0, $Name.Length - $ext.Length) }
+    }
+    return ''
 }
 
 function Invoke-DecisionSpoolIo([scriptblock]$Action) {
     <#
-      THE ONE RETRY THE SPOOL USES, around every read, rename and delete of a spool file. It is
-      coord-root.ps1's Invoke-CoordIoRetry with -AllowAccessDenied: a sharing violation and an
-      access denied are retried with a short bounded backoff, and anything else, a missing file
-      included, is rethrown at once as the .NET exception. Access denied is retried because Windows
-      raises it for a file another process holds open while this one renames or deletes it, and
-      for a file that is deleted but not yet gone (delete pending).
+      THE ONE RETRY THE SPOOL USES, around every read, rename and delete of a spool file: coord-root.ps1's
+      Invoke-CoordIoRetry with -AllowAccessDenied. A sharing violation and an access denied are
+      retried with a short bounded backoff; anything else, a missing file included, is rethrown at
+      once as the .NET exception. Access denied is retried because Windows raises it for a file
+      deleted but not yet gone (delete pending), and for a rename onto a file a reader holds open.
     #>
     return (Invoke-CoordIoRetry -AllowAccessDenied -Action $Action)
-}
-
-function Read-DecisionSpoolText([string]$Path) {
-    # Shares read, write and delete, so a reader never blocks a flusher's delete or -Log's rewrite.
-    $full = $Path
-    return (Invoke-DecisionSpoolIo {
-            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-            $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
-            try {
-                $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true)
-                try { $reader.ReadToEnd() } finally { $reader.Dispose() }
-            } finally { $stream.Dispose() }
-        })
 }
 
 function Read-DecisionSpoolFile([string]$Path) {
     <#
       One spooled record, $null when it has left the spool, and a throw when it cannot be read or
       holds no record. A record leaves the spool only once a flusher has posted it, so $null means
-      the vault holds it. A file deleted but still pending deletion on Windows refuses to open
-      with access denied; the retry outlasts that, and then the file is gone.
+      the vault holds it. Read-CoordText shares read, write and delete, so a reader never blocks a
+      flusher's delete or -Log's rewrite, and -AllowAccessDenied outlasts a delete pending.
     #>
-    try { $text = Read-DecisionSpoolText $Path }
+    try { $text = Read-CoordText -Path $Path -AllowAccessDenied }
     catch [System.IO.FileNotFoundException] { return $null }
     if (-not $text) { throw 'it is empty' }
     $rec = $text | ConvertFrom-Json -ErrorAction Stop
@@ -329,7 +320,7 @@ function Read-DecisionSpool([string]$CoordRoot, [string[]]$Days = @()) {
         try { $files = [System.IO.Directory]::GetFiles($dir, '*.json') }
         catch { $errors.Add("the spool $dir could not be listed: $($_.Exception.Message)") }
     }
-    # GetFiles' pattern also matches a longer extension on Windows, so the name is checked again.
+    # The pattern can match a longer extension on Windows, so the name is checked again.
     foreach ($f in @($files | Where-Object { $_.EndsWith('.json') })) {
         $day = Get-DecisionIdDay (Get-DecisionSpoolId ([System.IO.Path]::GetFileName($f)))
         if ($days.Count -and $day -and $days -notcontains $day) { continue }
@@ -371,92 +362,64 @@ function Update-DecisionSpool([string]$CoordRoot, $Record) {
     <#
       Rewrites a spooled record in one atomic rename over it. ONLY THE HOLDER OF ITS LOCK CALLS
       THIS (-Log, between its gate's answer and its unlock), so no flusher can post or delete the
-      record meanwhile. It throws when the part file cannot be written or the rename fails past the
-      retry; the caller reports that, since the gate has answered by then.
+      record meanwhile; a record no longer spooled is refused rather than spooled again. It throws
+      when the part file cannot be written or the rename fails past the retry; the caller reports
+      that, since the gate has answered by then.
     #>
     $f = Get-DecisionSpoolPaths $CoordRoot ([string]$Record.id)
+    if (-not [System.IO.File]::Exists($f.Final)) { throw "$($f.Final) has left the spool" }
     try {
         Write-DecisionSpoolPart $f $Record
-        $part = $f.Part; $final = $f.Final
-        Invoke-DecisionSpoolIo { [System.IO.File]::Move($part, $final, $true) }
+        Move-CoordFileReplace -Source $f.Part -Destination $f.Final
     } finally {
         # A part file that cannot be deleted is left: no reader or flusher takes a .tmp name.
         try { if ([System.IO.File]::Exists($f.Part)) { [System.IO.File]::Delete($f.Part) } } catch { $null = $_ }
     }
 }
 
-function Get-DecisionProcessStamp([int]$ProcessId) {
-    # A process's start time in ticks, which tells a live holder from a later process that reused
-    # its pid; '?' for a process whose start time cannot be read, and $null when none has that pid.
-    try { $p = Get-Process -Id $ProcessId -ErrorAction Stop } catch { return $null }
-    try { return [string]$p.StartTime.ToUniversalTime().Ticks } catch { return '?' }
-}
-
 function Lock-DecisionSpool([string]$CoordRoot, [string]$Id) {
     <#
-      Takes <id>.lock and returns $true, or returns $false when another worker holds it. It throws
-      when the lock cannot be made for another reason (the caller reports that). The lock names
-      this host, pid and the pid's start time, so a reader can tell whether its holder still runs.
+      Opens <id>.lock so that no other worker can open it, and returns the open handle; the caller
+      disposes it to let go. Returns $null when another worker holds it, and throws when it cannot
+      be opened for another reason (the caller reports that). On Windows the handle shares delete
+      only, so its holder alone can delete the name; elsewhere it shares nothing, which .NET backs
+      with an exclusive flock.
     #>
-    $f = Get-DecisionSpoolPaths $CoordRoot $Id
     $null = [System.IO.Directory]::CreateDirectory((Get-DecisionSpoolDir $CoordRoot))
-    $body = ConvertTo-Json -Compress -InputObject ([ordered]@{
-            host = [Environment]::MachineName; pid = $PID; started = (Get-DecisionProcessStamp $PID)
-        })
-    try {
-        # A lock its holder has just deleted can refuse a new one with access denied on Windows
-        # until it is gone, which the retry outlasts. An existing lock is no transient error.
-        $lockPath = $f.Lock
-        $stream = Invoke-DecisionSpoolIo { [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read) }
-    } catch [System.IO.IOException] {
-        if ([System.IO.File]::Exists($f.Lock)) { return $false }
-        throw
+    $path = (Get-DecisionSpoolPaths $CoordRoot $Id).Lock
+    $share = if ($IsWindows) { [System.IO.FileShare]::Delete } else { [System.IO.FileShare]::None }
+    $open = { [System.IO.FileStream]::new($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, $share) }
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            # Not retried: a lock another worker holds is an answer, not a transient error. A lock
+            # deleted but still pending on Windows refuses with access denied, which the retry outlasts.
+            try { $h = & $open } catch [System.UnauthorizedAccessException] { $h = Invoke-DecisionSpoolIo $open }
+        } catch [System.IO.IOException] {
+            # Windows names a held lock a sharing violation; elsewhere a refused flock is an IOException.
+            if ($IsWindows -and $script:CoordSharingHResults -notcontains $_.Exception.HResult) { throw }
+            return $null
+        }
+        # Outside Windows a file opened just before its holder deleted it is locked unlinked, which
+        # excludes nobody; the name is opened again. Windows refuses to open a file being deleted.
+        if ($IsWindows -or [System.IO.File]::Exists($path)) { return $h }
+        $h.Dispose()
     }
-    try {
-        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
-        $stream.Write($bytes, 0, $bytes.Length)
-    } finally { $stream.Dispose() }
-    return $true
+    throw "$path was deleted each time it was opened"
 }
 
-function Unlock-DecisionSpool([string]$CoordRoot, [string]$Id) {
-    # Gives up <id>.lock; a missing lock is already given up. A lock left behind reads as stale
-    # once its holder exits, so a failure here costs a delay, never a record.
-    $lock = (Get-DecisionSpoolPaths $CoordRoot $Id).Lock
-    try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($lock) } } catch { $null = $_ }
-}
-
-# How long a lock whose holder this host cannot check (another host's, or one not yet written)
-# stands before a flusher takes it, and how long a live holder may keep one before -Flush says so.
-$script:DecisionHoldMinutes = 10
-
-function Get-DecisionLockState([string]$LockPath) {
-    <#
-      'live' while the lock's holder may still be working, 'stale' once it cannot be, and 'gone'
-      when there is no lock. A lock written on this host is live exactly while its pid runs with
-      the same start time, which reads no clock: a clock stepped back or forward cannot make a
-      running gate's record look abandoned. A lock this host cannot check (another host's, or one
-      still being written) is live until its file is $script:DecisionHoldMinutes old.
-    #>
-    $text = $null
-    try { $text = Read-DecisionSpoolText $LockPath } catch [System.IO.FileNotFoundException] { return 'gone' } catch { $text = $null }
-    $lock = $null
-    if ($text) { try { $lock = $text | ConvertFrom-Json -ErrorAction Stop } catch { $lock = $null } }
-    $lockHost = [string](Get-DecisionJsonValue $lock 'host')
-    if ($lock -and $lockHost -eq [Environment]::MachineName) {
-        $stamp = Get-DecisionProcessStamp ([int](Get-DecisionJsonValue $lock 'pid'))
-        $started = [string](Get-DecisionJsonValue $lock 'started')
-        if ($null -ne $stamp -and ($stamp -eq $started -or '?' -in @($stamp, $started))) { return 'live' }
-        return 'stale'
-    }
-    try { $age = [DateTime]::UtcNow - [System.IO.File]::GetLastWriteTimeUtc($LockPath) } catch { return 'live' }
-    if ($age.TotalMinutes -ge $script:DecisionHoldMinutes) { return 'stale' }
-    return 'live'
+function Unlock-DecisionSpool($Handle, [string]$CoordRoot, [string]$Id) {
+    # Lets go of a lock: deletes its name while still holding it, so no other worker holds it
+    # until this worker is done, then closes the handle. A name that cannot be deleted is left,
+    # and the next worker opens and holds it as usual.
+    $path = (Get-DecisionSpoolPaths $CoordRoot $Id).Lock
+    try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($path) } } catch { $null = $_ }
+    finally { $Handle.Dispose() }
 }
 
 function Remove-DecisionSpoolPosted($Paths) {
-    # The record is in the vault: delete it, then its posted mark. A delete that fails leaves the
-    # mark, so no flusher posts it again, and the next flush tries the delete again.
+    # The record is in the vault: delete it, then its posted mark, and return $null. A delete that
+    # fails leaves both and returns why, so no flusher posts it again and the next flush tries the
+    # delete again.
     $final = $Paths.Final; $posted = $Paths.Posted
     try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($final) } }
     catch { return "posted, but $final could not be removed: $($_.Exception.Message)" }
@@ -468,11 +431,12 @@ function Send-DecisionSpool {
     <#
       Posts every spooled record to its day's issue, oldest first, each under its lock. Returns
       Posted (the count this call posted), PostedIds (those, and any found posted earlier and
-      cleared now), Errors (a record that
-      could not be read or posted, each named), Held (a record whose lock another worker holds,
-      such as a -Log still waiting on its gate, each named), Skipped (a lock that could not be
-      made, each named), and Warnings (a record posted whose spool file could not be removed).
-      A record posted earlier, with its posted mark, is never posted again.
+      cleared now), Errors (a record that could not be read or posted, each named), Held (a record
+      whose lock another worker holds, such as a -Log still waiting on its gate, each named),
+      Skipped (a record whose lock could not be opened for another reason, each named), and
+      Warnings (a record posted whose spool file could not be removed). A record with its posted
+      mark is not posted again. A flusher that dies between a post and its mark leaves a record
+      the next flush posts again; a reader reads it once, by id.
     #>
     param([string]$Repo, [string]$CoordRoot)
     $posts = 0
@@ -486,35 +450,27 @@ function Send-DecisionSpool {
     if ([System.IO.Directory]::Exists($dir)) {
         $names = @([System.IO.Directory]::GetFiles($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
         $ids = @($names | Where-Object { $_.EndsWith('.json') } | ForEach-Object { Get-DecisionSpoolId $_ } | Where-Object { $_ } | Sort-Object -Unique)
-        # A lock or posted mark with no record beside it is what a worker that died left. A lock
-        # is removed once stale; a posted mark at once, since its record has gone.
+        # A lock or posted mark whose record has gone is what a finished or dead worker left.
         foreach ($n in $names) {
             $id = Get-DecisionSpoolId $n
-            if (-not $id -or $ids -contains $id) { continue }
+            if (-not $id -or $ids -contains $id -or $n.EndsWith('.json')) { continue }
             $p = Join-Path $dir $n
-            if ($n -eq "$id.posted" -or ($n -eq "$id.lock" -and (Get-DecisionLockState $p) -eq 'stale')) {
+            if ($n.EndsWith('.posted')) {
                 try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($p) } } catch { $null = $_ }
+                continue
             }
+            $h = $null
+            try { $h = Lock-DecisionSpool $CoordRoot $id } catch { $h = $null }
+            if ($h) { Unlock-DecisionSpool $h $CoordRoot $id }
         }
     }
     $issues = @{}
     $dayFailed = @{}
     foreach ($id in $ids) {
         $f = Get-DecisionSpoolPaths $CoordRoot $id
-        try { $locked = Lock-DecisionSpool $CoordRoot $id }
-        catch { $skipped.Add("${id}: its lock could not be made: $($_.Exception.Message)"); continue }
-        if (-not $locked) {
-            $state = Get-DecisionLockState $f.Lock
-            if ($state -eq 'stale') {
-                # Its holder has exited. Two flushers that retake one stale lock together can both
-                # post the record; a reader reads it once, by id.
-                Unlock-DecisionSpool $CoordRoot $id
-                try { $locked = Lock-DecisionSpool $CoordRoot $id } catch { $locked = $false }
-            } elseif ($state -eq 'gone') {
-                try { $locked = Lock-DecisionSpool $CoordRoot $id } catch { $locked = $false }
-            }
-            if (-not $locked) { $held.Add("${id}: another worker holds $($f.Lock), such as a -Log whose gate is still running"); continue }
-        }
+        try { $lock = Lock-DecisionSpool $CoordRoot $id }
+        catch { $skipped.Add("${id}: its lock could not be opened: $($_.Exception.Message)"); continue }
+        if ($null -eq $lock) { $held.Add("${id}: another worker holds its lock, such as a -Log whose gate is still running"); continue }
         try {
             if ([System.IO.File]::Exists($f.Posted)) {
                 # Posted by an earlier flush whose delete failed: finish the delete, never re-post.
@@ -524,7 +480,7 @@ function Send-DecisionSpool {
             }
             $rec = Read-DecisionSpoolFile $f.Final
             if ($null -eq $rec) { continue }
-            if ([string]$rec.id -ne $id) { throw "spool file $($f.Final) holds id '$($rec.id)', not its own" }
+            if ([string]$rec.id -ne $id) { throw "spool file $($f.Final) holds id '$($rec.id)', not the one its name carries" }
             $day = Get-DecisionIdDay $id
             if (-not $day) { throw "spool file $($f.Final) holds no valid id" }
             # A day whose issue could not be found or made fails once per flush, not once per
@@ -555,7 +511,7 @@ function Send-DecisionSpool {
         } catch {
             $errors.Add("${id}: $($_.Exception.Message)")
         } finally {
-            Unlock-DecisionSpool $CoordRoot $id
+            Unlock-DecisionSpool $lock $CoordRoot $id
         }
     }
     return [pscustomobject]@{
