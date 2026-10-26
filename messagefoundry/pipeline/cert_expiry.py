@@ -28,7 +28,7 @@ import gc
 import logging
 import ssl
 import time
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -515,10 +515,6 @@ class _HeldCopyAccount:
     remedy: str
 
 
-#: :meth:`_HeldCopyLog.unchecked_later_crl`'s fold token: one such line a pass for each file.
-_UNCHECKED_LATER_CRL = "unchecked-later-crl"
-
-
 class _HeldCopyLog:
     """The rows naming each CRL file, and the held-copy warnings one scan pass has logged (vault
     BACKLOG #3099). The pass keys a row's file here, for its line and for its alert.
@@ -537,8 +533,7 @@ class _HeldCopyLog:
         # Each CRL row's path in key form, worked out once inside the grouping's guard, so the
         # lookups below never key a path themselves (BACKLOG #3512).
         self._keys = keys
-        # Each line logged this pass: the file's key, and what the line said of it.
-        self._logged: set[tuple[str, Hashable]] = set()
+        self._logged: set[tuple[str, _HeldCopyAccount]] = set()
 
     @classmethod
     def for_rows(cls, rows: Sequence[MonitoredCert]) -> _HeldCopyLog:
@@ -570,71 +565,37 @@ class _HeldCopyLog:
         Only log bookkeeping runs here, after the verdict, so a failure in it is logged and costs
         the row no date and no alert (vault BACKLOG #3548). An account counts as logged only once
         its line is, so a failure leaves the next row sharing the file to log it."""
-        self._log_once(
-            cert,
-            account,
-            "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), from "
-            "%s). The hop keeps the copy it read when it built its context; the soonest CRL in it "
-            "(issuer %r) lapses at %s. %s.%s",
-            account.why,
-            account.loads,
-            ", ".join(account.holders),
-            account.issuer,
-            log_timestamp(account.next_update_iso),
-            account.remedy,
-            failure="could not log the held copies of",
-        )
-
-    def unchecked_later_crl(self, cert: MonitoredCert) -> None:
-        """Log that a later CRL in ``cert``'s CA file did not parse for the signature check, so an
-        earlier CRL's unconfirmed verdict stands (BACKLOG #3512). Called inside the ``except``, so
-        the line carries the cause. Folded as :meth:`warn` folds."""
-        self._log_once(
-            cert,
-            _UNCHECKED_LATER_CRL,
-            "cert_expiry: could not check the signature of a later CRL in %r CA file %s, so an "
-            "earlier CRL's unconfirmed signature decides the alert.%s",
-            failure="could not log the unchecked CRL of",
-            exc_info=True,
-        )
-
-    def _log_once(
-        self,
-        cert: MonitoredCert,
-        token: Hashable,
-        message: str,
-        *args: object,
-        failure: str,
-        exc_info: bool = False,
-    ) -> None:
-        """Log ``message`` about ``cert``'s file once a pass for each ``token`` (vault BACKLOG #3099).
-        ``message`` starts with the row's label and path and ends with the other rows' clause, each
-        a ``%`` field filled here, around ``args``.
-
-        Only log bookkeeping runs here, so a failure in it is logged and costs the row no date and
-        no alert (vault BACKLOG #3548). A line counts as logged only once it is, so a failure leaves
-        the next row sharing the file to log it. A file the grouping does not hold is always
-        logged, because no line could name the rows a fold left out."""
         try:
             # Every keyed path is in the grouping, so a key is the fold's key.
             fold_key = self._keys.get(cert.path)
-            if fold_key is not None and (fold_key, token) in self._logged:
+            if fold_key is not None and (fold_key, account) in self._logged:
                 return
             # The alert's own words for the rows sharing a file, without its clause that each of
             # those rows reports the copy too: a folded line is the one report of it in the log.
             also = crl_expiry_detail(held_copy=False, detail="", shared_with=self.others(cert))
             log.warning(
-                message,
+                "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d "
+                "load(s), from %s). The hop keeps the copy it read when it built its context; "
+                "the soonest CRL in it (issuer %r) lapses at %s. %s.%s",
                 cert.label,
                 cert.path,
-                *args,
+                account.why,
+                account.loads,
+                ", ".join(account.holders),
+                account.issuer,
+                log_timestamp(account.next_update_iso),
+                account.remedy,
                 f" {also}" if also else "",
-                exc_info=exc_info,
             )
             if fold_key is not None:
-                self._logged.add((fold_key, token))
+                self._logged.add((fold_key, account))
         except Exception:
-            log.error("cert_expiry: %s %r CRL %s", failure, cert.label, cert.path, exc_info=True)
+            log.error(
+                "cert_expiry: could not log the held copies of %r CRL %s",
+                cert.label,
+                cert.path,
+                exc_info=True,
+            )
 
 
 def held_crl_label(path: str) -> str:
@@ -651,7 +612,6 @@ def _ca_file_crl_refusal(
     file_facts: CrlFacts | None,
     *,
     ca_file_only: bool,
-    on_unchecked: Callable[[], None],
 ) -> tuple[str, str] | None:
     """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy)``, or
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
@@ -668,9 +628,7 @@ def _ca_file_crl_refusal(
     the restart, after the reload's verdict. A CRL whose issuer this file does not hold is not
     refused: the issuer can be an intermediate the peer sends, which the reload treats the same
     way. ``file_facts`` is the lenient reading, which tells an expired CRL from one that cannot be
-    judged. ``on_unchecked`` is called, inside the ``except``, when a later CRL does not parse
-    and an earlier one's verdict stands. Each remedy leads, because the alert instance keeps only
-    the start of it."""
+    judged. Each remedy leads, because the alert instance keeps only the start of it."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -692,7 +650,9 @@ def _ca_file_crl_refusal(
     # No clock skew allowed, unlike a CRL setting's start: nothing at start refuses this CRL, and
     # OpenSSL allows none, so a restart before it takes effect refuses peers until then.
     if (early := crl_not_in_effect(blocks, now=now, skew=0.0)) is not None:
-        # main's words and main's wait, unchanged by BACKLOG #3512: a test holds them to main's.
+        # Word for word as before BACKLOG #3512, wait included: a test holds the sentence. The
+        # wait is unsafe where the hop's copy lapses first, which needs per-issuer blocks for
+        # CA-file copies to tell (vault #4151).
         return (
             "whose CA file now holds a CRL that is not yet in effect",
             f"Replace the CRL in the CA file with one in effect now, or wait until "
@@ -706,19 +666,12 @@ def _ca_file_crl_refusal(
         # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for
         # three of them, and only ``bad`` proves a failure (BACKLOG #3512).
         states: set[str] = set()
-        try:
-            for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True)):
-                states.add(sig.state)
-                if sig.state == "bad":
-                    break  # proven: no later block changes the remedy
-        except ValueError:
-            # main's check stopped at the first unconfirmed block, so a later block that does not
-            # parse, the one failure judge_crl_signatures documents, never cost that verdict. Keep
-            # the verdict the earlier blocks gave. Any other type is unexpected and takes the outer
-            # path, as before (BACKLOG #3512).
-            if not states - {"verified", "unlisted"}:
-                raise
-            on_unchecked()
+        # No guard of its own: judge_crl_bytes above already parsed every block, so a raise here is
+        # unexpected and takes the handlers below (BACKLOG #3512).
+        for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True)):
+            states.add(sig.state)
+            if sig.state == "bad":
+                break  # proven: no later block changes the remedy
     except ValueError:
         return unjudged  # OpenSSL loads other CRLs than were judged
     except ssl.SSLError as exc:
@@ -887,7 +840,6 @@ def _judge_crl(
                         now,
                         file_facts,
                         ca_file_only=not crl_setting_too,
-                        on_unchecked=lambda: said.unchecked_later_crl(cert),
                     )
                 )
                 is not None

@@ -704,7 +704,8 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-_UNCHECKED_LATER_CRL = "could not check the signature of a later CRL"
+#: The line the CA-file check logs when it fails for a reason that is no verdict on the file.
+_COULD_NOT_CHECK = "could not check the CRL in a CA file"
 
 
 def _blocks_then(first: str, error: type[Exception]) -> Any:
@@ -720,7 +721,7 @@ def _blocks_then(first: str, error: type[Exception]) -> Any:
 @pytest.mark.parametrize(
     ("first", "error", "lead"),
     [
-        ("unproven", ValueError, "Check that the CRL in the CA file is one its CA signed"),
+        ("unproven", ValueError, "Replace the CRL in the CA file with one the engine can judge"),
         ("unproven", RuntimeError, "Check the CRL in the CA file before restarting: the scan"),
         ("verified", ValueError, "Replace the CRL in the CA file with one the engine can judge"),
         ("verified", RuntimeError, "Check the CRL in the CA file before restarting: the scan"),
@@ -728,7 +729,7 @@ def _blocks_then(first: str, error: type[Exception]) -> Any:
         ("bad", RuntimeError, "Replace the CRL in the CA file with one its CA signed"),
     ],
 )
-def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
+def test_a_signature_check_that_raises_takes_the_ca_file_check_s_own_handlers(
     ca: _Ca,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -737,12 +738,10 @@ def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
     error: type[Exception],
     lead: str,
 ) -> None:
-    # BACKLOG #3512: main's check stopped at the first unconfirmed block, so a later block that
-    # does not parse (ValueError, the failure judge_crl_signatures documents) never cost that
-    # verdict. Draining every block must not change that, and the kept verdict is logged with its
-    # cause, naming the CA file. Any other type is unexpected and takes the outer path, as before.
-    # Controls: a verified block before the raise leaves nothing to keep, and a ``bad`` block stops
-    # the check, so a later raise is never reached.
+    # BACKLOG #3512: judge_crl_bytes has already parsed every block, so a raise from the signature
+    # check is unexpected. It keeps no earlier block's verdict: a ValueError reads as a file the
+    # engine cannot judge, and any other type as a scan that could not check, logged with its
+    # cause. A ``bad`` block stops the check, so a later raise is never reached.
     hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
     monkeypatch.setattr(
         "messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _blocks_then(first, error)
@@ -755,48 +754,13 @@ def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
     # The held-copy line is always logged here, so the walk below reads a log that has lines.
     assert caplog.records
     assert any("still holds a copy" in r.getMessage() for r in caplog.records), caplog.records
-    kept = [r for r in caplog.records if _UNCHECKED_LATER_CRL in r.getMessage()]
-    if (first, error) == ("unproven", ValueError):
-        assert len(kept) == 1, kept
-        assert kept[0].levelno == logging.WARNING
-        # A held-crl row spells the path in key form, which folds case on Windows.
-        assert str(bundle).lower() in kept[0].getMessage().lower(), kept[0].getMessage()
-        assert kept[0].exc_info is not None and kept[0].exc_info[0] is ValueError
+    unchecked = [r for r in caplog.records if _COULD_NOT_CHECK in r.getMessage()]
+    if error is RuntimeError and first != "bad":
+        assert len(unchecked) == 1, unchecked
+        assert unchecked[0].levelno == logging.WARNING
+        assert unchecked[0].exc_info is not None and unchecked[0].exc_info[0] is RuntimeError
     else:
-        assert kept == [], kept
-    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
-
-
-def test_a_later_unchecked_crl_is_logged_once_a_pass_for_the_rows_sharing_its_ca_file(
-    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # BACKLOG #3512: two rows name one CA file, and each judges it. The kept verdict's line is
-    # folded as the held-copy line is: once a pass for the file, naming the other row. Each row
-    # still gets its own alert with the kept verdict.
-    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
-    monkeypatch.setattr(
-        "messagefoundry.pipeline.cert_expiry.judge_crl_signatures",
-        _blocks_then("unproven", ValueError),
-    )
-    rows = [
-        MonitoredCert("a.crl_file", str(bundle), kind="crl"),
-        MonitoredCert("b.crl_file", str(bundle), kind="crl"),
-    ]
-    sink = _RecordingSink()
-    runner = CertExpiryRunner(lambda: rows, CertMonitorSettings(warn_days=30), alert_sink=sink)
-
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
-        runner.run_once(now=time.time())
-        runner.run_once(now=time.time())
-
-    assert [c[0] for c in sink.crl_calls] == ["a.crl_file", "b.crl_file"] * 2
-    assert all(
-        note[1].startswith("Check that the CRL in the CA file is one its CA signed")
-        for note in sink.crl_notes
-    ), sink.crl_notes
-    kept = [r.getMessage() for r in caplog.records if _UNCHECKED_LATER_CRL in r.getMessage()]
-    assert len(kept) == 2, kept  # one a pass, two passes
-    assert all("'a.crl_file'" in m and "b.crl_file" in m and str(bundle) in m for m in kept), kept
+        assert unchecked == [], unchecked
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -969,8 +933,8 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
-#: The CA-file step origin/main gives a CRL not yet in effect, word for word, wait included.
-_MAINS_NOT_IN_EFFECT_STEP = (
+#: The CA-file step for a CRL not yet in effect, word for word as before BACKLOG #3512.
+_NOT_IN_EFFECT_STEP = (
     "Replace the CRL in the CA file with one in effect now, or wait until {when}, before "
     "restarting: until then it refuses every peer under its issuer"
 )
@@ -986,14 +950,16 @@ _MAINS_NOT_IN_EFFECT_STEP = (
         pytest.param(10, crl_reload.LAPSES_FIRST, True, id="lapses-first-refusal"),
     ],
 )
-def test_the_ca_file_step_offers_main_s_wait_in_main_s_words(
+def test_the_ca_file_step_keeps_its_wait_word_for_word(
     ca: _Ca, tmp_path: Path, starts_in_days: float, remedy: str | None, shared: bool
 ) -> None:
-    # BACKLOG #3512: the advice must be no worse than main's. An earlier repair withheld the wait,
-    # or said "Do not wait", read from a held copy's soonest CRL, which counts superseded CRLs the
-    # reload does not; it could withhold a safe wait. So the CA-file step keeps main's sentence,
-    # wait and all, whatever the reload recorded. The hop's copy lapses in about five days, so at
-    # ten days the reload records LAPSES_FIRST, whose own remedy follows the step.
+    # BACKLOG #3512: the advice must be no worse than before it. An earlier repair withheld the
+    # wait, or said "Do not wait", read from a held copy's soonest CRL, which counts superseded
+    # CRLs the reload does not; it could withhold a safe wait. So the CA-file step keeps its
+    # sentence, wait and all, whatever the reload recorded. The hop's copy lapses in about five
+    # days, so at ten days the reload records LAPSES_FIRST, whose own remedy follows the step.
+    # The two ten-day cases pin a wait that refuses every peer from the lapse until the CRL takes
+    # effect, as before #3512. A fix for that (vault #4151) changes them on purpose.
     crl = ca.crl(days=90, number=3, starts_in_days=starts_in_days)
     if shared:
         hops, path = _shared_as_crl_and_ca_file(ca, tmp_path, crl)
@@ -1009,7 +975,7 @@ def test_the_ca_file_step_offers_main_s_wait_in_main_s_words(
         detail = _bundle_detail(tmp_path / "ca-bundle.pem")
     when = log_timestamp(x509.load_pem_x509_crl(crl).last_update_utc)
 
-    assert detail.startswith(f"{_MAINS_NOT_IN_EFFECT_STEP.format(when=when)}. "), detail
+    assert detail.startswith(f"{_NOT_IN_EFFECT_STEP.format(when=when)}. "), detail
     assert detail.lower().count("wait until") == 1, detail
     assert "Do not wait" not in detail, detail
     if remedy is not None:
@@ -1044,9 +1010,9 @@ def test_the_ca_file_step_and_its_reason_fit_inside_the_alert_list_s_cut(
     # BACKLOG #3512 (vault #4150, #4155): the alert list keeps about 200 characters, and the
     # held-copy marker takes the first 51. The CA-file step's first sentence, its action and its
     # reason, must survive the cut. What follows it, such as the reload's steps where a CRL setting
-    # names the file too, may fall past it. Before the fix the proven-bad step was cut at "before
-    # restarting: a hands". The not-in-effect step is main's, wait included, and the end of its
-    # reason falls past the cut as on main; its action and its wait survive.
+    # names the file too, may fall past it. An earlier draft cut the proven-bad step at "before
+    # restarting: a hands". The not-in-effect step is unchanged by #3512, wait included, and the
+    # end of its reason falls past the cut, as before; its action and its wait survive.
     if states is not None:
 
         def _states(pem: bytes, cas: object) -> list[CrlSignature]:
