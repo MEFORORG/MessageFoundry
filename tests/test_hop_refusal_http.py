@@ -433,24 +433,30 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw(cell, extra)
     message = str(exc.value)
-    assert "static headers outside the verify-off allowlist (X-Session)" in message
-    assert "credentials" not in message  # a header refused for its name is not called a credential
-    assert "Or remove those headers" in message  # the one listed item that removal can clear
+    assert "static header outside the verify-off allowlist (X-Session)" in message
+    assert "its credentials (" not in message  # a header refused for its name is not a credential
+    assert "Or remove the header" in message  # the one listed item that removal can clear
+    assert "Moving a secret into the url or a dynamic header is not a fix" in message
     _assert_credential_refusal(exc)
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [{"bearer_token": _SECRET}, {"url": f"https://api.example.com/x?api_key={_SECRET}"}],
+    ids=["auth-setting", "url-query"],
+)
 def test_removal_is_not_offered_when_a_credential_still_refuses_the_hop(
-    monkeypatch: pytest.MonkeyPatch,
+    credential: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With a credential beside an unlisted header, removing the header cannot clear the refusal,
+    """With a credential beside unlisted headers, removing the headers cannot clear the refusal,
     so the text names both apart and offers no removal."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    extra = {"verify_tls": False, "bearer_token": _SECRET, "headers": {"X-Trace": "t1"}}
+    extra = {"verify_tls": False, "headers": {"X-Trace": "t1", "X-Tenant": "a"}, **credential}
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw("REST", extra)
     message = str(exc.value)
     assert "its credentials (" in message
-    assert "static headers outside the verify-off allowlist (X-Trace)" in message
+    assert "static headers outside the verify-off allowlist (X-Trace, X-Tenant)" in message
     assert "X-Trace" not in message.split("its credentials (", 1)[1].split(")", 1)[0]
     assert "remove" not in message.lower()
     _assert_credential_refusal(exc)
@@ -482,7 +488,8 @@ def test_a_fhir_lookup_unlisted_static_header_over_verify_off_is_refused(
                 {"L": {**lookup, "headers": {"X-Session": _SECRET}}},
                 egress=EgressSettings(deny_by_default=False),
             )
-        assert "verify-off allowlist (X-Session)" in str(exc.value)
+        assert "static header outside the verify-off allowlist (X-Session)" in str(exc.value)
+        assert "its credentials (" not in str(exc.value)
         assert _SECRET not in str(exc.value)
         # The control arm: an allowlisted header still crosses on the escape.
         ex = FhirLookupExecutor(

@@ -50,9 +50,10 @@ builds it for each `POST /ai/chat`, so that request is refused and answers `503`
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that do fix it. A verify-off refusal
+the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
-also offers removing them, and says the hop is then decided by its own levers. `Email` and `Direct`
+also offers removing them. The engine then judges the hop as one with no credential, under its own
+levers. `Email` and `Direct`
 check the credential before the cleartext and verify-off checks, so a credentialed hop is never
 pointed at one of those levers.
 
@@ -69,13 +70,14 @@ pointed at one of those levers.
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
 a static header that settings views would mask, such as `Authorization` or an API key. On a
-`verify_tls = false` hop, any other static header counts too, unless its name is `Accept`,
-`Content-Type`, `User-Agent` or `X-Request-ID`, in any case. That allowlist fails closed, so a
+`verify_tls = false` hop, the engine also refuses any other static header, unless its name is
+`Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
+header as outside the allowlist, not as a credential. That allowlist fails closed, so a
 secret under a neutral name, such as `X-Session`, is refused without being recognized. A
 credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
 auth-setting credentials from the same reader as the static-credential inventory. That inventory
 does not yet count a static header or a `url` query credential, so for those two kinds this rule is
-the wider of the two. A hop with no credential is not refused by this rule. Its own loosening entry
+the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
 decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
@@ -89,8 +91,8 @@ engine has not verified, when the lever named beside each is set:
 - an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
-  query parameter with a neutral name, such as `?sid=`, because the query test reads only names
-  that look like a credential. It also covers any secret in the path. A path secret cannot be told
+  query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
+  like a credential. It also covers any secret in the path. A path secret cannot be told
   apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
   that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;

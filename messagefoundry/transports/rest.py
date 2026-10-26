@@ -1151,7 +1151,9 @@ def refuse_verify_off(
 
     **A hop that sends ``credentials`` is refused first, and nothing lifts that** (vault BACKLOG
     #3230). Since vault BACKLOG #3533 the list also names each static header off
-    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, which need not be a credential. Nothing lifts it:
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, which need not be a credential. The refusal names
+    those headers apart from the credentials, and offers removing them only when nothing else is
+    listed, since removal cannot clear a credential. Nothing lifts it:
     not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
     argument is required, so no caller can skip the question; pass :func:`http_credentials_sent`.
     The rule is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
@@ -1167,16 +1169,18 @@ def refuse_verify_off(
             c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)
         ]
         secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
+        noun = "header" if len(unlisted) == 1 else "headers"
         sends = []
         if secrets:
             sends.append(f"its credentials ({', '.join(secrets)})")
         if unlisted:
-            sends.append(f"static headers outside the verify-off allowlist ({', '.join(unlisted)})")
-        # Removing the headers clears this refusal only when nothing else is listed, and even then
-        # the hop is decided again as a credential-less verify-off hop, which may still refuse it.
+            sends.append(f"static {noun} outside the verify-off allowlist ({', '.join(unlisted)})")
+        # Removing the headers clears this refusal only when nothing else is listed. Even then the
+        # engine judges the hop again as a credential-less verify-off hop, which may still refuse.
         removal = (
-            " Or remove those headers; the hop is then decided as a verify-off hop with no "
-            "credential, which its own posture and levers may still refuse."
+            f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
+            "credential, which its own posture and levers may still refuse. Moving a secret into "
+            "the url or a dynamic header is not a fix: this refusal cannot see those."
             if not secrets
             else ""
         )
