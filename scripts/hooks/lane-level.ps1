@@ -20,7 +20,7 @@
     to restate with the current script. The number is read as a marker of who wrote the record,
     never as a cap. A record whose `capacity` is null or absent is read as stated. A null does not
     prove the current script stated the counts: its -Asked nulls `capacity` and leaves an older
-    statement's counts in place, so a level stated before 2026-10-26 can still read as held items
+    statement's counts in place, so a level an older lane.ps1 stated can still read as held items
     until the lane restates.
 
     EVERY NUMBER IS A LANE'S OWN QUOTE. A missing file, an unreadable file, a stale number, a
@@ -285,10 +285,13 @@ $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
 
 if ($leaf -match '^builder') {
     $rec = Read-LaneFor $cwd (Get-CoordHost)
-    if (Test-OldWriter $rec) {
+    # BOTH NAGS NAME THE lane.ps1 BESIDE THIS HOOK. The copy in this worktree may be the older one,
+    # and a restatement through it writes a level the OLD-WRITER nag below then asks about again.
+    $current = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane.ps1'
+    $stated = (Test-OldWriter $rec) -and (Test-Has $rec 'statedUtc') -and $rec.statedUtc
+    if ($stated) {
         # Asked every turn until it restates, however fresh the level: its free count is not held
-        # items. The lane.ps1 in this worktree may be the older copy, so name the one beside this hook.
-        $current = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane.ps1'
+        # items. A record with no stated level holds no count, so the unstated nag below covers it.
         Say '[lane] Your lane level was written by an OLDER lane.ps1, whose free count includes empty'
         Say '  slots under the retired ceiling, so it is not shown as held items. Restate it with the'
         Say '  current script, from this worktree:'
@@ -305,7 +308,7 @@ if ($leaf -match '^builder') {
     }
     if ($need) {
         Say '[lane] Your lane level is unstated or stale. State it now, it takes five seconds:'
-        Say '  pwsh -NoProfile -File scripts\coord\lane.ps1 -Free <n> -InFlight <n> -Note "<what is moving>"'
+        Say "  pwsh -NoProfile -File `"$current`" -Free <n> -InFlight <n> -Note `"<what is moving>`""
         Say '  FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE.'
         Say '  Parked on a condition is FREE. There is no item ceiling, so count no empty slots.'
         Say '  Nobody else can write this number for you.'
@@ -431,7 +434,8 @@ foreach ($v in ($verdicts | Sort-Object box)) {
             Say "  $pad $($v.inflight) in flight, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n"
             Say ('  {0,-28} {1,-20} WRITTEN BY AN OLDER lane.ps1: its free count includes empty' -f '', '')
             Say ('  {0,-28} {1,-20} slots, so it is not shown as held items. Ask the lane to' -f '', '')
-            Say ('  {0,-28} {1,-20} restate with the current scripts\coord\lane.ps1.' -f '', '') }
+            Say ('  {0,-28} {1,-20} restate with a current lane.ps1; its own worktree may hold' -f '', '')
+            Say ('  {0,-28} {1,-20} the older copy, and its own nag names a current one.' -f '', '') }
         default {
             $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
             Say "  $pad $($v.inflight) in flight, $($v.free) free by work, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n" }

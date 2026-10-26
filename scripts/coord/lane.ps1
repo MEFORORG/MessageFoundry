@@ -254,8 +254,8 @@ $rec.boxKey   = $boxKey
 # assigns $rec.capacity on every statement, and assigning a property a PSCustomObject lacks throws,
 # so that lane could not restate. Null is a value that names no cap; a record written before the
 # ceiling was retired holds 4 there until this next write replaces it. This branch's lane-level.ps1
-# reads only whether it is null: a number marks a level an older lane.ps1 stated, whose free count
-# includes empty slots, so it withholds that count and asks for a restatement. An older copy of that hook falls back to 4 whatever this field holds, and reads
+# reads only whether it is null, as a marker of who wrote the level; its header says how. An older
+# copy of that hook falls back to 4 whatever this field holds, and reads
 # 0 free with 2 or more in flight as full, which under the new meaning of -Free it does sooner. Only
 # replacing that reader, wherever it is installed, retires the ceiling there.
 $rec | Add-Member -NotePropertyName capacity -NotePropertyValue $null -Force

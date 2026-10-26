@@ -288,34 +288,46 @@ def test_a_builder_lane_is_asked_again_once_its_level_ages(
 OLD_NAG = "Your lane level was written by an OLDER lane.ps1"
 
 
+def _builder_report(tmp_path: Path, lane_fields: dict[str, Any]) -> str:
+    """The builder arm's text for its own lane record holding ``lane_fields``."""
+    shared = tmp_path / "shared" / "mefor-coord"
+    (shared / "lanes").mkdir(parents=True)
+    builder = _git_repo(tmp_path / "builder-lane")
+    lane = {"v": 1, "turnsSinceStated": 0, **lane_fields}
+    (shared / "lanes" / f"{_box_key(builder)}.json").write_text(json.dumps(lane), encoding="utf-8")
+
+    proc = _ps(HOOK, builder, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.strip()
+    return str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
+
+
 @pytest.mark.parametrize(("capacity", "old_writer"), [(4, True), (None, False)])
 def test_a_builder_lane_on_an_older_writers_level_is_asked_to_restate(
     tmp_path: Path, capacity: int | None, old_writer: bool
 ) -> None:
     """A fresh level, so only the writer differs; capacity null is the control and is not asked."""
-    shared = tmp_path / "shared" / "mefor-coord"
-    (shared / "lanes").mkdir(parents=True)
-    builder = _git_repo(tmp_path / "builder-lane")
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    lane = {
-        "v": 1,
-        "capacity": capacity,
-        "statedFree": 2,
-        "statedInFlight": 2,
-        "statedUtc": stamp,
-        "turnsSinceStated": 0,
-    }
-    (shared / "lanes" / f"{_box_key(builder)}.json").write_text(json.dumps(lane), encoding="utf-8")
-
-    proc = _ps(HOOK, builder, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
-    assert proc.returncode == 0, proc.stderr
-    text = (
-        str(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
-        if proc.stdout.strip()
-        else ""
+    text = _builder_report(
+        tmp_path,
+        {"capacity": capacity, "statedFree": 2, "statedInFlight": 2, "statedUtc": stamp},
     )
     assert (OLD_NAG in text) is old_writer, text
     assert NAG not in text, text
     if old_writer:
         # It names the lane.ps1 beside the hook, not the one in the worktree, which may be older.
         assert f'"{LANE}"' in text, text
+
+
+def test_an_older_writers_record_with_no_level_gets_the_unstated_nag(tmp_path: Path) -> None:
+    """An older ``-Asked`` record holds no count, so there is no free count to call slot-inclusive.
+
+    The unstated nag also names the lane.ps1 beside the hook: restating through the worktree's own
+    copy, if that is the older one, would write a level the OLD-WRITER nag asks about again.
+    """
+    text = _builder_report(
+        tmp_path, {"capacity": 4, "statedFree": None, "statedInFlight": None, "statedUtc": None}
+    )
+    assert NAG in text, text
+    assert OLD_NAG not in text, text
+    assert f'"{LANE}"' in text, text
