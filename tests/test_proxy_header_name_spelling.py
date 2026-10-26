@@ -1688,7 +1688,7 @@ _LEGS_A_PLAIN_HEADER_CROSSES = ("cleartext-proxy", "connect", "verified-tls-prox
 
 @pytest.mark.parametrize("leg", _LEGS_A_PLAIN_HEADER_CROSSES)
 @pytest.mark.parametrize(
-    "value", [_VALUE + "\nX-Made: up", _VALUE + "上"], ids=["line-feed", "not-latin-1"]
+    "value", [_VALUE + "\nX-Made: up", _VALUE + "\u4e0a"], ids=["line-feed", "not-latin-1"]
 )
 def test_a_plain_header_whose_value_can_never_be_sent_fails_in_fixed_text(
     value: str, leg: str
@@ -1732,3 +1732,30 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
         _attempt(opener, _held(_NAME, odd, url))
     assert peer.connections == 0
     assert asked == [(_NAME, odd)]
+
+
+@pytest.mark.parametrize(
+    ("name", "shown"),
+    [
+        (_NAME, repr(_NAME)),
+        (" " + _NAME + " \t", repr(" " + _NAME + " \t")),
+        (_NAME + " S3cretTail", repr(_NAME + " ") + " followed by more text, not shown"),
+        (
+            _NAME + " " + "".join(map(chr, (0x43F, 0x430, 0x440))),
+            repr(_NAME + " ") + " followed by more text, not shown",
+        ),
+        (_NAME + " ==S3cret", repr(_NAME + " ==") + " followed by more text, not shown"),
+        (
+            "\u043f\u0430 " + _NAME,
+            "a key holding Proxy-Authorization after other text, not shown",
+        ),
+        ("\x00" * 60 + _NAME, repr("\x00" * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+    ],
+    ids=["plain", "ends", "tail", "non-ascii-tail", "padding", "letters-before", "long"],
+)
+def test_an_error_shows_no_letter_or_digit_around_the_plain_name(name: str, shown: str) -> None:
+    """A credential typed into the key is made of letters and digits, in any script. None of
+    them is shown, and a cut at the cap is named, so the shown key never reads as whole when
+    it is not."""
+    assert is_proxy_credential_header_name(name)
+    assert bounded_read.proxy_credential_header_name_shown(name) == shown

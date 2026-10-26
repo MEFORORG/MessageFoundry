@@ -818,7 +818,7 @@ _MISSPELLED_PROXY_HEADER = (
     "not held as a plain str, and neither urllib nor a proxy is sure to read it as the proxy's "
     "own credential. Remove the header, or rename the header to Proxy-Authorization where that "
     "header may be sent; a connection's own proxy credential belongs in proxy_user and "
-    "proxy_password. Refusing to send (vault BACKLOG #3490)"
+    "proxy_password. Refusing to send (vault BACKLOG #3416, #3457, #3490)"
 )
 _UNSENDABLE_PROXY_HEADER = (
     "this request holds a header named like Proxy-Authorization that can never be sent: "
@@ -870,9 +870,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     character no name can hold, and any text after it (vault BACKLOG #3457).
     Each is judged once in a request, and the answer is kept on the request:
     :func:`_proxy_header_verdicts` says how. One that could be sent is refused on every leg, a
-    verified TLS leg included, in fixed text of its own that names the spelling, unless a
-    cleartext leg is refused for another reason too. Neither urllib nor a proxy is sure to take
-    that spelling as the proxy's own. One that can never be sent is not refused by this rule at all; the list below
+    verified TLS leg included. Its text is a fixed one about the spelling, except where a
+    cleartext leg is refused for another reason too, and where the request goes direct, which
+    keeps the direct text. Neither urllib nor a proxy is sure to take that spelling as the
+    proxy's own. One that can never be sent is not refused by this rule at all; the list below
     says what happens to it. The exception never covers
     a request that goes direct. It never covers a header whose value reads, by ``str()``, as
     the credential a proxy URL in the handler's map makes, including one a request carries on to
@@ -957,7 +958,7 @@ def _sends_cleartext_proxy_credentials(
     let the leg through. ``proxy`` is read exactly as ``ProxyHandler.proxy_open`` reads it, and
     the request's own ``Proxy-authorization`` header is read as well.
 
-    A header spelled other than plainly is refused with its own text, which names the spelling,
+    A header spelled other than plainly is refused with its own fixed text about the spelling,
     unless the leg is cleartext and would be refused for another reason too. That leaves the
     cleartext text where it applies, and gives a verified TLS leg a text that is true of it."""
     try:
@@ -1080,14 +1081,22 @@ def is_proxy_credential_header_name(name: str | bytes) -> bool:
 def proxy_credential_header_name_shown(name: str) -> str:
     """``name``, which :func:`is_proxy_credential_header_name` accepts, as an error may show it.
 
-    Shown in ``repr`` form up to the end of the run of characters that no name can hold after
-    the plain name. Any text after that run is not shown, because it may be a credential typed
-    into the name (vault BACKLOG #3457), and is named as more text instead. Capped at 64
-    characters."""
-    head = _PROXY_CREDENTIAL_NAME_HEAD.match(name)
-    end = head.end() if head is not None else 0
-    shown = repr(name[: min(end, 64)])
-    return shown if end >= len(name) else f"{shown} followed by more text, not shown"
+    Text around the plain name may be a credential typed into the name (vault BACKLOG #3457),
+    so no letter or digit outside the plain name is shown. The name is shown in ``repr`` form
+    from its start, through the plain name, up to the first letter or digit after it, and what
+    follows is named as more text. A name with a letter or digit before the plain name is not
+    shown at all. At most 64 characters are shown, and a cut there is named."""
+    start = _NON_NAME_RUN.match(name)
+    lead = start.end() if start is not None else 0
+    if any(ch.isalnum() for ch in name[:lead]):
+        return "a key holding Proxy-Authorization after other text, not shown"
+    cut = lead + len(_PLAIN_NAME)
+    while cut < len(name) and not name[cut].isalnum():
+        cut += 1
+    shown = repr(name[: min(cut, 64)])
+    if cut > 64:
+        shown += ", cut at 64 characters,"
+    return shown if cut >= len(name) else f"{shown} followed by more text, not shown"
 
 
 def _is_spelled_plainly(name: str | bytes) -> bool:
@@ -1303,7 +1312,10 @@ def _refuse_a_proxy_header_that_can_never_be_sent(
     such value, and the value a connection makes is one. Where a plain name is held in both
     stores, both values are asked about, as the rule judges both, so a request is refused here
     even where the value ``do_open`` would send is sendable. Only a hand-built request holds one
-    name in both stores.
+    name in both stores. On a ``CONNECT`` leg the header rides the tunnel request, which
+    ``http.client`` builds without ``putheader``: it encodes the value itself, so at least an
+    ``int`` or a ``bytes`` value passes here and fails there, after the proxy is dialled and
+    with nothing sent, as it did before.
     """
     for verdict in verdicts:
         if verdict.refusal is not None:
@@ -1483,11 +1495,8 @@ _FIELD_NAME = re.compile(_TOKEN)
 _PROXY_CREDENTIAL_NAME = re.compile(
     rf"[^{_TCHARS}]*{_PLAIN_NAME}(?:[^{_TCHARS}].*)?", re.ASCII | re.IGNORECASE | re.DOTALL
 )
-#: The part of such a name an error may show: the plain name and the characters no field name
-#: can hold on either side of it. Matched from the start only.
-_PROXY_CREDENTIAL_NAME_HEAD = re.compile(
-    rf"[^{_TCHARS}]*{_PLAIN_NAME}[^{_TCHARS}]*", re.ASCII | re.IGNORECASE
-)
+#: A run of characters that no field name can hold, matched from the start only.
+_NON_NAME_RUN = re.compile(rf"[^{_TCHARS}]*")
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")
