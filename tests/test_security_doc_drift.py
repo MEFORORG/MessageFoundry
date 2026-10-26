@@ -1736,6 +1736,10 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "describe is pinned by calling it in the tenth-sweep probe test, the exposure gate by "
         "tests/test_cli.py, and the lockout claim by absence only"
     ),
+    ("test_security_doc_drift.py", "test_the_changelog_records_the_re_bind_role_test"): (
+        "absence of a retired release-note sentence in CHANGELOG.md and presence of the #3081 "
+        "entry (BACKLOG #3822); the code is pinned by AST in the re-bind role-test test"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
@@ -3906,3 +3910,17 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         "charged to neither the lockout nor the session's re-proof budget",
     ):
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
+
+
+def test_the_changelog_records_the_re_bind_role_test() -> None:
+    """BACKLOG #3822: the released 0.5.2 notes said the password re-bind does not compare roles,
+    and had no entry for the #3081 refusal. RED when that sentence returns or the entry is lost.
+    The code it describes is pinned above, in
+    ``test_the_password_re_bind_role_test_is_documented_and_built``."""
+    changelog = " ".join((_ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split())
+    assert "do not compare roles yet" not in changelog, (
+        "CHANGELOG.md still says the password re-bind does not compare roles."
+    )
+    assert "**The password re-bind step-up refuses a directory account demoted" in changelog, (
+        "CHANGELOG.md lost the #3081 entry for the re-bind's demotion refusal."
+    )

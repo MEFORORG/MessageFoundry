@@ -2012,9 +2012,24 @@ ledger, so it has no public page.
   them. Before, such an account would renew its step-up window or clear the MFA gate with the old
   roles until the reconciliation pass revoked it. Only a demotion refuses; a promotion does not.
   The refusal writes no roles, checks no code or assertion, charges nothing to the lockout, and is
-  audited with `reason=directory_unconfirmed` and the outcome `directory_roles_demoted`. The
-  password re-bind and the enrolment legs do not compare roles yet, and channel scope is not
-  compared. (`vault BACKLOG #2240`)
+  audited with `reason=directory_unconfirmed` and the outcome `directory_roles_demoted`. Channel
+  scope is not compared. The password re-bind and the enrolment legs make the same role test in
+  this release; their own entries say how (`vault BACKLOG #3081`, `#3061`). (`vault BACKLOG #2240`)
+- **The password re-bind step-up refuses a directory account demoted in the directory since
+  sign-in.** A good re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) returns the
+  account's current groups, and the engine judges them with the role test the TOTP, passkey and
+  IdP step-up legs use, on the stored roles it reads after the bind returns. Before, such an
+  account would renew its step-up window with the old roles until the reconciliation pass revoked
+  it. The refusals are audited on the `auth.reauth` row, at least these:
+  `reason=directory_roles_demoted` for a lost role; `reason=directory_identity_conflict` when the
+  row's directory object id or provider moved during the bind, because the groups vouch only for
+  the object the bind was keyed on; and `reason=directory_role_map_unsealed` when the AD
+  group-to-role map fails its seal. The password was right, so none of them is charged to the
+  lockout or to the session's re-proof budget, and none clears either. None renews the window,
+  mints an action-bound grant or writes roles. Each is a **403** on `POST /me/reauth`, with the
+  per-fix text the `BACKLOG #3082` entry describes: a demotion is told to sign out and sign in
+  again. Channel scope is not compared. See [SECURITY.md](docs/SECURITY.md).
+  (`vault BACKLOG #3081`)
 - **One account whose directory probe raises no longer ends the reconcile pass.** In v0.5.1 a
   probe that raised something other than an LDAP error ended the whole pass, so it stopped
   revocation for every account. Step-up also returned an error, not an audited refusal. The rest
