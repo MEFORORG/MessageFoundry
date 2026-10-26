@@ -12,6 +12,17 @@
     becomes a verdict that a lane is full or that briefing should stop, and it adds no usage
     throttle of its own. The one count-driven word left is IDLE, for a lane with nothing in flight.
 
+    AN OLDER lane.ps1 MEANS SOMETHING ELSE BY FREE. Its free count includes the empty slots under
+    the retired ceiling, so read as held items it overstates them. The current lane.ps1 writes
+    `capacity` as null on every write, and the older one writes a number there on every statement,
+    so a record whose `capacity` is a number has a level an older lane.ps1 stated. This hook shows
+    that level's in-flight count, withholds its free count, labels it OLD-WRITER and asks the lane
+    to restate with the current script. The number is read as a marker of who wrote the record,
+    never as a cap. A record whose `capacity` is null or absent is read as stated. A null does not
+    prove the current script stated the counts: its -Asked nulls `capacity` and leaves an older
+    statement's counts in place, so a level stated before 2026-10-26 can still read as held items
+    until the lane restates.
+
     EVERY NUMBER IS A LANE'S OWN QUOTE. A missing file, an unreadable file, a stale number, a
     superseded number, a roster shortfall -- each is said aloud, never turned into a count.
 
@@ -96,10 +107,17 @@ function Test-Has($rec, [string]$name) {
     return ($rec.PSObject.Properties.Name -contains $name)
 }
 
+function Test-OldWriter($rec) {
+    # See the header: a number in `capacity` marks a record an older lane.ps1 wrote. Only whether it
+    # is null is read, never its value.
+    return ($null -ne $rec) -and ($rec -isnot [string]) -and (Test-Has $rec 'capacity') -and
+           ($null -ne $rec.capacity)
+}
+
 function Get-LaneVerdict($rec, [string]$boxKey) {
     # One state word and one confidence word, or a single non-answer word. A readable level is IDLE
     # when nothing is in flight and STATED otherwise, whatever its numbers: no count makes a lane
-    # full. A `capacity` field on an old record is not read, for the same reason.
+    # full. A level an older lane.ps1 wrote is OLD-WRITER and carries no free count (see the header).
     $o = [ordered]@{ box = $boxKey; occ = ''; conf = ''; free = $null; inflight = $null
                      ageMin = $null; turns = $null; note = '' }
 
@@ -120,9 +138,12 @@ function Get-LaneVerdict($rec, [string]$boxKey) {
     }
     if ($null -eq $free -or $null -eq $inf) { $o.occ = 'UNREADABLE'; return [pscustomobject]$o }
 
-    $o.free = [int]$free
     $o.inflight = [int]$inf
-    $o.occ = if ($o.inflight -eq 0) { 'IDLE' } else { 'STATED' }
+    if (Test-OldWriter $rec) { $o.occ = 'OLD-WRITER' }
+    else {
+        $o.free = [int]$free
+        $o.occ = if ($o.inflight -eq 0) { 'IDLE' } else { 'STATED' }
+    }
 
     $tipMoved = (Test-Has $rec 'tipNow') -and (Test-Has $rec 'tipAtStated') -and
                 $rec.tipNow -and $rec.tipAtStated -and ($rec.tipNow -ne $rec.tipAtStated)
@@ -147,21 +168,30 @@ $BLIND = @'
 
 if ($SelfTest) {
     $fail = @()
-    function New-Rec($f, $i, $t1, $t2, $turns) {
+    # The current lane.ps1 writes capacity as null; pass 4 for a record an older one wrote.
+    function New-Rec($f, $i, $t1, $t2, $turns, $cap = $null) {
         [pscustomobject]@{
             statedFree = $f; statedInFlight = $i
             statedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
             tipAtStated = $t1; tipNow = $t2; claimHashAtStated = 'a'; claimHashNow = 'a'
-            turnsSinceStated = $turns; capacity = 4; statedNote = ''; promptCount = 1 }
+            turnsSinceStated = $turns; capacity = $cap; statedNote = ''; promptCount = 1 }
     }
 
     $v = Get-LaneVerdict (New-Rec 3 1 'x' 'x' 0) 'b1'
     if ($v.occ -ne 'STATED' -or $v.free -ne 3 -or $v.inflight -ne 1) { $fail += "3 free / 1 in flight must be STATED 3/1, got $($v.occ) $($v.free)/$($v.inflight)" }
 
     # The retired ceiling's own case: an old record naming capacity 4, with 0 free and 4 in flight.
-    $v = Get-LaneVerdict (New-Rec 0 4 'x' 'x' 0) 'b2'
-    if ($v.occ -ne 'STATED' -or $v.conf -ne 'FRESH') { $fail += "0 free / 4 in flight must be STATED FRESH, never full, got $($v.occ)/$($v.conf)" }
+    $v = Get-LaneVerdict (New-Rec 0 4 'x' 'x' 0 4) 'b2'
+    if ($v.occ -ne 'OLD-WRITER' -or $v.conf -ne 'FRESH') { $fail += "0 free / 4 in flight on capacity 4 must be OLD-WRITER FRESH, never full, got $($v.occ)/$($v.conf)" }
     if ($v.PSObject.Properties.Name -contains 'cap') { $fail += 'a verdict must carry no capacity' }
+
+    # An older lane.ps1's free count includes empty slots, so it is withheld rather than shown as held.
+    $v = Get-LaneVerdict (New-Rec 2 2 'x' 'x' 0 4) 'b9'
+    if ($v.occ -ne 'OLD-WRITER' -or $null -ne $v.free -or $v.inflight -ne 2) { $fail += "capacity 4, 2 free / 2 in flight must be OLD-WRITER with no free count and 2 in flight, got $($v.occ) $($v.free)/$($v.inflight)" }
+
+    # The control: the same counts with capacity null are the current writer's, so 2 is held items.
+    $v = Get-LaneVerdict (New-Rec 2 2 'x' 'x' 0) 'b10'
+    if ($v.occ -ne 'STATED' -or $v.free -ne 2 -or $v.inflight -ne 2) { $fail += "capacity null, 2 free / 2 in flight must be STATED 2/2, got $($v.occ) $($v.free)/$($v.inflight)" }
 
     $v = Get-LaneVerdict $null 'b3'
     if ($v.occ -ne 'NO-RECORD') { $fail += 'a missing record must be NO-RECORD' }
@@ -182,7 +212,7 @@ if ($SelfTest) {
     if ($v.occ -ne 'IDLE') { $fail += "0 in flight must be IDLE, got $($v.occ)" }
 
     if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; exit 1 }
-    Write-Host 'lane-level self-test: 8 cases pass, and none of them can read a lane as full.'
+    Write-Host 'lane-level self-test: 10 cases pass, and none of them can read a lane as full.'
     exit 0
 }
 
@@ -255,6 +285,18 @@ $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
 
 if ($leaf -match '^builder') {
     $rec = Read-LaneFor $cwd (Get-CoordHost)
+    if (Test-OldWriter $rec) {
+        # Asked every turn until it restates, however fresh the level: its free count is not held
+        # items. The lane.ps1 in this worktree may be the older copy, so name the one beside this hook.
+        $current = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane.ps1'
+        Say '[lane] Your lane level was written by an OLDER lane.ps1, whose free count includes empty'
+        Say '  slots under the retired ceiling, so it is not shown as held items. Restate it with the'
+        Say '  current script, from this worktree:'
+        Say "  pwsh -NoProfile -File `"$current`" -Free <n> -InFlight <n> -Note `"<what is moving>`""
+        Say '  FREE MEANS ITEMS YOU HOLD AND ARE NOT WORKING: built-and-awaiting-land, blocked, parked.'
+        Say '  There is no item ceiling, so count no empty slots.'
+        Emit
+    }
     $need = ($null -eq $rec) -or ($rec -is [string])
     if (-not $need) {
         $t = if (Test-Has $rec 'turnsSinceStated') { [int]$rec.turnsSinceStated } else { 99 }
@@ -384,6 +426,12 @@ foreach ($v in ($verdicts | Sort-Object box)) {
         'UNREADABLE' {
             Say "  $pad its level file did not parse, or lacks a count. NO verdict, and"
             Say ('  {0,-28} {1,-20} this is NOT a pass.' -f '', '') }
+        'OLD-WRITER' {
+            $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
+            Say "  $pad $($v.inflight) in flight, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n"
+            Say ('  {0,-28} {1,-20} WRITTEN BY AN OLDER lane.ps1: its free count includes empty' -f '', '')
+            Say ('  {0,-28} {1,-20} slots, so it is not shown as held items. Ask the lane to' -f '', '')
+            Say ('  {0,-28} {1,-20} restate with the current scripts\coord\lane.ps1.' -f '', '') }
         default {
             $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
             Say "  $pad $($v.inflight) in flight, $($v.free) free by work, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n" }

@@ -13,10 +13,13 @@ These tests fail if a default cap of 4 comes back in either script:
    because an older lane.ps1 on another branch assigns it, and that throws when the key is missing;
 2. ``-Capacity`` is not a parameter any more, so a caller cannot reintroduce a cap by passing one;
 3. the dispatcher arm of the hook reports a lane that states 0 free and 4 in flight, on a record
-   still naming capacity 4, with its counts and with no capacity verdict. Against the scripts before
-   this change it printed ``AT-CAPACITY`` and ``of 4``;
-4. the hook's own self-test passes;
-5. a builder lane whose level is 45 minutes old is asked to restate. Its age is how a level stated
+   still naming capacity 4, with its in-flight count and with no capacity verdict. Against the
+   scripts before this change it printed ``AT-CAPACITY`` and ``of 4``;
+4. a record whose ``capacity`` is a number was written by an older lane.ps1, whose free count
+   includes empty slots. The hook labels it OLD-WRITER, withholds that free count rather than show
+   it as held items, and asks the lane to restate; the same counts with ``capacity`` null are shown;
+5. the hook's own self-test passes;
+6. a builder lane whose level is 45 minutes old is asked to restate. Its age is how a level stated
    under the old ceiling ages out, and the hook read every stamp hours in the future on a machine
    west of UTC until this change.
 """
@@ -184,7 +187,8 @@ def _plant_seat(seats: Path, box: str, worktree: Path | str, seat: str) -> None:
     (d / f"s-{box}.json").write_text(json.dumps(rec), encoding="utf-8")
 
 
-def test_the_dispatcher_report_has_no_capacity_verdict(tmp_path: Path) -> None:
+def _dispatcher_report(tmp_path: Path, lane_fields: dict[str, Any]) -> str:
+    """The dispatcher arm's text for one live builder lane holding ``lane_fields``."""
     shared = tmp_path / "shared" / "mefor-coord"
     seats = shared / "seats"
     lanes = shared / "lanes"
@@ -198,36 +202,61 @@ def test_the_dispatcher_report_has_no_capacity_verdict(tmp_path: Path) -> None:
     # The hook reads no verdict below a floor of five seat directories. These name no live tree.
     for i in range(4):
         _plant_seat(seats, f"filler-{i:04d}", "C:/no/such/tree", "manager")
-    # The retired ceiling's own case, on a record written before the change: 0 free, 4 in flight,
-    # capacity 4, stated just now with nothing moved since.
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Stated just now with nothing moved since.
     lane: dict[str, Any] = {
         "v": 1,
-        "capacity": 4,
-        "statedFree": 0,
-        "statedInFlight": 4,
-        "statedUtc": now,
-        "statedNote": "four in flight",
+        "statedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "turnsSinceStated": 0,
         "tipAtStated": "x",
         "tipNow": "x",
         "claimHashAtStated": "a",
         "claimHashNow": "a",
+        **lane_fields,
     }
     (lanes / f"{box}.json").write_text(json.dumps(lane), encoding="utf-8")
 
     proc = _ps(HOOK, dispatcher, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
     assert proc.returncode == 0, proc.stderr
-    text = str(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
+    return str(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
+
+
+OLD_WRITER = "WRITTEN BY AN OLDER lane.ps1"
+
+
+def test_the_dispatcher_report_has_no_capacity_verdict(tmp_path: Path) -> None:
+    # The retired ceiling's own case, on a record written before the change: 0 free, 4 in flight,
+    # capacity 4.
+    text = _dispatcher_report(
+        tmp_path,
+        {"capacity": 4, "statedFree": 0, "statedInFlight": 4, "statedNote": "four in flight"},
+    )
 
     # The control: the lane was discovered and its record read, before and after this change alike.
     assert 'Note: "four in flight"' in text, text
     # The ceiling checks come first, so against the old scripts they are what fails.
     assert "capacity" not in text.lower(), text
     assert "of 4" not in text, text
-    assert "4 in flight, 0 free by work" in text, text
+    assert "AT" + "-CAPACITY" not in text, text
+    assert "4 in flight" in text, text
     # A level stated just now is not in the future. West of UTC the old age read said -300m here.
     assert "stated -" not in text, text
+
+
+@pytest.mark.parametrize(("capacity", "old_writer"), [(4, True), (None, False)])
+def test_an_older_writers_free_count_is_not_shown_as_held_items(
+    tmp_path: Path, capacity: int | None, old_writer: bool
+) -> None:
+    """Capacity null is the control: the same counts from the current writer are held items."""
+    text = _dispatcher_report(
+        tmp_path, {"capacity": capacity, "statedFree": 2, "statedInFlight": 2, "statedNote": "n"}
+    )
+    # Both arms read the record and show its in-flight count.
+    assert 'Note: "n"' in text, text
+    assert "2 in flight" in text, text
+    assert (OLD_WRITER in text) is old_writer, text
+    assert ("OLD-WRITER" in text) is old_writer, text
+    assert ("2 free by work" in text) is not old_writer, text
+    assert "capacity" not in text.lower(), text
 
 
 def test_the_hook_self_test_passes(tmp_path: Path) -> None:
@@ -254,3 +283,39 @@ def test_a_builder_lane_is_asked_again_once_its_level_ages(
     proc = _ps(HOOK, builder, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
     assert proc.returncode == 0, proc.stderr
     assert (NAG in proc.stdout) is nags, proc.stdout
+
+
+OLD_NAG = "Your lane level was written by an OLDER lane.ps1"
+
+
+@pytest.mark.parametrize(("capacity", "old_writer"), [(4, True), (None, False)])
+def test_a_builder_lane_on_an_older_writers_level_is_asked_to_restate(
+    tmp_path: Path, capacity: int | None, old_writer: bool
+) -> None:
+    """A fresh level, so only the writer differs; capacity null is the control and is not asked."""
+    shared = tmp_path / "shared" / "mefor-coord"
+    (shared / "lanes").mkdir(parents=True)
+    builder = _git_repo(tmp_path / "builder-lane")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    lane = {
+        "v": 1,
+        "capacity": capacity,
+        "statedFree": 2,
+        "statedInFlight": 2,
+        "statedUtc": stamp,
+        "turnsSinceStated": 0,
+    }
+    (shared / "lanes" / f"{_box_key(builder)}.json").write_text(json.dumps(lane), encoding="utf-8")
+
+    proc = _ps(HOOK, builder, root=shared, stdin=json.dumps({"hook_event_name": "Stop"}))
+    assert proc.returncode == 0, proc.stderr
+    text = (
+        str(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
+        if proc.stdout.strip()
+        else ""
+    )
+    assert (OLD_NAG in text) is old_writer, text
+    assert NAG not in text, text
+    if old_writer:
+        # It names the lane.ps1 beside the hook, not the one in the worktree, which may be older.
+        assert f'"{LANE}"' in text, text
