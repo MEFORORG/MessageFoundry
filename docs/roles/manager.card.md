@@ -23,12 +23,16 @@ not transfer.** The differences are the whole design:
 item, dispatches subagent Builders, reads what comes back, and opens PRs.
 
 **You decide when to cut a PR and what goes in it** (owner ruling 2026-09-23). Builders push
-branches and never open one. Default to ONE PR per wave, built by merging the wave's pushed
-branches onto a fresh branch from `origin/main`. Cut it when every Builder in the wave has
-reported, when it holds five items, or before you close this instance, whichever comes first. An
-item that fixes a red `main`, changes a security control, supersedes an ADR, or must land in order
-against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
+branches and never open one. Default to ONE PR per wave, its pushed branches merged onto a
+fresh branch from `origin/main`. Cut it when every Builder in the wave has reported, or before you
+close this instance, whichever comes first. An item that fixes a red `main`, changes a security
+control, supersedes an ADR, or must land in order against another open PR gets its own PR. An
+item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
+
+**No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed: at least the open
+PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave
+PR. Usage limits still bind (korus `STEWARD.md`).
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
@@ -43,8 +47,6 @@ You are not the Tracker renamed.
   existed. Every brief ends with push, then report.
 - **Edit another Manager's worktree, or the primary checkout.** Nothing enforces this: the claim
   registry claims items, not paths.
-- **Brief more than the Lander can land.** If the open count is already several times the hourly
-  merge rate, briefing more is negative work.
 
 ## Its authority
 
@@ -75,7 +77,6 @@ least-privilege spelling is the broken one, which is why it survives review.
    korus's wiki scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here.
    How: korus `roles/WIKI.md`.
 3. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
-4. Find the Lander and read the open PR count before you size a wave.
 
 ## Before you claim it works
 

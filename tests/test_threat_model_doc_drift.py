@@ -28,7 +28,7 @@ makes that impossible in the ways a test mechanically can:
    value by import, so a code-side change fails CI naming the doc row it invalidates.
 6. **Shell-site invariant** — the set of modules under ``messagefoundry/`` and
    ``messagefoundry_toolkit/`` that execute through a shell or an elevation verb must stay exactly
-   the curated pair the 15.1.5 table documents. A new one fails with "add a Dangerous functionality
+   the curated set in ``_ALLOWED_SHELL_SITES``. A new one fails with "add a Dangerous functionality
    row". The process-start inventory reads the same two roots.
 
 What this guard structurally cannot do is discover *tomorrow's* surface: an enumerative table pins
@@ -321,10 +321,10 @@ _BOUNDARY4_ANCHORS: tuple[str, ...] = (
 #: Wording that described the RETIRED PySide6 desktop console. It must never reappear.
 _RETIRED_CONSOLE_STRINGS: tuple[str, ...] = ("OS keyring", "worker thread")
 
-#: The ONLY modules under messagefoundry/ permitted to reach a shell or an elevation verb. Both are
-#: documented rows in the 15.1.5 table. The scan reads CODE only (``_code_only``), so ``checks.py``,
-#: which names ``os.system`` only as a lint-trigger STRING, is no longer matched and no longer listed;
-#: ``test_checks_py_only_names_os_system_as_a_lint_string`` pins that string separately.
+#: The tokens that mark a shell or elevation site. This scan reads CODE only (``_code_only``), so
+#: ``checks.py``, which names ``os.system`` only as a lint-trigger STRING, is no longer matched and
+#: no longer in ``_ALLOWED_SHELL_SITES``; ``test_checks_py_only_names_os_system_as_a_lint_string``
+#: pins that string separately. String literals are read by the script-text scan below.
 _SHELL_TOKENS: tuple[str, ...] = (
     "create_subprocess_shell",
     "shell=True",
@@ -356,6 +356,9 @@ _SCRIPT_TEXT_FLAG_RE = re.compile(
     # -E is Python's. A short cluster ending in c, such as -lc or -Ic, is a shell or Python -c.
     r"|-e|-[A-Za-z]{1,3}c)(?=\s|$)"
 )
+#: The ONLY scanned modules permitted to reach a shell or an elevation verb, each a deliberate
+#: exception. The shell-site test does not read the document. Today each entry is also in
+#: ``_ALLOWED_SUBPROCESS_SITES``, whose test checks the module against the 15.1.5 section.
 _ALLOWED_SHELL_SITES: dict[str, str] = {
     "pipeline/dr.py": "[dr].takeover_hook / release_hook run via create_subprocess_shell",
     "service.py": "elevated cmd.exe / powershell.exe via ShellExecuteW|ExW 'runas'",
@@ -692,7 +695,7 @@ def test_planted_omission_in_the_resource_section_is_detected(anchor: str) -> No
     mutated = _drop_one_row_containing(section, anchor)
     if anchor in _RESOURCE_ROW_KEYS.values():
         # A shared anchor cannot be detected by its bare token; its rows are pinned individually by
-        # test_every_resource_row_key_pins_exactly_one_row instead.
+        # test_every_shared_anchor_row_is_pinned_individually instead.
         pytest.skip(f"{anchor!r} spans several rows; pinned per-row by _RESOURCE_ROW_KEYS")
     assert anchor in _missing_in_rows(mutated, _RESOURCE_ANCHORS), (
         f"the 15.1.3 anchor check does NOT detect the removal of {anchor!r} — the guard is asleep"
@@ -1252,8 +1255,49 @@ def test_checks_py_only_names_os_system_as_a_lint_string() -> None:
 # --- per-row pinning: the half a bare-token registry structurally cannot do ----------------------
 
 
+def _first_cell(row: str) -> str:
+    """A stripped table row's first cell: its label."""
+    return row[1:-1].split("|")[0].strip()
+
+
 def _row_first_cells(section_text: str) -> list[str]:
-    return [row[1:-1].split("|")[0].strip() for row in _table_rows(section_text)]
+    return [_first_cell(row) for row in _table_rows(section_text)]
+
+
+def _drop_row_labelled(text: str, label: str) -> str:
+    """``text`` with the first table row whose first cell contains ``label`` removed.
+
+    Not :func:`_drop_one_row_containing`, which drops the first row carrying the text anywhere: a
+    row that cross-references another by its bold label in a later cell carries that label too,
+    and if it comes first, that is the row the mutation removes. The first-cell test is the one
+    :func:`_row_key_problems` uses, so the mutation removes the row the pin counts as the owner.
+    """
+    target = next((row for row in _table_rows(text) if label in _first_cell(row)), None)
+    assert target is not None, f"no table row labelled {label!r} to drop — the fixture moved"
+    lines = text.splitlines()
+    del lines[next(i for i, raw in enumerate(lines) if raw.strip() == target)]
+    return "\n".join(lines)
+
+
+def _row_key_problems(section_text: str, keys: Mapping[str, str]) -> list[tuple[str, str]]:
+    """``(label, problem)`` for each key that does not pin exactly one row carrying its token."""
+    rows = _table_rows(section_text)
+    cells = [_first_cell(row) for row in rows]
+    problems: list[tuple[str, str]] = []
+    for label, token in sorted(keys.items()):
+        owning = [i for i, cell in enumerate(cells) if label in cell]
+        if len(owning) != 1:
+            problems.append(
+                (
+                    label,
+                    f"expected exactly one row whose first cell contains {label!r}; found "
+                    f"{len(owning)}. Each shared-anchor row must be individually identifiable, or "
+                    "its deletion is invisible.",
+                )
+            )
+        elif token not in rows[owning[0]]:
+            problems.append((label, f"the {label!r} row no longer carries {token!r}"))
+    return problems
 
 
 @pytest.mark.parametrize(
@@ -1270,16 +1314,8 @@ def test_every_shared_anchor_row_is_pinned_individually(heading: str, keys: dict
     raw-TCP listener row; ``sandbox`` appears in five 15.1.5 rows; ``/uploads`` in two. A
     bare-token check cannot see one of them go, so each is keyed on its own label here.
     """
-    section = _section(_doc_text(), heading)
-    rows = _table_rows(section)
-    cells = _row_first_cells(section)
-    for label, token in sorted(keys.items()):
-        owning = [i for i, cell in enumerate(cells) if label in cell]
-        assert len(owning) == 1, (
-            f"expected exactly one row whose first cell contains {label!r}; found {len(owning)}. "
-            "Each shared-anchor row must be individually identifiable, or its deletion is invisible."
-        )
-        assert token in rows[owning[0]], f"the {label!r} row no longer carries {token!r}"
+    problems = _row_key_problems(_section(_doc_text(), heading), keys)
+    assert not problems, [message for _label, message in problems]
 
 
 @pytest.mark.parametrize(
@@ -1293,13 +1329,22 @@ def test_shared_anchor_row_pinning_detects_a_planted_deletion(
     heading: str, keys: dict[str, str]
 ) -> None:
     """Proves the per-row pinning can fail: delete one shared-anchor row and it must be reported."""
-    section = _section(_doc_text(), heading)
+    _assert_planted_shared_row_deletion_is_detected(_section(_doc_text(), heading), keys)
+
+
+def _assert_planted_shared_row_deletion_is_detected(section: str, keys: Mapping[str, str]) -> None:
+    """Delete one shared-anchor row and run the pin's own check over the result."""
     rows = _table_rows(section)
     shared = [lab for lab, tok in sorted(keys.items()) if sum(1 for row in rows if tok in row) > 1]
+    heading = section.splitlines()[0]
     assert shared, f"no shared-anchor row left in {heading!r}; the registry is now redundant"
     label = shared[0]
-    mutated = _drop_one_row_containing(section, label)
-    assert not [c for c in _row_first_cells(mutated) if label in c], (
+    # The pin must be clean on this label BEFORE the deletion, or a report after it proves nothing.
+    assert label not in {lab for lab, _message in _row_key_problems(section, keys)}, (
+        f"the pin already reports {label!r} before any deletion; fix that first"
+    )
+    mutated = _drop_row_labelled(section, label)
+    assert label in {lab for lab, _message in _row_key_problems(mutated, keys)}, (
         f"deleting the {label!r} row was not detected — the per-row pinning is not load-bearing"
     )
     # And the bare-token checker demonstrably does NOT catch it, which is why this exists.
@@ -1659,8 +1704,8 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         ),
         ("**Operator-configured SHELL execution**", s.dr.takeover_timeout_seconds, "30.0 s"),
         # The full phrase, rendered from the constant: the check is a substring match within the
-        # row, which carries other bounds, and a bare "30 s" is also inside "130 s" or "330 s"
-        # (vault BACKLOG #3804 item 5).
+        # row, and a bare "30 s" is also inside "130 s" or "330 s", so a bound the row gains later
+        # could satisfy it (vault BACKLOG #3804 item 5).
         (
             "**Cipher-policy probe**",
             cipher_policy._PROBE_TIMEOUT_S,
@@ -1941,6 +1986,40 @@ def test_the_row_mutation_helper_refuses_to_silently_do_nothing() -> None:
     unchanged — otherwise every planted-omission self-test above would pass vacuously."""
     with pytest.raises(AssertionError, match="no table row containing"):
         _drop_one_row_containing(_stand_in_resource_section(), "a-token-in-no-row")
+
+
+#: A 15.1.5 stand-in whose FIRST row names the second by its bold label, as the real "Other
+#: subprocess invocations" row could come to name the "Cipher-policy probe" row. Both carry
+#: ``shell=False``. The cross-reference sits in a later cell: one in the first cell would make two
+#: rows own the label, which ``test_every_shared_anchor_row_is_pinned_individually`` reports.
+_CROSS_REFERENCE_STAND_IN = """\
+## Dangerous functionality (ASVS 15.1.5)
+
+| Functionality | Guard |
+|---|---|
+| **Other subprocess invocations** | `shell=False`; the cipher read is **Cipher-policy probe** |
+| **Cipher-policy probe** | `shell=False` |
+"""
+
+
+def test_the_planted_shared_row_deletion_drops_the_labelled_row_not_a_cross_reference() -> None:
+    """The self-test must delete the row LABELLED with the key, not the first row naming it.
+
+    Dropping the first row that carried the bold label anywhere removed the "Other" row here, so
+    the labelled row survived and the self-test went red on a correct document.
+    """
+    section = _section(_CROSS_REFERENCE_STAND_IN, _DANGEROUS_HEADING)
+    keys = {
+        "**Other subprocess invocations**": "shell=False",
+        "**Cipher-policy probe**": "shell=False",
+    }
+    assert _row_key_problems(section, keys) == []
+    _assert_planted_shared_row_deletion_is_detected(section, keys)
+
+    mutated = _drop_row_labelled(section, "**Cipher-policy probe**")
+    assert _row_first_cells(mutated) == ["**Other subprocess invocations**"]
+    with pytest.raises(AssertionError, match="no table row labelled"):
+        _drop_row_labelled(section, "`shell=False`")
 
 
 def test_the_token_and_link_scanners_find_what_they_claim_to() -> None:

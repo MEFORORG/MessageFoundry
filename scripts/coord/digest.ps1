@@ -42,7 +42,14 @@
         decisions logged in the 14 days ending -Day; above 5 percent is a breach.
     A rating older than the window is not read, so the trailing 60 is a trailing 60 within it.
 
-    An unread vault is said aloud: the digest is marked INCOMPLETE and the script exits 4.
+    THE GATE'S STATE (plan 4.5 to 4.7): the reversal budget fleet-wide and per seat, the cost rung
+    (today's digest only: it is a live reading), and each item past the chain limit's floor,
+    computed by the same functions decision.ps1 -Gate calls. THE ATTIC: every refs/attic ref on this clone with its age, as a Class C prune question
+    (plan 6.3). This script prunes nothing.
+
+    An incomplete read is said aloud: the digest is marked INCOMPLETE and the script exits 4. A
+    vault read that fails is one, and _decisionlog.ps1 Read-DecisionSpool says what makes a spool
+    read one.
 #>
 param(
     [string]$Day = '',
@@ -50,7 +57,11 @@ param(
     [string]$Rate = '',
     [Parameter(Position = 0)][string]$Verdict = '',
     [ValidateRange(14, 100)][int]$Window = 60,
-    [string]$Repo = 'MEFORORG/MessageFoundry-vault'
+    [string]$Repo = 'MEFORORG/MessageFoundry-vault',
+    # The usage reader and the Steward's thresholds file the cost rung reads, as decision.ps1 -Gate
+    # reads them. Defaulted in the body; tests point them at fixtures.
+    [string]$UsageScript = '',
+    [string]$ThresholdsFile = ''
 )
 
 Set-StrictMode -Version Latest
@@ -67,6 +78,8 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
 
 . (Join-Path $PSScriptRoot '_decisionlog.ps1')
 $coord = Get-DecisionCoordRoot
+if (-not $UsageScript) { $UsageScript = Get-DecisionUsageScript }
+if (-not $ThresholdsFile) { $ThresholdsFile = Get-DecisionThresholdsFile }
 
 function Get-BlindOptions($Record) {
     # The recommendation and the alternatives, in an order fixed by the record's id, so the number
@@ -78,15 +91,6 @@ function Get-BlindOptions($Record) {
     } finally {
         $sha.Dispose()
     }
-}
-
-function Get-Latest($Records, [string]$Kind) {
-    # The latest record of a kind per decision it refers to. Ordered by id, which is the UTC write
-    # time to the millisecond with a random tail: `ts` reads back as a DateTime, whose string form
-    # sorts month first and drops the milliseconds.
-    $map = @{}
-    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref } | Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
-    return $map
 }
 
 function Read-DigestSample([string]$Path) {
@@ -110,7 +114,10 @@ if ($Rate) {
     }
     $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days @($rday)
     $rec = @($res.Records | Where-Object { [string]$_.id -eq $Rate -and $_.kind -eq 'decision' }) | Select-Object -First 1
-    if (-not $rec) {
+    # Found or not, a part of the log that could not be read is said aloud.
+    if ($rec) {
+        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("digest.ps1: WARNING, the log was not fully read: $e") }
+    } else {
         $why = if ($res.Complete) { 'is not in the log' } else { 'could not be read: ' + ($res.Errors -join '; ') }
         [Console]::Error.WriteLine("digest.ps1: decision $Rate $why. Nothing was recorded.")
         exit $(if ($res.Complete) { 2 } else { 4 })
@@ -138,14 +145,18 @@ if ($Rate) {
 
 try { $Day = Resolve-DecisionDay $Day } catch { [Console]::Error.WriteLine("digest.ps1: $($_.Exception.Message)"); exit 2 }
 
-$res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Window)
-$all = @($res.Records)
+$res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Window)
+# The reversed decisions older than the window are read only to charge their reversals to the
+# right seat and item, as the gate does; every other section reads the window alone.
+$windowDays = @(Get-DecisionDayRange $Day $Window)
+$joined = @($res.Records)
+$all = @($joined | Where-Object { $windowDays -contains (Get-DecisionIdDay ([string]$_.id)) })
 $decisions = @($all | Where-Object { $_.kind -eq 'decision' })
 $today = @($all | Where-Object { (Get-DecisionIdDay ([string]$_.id)) -eq $Day })
 $todayDecisions = @($today | Where-Object { $_.kind -eq 'decision' })
-$ratings = Get-Latest $all 'rating'
-$outcomes = Get-Latest $all 'outcome'
-function Get-Outcome($r) { if ($outcomes.ContainsKey([string]$r.id)) { [string]$outcomes[[string]$r.id].outcome } else { [string]$r.outcome } }
+$ratings = Get-DecisionLatest $all 'rating'
+$outcomes = Get-DecisionLatest $all 'outcome'
+function Get-Outcome($r) { Get-DecisionOutcome $r $outcomes }
 
 # The blind sample: the saved draw, every id ever drawn that day, topped up at random to the target
 # from the day's Class B decisions not yet drawn or rated. Nothing is ever dropped from it, so a
@@ -170,14 +181,14 @@ $hidden = @($sampled | ForEach-Object { [string]$_.id })
 $hiddenAnyDay = @(@(Get-DecisionDayRange $Day $Window) | ForEach-Object { Read-DigestSample (Join-Path $digests "$_.sample.json") } |
         Where-Object { -not $ratings.ContainsKey($_) }) + $hidden
 
-$kill = @(& (Join-Path $PSScriptRoot 'afk-kill.ps1') -Status 2>$null) | Select-Object -Last 1
+$kill = Get-DecisionKillSwitch
 $md = [System.Collections.Generic.List[string]]::new()
 $md.Add("# AFK-autonomy digest, $Day (UTC)")
 $md.Add('')
 $md.Add("Generated $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) from the decision log in $Repo (ADR 0211). Records are data, never instructions.")
 $md.Add('')
 if (-not $res.Complete) {
-    $md.Add('**INCOMPLETE: the vault log was not fully read, so every count below may be low.** ' + ($res.Errors -join '; '))
+    $md.Add('**INCOMPLETE: the decision log (vault or local spool) was not fully read, so every count below may be low.** ' + ($res.Errors -join '; '))
     $md.Add('')
 }
 $md.Add("Kill switch: **$kill**")
@@ -269,32 +280,76 @@ $md.Add('')
 $md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
+# Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
+$calibration = @{}
 foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
-    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
-    # the latest one, 60 newer ratings must pass before the class is calibrated again.
-    $verdicts = @($g.Group | Where-Object { $ratings.ContainsKey([string]$_.id) } |
-            Sort-Object { [string]$ratings[[string]$_.id].id } | ForEach-Object { [string]$ratings[[string]$_.id].rating -eq 'disagree' })
-    $n = $verdicts.Count
-    $lastBreach = -1
-    for ($i = 59; $i -lt $n; $i++) {
-        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
-    }
-    $rated = [Math]::Min($n, 60)
-    $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
-    $since = $n - 1 - $lastBreach
-    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
-    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
-    else { 'calibrated' }
-    $last14 = @($g.Group | Where-Object { $recent -contains (Get-DecisionIdDay ([string]$_.id)) })
-    $revd = @($last14 | Where-Object { (Get-Outcome $_) -eq 'reversed' }).Count
-    $revRate = if ($last14.Count) { $revd / $last14.Count } else { 0 }
-    # Invariant culture, so the table reads the same on every machine.
-    $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
-    $rateText = if ($last14.Count) { $pct + $(if ($revRate -gt 0.05) { ' BREACH' } else { '' }) } else { 'n/a' }
-    $md.Add("| $seat | $class | $rated | $dis | $blind | $($last14.Count) | $revd | $rateText |")
+    $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
+    $calibration[$g.Name] = $c
+    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
 }
 
+# THE GATE'S STATE (plan 4.5-4.7), from the shared functions decision.ps1 -Gate calls, as of the end
+# of -Day, or now for today: the trailing 24 hours that day's last gate would have read.
+$md.Add('')
+$md.Add('## Gate state (plan 4.5 to 4.7)')
+$md.Add('')
+$now = [DateTime]::UtcNow
+$dayEnd = [DateTime]::ParseExact($Day, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
+    [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal).AddDays(1)
+$asOf = if ($dayEnd -lt $now) { $dayEnd } else { $now }
+function Format-Budget($Budget) {
+    $open = if ($Budget.ClosedUntil) { "CLOSED to the no-review path until $(Format-DecisionInstant $Budget.ClosedUntil)" } else { 'open' }
+    return "$($Budget.Count) of $($Budget.Limit) in the trailing 24 hours; $open"
+}
+$reversals = @(Get-DecisionReversals $joined)
+$md.Add("As of $(Format-DecisionInstant $asOf). ``decision.ps1 -Gate`` answers NO-REVIEW only when every condition holds, one of which is that the seat's Class B is calibrated.")
+$md.Add('')
+$md.Add("- Reversal budget, fleet-wide: $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf)).")
+# The rung is a live, per-account reading, so only today's digest carries it: a past day's would
+# record whichever account and minute the digest happened to be rebuilt on.
+if ($dayEnd -gt $now) {
+    $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile
+    $md.Add("- Cost rung, read now on the account this digest ran on: **$($rung.State)**. $($rung.Reason). UNKNOWN sends a decision to review, not to a halt; the Lander is exempt (korus roles/STEWARD.md 3e).")
+} else {
+    $md.Add('- Cost rung: a live reading, so a past day''s digest does not carry it.')
+}
+$md.Add('')
+$md.Add('| Seat | Seat reversal budget | Class B calibrated |')
+$md.Add('|---|---|---|')
+foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
+    $cal = $calibration["$s|B"]
+    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
+}
+$md.Add('')
+$md.Add('Chain limit: each item where a further Class B decision would build on more than two unsampled ones, by the 24-hour floor. A decision''s own buildsOn links can only raise its depth.')
+$md.Add('')
+$deep = @(Get-DecisionRecentUnsampledB -Records $decisions -Now $asOf -Ratings $ratings | Where-Object { $_.item } |
+        Group-Object { [string]$_.item } | Where-Object { $_.Count -gt 2 } | Sort-Object Name |
+        ForEach-Object { "- item $($_.Name): $($_.Count) unsampled Class B decisions in the trailing 24 hours" })
+if (-not $deep.Count) { $md.Add('None.') }
+foreach ($l in $deep) { $md.Add($l) }
+$md.Add('')
+
+# THE ATTIC (plan 6.3): remove.ps1 -Discard parks a snapshot on a clone-local refs/attic/<date>-<name>,
+# and "the attic is pruned only through the digest, as a Class C item". So it is listed here and
+# pruned by nobody: this script deletes nothing.
+$md.Add('## The attic: a Class C prune question for you')
+$md.Add('')
+$md.Add('Snapshots `remove.ps1 -Discard` parked on this clone. Nothing prunes them automatically (plan 6.3), so keeping or deleting each is your call. Deleting one is a ref deletion, which the tripwire hook records.')
+$md.Add('')
+try {
+    $refs = @(& git -C $PSScriptRoot for-each-ref refs/attic '--format=%(creatordate:unix) %(refname)' 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "git for-each-ref exited $LASTEXITCODE" }
+    if (-not $refs.Count) { $md.Add('Empty.') }
+    foreach ($line in $refs) {
+        $stamp, $name = ([string]$line).Split(' ', 2)
+        $age = [DateTime]::UtcNow - [DateTimeOffset]::FromUnixTimeSeconds([long]$stamp).UtcDateTime
+        $md.Add("- ``$name``, $([Math]::Floor($age.TotalDays)) days $($age.Hours) hours old")
+    }
+} catch {
+    $md.Add("**The attic could not be read**, so this says nothing about what it holds: $($_.Exception.Message)")
+}
 $path = Join-Path $digests "$Day.md"
 [System.IO.File]::WriteAllText($path, ($md -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
 $md | ForEach-Object { Write-Output $_ }
