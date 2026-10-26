@@ -19,6 +19,7 @@ records of ``messagefoundry.pipeline.cert_expiry`` that name the file.
 Run against ``cert_expiry.py`` as it stood before the fix, five tests fail: the three-listener
 count, the count on each of two passes, the two-file count, the two spellings of one path, and the
 file replaced part way through a pass. The other three pass before and after, as their comments say.
+The last two are vault BACKLOG #3548's, and each comment says what it fails against.
 
 All material is synthetic and minted here. No PHI.
 """
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.loaded_crls import HeldCrl, HeldCrlSnapshot, crl_path_key
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
 from messagefoundry.pipeline.alerts import crl_expiry_detail
@@ -44,6 +46,7 @@ from messagefoundry.pipeline.cert_expiry import (
     MonitoredCert,
     certs_from_registry,
 )
+from messagefoundry.pki import read_soonest_crl_facts
 from messagefoundry.transports.mllp import _mllp_ssl_context
 from tests.test_cert_expiry import _RecordingSink
 from tests.test_crl_bundle_anchors import (  # noqa: F401 - clean_anchor_checks is a fixture
@@ -340,3 +343,64 @@ def test_a_failure_grouping_the_rows_folds_nothing(
         assert f"a copy of {name!r} CRL " in line
         assert line.endswith(_NO_OTHER_ROW)
     assert len(_mine(sink, site.crl)) == 3
+
+
+def test_a_failure_logging_the_held_copy_keeps_its_verdict(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Vault BACKLOG #3548, item 1. The fold only logs, so a failure in it must not cost a row the
+    # held copy's date. Before the fix the first row's line ran inside the verdict's try: the
+    # failure reset the verdict, the row was judged by the file's 90 days, and it raised no alert.
+    site = _site(ca, tmp_path, 3)
+
+    def _broken(**_: object) -> str:
+        raise RuntimeError("synthetic logging failure")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.crl_expiry_detail", _broken)
+
+    sink = _scan(site.registry, caplog)
+
+    mine = _mine(sink, site.crl)
+    assert [sink.crl_calls[i][0] for i in mine] == site.names
+    assert [sink.crl_calls[i][3] for i in mine] == [5, 5, 5]  # the held copy's days, on each
+    assert all(sink.crl_notes[i][0] is True for i in mine)
+    # An account counts as logged only once its line is, so no row's failure folds the next row's
+    # attempt away: each row tries, and each failure is logged.
+    failed = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert len(failed) == 3
+    for message, name in zip(failed, site.names, strict=True):
+        assert message.startswith(f"cert_expiry: could not log the held copies of {name!r} CRL ")
+    assert site.lines(caplog) == []
+
+
+def test_two_files_with_one_account_each_log_their_own_line(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Vault BACKLOG #3548, item 7. The fold is keyed on the file as well as the account. Two files,
+    # one row each, whose held copies give the same account word for word: the same reason, holder,
+    # issuer, date and remedy. So the file is the only difference, and each file keeps its line. A
+    # fold keyed on the account alone logs one line for both, and fails this test; the other nine
+    # tests in this file all pass against it. This passes before and after the fix.
+    now = time.time()
+    old = read_soonest_crl_facts(ca.crl(days=5.5, number=1), now=now)  # one copy's facts, shared
+    rows: list[MonitoredCert] = []
+    copies: list[HeldCrl] = []
+    for name in ("east", "west"):
+        crl = tmp_path / f"{name}-crl.pem"
+        crl.write_bytes(ca.crl(days=90, number=2))
+        rows.append(MonitoredCert(f"tls.{name}", str(crl), kind="crl"))
+        copies.append(
+            HeldCrl(crl_path_key(crl), (0, 0), old, file_path=str(crl), setting="[tls].crl_file")
+        )
+    sink = _RecordingSink()
+    runner = _runner(Registry(), sink, rows)
+    monkeypatch.setattr(runner, "_held_snapshot", lambda: HeldCrlSnapshot(copies))
+
+    _pass(runner, caplog)
+
+    held = [r.getMessage() for r in caplog.records if _HELD in r.getMessage()]
+    assert len(held) == 2
+    for line, row in zip(held, rows, strict=True):
+        assert f"a copy of {row.label!r} CRL {row.path} " in line
+        assert line.endswith(_NO_OTHER_ROW)
+    assert [call[3] for call in sink.crl_calls] == [5, 5]  # both judged by the held copy

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -475,6 +476,17 @@ _NEW_IP_DEDUP_MAX = 4096
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
 
+# BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
+# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
+# not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
+# proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
+# short prefix and gains the SHA-256 of the whole, so two long strings that share the prefix stay
+# distinct. The replacement is longer than this bound, so it can never equal text kept as it is.
+# Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
+_NEW_IP_TEXT_MAX = 64
+_NEW_IP_TEXT_PREFIX = 24
+
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
 # one primary-key lookup. An address last seen before this window reads as NEW -- the signal answers
@@ -546,6 +558,24 @@ def _host_key(address: str) -> str:
     if parsed.is_loopback:
         return "::1"
     return str(parsed)
+
+
+def _bounded_address_text(address: str) -> str:
+    """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
+    and the SHA-256 of the whole (BACKLOG #3772).
+
+    The same input always gives the same output, so it serves as a dedupe key. At least the
+    new-address signal uses it; :func:`_host_key` stays unbounded, because the persisted
+    known-address record and :meth:`AuthService._same_host` compare by it."""
+    if len(address) <= _NEW_IP_TEXT_MAX:
+        return address
+    # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
+    # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
+    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+    # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
+    # and the result can be stored. Text within the bound is returned as it is, as on main.
+    prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
+    return f"{prefix}...sha256:{digest}"
 
 
 #: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
@@ -3166,7 +3196,7 @@ class AuthService:
             else None
         )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
-        # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
+        # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
         # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
         self._new_ip_seen: dict[str, set[str]] = {}
@@ -12182,7 +12212,10 @@ class AuthService:
             return False
         if self._same_host(client_ip, session.client):
             return False
-        seen_key = _host_key(client_ip)
+        # Bounded at intake (BACKLOG #3772), so the dedupe sets hold bounded text. The same value is
+        # added below and discarded in the ``finally``.
+        host_key = _host_key(client_ip)
+        seen_key = _bounded_address_text(host_key)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
         # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
@@ -12195,6 +12228,12 @@ class AuthService:
                 path,
             )
             return True
+        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
+        # which is every address without a long zone id, is unchanged, so a search by address still
+        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
+        # differs from the raw text other rows of the request carry. Text that does not parse is its
+        # own host key, so its bounded form is reused rather than hashed twice.
+        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop.
@@ -12203,13 +12242,14 @@ class AuthService:
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
                 _NEW_IP_PER_SESSION_MAX,
                 path,
-                scrub_log_argument(client_ip),
+                scrub_log_argument(seen_text),
             )
             return True
+        known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
             "path": path,
-            "known_ip": session.client,
-            "seen_ip": client_ip,
+            "known_ip": known_text,
+            "seen_ip": seen_text,
         }
         if flag == "audit_cap_reached":
             # The last row before the session re-verifies, so it says why the next new address
@@ -12220,12 +12260,13 @@ class AuthService:
             user = await self._load_user(session.user_id)
             username = user.username if user is not None else session.user_id
             # The client column too (vault BACKLOG #3197), so a search or export by address finds
-            # this row. `seen_ip` stays in the detail beside `known_ip`, which it is compared with.
+            # this row; over-long text is bounded (BACKLOG #3772). `seen_ip` stays in the detail
+            # beside `known_ip`, which it is compared with.
             await self._audit(
                 "auth.new_address_reverify_required",
                 actor=username,
                 detail=_json(detail),
-                client=client_ip,
+                client=seen_text,
             )
             written = True
         finally:
@@ -12236,14 +12277,14 @@ class AuthService:
                 flagged = self._new_ip_seen.get(token_hash)
                 if flagged is not None:
                     flagged.discard(seen_key)
-        notice: dict[str, object] = {"known_ip": session.client}
+        notice: dict[str, object] = {"known_ip": known_text}
         if flag == "audit_cap_reached":
             notice["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         await self._notify_security(
             NEW_ADDRESS_REVERIFY,
             username=username,
             email=user.notify_email if user is not None else None,
-            client=client_ip,
+            client=seen_text,
             detail=notice,
         )
         return True

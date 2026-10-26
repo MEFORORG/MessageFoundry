@@ -361,16 +361,18 @@ ledger, so it has no public page.
   other request keeps the client's timeout. (`vault BACKLOG #2950`)
 - **A directory refusal at the second factor, an enrolment or a step-up names the fix for its
   cause.** When a directory refuses an account at `/auth/mfa-verify`, `/me/mfa/confirm` or
-  `/me/reauth`, the proof is not checked and the 403 now has one text per fix. A role the account
-  lost in the directory since it signed in is told to sign out and sign in again, which takes the
-  roles its groups grant now. Every other cause, an outage included, is told to try again later
-  and, if it is still refused, to ask an administrator, never to sign out, since a new sign-in would
-  fail the same way. A group-to-role map that fails its seal is in that second group, audited as
-  `directory_role_map_unsealed`: a new sign-in reads the same map, and an administrator re-saving
-  it is the fix. The identity provider step-up leg has its own texts for a demotion and an unsealed
-  map. No text names a group or a role. Breaking for an embedder: `Elevation.directory_unconfirmed`
-  is replaced by `directory_refusal`, a `DirectoryRefusal`, which is `None` when no directory
-  refused. (`BACKLOG #3082`)
+  `/me/reauth`, the proof is not checked, except on at least the password re-bind refusals that
+  come after the bind accepted the password, which the `vault BACKLOG #3081` entry lists. The 403
+  now has one text per fix. A
+  role the account lost in the directory since it signed in is told to sign out and sign in again,
+  which takes the roles its groups grant now. Every other cause, an outage included, is told to try
+  again later and, if it is still refused, to ask an administrator, never to sign out, since a new
+  sign-in would fail the same way. A group-to-role map that fails its seal is in that second group,
+  audited as `directory_role_map_unsealed`: a new sign-in reads the same map, and an administrator
+  re-saving it is the fix. The identity provider step-up leg has its own texts for a demotion and an
+  unsealed map. No text names a group or a role. Breaking for an embedder:
+  `Elevation.directory_unconfirmed` is replaced by `directory_refusal`, a `DirectoryRefusal`, which
+  is `None` when no directory refused. (`BACKLOG #3082`)
 - **A File inbound refuses a negative `min_age_seconds` at build.** A negative value used to build
   and act as zero. It is now a build error naming the setting, with the value withheld. Zero, the
   default, and any positive value build as before. (`BACKLOG #3151`)
@@ -2010,11 +2012,33 @@ ledger, so it has no public page.
   account is present and enabled (BACKLOG #2023, #2239). They now also map the account's current
   groups to roles, as the reconciliation pass does, and refuse when a stored role is not among
   them. Before, such an account would renew its step-up window or clear the MFA gate with the old
-  roles until the reconciliation pass revoked it. Only a demotion refuses; a promotion does not.
+  roles until the reconciliation pass revoked it. Only a demotion refuses; a promotion does not. A
+  role map that fails its seal refuses too, as the `BACKLOG #3082` entry says.
   The refusal writes no roles, checks no code or assertion, charges nothing to the lockout, and is
-  audited with `reason=directory_unconfirmed` and the outcome `directory_roles_demoted`. The
-  password re-bind and the enrolment legs do not compare roles yet, and channel scope is not
-  compared. (`vault BACKLOG #2240`)
+  audited with `reason=directory_unconfirmed` and the outcome `directory_roles_demoted`. Channel
+  scope is not compared. The password re-bind and the enrolment legs make the same role test in
+  this release; their own entries say how (`vault BACKLOG #3081`, `#3061`). (`vault BACKLOG #2240`;
+  corrected under `vault BACKLOG #3822`, as this entry said those legs did not compare roles.)
+- **The password re-bind step-up refuses a directory account demoted in the directory since
+  sign-in.** A good re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) returns the
+  account's current groups, and the engine judges them with the role test the TOTP, passkey and
+  IdP step-up legs use, on the stored roles it reads after the bind returns. Before, such an
+  account would renew its step-up window with the old roles until the reconciliation pass revoked
+  it. The refusals are audited on the `auth.reauth` row, at least these:
+  `reason=directory_roles_demoted` for a lost role; `reason=directory_identity_conflict` when the
+  row's directory object id or provider moved during the bind, because the groups vouch only for
+  the object the bind was keyed on; and `reason=directory_role_map_unsealed` when the AD
+  group-to-role map fails its seal, for an account that holds a role. The password was right in
+  each of these cases, so none of them is charged to the lockout or to the session's re-proof
+  budget, and none clears either. `directory_identity_conflict` also marks an older, uncharged
+  refusal, where the directory answered about another object than the row's, so the bind cannot
+  vouch for this account whether or not it accepted the password (`vault BACKLOG #2027`).
+  The per-actor step-up attempt budget is still drawn. None renews the window, mints an
+  action-bound grant or writes roles. Each is a **403** on `POST /me/reauth`, with the per-fix text
+  the `BACKLOG #3082` entry describes: a demotion is told to sign out and sign in again. Channel
+  scope is not compared. See [SECURITY.md](docs/SECURITY.md).
+  (`vault BACKLOG #3081`; added under `vault BACKLOG #3822`, after the 0.5.2 release notes were
+  published without it.)
 - **One account whose directory probe raises no longer ends the reconcile pass.** In v0.5.1 a
   probe that raised something other than an LDAP error ended the whole pass, so it stopped
   revocation for every account. Step-up also returned an error, not an audited refusal. The rest

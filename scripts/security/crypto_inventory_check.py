@@ -340,8 +340,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
     # ADR 0197 Amendment A (AC-A9): store.crypto for CipherError alone, so the lockable-account census
     # can tell a TOTP cell the store key does not open apart from any other store error.
+    # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
+    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret.
     "messagefoundry/auth/service.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
+        {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
@@ -1162,6 +1164,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.oidc.flow",
             "hash:via messagefoundry.auth.oidc_http",
             "hash:via messagefoundry.auth.tokens",
+            # BACKLOG #3772: _bounded_address_text, a SHA-256 dedupe key over over-long client text.
+            "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).
             "hash:via messagefoundry.store.store",
@@ -1731,6 +1735,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/strict_requests.py": frozenset(
         {
             "hash:hashlib.sha256",  # Vault BACKLOG #4028: the ambient proxy disclosure's dedupe key
+            # BACKLOG #3458: connect() checks the client key hvac took from VAULT_CLIENT_CERT with
+            # keywrap.refuse_weak_cert_chain_key before urllib3 loads it. A check, not a load.
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.load_verify_locations()",
         }
     ),
