@@ -67,9 +67,9 @@ control: the plain CA verifies the server under that name, and does not under an
 
 No handshake runs in the pytest process. The server and every client are child processes, each
 killed on a deadline, so a regression fails a test and does not hang the suite. The server writes
-a line for each handshake, and each trial that connected checks it: a client that verified the
-server must match a server that finished the handshake, and a client that refused must match one
-that did not.
+a line for each handshake. A trial whose client verified the server must match a server line that
+finished the handshake, and one whose client refused it with a verification error must match one
+that did not. A trial with any other outcome is left to its own assertion.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ from tests._encrypted_pem_probe import (
     CAPATH_PLAIN_CRL,
     CAPATH_WRONG_NAME,
     CONDITIONS,
-    LoopbackServer,
+    ProbeTlsServer,
     Trial,
     assert_the_control_reaches_the_prompt,
     subject_hash,
@@ -110,8 +110,6 @@ _ANSWER_WITHIN = CAPATH_MIN_WAIT
 _CONTROL_WAIT = 3.0
 
 _REFUSED_THE_PEER = "SSLCertVerificationError"
-#: Whether the server must say the handshake finished, by the client's outcome.
-_SERVER_FINISHED = {"VERIFIED": True, "RAISED": False}
 
 
 @pytest.fixture(scope="module")
@@ -122,7 +120,7 @@ def shapes(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def server(shapes: Path) -> Iterator[LoopbackServer]:
+def server(shapes: Path) -> Iterator[ProbeTlsServer]:
     """The loopback TLS server, in a child process of its own. If it does not start, every test
     that needs it errors: nothing here skips."""
     with tls_server(shapes) as listening:
@@ -152,14 +150,13 @@ def test_the_subject_hash_is_the_value_openssl_printed() -> None:
 
 
 def _handshake(
-    shapes: Path, server: LoopbackServer, condition: str, shape: str, mode: str = "capath"
+    shapes: Path, server: ProbeTlsServer, condition: str, shape: str, mode: str = "capath"
 ) -> Trial:
-    """One handshake trial. Where the client connected and got an answer, the server's own line
-    for that connection must agree with it, so the server's errors are read, not dropped."""
+    """One handshake trial. Where the client verified or refused the server, the server's own
+    line for that connection must agree, so the server's errors are read, not dropped."""
     trial = server.handshake(mode, shapes / shape, condition, wait=_ANSWER_WITHIN)
-    expected = _SERVER_FINISHED.get(trial.outcome)
-    if trial.client_port is not None and expected is not None:
-        assert trial.server_finished is expected, (
+    if trial.server_agrees is not None:
+        assert trial.server_agrees, (
             f"the client's {trial.outcome} through {shape} ({mode}, {condition!r}) does not match "
             f"the server's line for its connection. Saw: {trial}. "
             f"Server stderr: {server.errors()!r}"
@@ -176,18 +173,20 @@ def _assert_never_waited(trial: Trial, where: str) -> None:
 
 
 def _assert_a_ca_directory_never_waits(
-    shapes: Path, server: LoopbackServer, condition: str
+    shapes: Path, server: ProbeTlsServer, condition: str
 ) -> None:
     plain = _handshake(shapes, server, condition, CAPATH_PLAIN)
     assert plain.outcome == "VERIFIED", (
         "the harness could not verify the server through a plain CA directory, so the directory "
-        f"is not being read: the hash name, the server or the probe is wrong. Saw: {plain}"
+        f"is not being read: the hash name, the server or the probe is wrong. Saw: {plain}. "
+        f"Server stderr: {server.errors()!r}"
     )
     # The control for the positional refusal below: the same call verifies a plain directory.
     positional = _handshake(shapes, server, condition, CAPATH_PLAIN, "capath-positional")
     assert positional.outcome == "VERIFIED", (
         "the positional call could not verify the server through a plain CA directory, so its "
-        f"refusal of the encrypted directory proves nothing. Saw: {positional}"
+        f"refusal of the encrypted directory proves nothing. Saw: {positional}. "
+        f"Server stderr: {server.errors()!r}"
     )
     with_crl = _handshake(shapes, server, condition, CAPATH_PLAIN_CRL, "capath-crl")
     assert with_crl.outcome == "VERIFIED", (
@@ -237,7 +236,7 @@ def _assert_a_ca_directory_never_waits(
 
 @pytest.mark.parametrize("condition", [c for c in CONDITIONS if c != "pty"])
 def test_a_ca_directory_with_an_encrypted_block_never_waits_with_no_terminal(
-    shapes: Path, server: LoopbackServer, condition: str
+    shapes: Path, server: ProbeTlsServer, condition: str
 ) -> None:
     """Runs on every platform. On POSIX the client has no controlling terminal. On Windows it has a
     hidden console of its own, or none."""
@@ -246,7 +245,7 @@ def test_a_ca_directory_with_an_encrypted_block_never_waits_with_no_terminal(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a pty needs POSIX: no pty module on win32")
 def test_a_ca_directory_with_an_encrypted_block_never_waits_on_a_terminal(
-    shapes: Path, server: LoopbackServer
+    shapes: Path, server: ProbeTlsServer
 ) -> None:
     """An operator's shell, where OpenSSL can open the terminal and ask. The client's controlling
     terminal is a pty that nobody types on."""
@@ -254,7 +253,7 @@ def test_a_ca_directory_with_an_encrypted_block_never_waits_on_a_terminal(
 
 
 def test_the_file_name_is_what_makes_a_directory_answer(
-    shapes: Path, server: LoopbackServer
+    shapes: Path, server: ProbeTlsServer
 ) -> None:
     """Why the plain-directory control proves the directory is read. The same plain CA under
     another name does not verify the server, and with a CRL check on, the CA with no ``.r0`` file

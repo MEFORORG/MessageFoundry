@@ -4,7 +4,7 @@
 
 A PEM block with a ``Proc-Type: 4,ENCRYPTED`` header can send OpenSSL to a password prompt. This
 module is the instrument that says, for one load call and one terminal condition, whether the load
-refused, loaded, or was still waiting when it was killed. Two pins run it,
+refused, loaded, or was still waiting when it was killed. At least two pins run it,
 ``tests/test_encrypted_pem_cafile_pin.py`` and ``tests/test_encrypted_pem_capath_pin.py``, and it
 also runs by hand, on a Python that has no engine installed::
 
@@ -44,7 +44,7 @@ handshakes. The trial child sets a socket timeout, and :func:`run_trial` refuses
 than :data:`CAPATH_MIN_WAIT`: two of them, one to connect and one to handshake, and a margin. So a
 server that stalls shows as a ``TimeoutError``, and only a child stuck outside the socket shows as
 ``WAITING``. The server writes one line per connection, naming the client's port and whether the
-handshake finished, and :meth:`LoopbackServer.handshake` hands it back with the trial.
+handshake finished, and :meth:`ProbeTlsServer.handshake` hands it back with the trial.
 
 :func:`subject_hash` works the file name out with ``hashlib``, so the probe needs no ``openssl``
 program. Two directory shapes prove the name: the plain CA under that name verifies the server,
@@ -81,7 +81,7 @@ __all__ = [
     "ENCRYPTED_SHAPES",
     "ENCRYPTION_HEADERS",
     "PLAIN_SHAPE",
-    "LoopbackServer",
+    "ProbeTlsServer",
     "Trial",
     "assert_the_control_reaches_the_prompt",
     "run_trial",
@@ -140,14 +140,15 @@ _SOCKET_TIMEOUT = 8.0
 #: The shortest deadline :func:`run_trial` takes for a capath mode: both socket waits, and 4 s for
 #: the child to load the directory and print its result on a busy runner.
 CAPATH_MIN_WAIT = 2 * _SOCKET_TIMEOUT + 4.0
-#: Seconds :meth:`LoopbackServer.handshake` waits for the server's line about one handshake.
-_SERVER_LINE_WAIT = 5.0
+#: Seconds :meth:`ProbeTlsServer.handshake` waits for the server's line about one handshake. Only
+#: a line that never comes spends it, so it is generous for a busy runner.
+_SERVER_LINE_WAIT = 30.0
 
 # The child. Standard library only, and it must run on any Python 3 this is measured on.
 # A capath mode is handed a directory, the server's port and its socket timeout, and run_trial
 # hands a port to no other mode. It keeps the deadline at CAPATH_MIN_WAIT or more, or a stalled
-# server would read as a wait for a password. The client's port goes in the result line, so the
-# caller can find the server's line for this handshake.
+# server would read as a wait for a password. Once connected, the child prints a CLIENT line with
+# its own port, so the caller can find the server's line for this handshake.
 _TRIAL = r"""
 import socket, ssl, sys, time
 mode, path = sys.argv[1], sys.argv[2]
@@ -169,12 +170,15 @@ try:
             ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
         if mode == "capath-positional":
             ctx.load_verify_locations(None, path, None)
-        else:
+        elif mode in ("capath", "capath-crl"):
             ctx.load_verify_locations(capath=path)
+        else:
+            raise SystemExit("unknown mode " + mode)
         note = " store after the load: " + store()
         address = ("127.0.0.1", int(sys.argv[3]))
         with socket.create_connection(address, timeout=float(sys.argv[4])) as raw:
-            note += "; client port %d" % raw.getsockname()[1]
+            sys.stdout.write("CLIENT %d\n" % raw.getsockname()[1])
+            sys.stdout.flush()
             with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
                 version = tls.version()
     elif mode == "cafile":
@@ -218,9 +222,12 @@ ctx.load_cert_chain(sys.argv[1])
 # has its answer and has closed would turn a verified handshake into a write error here.
 ctx.num_tickets = 0
 def watch_the_caller():
-    sys.stdin.buffer.read()
-    os._exit(0)
+    try:
+        sys.stdin.buffer.read()
+    finally:
+        os._exit(0)
 threading.Thread(target=watch_the_caller, daemon=True).start()
+sys.stdout.reconfigure(errors="backslashreplace")
 lock = threading.Lock()
 def say(line):
     with lock:
@@ -236,7 +243,7 @@ def serve(raw):
     try:
         raw.settimeout(120)
         ctx.wrap_socket(raw, server_side=True).close()
-    except OSError as exc:  # includes ssl.SSLError: the client refused the certificate, or was killed
+    except Exception as exc:  # ssl.SSLError when the client refused the certificate or was killed
         say("%s handshake failed: %s %s" % (peer, type(exc).__name__, exc))
     else:
         say("%s handshake ok" % peer)
@@ -323,7 +330,7 @@ class Trial:
     client_port: int | None = None
     #: The loopback server's line for that connection, with the port left off: ``handshake ok``,
     #: or ``handshake failed:`` and the error. ``None`` if no line came. Only
-    #: :meth:`LoopbackServer.handshake` sets it.
+    #: :meth:`ProbeTlsServer.handshake` sets it.
     server: str | None = None
 
     @property
@@ -332,12 +339,16 @@ class Trial:
         return self.outcome == "WAITING" or self.prompted
 
     @property
-    def server_finished(self) -> bool | None:
-        """Whether the server said the handshake finished. ``None`` if it said neither."""
-        if self.server == "handshake ok":
-            return True
-        if self.server is not None and self.server.startswith("handshake failed"):
-            return False
+    def server_agrees(self) -> bool | None:
+        """Whether the server's line matches the client's answer: a verified server finished the
+        handshake, and a server the client refused with a verification error did not. ``None``
+        where the client gave neither answer, or never connected, so there is nothing to match."""
+        if self.client_port is None:
+            return None
+        if self.outcome == "VERIFIED":
+            return self.server == "handshake ok"
+        if self.outcome == "RAISED" and "SSLCertVerificationError" in self.detail:
+            return self.server is not None and self.server.startswith("handshake failed")
         return None
 
 
@@ -357,10 +368,9 @@ def _trial_from(text: str, *, waited: bool) -> Trial:
     done = ("RAISED", "LOADED", "VERIFIED")
     result = next((line for line in after if line.startswith(done)), None)
     if result is not None:
-        # The capath child writes "; client port N;" into its result line once it has connected.
-        _, connected, rest = result.partition("; client port ")
-        port = rest.split(";", 1)[0].strip()
-        client = int(port) if connected and port.isdigit() else None
+        # A capath child prints "CLIENT <port>" once it has connected.
+        ports = [line.split()[1] for line in after if line.startswith("CLIENT ")]
+        client = int(ports[0]) if ports and ports[0].isdigit() else None
         return Trial(result.split(" ", 1)[0], result, prompted, client_port=client)
     return Trial("WAITING" if waited else "BROKEN", " | ".join(after), prompted)
 
@@ -451,7 +461,8 @@ def run_trial(
     """Run one load of ``path`` in a fresh child under ``condition``, and kill it after ``wait``.
 
     ``wait`` is counted from the child's ``READY`` line. A child still running then is ``WAITING``.
-    A ``capath`` mode takes a directory as ``path`` and the ``port`` :func:`tls_server` yielded.
+    A ``capath`` mode takes a directory as ``path`` and the :attr:`ProbeTlsServer.port` of the
+    server :func:`tls_server` yielded. :meth:`ProbeTlsServer.handshake` passes both for you.
     """
     if condition not in CONDITIONS:
         raise ValueError(f"{condition!r} is not a terminal condition on this platform")
@@ -485,7 +496,7 @@ def assert_the_control_reaches_the_prompt(
 
 
 @dataclass(frozen=True)
-class LoopbackServer:
+class ProbeTlsServer:
     """The loopback TLS server :func:`tls_server` started. Use it only inside that block."""
 
     port: int
@@ -527,7 +538,7 @@ class LoopbackServer:
 
 
 @contextlib.contextmanager
-def tls_server(directory: str | os.PathLike[str]) -> Iterator[LoopbackServer]:
+def tls_server(directory: str | os.PathLike[str]) -> Iterator[ProbeTlsServer]:
     """Serve TLS on a loopback port from a fresh child process, and yield it.
 
     The server presents ``server.pem`` from ``directory``, which :func:`write_shapes` signed with
@@ -552,7 +563,7 @@ def tls_server(directory: str | os.PathLike[str]) -> Iterator[LoopbackServer]:
             )
             try:
                 port = _port_of(proc, out_path, err_path)
-                yield LoopbackServer(port, out_path, err_path)
+                yield ProbeTlsServer(port, out_path, err_path)
             finally:
                 if proc.poll() is None:
                     proc.kill()
@@ -733,7 +744,8 @@ def _print_table(directory: Path, wait: float) -> None:
                 trial = server.handshake(mode, directory / shape, condition, wait=handshake_wait)
                 _print_row(shape, mode, trial)
                 if trial.client_port is not None:
-                    print(f"{'':47} server: {trial.server}")
+                    flag = " (DISAGREES with the client)" if trial.server_agrees is False else ""
+                    print(f"{'':47} server: {trial.server}{flag}")
 
 
 def _print_row(shape: str, mode: str, trial: Trial) -> None:
