@@ -2765,9 +2765,9 @@ def check_pinned_certificate(
     except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
         checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
     except MemoryError:
-        # Most likely a file that grew past the size check before the anchor checks read it. Not a
-        # guard for a FIFO or an endless device: such a read blocks, or the OS ends the process.
-        checked = f"[store].ssl_root_cert {path!r} could not be read: it is too large to read"
+        # Turns a MemoryError raised while the anchor checks run into a refusal naming the setting.
+        # The store open does not guard a FIFO or an endless device: such a read can block or never end.
+        checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
         raise ValueError(checked)
     cert = pinned_server_certificate(checked)

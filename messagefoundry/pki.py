@@ -846,9 +846,11 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     return pinned_server_certificate(data)
 
 
-#: The largest SQL Server pin file the engine reads (BACKLOG #3714). A pin is one certificate, a
-#: few KiB, so this leaves a wide margin and still stops a huge or endless file before it is
-#: read whole.
+#: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
+#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte. At store
+#: open the cap is judged on the size on disk, then on the bytes after the anchor checks have read
+#: the file whole. At least a reload, the serve start preflight, the expiry monitor and ``cert
+#: inventory`` read the file with no cap.
 PIN_FILE_MAX_BYTES = 1 << 20
 
 _TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"
@@ -858,7 +860,8 @@ def oversized_pin_reason(path: str) -> str | None:
     """The reason a pin file is too large to read, from its size on disk, or ``None``. For a
     caller whose read is not bounded, such as the trust-anchor checks, to call first. A file
     that cannot be stat'ed gives ``None``: the read that follows reports it. A file whose size
-    the OS does not report, such as a device, passes here, so that caller still guards its read."""
+    the OS does not report, such as a FIFO or a device, passes here, and the store open does not
+    guard its read: it can block or never end."""
     try:
         size = os.stat(path).st_size
     except (OSError, ValueError, TypeError):

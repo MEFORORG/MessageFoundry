@@ -649,8 +649,9 @@ def test_a_pin_file_too_large_is_refused_at_load_and_at_open(tmp_path: object) -
 def test_a_pin_read_that_runs_out_of_memory_is_refused_naming_the_setting(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file with no size on disk, such as a device, passes the size check, and the anchor
-    checks read it whole. A ``MemoryError`` there is refused naming the setting, not raised raw."""
+    """A ``MemoryError`` while the anchor checks run is refused naming the setting, not raised
+    raw. The store open does not guard a FIFO or an endless device, so this test raises the error
+    itself rather than reading one."""
     from messagefoundry.auth import trust_anchors
 
     settings = _ss(ssl_root_cert=_leaf_file(tmp_path))
@@ -659,8 +660,25 @@ def test_a_pin_read_that_runs_out_of_memory_is_refused_naming_the_setting(
         raise MemoryError
 
     monkeypatch.setattr(trust_anchors, "evaluate_anchor", endless)
-    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*too large to read"):
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*ran out of memory"):
         check_pinned_certificate(settings)
+
+
+def test_the_store_open_judges_the_cap_on_the_bytes_it_read(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The size on disk is checked first, but the bytes the anchor checks read are what the cap
+    judges in the end, so a file that passes the size check and then reads large is refused.
+    With the size check stubbed out, only the length check in ``pinned_server_certificate`` can
+    refuse here."""
+    from messagefoundry import pki
+
+    big = tmp_path / "big.pem"  # type: ignore[operator]
+    big.write_bytes(b"x" * (pki.PIN_FILE_MAX_BYTES + 1))
+    settings = _ss().model_copy(update={"ssl_root_cert": str(big)})
+    monkeypatch.setattr(pki, "oversized_pin_reason", lambda _path: None)
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*larger than \d+ bytes"):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))
 
 
 def test_the_store_open_check_reads_the_pin_once(
