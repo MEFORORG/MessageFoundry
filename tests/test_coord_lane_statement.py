@@ -298,7 +298,7 @@ def test_a_write_over_an_unreadable_record_is_refused_and_leaves_it(
 
 
 _BLANK_KEYS = {
-    "v", "boxKey", "worktree", "capacity", "statedFree", "statedInFlight", "statedUtc",
+    "v", "boxKey", "worktree", "statedFree", "statedInFlight", "statedUtc",
     "statedBySessionId", "statedNote", "tipAtStated", "claimHashAtStated", "turnsSinceStated",
     "tipNow", "claimHashNow", "lastTurnUtc", "promptedUtc", "promptCount", "askedByDispatcherUtc",
 }  # fmt: skip

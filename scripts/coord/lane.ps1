@@ -2,11 +2,19 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Record THIS lane's own free-slot count. The only writer of a lane level.
+    Record THIS lane's own counts of items in flight and items free by work. The only writer of a
+    lane level.
 
 .DESCRIPTION
-    A builder lane states how many of its slots are free BY WORK. Nothing else in the fleet may write
-    that number -- not the dispatcher, not a hook, not an inference from claims.
+    A builder lane states how many items it is working and how many it holds without working them.
+    Nothing else in the fleet may write those numbers -- not a Manager, not a hook, not an inference
+    from claims.
+
+    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). The four-item lane ceiling, and the
+    -Capacity parameter that defaulted to it, are retired: Builders and Managers work at full speed,
+    and usage is governed only by the Steward's holds and the korus Workflow gate. Nothing this
+    script records is a cap, a slot count or a reason to stop briefing or building. Do not add a
+    capacity back, and do not add a usage throttle here; usage is the Steward's.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
     derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
@@ -15,8 +23,9 @@
     numbers were honest. Only the lane knows which is which.
 
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
-    condition is FREE. A claim you are not currently able to progress is a FREE slot wearing an
-    occupied label, and that mislabelling is the outage.
+    condition is FREE. A claim you are not currently able to progress is FREE work wearing an
+    occupied label, and that mislabelling is the outage. With no ceiling there are no empty slots,
+    so -Free counts exactly those held items and nothing else.
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
@@ -27,8 +36,7 @@ param(
     [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$Free,
     [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$InFlight,
     [Parameter(ParameterSetName = 'State')][string]$Note = '',
-    [Parameter(ParameterSetName = 'State')][ValidateRange(1, 99)][int]$Capacity = 4,
-    # Stamp that a dispatcher asked. Carries NO number and cannot produce an at-capacity reading.
+    # Stamp that a dispatcher asked. Carries NO number.
     [Parameter(ParameterSetName = 'Asked', Mandatory)][switch]$Asked,
     [Parameter(ParameterSetName = 'Show', Mandatory)][switch]$Show
 )
@@ -140,7 +148,7 @@ if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
-        v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+        v = 1; boxKey = $boxKey; worktree = $worktree
         statedFree = $null; statedInFlight = $null; statedUtc = $null
         statedBySessionId = $null; statedNote = ''
         tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -175,7 +183,7 @@ if ($Show) {
         # between the two reads would print a stated level beside an `absent` reason. The fields
         # match the blank record above; fold the two together once that read keeps its reason.
         $shown = [pscustomobject]@{
-            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            v = 1; boxKey = $boxKey; worktree = $worktree
             statedFree = $null; statedInFlight = $null; statedUtc = $null
             statedBySessionId = $null; statedNote = ''
             tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -224,7 +232,6 @@ if ($Asked) {
     $tip = (& git rev-parse HEAD 2>$null)
     if ($LASTEXITCODE -ne 0) { $tip = '' } else { $tip = $tip.Trim() }
 
-    $rec.capacity          = $Capacity
     $rec.statedFree        = $Free
     $rec.statedInFlight    = $InFlight
     $rec.statedUtc         = $nowUtc
@@ -238,6 +245,9 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
+# A record written before the ceiling was retired carries `capacity`, 4 by default. Drop it on the
+# next write, so no stored lane level still names a cap for a reader to apply.
+$rec.PSObject.Properties.Remove('capacity')
 # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
 $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
@@ -250,7 +260,7 @@ Move-CoordFileReplace -Source $tmp -Destination $file -ReplaceReadOnly
 if ($Asked) {
     Write-Host "lane: recorded that a dispatcher asked. No number written."
 } else {
-    Write-Host "lane: $boxKey -- $Free free / $InFlight in flight of $($rec.capacity), stated $nowUtc"
+    Write-Host "lane: $boxKey -- $Free free / $InFlight in flight, stated $nowUtc"
     if (-not $Note) { Write-Host "      (no note. A note is what makes the number auditable later.)" }
 }
 exit 0
