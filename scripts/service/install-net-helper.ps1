@@ -59,15 +59,16 @@ param(
     #
     # THE CHARACTER SET IS messagefoundry/service_status.py's `_SAFE_SERVICE_NAME`, SPACE INCLUDED, and the
     # space is the part to leave alone. -EngineServiceName names the service the ENGINE's installer
-    # created, install-service.ps1 puts no validation on its own -ServiceName, and a space is legal
-    # there -- `_elevated_cmd_params` uses "My Engine" as its worked example. A tighter pattern here
+    # created, install-service.ps1 validates its own -ServiceName with this same pattern, and a space is
+    # legal there -- `_elevated_cmd_params` uses "My Engine" as its worked example. A tighter pattern here
     # would make an engine installed as "MessageFoundry Prod" unnameable to this script, failing at
     # parameter binding before anything ran. A space cannot end a WQL literal, so it costs nothing.
-    # The first character must be alphanumeric, and `\z` (not `$`, which also matches before a
-    # trailing line feed) ends the match, as in the Python guard (BACKLOG #1680).
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z')][string]$ServiceName = "MessageFoundryNetHelper",
+    # The first character must be alphanumeric, `\z` (not `$`, which also matches before a trailing
+    # line feed) ends the match, and Options = 'None' makes it case-sensitive, because a
+    # case-insensitive [A-Za-z] also matches the Kelvin sign: as in the Python guard (BACKLOG #1680).
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundryNetHelper",
     # The engine's service, read for its run-as account (the pipe's only non-administrator caller).
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z')][string]$EngineServiceName = "MessageFoundry",
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$EngineServiceName = "MessageFoundry",
     # The engine executable, used only to read [cluster.vip]. Defaults to the repo venv, as
     # install-service.ps1's -AppExe does.
     [string]$AppExe,

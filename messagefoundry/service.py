@@ -15,9 +15,10 @@ process is detached, output isn't captured) — poll :func:`service_state` to ob
 tray service-manager and the ``service start``/``stop`` CLI. Both elevate the same ``net`` command;
 neither elevates user-writable code.
 
-A third elevated launch, :func:`install_service`, is one-time setup: it runs the system's Windows
-PowerShell on the checkout's own ``install-service.ps1``, so that script is as trustworthy as the
-directory it was installed into.
+A third elevated launch, :func:`install_service`, is one-time setup, and it is the exception: it
+runs the system's Windows PowerShell on ``install-service.ps1`` from the source checkout
+(:func:`install_script_path` finds it nowhere else), so it does elevate a script that whoever can
+write that checkout can change.
 
 **Every** program these hand to the OS is an absolute system-directory path, resolved by
 :func:`messagefoundry.service_status._system_exe`, whose docstring is the one place that explains
@@ -104,9 +105,10 @@ def _elevated_cmd_params(action: str, name: str) -> str:
 # into an ELEVATED PowerShell command line (ShellExecuteW "runas"). It also becomes a filename segment
 # (environments/<name>.toml), so constrain it to the same token charset the engine validates
 # ([ai].environment) and reject anything else — an unsafe value could break out of the quoted arg and
-# run as admin (cf. the service-name guard above). Matched whole, with `fullmatch`: `$` with `.match`
-# also accepted a trailing line feed (BACKLOG #1680).
-_SAFE_ENV_NAME = re.compile(r"[A-Za-z0-9._-]+")
+# run as admin (cf. service_status.is_safe_service_name). Matched whole, with `fullmatch` and `\z`:
+# `$` with `.match` also accepted a trailing line feed (BACKLOG #1680). install-service.ps1 checks
+# -Environment against this same text, case-sensitively.
+_SAFE_ENV_NAME = re.compile(r"^[A-Za-z0-9._-]+\z")
 
 
 def is_safe_environment(name: str) -> bool:

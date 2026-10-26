@@ -87,6 +87,8 @@ def test_is_safe_service_name() -> None:
     # Matched whole: `$` with `.match` also accepted a name ending in a line feed (BACKLOG #1680).
     for bad in ("MessageFoundry\n", "MessageFoundry\r\n", "MessageFoundry\nx"):
         assert not service_status.is_safe_service_name(bad), repr(bad)
+    # A non-str from an untyped caller is refused, not raised: query_service_state never raises.
+    assert not service_status.is_safe_service_name(None)  # type: ignore[arg-type]
 
 
 def test_parse_service_state() -> None:

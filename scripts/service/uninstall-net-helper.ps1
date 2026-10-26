@@ -44,7 +44,7 @@ param(
     # The two literals cannot be collapsed into one: a PowerShell attribute argument must be a
     # compile-time constant, so `[ValidatePattern($pattern)]` is a parse error. They are pinned to
     # the Python definition by tests/test_net_helper_install_scripts.py instead.
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z')][string]$ServiceName = "MessageFoundryNetHelper",
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundryNetHelper",
     # Where install-net-helper.ps1 put the files. Read for mefor-net-helper.conf, which is the only
     # record on the node of which address the helper was scoped to.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",

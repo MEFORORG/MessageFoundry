@@ -99,7 +99,9 @@ _NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def is_safe_service_name(name: str) -> bool:
     """True iff ``name`` is a non-empty, plain Windows service name (no shell metacharacters)."""
-    return _SAFE_SERVICE_NAME.fullmatch(name) is not None
+    # The isinstance keeps the documented never-raises contract of query_service_state for an
+    # untyped caller: fullmatch raises TypeError on None.
+    return isinstance(name, str) and _SAFE_SERVICE_NAME.fullmatch(name) is not None
 
 
 # `sc query` prints one field per line, and the run state is the STATE field, whose value is the

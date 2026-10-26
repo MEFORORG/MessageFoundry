@@ -24,7 +24,10 @@ param(
     # administrator, and the SCM starts it as the service account. Not under -DataDir, where the
     # engine's own account has modify rights.
     [string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm",
-    [string]$ServiceName = "MessageFoundry",
+    # messagefoundry/service_status.py's _SAFE_SERVICE_NAME, the one service-name guard, so this
+    # installer cannot register a name the tray, the CLI and the net-helper scripts then refuse.
+    # Pinned by tests/test_net_helper_install_scripts.py (BACKLOG #1680).
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundry",
     # The engine's console-script launcher, e.g. <venv>\Scripts\messagefoundry.exe. It names the
     # INSTALL the service runs from. The service does not run it: it runs the Python interpreter of
     # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
@@ -1279,8 +1282,10 @@ if (-not $Environment) {
     throw ("specify the active environment with -Environment <name> (e.g. -Environment prod). It " +
         "selects environments/<name>.toml and the instance's PHI posture (ADR 0017).")
 }
-# `\z`, not `$`: `$` also matches before a trailing line feed (BACKLOG #1680).
-if ($Environment -notmatch '^[A-Za-z0-9._-]+\z') {
+# `\z`, not `$`, which also matches before a trailing line feed, and case-sensitive, because a
+# case-insensitive [A-Za-z] also matches the Kelvin sign. The text is messagefoundry/service.py's
+# _SAFE_ENV_NAME, pinned by tests/test_service_control.py (BACKLOG #1680).
+if ($Environment -cnotmatch '^[A-Za-z0-9._-]+\z') {
     throw ("invalid -Environment '$Environment': use letters, digits, '.', '_' or '-' (it selects " +
         "environments/<name>.toml).")
 }

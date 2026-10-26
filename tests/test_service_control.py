@@ -172,9 +172,10 @@ def test_installer_keeps_restart_and_throttle_guardrails() -> None:
 #
 # service.py's own elevated-dispatch guards (the service-name / environment metacharacter rejections)
 # and the exact ShellExecuteW argument construction had no coverage: test_service_cli mocks
-# control_service / install_service wholesale so the real ShellExecuteW line is never reached, and
-# test_service_status covers a *different* module's is_safe_service_name. These fill that gap without a
-# real elevation (ShellExecuteW is monkeypatched) or a real installed service.
+# control_service / install_service wholesale so the real ShellExecuteW line is never reached.
+# test_service_status covers the guard itself, service_status.is_safe_service_name, which service.py
+# imports (BACKLOG #1680). These fill that gap without a real elevation (ShellExecuteW is
+# monkeypatched) or a real installed service.
 
 
 def _recorded_dispatch(monkeypatch: pytest.MonkeyPatch) -> _ShellExecRecorder:
@@ -324,7 +325,27 @@ def test_control_service_rejects_unsafe_names(bad: str) -> None:
 
 # BACKLOG #1680: names the one guard refuses by their first character or by a trailing line feed,
 # which `$` with `.match` used to admit. control_service_ex's are in test_service_control_outcome.
-_EDGE_NAMES = [" MyEngine", ".MyEngine", "-MyEngine", "MyEngine\n", "My Engine\n", "MyEngine\r\n"]
+_EDGE_NAMES = [
+    " MyEngine",
+    ".MyEngine",
+    "-MyEngine",
+    "_MyEngine",
+    "MyEngine\n",
+    "My Engine\n",
+    "MyEngine\r\n",
+]
+
+
+def test_installer_checks_the_environment_with_the_python_text() -> None:
+    """install-service.ps1's -Environment check is service.py's pattern, case-sensitive.
+
+    Case-sensitive because a case-insensitive [A-Za-z] in .NET also matches the Kelvin sign, and
+    the same text because a `$` there would admit a trailing line feed the Python guard refuses."""
+    script = install_script_path()
+    assert script is not None
+    text = script.read_text(encoding="utf-8")
+    line = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
+    assert line in text, line
 
 
 def test_service_uses_the_one_guard_from_service_status() -> None:
