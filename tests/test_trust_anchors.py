@@ -3006,6 +3006,7 @@ async def test_a_start_at_warn_logs_the_pins_warning_once(
     reload after it, which warns again. Red under: the preflight ignoring the open's warning."""
     import logging
 
+    from messagefoundry import pki
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import check_pinned_certificate
 
@@ -3033,3 +3034,10 @@ async def test_a_start_at_warn_logs_the_pins_warning_once(
         assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
         await run_anchor_preflight(specs, store, enforcing=False)  # a reload
         assert warnings_logged() == 2
+        # The control that can differ: a file swapped between the open and the preflight is a
+        # different verdict, so the preflight warns about it too. Red under: matching on the
+        # label alone, without the verdict.
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))
+        pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+        await run_anchor_preflight(specs, store, enforcing=False)
+        assert warnings_logged() == 4

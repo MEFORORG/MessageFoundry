@@ -138,11 +138,12 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     and no fingerprint pin. A changed file is used by the next connect and audited by the next
     reload, which writes ``changed`` and no ``restart_required``.
 
-    **A reload re-checks the ACL, the path and the change only**, items 1 to 4. The store's own
-    content checks run at the next store open, not at a reload: at least that the file is one
-    server certificate, that it is inside its validity period, and the encryption-header refusal
-    (BACKLOG #3090). So a reload can pass a swapped file the next store open refuses, while the
-    driver reads it at its next connect. At ``warn`` the start logs the pin's warning once: the
+    **A reload runs the anchor checks and none of the store's content checks.** It checks the
+    ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
+    cannot read. The store's own content checks run at the next store open, not at a reload: at
+    least that the file is one server certificate, that it is inside its validity period, and
+    the encryption-header refusal (BACKLOG #3090). So a reload can pass a swapped file the next
+    store open refuses, and the driver reads that file at its next connect. At ``warn`` the start logs the pin's warning once: the
     preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
     **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
@@ -1158,7 +1159,8 @@ def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
     (every verdict it passes with a warning has an ACL or path that is not plainly fine)."""
     if verdict.acl_ok is True and verdict.path_ok is True:
         return None
-    return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok)
+    path_findings = tuple((f.path, f.reason) for f in _findings(verdict, insecure=True))
+    return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok, path_findings)
 
 
 #: The open-time warnings the settings preflight need not repeat (vault BACKLOG #3714). The SQL
