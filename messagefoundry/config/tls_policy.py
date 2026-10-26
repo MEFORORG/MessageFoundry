@@ -51,7 +51,7 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -799,14 +799,16 @@ def crl_not_in_effect(
 ) -> CrlBlock | None:
     """The CRL that decides when every issuer in ``blocks`` has one in effect, or ``None`` when each
     does at ``now``. For each issuer with none in effect, its earliest CRL counts; of those, the
-    latest decides, since the file is whole only once that one takes effect."""
-    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now, skew=skew)}
-    earliest: dict[str, CrlBlock] = {}
+    latest decides, since the file is whole only once that one takes effect. An issuer is its
+    ``issuer_key``, as OpenSSL compares names (vault BACKLOG #3755)."""
+    in_effect = {block.issuer_key for block in blocks if crl_in_effect(block, now=now, skew=skew)}
+    earliest: dict[Hashable, CrlBlock] = {}
     for block in blocks:
-        if block.issuer in in_effect:
+        key = block.issuer_key
+        if key in in_effect:
             continue
-        if block.issuer not in earliest or block.this_update < earliest[block.issuer].this_update:
-            earliest[block.issuer] = block
+        if key not in earliest or block.this_update < earliest[key].this_update:
+            earliest[key] = block
     return max(earliest.values(), key=lambda block: block.this_update, default=None)
 
 

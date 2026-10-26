@@ -291,9 +291,17 @@ class CrlBlock:
     does not handle. Among equal scores it takes the latest ``thisUpdate``. So ``selection`` holds
     the scope, the key identifier and the critical extension OIDs, and two CRLs score alike only when
     those match. ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised
-    however its PEM is wrapped."""
+    however its PEM is wrapped.
+
+    ``issuer`` is the name as text, for a message. ``issuer_key`` is the same name as
+    :func:`_issuer_name_key` compares it, with ASCII letter case folded as OpenSSL folds it, so
+    every grouping by issuer uses it (vault BACKLOG #3755). Grouped by the text, a replacement CRL
+    whose issuer differed only in ASCII case was refused as superseding nothing, while OpenSSL
+    takes it for the same issuer. It has no default, so no block can group by a key nobody
+    computed."""
 
     issuer: str
+    issuer_key: _NameKey
     this_update: datetime.datetime
     next_update: datetime.datetime
     fingerprint: bytes
@@ -357,6 +365,7 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
                     _crl_facts(crl, nxt, now),
                     CrlBlock(
                         issuer=crl.issuer.rfc4514_string(),
+                        issuer_key=_issuer_name_key(crl.issuer),
                         this_update=crl.last_update_utc,
                         next_update=nxt,
                         fingerprint=crl.fingerprint(hashes.SHA256()),

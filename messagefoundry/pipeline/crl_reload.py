@@ -105,7 +105,7 @@ import os
 import ssl
 import threading
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
@@ -299,10 +299,11 @@ def _first_lapse(held: Sequence[CrlBlock]) -> CrlBlock | None:
     OpenSSL scores CRLs per issuer and per ``selection`` (scope and signing key), and among equals
     uses the latest ``thisUpdate``. So each such group lapses with its latest CRL. An older CRL in
     the group that lapses sooner changes nothing, and one that lapses later would only stand in
-    without the newer revocations. The soonest of those latest CRLs decides."""
-    latest: dict[tuple[str, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock] = {}
+    without the newer revocations. The soonest of those latest CRLs decides. An issuer is its
+    ``issuer_key``, as OpenSSL compares names (vault BACKLOG #3755)."""
+    latest: dict[tuple[Hashable, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock] = {}
     for block in held:
-        group = (block.issuer, block.selection)
+        group = (block.issuer_key, block.selection)
         if group not in latest or block.this_update > latest[group].this_update:
             latest[group] = block
     return min(latest.values(), key=lambda block: block.next_update, default=None)
@@ -358,11 +359,12 @@ def supersede_refusal(
 
 
 def _successors(old: CrlBlock, new: Sequence[CrlBlock]) -> list[CrlBlock]:
-    """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect."""
+    """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect. The issuers
+    match by ``issuer_key``, so a change of ASCII letter case alone still supersedes."""
     return [
         block
         for block in new
-        if block.issuer == old.issuer
+        if block.issuer_key == old.issuer_key
         and block.selection == old.selection
         and block.this_update > old.this_update
         and block.next_update >= old.next_update

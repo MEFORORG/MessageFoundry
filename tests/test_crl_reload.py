@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import functools
 import gc
 import logging
 import re
@@ -60,7 +61,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
 )
 from messagefoundry.pipeline import crl_reload
-from messagefoundry.pipeline.cert_expiry import MonitoredCert
+from messagefoundry.pipeline.cert_expiry import MonitoredCert, _ca_file_crl_refusal
 from messagefoundry.pipeline.crl_reload import (
     BAD_SIGNATURE,
     FIX,
@@ -113,11 +114,12 @@ class _Pki:
         scope: bool = False,
         signer: ec.EllipticCurvePrivateKey | None = None,
         aki: x509.AuthorityKeyIdentifier | None = None,
+        issuer: x509.Name | None = None,
     ) -> bytes:
         """A CRL issued ``issued`` ago (negative is in the future) that runs ``lasts`` from now."""
         builder = (
             x509.CertificateRevocationListBuilder()
-            .issuer_name(self.name)
+            .issuer_name(issuer or self.name)
             .last_update(_NOW - issued)
             .next_update(_NOW + lasts)
             .add_extension(aki or self.aki, False)
@@ -494,8 +496,28 @@ def test_a_refusal_clears_once_the_file_is_fixed(pki: _Pki) -> None:
 # --- the superseding rule, alone --------------------------------------------------------------------
 
 
+@functools.cache
+def _judged(issuer: str) -> CrlBlock:
+    """The block :func:`judge_every_crl` makes of a CRL from ``issuer`` with no extensions, so a
+    test block groups by the issuer key the engine computes, not one this file guesses."""
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(x509.Name.from_rfc4514_string(issuer))
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + _DAY)
+        .sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+    )
+    ((_, block),) = judge_every_crl(crl.public_bytes(serialization.Encoding.PEM), now=time.time())
+    return block
+
+
 def _block(issuer: str, issued_days_ago: float, lasts_days: float, tag: bytes) -> CrlBlock:
-    return CrlBlock(issuer, _NOW - issued_days_ago * _DAY, _NOW + lasts_days * _DAY, tag)
+    return replace(
+        _judged(issuer),
+        this_update=_NOW - issued_days_ago * _DAY,
+        next_update=_NOW + lasts_days * _DAY,
+        fingerprint=tag,
+    )
 
 
 def test_the_superseding_rule() -> None:
@@ -520,6 +542,49 @@ def test_the_superseding_rule() -> None:
     # Not in effect until after the held copy lapses: waiting leaves a gap, so the file must change.
     late = supersede_refusal(held, [_block("CN=a", -7, 30, b"new")], now=now)
     assert late is not None and late[1] == LAPSES_FIRST
+
+
+# Vault BACKLOG #3755. OpenSSL takes two issuer names that differ only in the case of ASCII letters
+# for one issuer, and no other case change (``_issuer_name_key`` in ``pki.py`` says why).
+_ASCII_CASE = ("CN=Partner CA", "CN=PARTNER CA")
+_ISSUER_PAIRS = [
+    pytest.param(*_ASCII_CASE, True, id="ascii-case"),
+    pytest.param("CN=\u00e9tude CA", "CN=\u00c9tude CA", False, id="non-ascii-case"),
+    pytest.param("CN=Partner CA", "CN=Partner CB", False, id="other-name"),
+]
+
+
+@pytest.mark.parametrize(("held", "issuer", "same"), _ISSUER_PAIRS)
+def test_a_replacement_supersedes_only_from_the_same_issuer(
+    held: str, issuer: str, same: bool
+) -> None:
+    now = _NOW.timestamp()
+    verdict = supersede_refusal(
+        [_block(held, 2, 5, b"old")], [_block(issuer, 1, 30, b"new")], now=now
+    )
+    refused = verdict is not None and verdict[1] == RESTART
+    assert (verdict is None) if same else refused, verdict
+
+
+@pytest.mark.parametrize(("current", "future", "same"), _ISSUER_PAIRS)
+def test_a_current_crl_covers_a_future_one_only_from_the_same_issuer(
+    current: str, future: str, same: bool
+) -> None:
+    now = _NOW.timestamp()
+    later = _block(future, -1, 30, b"later")
+    unmet = crl_not_in_effect([_block(current, 1, 30, b"now"), later], now=now)
+    assert unmet == (None if same else later)
+
+
+def test_a_lapse_is_judged_across_an_ascii_case_change() -> None:
+    # The hop holds an older CRL lapsing in 2 days and a newer one, from the same issuer spelled in
+    # other ASCII case, lapsing in 30. OpenSSL uses the newer one, so a successor in effect in 5
+    # days is a plain wait, not a file that lapses first.
+    now = _NOW.timestamp()
+    lower, upper = _ASCII_CASE
+    held = [_block(lower, 3, 2, b"older"), _block(upper, 2, 30, b"newer")]
+    verdict = supersede_refusal(held, [_block(upper, -5, 60, b"next")], now=now)
+    assert verdict is not None and verdict[1] == WAIT, verdict
 
 
 def test_judge_every_crl_names_each_block(pki: _Pki) -> None:
@@ -664,6 +729,59 @@ def test_a_start_accepts_a_future_crl_beside_a_current_one(pki: _Pki) -> None:
     # OpenSSL prefers the CRL in effect, so the future one beside it is harmless until it starts.
     pki.crl.write_bytes(pki.crl.read_bytes() + pki.crl_pem(issued=-_DAY, lasts=60 * _DAY))
     assert _accepts(pki.outbound_hop(), pki.server())
+
+
+def _in_other_case(pki: _Pki) -> x509.Name:
+    """The CA's own name with its ASCII letters upper-cased, which OpenSSL takes for that CA."""
+    (cn,) = pki.name.get_attributes_for_oid(NameOID.COMMON_NAME)
+    assert isinstance(cn.value, str) and cn.value != cn.value.upper()
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn.value.upper())])
+
+
+_OTHER_CA = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3755-other-ca")])
+
+
+def test_a_start_accepts_a_future_crl_beside_a_current_one_in_other_ascii_case(pki: _Pki) -> None:
+    """Vault BACKLOG #3755: one issuer to OpenSSL, so the current CRL covers it. Red before the
+    fix, which grouped by the exact issuer text and refused the start with CrlNotInEffect."""
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
+    pki.crl.write_bytes(pki.crl.read_bytes() + future)
+    assert _accepts(pki.outbound_hop(), pki.server())
+
+
+def test_control_a_start_refuses_a_future_crl_beside_one_from_another_name(pki: _Pki) -> None:
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
+    pki.crl.write_bytes(pki.crl.read_bytes() + future)
+    with pytest.raises(CrlNotInEffect, match="mefor-3755-other-ca"):
+        pki.outbound_hop()
+
+
+def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(pki: _Pki) -> None:
+    """Vault BACKLOG #3755: the replacement supersedes, with no restart, and the SAME context then
+    refuses the revoked peer, so OpenSSL took it for the held CRL's issuer too. Red before the fix,
+    which refused it RESTART."""
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(
+        pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=_in_other_case(pki))
+    )
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None), outcome
+    assert not _accepts(hop, pki.server())
+
+
+def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
+    pki: _Pki,
+) -> None:
+    """The expiry monitor's caller of ``crl_not_in_effect`` (BACKLOG #3176) groups the same way,
+    so a restart into this CA file is not refused. The control is a future CRL from another name."""
+    current = pki.crl.read_bytes()
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
+    assert _ca_file_crl_refusal(pki.ca_pem + current + future, time.time(), None) is None
+    stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
+    refusal = _ca_file_crl_refusal(pki.ca_pem + current + stray, time.time(), None)
+    assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
 
 def test_a_crl_whose_akid_names_the_ca_by_issuer_and_serial_does_not_supersede(pki: _Pki) -> None:
