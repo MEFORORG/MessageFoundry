@@ -129,8 +129,18 @@ class AiBroker:
                 "engine-brokered AI requires an '[ai].endpoint' (the customer-managed LLM's URL)"
             )
         scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise AiBrokerError(f"[ai].endpoint must be http or https, got scheme {scheme!r}")
+        # The api_key is a credential, and every call sends it (an empty key is refused below), so a
+        # cleartext http endpoint is refused with no escape and in every posture: vault BACKLOG #3533
+        # item 5, which applies docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+        # unverified peer*. The insecure-TLS escape released it at warn until then. Refused first,
+        # so an http endpoint is never sent to fix an allowlist entry it cannot use.
+        if scheme == "http":
+            raise AiBrokerError(
+                "[ai].endpoint over cleartext http would send the api_key in clear; refused, with "
+                "no escape. Use an https endpoint."
+            )
+        if scheme != "https":
+            raise AiBrokerError(f"[ai].endpoint must be https, got scheme {scheme!r}")
         refuse_url_credentials(endpoint, "[ai].endpoint", use="[ai].api_key", error=AiBrokerError)
         if not api_key:
             raise AiBrokerError(
@@ -144,15 +154,6 @@ class AiBroker:
             raise AiBrokerError(
                 f"[ai].endpoint host {host!r} is not in the [ai].allowed_endpoints allowlist; "
                 "list it explicitly to permit engine-brokered AI egress (SSRF fail-closed)"
-            )
-        # The api_key is a credential, and every call sends it (an empty key is refused above), so a
-        # cleartext http endpoint is refused with no escape and in every posture: vault BACKLOG #3533
-        # item 5, which applies docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
-        # unverified peer*. The insecure-TLS escape released it at warn until then.
-        if scheme == "http":
-            raise AiBrokerError(
-                "[ai].endpoint over cleartext http would send the api_key in clear; refused, with "
-                "no escape. Use an https endpoint."
             )
         # ASVS 4.2.5. Both values are operator-supplied via env() and both ship on every provider call
         # -- the endpoint as the request line, the key as the ``x-api-key`` header. Bounded here rather
@@ -188,7 +189,7 @@ class AiBroker:
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode("utf-8")
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to https in __init__
             self.endpoint,
             data=data,
             headers={

@@ -133,6 +133,15 @@ def test_broker_refuses_cleartext_http_endpoint(
     assert "synthetic-ai-key" not in message
 
 
+def test_broker_refuses_http_before_the_allowlist_and_other_schemes_as_not_https() -> None:
+    # http is refused before the SSRF allowlist check, so an operator is never sent to list a host
+    # whose http endpoint is refused anyway. Any other non-https scheme says https is required.
+    with pytest.raises(AiBrokerError, match="cleartext http"):
+        AiBroker(endpoint="http://ai.internal/v1/messages", api_key="k", allowed_endpoints=[])
+    with pytest.raises(AiBrokerError, match="must be https, got scheme 'ftp'"):
+        AiBroker(endpoint="ftp://ai.internal/x", api_key="k", allowed_endpoints=["ai.internal"])
+
+
 def test_broker_requires_endpoint_and_key() -> None:
     with pytest.raises(AiBrokerError, match="endpoint"):
         AiBroker(endpoint="", api_key="k", allowed_endpoints=["ai.internal"])

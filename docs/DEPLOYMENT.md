@@ -724,7 +724,8 @@ Each bullet below releases a hop with no credential, unless it says otherwise.
 With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
 loud warning):
 
-- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped.)*
+- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped. A static header off the verify-off
+  allowlist refuses the hop in every case, as a credential does.)*
 - MLLP outbound `tls_verify = false`; FTPS `tls_verify = false`. *(Clamped.)*
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
   `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped. These carry the

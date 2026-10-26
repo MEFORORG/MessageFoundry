@@ -1069,6 +1069,10 @@ VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
     {"accept", "content-type", "user-agent", "x-request-id"}
 )
 
+#: How :func:`http_credentials_sent` labels a header refused only for its name, so the refusal in
+#: :func:`refuse_verify_off` can also offer removing it. Such a header need not be a credential.
+_OFF_ALLOWLIST = "which is not on the verify-off header allowlist"
+
 
 def http_credentials_sent(
     ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
@@ -1103,7 +1107,7 @@ def http_credentials_sent(
             if _is_secret_header(key, value):
                 sent.append(f"{name} header")
             elif key.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
-                sent.append(f"{name} header, which is not on the verify-off header allowlist")
+                sent.append(f"{name} header, {_OFF_ALLOWLIST}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
@@ -1145,7 +1149,9 @@ def refuse_verify_off(
     0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening.
 
     **A hop that sends ``credentials`` is refused first, and nothing lifts that** (vault BACKLOG
-    #3230): not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
+    #3230). Since vault BACKLOG #3533 the list also names each static header off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, which need not be a credential. Nothing lifts it:
+    not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
     argument is required, so no caller can skip the question; pass :func:`http_credentials_sent`.
     The rule is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
     unverified peer*. It runs before the escape check, so a credentialed hop is never told to set an
@@ -1156,12 +1162,17 @@ def refuse_verify_off(
     if scheme != "https":
         return None
     if credentials:
+        unlisted = (
+            " Or remove each static header named as not on the allowlist."
+            if any(c.endswith(_OFF_ALLOWLIST) for c in credentials)
+            else ""
+        )
         raise ValueError(
             f"{hop_name_prefix(connection)}{connector} would send its credentials "
             f"({', '.join(credentials)}) to a peer whose certificate it does not verify "
             "(verify_tls=false); refused, with no escape. Leave verify_tls on (the default). For a "
             "server whose certificate comes from a private or self-signed CA, pin that CA with "
-            "tls_ca_file."
+            f"tls_ca_file.{unlisted}"
         )
     cell = f"{connector} verify_tls=false"
     host = _hop_guard_host(url, cell=cell)

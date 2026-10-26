@@ -44,11 +44,14 @@ statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, except SFTP: the host key is known only once the server answers, so that
-refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+or starts the service, with two exceptions. SFTP: the host key is known only once the server
+answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
+builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
+names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+the `[auth]` setting for the AD bind, and offers only settings that do fix it. A verify-off refusal
+of a header off the allowlist also offers removing that header. `Email` and `Direct`
 check the credential before the cleartext and verify-off checks, so a credentialed hop is never
 pointed at one of those levers.
 
@@ -88,6 +91,9 @@ engine has not verified, when the lever named beside each is set:
   cannot be told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
   that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
+- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
+  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
+  knows only auth-scheme prefixes and JWTs;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;

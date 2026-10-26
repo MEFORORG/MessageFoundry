@@ -433,7 +433,43 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw(cell, extra)
     assert "X-Session header, which is not on the verify-off header allowlist" in str(exc.value)
+    assert "remove each static header named as not on the allowlist" in str(exc.value)
     _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_an_unlisted_static_header_is_refused_on_an_attested_or_loopback_hop_too(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allowlist rides the credential arm, so the two levers that ALLOW a credential-less
+    verify-off hop on production leave this one refused, as for a credential."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    extra = {"verify_tls": False, "headers": {"X-Trace": "t1"}}
+    with active_hop_posture(_PROD):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, attested=True)
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, url="https://127.0.0.1:8443/x")
+
+
+def test_a_fhir_lookup_unlisted_static_header_over_verify_off_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    lookup = {"url": "https://fhir.example.org/fhir", "verify_tls": False}
+    with active_hop_posture(_STAGING):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+            FhirLookupExecutor(
+                {"L": {**lookup, "headers": {"X-Session": _SECRET}}},
+                egress=EgressSettings(deny_by_default=False),
+            )
+        assert "X-Session header" in str(exc.value) and _SECRET not in str(exc.value)
+        # The control arm: an allowlisted header still crosses on the escape.
+        ex = FhirLookupExecutor(
+            {"L": {**lookup, "headers": {"Accept": "application/fhir+json"}}},
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert ex.connections == frozenset({"L"})
 
 
 @pytest.mark.parametrize("cell", _CELLS)
@@ -461,7 +497,7 @@ def test_a_credential_value_under_an_allowlisted_name_is_still_refused(
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw("REST", extra)
     assert "User-Agent header" in str(exc.value)
-    assert "allowlist" not in str(exc.value)
+    assert "allowlist" not in str(exc.value)  # labelled a credential, and not told to remove it
     _assert_credential_refusal(exc)
 
 
