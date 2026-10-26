@@ -41,7 +41,8 @@ param(
     # this script - refused at parameter binding, before it can say why. This read "^[A-Za-z0-9._-]+$"
     # until BACKLOG #1523's third review round, and that was the defect.
     #
-    # The two literals cannot be collapsed into one: a PowerShell attribute argument must be a
+    # The literal copies (here, twice in install-net-helper.ps1, and install-service.ps1's
+    # -ServiceName) cannot be collapsed into one: a PowerShell attribute argument must be a
     # compile-time constant, so `[ValidatePattern($pattern)]` is a parse error. They are pinned to
     # the Python definition by tests/test_net_helper_install_scripts.py instead.
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundryNetHelper",

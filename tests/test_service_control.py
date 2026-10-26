@@ -340,12 +340,42 @@ def test_installer_checks_the_environment_with_the_python_text() -> None:
     """install-service.ps1's -Environment check is service.py's pattern, case-sensitive.
 
     Case-sensitive because a case-insensitive [A-Za-z] in .NET also matches the Kelvin sign, and
-    the same text because a `$` there would admit a trailing line feed the Python guard refuses."""
-    script = install_script_path()
-    assert script is not None
-    text = script.read_text(encoding="utf-8")
-    line = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
-    assert line in text, line
+    the same text because a `$` there would admit a trailing line feed the Python guard refuses.
+
+    Matched as a whole live line, not a substring, so a commented-out check fails, and it must come
+    before the first line that writes ``--env $Environment`` into the service's parameters."""
+    lines = [ln.strip() for ln in _install_script_text().splitlines()]
+    expected = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
+    checks = [i for i, ln in enumerate(lines) if ln == expected]
+    assert len(checks) == 1, f"expected exactly one live line {expected!r}, found {len(checks)}"
+    # Any other live -Environment pattern test would be a second, unpinned copy.
+    others = [
+        ln
+        for ln in lines
+        if ln.startswith("if ($Environment -") and "match" in ln and ln != expected
+    ]
+    assert others == [], others
+    uses = [
+        i for i, ln in enumerate(lines) if "--env $Environment" in ln and not ln.startswith("#")
+    ]
+    assert uses, "CONTROL FAILED: no line writes --env $Environment; re-aim this guard"
+    assert checks[0] < uses[0], "the -Environment check must run before --env is written"
+
+
+def test_environment_guard_matches_the_engine_charset() -> None:
+    """service.py's environment pattern and settings' allowed set are one character set.
+
+    settings cannot import service.py (it would pull ctypes into config), so the two are pinned
+    here instead. Every BMP code point is asked, so a case-folding look-alike such as the Kelvin
+    sign, or a character added to one side only, fails (BACKLOG #1680)."""
+    from messagefoundry.config.settings import _ENV_NAME_ALLOWED
+
+    differ = [
+        hex(cp)
+        for cp in range(0x10000)
+        if is_safe_environment(chr(cp)) != (chr(cp) in _ENV_NAME_ALLOWED)
+    ]
+    assert differ == []
 
 
 def test_service_uses_the_one_guard_from_service_status() -> None:
@@ -443,10 +473,17 @@ def test_is_safe_environment_accepts_valid(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b", "dev\n", "dev\r\n"]
+    "name",
+    ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b", "dev\n", "dev\r\n", None],
 )
 def test_is_safe_environment_rejects_invalid(name: str) -> None:
     assert is_safe_environment(name) is False
+
+
+def test_install_service_refuses_a_non_str_environment_with_value_error() -> None:
+    """An untyped caller gets the documented ValueError, which the CLI turns into exit 2."""
+    with pytest.raises(ValueError, match="unsafe environment name"):
+        install_service("script.ps1", None, config=_CFG)  # type: ignore[arg-type]
 
 
 def test_cli_start_unsafe_name_exits_2(

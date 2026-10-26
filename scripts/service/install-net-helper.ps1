@@ -48,7 +48,7 @@ param(
     # script refuses a binary that does not match, before it stops a running helper and again after
     # the copy, because it starts that binary as LocalSystem. REQUIRED, with no default: this
     # repository cannot pin a binary that each release and each machine builds for itself.
-    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$HelperSha256,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}\z')][string]$HelperSha256,
     # Administrator-only by default, and the README explains why it is not under ProgramData: the
     # engine's account has modify rights there, so it could replace the binary that runs as SYSTEM.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",

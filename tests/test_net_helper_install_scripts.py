@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Static guards on the two mefor-net-helper service scripts (BACKLOG #1523, ADR 0056).
+"""Static guards on the two mefor-net-helper service scripts (BACKLOG #1523, ADR 0056), and on the
+service-name parameter they share with install-service.ps1 (BACKLOG #1680).
 
 NOTHING IN CI RUNS THESE SCRIPTS. They need an elevated Windows session, a published helper binary
 and an nssm.exe, so the first thing that reads them end to end is an operator on a cluster node. That
@@ -247,8 +248,8 @@ def test_the_uninstaller_releases_the_address_only_when_asked(
     )
 
 
-def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object]) -> None:
-    """Whatever the installer will accept as a service name, the uninstaller must accept too.
+def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]) -> None:
+    """Whatever one script accepts as a service name, the others must accept too.
 
     ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and literal copies
     of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680),
