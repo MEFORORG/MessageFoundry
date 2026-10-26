@@ -372,10 +372,11 @@ and the builders, and a test checks that each module named calls each builder na
 - The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
-- The two `openssl` starts in `verify/cipher_policy.py`, `openssl ciphers` and
-  `openssl version -d`, get the platform's start-up names and the variables OpenSSL reads to find
-  its configuration file, `OPENSSL_CONF` and `OPENSSL_CONF_INCLUDE`, and the provider modules and
-  engines it loads, `OPENSSL_MODULES` and `OPENSSL_ENGINES` (`system_tool_environment`). No other
+- The two `openssl` starts in `verify/cipher_policy.py` are `openssl ciphers` and
+  `openssl version -d`. They get the platform's start-up names (`system_tool_environment`). They
+  also get the variables OpenSSL reads to find its configuration file, `OPENSSL_CONF` and
+  `OPENSSL_CONF_INCLUDE`, and the provider modules and engines it loads, `OPENSSL_MODULES` and
+  `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
 - The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the

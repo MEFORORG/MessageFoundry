@@ -38,7 +38,6 @@ from pathlib import Path
 from messagefoundry.childenv import system_tool_environment
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _NO_WINDOW, _system_exe
-from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.verify.model import CheckResult, Status
 
 RID = "host.ciphers"
@@ -126,10 +125,15 @@ _JUDGED_KEYS = frozenset({"CipherString", "MinProtocol"})
 #: ``\s`` and ``str.strip`` take more, such as a no-break space, which OpenSSL keeps in a value and
 #: refuses in a name (measured on OpenSSL 3.5.7, BACKLOG #3803 T5).
 _WS = " \t\r"
-#: A name, or one word of a section name, as OpenSSL reads it: letters, digits, the punctuation
-#: below, and a backslash with the character it escapes. Measured on OpenSSL 3.5.7, one other
-#: character in a name or a section name, in any section, made it apply none of the file.
-_NAME = r"(?:[A-Za-z0-9_!%&*+,\-./;?@^|~]|\\.)+"
+#: A name, or one word of a section name, as OpenSSL reads it: letters, digits and the punctuation
+#: below. Measured on OpenSSL 3.5.7, one other character in a name or a section name, in any
+#: section, made it apply none of the file. A backslash, which OpenSSL reads as an escape, is
+#: refused before this is matched (:func:`_config_sections`).
+_NAME = r"[A-Za-z0-9_!%&*+,\-./;?@^|~]+"
+#: What follows a ``$`` in a value: ``name``, ``section::name``, or either in braces or brackets.
+_REFERENCE = re.compile(r"([{(]?)([A-Za-z0-9_]*)(?:::([A-Za-z0-9_]*))?")
+#: The quote characters of OpenSSL's default character table; the backtick is one (measured).
+_QUOTES = "\"'`"
 _SECTION_HEADER = re.compile(rf"\[[{_WS}]*((?:{_NAME}(?:[{_WS}]+{_NAME})*)?)[{_WS}]*\]")
 _ASSIGNMENT = re.compile(rf"({_NAME}(?:::{_NAME})?)[{_WS}]*=(.*)")
 #: OpenSSL reads a name that starts with ``.include`` as that directive, so ``.include_x path``
@@ -361,32 +365,52 @@ def _openssl_default_file() -> Path:
 def _config_value(raw: str) -> str:
     """An OpenSSL configuration value as the library reads it.
 
-    A quote, single or double, is removed, and a ``#`` or a space inside one is kept. A backslash
-    keeps the next character as it is. A ``#`` outside quotes starts a comment. Unquoted space at
-    the end is dropped, and only what OpenSSL takes as space (``_WS``): a no-break space stays in
-    the value, as OpenSSL keeps it. ``$name`` expansion is not done; :func:`_expanded_nowhere`
-    refuses it."""
-    out: list[str] = []
-    kept = 0  # out[:kept] ends with a quoted or escaped character, which no trim may drop
-    quote = ""
-    chars = iter(raw.strip(_WS))
-    for char in chars:
-        if char == "\\":
-            out.append(next(chars, ""))
-            kept = len(out)
-        elif quote:
+    A quote (``_QUOTES``) is removed, and a ``#`` or a space inside one is kept. A ``#`` outside
+    quotes starts a comment. Unquoted space at the end is dropped, and only what OpenSSL takes as
+    space (``_WS``). A backslash or a non-ASCII character, such as the no-break space OpenSSL keeps
+    in a value, never reaches here: :func:`_config_sections` refuses it. ``$name`` expansion is not
+    done;
+    :func:`_expanded_nowhere` refuses it in a value the verdict reads."""
+    pieces = list(_pieces(raw.strip(_WS)))
+    while pieces and not pieces[-1][1] and pieces[-1][0] in _WS:
+        pieces.pop()
+    return "".join(text for text, _ in pieces)
+
+
+def _pieces(raw: str) -> Iterator[tuple[str, bool]]:
+    """``(text, quoted)`` runs of ``raw`` with its quotes removed, up to a ``#`` outside quotes.
+    An unquoted character is a run of its own; an unclosed quote runs to the end."""
+    quote, run = "", ""
+    for char in raw:
+        if quote:
             if char == quote:
-                quote = ""
+                yield run, True
+                quote, run = "", ""
             else:
-                out.append(char)
-                kept = len(out)
-        elif char in "\"'":
+                run += char
+        elif char in _QUOTES:
             quote = char
         elif char == "#":
-            break
+            return
         else:
-            out.append(char)
-    return "".join(out[:kept]) + "".join(out[kept:]).rstrip(_WS)
+            yield char, False
+    if quote:
+        yield run, True
+
+
+def _references(raw: str) -> Iterator[tuple[str | None, str] | None]:
+    """Each ``$`` variable OpenSSL would expand in ``raw``, as ``(section or None, name)``, or
+    ``None`` for one it cannot read, such as an unclosed brace. A ``$`` inside quotes or a comment
+    is not expanded (measured on OpenSSL 3.5.7)."""
+    text = "".join(" " if quoted else piece for piece, quoted in _pieces(raw))
+    for start in (i for i, char in enumerate(text) if char == "$"):
+        found = _REFERENCE.match(text, start + 1)
+        assert found is not None  # every group is optional, so it always matches
+        opened, first, second = found.groups()
+        if opened and not text.startswith("}" if opened == "{" else ")", found.end()):
+            yield None
+        else:
+            yield (None, first) if second is None else (first, second)
 
 
 def _not_followed(construct: str) -> ProbeUnavailable:
@@ -404,37 +428,67 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     """Each section's ``name = value`` lines, in file order. Lines above the first header are in
     ``default``, which is where OpenSSL files them.
 
-    An ``.include`` or ``.pragma`` (any name that starts with either), a line continued with a
-    backslash or a ``section::name`` assignment raises :class:`ProbeUnavailable`, wherever it is
-    in the file: each can add to, or change how OpenSSL reads, the section this check reads, so a
-    reading taken without it could PASS on lines OpenSSL does not apply. These are the constructs
-    known here, not all of them. So does a line that is none of blank, comment, section header and
-    ``name = value`` as OpenSSL spells them, such as one indented with a no-break space: measured
-    on OpenSSL 3.5.7, one such line anywhere made it apply none of the file (BACKLOG #3803 T5)."""
+    An ``.include`` or ``.pragma`` (any name that starts with either), a ``section::name``
+    assignment, or a ``$ENV::`` variable raises :class:`ProbeUnavailable`, wherever it is in the
+    file: each can add to, or change how OpenSSL reads, the section this check reads, so a reading
+    taken without it could PASS on lines OpenSSL does not apply. These are the constructs known
+    here, not all of them.
+
+    So does a line OpenSSL may refuse, because measured on OpenSSL 3.5.7, one such line anywhere
+    made it apply none of the file (BACKLOG #3803 T5). That is a line that is none of blank,
+    comment, section header and ``name = value`` as OpenSSL spells them, and a ``$`` variable no
+    earlier line defines. A line holding a backslash, a NUL or a non-ASCII character is refused
+    too, rather than read: OpenSSL reads the file as bytes, and a backslash escapes or continues
+    what follows it."""
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
-    current = sections["default"]
-    # OpenSSL ends a line only at a newline; splitlines() would also break at a form feed and
-    # other separators, showing this reader a line OpenSSL never sees.
+    current_name, current = "default", sections["default"]
+    # OpenSSL ends a line only at a newline; splitlines() would also break at a form feed, a lone
+    # carriage return and other separators, showing this reader a line OpenSSL never sees.
     for number, line in enumerate(text.split("\n"), start=1):
         stripped = line.lstrip(_WS)
         if directive := _DIRECTIVE.match(stripped):
             raise _not_followed(directive[0])
-        if line.rstrip().endswith("\\"):
-            raise _not_followed("a line continued with a backslash")
+        if "\\" in line or "\0" in line or not line.isascii():
+            raise _not_followed(f"a backslash, a NUL or a non-ASCII character on line {number}")
         if not stripped or stripped.startswith("#"):
             continue
         if header := _SECTION_HEADER.match(stripped):
-            current = sections.setdefault(header[1], [])
+            current_name = header[1]
+            current = sections.setdefault(current_name, [])
         elif assignment := _ASSIGNMENT.fullmatch(stripped):
             if "::" in assignment[1]:
                 raise _not_followed("a section::name assignment")
+            for reference in _references(assignment[2]):
+                if not _defined(reference, sections, current_name):
+                    raise _refused(number)
             current.append((assignment[1], _config_value(assignment[2])))
         else:
-            raise ProbeUnavailable(
-                f"has line {number}, which this check cannot read as OpenSSL does; OpenSSL may "
-                "apply none of the file"
-            )
+            raise _refused(number)
     return sections
+
+
+def _refused(number: int) -> ProbeUnavailable:
+    return ProbeUnavailable(
+        f"has line {number}, which this check cannot read as OpenSSL does; OpenSSL may apply "
+        "none of the file"
+    )
+
+
+def _defined(
+    reference: tuple[str | None, str] | None,
+    sections: dict[str, list[tuple[str, str]]],
+    current: str,
+) -> bool:
+    """Whether OpenSSL can expand ``reference`` from the lines read so far: in the section it
+    names, else the current one, and failing that the default section, as OpenSSL looks it up. A
+    variable defined only on a later line is not (measured on OpenSSL 3.5.7)."""
+    if reference is None:
+        return False
+    section, name = reference
+    if section == "ENV":  # the environment the probe gets, which this reader does not model
+        raise _not_followed("a $ENV:: variable")
+    names = {line_name for line_name, _ in sections.get(section or current, [])}
+    return name in names or name in {line_name for line_name, _ in sections["default"]}
 
 
 def _system_default_section(sections: dict[str, list[tuple[str, str]]]) -> str | None:
@@ -481,18 +535,21 @@ def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
     ``OPENSSLDIR`` (:func:`_openssl_default_file`). Returns the file, the system-default section,
     and that section's policy lines; no section means the file sets no system-default policy.
     OpenSSL matches a file-form command name without case, so this does too. A file using what
-    this check does not follow raises :class:`ProbeUnavailable` naming the file, and so do a file
-    that is not there and an ``OPENSSL_CONF`` that is set but empty, because which file
-    ``openssl`` read is then not known. A file that is there and cannot be read raises
-    :class:`ProbeFailed`. A leading byte-order mark is dropped, as OpenSSL drops it."""
+    this check does not follow raises :class:`ProbeUnavailable` naming the file, and so does an
+    ``OPENSSL_CONF`` that is set but empty, because which file ``openssl`` read is then not known.
+    A file that is not there raises :class:`FileNotFoundError`: OpenSSL then applies no policy
+    from it (measured on OpenSSL 3.5.7). One that is there and cannot be read raises
+    :class:`ProbeFailed`. The bytes are decoded here, not read as text, so a lone carriage return
+    stays inside its line as it does in OpenSSL. A leading byte-order mark is dropped, as OpenSSL
+    drops it."""
     named = os.environ.get("OPENSSL_CONF")
     if named == "":
         raise ProbeUnavailable("OPENSSL_CONF is set but empty, so the file openssl read is unknown")
     path = Path(named) if named else _openssl_default_file()
     try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except FileNotFoundError as exc:
-        raise ProbeUnavailable(f"no file at {path}") from exc
+        text = path.read_bytes().decode("utf-8-sig", errors="replace")
+    except FileNotFoundError:
+        raise  # a reading, not a broken one: the caller FAILs it
     except OSError as exc:
         raise ProbeFailed(f"{path} could not be read: {codec_safe_str(exc)}") from exc
     try:
@@ -586,7 +643,12 @@ def _windows_protocol_readings() -> list[_Reading]:
 
 
 def _linux_policy_reading() -> _Reading:
-    taken = _taken("OpenSSL file", _openssl_policy_lines, _BY_HAND)
+    try:
+        taken = _taken("OpenSSL file", _openssl_policy_lines, _BY_HAND)
+    except FileNotFoundError as exc:
+        return _Reading(
+            Status.FAIL, f"no file at {exc.filename}, so openssl applies no system-default policy"
+        )
     if isinstance(taken, _Reading):
         return taken
     path, section, settings = taken
@@ -608,9 +670,7 @@ def _linux_policy_reading() -> _Reading:
     if not min_protocols:
         problems.append("no MinProtocol line")
     elif min_protocols[-1] not in _TLS12_OR_HIGHER:  # OpenSSL takes the last one
-        # Escaped, so a no-break space OpenSSL keeps in the value shows in the detail.
-        shown = escape_for_terminal(min_protocols[-1], single_line=True)
-        problems.append(f"MinProtocol = {shown}, not TLSv1.2 or higher")
+        problems.append(f"MinProtocol = {min_protocols[-1]}, not TLSv1.2 or higher")
     if problems:
         return _Reading(Status.FAIL, f"{where}: " + "; ".join(problems), evidence=evidence)
     return _Reading(

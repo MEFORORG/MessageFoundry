@@ -624,14 +624,14 @@ def test_linux_missing_openssl_is_manual(monkeypatch: pytest.MonkeyPatch) -> Non
     assert r.status is Status.MANUAL
 
 
-def test_linux_missing_policy_file_is_manual(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_linux_missing_policy_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: with ``OPENSSL_CONF`` naming no file, ``openssl`` ran on its
+    built-in defaults, so no floor is set and the reading is a FAIL, as a file with no chain is."""
     missing = tmp_path / "absent.cnf"
     monkeypatch.setenv("OPENSSL_CONF", str(missing))
     r = _linux_row(monkeypatch)
-    assert r.status is Status.MANUAL, r.detail
-    assert f"(no file at {missing}); run the commands by hand" in r.detail
+    assert r.status is Status.FAIL, r.detail
+    assert f"no file at {missing}, so openssl applies no system-default policy" in r.detail
 
 
 def test_an_unreadable_policy_file_is_an_error(
@@ -809,7 +809,8 @@ def test_other_module_lines_do_not_name_the_ssl_module(
         ('"TLSv1.2"', "TLSv1.2"),
         ("'TLSv1.2'  # quoted", "TLSv1.2"),
         ('"DEFAULT:#x" # comment', "DEFAULT:#x"),
-        (r"a\#b", "a#b"),
+        ("`TLSv1.2`", "TLSv1.2"),  # a backtick is a quote too (measured)
+        ('"TLSv1.2 "  ', "TLSv1.2 "),
         ('" spaced "  ', " spaced "),
         ("TLSv1.2   ", "TLSv1.2"),
         ("", ""),
@@ -835,9 +836,15 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
         (_CHAIN + _HEALTHY_SECTION + ".include /etc/ssl/more.cnf\n", ".include"),
         (".include = /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
         (".pragma dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
-        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line continued"),
-        (_CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable expansion"),
-        (_CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION, "$ variable expansion"),
+        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a backslash"),
+        (_CHAIN + "[system_default_s\\ect]\n" + _HEALTHY_SECTION[21:], "a backslash"),
+        (_CHAIN + _HEALTHY_SECTION + "x = y # z\0\n", "a NUL"),
+        (_CHAIN + _HEALTHY_SECTION + "home = $ENV::HOME\n", "a $ENV:: variable"),
+        ("floor = TLSv1\n" + _CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable"),
+        (
+            "name = ssl_sect\n" + _CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION,
+            "$ variable",
+        ),
         (
             _CHAIN + _HEALTHY_SECTION + "[other]\nsystem_default_sect::MinProtocol = TLSv1\n",
             "section::name",
@@ -865,12 +872,60 @@ def test_a_file_using_what_the_check_does_not_follow_is_manual(
 def test_a_dollar_outside_the_read_lines_is_not_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads."""
-    text = "HOME = .\n" + _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = $dir/certs\n"
+    """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads.
+    Each variable is defined on an earlier line, as OpenSSL needs."""
+    text = (
+        "HOME = .\ntls13 = TLS_AES_256_GCM_SHA384\n"
+        + _CHAIN
+        + _HEALTHY_SECTION
+        + "[CA_default]\ndir = ./demoCA\ncerts = $dir/certs\nkey = ${dir}/k\nhome = $(HOME)\n"
+        + "[other]\nca = $CA_default::dir\n"
+    )
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
     # Ciphersuites is evidence only, so a $ there does not stop the verdict.
     r = _linux_from_file(monkeypatch, tmp_path / "b.cnf", text + "Ciphersuites = $tls13\n")
     assert r.status is Status.PASS, r.detail
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        "[CA_default]\ncerts = $dir/certs\n",  # never defined
+        "[CA_default]\ncerts = $dir/certs\ndir = ./demoCA\n",  # defined only after it is used
+        "[CA_default]\ndir = ./demoCA\ncerts = ${dir/certs\n",  # an unclosed brace
+        "[CA_default]\ndir = ./demoCA\n[other]\nca = $nowhere::dir\n",
+        "[CA_default]\ncerts = $/certs\n",  # no name at all
+    ],
+)
+def test_a_variable_openssl_cannot_expand_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lines: str
+) -> None:
+    """Measured on OpenSSL 3.5.7: a ``$dir`` no earlier line defines, in a section the policy never
+    reads, made OpenSSL apply none of the file, and one defined on a later line did too. Before,
+    the row read PASS on each (code-review round 1)."""
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", _CHAIN + _HEALTHY_SECTION + lines)
+    assert r.status is Status.MANUAL, r.detail
+    assert "cannot read as OpenSSL does" in r.detail
+
+
+def test_a_quoted_dollar_is_not_expanded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: ``'$dir/certs'`` with no ``dir`` left the file applied."""
+    text = _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = '$dir/certs' # $nor_here\n"
+    assert _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text).status is Status.PASS
+
+
+def test_a_lone_carriage_return_does_not_end_a_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Measured on OpenSSL 3.5.7: after ``# x`` and a lone CR, the rest of the line is comment, so
+    a policy line there is not applied. Read as text, the CR became a line end, and the row read
+    the floor and PASSed (code-review round 1)."""
+    text = (
+        _CHAIN + "[system_default_sect]\nCipherString = ECDHE+AESGCM # x\rMinProtocol = TLSv1.2\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.FAIL, r.detail
+    assert "no MinProtocol line" in r.detail
 
 
 def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
@@ -884,33 +939,33 @@ def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
 _NBSP = "\N{NO-BREAK SPACE}"
 
 
-def test_a_no_break_space_stays_in_a_value_as_openssl_keeps_it(
+def test_a_no_break_space_in_a_value_is_not_read_as_space(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7: a ``CipherString`` ending in a no-break space
     was not applied, so OpenSSL keeps that character. Python's ``strip`` dropped it, and this
-    floor read as ``TLSv1.2`` and PASS."""
+    floor read as ``TLSv1.2`` and PASS. A non-ASCII character is now refused, not read."""
     text = _CHAIN + _HEALTHY_SECTION.replace("TLSv1.2", f"TLSv1.2{_NBSP}")
     r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
-    assert r.status is Status.FAIL, r.detail
-    assert "MinProtocol = TLSv1.2\\u00a0, not TLSv1.2 or higher" in r.detail
+    assert r.status is Status.MANUAL, r.detail
+    assert "a non-ASCII character on line 8" in r.detail
 
 
 @pytest.mark.parametrize(
-    "line",
+    ("line", "said"),
     [
-        f"{_NBSP}MinProtocol = TLSv1.2",  # indented with a no-break space
-        f"MinProtocol{_NBSP}= TLSv1.2",
-        "\vMinProtocol = TLSv1.2",  # a vertical tab is not OpenSSL whitespace either
-        f"[other{_NBSP}]",
-        "[other]\njunk",
-        "[other]\nMin Protocol = TLSv1",
-        "[other]\na$b = 1",
-        "[other\n",
+        (f"{_NBSP}MinProtocol = TLSv1.2", "non-ASCII"),  # indented with a no-break space
+        (f"MinProtocol{_NBSP}= TLSv1.2", "non-ASCII"),
+        ("\vMinProtocol = TLSv1.2", "cannot read as OpenSSL does"),  # not OpenSSL space either
+        (f"[other{_NBSP}]", "non-ASCII"),
+        ("[other]\njunk", "cannot read as OpenSSL does"),
+        ("[other]\nMin Protocol = TLSv1", "cannot read as OpenSSL does"),
+        ("[other]\na$b = 1", "cannot read as OpenSSL does"),
+        ("[other\n", "cannot read as OpenSSL does"),
     ],
 )
 def test_a_line_openssl_may_refuse_is_manual(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, line: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, line: str, said: str
 ) -> None:
     """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7, with each line after this healthy file: every
     one made OpenSSL apply none of the file, so a PASS on the lines read here would not hold.
@@ -919,8 +974,8 @@ def test_a_line_openssl_may_refuse_is_manual(
     cnf = tmp_path / "openssl.cnf"
     r = _linux_from_file(monkeypatch, cnf, _CHAIN + _HEALTHY_SECTION + line + "\n")
     assert r.status is Status.MANUAL, r.detail
-    assert f"{cnf} has line " in r.detail
-    assert "cannot read as OpenSSL does" in r.detail
+    assert str(cnf) in r.detail
+    assert said in r.detail
 
 
 def test_lines_openssl_reads_are_not_refused(
@@ -934,7 +989,17 @@ def test_lines_openssl_reads_are_not_refused(
         + _CHAIN.replace("\n", "\r\n")
         + "[system_default_sect] # the policy\r\n"
         + "\tCipherString = ECDHE+AESGCM\t\r\nMinProtocol = TLSv1.2 \r\n"
-        + "[ spaced name ]\na!%&*+,-./;?@^_|~b = 1\nesc\\=aped = 2\n"
+        + "[ spaced name ]\na!%&*+,-./;?@^_|~b = 1\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.PASS, r.detail
+
+
+def test_a_backtick_quotes_a_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: a backtick-quoted ``CipherString`` was applied, so the backtick
+    is a quote. Before, the row read the floor as ```TLSv1.2``` and FAILed (code-review round 1)."""
+    text = (
+        _CHAIN + "[system_default_sect]\nCipherString = `ECDHE+AESGCM`\nMinProtocol = `TLSv1.2`\n"
     )
     r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
     assert r.status is Status.PASS, r.detail
