@@ -37,6 +37,7 @@ from messagefoundry.pipeline.secret_rotation import (
 from messagefoundry.store.crypto import (
     ROTATION_FP_SEALED_SCHEME,
     AesGcmCipher,
+    CipherError,
     generate_key,
     make_cipher,
     open_rotation_fingerprint,
@@ -193,7 +194,7 @@ async def test_the_rotation_leaves_a_cell_no_key_opens_and_does_not_stop(
     caplog.set_level(logging.WARNING, logger="messagefoundry.store.crypto")
     await _rotate(path, a, b)
     assert await _stored(path, b) == planted
-    warned = [r for r in caplog.records if "could not be opened by any configured" in r.message]
+    warned = [r for r in caplog.records if "could not be read: no configured key" in r.message]
     assert len(warned) == 1 and warned[0].getMessage().startswith("key rotation: 1 ")
     assert _AD not in caplog.text
     stamps, _ = await _start(path, b, _NEW_VALUE)
@@ -500,3 +501,93 @@ def test_every_backend_rotation_reseals_the_fingerprints(backend: str) -> None:
 
     assert "_reseal_rotation_fingerprints_to_active" in calls("reencrypt_to_active")
     assert "reseal_rotation_fingerprints" in calls("_reseal_rotation_fingerprints_to_active")
+
+
+# --- review round 2 (BACKLOG #3472) -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tracked_since", "last_rotated", "expected"),
+    [
+        ("nope", "2020-01-01", _OLD),
+        ("2020-01-01", "nope", _OLD),
+        ("nope", "nope", datetime.date.min),
+    ],
+)
+async def test_a_malformed_date_on_any_row_never_fails_the_reconcile(
+    tmp_path: Path, tracked_since: str, last_rotated: str, expected: datetime.date
+) -> None:
+    """A date that does not parse falls back to the other one, and with neither to the earliest
+    date, never to today. The reconcile must finish: a raise would be swallowed and leave every
+    class untracked for the start."""
+    path, key = tmp_path / "dates.db", generate_key()
+    store = await MessageStore.open(path, cipher=_cipher(key))
+    try:
+        await store.upsert_secret_rotation_meta(
+            _SMTP,
+            fingerprint=f"{sr._FP_SCHEME}:0123456789abcdef:{'a' * 32}",
+            tracked_since=tracked_since,
+            last_rotated=last_rotated,
+        )
+        stamps = await reconcile_rotation_meta(
+            store,
+            SecretRotationSettings(),
+            dek_key_id=store.cipher_info().active_key_id,
+            enforcement=SecurityEnforcement.WARN,
+            now=_NOW.timestamp(),
+            env_values={_AD: _VALUE, _SMTP: _VALUE},
+        )
+    finally:
+        await store.close()
+    assert stamps[_SMTP].last_rotated == expected
+    assert stamps[_AD].last_rotated == _TODAY  # the other class is still tracked
+
+
+@pytest.mark.parametrize(
+    "mac",
+    ["", "a" * 31, "a" * 33, "A" * 32, "g" * 32],
+    ids=["empty", "short", "long", "upper", "nonhex"],
+)
+def test_a_cell_with_a_damaged_mac_reads_as_unreadable_not_as_a_rotation(mac: str) -> None:
+    """``False`` resets the clock, so a cell whose MAC field is damaged must read ``None``."""
+    assert sr._cell_unchanged(f"{'ab' * 32}:{mac}:{_AD}", _AD, _VALUE) is None
+
+
+def test_a_moved_cell_whose_class_id_ends_in_this_rows_is_refused() -> None:
+    """The row binding is the exact third field, not a suffix: ``acme:K``'s cell is not ``K``'s."""
+    frozen = _cipher(generate_key(), aad_bind=False)
+    moved = seal_rotation_fingerprint(frozen, "acme:K", sr._fingerprint_cell("acme:K", _VALUE))
+    assert open_rotation_fingerprint(frozen, "K", moved) is None
+    assert open_rotation_fingerprint(frozen, "acme:K", moved) is not None
+
+
+async def test_a_cipher_refusal_for_one_class_leaves_the_others_tracked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A seal the cipher refuses, such as at its invocation ceiling, costs only that class its
+    stamp; the reconcile goes on, and the count is logged without the class id."""
+    real = seal_rotation_fingerprint
+
+    def refusing(cipher: AesGcmCipher, secret_key: str, cell: str) -> str:
+        if secret_key == _SMTP:
+            raise CipherError("synthetic refusal")
+        return real(cipher, secret_key, cell)
+
+    monkeypatch.setattr(sr, "seal_rotation_fingerprint", refusing)
+    path, key = tmp_path / "refused.db", generate_key()
+    store = await MessageStore.open(path, cipher=_cipher(key))
+    try:
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            stamps = await reconcile_rotation_meta(
+                store,
+                SecretRotationSettings(),
+                dek_key_id=store.cipher_info().active_key_id,
+                enforcement=SecurityEnforcement.WARN,
+                now=_NOW.timestamp(),
+                env_values={_AD: _VALUE, _SMTP: _VALUE},
+            )
+    finally:
+        await store.close()
+    assert _AD in stamps and _SMTP not in stamps
+    assert "1 secret(s) could not be sealed or opened" in caplog.text
+    assert _SMTP not in caplog.text

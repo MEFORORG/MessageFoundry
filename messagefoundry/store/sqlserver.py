@@ -2681,8 +2681,9 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
         secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(MAX) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
-    # BACKLOG #3472: a sealed fingerprint cell is longer than 255 characters (about 260 to 320 for
-    # the class ids shipped), so a table created at NVARCHAR(255) is widened in place. COL_LENGTH is
+    # BACKLOG #3472: a sealed fingerprint cell can be longer than 255 characters (measured: about 240
+    # to 255 under the frozen v1 writer, 260 to 320 under the default cell-bound writer, and more
+    # for a long env() key), so a table created at NVARCHAR(255) is widened in place. COL_LENGTH is
     # -1 for a MAX column and NULL for no table, so this runs once and never on a fresh store. The
     # column is in no key or index, so it alters in place.
     """IF COL_LENGTH('secret_rotation_meta','fingerprint') <> -1
@@ -3677,7 +3678,9 @@ class SqlServerStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via a single atomic ``MERGE``
         under ``HOLDLOCK`` (range-locks the PK so two concurrent nodes can't both INSERT), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._execute(
             "MERGE secret_rotation_meta WITH (HOLDLOCK) AS t"
             " USING (SELECT ? AS secret_key) AS s ON t.secret_key=s.secret_key"

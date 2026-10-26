@@ -2497,7 +2497,9 @@ class PostgresStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via ``ON CONFLICT (secret_key) DO
         UPDATE`` (MVCC-atomic — the Postgres equivalent of SQLite's INSERT OR REPLACE), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._pool.execute(
             "INSERT INTO secret_rotation_meta (secret_key, fingerprint, tracked_since, last_rotated)"
             " VALUES ($1,$2,$3,$4)"

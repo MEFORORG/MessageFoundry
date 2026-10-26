@@ -541,12 +541,14 @@ reconcile stamp the new key's id and date in the secret-rotation metadata, which
 without auditing it. A key leaving the retired list is never recorded, because the engine sees only
 the setting.
 
-**Found by this read, outside the mapping.** The rotation-fingerprint MAC key hangs off the active
-DEK, so a DEK rotation changes every stored secret fingerprint. At the next engine start the
+**Found by this read, outside the mapping.** The rotation-fingerprint MAC key hung off the active
+DEK, so a DEK rotation changed every stored secret fingerprint. At the next engine start the
 reconcile would read each tracked secret as freshly rotated and reset its clock, which would also
 lift an overdue refusal under `enforce_secret_expiry_classes`. That is a code
-question, not a mapping one. It is read from the code, not measured by a run, and it is reported
-rather than fixed here.
+question, not a mapping one. It was read from the code, not measured by a run, and was reported
+rather than fixed here. **CORRECTED 2026-10-26:** that read is no longer true of the code. Since
+BACKLOG #3472 the fingerprint is a sealed store-cipher cell under a random per-row key, and
+`rotate-key` re-seals it ([ADR 0213](adr/0213-seal-the-secret-rotation-fingerprint-as-a-store-cipher-cell.md)).
 
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 

@@ -7777,7 +7777,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets
 -- it, and persists/logs the MAC + dates alone.
 CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     secret_key    TEXT PRIMARY KEY,   -- registry class id: 'MEFOR_STORE_ENCRYPTION_KEY' (DEK) or an env/setting name
-    fingerprint   TEXT NOT NULL,      -- keyed MAC of the current value / DEK key-id — one-way, NOT the value
+    fingerprint   TEXT NOT NULL,      -- sealed keyed-MAC cell (#3472) / DEK key-id — one-way, NOT the value
     tracked_since TEXT NOT NULL,      -- ISO YYYY-MM-DD first observed (tracked-since age floor)
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
@@ -8075,7 +8075,9 @@ class MessageStore:
         self, secret_key: str, *, fingerprint: str, tracked_since: str, last_rotated: str
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent (INSERT OR REPLACE on the PK), so a
-        re-run — or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        re-run — or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT OR REPLACE INTO secret_rotation_meta"

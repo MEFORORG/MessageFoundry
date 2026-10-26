@@ -81,9 +81,10 @@ re-seals. Stored behind a new scheme tag, `sealed-hmac-sha256-32`.**
 - **The DEK row is unchanged.** Its fingerprint is still its key id, tagged `sha256-16`, and
   `rotate-key` still stamps it.
 - **Schema.** No new table or column. One column's stored format changes for non-DEK rows. A
-  sealed cell is longer than 255 characters (about 260 to 320 for the class ids shipped), so on SQL
-  Server, where the column was `NVARCHAR(255)`, it becomes `NVARCHAR(MAX)`, and an existing table is
-  widened in place. SQLite and PostgreSQL store it as `TEXT` already.
+  sealed cell can be longer than 255 characters (measured: about 240 to 255 under the frozen v1
+  writer, 260 to 320 under the default cell-bound writer, more for a long `env()` key), so on SQL
+  Server, where the column was `NVARCHAR(255)`, it becomes `NVARCHAR(MAX)`, and an existing table
+  is widened in place. SQLite and PostgreSQL store it as `TEXT` already.
 
 This supersedes the BACKLOG #2242 re-key rule.
 

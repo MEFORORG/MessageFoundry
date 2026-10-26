@@ -568,8 +568,7 @@ environment.
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
   `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
-  service's first start after a rotation needs no retired key: `rotate-key` re-seals the
-  secret-rotation watcher's fingerprints under the new key (BACKLOG #3472, [PHI.md](PHI.md) §3).
+  service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 

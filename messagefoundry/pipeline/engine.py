@@ -2100,8 +2100,9 @@ class Engine:
         if self._secret_rotation_settings is not None:
             # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
             # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
-            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG
-            # #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires here (at restart) for a DEK past max_age + grace.
+            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
+            # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
+            # here (at restart) for a DEK past max_age + grace.
             # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
             # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
             # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation

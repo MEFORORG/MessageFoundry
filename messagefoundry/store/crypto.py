@@ -874,10 +874,11 @@ def open_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str
 
     ``None`` when ``stored`` is not a sealed fingerprint (a DEK key id, a pre-#3472 keyed MAC, an
     unknown tag, a blank), when no configured key opens it under this row's AAD (a key not
-    supplied, a cell moved from another row, a corrupt value), and when the plaintext does not end
-    in ``:<secret_key>``. That last check is what refuses a moved cell that the frozen v1 writer
-    sealed with no AAD, so the rotation pass never re-seals one as this row's. The caller keeps
-    that row's dates, so a cell it cannot read never resets a clock."""
+    supplied, a cell moved from another row, a corrupt value), and when the plaintext's third
+    ``:``-field is not exactly ``secret_key``. The first two fields are hex, so only the class id
+    may hold a ``:``. That last check is what refuses a moved cell that the frozen v1 writer sealed
+    with no AAD, so the rotation pass never re-seals one as this row's. The caller keeps that row's
+    dates, so a cell it cannot read never resets a clock."""
     head, sep, inner = stored.partition(":")
     if not sep or head != ROTATION_FP_SEALED_SCHEME or not cipher.is_encrypted(inner):
         return None
@@ -885,7 +886,8 @@ def open_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str
         cell = cipher.decrypt(inner, aad=_rotation_fp_aad(secret_key))
     except CipherError:
         return None
-    return cell if cell.endswith(f":{secret_key}") else None
+    parts = cell.split(":", 2)
+    return cell if len(parts) == 3 and parts[2] == secret_key else None
 
 
 def reseal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:
@@ -920,9 +922,9 @@ def reseal_rotation_fingerprints(
             updates.append((resealed, secret_key))
     if len(updates) < len(rows):
         _log.warning(
-            "key rotation: %d secret-rotation fingerprint(s) could not be opened by any configured "
-            "key and were left as they are. The next engine start keeps those secrets' rotation "
-            "dates and seals a new fingerprint for each.",
+            "key rotation: %d secret-rotation fingerprint(s) could not be read: no configured key "
+            "opens it, or it belongs to another row. They were left as they are. The next engine "
+            "start keeps those secrets' rotation dates and seals a new fingerprint for each.",
             len(rows) - len(updates),
         )
     return updates
