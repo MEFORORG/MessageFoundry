@@ -11082,17 +11082,15 @@ def create_managed_app(
             if secrets_settings is not None
             else None
         )
-        # BACKLOG #3470: the CA the notifier's SMTP hop reads is checked before it is built. At
-        # least three things send through it before the start check below runs: the store open's
-        # failure path, the cipher refusal hook and the startup attestation. A refusal here builds
-        # no notifier, so those alerts take the logging sink. The audited check below then refuses
-        # the start with its rows, and this refusal is raised if that check passes. Only a CA that
-        # check is given is checked here, so this moves a refusal earlier and adds none.
+        # BACKLOG #3470: the CA the notifier's email transport reads is checked before the
+        # notifier is built, since at least three things send through it before the start check
+        # below. Only a CA that check is given. trust_anchors module item 10 says what a refusal
+        # does.
         smtp_ca = (
             smtp_hop_anchor_spec(
                 alerts_settings, auth_settings or AuthSettings(), tls_settings or TlsSettings()
             )
-            if alerts_settings is not None
+            if alerts_settings is not None and alerts_settings.email_to
             else None
         )
         smtp_anchor_refusal = (
@@ -11221,8 +11219,10 @@ def create_managed_app(
                     trust_anchor_specs, store, enforcing=trust_anchors_enforcing
                 )
                 if smtp_anchor_refusal is not None:
-                    # The CA passed here after it was refused above, so it changed in between.
-                    # The engine has no notifier, so it does not start.
+                    # The CA passed here after it was refused above: it changed, or a read
+                    # failed once. The engine has no notifier, so it does not start, and the
+                    # rows above record a pass this refusal is not behind.
+                    smtp_anchor_refusal.unaudited = True
                     raise smtp_anchor_refusal
             except BaseException:
                 if notifier is not None:

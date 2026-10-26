@@ -2318,9 +2318,8 @@ def _start_logging(
             return 2
 
     # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
-    # it. The audited settings preflight checks it too, but in `serve` that runs in the API
-    # lifespan, after the forwarder has sent its first records, and `supervise` runs none. No store
-    # is open here, so a refusal writes no audit row; it goes to stderr with the other gates'.
+    # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
+    # sent; `supervise` runs none. trust_anchors module item 10 says what a refusal does.
     from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
 
     _forward_ca = log_forward_anchor_spec(settings.logging) if log_forward is not None else None

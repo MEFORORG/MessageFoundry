@@ -125,15 +125,19 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     :func:`anchor_refusal`, which writes no audit row. At least four are covered:
 
     * ``serve`` and ``supervise`` check ``[logging].forward_tls_ca_file`` before they build the
-      log forwarder, and a refusal stops the start on stderr. No store is open there, so it has
-      no row. ``supervise`` runs no other anchor check.
-    * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds the alert
-      notifier, when that CA is one of the specs this preflight is given. A refusal builds no
-      notifier, so the alerts sent before this preflight take the logging sink, and this
-      preflight then refuses the start with its rows. If it passes, the file changed in between,
-      and the first refusal is raised.
+      log forwarder. A refusal stops the start on stderr. No store is open yet, so no row is
+      written. ``supervise`` runs no other anchor check.
+    * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
+      notifier with an email transport. It checks only a CA this preflight is given. A refusal
+      builds no notifier, webhook included, so the alerts sent before this preflight go to the
+      log. This preflight then refuses the start, with its rows when the file can be read. If it
+      passes instead, the file changed or a read failed once. The first refusal is raised then,
+      marked ``unaudited``, since the rows record a pass.
     * The offline security notifier of the recovery commands checks the same CA. A refusal drops
       the notice with a WARNING and never refuses the recovery.
+
+    Under ``warn`` each check warns and goes on, so ``serve`` logs the warning twice: here, and
+    in this preflight. In ``supervise`` the warning reaches the console, not the forwarder.
 
     **Accepted:** these checks keep the check-then-load gap above, since each hop still loads the
     file by path after its check. A reload adds no second check; this preflight is the reload's.
@@ -1589,12 +1593,17 @@ def smtp_hop_anchor_spec(
 ) -> AnchorSpec | None:
     """The settings CA an ``[alerts]`` SMTP hop verifies its relay with, for a check before the
     hop is built (BACKLOG #3470), or ``None`` when it reads none. That is
-    ``[alerts].email_tls_ca_file`` when it is set. With none set, the hop falls back to the
-    internal CA (:func:`internal_ca_anchor_spec`), which is checked even for a loopback relay that
-    ignores it."""
-    if not alerts.email_tls_ca_file and _smtp_hop_verifies(alerts, auth):
+    ``[alerts].email_tls_ca_file`` when it is set. With none set, a relay off this host falls back
+    to the internal CA (:func:`internal_ca_anchor_spec`), as
+    :func:`~messagefoundry.config.tls_policy.resolve_trust_anchor` chooses."""
+    if alerts.email_tls_ca_file:
+        return alerts_email_anchor_spec(alerts, auth)
+    from messagefoundry.config.tls_policy import is_loopback_hop_host
+
+    host = alerts.email_smtp_host
+    if host and not is_loopback_hop_host(host) and _smtp_hop_verifies(alerts, auth):
         return internal_ca_anchor_spec(tls)
-    return alerts_email_anchor_spec(alerts, auth)
+    return None
 
 
 def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:

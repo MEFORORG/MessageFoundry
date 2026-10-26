@@ -2921,11 +2921,16 @@ class _NotifierBuilt(Exception):
 
 
 def _smtp_app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, start_checked: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    start_checked: bool = True,
+    email: bool = True,
 ) -> tuple[Any, list[object]]:
     """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the notifier factory's
     calls. The factory raises :class:`_NotifierBuilt`, so a lifespan that reaches it stops there.
-    ``start_checked=False`` gives the app no anchor specs, as an embedding that checks none."""
+    ``start_checked=False`` gives the app no anchor specs, as an embedding that checks none.
+    ``email=False`` names no alert recipient, so only the security notices read the CA."""
     from messagefoundry.api.app import create_managed_app
 
     built: list[object] = []
@@ -2937,13 +2942,14 @@ def _smtp_app(
     monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _factory)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = str(_pem(tmp_path))
+    smtp = _SMTP if email else {**_SMTP, "email_to": []}
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
     app = create_managed_app(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
-        alerts_settings=AlertsSettings(email_tls_ca_file=ca, **_SMTP),
-        trust_anchor_specs=_dialling_specs(ca, alerts=_SMTP) if start_checked else (),
+        alerts_settings=AlertsSettings(email_tls_ca_file=ca, **smtp),
+        trust_anchor_specs=_dialling_specs(ca, alerts=smtp) if start_checked else (),
         trust_anchors_enforcing=True,
         allow_no_auth=True,
         egress_settings=EgressSettings(deny_by_default=False),
@@ -2998,15 +3004,29 @@ async def test_the_notifier_check_adds_no_check_the_start_does_not_make(
 async def test_an_alerts_ca_refused_before_the_notifier_refuses_the_start_if_it_then_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The file changed between the two checks. The engine has no notifier by then, so the first
-    refusal stops the start even though the audited check passed."""
+    """The file changed between the two checks, or a read failed once. The engine has no notifier
+    by then, so the first refusal stops the start even though the audited check passed. It is
+    marked ``unaudited``, since the row the audited check wrote records a pass."""
     verdicts = iter([False, True])
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
     app, built = _smtp_app(tmp_path, monkeypatch)
-    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file") as err:
         async with app.router.lifespan_context(app):
             pass
-    assert built == []
+    assert built == [] and err.value.unaudited
+
+
+async def test_a_notifier_with_no_email_transport_is_not_held_back_by_the_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no alert recipient the alert notifier reads no CA; only the security notifier does,
+    and it is built after the audited check. So the early check leaves the notifier alone."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch, email=False)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
 
 
 def _offline_settings(ca: str, *, tls: dict[str, Any] | None = None) -> Any:
@@ -3096,6 +3116,18 @@ def test_an_unreadable_anchor_is_a_refusal_naming_its_setting(tmp_path: Path) ->
         ),
         pytest.param(
             {"email_smtp_host": None}, {"trust_anchor_mode": "pinned"}, None, id="no-host"
+        ),
+        pytest.param(
+            {"email_smtp_host": "127.0.0.1"},
+            {"trust_anchor_mode": "pinned"},
+            None,
+            id="internal-loopback-relay",
+        ),
+        pytest.param(
+            {"email_smtp_host": "127.0.0.1", "email_tls_ca_file": "ca.pem"},
+            {"trust_anchor_mode": "pinned"},
+            "alerts_email_ca",
+            id="own-ca-loopback-relay",
         ),
         pytest.param(
             {"email_tls_ca_file": "ca.pem", "email_use_tls": False},
