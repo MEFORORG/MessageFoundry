@@ -3005,7 +3005,9 @@ async def test_a_refused_alerts_ca_drops_email_from_every_rule_and_tier(
         transports=["email", "webhook"],
         escalate=[EscalationTier(after_count=2, transports=["email"])],
     )
-    app, built = _smtp_app(tmp_path, monkeypatch, rules=(rule, AlertRule()))
+    # The operator's own suppression stays one: an empty list is not widened.
+    muted = AlertRule(transports=[], escalate=[EscalationTier(after_count=3, transports=[])])
+    app, built = _smtp_app(tmp_path, monkeypatch, rules=(rule, AlertRule(), muted))
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
         async with app.router.lifespan_context(app):
             pass
@@ -3013,7 +3015,24 @@ async def test_a_refused_alerts_ca_drops_email_from_every_rule_and_tier(
     assert [(r.transports, [t.transports for t in r.escalate]) for r in built[0].rules] == [
         (["webhook"], [["webhook"]]),
         (None, []),
+        ([], [[]]),
     ]
+
+
+def test_a_rule_naming_a_missing_transport_still_refuses_with_no_transport_left() -> None:
+    """With no webhook the rules that route only the notifier are dropped, but not a rule naming a
+    transport this instance lacks. The notifier still refuses that rule, so the lifespan logs the
+    error in this start. Red on 84590597630d: every rule was dropped, and the error waited a
+    restart."""
+    from messagefoundry.api.app import _alerts_without_email
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    typo = AlertRule(transports=["webhook"])
+    alerts = AlertsSettings(rules=[AlertRule(transports=["email"]), typo], **_SMTP)
+    stripped = _alerts_without_email(alerts)
+    assert [r.transports for r in stripped.rules] == [["webhook"]]
+    with pytest.raises(ValueError, match="unconfigured transport"):
+        notifier_from_settings(stripped)
 
 
 @pytest.mark.parametrize("webhook", [True, False])

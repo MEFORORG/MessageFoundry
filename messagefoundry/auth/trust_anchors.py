@@ -136,11 +136,12 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
       notifier with an email transport. It checks only a CA this preflight is given. A refusal
-      builds the notifier without its email transport, and no alert goes quieter for it. A rule
-      that sent only by email pages the webhook instead. With no webhook there is no notifier,
-      and the logging sink logs each alert at WARNING. This preflight then refuses the start,
-      with its rows when the file can be read. If it passes instead, the file changed or a read
-      failed once. The first refusal is raised then, marked ``unaudited``: no row records it.
+      builds no email transport, and no alert is suppressed for it. A rule that sent only by
+      email uses the other transports instead. With none there is no notifier, and the logging
+      sink logs each alert, so an email page becomes a log line. This preflight then refuses the
+      start, with its rows when the file can be read. If it passes instead, the file changed or a
+      read failed once. The first refusal is raised then, marked ``unaudited``: no row records
+      it.
     * The offline security notifier of the recovery commands checks the same CA. A refusal drops
       the notice with a WARNING and never refuses the recovery.
 
@@ -154,8 +155,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **Declined** (BACKLOG #3470). The internal CA check stays for an instance whose hops never
     read the file, as the paragraph above says. This preflight runs before any graph is loaded,
-    so it cannot tell. A reload can also add a hop that reads the CA. It errs toward refusing. And each spec builder restates its hop's enable
-    conditions rather than sharing one predicate with the hop's builder. One predicate would run
+    so it cannot tell. A reload can also add a hop that reads the CA. It errs toward refusing.
+    And each spec builder restates its hop's enable conditions rather than sharing one predicate
+    with the hop's builder. One predicate would run
     through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each
     builder's conditions, not their agreement with the hop.

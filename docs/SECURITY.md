@@ -6463,7 +6463,7 @@ are covered:
 |---|---|---|
 | The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start before any listener binds. It writes its rows when it can read the file |
 | The `supervise` syslog forwarder | Before the forwarder is built | Refuses the start on stderr before any engine shard spawns, with no audit row: that process has no audited check |
-| The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds the notifier without email, and no alert goes quieter. A rule that sent only by email pages the webhook instead. With no webhook, each alert is logged at WARNING. The audited check then refuses the start. It writes its rows when it can read the file |
+| The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds no email transport, and no alert is suppressed for it (module item 10 says how). The audited check then refuses the start. It writes its rows when it can read the file |
 | The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |
 
 Under `warn`, each warns and goes on, as the start check does. A file that cannot be read refuses
