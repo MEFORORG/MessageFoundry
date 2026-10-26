@@ -43,7 +43,11 @@ from tests.test_dicom_scp import (  # noqa: E402
     _scu_cstore,
     _server_cert,
 )
-from tests.test_tls_handshake_failures import _plaintext_peer, _refuse_the_certificate  # noqa: E402
+from tests.test_tls_handshake_failures import (  # noqa: E402
+    _close_notify_peer,
+    _plaintext_peer,
+    _refuse_the_certificate,
+)
 
 _LOG = "messagefoundry.transports.dicom"
 #: An allowlist that does not contain the loopback address every test client connects from.
@@ -689,6 +693,16 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
         await _until(lambda: scp.tls_handshake_failures == 1)
     finally:
         await scp.stop()
+
+
+async def test_the_scp_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
+    """The SCP counts what main's MLLP listener counts when it runs its own handshake: a peer that
+    sends close_notify after its ClientHello raises ``SSLZeroReturnError``, which is counted. A
+    bare connect and close, the health check above, is not (vault BACKLOG #3785, #3784)."""
+    captured: list[bytes] = []
+    async with _running_scp(_tls_settings(tmp_path), captured=captured) as scp:
+        await _close_notify_peer(scp.sockport)
+        await _until(lambda: scp.tls_handshake_failures == 1)
 
 
 # --- The pins ------------------------------------------------------------------------------------

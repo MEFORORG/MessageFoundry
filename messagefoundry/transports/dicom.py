@@ -229,12 +229,15 @@ _REFUSAL_LOG_MAX_PER_WINDOW = REFUSAL_LOG_MAX_PER_WINDOW
 #: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
 _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 
-#: A peer hanging up mid-handshake, which no surface counts (:data:`HUNG_UP` says why), plus
-#: ``ConnectionAbortedError``. On this plain socket that is the OS reporting the connection gone,
-#: for example when a client closes as soon as its side of the handshake is done (measured
-#: 2026-10-26 on Windows, WinError 10053). On the MLLP listener it is that listener's own
-#: handshake bound, and is counted there.
-_HUNG_UP = (*HUNG_UP, ConnectionAbortedError)
+#: What this blocking handshake leaves uncounted: the same peer acts main's MLLP listener leaves
+#: uncounted (:data:`HUNG_UP`), as this socket reports them. A peer that closes the socket
+#: mid-handshake raises ``SSLEOFError`` here, where the event loop reports that close to MLLP as
+#: ``ConnectionResetError`` (measured 2026-10-26, CPython 3.14 for Windows). A close_notify after
+#: the ClientHello raises ``SSLZeroReturnError``, which MLLP counts, so it is counted here too.
+#: ``ConnectionAbortedError`` (WinError 10053) is what this side sees when a client closes as soon
+#: as its side of a COMPLETED handshake is done (measured 2026-10-26 on Windows), so it is no
+#: failed handshake. On the MLLP listener it is that listener's own bound, and counted there.
+_HUNG_UP = (*HUNG_UP, ssl.SSLEOFError, ConnectionAbortedError)
 
 
 def _address_host(client_address: Any) -> str:
@@ -441,7 +444,8 @@ def _admitting_server_class() -> type[Any]:
             A handshake that fails is logged at DEBUG with its detail, and handed to
             ``handshake_failed`` to be counted (vault BACKLOG #3784), as the MLLP listener counts
             the handshakes it runs itself: a TLS error and the bound count, and so does the
-            connection timing out. A peer that hung up (:data:`_HUNG_UP`) does not, nor does a stop.
+            connection timing out. A peer that closed or reset the socket (:data:`_HUNG_UP`) does
+            not, nor does a stop.
             A peer can fail a handshake as often as it can connect, so the SCP's record is the
             throttled WARNING that ``docs/PHI.md`` section 7, row 7 states, never a line each."""
             tls: ssl.SSLSocket | None = None

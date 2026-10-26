@@ -145,10 +145,37 @@ def test_the_hook_reports_a_failed_handshake_and_not_a_completed_one(tmp_path: P
 _CLOSE_NOTIFY = b"\x15\x03\x03\x00\x02\x01\x00"
 
 
-def test_the_hook_does_not_count_a_peer_hanging_up_midway(tmp_path: Path) -> None:
-    """A peer that sends close_notify after its ClientHello hangs up mid-handshake, and the server's
-    ``do_handshake`` raises ``SSLZeroReturnError`` (measured 2026-10-26). No surface counts a
-    hang-up (owner ruling 2026-10-26, vault BACKLOG #3785 item 8), so the hook does not either."""
+def _client_hello() -> bytes:
+    """A real ClientHello, as the first bytes a TLS client sends."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    c_in, c_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = ctx.wrap_bio(c_in, c_out, server_hostname="127.0.0.1")
+    with pytest.raises(ssl.SSLWantReadError):
+        client.do_handshake()
+    return c_out.read()
+
+
+async def _close_notify_peer(port: int) -> None:
+    """Send a ClientHello, then close_notify, then wait for the listener to drop the socket. The
+    server's handshake raises ``SSLZeroReturnError``, which main counts (vault BACKLOG #3785)."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(_client_hello() + _CLOSE_NOTIFY)
+        await writer.drain()
+        with contextlib.suppress(ConnectionError, TimeoutError):
+            while await asyncio.wait_for(reader.read(4096), timeout=5.0):
+                pass
+    finally:
+        await _close_raw(writer)
+
+
+def test_the_hook_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
+    """A peer that sends close_notify after its ClientHello makes the server's ``do_handshake``
+    raise ``SSLZeroReturnError`` (measured 2026-10-26). main counts it, and the owner's item 8
+    decline adds no hang-up counting and removes none, so the hook still counts it (vault BACKLOG
+    #3785)."""
     server_ctx, cert = _server_ctx(tmp_path)
     seen: list[str] = []
     watch_loop_handshakes(server_ctx, seen.append)
@@ -167,10 +194,10 @@ def test_the_hook_does_not_count_a_peer_hanging_up_midway(tmp_path: Path) -> Non
             server.do_handshake()
 
     after_hello(_CLOSE_NOTIFY)
-    assert seen == []
-    # The control: the same point in the handshake, a record that is no TLS record, is counted.
+    assert seen == ["SSLZeroReturnError"]
+    # The same point in the handshake, a record that is no TLS record, is counted too.
     after_hello(_PLAINTEXT)
-    assert len(seen) == 1
+    assert len(seen) == 2
 
 
 def test_a_fault_in_the_recorder_does_not_change_the_handshake_error(
@@ -578,6 +605,22 @@ def test_mllp_records_a_failed_handshake_on_uvloop(tmp_path: Path) -> None:
     installed."""
     uvloop = pytest.importorskip("uvloop")
     asyncio.run(_mllp_loop_run_scenario(tmp_path), loop_factory=uvloop.new_event_loop)
+
+
+async def test_mllp_running_its_own_handshake_counts_a_close_notify_as_main_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """main's `_start_tls` leaves out only a reset and a broken pipe, so a close_notify after the
+    ClientHello is counted. The owner's item 8 decline keeps that (vault BACKLOG #3785)."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: True)
+    source, _cert_path = _tls_source(tmp_path)
+    source.on_connection_event = _Events()
+    await source.start(_ack)
+    try:
+        await _close_notify_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures == 1, "the close_notify not counted")
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
 async def test_a_listener_running_its_own_handshake_does_not_count_twice(

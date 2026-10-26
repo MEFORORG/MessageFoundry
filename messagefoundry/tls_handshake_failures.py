@@ -38,9 +38,12 @@ protocol class is replaced.
   with a TLS alert, a missing client certificate, a protocol downgrade and plaintext on a TLS
   port all raise, so all are counted. A client that refuses a certificate by closing the socket
   with no alert, as asyncio's own client does, looks like a hang-up and is not counted.
-* **A peer that hangs up mid-handshake. A known limit, declined by owner ruling 2026-10-26 (vault
-  BACKLOG #3785 item 8).** Not counted on any surface, as on MLLP since #2613: that is what a load
-  balancer's TCP health check does.
+* **A peer that closes or resets the socket mid-handshake. A known limit, declined by owner ruling
+  2026-10-26 (vault BACKLOG #3785 item 8).** That is what a load balancer's TCP health check does.
+  The decline keeps main's counting and adds none. So the loop's hook counts each ``SSLError``
+  from ``do_handshake``, as on main, a close_notify after the ClientHello among them, and a
+  listener running its own handshakes leaves out only :data:`HUNG_UP`. Where the loop runs the
+  handshake, a closed socket ends it without ``do_handshake`` raising, so nothing counts it.
 * **A failure outside ``do_handshake``**, such as one in ``wrap_bio`` itself, and any context driven
   through ``wrap_socket`` rather than by an event loop. The DICOM SCP drives its handshakes that way,
   so the hook never sees them; its ``_handshake`` counts them itself, on the connection's thread,
@@ -108,20 +111,14 @@ def _weakly[**P, R](fn: Callable[P, R]) -> Callable[P, R | None]:
 #: same tuple as CPython's ``asyncio.sslproto.SSLAgainErrors`` and uvloop's ``ssl_SSLAgainErrors``.
 _AGAIN = (ssl.SSLWantReadError, ssl.SSLSyscallError)
 
-#: What a listener running its own handshakes sees when the peer hangs up before finishing one,
-#: which is what a load balancer's TCP health check does. Not counted on any surface (vault
-#: BACKLOG #2613; owner ruling 2026-10-26, #3785 item 8). A reset is how the Windows Proactor
-#: reports a hang-up to the MLLP listener. A blocking handshake, the DICOM SCP's, sees a close as
-#: ``SSLEOFError`` and a reset as ``ConnectionResetError`` (measured 2026-10-26, CPython 3.14 for
-#: Windows). The loop's TLS object raises ``SSLZeroReturnError`` from ``do_handshake`` when a
-#: peer sends close_notify after its ClientHello (measured 2026-10-26 over memory buffers), so
-#: the loop's hook skips this set too.
-HUNG_UP: tuple[type[OSError], ...] = (
-    ConnectionResetError,
-    BrokenPipeError,
-    ssl.SSLEOFError,
-    ssl.SSLZeroReturnError,
-)
+#: What the MLLP listener leaves uncounted when it runs its own handshake: the event loop's report
+#: of a peer that closed or reset the socket mid-handshake, which is what a load balancer's TCP
+#: health check does (vault BACKLOG #2613). A reset is how the Windows Proactor reports that
+#: hang-up, and the stdlib loop reports a close the same way (``asyncio/sslproto.py``,
+#: ``eof_received``). This is main's set. The owner's item 8 decline (ruling 2026-10-26, vault
+#: BACKLOG #3785) adds no hang-up counting and removes none, so a close_notify after the
+#: ClientHello, which raises ``SSLZeroReturnError``, is still counted everywhere main counted it.
+HUNG_UP: tuple[type[OSError], ...] = (ConnectionResetError, BrokenPipeError)
 
 #: An OpenSSL reason mnemonic such as ``WRONG_VERSION_NUMBER``. Matched in full before it is kept,
 #: so a cause can never carry anything a peer chose.
@@ -332,8 +329,6 @@ class _WatchedSSLObject(ssl.SSLObject):
         try:
             super().do_handshake()
         except _AGAIN:
-            raise
-        except HUNG_UP:  # a peer's close_notify after its ClientHello raises SSLZeroReturnError
             raise
         except ssl.SSLError as exc:
             try:
