@@ -846,8 +846,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/verify/cipher_policy.py::_openssl_default_file": Site(
         1,
         INTERNAL,
-        "The fixed `openssl.cnf` name under the OPENSSLDIR the `openssl` on the operator's PATH "
-        "prints. Read only; a PASS from that file alone is capped at MANUAL.",
+        "The fixed `openssl.cnf` name under the OPENSSLDIR printed by the `openssl` on the "
+        "operator's PATH, a binary the check already runs and so already trusts to run code. Read "
+        "only; a PASS from that file alone is capped at MANUAL.",
     ),
     "messagefoundry/verify/cipher_policy.py::_powershell_pins": Site(
         1, INTERNAL, "The fixed `Modules` name under the system's Windows PowerShell directory."

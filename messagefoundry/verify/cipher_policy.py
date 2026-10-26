@@ -132,11 +132,12 @@ _JUDGED_KEYS = frozenset({"CipherString", "MinProtocol"})
 #: ``\s`` and ``str.strip`` take more, such as a no-break space, which OpenSSL keeps in a value and
 #: refuses in a name (measured on OpenSSL 3.5.7, BACKLOG #3803 T5).
 _WS = " \t\r"
-#: A name, or one word of a section name, as OpenSSL reads it: letters, digits and the punctuation
-#: below. Measured on OpenSSL 3.5.7, one other character in a name or a section name, in any
-#: section, made it apply none of the file. A backslash, which OpenSSL reads as an escape, is
-#: refused before this is matched (:func:`_config_sections`).
+#: The characters of :data:`_NAME`, as the body of a regex character class.
 _NAME_CHARS = r"A-Za-z0-9_!%&*+,\-./;?@^|~"
+#: A name, or one word of a section name, as OpenSSL reads it: letters, digits and the punctuation
+#: in :data:`_NAME_CHARS`. Measured on OpenSSL 3.5.7, one other character in a name or a section
+#: name, in any section, made it apply none of the file. A backslash, which OpenSSL reads as an
+#: escape, is refused before this is matched (:func:`_config_sections`).
 _NAME = rf"[{_NAME_CHARS}]+"
 #: What follows a ``$`` in a value: ``name``, ``section::name``, or either in braces or brackets.
 _REFERENCE = re.compile(r"([{(]?)([A-Za-z0-9_]*)(?:::([A-Za-z0-9_]*))?")

@@ -526,31 +526,39 @@ def test_the_pinned_path_keeps_a_plant_from_answering_a_bare_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """BACKLOG #3803 S1: in the environment the probe starts its PowerShell with, PowerShell finds
-    no program on ``PATH`` under any name the text as it stood at the hold used bare, so no plant
-    can answer one. With the operator's ``PATH`` in that environment instead, it finds every plant.
-
-    The lookup is PowerShell's own search for an external program. Running the old text instead
-    makes Windows PowerShell 5.1 autoload ``Join-Path``, which with a cold module analysis cache
-    analyses every module ahead of ``$PSHOME`` on the module path: over 30s on the CI runners. The
+    no program or script on ``PATH`` under any name the text as it stood at the hold used bare. With
+    the operator's ``PATH`` in that environment instead, it finds every planted program. The
     plants go on ``PATH`` before the environment is read, so a pin that took the operator's
-    ``PATH`` would hand them over and fail this test."""
-    _plant_on_path(monkeypatch, tmp_path, keep_the_pin=True)
+    ``PATH`` would hand them over and fail this test. The probe itself, run under the pin with the
+    plants there, reads what it reads unplanted and runs none of them.
+
+    Running the old text under the pin, as this test once did, makes Windows PowerShell 5.1
+    autoload ``Join-Path``, which with a cold module analysis cache analyses every module ahead of
+    ``$PSHOME`` on the module path: over 30s on the CI runners. :func:`_applications_named` turns
+    autoloading off."""
+    real = cipher_policy._windows_enabled_suites()
+    ran = _plant_on_path(monkeypatch, tmp_path, keep_the_pin=True)
+    assert cipher_policy._windows_enabled_suites() == real
+    assert sorted(p.name for p in ran.iterdir()) == [], "a command planted on PATH ran"
     env = _start_environment(
         monkeypatch, cipher_policy._windows_enabled_suites, "TLS_AES_256_GCM_SHA384\n"
     )
     planted = _applications_named(_PLANTED_COMMANDS, {**env, "PATH": os.environ["PATH"]})
     assert sorted(Path(found).stem for found in planted) == sorted(_PLANTED_COMMANDS)
-    assert _applications_named(_PLANTED_COMMANDS, env) == [], "a program planted on PATH was found"
+    assert _applications_named(_PLANTED_COMMANDS, env) == [], "a command planted on PATH was found"
 
 
 def _applications_named(names: tuple[str, ...], env: dict[str, str]) -> list[str]:
-    """The programs Windows PowerShell finds for ``names`` as external commands, started with
-    ``env``, the probe's own, so laying it over the start-up names changes nothing.
-    ``Get-Command`` is Core-qualified, so the lookup autoloads no module."""
+    """The programs and scripts Windows PowerShell finds on ``PATH`` for ``names``, started with
+    ``env``, the probe's own, so laying it over the start-up names changes nothing. Module
+    autoloading is off: ``Get-Command`` otherwise imports each module exporting a name it is
+    asked about, which is the walk this lookup exists to avoid, and that module's warnings would
+    reach stdout."""
     quoted = ",".join(f"'{name}'" for name in names)
     done = _run_powershell(
-        f"@(Microsoft.PowerShell.Core\\Get-Command -Name {quoted} -CommandType Application "
-        "-ErrorAction SilentlyContinue).Path",
+        "$PSModuleAutoLoadingPreference = 'None'; "
+        f"@(Microsoft.PowerShell.Core\\Get-Command -Name {quoted} "
+        "-CommandType Application, ExternalScript -ErrorAction SilentlyContinue).Path",
         env,
     )
     assert done.returncode == 0, done.stderr[:300]
