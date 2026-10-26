@@ -200,6 +200,83 @@ async def test_the_rotation_leaves_a_cell_no_key_opens_and_does_not_stop(
     assert stamps[_AD].last_rotated == _OLD
 
 
+async def test_a_start_before_rotate_key_reads_the_retired_key_and_rewrites_nothing(
+    tmp_path: Path,
+) -> None:
+    """The window between setting a new active key and running ``rotate-key``: the old key is
+    configured as retired, and a start there still reads each cell under it. An unchanged secret is
+    not rewritten, so the cell stays under the retired key for ``rotate-key`` to re-seal, and a
+    changed one still resets its clock."""
+    path, a, b = tmp_path / "window.db", generate_key(), generate_key()
+    await _seed(path, a)
+    before = await _stored(path, a)
+    store = await MessageStore.open(path, cipher=_cipher(b, (a,)))
+    try:
+        same = await _reconcile(store, _VALUE)
+        assert same[_AD].last_rotated == _OLD
+        assert (await store.get_secret_rotation_meta())[_AD].fingerprint == before
+        changed = await _reconcile(store, _NEW_VALUE)
+        assert changed[_AD].last_rotated == _TODAY
+    finally:
+        await store.close()
+
+
+async def test_the_rotation_never_reseals_a_cell_moved_from_another_row(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The frozen v1 writer seals with no AAD, so only the class id inside the plaintext says whose
+    cell it is. A cell moved from another row must not be re-sealed as this row's, which would make
+    it AAD-valid here; it is left, and the next start keeps the dates."""
+    path, a, b = tmp_path / "moved.db", generate_key(), generate_key()
+    await _seed(path, a)
+    moved = seal_rotation_fingerprint(
+        _cipher(a, aad_bind=False), _SMTP, sr._fingerprint_cell(_SMTP, _VALUE)
+    )
+    await _plant(path, a, moved)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.crypto")
+    await _rotate(path, a, b)
+    assert await _stored(path, b) == moved
+    assert "key rotation: 1 " in caplog.text
+    stamps, _ = await _start(path, b, _NEW_VALUE)
+    assert stamps[_AD].last_rotated == _OLD
+
+
+async def test_a_held_value_with_a_lone_surrogate_is_fingerprinted(tmp_path: Path) -> None:
+    """A POSIX environment value decoded with ``surrogateescape`` must not raise inside the
+    reconcile, which the engine would swallow for every class."""
+    path, key = tmp_path / "surrogate.db", generate_key()
+    store = await MessageStore.open(path, cipher=_cipher(key))
+    try:
+        first = await _reconcile(store, "test-only-" + chr(0xDCFF) + "-value")
+        assert _AD in first
+        again = await _reconcile(store, "test-only-" + chr(0xDCFF) + "-value")
+        assert again[_AD].last_rotated == first[_AD].last_rotated
+    finally:
+        await store.close()
+
+
+def test_the_sql_server_column_holds_a_sealed_cell() -> None:
+    """A sealed cell is longer than the NVARCHAR(255) the SQL Server table was created with, so the
+    column is NVARCHAR(MAX) and an existing table is widened in place (BACKLOG #3472)."""
+    from messagefoundry.store import sqlserver
+
+    longest = max(
+        len(seal_rotation_fingerprint(_cipher(generate_key()), c, sr._fingerprint_cell(c, _VALUE)))
+        for c in ("X", _AD, "acme_partner_api_key_for_the_lab_feed")
+    )
+    assert longest > 255, "premise: the old width could not hold one"
+    batch = [" ".join(str(stmt).split()) for stmt in sqlserver._SCHEMA]
+    assert any(
+        "CREATE TABLE secret_rotation_meta" in stmt and "fingerprint NVARCHAR(MAX) NOT NULL" in stmt
+        for stmt in batch
+    )
+    assert any(
+        "COL_LENGTH('secret_rotation_meta','fingerprint') <> -1" in stmt
+        and "ALTER COLUMN fingerprint NVARCHAR(MAX) NOT NULL" in stmt
+        for stmt in batch
+    )
+
+
 async def test_a_store_key_rotation_does_not_lift_an_opted_in_overdue_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -274,6 +351,7 @@ def _unreadable_rows(key: str, stray: str) -> dict[str, str]:
         "another row's cell, moved under the frozen writer": seal_rotation_fingerprint(
             _cipher(key, aad_bind=False), _SMTP, sr._fingerprint_cell(_SMTP, _VALUE)
         ),
+        "an empty tag": ":abcdef",
         "a corrupt cell": f"{tag}mfenc:v4:not-a-real-cell",
         "a sealed tag over plaintext": f"{tag}{'c' * 64}:{'d' * 32}:{_AD}",
         "a cell with a malformed plaintext": seal_rotation_fingerprint(
@@ -288,6 +366,7 @@ _UNREADABLE_CASES = (
     "a cell under a key nobody supplied",
     "another row's cell",
     "another row's cell, moved under the frozen writer",
+    "an empty tag",
     "a corrupt cell",
     "a sealed tag over plaintext",
     "a cell with a malformed plaintext",
@@ -313,7 +392,7 @@ async def test_an_unreadable_fingerprint_never_resets_a_clock(
     assert stamps[_AD].last_rotated == _OLD
     assert stamps[_AD].tracked_since == _OLD
     assert open_rotation_fingerprint(_cipher(key), _AD, stored) is not None
-    kind = "earlier release" if case in _legacy_rows() else "could not be opened"
+    kind = "earlier release" if case in _legacy_rows() else "could not be read"
     warned = [r for r in caplog.records if kind in r.getMessage()]
     assert len(warned) == 1 and warned[0].getMessage().startswith("secret rotation: 1 ")
     # The count only: neither the class id (it names the secret) nor the value reaches the log.

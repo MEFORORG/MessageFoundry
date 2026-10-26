@@ -1048,8 +1048,9 @@ _SCHEMA: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves
     # _schema_hash() automatically — the ADR 0064 bump — so the table is created at open on Postgres too,
     # engaging the engine's `isinstance(store, SecretRotationMetaStore)` reconcile on this backend.
     """CREATE TABLE IF NOT EXISTS secret_rotation_meta (

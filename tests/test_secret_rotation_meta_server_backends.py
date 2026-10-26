@@ -97,18 +97,29 @@ async def _reseal_roundtrip(store: Any, retired_key: str) -> None:
     stray_key = f"TEST_3472_{uuid.uuid4().hex}"
     cell = f"{'ab' * 32}:{'cd' * 16}:{sealed_key}"  # synthetic cell shape -- NEVER a value
     old = seal_rotation_fingerprint(_aes(retired_key), sealed_key, cell)
-    stray = seal_rotation_fingerprint(_aes(generate_key()), stray_key, cell)
-    for key, fingerprint in ((sealed_key, old), (stray_key, stray)):
-        await store.upsert_secret_rotation_meta(
-            key, fingerprint=fingerprint, tracked_since="2026-06-15", last_rotated="2026-06-15"
-        )
-    cipher = store.cipher()
-    active = cipher.active_marker_prefix
-    assert await store._reseal_rotation_fingerprints_to_active(cipher, f"{active}%") >= 1
-    got = await store.get_secret_rotation_meta()
-    assert got[sealed_key].fingerprint.startswith(f"{ROTATION_FP_SEALED_SCHEME}:{active}")
-    assert open_rotation_fingerprint(cipher, sealed_key, got[sealed_key].fingerprint) == cell
-    assert got[stray_key].fingerprint == stray, "a cell no key opens is left in place"
+    stray_cell = f"{'ab' * 32}:{'cd' * 16}:{stray_key}"
+    stray = seal_rotation_fingerprint(_aes(generate_key()), stray_key, stray_cell)
+    try:
+        for key, fingerprint in ((sealed_key, old), (stray_key, stray)):
+            await store.upsert_secret_rotation_meta(
+                key, fingerprint=fingerprint, tracked_since="2026-06-15", last_rotated="2026-06-15"
+            )
+        cipher = store.cipher()
+        active = cipher.active_marker_prefix
+        await store._reseal_rotation_fingerprints_to_active(cipher, f"{active}%")
+        got = await store.get_secret_rotation_meta()
+        assert got[sealed_key].fingerprint.startswith(f"{ROTATION_FP_SEALED_SCHEME}:{active}")
+        assert open_rotation_fingerprint(cipher, sealed_key, got[sealed_key].fingerprint) == cell
+        assert got[stray_key].fingerprint == stray, "a cell no key opens is left in place"
+    finally:
+        # The CI database is shared across runs, so this test's two rows go with it.
+        for key in (sealed_key, stray_key):
+            if type(store).__name__ == "PostgresStore":
+                await store._execute("DELETE FROM secret_rotation_meta WHERE secret_key = $1", key)
+            else:
+                await store._execute(
+                    "DELETE FROM secret_rotation_meta WHERE secret_key = ?", (key,)
+                )
 
 
 async def _roundtrip(store: Any, retired_key: str) -> None:

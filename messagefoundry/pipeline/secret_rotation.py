@@ -244,8 +244,13 @@ _CELL_KEY_BYTES = 32
 
 
 def _bare_mac(key: bytes, value: str) -> str:
-    """The HMAC-SHA256 of ``value`` under ``key``, cut to :data:`_FP_HEX_LEN` hex."""
-    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()[:_FP_HEX_LEN]
+    """The HMAC-SHA256 of ``value`` under ``key``, cut to :data:`_FP_HEX_LEN` hex. ``surrogatepass``
+    for the reason :func:`_fingerprint_bytes` gives: an environment value POSIX decoded with
+    ``surrogateescape`` would otherwise raise here, and the engine's reconcile handler would swallow
+    it for every class. Identical to strict UTF-8 for every value that encodes at all."""
+    return hmac.new(key, value.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()[
+        :_FP_HEX_LEN
+    ]
 
 
 def _fingerprint_cell(class_id: str, value: str) -> str:
@@ -285,7 +290,8 @@ def _is_legacy_fingerprint(stored: str) -> bool:
     :func:`~messagefoundry.store.crypto.read_scheme_tag`'s. For the log line only; every unreadable
     row is handled the same way."""
     head, sep, _ = stored.partition(":")
-    return bool(stored) and (head == _FP_SCHEME or not sep or not head.strip("0123456789abcdef"))
+    untagged = not sep or bool(head and not head.strip("0123456789abcdef"))
+    return bool(stored) and (head == _FP_SCHEME or untagged)
 
 
 def _parsed_date(text: str) -> datetime.date | None:
@@ -560,9 +566,10 @@ async def reconcile_rotation_meta(
         )
     if unreadable:
         log.warning(
-            "secret rotation: %d secret fingerprint(s) could not be opened by any configured store "
-            "key, or were not this row's, so a change made before this start cannot be detected. "
-            "Their last-rotated dates are kept and a new fingerprint was sealed for each.",
+            "secret rotation: %d secret fingerprint(s) could not be read: no configured store key "
+            "opens it, it belongs to another row, or it is blank, malformed or in a format this "
+            "release does not know. A change made before this start cannot be detected. Their "
+            "last-rotated dates are kept and a new fingerprint was sealed for each.",
             unreadable,
         )
 

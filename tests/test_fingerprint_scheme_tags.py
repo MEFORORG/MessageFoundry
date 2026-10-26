@@ -237,7 +237,7 @@ async def test_an_unknown_scheme_is_refused_and_resets_nothing(
     assert stored[_AD].startswith(tagged[_AD])
     assert "1 stored fingerprint(s) name a scheme this release does not know" in caplog.text
     # The non-DEK row is one the engine cannot read, which keeps its dates the same way (#3472).
-    assert "1 secret fingerprint(s) could not be opened" in caplog.text
+    assert "1 secret fingerprint(s) could not be read" in caplog.text
 
 
 def test_fingerprints_equal_refuses_an_unknown_stored_scheme() -> None:

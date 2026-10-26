@@ -234,7 +234,7 @@ BODY_DIGEST_UNNAMED_KDF = "hkdf-sha256:mefor/audit-chain/v1,hkdf-sha256:mefor/au
 
 # Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
 # `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
-# so it is a different key from the audit key, the rotation-fingerprint key and every data key, and a
+# so it is a different key from the audit key and every data key, and a
 # data-key roll never touches it. The ROW-SEAL KEY is derived from that root under a second label
 # followed by the store id. Both labels are fixed-length, so `label || store_id` is unambiguous.
 _AUTHZ_ROOT_INFO = b"mefor/root/authz/v1"
@@ -873,16 +873,19 @@ def open_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str
     """The plaintext of row ``secret_key``'s sealed fingerprint ``stored``, or ``None``.
 
     ``None`` when ``stored`` is not a sealed fingerprint (a DEK key id, a pre-#3472 keyed MAC, an
-    unknown tag, a blank), and when no configured key opens it under this row's AAD: a key not
-    supplied, a cell moved from another row, a corrupt value. The caller keeps that row's dates, so
-    a cell it cannot read never resets a clock."""
+    unknown tag, a blank), when no configured key opens it under this row's AAD (a key not
+    supplied, a cell moved from another row, a corrupt value), and when the plaintext does not end
+    in ``:<secret_key>``. That last check is what refuses a moved cell that the frozen v1 writer
+    sealed with no AAD, so the rotation pass never re-seals one as this row's. The caller keeps
+    that row's dates, so a cell it cannot read never resets a clock."""
     head, sep, inner = stored.partition(":")
     if not sep or head != ROTATION_FP_SEALED_SCHEME or not cipher.is_encrypted(inner):
         return None
     try:
-        return cipher.decrypt(inner, aad=_rotation_fp_aad(secret_key))
+        cell = cipher.decrypt(inner, aad=_rotation_fp_aad(secret_key))
     except CipherError:
         return None
+    return cell if cell.endswith(f":{secret_key}") else None
 
 
 def reseal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:

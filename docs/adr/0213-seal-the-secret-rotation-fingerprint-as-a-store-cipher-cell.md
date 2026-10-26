@@ -55,8 +55,9 @@ re-seals. Stored behind a new scheme tag, `sealed-hmac-sha256-32`.**
   by the store cipher under the cell AAD `("secret_rotation_meta", "fingerprint", secret_key)` and
   stored as `sealed-hmac-sha256-32:` followed by the `mfenc:` value
   (`store/crypto.py`, `seal_rotation_fingerprint` and `open_rotation_fingerprint`). The class id is
-  checked inside the plaintext too, so a cell moved to another row reads as unreadable even with
-  `[store].aad_bind = false`.
+  checked inside the plaintext too, on every open, so a cell moved to another row reads as
+  unreadable even when the frozen v1 writer sealed it with no AAD (`[store].aad_bind = false`), and
+  the rotation pass never re-seals such a cell as its new row's.
 - **The compare.** The reconcile opens the cell and recomputes the MAC under the key inside it,
   through `hmac.compare_digest` over bytes (#1167). A match keeps the row as it is. A mismatch is a
   rotation and resets `last_rotated`. Either way a rotation writes a fresh key.
@@ -79,7 +80,10 @@ re-seals. Stored behind a new scheme tag, `sealed-hmac-sha256-32`.**
   and the advice to keep the retired key through the first start after a rotation.
 - **The DEK row is unchanged.** Its fingerprint is still its key id, tagged `sha256-16`, and
   `rotate-key` still stamps it.
-- **No schema change.** No new table or column. One column's stored format changes for non-DEK rows.
+- **Schema.** No new table or column. One column's stored format changes for non-DEK rows. A
+  sealed cell is longer than 255 characters (about 260 to 320 for the class ids shipped), so on SQL
+  Server, where the column was `NVARCHAR(255)`, it becomes `NVARCHAR(MAX)`, and an existing table is
+  widened in place. SQLite and PostgreSQL store it as `TEXT` already.
 
 This supersedes the BACKLOG #2242 re-key rule.
 

@@ -2673,13 +2673,20 @@ _SCHEMA: list[str] = [
         CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
-    # _schema_hash() — the ADR 0064 bump — so the table is created at open on SQL Server too, engaging the
-    # engine's `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves _schema_hash() — the ADR
+    # 0064 bump — so the table is created at open on SQL Server too, engaging the engine's
+    # `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
-        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(255) NOT NULL,
+        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(MAX) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
+    # BACKLOG #3472: a sealed fingerprint cell is longer than 255 characters (about 260 to 320 for
+    # the class ids shipped), so a table created at NVARCHAR(255) is widened in place. COL_LENGTH is
+    # -1 for a MAX column and NULL for no table, so this runs once and never on a fresh store. The
+    # column is in no key or index, so it alters in place.
+    """IF COL_LENGTH('secret_rotation_meta','fingerprint') <> -1
+        ALTER TABLE secret_rotation_meta ALTER COLUMN fingerprint NVARCHAR(MAX) NOT NULL""",
     # ADR 0114 sub-lever A: the lane-family claim procedures, deployed as guarded,
     # self-no-op'ing CREATE OR ALTER statements (see _claim_proc_ddl — a guard miss leaves the proc
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).

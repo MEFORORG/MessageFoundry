@@ -7768,8 +7768,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets
 
 -- Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282). One row per tracked secret CLASS (the store
 -- DEK by its key-id, plus each configured connector/AD/SMTP/Vault/OIDC secret the engine holds). Every
--- column is NON-SECRET: `fingerprint` is a KEYED MAC (DEK-derived subkey, HMAC — never a salted hash, so
--- a low-entropy secret is not offline-guessable) OR the DEK's one-way key-id; `tracked_since` is the
+-- column is NON-SECRET: `fingerprint` is the DEK's one-way key-id, or for any other class a store-cipher
+-- cell sealing a KEYED MAC under a random per-row key (HMAC — never a salted hash, so a low-entropy
+-- secret is not offline-guessable; BACKLOG #3472, ADR 0213); `tracked_since` is the
 -- age FLOOR first observed (so a pre-existing year-old key gets a fresh clock on upgrade, never a
 -- retroactive alert); `last_rotated` is reset to today when the fingerprint changes (rotation is
 -- AUTO-DETECTED, never operator-attested). NEVER a secret value — the watcher reads a value only to MAC
