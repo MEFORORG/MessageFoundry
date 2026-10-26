@@ -133,8 +133,8 @@ class ApiHandshakeRecord:
     DEBUG at most, so before #3302 nothing an operator reads showed a peer failing them again and
     again. The API has no connection to carry an event, so the record is a log line, throttled as
     ``docs/PHI.md`` section 7, row 7 states. The peer's address is not known where the hook runs
-    (see :mod:`messagefoundry.tls_handshake_failures`). Serve keeps this object for as long as
-    uvicorn runs, since the hook holds it weakly, and calls :meth:`close` once uvicorn returns, so
+    (see :mod:`messagefoundry.tls_handshake_failures`). The context's hook holds the counter, not
+    this object. Serve keeps this object so it can call :meth:`close` once uvicorn returns, and
     what the trailing line still held is logged rather than lost with the loop.
 
     A client refusing the engine's own auto-minted certificate (ADR 0172), such as a browser before

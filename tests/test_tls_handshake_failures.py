@@ -141,6 +141,38 @@ def test_the_hook_reports_a_failed_handshake_and_not_a_completed_one(tmp_path: P
     assert "GET" not in seen[0]
 
 
+#: A TLS close_notify alert record: content type 21, TLS 1.2 record version, level warning.
+_CLOSE_NOTIFY = b"\x15\x03\x03\x00\x02\x01\x00"
+
+
+def test_the_hook_does_not_count_a_peer_hanging_up_midway(tmp_path: Path) -> None:
+    """A peer that sends close_notify after its ClientHello hangs up mid-handshake, and the server's
+    ``do_handshake`` raises ``SSLZeroReturnError`` (measured 2026-10-26). No surface counts a
+    hang-up (owner ruling 2026-10-26, vault BACKLOG #3785 item 8), so the hook does not either."""
+    server_ctx, cert = _server_ctx(tmp_path)
+    seen: list[str] = []
+    watch_loop_handshakes(server_ctx, seen.append)
+
+    def after_hello(then: bytes) -> None:
+        c_in, c_out, s_in, s_out = (ssl.MemoryBIO() for _ in range(4))
+        client = _pinned_client(cert).wrap_bio(c_in, c_out, server_hostname="127.0.0.1")
+        server = server_ctx.wrap_bio(s_in, s_out, server_side=True)
+        with pytest.raises(ssl.SSLWantReadError):
+            client.do_handshake()
+        s_in.write(c_out.read())
+        with pytest.raises(ssl.SSLWantReadError):
+            server.do_handshake()
+        s_in.write(then)
+        with pytest.raises(ssl.SSLError):
+            server.do_handshake()
+
+    after_hello(_CLOSE_NOTIFY)
+    assert seen == []
+    # The control: the same point in the handshake, a record that is no TLS record, is counted.
+    after_hello(_PLAINTEXT)
+    assert len(seen) == 1
+
+
 def test_a_fault_in_the_recorder_does_not_change_the_handshake_error(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,6 +299,32 @@ async def test_a_closed_counter_counts_nothing_and_flushes_only_while_closed() -
     failures.open()
     await failures.note(None, "SSLError")
     assert failures.count == 3
+
+
+async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
+    """``flush`` waits for a report in flight before it sends what was held. A restart reached in
+    that wait makes the held failure the restarted listener's, so the flush sends nothing more."""
+    sent: list[str] = []
+    gate = asyncio.Event()
+
+    async def emit(_peer_host: str | None, reason: str) -> None:
+        sent.append(reason)
+        await gate.wait()
+
+    failures = HandshakeFailures(emit)
+    failures.note_soon(None, "SSLError A")  # due now: a report in flight, parked on the gate
+    failures.note_soon(None, "SSLError B")  # held
+    failures.close()
+    flushing = asyncio.ensure_future(failures.flush())
+    await asyncio.sleep(0)  # the flush is in its wait
+    failures.open()
+    gate.set()
+    await flushing
+    assert len(sent) == 1 and sent[0].endswith("SSLError A")
+    # The control: closed again, the held failure is sent.
+    failures.close()
+    await failures.flush()
+    assert len(sent) == 2 and sent[1].endswith("SSLError B")
 
 
 # --- a listener is freed by refcounting (vault BACKLOG #3785 item 1) ---------------------------
@@ -528,6 +586,26 @@ async def test_a_listener_running_its_own_handshake_does_not_count_twice(
         assert peer == "127.0.0.1"  # counted by `_start_tls`, which knows the peer
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_restarted_listener_counts_again(tmp_path: Path) -> None:
+    """stop() closes the counter, so the next start() must open it again or count nothing."""
+
+    async def restart_then_fail(source: Any, handler: Any) -> None:
+        source.on_connection_event = _Events()
+        await source.start(handler)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+        await source.start(handler)
+        try:
+            await _plaintext_peer(source.sockport)
+            await _until(lambda: source.tls_handshake_failures == 1, "not counted again")
+        finally:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+
+    for sub in ("mllp", "http"):
+        (tmp_path / sub).mkdir()
+    await restart_then_fail(_tls_source(tmp_path / "mllp")[0], _ack)
+    await restart_then_fail(_http_tls_source(tmp_path / "http")[0], _no_reply)
 
 
 # --- the API ------------------------------------------------------------------------------------

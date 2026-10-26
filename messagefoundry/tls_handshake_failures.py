@@ -4,9 +4,10 @@
 
 Two parts, shared by the MLLP listener, the HTTP intake listener and the API:
 
-* :class:`HandshakeFailures` is the counter and the throttle, one per listener, and the DICOM C-STORE
-  SCP's too since #3784. It was the MLLP listener's own until #3302 lifted it here. What it throttles, and how, is stated once, in
-  ``docs/PHI.md`` section 7, row 7 (vault BACKLOG #3785 item 2).
+* :class:`HandshakeFailures` is the counter and the throttle, one per listener, and the DICOM
+  C-STORE SCP's too since #3784. It was the MLLP listener's own until #3302 lifted it here. What
+  it throttles, and how, is stated once, in ``docs/PHI.md`` section 7, row 7 (vault BACKLOG #3785
+  item 2).
 * :func:`watch_loop_handshakes` sees a failure the EVENT LOOP had, where no listener code runs.
 
 **Why the second part exists.** Where the loop runs the handshake, through
@@ -33,8 +34,9 @@ protocol class is replaced.
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
   counted there. Where a listener runs its own handshakes, it still counts that case itself: the
-  MLLP listener on the stdlib loop, and the DICOM SCP always. A wrong certificate, a missing client certificate, a protocol downgrade and
-  plaintext on a TLS port all raise, so all are counted.
+  MLLP listener on the stdlib loop, and the DICOM SCP always. A wrong certificate, a missing
+  client certificate, a protocol downgrade and plaintext on a TLS port all raise, so all are
+  counted.
 * **A peer that hangs up mid-handshake. A known limit, declined by owner ruling 2026-10-26 (vault
   BACKLOG #3785 item 8).** Not counted on any surface, as on MLLP since #2613: that is what a load
   balancer's TCP health check does.
@@ -88,7 +90,8 @@ def _weakly[**P, R](fn: Callable[P, R]) -> Callable[P, R | None]:
     listener). Only the cyclic collector freed either. The context's hook now holds the counter
     (:meth:`HandshakeFailures.watch`), so with this no cycle runs through the listener. A plain
     function owns no object, and ``weakref.WeakMethod`` refuses one, so it is held as it is.
-    Once the object is gone the call does nothing and returns ``None``."""
+    Once the object is gone the call does nothing and returns ``None``. So a method of an object
+    nothing else holds, such as a temporary, reports nothing: hand in the listener's own method."""
     if not inspect.ismethod(fn):
         return fn
     ref = weakref.WeakMethod(fn)
@@ -109,8 +112,9 @@ _AGAIN = (ssl.SSLWantReadError, ssl.SSLSyscallError)
 #: BACKLOG #2613; owner ruling 2026-10-26, #3785 item 8). A reset is how the Windows Proactor
 #: reports a hang-up to the MLLP listener. A blocking handshake, the DICOM SCP's, sees a close as
 #: ``SSLEOFError`` and a reset as ``ConnectionResetError`` (measured 2026-10-26, CPython 3.14 for
-#: Windows). The loop's hook never sees a hang-up, since neither loop raises one from
-#: ``do_handshake``.
+#: Windows). The loop's TLS object raises ``SSLZeroReturnError`` from ``do_handshake`` when a
+#: peer sends close_notify after its ClientHello (measured 2026-10-26 over memory buffers), so
+#: the loop's hook skips this set too.
 HUNG_UP: tuple[type[OSError], ...] = (
     ConnectionResetError,
     BrokenPipeError,
@@ -147,8 +151,10 @@ class HandshakeFailures:
     listener keeps its counter alive and not the other way round. The reason is
     a count and a cause from :func:`handshake_cause`, never the peer's bytes.
 
-    Every method runs on the listener's event loop. A caller on another thread hands a failure
-    over with ``loop.call_soon_threadsafe``.
+    Each method that counts or reports runs on the listener's event loop, and a caller on another
+    thread hands a failure over with ``loop.call_soon_threadsafe``. :meth:`open`, :meth:`close`
+    and :meth:`take_held` need no running loop, so the API can log what was held after uvicorn's
+    loop is gone.
     """
 
     def __init__(self, emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None]) -> None:
@@ -265,7 +271,8 @@ class HandshakeFailures:
                 await sent
 
     def _disarm(self) -> None:
-        """Disarm the trailing timer. What it held stays held, for :meth:`flush` or :meth:`take_held`."""
+        """Disarm the trailing timer. What it held stays held, for :meth:`flush` or
+        :meth:`take_held`."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -280,12 +287,15 @@ class HandshakeFailures:
         which the engine's runner never does: it joins an abandoned stop() before it starts the
         listener again (``_settle_pending_source_stops`` in ``pipeline/wiring_runner.py``). The
         check is kept anyway (vault BACKLOG #3785 item 5). It costs one flag test, and without it
-        this class would depend on its caller's ordering."""
+        this class would depend on its caller's ordering. It is checked again after the wait,
+        since :meth:`open` can run during it. Called without :meth:`close` first, it sends
+        nothing, for the same reason."""
         if not self._closed:
             return
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self.report()
+        if self._closed:
+            await self.report()
 
 
 def watch_loop_handshakes(ctx: ssl.SSLContext, on_failure: Callable[[str], None]) -> None:
@@ -313,6 +323,8 @@ class _WatchedSSLObject(ssl.SSLObject):
         try:
             super().do_handshake()
         except _AGAIN:
+            raise
+        except HUNG_UP:  # a peer's close_notify after its ClientHello raises SSLZeroReturnError
             raise
         except ssl.SSLError as exc:
             try:

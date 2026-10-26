@@ -1240,7 +1240,9 @@ class DicomScpSource(SourceConnector):
         # a rate debt (BACKLOG #1114). A no-op when pacing is off, and idempotent.
         self._stopping.set()
         # In the same loop step, so a failure a connection thread hands over from here on, the
-        # ones the stop causes among them, is not counted (vault BACKLOG #3784).
+        # ones the stop causes among them, is not counted (vault BACKLOG #3784). A genuine failure
+        # still in flight to the loop when stop() starts is dropped with them: the loop cannot tell
+        # the two apart, and stop() ends the listener's record anyway.
         self._tls_failures.close()
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
         # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
