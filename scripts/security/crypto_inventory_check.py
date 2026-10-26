@@ -1731,6 +1731,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/strict_requests.py": frozenset(
         {
             "hash:hashlib.sha256",  # Vault BACKLOG #4028: the ambient proxy disclosure's dedupe key
+            # BACKLOG #3458: connect() checks the client key hvac took from VAULT_CLIENT_CERT with
+            # keywrap.refuse_weak_cert_chain_key before urllib3 loads it. A check, not a load.
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.load_verify_locations()",
         }
     ),
