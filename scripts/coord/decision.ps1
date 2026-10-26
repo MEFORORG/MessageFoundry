@@ -538,14 +538,14 @@ function Complete-Log([string]$How, [int]$Code) {
 
 # EVERY RECORD IS SPOOLED BEFORE ANYTHING ELSE RUNS, the gate included, so a gate that crashes or
 # hangs cannot lose it. The gate then skips this record's own id, and its answer is written into
-# the spooled copy, unless a flusher has already taken that copy to post.
+# the spooled copy. A flusher leaves a fresh PENDING record alone, so it is not posted before then.
 Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
 if ($gated) {
     $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
         -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
     $record.gate = $gateAnswer.Result
     if (-not (Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record))) {
-        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but another flusher had already taken $($record.id) to post, so the record says gate PENDING.")
+        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten (a flusher had taken it to post, or it stayed locked), so the record says gate PENDING.")
     }
 }
 if ($NoPost) { Complete-Log 'spooled' 0 }

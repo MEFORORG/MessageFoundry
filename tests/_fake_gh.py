@@ -268,13 +268,17 @@ class Sandbox:
         env.update(extra)
         return env
 
+    def argv(self, script: Path, *args: str) -> list[str]:
+        """The pwsh command line for a script by its real-tree path; the sandbox's copy runs."""
+        local = self.repo / script.resolve().relative_to(ROOT)
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(local), *args]
+
     def run(
         self, script: Path, *args: str, stdin: str = "", **extra: str
     ) -> subprocess.CompletedProcess[str]:
         """Run a script by its real-tree path; the sandbox's own copy is what runs."""
-        local = self.repo / script.resolve().relative_to(ROOT)
         return subprocess.run(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(local), *args],
+            self.argv(script, *args),
             cwd=str(self.repo),
             env=self.env(**extra),
             input=stdin,

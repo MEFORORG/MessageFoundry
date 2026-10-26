@@ -353,7 +353,8 @@ CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOW
 does not finish within 30 seconds is UNKNOWN. A window graded HIT stays HIT whatever
 `usage.ps1` reads overall, because downgrading a hit would fail open.
 
-At the rung the answer is HALT. A reading `usage.ps1` calls UNKNOWN answers REVIEW, not HALT:
+At the rung the answer is HALT. A 5-hour reading `usage.ps1` calls UNKNOWN, or an overall UNKNOWN
+below the rung, answers REVIEW, not HALT:
 UNKNOWN is common, because a Desktop session runs no statusLine, and halting on it would shut the
 gate for good. The Steward's `status.json` fallback, which `usage-headroom-inject.ps1` prints for
 such a session, is **not read**. Reading it would mean a third copy of `watch.py`'s pool rules. So
@@ -366,7 +367,8 @@ roster alias of the Lander.
 **`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is spooled
 first with `gate` `PENDING`, so the log keeps its rule that every record is spooled locally first.
 The gate then runs, skipping that record's own id, and its answer replaces `PENDING` in the
-spooled copy. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
+spooled copy; a flusher leaves a `PENDING` record younger than ten minutes alone, so it is not
+posted first. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
 toward the chain floor. The record is posted whatever the answer. When the answer is not
 NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
 `LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,

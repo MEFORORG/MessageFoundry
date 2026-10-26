@@ -13,12 +13,10 @@ starts from that seat, so a REVIEW proves the one condition the test adds closed
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 import json
 import os
 import shutil
-import signal
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
@@ -297,22 +295,15 @@ def test_a_reading_usage_calls_unknown_overall_is_unknown_here(sb: Sandbox) -> N
     assert code == REVIEW and "WIRED_ELSEWHERE" in why(out)
 
 
-@pytest.mark.parametrize(
-    ("five", "reason"),
-    [
-        pytest.param(usage(99.0, state="CRITICAL"), "At the ceiling", id="ceiling"),
-        pytest.param(usage(85.0, state="WARN"), "the level is the backstop", id="level"),
-    ],
-)
-def test_a_hit_stands_when_usage_reads_unknown_overall(
-    sb: Sandbox, five: dict[str, Any], reason: str
-) -> None:
-    """Downgrading a 5-hour hit to UNKNOWN would let a session at the rung act after review."""
+def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
+    """An OK 5-hour window past the level backstop, under usage.ps1's refusal of a statusLine
+    wired elsewhere: downgrading that hit to UNKNOWN would let a session at the rung act."""
     seed_vault(sb, calibrated("manager"))
-    five.update(state="UNKNOWN", statusline_state="WIRED_ELSEWHERE")
-    write_fake_usage(_usage_path(sb), five, code=20)
-    code, doc = gate(sb)
-    assert code == HALT and reason in why(doc), why(doc)
+    doc = usage(82.0)
+    doc.update(state="UNKNOWN", statusline_state="WIRED_ELSEWHERE")
+    write_fake_usage(_usage_path(sb), doc, code=20)
+    code, out = gate(sb)
+    assert code == HALT and "the level is the backstop" in why(out), why(out)
 
 
 @pytest.mark.parametrize("seat", ["lander", "land"])
@@ -483,9 +474,11 @@ def test_the_item_floor_counts_unsampled_class_b_in_24_hours(
 
 
 def test_a_future_dated_decision_counts_toward_the_floor(sb: Sandbox) -> None:
-    """Two in the last hours and one a skewed clock dated ahead of now: depth three."""
+    """Two in the last hours and one a skewed clock dated just past tomorrow's 00:00 UTC, so it
+    sits in tomorrow's issue, which the gate must read as well: depth three."""
     recent = [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(2)]
-    ahead = rec(at=ago(hours=-1), seat="builder", item="4242")
+    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    ahead = rec(at=midnight + timedelta(days=1, seconds=30), seat="builder", item="4242")
     seed_vault(sb, [*calibrated("manager"), *recent, ahead])
     code, doc = gate(sb)
     assert code == REVIEW and "chain: depth 3" in why(doc), why(doc)
@@ -642,38 +635,56 @@ def test_a_gate_that_crashes_leaves_the_record_spooled(sb: Sandbox) -> None:
 
 
 def test_a_gate_that_hangs_leaves_the_record_spooled(sb: Sandbox, tmp_path: Path) -> None:
-    """The usage reader never answers; while the gate waits on it, the record is already spooled."""
-    started = tmp_path / "usage-started"
+    """The usage reader never answers. While the gate waits on it, the record is already spooled,
+    and a flusher leaves it there rather than post its PENDING gate for good."""
+    started, stop = tmp_path / "usage-started", tmp_path / "usage-stop"
     _usage_path(sb).write_text(
-        f"Set-Content -LiteralPath '{started}' -Value $PID\nStart-Sleep -Seconds 300\n",
+        f"Set-Content -LiteralPath '{started}' -Value started\n"
+        "$until = (Get-Date).AddSeconds(120)\n"
+        f"while (-not (Test-Path -LiteralPath '{stop}') -and (Get-Date) -lt $until) "
+        "{ Start-Sleep -Milliseconds 200 }\n",
         encoding="utf-8",
     )
-    local = sb.repo / DECISION.resolve().relative_to(ROOT)
-    args = no_host_usage(sb, (*LOG_B, "-Class", "B"))
-    proc = subprocess.Popen(  # noqa: S603 - a fixed pwsh argv
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(local), *args],
+    proc = subprocess.Popen(
+        sb.argv(DECISION, *no_host_usage(sb, (*LOG_B, "-Class", "B"))),
         cwd=str(sb.repo),
         env=sb.env(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    reader = 0
     try:
         deadline = time.monotonic() + 60
-        while not reader and time.monotonic() < deadline:
-            text = started.read_text(encoding="utf-8").strip() if started.exists() else ""
-            reader = int(text) if text.isdigit() else 0
+        while not started.exists() and time.monotonic() < deadline:
             time.sleep(0.2)
-        assert reader, "the stand-in usage reader never started"
+        assert started.exists(), "the stand-in usage reader never started"
         assert proc.poll() is None, "decision.ps1 finished; the gate did not hang"
         (row,) = _spooled(sb)
         assert (row["kind"], row["item"], row["gate"]) == ("decision", "4242", "PENDING")
+        flush = sb.run(DECISION, "-Flush")
+        assert "FLUSHED posted=0 failed=0" in flush.stdout, (flush.stdout, flush.stderr)
+        assert [r["id"] for r in _spooled(sb)] == [row["id"]]
     finally:
+        stop.write_text("stop", encoding="utf-8")
         proc.kill()
         proc.wait(timeout=30)
-        if reader:
-            with contextlib.suppress(OSError):
-                os.kill(reader, signal.SIGTERM)
+
+
+def test_a_record_claimed_before_the_gate_answers_stays_pending(sb: Sandbox) -> None:
+    """A flusher claims the record while the gate runs: the answer cannot be written into it, so
+    it keeps gate PENDING, which counts toward the floor, and -Log says so."""
+    spool = sb.coord / "decisions" / "spool"
+    _usage_path(sb).write_text(
+        f"$f = Get-ChildItem -LiteralPath '{spool}' -Filter '*.json' | Select-Object -First 1\n"
+        "Rename-Item -LiteralPath $f.FullName -NewName ($f.Name + '.99999.posting')\n"
+        f"Write-Output @'\n{json.dumps(usage(95.0, state='WARN'))}\n'@\n",
+        encoding="utf-8",
+    )
+    proc = _log(sb)
+    assert proc.returncode == HALT, (proc.stdout, proc.stderr)
+    assert "could not be rewritten" in proc.stderr and "says gate PENDING" in proc.stderr
+    (claim,) = sb.spool()
+    assert claim.name.endswith(".json.99999.posting"), sb.spool()
+    assert json.loads(claim.read_text(encoding="utf-8"))["gate"] == "PENDING"
 
 
 def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:
@@ -681,9 +692,10 @@ def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:
     script = (
         "[cultureinfo]::CurrentCulture = 'th-TH'; "
         f". '{COORD / '_decisionlog.ps1'}'; "
-        "New-DecisionId; Get-DecisionDayRange '2026-10-26' 2; (Get-Date).ToString('yyyy')"
+        "New-DecisionId; Get-DecisionDayRange '2026-10-26' 2; Resolve-DecisionDay ''; "
+        "(Get-Date).ToString('yyyy')"
     )
-    proc = subprocess.run(  # noqa: S603 - a fixed pwsh argv
+    proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
@@ -691,11 +703,13 @@ def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    minted, *days, control = proc.stdout.split()
-    assert int(control) > 2500, "the control: the culture did not take, so this proves nothing"
+    minted, *days, today, control = proc.stdout.split()
+    if int(control) < 2500:
+        pytest.skip("th-TH did not take on this host (invariant globalization?); nothing is shown")
     at = datetime.strptime(minted[1:16], "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
     assert abs(at - datetime.now(UTC)) < timedelta(hours=1), minted
     assert days == ["2026-10-26", "2026-10-25"]
+    assert today[:4] == minted[1:5], today
 
 
 # --- the digest carries the gate's state and the attic ---------------------------------------

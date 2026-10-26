@@ -47,7 +47,7 @@ function Get-DecisionCoordRoot {
 
 function Resolve-DecisionDay([string]$Day) {
     # Today (UTC) by default; a malformed day is refused rather than read as a day with no records.
-    if (-not $Day) { return [DateTime]::UtcNow.ToString('yyyy-MM-dd') }
+    if (-not $Day) { return [DateTime]::UtcNow.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
     $parsed = [DateTime]::MinValue
     if ($Day -notmatch '^\d{4}-\d{2}-\d{2}$' -or -not [DateTime]::TryParseExact($Day, 'yyyy-MM-dd',
             [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
@@ -257,7 +257,7 @@ function Read-DecisionSpool([string]$CoordRoot) {
         # A file being posted right now is <id>.json.<pid>.posting; it is still unposted until it goes.
         if (-not ($f.EndsWith('.json') -or $f.EndsWith('.posting'))) { continue }
         try {
-            $rec = Complete-DecisionRecord ([System.IO.File]::ReadAllText($f) | ConvertFrom-Json -ErrorAction Stop)
+            $rec = Complete-DecisionRecord (Read-DecisionSpoolText $f | ConvertFrom-Json -ErrorAction Stop)
             $rec | Add-Member -NotePropertyName posted -NotePropertyValue $false -Force
             $out.Add($rec)
         } catch {
@@ -267,43 +267,78 @@ function Read-DecisionSpool([string]$CoordRoot) {
     return $out.ToArray()
 }
 
-function Write-DecisionSpool([string]$CoordRoot, $Record) {
-    $dir = Get-DecisionSpoolDir $CoordRoot
-    $null = [System.IO.Directory]::CreateDirectory($dir)
-    $final = Join-Path $dir "$($Record.id).json"
+function Read-DecisionSpoolText([string]$Path) {
+    # A spool file being rewritten (Update-DecisionSpool) is locked for a moment, and a gate that
+    # skipped it would count one record fewer, so a sharing violation is retried briefly.
+    for ($try = 1; ; $try++) {
+        try { return [System.IO.File]::ReadAllText($Path) }
+        catch [System.IO.FileNotFoundException] { throw }
+        catch [System.IO.IOException] { if ($try -ge 5) { throw }; Start-Sleep -Milliseconds 50 }
+    }
+}
+
+function Write-DecisionSpoolPart([string]$CoordRoot, $Record) {
+    # The record as <id>.json.<pid>.tmp beside its final name, which no reader or flusher takes.
+    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$($Record.id).json"
     $part = "$final.$PID.tmp"
     [System.IO.File]::WriteAllText($part, ($Record | ConvertTo-Json -Depth 8 -Compress), [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::Move($part, $final)
+    return [pscustomobject]@{ Part = $part; Final = $final }
+}
+
+function Write-DecisionSpool([string]$CoordRoot, $Record) {
+    $null = [System.IO.Directory]::CreateDirectory((Get-DecisionSpoolDir $CoordRoot))
+    $f = Write-DecisionSpoolPart $CoordRoot $Record
+    [System.IO.File]::Move($f.Part, $f.Final)
 }
 
 function Update-DecisionSpool([string]$CoordRoot, $Record) {
     <#
       Rewrites a record still spooled as <id>.json, and returns whether it did. A flusher that has
-      already claimed the file (renamed it to post) leaves nothing to replace, and File.Replace
-      refuses rather than spool a second copy that would be posted twice.
+      claimed the file (renamed it to post) leaves nothing to replace: on Windows File.Replace then
+      refuses rather than spool a second copy. On Linux and macOS it checks and then renames, so a
+      claim between the two would spool the record twice, which a reader dedups by id; a flusher
+      does not claim a fresh PENDING record (Send-DecisionSpool), which keeps that window shut in
+      practice. A lock from a reader is retried briefly.
     #>
-    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$($Record.id).json"
-    $part = "$final.$PID.tmp"
-    [System.IO.File]::WriteAllText($part, ($Record | ConvertTo-Json -Depth 8 -Compress), [System.Text.UTF8Encoding]::new($false))
+    $f = Write-DecisionSpoolPart $CoordRoot $Record
     try {
-        # [NullString], since PowerShell passes $null to a string parameter as ''.
-        [System.IO.File]::Replace($part, $final, [NullString]::Value)
-        return $true
-    } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
-        [System.IO.File]::Delete($part)
+        for ($try = 1; $try -le 5; $try++) {
+            if (-not [System.IO.File]::Exists($f.Final)) { return $false }
+            try {
+                # [NullString], since PowerShell passes $null to a string parameter as ''.
+                [System.IO.File]::Replace($f.Part, $f.Final, [NullString]::Value)
+                return $true
+            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                Start-Sleep -Milliseconds 100
+            }
+        }
         return $false
+    } finally {
+        if ([System.IO.File]::Exists($f.Part)) { [System.IO.File]::Delete($f.Part) }
     }
 }
 
+function Test-DecisionSpoolPending([System.IO.FileInfo]$File) {
+    # A record whose -Log is still waiting on its gate: PENDING, and written in the last ten
+    # minutes. Posting it now would post PENDING for good. Older, its gate crashed or hung, and it
+    # is posted as it stands. An unreadable file is left to the claim, which reports it.
+    if ($File.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)) { return $false }
+    try { return [string](Read-DecisionSpoolText $File.FullName | ConvertFrom-Json -ErrorAction Stop).gate -eq 'PENDING' }
+    catch { return $false }
+}
+
 function Send-DecisionSpool {
-    <# Posts every spooled record to its day's issue, oldest first. Returns the count posted and an error per record left. #>
+    <#
+      Posts every spooled record to its day's issue, oldest first, except one still waiting on its
+      gate (Test-DecisionSpoolPending). Returns the count posted and an error per record left.
+    #>
     param([string]$Repo, [string]$CoordRoot)
     $posted = 0; $errors = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
     if (-not [System.IO.Directory]::Exists($dir)) { return [pscustomobject]@{ Posted = 0; Errors = $errors } }
     $stale = [DateTime]::UtcNow.AddMinutes(-10)
     $files = [System.IO.DirectoryInfo]::new($dir).GetFiles() | Where-Object {
-        $_.Name.EndsWith('.json') -or ($_.Name.EndsWith('.posting') -and $_.LastWriteTimeUtc -lt $stale)
+        ($_.Name.EndsWith('.json') -and -not (Test-DecisionSpoolPending $_)) -or ($_.Name.EndsWith('.posting') -and $_.LastWriteTimeUtc -lt $stale)
     } | Sort-Object Name
     $issues = @{}
     $dayFailed = @{}
