@@ -1169,11 +1169,8 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
-        if (
-            self.ssl_root_cert
-            and self.backend is StoreBackend.SQLSERVER
-            and (not self.encrypt or self.trust_server_certificate)
-        ):
+        sqlserver = self.backend is StoreBackend.SQLSERVER
+        if self.ssl_root_cert and sqlserver and self.sqlserver_pin_path() is None:
             # Vault BACKLOG #3714 item 9: the store sends the pin only on the verifying posture, so
             # beside a weakened one it would be dropped with nothing said. Refuse rather than ignore,
             # as _ssl_crl_file_reachable does for its own setting.

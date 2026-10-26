@@ -833,8 +833,14 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
         with open(path, "rb") as fh:
             data = fh.read()
     except OSError as exc:
-        return f"could not be read: {exc.strerror or type(exc).__name__}"
+        return unreadable_pin_reason(exc)
     return pinned_server_certificate(data)
+
+
+def unreadable_pin_reason(exc: OSError) -> str:
+    """The phrase for a pin file the OS would not read, in the shape of
+    :func:`read_pinned_server_certificate`'s reasons: the ``strerror``, never the path's bytes."""
+    return f"could not be read: {exc.strerror or type(exc).__name__}"
 
 
 def pinned_server_certificate(data: bytes) -> x509.Certificate | str:

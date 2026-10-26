@@ -2717,7 +2717,7 @@ def check_pinned_certificate(
     host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
 
     * it takes the trust-anchor ACL and path checks with their own rules and messages
-      (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor_bytes`): a file or folder a broad
+      (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
       principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
       and no posture counts as enforcing. The driver reads the file by path, so the spec carries
       ``loads_verified_bytes=False`` (:func:`~messagefoundry.auth.trust_anchors.store_pin_anchor_spec`);
@@ -2726,9 +2726,8 @@ def check_pinned_certificate(
       still counts as valid, as RFC 5280 reads it.
 
     The file is read once, and the certificate checks read the bytes the anchor checks read
-    (BACKLOG #3714). This check writes no audit row, because it runs before the store that holds
-    them is open. The audited check of the same file is the settings preflight at start and reload
-    (:func:`~messagefoundry.auth.trust_anchors.collect_anchor_specs`).
+    (BACKLOG #3714). It writes no audit row; the audited check is the settings preflight
+    (:mod:`messagefoundry.auth.trust_anchors`, module item 11).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
     :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
@@ -2736,27 +2735,26 @@ def check_pinned_certificate(
     so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
     from messagefoundry.auth.trust_anchors import (
         TrustAnchorError,
-        enforced_anchor_bytes,
+        enforced_anchor,
         store_pin_anchor_spec,
     )
-    from messagefoundry.pki import pinned_server_certificate
+    from messagefoundry.pki import pinned_server_certificate, unreadable_pin_reason
     from messagefoundry.redaction import log_timestamp
 
     spec = store_pin_anchor_spec(settings)
     if spec is None:
         return
     path = spec.path
-    refusal: str | None = None
-    data = b""
+    checked: bytes | str  # the bytes the anchor checks read, or the refusal
     try:
-        _, data = enforced_anchor_bytes(spec, enforcing=posture is None or posture.enforcing)
+        checked = enforced_anchor(spec, enforcing=posture is None or posture.enforcing).data
     except TrustAnchorError as exc:
-        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
+        checked = str(exc)  # the anchor module's own message, which names the setting and the fix
     except OSError as exc:
-        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
-    if refusal is not None:
-        raise ValueError(refusal)
-    cert = pinned_server_certificate(data)
+        checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
+    if isinstance(checked, str):  # raised outside the handler, so no chained parser text
+        raise ValueError(checked)
+    cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
         raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
     moment = time.time() if now is None else now
@@ -2839,8 +2837,6 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
     # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
     # keywords stay inside the last-wins tail.
-    # The posture arm guards settings built without validation: load refuses a pin beside a
-    # weakened posture (BACKLOG #3714). The predicate is shared with the trust-anchor preflight.
     pin = settings.sqlserver_pin_path()
     if pin:
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")

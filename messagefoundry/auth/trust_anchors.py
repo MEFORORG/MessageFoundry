@@ -130,9 +130,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
-    items 1 to 4 at start and at every reload. The store checks it too, unaudited, at each open.
+    items 1 to 4 at start and at every reload. The store checks it too at each open, before any
+    connect, with no audit row, because the store that holds the rows is not open yet. A
+    PostgreSQL ``ssl_root_cert`` is a CA bundle its driver checks itself, and is not added.
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
-    checked bytes are not the loaded bytes.
+    checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
+    and no fingerprint pin. A changed file is used by the next connect and audited by the next
+    reload, which writes ``changed`` and no ``restart_required``.
 """
 
 from __future__ import annotations
@@ -1083,6 +1087,12 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     )
 
 
+#: The last line of an enforced refusal and of a warning (BACKLOG #3714 item 4). Neither says
+#: "start": the same check runs at a reload, a lane build and a store open.
+_REFUSED = "[security].enforcement=enforce refuses it"
+_WARNED = "[security].enforcement=warn, using it anyway"
+
+
 def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool) -> None:
     """Apply the owner fork to a verdict. Raises :class:`TrustAnchorError` on a fatal violation.
 
@@ -1099,18 +1109,12 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _acl_message(spec) + "\n[security].enforcement=enforce refuses it"
-            )
-        log.warning("%s\n[security].enforcement=warn, using it anyway", _acl_message(spec))
+            raise TrustAnchorError(f"{_acl_message(spec)}\n{_REFUSED}")
+        log.warning("%s\n%s", _acl_message(spec), _WARNED)
     if verdict.path_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses it"
-            )
-        log.warning(
-            "%s\n[security].enforcement=warn, using it anyway", _path_message(spec, verdict)
-        )
+            raise TrustAnchorError(f"{_path_message(spec, verdict)}\n{_REFUSED}")
+        log.warning("%s\n%s", _path_message(spec, verdict), _WARNED)
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
@@ -1125,28 +1129,25 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
         return
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
-        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses it")
-    log.warning("%s\n%s\n[security].enforcement=warn, using it anyway", unknown, fix)
+        raise TrustAnchorError(f"{unknown}\n{fix}\n{_REFUSED}")
+    log.warning("%s\n%s\n%s", unknown, fix, _WARNED)
+
+
+def enforced_anchor(spec: AnchorSpec, *, enforcing: bool) -> AnchorVerdict:
+    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
+    verdict, whose ``data`` is the bytes it checked. It loads nothing. A consumer that loads the
+    anchor into a context calls :func:`verified_anchor_cadata` instead and loads what that returns:
+    calling this and then loading the file by path reopens the check-then-load gap BACKLOG #1142,
+    slice 2 closed. A caller that inspects the content itself reads ``data``, so it reads the file
+    once, as the SQL Server pin's validity check does (vault BACKLOG #3714)."""
+    verdict = evaluate_anchor(spec)
+    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    return verdict
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
-    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
-    fingerprint. It loads nothing. A consumer that loads the anchor into a context calls
-    :func:`verified_anchor_cadata` instead and loads what that returns: calling this and then loading
-    the file by path reopens the check-then-load gap BACKLOG #1142, slice 2 closed."""
-    return enforced_anchor_bytes(spec, enforcing=enforcing)[0]
-
-
-def enforced_anchor_bytes(spec: AnchorSpec, *, enforcing: bool) -> tuple[str, bytes]:
-    """:func:`enforce_anchor`, also returning the bytes it checked: ``(fingerprint, data)``.
-
-    For a caller that inspects the file's content itself, so it reads the file once rather than
-    twice, such as the SQL Server pin's validity check (vault BACKLOG #3714). It loads nothing,
-    and it does not make the checked bytes the loaded ones: a consumer that reads the file again
-    by path, as the ODBC driver reads that pin, still reads it again."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return verdict.fingerprint, verdict.data
+    """:func:`enforced_anchor`, returning only the fingerprint."""
+    return enforced_anchor(spec, enforcing=enforcing).fingerprint
 
 
 def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1170,8 +1171,7 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     whoever can write it can change what is revoked, but not what is trusted.
 
     It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    verdict = enforced_anchor(spec, enforcing=enforcing)
     text = anchor_cadata(verdict.data, spec)
     _LOADED[(spec.label, spec.path)] = verdict.fingerprint
     return text
@@ -1590,10 +1590,7 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     no pin (vault BACKLOG #2223, #3714): another backend, an unset file, or a weakened posture,
     as :meth:`~messagefoundry.config.settings.StoreSettings.sqlserver_pin_path` decides.
 
-    Under ``Encrypt=strict`` a pin match stands in for the driver's chain, host-name and expiry
-    checks, so this file is the store hop's only trust anchor. The driver reads it by path at each
-    connect, so the spec carries ``loads_verified_bytes=False`` and no fingerprint pin. A
-    PostgreSQL ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not here."""
+    Module item 11 says why it is an anchor and what the check does not cover."""
     path = store.sqlserver_pin_path()
     if path is None:
         return None
@@ -1617,12 +1614,6 @@ def collect_anchor_specs(
     (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
     its hop does not read, so an install with none yields an empty list: the dormant,
     byte-identical path.
-
-    The store pin is checked unaudited at each store open, before any connect, because the store
-    that holds the audit rows is not open yet. Here it takes the audited preflight at start and
-    at every reload. As with module item 10, a reload checks the file on disk and changes no hop:
-    the driver reads the file again at each connect, so a changed pin is used by the next connect
-    and audited by the next reload, and no ``restart_required`` row is written for it.
 
     The four section keywords have no default on purpose. A caller that left one out would leave
     its anchor unchecked with nothing to say so.
