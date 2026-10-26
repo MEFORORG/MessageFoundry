@@ -202,7 +202,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `sessions.token_hash` / `client`, `resend_log`, `processed_files`, `pending_approvals.params`, `webauthn_credentials.public_key` | all three | **No** | No (deliberately not ciphered) | **PL-4** | Session tokens are stored as SHA-256 only; `processed_files` holds a hashed derived file key, never a path; approval params carry connection names / channel ids / a config dir by construction; COSE public keys (ADR 0068) are **verification material, not secrets** and are explicitly excluded from the cipher and from rekey | `n/a — not PHI` |
 | `session_lineage` (`retired_hash` / `successor_hash` / `retired_at`, vault BACKLOG #3028, ADR 0210) | all three | **No** | No (deliberately not ciphered) | **PL-4** | Two SHA-256 session token hashes and a time, the same class as `sessions.token_hash`: which hash an elevation retired and which replaced it. Read only by the sign-in supersession, never by a session read, so a retired hash authenticates nothing; not sealed, because a forged link can only direct a revoke. The session reaper deletes links past the window the supersession follows them for (section 8) | `n/a — not PHI` |
 | `known_login_addresses` (`user_id` / `address` / `first_seen` / `last_seen`, vault BACKLOG #2145) | all three | **No** — a network address tied to an account; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The first-seen sign-in address baseline (BACKLOG #288): one row per host an account finished a sign-in from, or, in the cases [SECURITY.md](SECURITY.md) Table A lists, passed a step-up or confirmed a factor enrolment from, keyed on the account id. **Personal data, not PHI** — the same class and the same decision as `sessions.client` and `audit_log.client`. Read only by the sign-in signal; **no API surface**. Each write to the account's record, even one that re-records a known address, is followed by a prune of its rows past the signal's 90-day lookback. An event that writes nothing prunes nothing, such as a sign-in that still owes a factor. A failed prune deletes nothing either. So a dormant account keeps its stale rows until its next write. An administrator's password or MFA reset deletes the account's rows and leaves one marker row holding no address (vault BACKLOG #2946). `delete_user` removes every row with the account, and the account's foreign key cascades to any row a racing write leaves | `n/a — not PHI` |
-| `secret_rotation_meta` (`secret_key` / `fingerprint` / `tracked_since` / `last_rotated`) | **All three backends** (#1186 — SQLite `MessageStore`, `SqlServerStore` and `PostgresStore` each create the table at open and implement the `SecretRotationMetaStore` protocol) | **No** — non-secret rotation state: a **keyed MAC** (DEK-derived, one-way — never the secret value) + ISO dates only | No (deliberately not ciphered — it is neither PHI nor a secret; the MAC is one-way and un-guessable without the DEK) | **PL-4** | ASVS 13.3.4 rotation watcher (BACKLOG #282). `fingerprint` is a keyed MAC so obtaining the rows leaks no secret. Written on a keyed store; absent on a keyless one | `n/a — not PHI` |
+| `secret_rotation_meta` (`secret_key` / `fingerprint` / `tracked_since` / `last_rotated`), the cipher cell `secret_rotation_meta.fingerprint` | **All three backends** (#1186 — SQLite `MessageStore`, `SqlServerStore` and `PostgresStore` each create the table at open and implement the `SecretRotationMetaStore` protocol) | **No** — non-secret rotation state: a **keyed MAC** (one-way — never the secret value) + ISO dates only | **Yes, for each non-DEK `fingerprint`** — a store-cipher cell (BACKLOG #3472, [ADR 0213](adr/0213-seal-the-secret-rotation-fingerprint-as-a-store-cipher-cell.md)) holding a random per-row HMAC key, the value's MAC and the row's `secret_key`; AAD `("secret_rotation_meta","fingerprint",secret_key)`; store DEK. The DEK row's `fingerprint` (its one-way key id) and the dates are plaintext | **PL-4** | ASVS 13.3.4 rotation watcher (BACKLOG #282). Sealed so that obtaining the rows without the store key gives nothing to test a guess of a low-entropy secret against, and so that `rotate-key` re-seals rather than moves it. `store/crypto.py` seals it on every backend, so the per-backend counts below leave it out. Written on a keyed store; absent on a keyless or `vault_transit` one | `n/a — not PHI` |
 | SQLite DB file + `-wal` / `-shm` / temp files, and every index | SQLite | **Yes** (mirror the above) | **No** — the app cipher cannot reach them | **PL-5** | WAL/shm hold recently-written PHI outside any app-level encryption. Cover: SQLCipher (whole-DB) and/or FDE on the engine host's data volume. A purge zeroes what it frees, and the WAL truncate is tried hourly, both by default; what they miss is in [§8](#8-retention--purge) (vault BACKLOG #2619) | `n/a — not PHI` |
 | SQL Server `.ldf` **transaction log** + the **tempdb version store**, and every index | SQL Server | **Yes** (row images of `messages`/`queue`, ciphertext columns **plus** the always-plaintext `control_id`/`message_type`) | **No** — outside the app-level AEAD entirely | **PL-5** | The engine itself makes this load-bearing: it **force-enables `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`** on the store database at open, so tempdb's version store holds row images for the lifetime of every open snapshot. The `.ldf` holds every row image for the same reason. Additional tempdb objects: the `#eligible` temp table used by `purge_message_bodies` and the FIFO-claim table variables (ids only, non-PHI). Cover: **SQL Server TDE at the database + FDE on the *SQL Server host's* volumes** — **not** BitLocker on the engine host | `n/a — not PHI` |
 | PostgreSQL WAL (`pg_wal`), base files and every index | Postgres | **Yes** (mirror the above) | **No** — outside the app-level AEAD | **PL-5** | Cover: cluster-level / filesystem encryption on the database host, infra-owned | `n/a — not PHI` |
@@ -269,7 +269,9 @@ and has no notion of a credential. `tests/test_no_store_phi_coverage.py` binds t
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
-there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. SQL Server's count was
+there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. Each count leaves out
+`secret_rotation_meta.fingerprint`, which `store/crypto.py` seals on all three backends rather than a
+backend's own pass (BACKLOG #3472). SQL Server's count was
 18 until the legacy `outbox.payload` was retired (below); the two server backends now carry the same
 set. One asymmetry remains and is worth knowing: neither SQL Server nor Postgres sweeps
 `attachment_chunk` in its *on-open* plaintext→cipher migration (only in `rotate-key`), which is
@@ -527,7 +529,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
 1. **Application-level AES-256-GCM `[BUILT]`.** The store's `_cipher`
    ([store/crypto.py](../messagefoundry/store/crypto.py)) encrypts the cipher-covered columns.
    **[§2](#2-where-phi-lives--data-at-rest-inventory) is the normative list** — 18 `(table, column)`
-   pairs on SQLite, 17 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells. The
+   pairs on SQLite, 17 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells and the
+   `secret_rotation_meta.fingerprint` cell on every backend. The
    per-level blocks below group that same set; they do not redefine it, and CI pins the counts **and**
    the membership of both sections to the store's cipher registry, so they cannot diverge. Stored format
    `mfenc:v1 ‖ key_id ‖ base64(nonce ‖ ciphertext ‖ GCM tag)` — the GCM tag
@@ -685,12 +688,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
    key and verifies the chain first; do not drop the retired key until it exits 0 and prints its audit
    line as `OK:` ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
-   BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too. The
-   secret-rotation watcher keys its fingerprints off the store key, and that start re-keys them. With
-   the retired key in hand, a secret changed in the same window still reads as rotated. Without it,
-   the watcher keeps each secret's older date and logs a warning (BACKLOG #2242). Under the Windows
-   service that first start runs without it: the engine refuses a store key in the service's
-   environment lists (SERVICE.md, "Protect the store encryption key at rest"). The same command re-seals the uploaded-file store, and on a first key-enable it
+   BACKLOG #1904). The same pass re-seals the secret-rotation watcher's fingerprint cells, so the
+   engine's first start after the rotation needs no retired key to tell an unchanged secret from a
+   rotated one, under the Windows service too (BACKLOG #3472,
+   [ADR 0213](adr/0213-seal-the-secret-rotation-fingerprint-as-a-store-cipher-cell.md)). A cell no
+   configured key opens is left as it is; the next start keeps that secret's dates and seals a new
+   one. The same command re-seals the uploaded-file store, and on a first key-enable it
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
@@ -990,14 +993,17 @@ is no plaintext to protect.
 `channel_id` · `messages.control_id` / `message_type` · `messages.origin` / `origin_actor` · `webauthn_credentials.public_key` · `state.namespace` /
 `state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · `known_login_addresses` · the `attachment`
 header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `message_attachment`
-linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends · and,
+linkage · `secret_rotation_meta` (all three backends), including the `secret_rotation_meta.fingerprint`
+cell · `.mfbak` on the server backends · and,
 from the [harness table](#the-test-harnesss-own-at-rest-data-harness), the `MEFOR_COORD_DIR` coord
 files · the load, scenario and acceptance run reports (`--report-json` and its siblings, but **not**
 the reconcile compare report, which is PL-1) · the `remotefile_known_hosts` pin file · the GUI's
 `QSettings` layout.
 
 Deliberately **not** ciphered, so that ids stay indexable and the audit trail stays greppable for
-incident response. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
+incident response. **One exception:** each non-DEK `secret_rotation_meta.fingerprint` is a store-cipher
+cell, AAD-bound to its row (BACKLOG #3472). It is not PHI; it is sealed because the keyed MAC inside
+it is the only thing between a store reader and offline guessing of a low-entropy secret. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
 address is folded *inside* it), not from a cipher. Its strength is **key-custody-dependent**: HMAC-SHA256 on a DEK-derived subkey or a Transit MAC when the chain is keyed, keyless SHA-256 when it is not. §3 item 1 says when each applies.
 
 **Access, per tier — several of these ARE returned by an API, under RBAC:**
@@ -1050,8 +1056,9 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `attachment` header + `message_attachment` linkage — the join rows are `DELETE`d and the header's
   `refcount` decremented (GC at 0) inside `purge_message_bodies` / `purge_dead_letters`
   (`_release_message_attachments`), with a startup `sweep_orphan_attachments` reclaiming orphans.
-- `secret_rotation_meta` — **no purge path on any backend**; one row per tracked secret, replaced in
-  place by the watcher's upsert (all three backends since #1186).
+- `secret_rotation_meta`, its `secret_rotation_meta.fingerprint` cell included — **no purge path on any
+  backend**; one row per tracked secret, replaced in place by the watcher's upsert (all three backends
+  since #1186).
 - `.mfbak` — keep-N (`[backup].retention_keep`), as PL-1; the canonical name only, with `.failed` / `.part`
   archives unbounded as PL-1 records.
 - The test harness's PL-4 files — each row of the
@@ -2096,6 +2103,7 @@ window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | no window, and no engine sweep of any kind — `pipeline/retention.py`'s only filesystem pass is `_sweep_app_logs`, which scans the log directory alone. These are operator-configured output paths, so the engine deleting from them would be deleting data an operator or a downstream system owns. On a first deployment they would accumulate plaintext **PL-1** bodies indefinitely; the cover is the operator's: volume or share encryption plus an ACL ([§10](#10-secure-deployment--operations-checklist)) |
 | Test-harness stores (the [harness table](#the-test-harnesss-own-at-rest-data-harness) in §2) | no engine sweep removes them after a run, and that table states each one's retention. The stores an operator can feed real messages, and which would then accumulate them, are named there: at least the reconcile capture, its compare report and the Compose-fed file drop |
 | `users.totp_secret` | no window by design — it lives and dies with the user row |
+| `secret_rotation_meta.fingerprint` | no window by design — one row per tracked secret, replaced in place by the rotation watcher; not PHI (BACKLOG #3472) |
 | `audit_log`, `delivered_keys`, `resend_log` | keep-forever by design (see below) |
 | `messages.control_id`, `messages.message_type` | kept for the life of the message row by design (dedup/routing keys) |
 | `messages.origin`, `messages.origin_actor` | kept for the life of the message row by design. Retention blanks the body and `metadata`, whose `edited_from` goes with it, and leaves these, so an operator-made message stays identifiable (vault BACKLOG #2615) |

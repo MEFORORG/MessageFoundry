@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import importlib
 import os
+import uuid
 from typing import Any
 
 import pytest
 
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    ROTATION_FP_SEALED_SCHEME,
+    AesGcmCipher,
+    generate_key,
+    make_cipher,
+    open_rotation_fingerprint,
+    seal_rotation_fingerprint,
+)
 from messagefoundry.store.store import SecretRotationMetaRow, SecretRotationMetaStore
 
 #: (module, class-name) for every shipped SERVER backend (SQLite is the reference and already conforms).
@@ -30,7 +38,7 @@ _SERVER_BACKENDS: list[tuple[str, str]] = [
 ]
 
 _ROT_MEMBERS = (
-    "secret_rotation_fingerprint_key",
+    "secret_rotation_cipher",
     "get_secret_rotation_meta",
     "upsert_secret_rotation_meta",
 )
@@ -74,10 +82,41 @@ def test_secret_rotation_meta_table_in_schema_batch(module: str, name: str) -> N
 # --- live-DB round-trip (CI only; skips locally per the SS/PG env gates) -----
 
 
-async def _roundtrip(store: Any) -> None:
-    # The fingerprint-key derivation is wired to the live cipher (bytes when keyed, None when keyless).
-    fp = store.secret_rotation_fingerprint_key()
-    assert fp is None or isinstance(fp, bytes)
+def _aes(key: str) -> AesGcmCipher:
+    cipher = make_cipher(key)
+    assert isinstance(cipher, AesGcmCipher)
+    return cipher
+
+
+async def _reseal_roundtrip(store: Any, retired_key: str) -> None:
+    """BACKLOG #3472: the backend's rotation pass re-seals a fingerprint cell sealed under a retired
+    key, so it opens under the active key with the same plaintext, and leaves one no key opens.
+    Called directly, not through ``reencrypt_to_active``: the CI database is shared, and a full
+    rotation would try to re-encrypt other tests' rows under keys this store does not hold."""
+    sealed_key = f"TEST_3472_{uuid.uuid4().hex}"
+    stray_key = f"TEST_3472_{uuid.uuid4().hex}"
+    cell = f"{'ab' * 32}:{'cd' * 16}:{sealed_key}"  # synthetic cell shape -- NEVER a value
+    old = seal_rotation_fingerprint(_aes(retired_key), sealed_key, cell)
+    stray = seal_rotation_fingerprint(_aes(generate_key()), stray_key, cell)
+    for key, fingerprint in ((sealed_key, old), (stray_key, stray)):
+        await store.upsert_secret_rotation_meta(
+            key, fingerprint=fingerprint, tracked_since="2026-06-15", last_rotated="2026-06-15"
+        )
+    cipher = store.cipher()
+    active = cipher.active_marker_prefix
+    assert await store._reseal_rotation_fingerprints_to_active(cipher, f"{active}%") >= 1
+    got = await store.get_secret_rotation_meta()
+    assert got[sealed_key].fingerprint.startswith(f"{ROTATION_FP_SEALED_SCHEME}:{active}")
+    assert open_rotation_fingerprint(cipher, sealed_key, got[sealed_key].fingerprint) == cell
+    assert got[stray_key].fingerprint == stray, "a cell no key opens is left in place"
+
+
+async def _roundtrip(store: Any, retired_key: str) -> None:
+    # The sealing cipher is the live in-process cipher when keyed, None when keyless (BACKLOG #3472).
+    sealing = store.secret_rotation_cipher()
+    assert sealing is None or sealing is store.cipher()
+    if sealing is not None:
+        await _reseal_roundtrip(store, retired_key)
 
     row = SecretRotationMetaRow(
         secret_key="MEFOR_STORE_ENCRYPTION_KEY",
@@ -117,9 +156,10 @@ async def test_sqlserver_secret_rotation_meta_roundtrip() -> None:
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
-    store = await SqlServerStore.open(settings, cipher=make_cipher(generate_key()))
+    retired = generate_key()
+    store = await SqlServerStore.open(settings, cipher=make_cipher(generate_key(), (retired,)))
     try:
-        await _roundtrip(store)
+        await _roundtrip(store, retired)
     finally:
         await store.close()
 
@@ -133,8 +173,9 @@ async def test_postgres_secret_rotation_meta_roundtrip() -> None:
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
-    store = await PostgresStore.open(settings, cipher=make_cipher(generate_key()))
+    retired = generate_key()
+    store = await PostgresStore.open(settings, cipher=make_cipher(generate_key(), (retired,)))
     try:
-        await _roundtrip(store)
+        await _roundtrip(store, retired)
     finally:
         await store.close()

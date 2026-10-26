@@ -8,6 +8,9 @@ would then restart an unchanged key's AES-GCM invocation count at zero (ADR 0196
 age clock. Each stored value is now tagged. A value written before tags reads as today's scheme, so
 nothing resets on upgrade, and a tag this release does not compile in is refused.
 
+Since BACKLOG #3472 (ADR 0213) a non-DEK row is a sealed store-cipher cell behind its own tag, and a
+row an earlier release wrote, tagged or not, keeps its dates and is replaced by a sealed cell.
+
 Synthetic values only: every "secret" here is a test string.
 """
 
@@ -26,6 +29,7 @@ from messagefoundry.config.settings import SecretRotationSettings
 from messagefoundry.pipeline import secret_rotation as sr
 from messagefoundry.store.crypto import (
     KEY_ID_SCHEME,
+    ROTATION_FP_SEALED_SCHEME,
     UnknownSchemeError,
     _fingerprint,
     cipher_meta_key,
@@ -69,19 +73,18 @@ def test_a_tag_this_release_does_not_compile_in_is_refused(stored: str, scheme: 
 
 def test_every_compiled_tag_reads_as_a_tag() -> None:
     # An all-hex tag would read as a pre-tag key id, so the reader would never see it.
-    for scheme in (KEY_ID_SCHEME, sr._FP_SCHEME):
+    for scheme in (KEY_ID_SCHEME, sr._FP_SCHEME, ROTATION_FP_SEALED_SCHEME):
         assert set(scheme) - set("0123456789abcdef"), scheme
         assert ":" not in scheme
 
 
 def test_each_tag_still_names_the_function_it_tags() -> None:
-    # Known answers. A change to `_fingerprint`, `_fingerprint_key_id` or `_bare_mac` fails here,
-    # and the fix is a new scheme tag read beside the old one, not new constants (BACKLOG #3421).
+    # Known answers. A change to `_fingerprint` or `_bare_mac` fails here, and the fix is a new
+    # scheme tag read beside the old one, not new constants (BACKLOG #3421). `_bare_mac` is the MAC
+    # inside a sealed cell, so ROTATION_FP_SEALED_SCHEME names it (BACKLOG #3472).
     key = bytes(range(32))
     assert cipher_meta_key(_fingerprint(key)) == "sha256-16:630dcd2966c43366"
-    assert sr._keyed_fingerprint(key, "synthetic-value") == (
-        "hmac-sha256-32:890afc1e8cb38dc9:150c9b3dc722074a34b2cf276a40e750"
-    )
+    assert sr._bare_mac(key, "synthetic-value") == "150c9b3dc722074a34b2cf276a40e750"
 
 
 # --- cipher_meta: the invocation count carries over ------------------------------------------
@@ -166,17 +169,18 @@ _Out = tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]
 async def _reconcile(db: Path, key: str, rows: dict[str, str] | None = None) -> _Out:
     """Reconcile a keyed store as the engine does at start, after seeding ``rows`` (class id to
     stored fingerprint, ``""`` for the class's pre-tag form) dated 2020. Returns the stamps'
-    last-rotated dates, the stored fingerprints, and each class's pre-tag and tagged forms."""
+    last-rotated dates, the stored fingerprints, and each class's pre-tag and tagged forms. The AD
+    row's "tagged" form is the sealed tag's prefix only: a sealed cell holds a random key, so two
+    seals of one value differ (BACKLOG #3472)."""
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
         dek_id = store.cipher_info().active_key_id
         assert dek_id
-        fp_key = store.secret_rotation_fingerprint_key()
-        assert fp_key is not None
-        tagged = {_DEK: sr.dek_fingerprint(dek_id), _AD: sr._keyed_fingerprint(fp_key, _VALUE)}
+        assert store.secret_rotation_cipher() is not None
+        tagged = {_DEK: sr.dek_fingerprint(dek_id), _AD: f"{ROTATION_FP_SEALED_SCHEME}:"}
         pre_tag = {
             _DEK: read_scheme_tag(tagged[_DEK], KEY_ID_SCHEME),
-            _AD: read_scheme_tag(tagged[_AD], sr._FP_SCHEME),
+            _AD: "0123456789abcdef:" + "a" * 32,  # the pre-tag `<key id>:<mac>` shape
         }
         for class_id, fingerprint in (rows or {}).items():
             await store.upsert_secret_rotation_meta(
@@ -202,9 +206,9 @@ async def _reconcile(db: Path, key: str, rows: dict[str, str] | None = None) -> 
 
 async def test_fingerprints_are_stored_tagged(tmp_path: Path) -> None:
     _, stored, _, tagged = await _reconcile(tmp_path / "s.db", generate_key())
-    assert stored == tagged
+    assert stored[_DEK] == tagged[_DEK]
     assert stored[_DEK].startswith(f"{KEY_ID_SCHEME}:")
-    assert stored[_AD].startswith(f"{sr._FP_SCHEME}:")
+    assert stored[_AD].startswith(tagged[_AD])
 
 
 async def test_pre_tag_fingerprints_compare_equal_and_keep_their_clocks(tmp_path: Path) -> None:
@@ -212,8 +216,10 @@ async def test_pre_tag_fingerprints_compare_equal_and_keep_their_clocks(tmp_path
     dates, stored, pre_tag, tagged = await _reconcile(db, generate_key(), {_DEK: "", _AD: ""})
     assert pre_tag != tagged  # premise: the seeded rows are untagged
     assert dates == {_DEK: _OLD, _AD: _OLD}  # neither clock reset on upgrade
-    # Read as today's scheme, then re-stamped tagged, so no untagged row outlives this release.
-    assert stored == tagged
+    # Read as today's scheme, then re-stamped tagged, so no untagged row outlives this release. The
+    # AD row is not compared at all (BACKLOG #3472): its dates are kept and a sealed cell replaces it.
+    assert stored[_DEK] == tagged[_DEK]
+    assert stored[_AD].startswith(tagged[_AD])
 
 
 async def test_an_unknown_scheme_is_refused_and_resets_nothing(
@@ -227,8 +233,11 @@ async def test_an_unknown_scheme_is_refused_and_resets_nothing(
     # Read as a change, the DEK's clock would restart today and lift its ENFORCE escalation.
     assert dates == {_DEK: _OLD, _AD: _OLD}
     # Re-stamped under today's scheme with the dates kept, so the next rotation is detected.
-    assert stored == tagged
-    assert "2 stored fingerprint(s) name a scheme this release does not know" in caplog.text
+    assert stored[_DEK] == tagged[_DEK]
+    assert stored[_AD].startswith(tagged[_AD])
+    assert "1 stored fingerprint(s) name a scheme this release does not know" in caplog.text
+    # The non-DEK row is one the engine cannot read, which keeps its dates the same way (#3472).
+    assert "1 secret fingerprint(s) could not be opened" in caplog.text
 
 
 def test_fingerprints_equal_refuses_an_unknown_stored_scheme() -> None:

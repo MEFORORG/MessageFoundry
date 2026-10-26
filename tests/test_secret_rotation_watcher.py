@@ -34,14 +34,22 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.secret_rotation import (
     SecretRotationRunner,
     SecretStamp,
+    _cell_unchanged,
     _fingerprint_bytes,
-    _keyed_fingerprint,
+    _fingerprint_cell,
     dek_fingerprint,
     held_env_secret_values,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
-from messagefoundry.store.crypto import generate_key, make_cipher, rotation_fingerprint_key
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    generate_key,
+    make_cipher,
+    open_rotation_fingerprint,
+    rotation_fingerprint_cipher,
+    seal_rotation_fingerprint,
+)
 from messagefoundry.store.store import MessageStore, SecretRotationMetaRow
 
 _UTC = datetime.UTC
@@ -51,21 +59,46 @@ _TODAY = _REF.date()
 _DEK = "MEFOR_STORE_ENCRYPTION_KEY"
 
 
+def _aes(key: str) -> AesGcmCipher:
+    cipher = make_cipher(key)
+    assert isinstance(cipher, AesGcmCipher)
+    return cipher
+
+
+#: The fake store's sealing cipher (BACKLOG #3472): one fixed test key for the whole module.
+_CIPHER = _aes(generate_key())
+
+
+def _sealed(class_id: str, value: str) -> str:
+    """A stored fingerprint of ``value`` for row ``class_id``, as the reconcile writes it."""
+    return seal_rotation_fingerprint(_CIPHER, class_id, _fingerprint_cell(class_id, value))
+
+
+def _holds(stored: str, class_id: str, value: str) -> bool:
+    """Whether the stored fingerprint ``stored`` of row ``class_id`` is ``value``'s."""
+    cell = open_rotation_fingerprint(_CIPHER, class_id, stored)
+    return cell is not None and _cell_unchanged(cell, class_id, value) is True
+
+
+_UNSET: object = object()
+
+
 class _FakeMetaStore:
-    """A stand-in for the narrow SecretRotationMetaStore: a fixed fingerprint key + an in-memory row map."""
+    """A stand-in for the narrow SecretRotationMetaStore: a fixed sealing cipher + an in-memory row map."""
 
     def __init__(
         self,
         *,
-        fp_key: bytes | None = b"K" * 32,
+        cipher: AesGcmCipher | None | object = _UNSET,
         rows: dict[str, SecretRotationMetaRow] | None = None,
     ) -> None:
-        self._fp_key = fp_key
+        self._cipher = _CIPHER if cipher is _UNSET else cipher
         self.rows: dict[str, SecretRotationMetaRow] = dict(rows or {})
         self.upserts: list[tuple[str, str, str, str]] = []
 
-    def secret_rotation_fingerprint_key(self) -> bytes | None:
-        return self._fp_key
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        assert self._cipher is None or isinstance(self._cipher, AesGcmCipher)
+        return self._cipher
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         return dict(self.rows)
@@ -128,22 +161,22 @@ def _reconcile(store: _FakeMetaStore, **kw: object) -> dict[str, SecretStamp]:
 # --- keyed MAC (binding correction a: keyed MAC, NEVER a salted hash) --------
 
 
-def test_keyed_fingerprint_is_a_keyed_mac_not_the_value() -> None:
-    key = b"K" * 32
-    fp = _keyed_fingerprint(key, "hunter2")
-    assert fp == _keyed_fingerprint(key, "hunter2")  # deterministic for a fixed key+value
-    assert "hunter2" not in fp  # one-way — the value is not recoverable from the fingerprint
+def test_fingerprint_cell_is_a_keyed_mac_not_the_value() -> None:
+    cell = _fingerprint_cell("MEFOR_STORE_PASSWORD", "hunter2")
+    assert "hunter2" not in cell  # one-way — the value is not recoverable from the fingerprint
+    assert _cell_unchanged(cell, "MEFOR_STORE_PASSWORD", "hunter2") is True
+    assert _cell_unchanged(cell, "MEFOR_STORE_PASSWORD", "hunter3") is False
+    # KEYED, under a fresh random key per cell: two cells of one value carry different MACs.
+    other = _fingerprint_cell("MEFOR_STORE_PASSWORD", "hunter2")
+    assert cell.split(":")[1] != other.split(":")[1]
+
+
+def test_rotation_fingerprint_cipher_none_when_keyless_and_the_cipher_otherwise() -> None:
     assert (
-        _keyed_fingerprint(b"D" * 32, "hunter2") != fp
-    )  # KEYED: a different key → a different MAC
-
-
-def test_rotation_fingerprint_key_none_when_keyless_and_keyed_otherwise() -> None:
-    assert rotation_fingerprint_key(make_cipher(None)) is None  # identity cipher → no key material
-    k1 = rotation_fingerprint_key(make_cipher(generate_key()))
-    k2 = rotation_fingerprint_key(make_cipher(generate_key()))
-    assert k1 is not None and len(k1) == 32
-    assert k1 != k2  # DEK-derived → distinct per DEK
+        rotation_fingerprint_cipher(make_cipher(None)) is None
+    )  # identity cipher → nothing to seal
+    keyed = make_cipher(generate_key())
+    assert rotation_fingerprint_cipher(keyed) is keyed
 
 
 # --- reconcile: stamps, tracked-since floor, auto-detected rotation ----------
@@ -190,14 +223,15 @@ def test_reconcile_enumerates_all_held_classes() -> None:
         env_values={"MEFOR_STORE_PASSWORD": "pw", "MEFOR_AUTH_AD_BIND_PASSWORD": "bind"},
     )
     assert set(stamps) == {_DEK, "MEFOR_STORE_PASSWORD", "MEFOR_AUTH_AD_BIND_PASSWORD"}
-    # The non-DEK classes carry a KEYED-MAC fingerprint of the value (not the value, not the key-id).
-    assert store.rows["MEFOR_STORE_PASSWORD"].fingerprint == _keyed_fingerprint(b"K" * 32, "pw")
+    # The non-DEK classes carry a sealed KEYED-MAC fingerprint of the value (not the value, not the
+    # key-id).
+    assert _holds(store.rows["MEFOR_STORE_PASSWORD"].fingerprint, "MEFOR_STORE_PASSWORD", "pw")
 
 
 def test_env_classes_skipped_when_no_in_heap_key() -> None:
     # A keyless / Transit store (no fingerprint key) tracks only the DEK key-id stamp — env secrets are
     # not fingerprintable in-heap and are skipped (documented degrade), never an error.
-    store = _FakeMetaStore(fp_key=None)
+    store = _FakeMetaStore(cipher=None)
     stamps = _reconcile(store, env_values={"MEFOR_STORE_PASSWORD": "pw"})
     assert set(stamps) == {_DEK}
 
@@ -206,7 +240,7 @@ def test_env_classes_skipped_when_no_in_heap_key() -> None:
 
 
 def test_connector_cred_via_extra_values_is_stamped() -> None:
-    # A per-Connection env() credential passed via extra_values is fingerprinted with the SAME DEK-derived
+    # A per-Connection env() credential passed via extra_values is fingerprinted with the SAME sealed
     # keyed MAC as the fixed MEFOR_* classes and gets its own stamp (tracked_since == today, the floor).
     # This is the runtime coverage the §4 doc claims — the engine resolves the graph's env() creds and
     # passes them here (see test_connector_secret_env_values_* for the resolver half).
@@ -214,7 +248,7 @@ def test_connector_cred_via_extra_values_is_stamped() -> None:
     stamps = _reconcile(store, extra_values={"acme_api_key": "APIKEY-1"})
     stamp = stamps["acme_api_key"]
     assert isinstance(stamp, SecretStamp)  # narrows the object value to SecretStamp
-    assert store.rows["acme_api_key"].fingerprint == _keyed_fingerprint(b"K" * 32, "APIKEY-1")
+    assert _holds(store.rows["acme_api_key"].fingerprint, "acme_api_key", "APIKEY-1")
     assert stamp.tracked_since == _TODAY
     assert stamp.last_rotated == _TODAY
 
@@ -223,7 +257,7 @@ def test_connector_cred_value_change_resets_the_clock() -> None:
     # A changed connector-credential value (rotation) resets last_rotated to today while preserving the
     # tracked_since floor — rotation auto-detected, never operator-attested, exactly like the DEK.
     prior = SecretRotationMetaRow(
-        "acme_api_key", _keyed_fingerprint(b"K" * 32, "APIKEY-OLD"), "2025-01-01", "2025-01-01"
+        "acme_api_key", _sealed("acme_api_key", "APIKEY-OLD"), "2025-01-01", "2025-01-01"
     )
     store = _FakeMetaStore(rows={"acme_api_key": prior})
     stamps = _reconcile(store, extra_values={"acme_api_key": "APIKEY-NEW"})
@@ -231,13 +265,13 @@ def test_connector_cred_value_change_resets_the_clock() -> None:
     assert isinstance(stamp, SecretStamp)
     assert stamp.last_rotated == _TODAY  # reset on change
     assert stamp.tracked_since == datetime.date(2025, 1, 1)  # floor preserved
-    assert store.rows["acme_api_key"].fingerprint == _keyed_fingerprint(b"K" * 32, "APIKEY-NEW")
+    assert _holds(store.rows["acme_api_key"].fingerprint, "acme_api_key", "APIKEY-NEW")
 
 
 def test_connector_cred_skipped_when_no_in_heap_key() -> None:
     # No fingerprint key (keyless / Transit store) → connector creds are not in-heap MAC'able either, so
     # they are skipped alongside the fixed env classes (documented degrade), never an error.
-    store = _FakeMetaStore(fp_key=None)
+    store = _FakeMetaStore(cipher=None)
     stamps = _reconcile(store, extra_values={"acme_api_key": "APIKEY-1"})
     assert set(stamps) == {_DEK}
 
@@ -447,8 +481,8 @@ def test_real_store_meta_roundtrip_and_reconcile(tmp_path) -> None:
     async def _go() -> None:
         store = await MessageStore.open(tmp_path / "rot.db", cipher=make_cipher(generate_key()))
         try:
-            # The real store derives a non-None keyed fingerprint key off its live DEK.
-            assert store.secret_rotation_fingerprint_key() is not None
+            # The real keyed store seals fingerprint cells under its live cipher.
+            assert store.secret_rotation_cipher() is store.cipher()
             # First reconcile: the DEK stamp is persisted with tracked_since == last_rotated == today.
             settings = SecretRotationSettings()
             stamps1 = await reconcile_rotation_meta(
@@ -480,8 +514,8 @@ def test_real_store_meta_roundtrip_and_reconcile(tmp_path) -> None:
 
 # --- ASVS 11.2.4 (BACKLOG #1167): the fingerprint comparison ----------------
 # `reconcile_rotation_meta` decides "did this secret rotate" by comparing the STORED keyed MAC against
-# the freshly computed one. Those operands are keyed and secret-derived (`_keyed_fingerprint` is an
-# HMAC-SHA256 over a live secret value), so the comparison must be constant-time — and it must be
+# the freshly computed one. Those operands are keyed and secret-derived (the MAC in a sealed cell
+# is an HMAC-SHA256 over a live secret value), so the comparison must be constant-time — and it must be
 # TOTAL, because `hmac.compare_digest`'s str overload raises on non-ASCII input and the engine's
 # reconcile call site swallows every exception from this function into one log line.
 
@@ -502,10 +536,10 @@ class _CompareCounter:
 def test_fingerprint_comparison_goes_through_compare_digest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Asserted by counting calls to a monkeypatched comparator, not by grepping source. fp_key=None
+    # Asserted by counting calls to a monkeypatched comparator, not by grepping source. cipher=None
     # keeps the class set to the DEK alone, so the expected count is exact.
     prior = SecretRotationMetaRow(_DEK, "dekid-SAME", "2025-01-01", "2025-03-01")
-    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    store = _FakeMetaStore(rows={_DEK: prior}, cipher=None)
     counter = _CompareCounter()
     monkeypatch.setattr(hmac, "compare_digest", counter)
     _reconcile(store, dek_key_id="dekid-SAME")
@@ -534,7 +568,7 @@ def test_non_ascii_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
     # non-ASCII value must read as "the fingerprint changed", never raise — a raise here is swallowed
     # by the engine's reconcile handler, which would silently stop rotation tracking for every class.
     prior = SecretRotationMetaRow(_DEK, "brøken", "2025-01-01", "2025-01-01")
-    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    store = _FakeMetaStore(rows={_DEK: prior}, cipher=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
     dek = stamps[_DEK]
     assert dek.last_rotated == _TODAY
@@ -546,7 +580,7 @@ def test_lone_surrogate_stored_fingerprint_is_a_rotation_not_a_type_error() -> N
     # A lone surrogate is a str CPython can hold but cannot UTF-8 encode by default; `surrogatepass`
     # keeps the mapping total.
     prior = SecretRotationMetaRow(_DEK, "\ud800", "2025-01-01", "2025-01-01")
-    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    store = _FakeMetaStore(rows={_DEK: prior}, cipher=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
     assert stamps[_DEK].last_rotated == _TODAY
 
