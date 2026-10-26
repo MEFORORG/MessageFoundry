@@ -3908,23 +3908,37 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         "reading the stored roles after the bind returns",
         "no action-bound grant is minted",
         "charged to neither the lockout nor the session's re-proof budget",
+        # BACKLOG #3822: the paragraph cites the role rule by the opening words of the paragraph
+        # that states it, so those words must still open a paragraph.
+        "Both legs also refuse a present account that lost a role in the directory",
     ):
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
+    rule = "**Both legs also refuse a present account that lost a role in the directory"
+    assert rule in doc, "the role-rule paragraph the re-bind paragraph cites lost its opening"
 
 
 def test_the_changelog_records_the_re_bind_role_test() -> None:
     """BACKLOG #3822: the released 0.5.2 notes said the password re-bind does not compare roles,
-    and had no entry for the #3081 refusal. RED when that sentence returns, or when the entry
-    leaves the 0.5.2 section or drops a fact below. A text check only: the behaviour is pinned by
+    and had no entry for the #3081 refusal. RED when that exact phrase returns, or when the entry
+    is not in the 0.5.2 section exactly once, or drops a fact below. A reworded return of the old
+    claim is not caught. A text check only: the behaviour is pinned by
     ``tests/test_reauth_directory_demotion.py``."""
-    changelog = " ".join((_ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split())
-    assert "do not compare roles yet" not in changelog, (
+    lines = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    assert "do not compare roles yet" not in " ".join(" ".join(lines).split()), (
         "CHANGELOG.md still says the password re-bind does not compare roles."
     )
-    release = changelog.split("## [0.5.2]", 1)[1].split("## [0.5.1]", 1)[0]
-    marker = "**The password re-bind step-up refuses a directory account demoted"
-    assert marker in release, "CHANGELOG.md [0.5.2] lost the #3081 re-bind demotion entry."
-    entry = release.split(marker, 1)[1].split(" - **", 1)[0]
+    heads = [i for i, line in enumerate(lines) if line.startswith("## [")]
+    start = next(i for i in heads if lines[i].startswith("## [0.5.2]"))
+    release = lines[start : next(i for i in heads if i > start)]
+    marker = "- **The password re-bind step-up refuses a directory account demoted"
+    hits = [i for i, line in enumerate(release) if line.startswith(marker)]
+    assert len(hits) == 1, f"CHANGELOG.md [0.5.2] holds the #3081 entry {len(hits)} times, not once"
+    body = [release[hits[0]]]
+    for line in release[hits[0] + 1 :]:
+        if not line.startswith("  "):
+            break
+        body.append(line)
+    entry = " ".join(" ".join(body).split())
     for fact in (
         "reason=directory_roles_demoted",
         "reason=directory_identity_conflict",

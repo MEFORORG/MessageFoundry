@@ -361,9 +361,9 @@ ledger, so it has no public page.
   other request keeps the client's timeout. (`vault BACKLOG #2950`)
 - **A directory refusal at the second factor, an enrolment or a step-up names the fix for its
   cause.** When a directory refuses an account at `/auth/mfa-verify`, `/me/mfa/confirm` or
-  `/me/reauth`, the proof is not checked, except on the password re-bind's refusals for the
-  account's roles, an unsealed role map or a row that moved during the bind, which come after the
-  password was checked and found right (`vault BACKLOG #3081`). The 403 now has one text per fix. A
+  `/me/reauth`, the proof is not checked, except on at least the password re-bind refusals that
+  come after the bind accepted the password, which the `vault BACKLOG #3081` entry lists. The 403
+  now has one text per fix. A
   role the account lost in the directory since it signed in is told to sign out and sign in again,
   which takes the roles its groups grant now. Every other cause, an outage included, is told to try
   again later and, if it is still refused, to ask an administrator, never to sign out, since a new
@@ -2012,7 +2012,8 @@ ledger, so it has no public page.
   account is present and enabled (BACKLOG #2023, #2239). They now also map the account's current
   groups to roles, as the reconciliation pass does, and refuse when a stored role is not among
   them. Before, such an account would renew its step-up window or clear the MFA gate with the old
-  roles until the reconciliation pass revoked it. Only a demotion refuses; a promotion does not.
+  roles until the reconciliation pass revoked it. Only a demotion refuses; a promotion does not. A
+  role map that fails its seal refuses too, as the `BACKLOG #3082` entry says.
   The refusal writes no roles, checks no code or assertion, charges nothing to the lockout, and is
   audited with `reason=directory_unconfirmed` and the outcome `directory_roles_demoted`. Channel
   scope is not compared. The password re-bind and the enrolment legs make the same role test in
@@ -2029,8 +2030,9 @@ ledger, so it has no public page.
   the object the bind was keyed on; and `reason=directory_role_map_unsealed` when the AD
   group-to-role map fails its seal, for an account that holds a role. The password was right in
   each of these cases, so none of them is charged to the lockout or to the session's re-proof
-  budget, and none clears either. `directory_identity_conflict` also marks an older refusal that
-  judges no password, where the directory answered about another object (`vault BACKLOG #2027`).
+  budget, and none clears either. `directory_identity_conflict` also marks an older, uncharged
+  refusal, where the directory answered about another object than the row's, so the bind cannot
+  vouch for this account whether or not it accepted the password (`vault BACKLOG #2027`).
   The per-actor step-up attempt budget is still drawn. None renews the window, mints an
   action-bound grant or writes roles. Each is a **403** on `POST /me/reauth`, with the per-fix text
   the `BACKLOG #3082` entry describes: a demotion is told to sign out and sign in again. Channel
