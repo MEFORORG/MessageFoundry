@@ -846,10 +846,14 @@ It runs the commands of this step. It differs from them in at least the ways nam
   runs `openssl ciphers -s -v` from the `PATH`. It reads the `CipherString`, `Ciphersuites` and
   `MinProtocol` lines of the file that `openssl` loads, which is not always the file the manual
   `grep` reads. Where `OPENSSL_CONF` is set in the environment, that is the file the variable
-  names. Otherwise it is `openssl.cnf` in the `OPENSSLDIR` folder that `openssl version -d`
-  prints, which the row runs as a second `openssl` start. That folder is fixed when `openssl` is
-  built, so it may not be `/etc/ssl`. It differs from the manual `grep` in at least
-  these ways too. It reads only the section OpenSSL applies as the system default: it follows
+  names, and the row reads it alone. Otherwise it is `openssl.cnf` in the `OPENSSLDIR` folder that
+  `openssl version -d` prints, which the row runs as a second `openssl` start. That folder is
+  fixed when `openssl` is built, so it may not be `/etc/ssl`. Then the row also reads
+  `/etc/ssl/openssl.cnf`, and the worse of the two readings stands. A program named `openssl`
+  earlier on the `PATH` can print any folder, so this keeps it from hiding that file's FAIL. One
+  file under both names is read once. With no `/etc/ssl/openssl.cnf`, the row reads the binary's
+  file alone, unless that file is under a folder on the `PATH`; then it reads MANUAL. It differs
+  from the manual `grep` in at least these ways too. It reads only the section OpenSSL applies as the system default: it follows
   `openssl_conf` in the top of the file, then that section's `ssl_conf`, then that section's
   `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. The
   `ssl_conf` line names a module, so as in OpenSSL it may carry a suffix after its last `.`, such
@@ -857,8 +861,10 @@ It runs the commands of this step. It differs from them in at least the ways nam
   reads MANUAL. A file where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
   regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
   and drops a leading byte-order mark. As in OpenSSL, a backtick quotes a value too. It drops a
-  `#` comment outside quotes. As in OpenSSL, it ends a line only at a newline, and only a space, a
-  tab or a carriage return counts as space. Any `openssl ciphers` output line not shaped like a
+  `#` comment outside quotes. It ends a line at a newline. OpenSSL can also end one at a lone
+  carriage return, where that falls at the end of a block it reads, so the row refuses a lone
+  carriage return (below). As in OpenSSL, only a space, a tab or a carriage return counts as space.
+  Any `openssl ciphers` output line not shaped like a
   suite line makes the row ERROR, as on Windows. It does not follow at least these: an `.include`
   or `.pragma` line, a `section::name` assignment, a variable from the `ENV` section, and a NUL, a
   lone carriage return or a backslash at the end of a line. Outside a comment line, it does not

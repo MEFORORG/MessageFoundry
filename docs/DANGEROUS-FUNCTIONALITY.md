@@ -320,7 +320,10 @@ Three argument-list starts are not pinned that way:
   copy in the working directory before the one on `PATH`.
 - `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
   [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
-  `verify` with picks the copy. On Windows it runs Windows PowerShell by its system-directory path.
+  `verify` with picks the copy. That copy names the folder of the file the floor is read from. So
+  without `OPENSSL_CONF`, the row also reads `/etc/ssl/openssl.cnf` itself, and the worse reading
+  stands: a planted `openssl` cannot hide that file's FAIL. On Windows it runs Windows PowerShell
+  by its system-directory path.
 - `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
   batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
   command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks
@@ -424,7 +427,8 @@ setting or message reaches it, and it calls `Get-TlsCipherSuite` through the sys
 imported by its path, never by name. No command it runs is looked up by a bare name, so a
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
-The module makes one start on Windows, `powershell.exe`, and two on Linux, both `openssl`. Each
+The module makes one start on Windows, `powershell.exe`, and up to two on Linux, both `openssl`.
+Each
 is bounded at 30 s (`_PROBE_TIMEOUT_S`). `subprocess.run` kills a probe that runs longer, and that
 reading is an ERROR. The Linux row can so take twice that bound.
 

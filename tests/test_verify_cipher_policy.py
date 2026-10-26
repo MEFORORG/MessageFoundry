@@ -59,17 +59,28 @@ def _windows(
     return cipher_policy.read_host_cipher_policy("win32")
 
 
+@pytest.fixture(autouse=True)
+def _no_system_cnf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads this host's real ``/etc/ssl/openssl.cnf``: the seam names a path that is never
+    there, and a test that wants a system file points it at its own. ``raising=False`` lets the
+    tests run red against code without the seam."""
+    absent = Path(__file__).parent / "no-such-folder" / "openssl.cnf"
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", absent, raising=False)
+
+
 def _linux(
     monkeypatch: pytest.MonkeyPatch,
     lines: list[str] | Exception,
     settings: list[tuple[str, str]] | Exception,
     section: str | None = "system_default_sect",
 ) -> CheckResult:
+    """The Linux row over one named file, with both its probes stubbed."""
+    monkeypatch.setenv("OPENSSL_CONF", "/etc/ssl/openssl.cnf")
     monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _give(lines))
     monkeypatch.setattr(
         cipher_policy,
         "_openssl_policy_lines",
-        lambda: (Path("/etc/ssl/openssl.cnf"), section, _give(settings)),
+        lambda path: (path, section, _give(settings)),
     )
     return cipher_policy.read_host_cipher_policy("linux")
 
@@ -683,7 +694,7 @@ def _read_cnf(
     monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str
 ) -> tuple[Path, str | None, list[tuple[str, str]]]:
     _point_openssl_conf_at(monkeypatch, cnf, text)
-    return cipher_policy._openssl_policy_lines()
+    return cipher_policy._openssl_policy_lines(cnf)
 
 
 def _linux_row(monkeypatch: pytest.MonkeyPatch) -> CheckResult:
@@ -1055,25 +1066,157 @@ def test_without_openssl_conf_the_binarys_own_file_is_read(
     ``OPENSSLDIR`` it was built with, which need not be ``/etc/ssl``. Before, the row read
     ``/etc/ssl/openssl.cnf`` whatever the binary loaded, and could judge the floor from it."""
     cnf = tmp_path / "openssl.cnf"
-    cnf.write_text(_CHAIN + "[system_default_sect]\nMinProtocol = TLSv1.2\n", encoding="utf-8")
+    cnf.write_bytes((_CHAIN + _HEALTHY_SECTION).encode("utf-8"))
     monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))  # a PATH that does not hold the file
     argvs = _openssl_returns(monkeypatch, f'OPENSSLDIR: "{tmp_path}"\n')
-    assert cipher_policy._openssl_policy_lines() == (
-        cnf,
-        "system_default_sect",
-        [("MinProtocol", "TLSv1.2")],
-    )
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.PASS, r.detail
+    assert f"{cnf} [system_default_sect]: one CipherString line" in r.detail
     assert argvs == [["openssl", "version", "-d"]]
 
 
 def test_with_openssl_conf_no_directory_is_asked_for(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``OPENSSL_CONF`` wins over ``OPENSSLDIR`` in OpenSSL, so the row starts no second probe."""
+    """``OPENSSL_CONF`` wins over ``OPENSSLDIR`` in OpenSSL, so the row starts no second probe,
+    and reads no system file beside the one named."""
     argvs = _openssl_returns(monkeypatch, 'OPENSSLDIR: "/elsewhere"\n')
-    _point_openssl_conf_at(monkeypatch, tmp_path / "named.cnf", _CHAIN + _HEALTHY_SECTION)
-    assert cipher_policy._openssl_policy_lines()[0] == tmp_path / "named.cnf"
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    r = _linux_from_file(monkeypatch, tmp_path / "named.cnf", _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.PASS, r.detail
+    assert str(tmp_path / "named.cnf") in r.detail
+    assert str(system) not in r.detail
     assert argvs == []
+
+
+_TLSV1_SECTION = _HEALTHY_SECTION.replace("TLSv1.2", "TLSv1")
+
+
+def _system_cnf_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str) -> Path:
+    """Point the system-file seam at a file in ``tmp_path`` holding ``text``."""
+    system = tmp_path / "etc-ssl" / "openssl.cnf"
+    system.parent.mkdir(exist_ok=True)
+    system.write_bytes(text.encode("utf-8"))
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system, raising=False)
+    return system
+
+
+def _system_and_own(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    system: str | None,
+    own: str,
+    own_dir: Path | None = None,
+) -> CheckResult:
+    """The row without ``OPENSSL_CONF``. The system file holds ``system`` (``None``: there is
+    none), and ``openssl version -d`` names ``own_dir``, whose ``openssl.cnf`` holds ``own``. PATH
+    is one ``bin`` folder that holds neither, unless ``own_dir`` is put under it."""
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    own_dir = own_dir or tmp_path / "planted"
+    own_dir.mkdir(parents=True, exist_ok=True)
+    (own_dir / "openssl.cnf").write_bytes(own.encode("utf-8"))
+    if system is not None:
+        _system_cnf_at(monkeypatch, tmp_path, system)
+    _openssl_returns(monkeypatch, f'OPENSSLDIR: "{own_dir}"\n')
+    return _linux_row(monkeypatch)
+
+
+def test_a_planted_openssl_cannot_hide_the_system_files_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3 note 3: the binary on PATH names the folder its file is read from, so a planted one
+    can name a healthy file anywhere. Main read ``/etc/ssl/openssl.cnf`` and FAILed this host. The
+    system file is still read, and its FAIL stands."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
+    assert str(tmp_path / "etc-ssl" / "openssl.cnf") in r.detail
+
+
+def test_both_files_healthy_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The control for the test above: both files are read, and both are named."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.PASS, r.detail
+    assert str(tmp_path / "etc-ssl" / "openssl.cnf") in r.detail
+    assert str(tmp_path / "planted" / "openssl.cnf") in r.detail
+
+
+def test_the_binarys_own_file_failing_fails_the_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The worse reading stands, whichever file gives it (BACKLOG #3803 item 2)."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION, _CHAIN + _TLSV1_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert f"{tmp_path / 'planted' / 'openssl.cnf'} [system_default_sect]: MinProtocol" in r.detail
+
+
+def test_one_file_under_both_names_is_read_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The stock case: the binary's ``OPENSSLDIR`` holds the system file itself."""
+    healthy = _CHAIN + _HEALTHY_SECTION
+    r = _system_and_own(monkeypatch, tmp_path, healthy, healthy, own_dir=tmp_path / "etc-ssl")
+    assert r.status is Status.PASS, r.detail
+    assert r.detail.count(str(tmp_path / "etc-ssl" / "openssl.cnf")) == 1
+
+
+def test_with_no_system_file_a_binary_file_under_path_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A planted binary can write its own file next to itself, and no system file is there to check
+    it against, so the row does not PASS on it."""
+    healthy = _CHAIN + _HEALTHY_SECTION
+    r = _system_and_own(monkeypatch, tmp_path, None, healthy, own_dir=tmp_path / "bin" / "ssl")
+    assert r.status is Status.MANUAL, r.detail
+    assert "a folder on PATH" in r.detail
+
+
+def test_without_openssl_the_system_file_is_still_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Main judged the floor from the system file with no ``openssl`` start. A missing binary,
+    which makes the directory reading MANUAL, must not hide that file's FAIL."""
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(2, "No such file", argv[0])
+
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setattr(subprocess, "run", run)
+    _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.FAIL, r.detail
+    assert "OpenSSL file not read (openssl not found)" in r.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a POSIX shell script stands in for openssl")
+def test_a_planted_openssl_binary_on_path_cannot_hide_the_system_files_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The test above with a real program: a fake ``openssl`` first on PATH prints AEAD-only
+    suites and an ``OPENSSLDIR`` holding a healthy file. The system file allows TLSv1, so the row
+    FAILs, as main did."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "openssl.cnf").write_bytes((_CHAIN + _HEALTHY_SECTION).encode("utf-8"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "openssl"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = version ]; then echo \'OPENSSLDIR: "{planted}"\'; '
+        f"else echo '{_SSL_AEAD[0]}'; fi\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    r = cipher_policy.read_host_cipher_policy("linux")
+    assert r.status is Status.FAIL, r.detail
+    assert "all 1 enabled suites are AEAD" in r.detail  # the planted binary answered
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
 
 
 @pytest.mark.parametrize(

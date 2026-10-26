@@ -18,9 +18,9 @@ and the TLS 1.0 and 1.1 client switches come from the registry through stdlib ``
 needs no subprocess. Linux runs the ``openssl`` command
 rather than Python's ``ssl`` module: section 5.4 measured that the CLI offers what the driver
 offers, and Python sets its own default cipher string over the host's ``CipherString``. It reads
-the policy lines from the file that ``openssl`` loads (:func:`_openssl_policy_lines`), in the
-section OpenSSL applies as the system default, found the way OpenSSL finds it
-(:func:`_system_default_section`).
+the policy lines from the file that ``openssl`` loads, and without ``OPENSSL_CONF`` from the
+system file too (:func:`_linux_policy_readings`). It reads them in the section OpenSSL applies as
+the system default, found the way OpenSSL finds it (:func:`_system_default_section`).
 """
 
 from __future__ import annotations
@@ -111,6 +111,11 @@ _OPENSSL_SUITE_LINE = re.compile(r"\S+\s+\S+\s+Kx=\S+\s+Au=\S+\s+Enc=\S+\s+Mac=\
 #: ``openssl.cnf`` it loads when ``OPENSSL_CONF`` is not set.
 _OPENSSLDIR_LINE = re.compile(r'OPENSSLDIR: "(.+)"')
 _OPENSSL_CNF_NAME = "openssl.cnf"
+#: The system file, at the fixed path the row read before BACKLOG #3803 item 2. Without
+#: ``OPENSSL_CONF`` it is read as well as the binary's own file, and the worse reading stands. The
+#: binary is found on ``PATH``, so a planted one can name any ``OPENSSLDIR``. Reading this file too
+#: keeps a planted binary from turning its FAIL into a PASS.
+_SYSTEM_CNF = Path("/etc/ssl/openssl.cnf")
 #: The variables OpenSSL reads to find its configuration file and the provider modules and engines
 #: it loads. They cross to the probe on top of the platform's start-up names, which on POSIX hold
 #: ``LD_LIBRARY_PATH``. No Python variable crosses, because ``openssl`` is not Python and reads
@@ -539,25 +544,18 @@ def _names_the_ssl_module(name: str) -> bool:
     return False
 
 
-def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
-    """The ``CipherString``, ``Ciphersuites`` and ``MinProtocol`` settings OpenSSL applies.
+def _openssl_policy_lines(path: Path) -> tuple[Path, str | None, list[tuple[str, str]]]:
+    """The ``CipherString``, ``Ciphersuites`` and ``MinProtocol`` settings OpenSSL applies from
+    the file at ``path``; :func:`_linux_policy_readings` chooses which files are read.
 
-    Reads the file the probed ``openssl`` loads: the one ``OPENSSL_CONF`` names when this
-    environment sets it, which the probe gets too, and otherwise ``openssl.cnf`` in the binary's
-    ``OPENSSLDIR`` (:func:`_openssl_default_file`). Returns the file, the system-default section,
-    and that section's policy lines; no section means the file sets no system-default policy.
-    OpenSSL matches a file-form command name without case, so this does too. A file using what
-    this check does not follow raises :class:`ProbeUnavailable` naming the file, and so does an
-    ``OPENSSL_CONF`` that is set but empty, because which file ``openssl`` read is then not known.
-    A file that is not there raises :class:`FileNotFoundError`: OpenSSL then applies no policy
-    from it (measured on OpenSSL 3.5.7). One that is there and cannot be read raises
-    :class:`ProbeFailed`. The bytes are decoded here, not read as text, so a lone carriage return
-    stays inside its line as it does in OpenSSL. A leading byte-order mark is dropped, as OpenSSL
-    drops it."""
-    named = os.environ.get("OPENSSL_CONF")
-    if named == "":
-        raise ProbeUnavailable("OPENSSL_CONF is set but empty, so the file openssl read is unknown")
-    path = Path(named) if named else _openssl_default_file()
+    Returns the file, the system-default section, and that section's policy lines; no section
+    means the file sets no system-default policy. OpenSSL matches a file-form command name without
+    case, so this does too. A file using what this check does not follow raises
+    :class:`ProbeUnavailable` naming the file. A file that is not there raises
+    :class:`FileNotFoundError`: OpenSSL then applies no policy from it (measured on OpenSSL
+    3.5.7). One that is there and cannot be read raises :class:`ProbeFailed`. The bytes are
+    decoded here, not read as text, so a lone carriage return stays inside its line as it does in
+    OpenSSL. A leading byte-order mark is dropped, as OpenSSL drops it."""
     try:
         text = path.read_bytes().decode("utf-8-sig", errors="replace")
     except FileNotFoundError:
@@ -654,9 +652,65 @@ def _windows_protocol_readings() -> list[_Reading]:
     return readings
 
 
-def _linux_policy_reading() -> _Reading:
+def _linux_policy_readings() -> list[_Reading]:
+    """One reading per OpenSSL file the floor is judged from.
+
+    Where ``OPENSSL_CONF`` is set, that is the one file, since the probe gets it too and loads
+    it; set but empty, which file ``openssl`` read is not known. Otherwise two files are read: the
+    system file at ``_SYSTEM_CNF``, as before BACKLOG #3803 item 2, and ``openssl.cnf`` in the
+    ``OPENSSLDIR`` the binary prints (:func:`_openssl_default_file`). The worse reading stands,
+    so a planted ``openssl`` naming a healthy file elsewhere cannot hide a system file's FAIL. One
+    file under both names is read once. With no system file, the binary's file is read alone,
+    unless it sits under a folder on ``PATH``, where a planted binary could have put it; that is
+    MANUAL."""
+    named = os.environ.get("OPENSSL_CONF")
+    if named == "":
+        return [
+            _Reading(
+                Status.MANUAL,
+                "OpenSSL file not read (OPENSSL_CONF is set but empty, so the file openssl read "
+                f"is unknown){_BY_HAND}",
+            )
+        ]
+    if named:
+        return [_policy_reading(Path(named))]
+    system = [_policy_reading(_SYSTEM_CNF)] if _SYSTEM_CNF.exists() else []
+    own = _taken("OpenSSL file", _openssl_default_file, _BY_HAND)
+    if isinstance(own, _Reading):
+        return [*system, own]
+    if system:
+        return system if _same_file(own, _SYSTEM_CNF) else [*system, _policy_reading(own)]
+    if holder := _path_folder_holding(own):
+        return [
+            _Reading(
+                Status.MANUAL,
+                f"OpenSSL file not read ({own} is under {holder}, a folder on PATH, and there is "
+                f"no {_SYSTEM_CNF} to check it against){_BY_HAND}",
+            )
+        ]
+    return [_policy_reading(own)]
+
+
+def _same_file(a: Path, b: Path) -> bool:
     try:
-        taken = _taken("OpenSSL file", _openssl_policy_lines, _BY_HAND)
+        return os.path.samefile(a, b)
+    except OSError:  # one is not there, so they are not one file
+        return False
+
+
+def _path_folder_holding(path: Path) -> str | None:
+    """The first ``PATH`` folder, as this process has it and the probe gets it, that holds
+    ``path``. An empty entry is the working folder, as a POSIX shell reads it."""
+    target = Path(os.path.realpath(path))
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if target.is_relative_to(os.path.realpath(entry or ".")):
+            return entry or "."
+    return None
+
+
+def _policy_reading(path: Path) -> _Reading:
+    try:
+        taken = _taken("OpenSSL file", partial(_openssl_policy_lines, path), _BY_HAND)
     except FileNotFoundError as exc:
         return _Reading(
             Status.FAIL, f"no file at {exc.filename}, so openssl applies no system-default policy"
@@ -716,7 +770,7 @@ def read_host_cipher_policy(platform: str | None = None) -> CheckResult:
         # Section 5.4's check is `grep -v AEAD` over each `openssl ciphers -v` line.
         return _combine(
             _suite_reading("enabled suites", _openssl_suites, lambda line: "AEAD" in line),
-            _linux_policy_reading(),
+            *_linux_policy_readings(),
         )
     return CheckResult(
         RID, TITLE, Status.SKIP, f"section 5.4 covers Windows and Linux hosts, not {platform}"
