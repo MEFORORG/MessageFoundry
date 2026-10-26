@@ -364,8 +364,6 @@ class CertExpiryRunner:
             if check.days_remaining <= self._settings.warn_days:
                 if check.kind == "crl":
                     try:
-                        # Vault BACKLOG #2319: the other rows naming this file. A held copy is
-                        # matched by its file, not its hop, so it is reported under each of them.
                         self._alert_sink.crl_expiry(
                             check.label,
                             path=check.path,
@@ -373,6 +371,8 @@ class CertExpiryRunner:
                             days_remaining=check.days_remaining,
                             held_copy=check.held_copy,
                             detail=check.detail,
+                            # Vault BACKLOG #2319: the other rows naming this file. A held copy is
+                            # matched by its file, not its hop, so it is reported under each.
                             shared_with=said.others(check),
                         )
                     except Exception:
@@ -482,8 +482,9 @@ def _rows_by_crl_file(rows: Sequence[MonitoredCert]) -> dict[str, tuple[str, ...
 
 @dataclass(frozen=True)
 class _HeldCopyAccount:
-    """What a held-copy warning says of a file, but the row and the path's spelling (vault BACKLOG
-    #3099). Named fields, so the fold's key and the line's arguments cannot be put out of order."""
+    """The facts a held-copy warning gives of a file, but the row and the path's spelling (vault
+    BACKLOG #3099). The line formats them, so two accounts fold only when their facts match. Named
+    fields, so the fold's key and the line's arguments cannot be put out of order."""
 
     why: str
     loads: int
@@ -491,13 +492,6 @@ class _HeldCopyAccount:
     issuer: str
     next_update_iso: str
     remedy: str
-
-    @property
-    def detail(self) -> str:
-        """The same account for the alert, which the log line gives only to the log (vault
-        BACKLOG #2319). The remedy leads, because the alert instance keeps only the start of it.
-        The date is the alert's own not_after, so it is not repeated here."""
-        return f"{self.remedy}. Held by: {', '.join(self.holders)}."
 
 
 class _HeldCopyLog:
@@ -542,13 +536,13 @@ class _HeldCopyLog:
         (BACKLOG #3176) costs the fold and no row its mention.
 
         Only log bookkeeping runs here, after the verdict, so a failure in it is logged and costs
-        the row no date and no alert (vault BACKLOG #3548)."""
+        the row no date and no alert (vault BACKLOG #3548). An account counts as logged only once
+        its line is, so a failure leaves the next row sharing the file to log it."""
         try:
             key = crl_path_key(cert.path)
-            if key in self._sharing:
-                if (key, account) in self._logged:
-                    return
-                self._logged.add((key, account))
+            folds = key in self._sharing
+            if folds and (key, account) in self._logged:
+                return
             # The alert's own words for the rows sharing a file, without its clause that each of
             # those rows reports the copy too: a folded line is the one report of it in the log.
             also = crl_expiry_detail(held_copy=False, detail="", shared_with=self.others(cert))
@@ -566,6 +560,8 @@ class _HeldCopyLog:
                 account.remedy,
                 f" {also}" if also else "",
             )
+            if folds:
+                self._logged.add((key, account))
         except Exception:
             log.error(
                 "cert_expiry: could not log the held copies of %r CRL %s",
@@ -682,6 +678,7 @@ def _judge_crl(
     a copy of it. ``None`` only when nothing can be judged. A failure judging the held copies is
     logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
+    detail = ""
     account: _HeldCopyAccount | None = None
     try:
         copies = held.copies(cert.path)
@@ -759,10 +756,15 @@ def _judge_crl(
                     "A reload is pending: the engine applies the file to the running hop within "
                     f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
                 )
+            holders = tuple(sorted({copy.setting or "an unnamed setting" for copy in copies}))
+            # Vault BACKLOG #2319: the same account for the alert, which the log line gives only
+            # to the log. The remedy leads, because the alert instance keeps only the start of it.
+            # The date is the alert's own not_after, so it is not repeated here.
+            detail = f"{remedy}. Held by: {', '.join(holders)}."
             account = _HeldCopyAccount(
                 why=why,
                 loads=len(copies),
-                holders=tuple(sorted({copy.setting or "an unnamed setting" for copy in copies})),
+                holders=holders,
                 issuer=oldest.issuer,
                 next_update_iso=oldest.next_update_iso,
                 remedy=remedy,
@@ -790,5 +792,5 @@ def _judge_crl(
         # The file comes first in ``judged``, and soonest_crl keeps the first of a tie, so a held
         # copy that lapses with the file does not take the date from it (vault BACKLOG #2319).
         held_copy=facts is not file_facts,
-        detail=account.detail if account is not None else "",
+        detail=detail if stale else "",
     )

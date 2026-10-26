@@ -364,8 +364,13 @@ def test_a_failure_logging_the_held_copy_keeps_its_verdict(
     assert [sink.crl_calls[i][0] for i in mine] == site.names
     assert [sink.crl_calls[i][3] for i in mine] == [5, 5, 5]  # the held copy's days, on each
     assert all(sink.crl_notes[i][0] is True for i in mine)
-    failed = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
-    assert failed and "could not log" in failed[0].getMessage()
+    # An account counts as logged only once its line is, so no row's failure folds the next row's
+    # attempt away: each row tries, and each failure is logged.
+    failed = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert len(failed) == 3
+    for message, name in zip(failed, site.names, strict=True):
+        assert message.startswith(f"cert_expiry: could not log the held copies of {name!r} CRL ")
+    assert site.lines(caplog) == []
 
 
 def test_two_files_with_one_account_each_log_their_own_line(
@@ -374,8 +379,8 @@ def test_two_files_with_one_account_each_log_their_own_line(
     # Vault BACKLOG #3548, item 7. The fold is keyed on the file as well as the account. Two files,
     # one row each, whose held copies give the same account word for word: the same reason, holder,
     # issuer, date and remedy. So the file is the only difference, and each file keeps its line. A
-    # fold keyed on the account alone logs one line for both, and fails this test; the eight tests
-    # above all pass against it. This passes before and after the fix.
+    # fold keyed on the account alone logs one line for both, and fails this test; the other nine
+    # tests in this file all pass against it. This passes before and after the fix.
     now = time.time()
     old = read_soonest_crl_facts(ca.crl(days=5.5, number=1), now=now)  # one copy's facts, shared
     rows: list[MonitoredCert] = []

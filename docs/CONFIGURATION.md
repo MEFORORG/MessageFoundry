@@ -2156,7 +2156,8 @@ alert then lists the other rows in `shared_with`. Its `detail` names the setting
 read that, not the row's label, to find the hop to restart. The scan's warning is not repeated for
 each row (vault BACKLOG #3099). A pass logs it once, under the first row, and the line ends with
 "The same file also serves" and the other rows. A later row still gets its own line in at least two
-cases: the file changed part way through the pass, or the scan could not group the rows by file.
+cases. One is a file that changed part way through the pass in a way that changes the line, such as
+one that became unreadable. The other is a pass that could not group the rows by file.
 
 **A CRL inside a CA file counts too, on an outbound hop that checks revocation** (vault BACKLOG
 #2319). The outbound hops that resolve a trust anchor load `[tls].internal_ca_file`, or a
