@@ -543,8 +543,12 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     current one.
 
     **It reads a private attribute.** The string type comes from ``cryptography``'s
-    ``NameAttribute._type``. If a release drops it, every CRL is refused, naming that cause.
-    Comparing the exact text instead would reopen the T61String gap with no sign."""
+    ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
+    name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
+    CRL. Comparing the exact text instead would reopen the T61String gap with no sign.
+
+    **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
+    UTF-8 already fails ``cryptography``'s parse, so the file is refused."""
     return tuple(tuple(sorted(map(_crl_attribute_key, rdn))) for rdn in name.rdns)
 
 

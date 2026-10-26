@@ -835,14 +835,17 @@ def _openssl_takes_for_the_ca(pki: _Pki, issuer: x509.Name) -> bool:
 
 
 # Vault BACKLOG #3755, third pass. ``cryptography`` decodes the bytes of a T61String or an
-# IA5String as UTF-8, while OpenSSL reads them as Latin-1, so the two see other text for one byte
-# string. Each case is a CA named in a UTF8String and a CRL from a name in another type. Measured on
-# OpenSSL 3.5.7 by this test; ``openssl crl -hash`` gives the same groups.
+# IA5String as UTF-8. OpenSSL reads them as Latin-1, so it sees other text in the same bytes. Each
+# case is a CA named in a UTF8String and a CRL from a name in another type. Measured on OpenSSL
+# 3.5.7 by this test; ``openssl crl -hash`` gives the same groups.
 _E = "mefor-3755-\u00e9"  # e with an acute accent, two bytes in UTF-8
 _ONE_BYTE_TEXT_CASES = [
     pytest.param(_E, _E, _ASN1Type.T61String, False, id="t61-utf8-bytes-are-latin1"),
     pytest.param("mefor-3755-\u00c3\u00a9", _E, _ASN1Type.T61String, True, id="t61-as-latin1"),
-    pytest.param(_E + "a", _E + "A", _ASN1Type.T61String, False, id="t61-latin1-then-case"),
+    pytest.param(_E + "a", _E + "A", _ASN1Type.T61String, False, id="t61-case-is-not-enough"),
+    pytest.param(
+        "mefor-3755-\u00c3\u00a9a", _E + "A", _ASN1Type.T61String, True, id="t61-latin1-then-case"
+    ),
     pytest.param(_E, _E, _ASN1Type.IA5String, False, id="ia5-utf8-bytes-are-latin1"),
     pytest.param("mefor-3755-a", "MEFOR-3755-A", _ASN1Type.T61String, True, id="t61-ascii-case"),
     pytest.param(_E, _E, _ASN1Type.BMPString, True, id="bmp-control"),
@@ -854,9 +857,9 @@ _ONE_BYTE_TEXT_CASES = [
 def test_the_issuer_key_reads_a_one_byte_text_type_as_openssl_does(
     tmp_path: Path, ca_cn: str, crl_cn: str, kind: _ASN1Type, same: bool
 ) -> None:
-    """The first three and the IA5String case are red before the third pass. Then the key took
-    ``cryptography``'s text, so it grouped a T61String CRL with a CA OpenSSL keeps apart, and the
-    reverse. The rest are controls, green before and after."""
+    """The cases with a non-ASCII letter in a T61String or an IA5String are red before the third
+    pass. Then the key took ``cryptography``'s text, so it grouped a T61String CRL with a CA
+    OpenSSL keeps apart, and the reverse. The rest are controls, green before and after."""
     pki = _make_pki(tmp_path, ca_cn)
     issuer = _cn(crl_cn, kind)
     assert _openssl_takes_for_the_ca(pki, issuer) is same
