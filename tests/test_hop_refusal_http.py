@@ -432,8 +432,27 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     extra = {"verify_tls": False, "headers": {"X-Session": _SECRET}}
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw(cell, extra)
-    assert "X-Session header, which is not on the verify-off header allowlist" in str(exc.value)
-    assert "remove each static header named as not on the allowlist" in str(exc.value)
+    message = str(exc.value)
+    assert "static headers outside the verify-off allowlist (X-Session)" in message
+    assert "credentials" not in message  # a header refused for its name is not called a credential
+    assert "Or remove those headers" in message  # the one listed item that removal can clear
+    _assert_credential_refusal(exc)
+
+
+def test_removal_is_not_offered_when_a_credential_still_refuses_the_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a credential beside an unlisted header, removing the header cannot clear the refusal,
+    so the text names both apart and offers no removal."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "bearer_token": _SECRET, "headers": {"X-Trace": "t1"}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("REST", extra)
+    message = str(exc.value)
+    assert "its credentials (" in message
+    assert "static headers outside the verify-off allowlist (X-Trace)" in message
+    assert "X-Trace" not in message.split("its credentials (", 1)[1].split(")", 1)[0]
+    assert "remove" not in message.lower()
     _assert_credential_refusal(exc)
 
 
@@ -463,7 +482,8 @@ def test_a_fhir_lookup_unlisted_static_header_over_verify_off_is_refused(
                 {"L": {**lookup, "headers": {"X-Session": _SECRET}}},
                 egress=EgressSettings(deny_by_default=False),
             )
-        assert "X-Session header" in str(exc.value) and _SECRET not in str(exc.value)
+        assert "verify-off allowlist (X-Session)" in str(exc.value)
+        assert _SECRET not in str(exc.value)
         # The control arm: an allowlisted header still crosses on the escape.
         ex = FhirLookupExecutor(
             {"L": {**lookup, "headers": {"Accept": "application/fhir+json"}}},

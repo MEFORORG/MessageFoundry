@@ -1069,9 +1069,10 @@ VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
     {"accept", "content-type", "user-agent", "x-request-id"}
 )
 
-#: How :func:`http_credentials_sent` labels a header refused only for its name, so the refusal in
-#: :func:`refuse_verify_off` can also offer removing it. Such a header need not be a credential.
-_OFF_ALLOWLIST = "which is not on the verify-off header allowlist"
+#: The suffix :func:`http_credentials_sent` puts on a header refused only for its name. Such a
+#: header need not be a credential, so :func:`refuse_verify_off` strips the suffix and names the
+#: header apart from the credentials, as one outside the allowlist.
+_OFF_ALLOWLIST = " header, which is not on the verify-off header allowlist"
 
 
 def http_credentials_sent(
@@ -1107,7 +1108,7 @@ def http_credentials_sent(
             if _is_secret_header(key, value):
                 sent.append(f"{name} header")
             elif key.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
-                sent.append(f"{name} header, {_OFF_ALLOWLIST}")
+                sent.append(f"{name}{_OFF_ALLOWLIST}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
@@ -1162,17 +1163,28 @@ def refuse_verify_off(
     if scheme != "https":
         return None
     if credentials:
-        unlisted = (
-            " Or remove each static header named as not on the allowlist."
-            if any(c.endswith(_OFF_ALLOWLIST) for c in credentials)
+        unlisted = [
+            c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)
+        ]
+        secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
+        sends = []
+        if secrets:
+            sends.append(f"its credentials ({', '.join(secrets)})")
+        if unlisted:
+            sends.append(f"static headers outside the verify-off allowlist ({', '.join(unlisted)})")
+        # Removing the headers clears this refusal only when nothing else is listed, and even then
+        # the hop is decided again as a credential-less verify-off hop, which may still refuse it.
+        removal = (
+            " Or remove those headers; the hop is then decided as a verify-off hop with no "
+            "credential, which its own posture and levers may still refuse."
+            if not secrets
             else ""
         )
         raise ValueError(
-            f"{hop_name_prefix(connection)}{connector} would send its credentials "
-            f"({', '.join(credentials)}) to a peer whose certificate it does not verify "
-            "(verify_tls=false); refused, with no escape. Leave verify_tls on (the default). For a "
-            "server whose certificate comes from a private or self-signed CA, pin that CA with "
-            f"tls_ca_file.{unlisted}"
+            f"{hop_name_prefix(connection)}{connector} would send {' and '.join(sends)} to a peer "
+            "whose certificate it does not verify (verify_tls=false); refused, with no escape. "
+            "Leave verify_tls on (the default). For a server whose certificate comes from a "
+            f"private or self-signed CA, pin that CA with tls_ca_file.{removal}"
         )
     cell = f"{connector} verify_tls=false"
     host = _hop_guard_host(url, cell=cell)

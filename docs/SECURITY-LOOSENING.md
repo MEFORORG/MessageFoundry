@@ -51,7 +51,8 @@ names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
 the `[auth]` setting for the AD bind, and offers only settings that do fix it. A verify-off refusal
-of a header off the allowlist also offers removing that header. `Email` and `Direct`
+names a header off the allowlist apart from any credential. Where such headers are all it lists, it
+also offers removing them, and says the hop is then decided by its own levers. `Email` and `Direct`
 check the credential before the cleartext and verify-off checks, so a credentialed hop is never
 pointed at one of those levers.
 
@@ -86,9 +87,11 @@ every case.
 engine has not verified, when the lever named beside each is set:
 
 - an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
-- a secret in the path of the `url` of an HTTP-family hop, on a `verify_tls = false` hop or over
-  plain `http`, under that hop's own levers. The `url` test reads only the query. A path secret
-  cannot be told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
+- an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
+  `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
+  query parameter with a neutral name, such as `?sid=`, because the query test reads only names
+  that look like a credential. It also covers any secret in the path. A path secret cannot be told
+  apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
   that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
 - a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
