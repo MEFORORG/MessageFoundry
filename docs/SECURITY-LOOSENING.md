@@ -1746,8 +1746,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     caller who can restart the engine adds a read at each start and stop.
   - **No file name.** The injecting process chooses the script's name, so neither the row nor
     the alert carries it. The engine's log output can still hold the name. Usually it is in the
-    refusal's WARNING line, bounded and escaped. In the case below where the guard reads as
-    missing, the interpreter writes the full path to standard error instead. Some refusals have
+    refusal's WARNING line, bounded and escaped. In the one case below where another audit hook
+    refuses the script ahead of the guard, the interpreter writes the full path to standard error
+    instead. Some refusals have
     no line with the name at all. At least these do: one past the backlog of 64, one still
     waiting to be logged when the process exits, and every one where the thread that writes the
     lines could not start.
@@ -1824,20 +1825,27 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `pythonw -m messagefoundry.tray`, has the interface on. That process hands over to the branded
   relaunch. Where branding is unavailable, or the branded child exits at once, it runs the whole
   tray itself with the interface on.
-- **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
-  operating system lets attach could run Python inside the engine, with the store key, the
-  connection secrets and the messages in flight. An application that builds the API without
-  `serve` reports this, until something in it imports the command-line module, which installs
-  the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  in at least two cases. Both need an audit hook that something else added to the process first.
-  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
-  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
-  is there. The engine's hook is then in place and refuses a script, but the entry still reads
-  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
-  refusals. The interpreter reports each one on standard error, with the script's full path.
-  The refusal is still counted, so under `serve` the `remote_debug_refused` audit row and alert
-  still come. In the first case nothing is refused, so there is no row and no alert. The entry cannot tell the two cases apart, so read
-  it as the first, and look for what else in the process adds an audit hook.
+- **`remote_debug_unguarded`: the interface is on, and the hook did not answer.** Read it as the
+  hook not installed: a process the operating system lets attach could run Python inside the
+  engine, with the store key, the connection secrets and the messages in flight. An application
+  that builds the API without `serve` reports this, until something in it imports the
+  command-line module, which installs the hook. `messagefoundry/api/tls.py` does that when it
+  writes a key. `serve` would report it in at least two cases. Both need an audit hook that
+  something else added to the process first. In one, that hook refused the engine's, so the
+  engine's hook is missing and an injected script runs. Nothing is refused, so there is no
+  WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
+  ask whether its own hook is there. The engine's hook is then in place and refuses a script,
+  but the entry still reads as unguarded. A refusal in that state is logged as a WARNING and
+  counted like any other, so under `serve` the `remote_debug_refused` audit row and alert come
+  too, and the entry carries the count, which tells the second case from the first (vault
+  BACKLOG #3463). One refusal in the second case is out of the engine's reach: where that hook
+  also raises on the interpreter's injection event, it refuses the script itself and the
+  engine's hook is never asked. There is then no WARNING, no count, no row and no alert, and the
+  interpreter writes the script's full path on standard error. The engine leaves that line, as
+  it is the other hook's and the only record of the refusal. In neither case does a later
+  install call add the hook again, so the engine does not retry against the hook that refused
+  it. Without a count, the entry cannot tell the two cases apart, so read it as the first, and
+  look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

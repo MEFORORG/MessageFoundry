@@ -607,6 +607,8 @@ class _Installs:
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
         # This process started its reporter when the suite imported the command line.
         monkeypatch.setattr(remotedebug, "_reporter_started", False)
+        # And added its hook then.
+        monkeypatch.setattr(remotedebug, "_hook_added", False)
 
     def _start(self) -> None:
         self.reporters += 1
@@ -629,21 +631,41 @@ def test_install_adds_one_hook_and_a_second_call_adds_nothing(
     assert wrapped is not before and sys.unraisablehook is wrapped
 
 
-def test_install_tries_again_while_the_hook_does_not_answer(
+def test_a_hook_that_does_not_answer_is_added_once_and_still_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control for the test above, and the reason "once" is measured and not remembered: the
-    interpreter drops a new hook without an error when one already installed objects, so a flag
-    set after ``sys.addaudithook`` returned would say "installed" for a hook that is not there."""
+    """Vault BACKLOG #3463, state 2 of ``install_remote_debug_guard``: an earlier audit hook raises
+    on the probe event, so the engine's hook is in and refuses but never answers. Until then every
+    call added another copy, started no reporter, and put the interpreter's unraisable hook back,
+    so a refusal was not logged and its full path went to standard error."""
     installs = _Installs(monkeypatch)
     before = sys.unraisablehook
     monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
     install_remote_debug_guard()
+    quiet = sys.unraisablehook
     install_remote_debug_guard()
-    assert installs.hooks == [remotedebug._guard, remotedebug._guard]
-    # A hook the interpreter dropped gets no reporter thread, and the unraisable hook is put back.
-    assert installs.reporters == 0
-    assert sys.unraisablehook is before
+    install_remote_debug_guard()
+    assert installs.hooks == [remotedebug._guard]
+    assert installs.reporters == 1
+    assert quiet is not before and sys.unraisablehook is quiet
+
+
+def test_a_hook_the_interpreter_dropped_is_not_added_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State 1, and the control for the test above: an earlier hook raises on
+    ``sys.addaudithook``, so the interpreter drops the engine's without an error. The stand-in
+    records the call and adds nothing, so the probe never answers here either. The install cannot
+    tell this from state 2, and the docstring records the retry given up. A real interpreter in
+    this state is measured further down, where the posture still reads the hook as missing."""
+    installs = _Installs(monkeypatch)
+    calls: list[object] = []
+    monkeypatch.setattr(sys, "addaudithook", calls.append)  # returns, adds nothing
+    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    install_remote_debug_guard()
+    install_remote_debug_guard()
+    assert calls == [remotedebug._guard]
+    assert installs.reporters == 1
 
 
 def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
@@ -821,7 +843,12 @@ def test_the_entry_follows_the_reading() -> None:
 
     unguarded = remote_debug_loosening(_UNGUARDED)
     assert unguarded is not None and unguarded[0] == "remote_debug_unguarded"
-    assert "NOT installed" in unguarded[1]
+    assert "NOT installed" in unguarded[1] and "has refused" not in unguarded[1]
+    # A count while the hook does not answer means it is in, behind a hook that stops the probe
+    # (vault BACKLOG #3463), and the entry says so.
+    behind = remote_debug_loosening(RemoteDebugPosture(True, False, refused_scripts=2))
+    assert behind is not None and behind[0] == "remote_debug_unguarded"
+    assert "the hook has refused 2 since this process started" in behind[1]
 
 
 def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
@@ -918,6 +945,7 @@ async def test_the_posture_route_reads_the_live_process_when_nothing_is_pinned(
 _INSTALL_PROBE = """\
 import json
 import sys
+import threading
 
 from messagefoundry.remotedebug import remote_debug_posture
 
@@ -939,10 +967,23 @@ if mode == "objecting":
             raise ValueError("this hook refuses every new one")
 
     real(objects)
+elif mode == "probe-objecting":
+
+    def objects(event, args):
+        if event == "messagefoundry.remotedebug.probe":
+            raise ValueError("this hook refuses an event it does not know")
+
+    real(objects)
 before = remote_debug_posture().guard_installed
+quiet_before = sys.unraisablehook
 try:
-    if mode in ("import", "objecting"):
+    if mode in ("import", "objecting", "probe-objecting"):
         import messagefoundry.__main__
+        from messagefoundry.remotedebug import install_remote_debug_guard
+
+        # The calls `serve` and `supervise` make later.
+        install_remote_debug_guard()
+        install_remote_debug_guard()
     elif mode == "run":
         import runpy
 
@@ -958,6 +999,10 @@ finally:
                 "before": before,
                 "after": remote_debug_posture().guard_installed,
                 "loaded_at_install": loaded_at_install,
+                "reporter": any(
+                    t.name == "mefor-remote-debug-report" for t in threading.enumerate()
+                ),
+                "quiet": sys.unraisablehook is not quiet_before,
             },
             fh,
         )
@@ -1017,7 +1062,21 @@ def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
     does not show that the install contains it. The stand-in test further up does."""
     reading = _install_probe(tmp_path, "objecting")
     assert reading["before"] is False and reading["after"] is False
-    assert len(cast("list[object]", reading["loaded_at_install"])) == 1  # tried, once
+    # Tried once, and not again by the two later calls (vault BACKLOG #3463, state 1).
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+
+
+def test_a_hook_behind_one_that_stops_the_probe_is_added_once_and_reported(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #3463, state 2, against a real interpreter: a hook installed earlier raises on
+    the probe event only. The engine's hook goes in behind it and reads as missing, so before the
+    fix each later call added another copy, no reporter thread ran, and the interpreter's own
+    unraisable hook was put back. Now: one hook, a reporter, and the quiet wrapper stays."""
+    reading = _install_probe(tmp_path, "probe-objecting")
+    assert reading["before"] is False and reading["after"] is False
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+    assert reading["reporter"] is True and reading["quiet"] is True
 
 
 def test_the_probe_alone_installs_nothing(tmp_path: Path) -> None:
