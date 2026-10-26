@@ -528,26 +528,33 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
 
 
 def test_a_decrypt_miss_renders_the_cipher_error_token_restore_verify_reads() -> None:
-    """The token rule, pinned directly (BACKLOG #3605). A full verify's reason is
-    ``safe_exc`` of the decrypt error, so it names the exception's CLASS, and operators and the
-    rotation test above match the ``CipherError`` token in it. BACKLOG #2593 gave the decrypt miss
-    its own subclass, and the first name it took dropped the token. Nothing failed except that
-    end-to-end match.
+    """The token rule, pinned directly (BACKLOG #3605). A full verify's reason is ``safe_exc`` of
+    the error that stopped it, so it names the exception's CLASS, and an operator would match the
+    ``CipherError`` token in it, as the since-retired-key test above does. BACKLOG #2593 gave the
+    decrypt miss its own subclass, and the first name it took dropped the token. Nothing failed
+    except that end-to-end match.
 
-    Covered here: the miss a wrong key really raises, and a plain ``CipherError`` (the corrupt-row
-    arms). NOT every subclass: ``CellTagError``, ``QueueTagError`` and
-    ``AuditKeyVersionRefusedError`` deliberately do not end in the token, and none of them reaches
-    restore-verify's per-cell decrypt."""
-    sealed = make_cipher(generate_key()).encrypt("PID|1||SYNTH-0001")
-    with pytest.raises(CipherError) as raised:
-        make_cipher(generate_key()).decrypt(sealed)
+    Both errors are read off a real raise of the cell-bound (v4, AAD) cipher the store writes with:
+    the miss a wrong key raises, and the plain ``CipherError`` of a too-short value (a corrupt-row
+    arm). NOT every subclass: at least ``CellTagError``, ``QueueTagError`` and
+    ``AuditKeyVersionRefusedError`` deliberately lack the token, and this test says nothing about
+    them."""
+    aad = b"synthetic-cell"
+    sealed = make_cipher(generate_key(), write_v2=True).encrypt("PID|1||SYNTH-0001", aad=aad)
+    reader = make_cipher(generate_key(), write_v2=True)
+    with pytest.raises(CipherError) as miss:
+        reader.decrypt(sealed, aad=aad)
     # The class the miss raises today, so the token below is read off the real raise.
-    assert type(raised.value) is UnauthenticatedCipherError
-    corrupt = CipherError("decrypted value is not valid UTF-8; the row is corrupt")
-    for err in (raised.value, corrupt):
+    assert type(miss.value) is UnauthenticatedCipherError
+    with pytest.raises(CipherError) as corrupt:
+        reader.decrypt(sealed.rsplit(":", 1)[0] + ":AAAA", aad=aad)
+    assert type(corrupt.value) is CipherError
+    for err in (miss.value, corrupt.value):
+        name = type(err).__name__
         rendered = safe_exc(err)
-        assert rendered.startswith(f"{type(err).__name__}: "), rendered
-        assert "CipherError" in rendered, rendered
+        assert rendered.startswith(f"{name}: "), rendered
+        # The class name, not the message: a message that happened to say CipherError proves nothing.
+        assert "CipherError" in name, rendered
 
 
 def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(
@@ -750,7 +757,6 @@ def test_an_exception_after_extraction_with_a_held_handle_leaves_no_plaintext(
 ) -> None:
     """Limb 2 of #1721 on the exception path: the error that escapes is the verify's own, never the
     teardown's, and the plaintext is gone either way. Bites on Windows, like the test above."""
-    import pytest
 
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
@@ -889,7 +895,6 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
 def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, monkeypatch) -> None:
     """``KeyboardInterrupt`` is not an ``Exception``: the teardown must run for it too, and it must
     reach the caller unchanged."""
-    import pytest
 
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
@@ -911,7 +916,6 @@ def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, mon
 def test_an_exception_carries_the_directory_it_could_not_clear(tmp_path, monkeypatch) -> None:
     """An exception escaping the verify keeps its own type, and a staging directory that still holds
     decrypted bytes is named on it as a note, not only in the log."""
-    import pytest
 
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
