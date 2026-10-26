@@ -381,6 +381,10 @@ def test_every_guard_name_reaches_the_guard() -> None:
     stand in for a wrapper; the guard names here are unique today."""
     defs = _scan().defs
     assert callable(getattr(RevocationHopGuard, "capture", None))
+    # 6 guard names when this floor was set, so 4 lets two go with no edit here (BACKLOG #3512). It
+    # fails a list emptied or cut to "capture" alone, over which the check below passes on nothing.
+    assert "capture" in _GUARDS, sorted(_GUARDS)
+    assert len(_GUARDS) >= 4, f"only {len(_GUARDS)} guard names, floor 4"
     reaches = {"capture"}
     grew = True
     while grew:
