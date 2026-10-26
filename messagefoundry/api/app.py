@@ -10910,12 +10910,25 @@ def _chain_registry_preflights(
 
 def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
     """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
-    (BACKLOG #3470). Each rule and escalation tier stops naming ``email`` too, since the notifier
-    refuses a rule that routes to a transport it does not have, and the webhook would go with it. A
-    rule that named only email then names none, so it pages nobody, as email could not."""
+    (BACKLOG #3470). A refused CA must never make an alert quieter.
+
+    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
+      transport it lacks, and the webhook would go with it.
+    * A rule or tier that named only email now names the webhook, the one transport left. An
+      empty list means suppress, and the operator never asked for that. ``None`` would not do for
+      a tier: it keeps its rule's transports, which may be an empty list.
+    * With no webhook there is no notifier, so the engine's logging sink logs each alert at
+      WARNING. The rules are dropped then: they route only the notifier, and kept they would log
+      advice to configure the email that is configured.
+    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
+      not built. A secret store that is down cannot abort the start before the CA refusal."""
 
     def _no_email(transports: list[str] | None) -> list[str] | None:
-        return None if transports is None else [t for t in transports if t != "email"]
+        if transports is None:
+            return None
+        kept = [t for t in transports if t != "email"]
+        # Rules are kept only beside a webhook, so it is every transport left.
+        return kept if kept or not transports else ["webhook"]
 
     rules = [
         rule.model_copy(
@@ -10929,7 +10942,13 @@ def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
         )
         for rule in alerts.rules
     ]
-    return alerts.model_copy(update={"email_to": [], "rules": rules})
+    return alerts.model_copy(
+        update={
+            "email_to": [],
+            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
+            "rules": rules if alerts.webhook_url else [],
+        }
+    )
 
 
 def create_managed_app(

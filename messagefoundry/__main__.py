@@ -2974,7 +2974,8 @@ def _serve(args: argparse.Namespace) -> int:
         else None
     )
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
-    # built, and the API lifespan's audited preflight refuses the start with its audit row.
+    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
+    # when it can read the file.
     _forward_ca_refusals: list[TrustAnchorError] = []
     _logging_refused = _start_logging(
         settings,

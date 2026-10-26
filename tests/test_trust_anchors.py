@@ -3011,9 +3011,96 @@ async def test_a_refused_alerts_ca_drops_email_from_every_rule_and_tier(
             pass
     assert _webhook_only(built)
     assert [(r.transports, [t.transports for t in r.escalate]) for r in built[0].rules] == [
-        (["webhook"], [[]]),
+        (["webhook"], [["webhook"]]),
         (None, []),
     ]
+
+
+@pytest.mark.parametrize("webhook", [True, False])
+@pytest.mark.parametrize("event_type", ["integrity_drift", "any"])
+def test_a_refused_alerts_ca_never_makes_an_email_only_alert_quieter(
+    event_type: str, webhook: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rule that sent an alert only by email must still page or log it once email is dropped.
+    With a webhook it pages the webhook, never the empty list that means suppress. With none
+    there is no notifier, so the engine's logging sink logs it at WARNING, and nothing tells the
+    operator to configure the email they did configure. Red on c53d91e21c: the rule became an
+    empty list, which suppresses with a webhook and logs that advice without one."""
+    from messagefoundry.api.app import _alerts_without_email
+    from messagefoundry.pipeline.alert_sinks import (
+        AlertRuleSet,
+        NotifierAlertSink,
+        notifier_from_settings,
+    )
+
+    alerts = AlertsSettings(
+        webhook_url="https://hooks.example.org/mefor" if webhook else None,
+        rules=[
+            AlertRule(
+                event_type=event_type,
+                transports=["email"],
+                escalate=[EscalationTier(after_count=2, transports=["email"])],
+            )
+        ],
+        **_SMTP,
+    )
+    stripped = _alerts_without_email(alerts)
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.alert_sinks"):
+        sink = notifier_from_settings(stripped)
+    assert "no transport is configured" not in caplog.text
+    if not webhook:
+        # No notifier: the lifespan puts the engine on LoggingAlertSink, which logs at WARNING.
+        assert sink is None
+        return
+    assert isinstance(sink, NotifierAlertSink)
+    decision = AlertRuleSet(stripped.rules).decide(
+        {"type": "integrity_drift", "connection": "store-cipher"}
+    )
+    assert decision.transports == ("webhook",)
+    assert [tier.transports for tier in decision.escalate] == [["webhook"]]
+
+
+async def test_a_secret_store_that_is_down_does_not_hide_a_refused_alerts_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Email is dropped for a refused CA, so its SMTP password is not resolved. A secret store
+    that is down then cannot abort the lifespan before the audited check refuses the start and
+    writes its row. Red on c53d91e21c: the reference was kept, and the provider's error ended the
+    start with no row."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.secretprovider import SecretProviderError
+    from messagefoundry.config.settings import SecretsSettings
+
+    class _Down:
+        def resolve(self, ref: str) -> str:
+            raise SecretProviderError("the secret store is down")
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr("messagefoundry.api.app.resolve_secret_provider", lambda *a, **k: _Down())
+    ca = str(_pem(tmp_path))
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        alerts_settings=AlertsSettings(
+            email_tls_ca_file=ca, email_password_secret="alerts/smtp#password", **_SMTP
+        ),
+        secrets_settings=SecretsSettings(),
+        trust_anchor_specs=_dialling_specs(ca, alerts=_SMTP),
+        trust_anchors_enforcing=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        assert "acl_insecure" in [r["event"] for r in await _rows(reopened, "alerts_email_ca")]
+    finally:
+        await reopened.close()
 
 
 async def test_a_notifier_refusal_behind_a_refused_alerts_ca_is_logged(

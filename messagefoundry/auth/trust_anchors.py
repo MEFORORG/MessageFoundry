@@ -128,17 +128,19 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       refusal builds no forwarder and logs a WARNING that forwarding is off. ``serve`` hands the
       refusal to the API lifespan, which refuses the start once this preflight has run. It has
       its rows when the file can be read, and is marked ``unaudited`` if this preflight passed.
-      At least these run first: the API
-      TLS pair is minted or renewed, the store is created and migrated, and the startup
-      attestation runs and may alert. No listener binds, since uvicorn binds after the lifespan.
+      At least these run first: the API TLS pair is minted or renewed, the store is created and
+      migrated, and the startup attestation runs and may alert. Their log records reach stdout
+      and the log file but no collector. No listener binds, since uvicorn binds after the
+      lifespan.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
       notifier with an email transport. It checks only a CA this preflight is given. A refusal
-      builds the notifier without its email transport, and no rule or escalation tier names email,
-      so the webhook still pages the alerts sent before this preflight. This preflight then refuses the start, with its rows when the file
-      can be read. If it passes instead, the file changed or a read failed once. The first
-      refusal is raised then, marked ``unaudited``: no row records it.
+      builds the notifier without its email transport, and no alert goes quieter for it. A rule
+      that sent only by email pages the webhook instead. With no webhook there is no notifier,
+      and the logging sink logs each alert at WARNING. This preflight then refuses the start,
+      with its rows when the file can be read. If it passes instead, the file changed or a read
+      failed once. The first refusal is raised then, marked ``unaudited``: no row records it.
     * The offline security notifier of the recovery commands checks the same CA. A refusal drops
       the notice with a WARNING and never refuses the recovery.
 
@@ -152,8 +154,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **Declined** (BACKLOG #3470). The internal CA check stays for an instance whose hops never
     read the file, as the paragraph above says. This preflight runs before any graph is loaded,
-    so it cannot tell. A reload can also add a hop that
-    reads the CA. It errs toward refusing. And each spec builder restates its hop's enable
+    so it cannot tell. A reload can also add a hop that reads the CA. It errs toward refusing. And each spec builder restates its hop's enable
     conditions rather than sharing one predicate with the hop's builder. One predicate would run
     through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each

@@ -173,7 +173,8 @@ def test_serve_hands_an_exposed_collector_ca_to_the_audited_start_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``serve`` builds no forwarder for a refused collector CA, logs that forwarding is off, and
-    hands the refusal to the API lifespan, whose audited check refuses the start with its row.
+    hands the refusal to the API lifespan, whose audited check refuses the start. That check
+    writes its row when it can read the file.
     Red before the fix: ``serve`` built the forwarder, and the lifespan got no refusal."""
     from messagefoundry.auth.trust_anchors import TrustAnchorError
 
