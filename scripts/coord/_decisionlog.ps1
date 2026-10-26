@@ -63,7 +63,8 @@ function Get-DecisionSpoolDir([string]$CoordRoot) {
 function New-DecisionId {
     $bytes = [byte[]]::new(3)
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    return 'd' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '-' + [Convert]::ToHexString($bytes).ToLowerInvariant()
+    # Invariant, or a Thai culture writes a Buddhist-era year: an id 543 years ahead.
+    return 'd' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) + '-' + [Convert]::ToHexString($bytes).ToLowerInvariant()
 }
 
 function Get-DecisionInstant([string]$Id) {
@@ -275,6 +276,25 @@ function Write-DecisionSpool([string]$CoordRoot, $Record) {
     [System.IO.File]::Move($part, $final)
 }
 
+function Update-DecisionSpool([string]$CoordRoot, $Record) {
+    <#
+      Rewrites a record still spooled as <id>.json, and returns whether it did. A flusher that has
+      already claimed the file (renamed it to post) leaves nothing to replace, and File.Replace
+      refuses rather than spool a second copy that would be posted twice.
+    #>
+    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$($Record.id).json"
+    $part = "$final.$PID.tmp"
+    [System.IO.File]::WriteAllText($part, ($Record | ConvertTo-Json -Depth 8 -Compress), [System.Text.UTF8Encoding]::new($false))
+    try {
+        # [NullString], since PowerShell passes $null to a string parameter as ''.
+        [System.IO.File]::Replace($part, $final, [NullString]::Value)
+        return $true
+    } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+        [System.IO.File]::Delete($part)
+        return $false
+    }
+}
+
 function Send-DecisionSpool {
     <# Posts every spooled record to its day's issue, oldest first. Returns the count posted and an error per record left. #>
     param([string]$Repo, [string]$CoordRoot)
@@ -359,7 +379,7 @@ function Read-DecisionLog {
 
 function Get-DecisionDayRange([string]$Day, [int]$Count) {
     $end = [DateTime]::ParseExact($Day, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
-    return @(0..($Count - 1) | ForEach-Object { $end.AddDays(-$_).ToString('yyyy-MM-dd') })
+    return @(0..($Count - 1) | ForEach-Object { $end.AddDays(-$_).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) })
 }
 
 # --- What the class B gate reads (docs/AUTONOMY-PLAN.md 4.2 and 4.5-4.7) ---------------------------
@@ -488,8 +508,10 @@ function Get-DecisionBudget {
     }
     $day = [TimeSpan]::FromHours(24)
     # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
-    # before it can count toward it; a future-dated one is not counted.
-    $times = @($Reversals | Where-Object { $null -ne $_.At -and $_.At -le $Now -and $_.At -gt $Now - $day - $day } | ForEach-Object { $_.At } | Sort-Object)
+    # before it can count toward it. A future-dated one (a skewed clock wrote its id) counts as now,
+    # so it closes the budget rather than slipping past it.
+    $times = @($Reversals | Where-Object { $null -ne $_.At -and $_.At -gt $Now - $day - $day } |
+            ForEach-Object { if ($_.At -gt $Now) { $Now } else { $_.At } } | Sort-Object)
     $closedUntil = $null
     for ($i = $Limit - 1; $i -lt $times.Count; $i++) {
         if ($times[$i] - $times[$i - $Limit + 1] -lt $day -and $times[$i] + $day -gt $Now) { $closedUntil = $times[$i] + $day }
@@ -542,10 +564,11 @@ function Get-DecisionChain {
 
 function Get-DecisionRecentUnsampledB {
     # The unsampled Class B decisions logged in the 24 hours before -Now: plan 4.6's floor, per item.
+    # One dated after -Now (a skewed clock wrote its id) counts, as though logged now.
     param($Records, [datetime]$Now, [hashtable]$Ratings)
     $since = $Now.AddHours(-24)
     return @($Records | Where-Object {
-            (Test-DecisionUnsampledB $_ $Ratings) -and ($at = Get-DecisionInstant ([string]$_.id)) -and $at -gt $since -and $at -le $Now
+            (Test-DecisionUnsampledB $_ $Ratings) -and ($at = Get-DecisionInstant ([string]$_.id)) -and $at -gt $since
         })
 }
 
@@ -641,7 +664,8 @@ function Get-DecisionCostRung {
 
       UNKNOWN when the reading is missing, stale, refused, or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
-      5-hour state does not). usage.ps1 skips that refusal when it reads CRITICAL overall, so a
+      5-hour state does not), unless the 5-hour window grades HIT: a hit is never downgraded, since
+      that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
       CRITICAL reading that this grades below the rung is UNKNOWN too: it may be another root's. A
       reader that does not finish within -TimeoutSeconds is UNKNOWN. A Desktop session that runs no
       statusLine reads UNKNOWN here; the Steward's status.json fallback that
@@ -687,9 +711,6 @@ function Get-DecisionCostRung {
         if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }
         return (New-DecisionRung 'UNKNOWN' "the 5-hour window is UNKNOWN: $why")
     }
-    if ($overall -notin @('OK', 'WARN', 'CRITICAL')) {
-        return (New-DecisionRung 'UNKNOWN' "usage.ps1 reads '$overall' overall: $(Get-DecisionJsonValue $j 'statusline_state')")
-    }
     $pct = [double]$pct
     $rate = Get-DecisionJsonValue $five 'rate_pct_per_hr'
     $toEmpty = Get-DecisionJsonValue $five 'minutes_to_empty'
@@ -709,7 +730,13 @@ function Get-DecisionCostRung {
     } else {
         New-DecisionRung 'OK' "$at. No burn rate; below the level backstop"
     }
-    if ($overall -eq 'CRITICAL' -and $rung.State -ne 'HIT') {
+    # A HIT stands whatever the overall state: halting on a reading that may be another root's
+    # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.
+    if ($rung.State -eq 'HIT') { return $rung }
+    if ($overall -notin @('OK', 'WARN', 'CRITICAL')) {
+        return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 reads '$overall' overall: $(Get-DecisionJsonValue $j 'statusline_state')")
+    }
+    if ($overall -eq 'CRITICAL') {
         return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 reads CRITICAL overall, which skips its statusLine trust check, so this reading may be another root's")
     }
     return $rung

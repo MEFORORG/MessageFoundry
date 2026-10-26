@@ -13,11 +13,14 @@ starts from that seat, so a REVIEW proves the one condition the test adds closed
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -294,6 +297,24 @@ def test_a_reading_usage_calls_unknown_overall_is_unknown_here(sb: Sandbox) -> N
     assert code == REVIEW and "WIRED_ELSEWHERE" in why(out)
 
 
+@pytest.mark.parametrize(
+    ("five", "reason"),
+    [
+        pytest.param(usage(99.0, state="CRITICAL"), "At the ceiling", id="ceiling"),
+        pytest.param(usage(85.0, state="WARN"), "the level is the backstop", id="level"),
+    ],
+)
+def test_a_hit_stands_when_usage_reads_unknown_overall(
+    sb: Sandbox, five: dict[str, Any], reason: str
+) -> None:
+    """Downgrading a 5-hour hit to UNKNOWN would let a session at the rung act after review."""
+    seed_vault(sb, calibrated("manager"))
+    five.update(state="UNKNOWN", statusline_state="WIRED_ELSEWHERE")
+    write_fake_usage(_usage_path(sb), five, code=20)
+    code, doc = gate(sb)
+    assert code == HALT and reason in why(doc), why(doc)
+
+
 @pytest.mark.parametrize("seat", ["lander", "land"])
 def test_the_lander_is_exempt_from_the_halt(sb: Sandbox, seat: str) -> None:
     """The roster's aliases count too; the sandbox gets the real roster, as a checkout has it."""
@@ -386,6 +407,15 @@ def test_a_reversal_logged_twice_counts_once(sb: Sandbox) -> None:
     assert code == NO_REVIEW, why(doc)
 
 
+def test_a_future_dated_reversal_counts_as_now(sb: Sandbox) -> None:
+    """A clock running ahead wrote the second id; dropping it would leave the budget open."""
+    mine = [rec(at=ago(days=20), seat="manager", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=-2))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
+
+
 def test_three_reversals_fleet_wide_close_every_seat(sb: Sandbox) -> None:
     others = [rec(at=ago(days=20), seat=s, item="x") for s in ("a", "b", "c")]
     seed_vault(sb, calibrated("manager") + others)
@@ -450,6 +480,15 @@ def test_the_item_floor_counts_unsampled_class_b_in_24_hours(
     seed_vault(sb, [*calibrated("manager"), *recent, stale, class_c])
     code, doc = gate(sb)
     assert code == expected, why(doc)
+
+
+def test_a_future_dated_decision_counts_toward_the_floor(sb: Sandbox) -> None:
+    """Two in the last hours and one a skewed clock dated ahead of now: depth three."""
+    recent = [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(2)]
+    ahead = rec(at=ago(hours=-1), seat="builder", item="4242")
+    seed_vault(sb, [*calibrated("manager"), *recent, ahead])
+    code, doc = gate(sb)
+    assert code == REVIEW and "chain: depth 3" in why(doc), why(doc)
 
 
 def test_a_halted_decision_does_not_count_toward_the_floor(sb: Sandbox) -> None:
@@ -574,6 +613,89 @@ def test_a_reviewed_or_other_class_record_is_not_gated(
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "GATE" not in proc.stdout
     assert [r["gate"] for r in _logged(sb)] == [""]
+
+
+def _spooled(sb: Sandbox) -> list[dict[str, Any]]:
+    return [json.loads(p.read_text(encoding="utf-8")) for p in sb.spool() if p.suffix == ".json"]
+
+
+def test_the_logged_record_does_not_count_against_its_own_chain_floor(sb: Sandbox) -> None:
+    """It is spooled before the gate runs; read back, it would be the third unsampled decision."""
+    seed_vault(sb, calibrated("manager"))
+    seed_vault(sb, [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(2)])
+    proc = _log(sb)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert proc.stdout.split("\n")[1] == "GATE NO-REVIEW"
+
+
+def test_a_gate_that_crashes_leaves_the_record_spooled(sb: Sandbox) -> None:
+    """The usage reader kills decision.ps1 mid-gate; the record was spooled before the gate ran."""
+    _usage_path(sb).write_text(
+        "$p = (Get-Process -Id $PID).Parent\nStop-Process -Id $p.Id -Force\n$p.WaitForExit()\n",
+        encoding="utf-8",
+    )
+    proc = _log(sb)
+    assert proc.returncode not in (0, 4, NO_REVIEW, REVIEW, HALT), (proc.stdout, proc.stderr)
+    assert "LOGGED" not in proc.stdout
+    (row,) = _spooled(sb)
+    assert (row["kind"], row["item"], row["gate"]) == ("decision", "4242", "PENDING")
+
+
+def test_a_gate_that_hangs_leaves_the_record_spooled(sb: Sandbox, tmp_path: Path) -> None:
+    """The usage reader never answers; while the gate waits on it, the record is already spooled."""
+    started = tmp_path / "usage-started"
+    _usage_path(sb).write_text(
+        f"Set-Content -LiteralPath '{started}' -Value $PID\nStart-Sleep -Seconds 300\n",
+        encoding="utf-8",
+    )
+    local = sb.repo / DECISION.resolve().relative_to(ROOT)
+    args = no_host_usage(sb, (*LOG_B, "-Class", "B"))
+    proc = subprocess.Popen(  # noqa: S603 - a fixed pwsh argv
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(local), *args],
+        cwd=str(sb.repo),
+        env=sb.env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    reader = 0
+    try:
+        deadline = time.monotonic() + 60
+        while not reader and time.monotonic() < deadline:
+            text = started.read_text(encoding="utf-8").strip() if started.exists() else ""
+            reader = int(text) if text.isdigit() else 0
+            time.sleep(0.2)
+        assert reader, "the stand-in usage reader never started"
+        assert proc.poll() is None, "decision.ps1 finished; the gate did not hang"
+        (row,) = _spooled(sb)
+        assert (row["kind"], row["item"], row["gate"]) == ("decision", "4242", "PENDING")
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+        if reader:
+            with contextlib.suppress(OSError):
+                os.kill(reader, signal.SIGTERM)
+
+
+def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:
+    """A Buddhist-era id would read 543 years ahead, past every window the gate counts."""
+    script = (
+        "[cultureinfo]::CurrentCulture = 'th-TH'; "
+        f". '{COORD / '_decisionlog.ps1'}'; "
+        "New-DecisionId; Get-DecisionDayRange '2026-10-26' 2; (Get-Date).ToString('yyyy')"
+    )
+    proc = subprocess.run(  # noqa: S603 - a fixed pwsh argv
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    minted, *days, control = proc.stdout.split()
+    assert int(control) > 2500, "the control: the culture did not take, so this proves nothing"
+    at = datetime.strptime(minted[1:16], "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+    assert abs(at - datetime.now(UTC)) < timedelta(hours=1), minted
+    assert days == ["2026-10-26", "2026-10-25"]
 
 
 # --- the digest carries the gate's state and the attic ---------------------------------------

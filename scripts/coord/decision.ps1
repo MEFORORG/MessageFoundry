@@ -46,10 +46,11 @@
     unsampled Class B decisions on the item logged in the trailing 24 hours, because -BuildsOn is
     self-reported. More than two goes to review. A linked id the log does not hold fails closed.
 
-    -LOG ENFORCES IT. A `decision` record of Class B with -Reviewed no runs the gate before it is
-    written. The record is spooled and posted whatever the answer, with the answer in its `gate`
-    field. When the answer is not NO-REVIEW, -Log prints `GATE <word>` and why, and exits with the
-    gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
+    -LOG ENFORCES IT. A `decision` record of Class B with -Reviewed no is spooled first with `gate`
+    PENDING, then the gate runs, skipping that record, and its answer replaces PENDING in the spooled
+    copy. So a gate that crashes or hangs loses no record; one left PENDING counts toward the chain
+    floor. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
+    `GATE <word>` and why, and exits with the gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
     LOGGED line still says whether the record was posted or is still spooled. Under -NoPost the gate
     reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. -Log stops an act only
     when a session logs BEFORE it acts; the empower skill, as read on 2026-10-26, says to log each
@@ -305,9 +306,11 @@ function Invoke-DecisionGate {
       The class B gate's answer, NO-REVIEW, REVIEW or HALT, with its reasons. The header lists the
       conditions. Checked cheapest first, and it stops at the first that closes the no-review path
       until the log is read; from there every condition is checked and every failure is named. Any
-      throw inside is REVIEW.
+      throw inside is REVIEW. -ExcludeId is the record -Log spooled before asking, which must not
+      count against itself.
     #>
-    param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline)
+    param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline,
+        [string]$ExcludeId = '')
     $why = [System.Collections.Generic.List[string]]::new()
     try {
         if (Test-DecisionLanderSeat $Seat) {
@@ -338,16 +341,19 @@ function Invoke-DecisionGate {
         }
         $now = [DateTime]::UtcNow
         $today = $now.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
-        # The digest's default window, plus the days the -BuildsOn ids name; Read-DecisionLogForGate
-        # adds the days of reversed decisions older than both.
+        # The digest's default window, plus the days the -BuildsOn ids name, plus tomorrow, where a
+        # clock running ahead files a record near midnight: the budget and the chain floor count a
+        # future-dated record as now. Read-DecisionLogForGate adds the days of reversed decisions
+        # older than all of them.
         $window = @(Get-DecisionDayRange $today 60)
-        $days = @(@($window) + @($BuildsOn | ForEach-Object { Get-DecisionIdDay $_ }) | Select-Object -Unique)
+        $tomorrow = $now.AddDays(1).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $days = @(@($window) + $tomorrow + @($BuildsOn | ForEach-Object { Get-DecisionIdDay $_ }) | Select-Object -Unique)
         $res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days $days
         if (-not $res.Complete) {
             $why.Add("the decision log was not fully read, so no condition on it can be shown: $($res.Errors -join '; ')")
             return (New-GateAnswer 'REVIEW' $why)
         }
-        $all = @($res.Records)
+        $all = @($res.Records | Where-Object { [string]$_.id -ne $ExcludeId })
         $ratings = Get-DecisionLatest $all 'rating'
         $outcomes = Get-DecisionLatest $all 'outcome'
         $reversals = @(Get-DecisionReversals $all)
@@ -486,16 +492,13 @@ $preds = foreach ($p in $Predicate) {
 # Where the gate is enforced (plan 4.5-4.7): empower requires every Class B decision to be logged,
 # so an unreviewed one meets the gate here. That stops the act only when the log comes before it
 # (the header says so). The record is written whatever the answer.
+$gated = $Kind -eq 'decision' -and $Class -eq 'B' -and $Reviewed -eq 'no'
 $gateAnswer = $null
-if ($Kind -eq 'decision' -and $Class -eq 'B' -and $Reviewed -eq 'no') {
-    $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
-        -ThresholdsFile $ThresholdsFile -Offline:$NoPost
-}
 $cfg = [string]$env:CLAUDE_CONFIG_DIR
 $record = [ordered]@{
     v              = 1
     id             = New-DecisionId
-    ts             = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    ts             = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
     kind           = $Kind
     item           = $Item
     seat           = $Seat
@@ -515,7 +518,9 @@ $record = [ordered]@{
     rating         = $Rating
     note           = $Note
     buildsOn       = @($BuildsOn)
-    gate           = $(if ($gateAnswer) { $gateAnswer.Result } else { '' })
+    # PENDING until the gate answers, below. A record left PENDING (the gate crashed or hung, or a
+    # flusher posted it first) counts toward the chain floor like any unsampled Class B decision.
+    gate           = $(if ($gated) { 'PENDING' } else { '' })
 }
 
 function Complete-Log([string]$How, [int]$Code) {
@@ -531,7 +536,18 @@ function Complete-Log([string]$How, [int]$Code) {
     exit $Code
 }
 
+# EVERY RECORD IS SPOOLED BEFORE ANYTHING ELSE RUNS, the gate included, so a gate that crashes or
+# hangs cannot lose it. The gate then skips this record's own id, and its answer is written into
+# the spooled copy, unless a flusher has already taken that copy to post.
 Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
+if ($gated) {
+    $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
+        -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
+    $record.gate = $gateAnswer.Result
+    if (-not (Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record))) {
+        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but another flusher had already taken $($record.id) to post, so the record says gate PENDING.")
+    }
+}
 if ($NoPost) { Complete-Log 'spooled' 0 }
 $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
 Write-Flushed $r

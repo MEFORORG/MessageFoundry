@@ -317,7 +317,9 @@ earliest such record; a decision whose latest outcome is something else is not o
 calibration reads it. It is charged to the seat of the **decision** it refers to, joined through
 the ref, never to the seat that logged the outcome. Three inside any 24 hours close the no-review
 path for every seat, and two of one seat's decisions close it for that seat, in each case for 24
-hours from the reversal that reached the limit. A reversal of a decision the log does not hold has
+hours from the reversal that reached the limit. A reversal whose id is dated after now, by a
+clock running ahead, counts as now, and so does such a decision in the chain floor below; the gate
+also reads tomorrow's day for them. A reversal of a decision the log does not hold has
 no seat; it counts against every seat's budget, and for the item rule it closes the path for any
 item, since its item cannot be told.
 
@@ -325,7 +327,8 @@ item, since its item cannot be told.
 
 `-Log` takes `-BuildsOn <id>`, split at newlines like `-Predicate`, and the record schema gains
 two fields, still version 1: `buildsOn`, the ids, and `gate`, the gate's answer on an unreviewed
-Class B record (empty otherwise). A reader fills both for an older record. Depth is the unsampled
+Class B record (empty otherwise; `PENDING` until the gate answers). A reader fills both for an
+older record. Depth is the unsampled
 (never rated) Class B decisions on the same item reachable through `buildsOn` links, and never
 less than the unsampled Class B decisions on that item logged in the trailing 24 hours. The floor
 exists because `-BuildsOn` is self-reported: a session that names nothing still meets it. More
@@ -347,7 +350,8 @@ within 20 minutes and before it resets. Only with no rate is 80 percent the back
 98 percent or more, `usage.ps1`'s own "at the ceiling" band, is hit whatever the rate: a flat rate
 there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
 CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOWN. A reader that
-does not finish within 30 seconds is UNKNOWN.
+does not finish within 30 seconds is UNKNOWN. A window graded HIT stays HIT whatever
+`usage.ps1` reads overall, because downgrading a hit would fail open.
 
 At the rung the answer is HALT. A reading `usage.ps1` calls UNKNOWN answers REVIEW, not HALT:
 UNKNOWN is common, because a Desktop session runs no statusLine, and halting on it would shut the
@@ -359,8 +363,11 @@ roster alias of the Lander.
 
 ### Where it is enforced, and where it is not
 
-**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` runs the gate
-before it is written. The record is spooled and posted whatever the answer. When the answer is not
+**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is spooled
+first with `gate` `PENDING`, so the log keeps its rule that every record is spooled locally first.
+The gate then runs, skipping that record's own id, and its answer replaces `PENDING` in the
+spooled copy. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
+toward the chain floor. The record is posted whatever the answer. When the answer is not
 NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
 `LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,
 so it can answer HALT or REVIEW but never NO-REVIEW. A reviewed record is not gated, because its
