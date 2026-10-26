@@ -57,12 +57,14 @@ logger = logging.getLogger(__name__)
 # ``"choice"``. Typed loosely because hl7apy ships no types.
 _Reference = tuple[Any, ...]
 
-# hl7apy 1.3.5 validates a ``choice`` group as a ``sequence`` (upstream crs4/hl7apy issue 151;
-# the fix, PR 152, was open and unmerged on 2026-09-30). That makes every alternative of a choice
-# required, so strict validation would reject any ORM^O01 or ORR^O02 carrying an order detail
-# (ORC then OBR, say), and any other structure with a choice group, in every HL7 version hl7apy
-# ships from 2.2 on. The first probe is such a message, valid and synthetic; the second puts two
-# alternatives in one choice group, so a conformant validator must reject it.
+# hl7apy 1.3.5 validates a ``choice`` group as a ``sequence`` (upstream crs4/hl7apy issue 151).
+# That makes every alternative of a choice required, so strict validation would reject any
+# ORM^O01 or ORR^O02 carrying an order detail (ORC then OBR, say), and any other structure with a
+# choice group, in every HL7 version hl7apy ships from 2.2 on. The first probe is such a message,
+# valid and synthetic; the second puts two alternatives in one choice group, so a conformant
+# validator must reject it. The fix, PR 152, merged into hl7apy's ``develop`` branch on
+# 2026-10-26. On that date no release carried it (PyPI's latest was 1.3.5, which the lock pins),
+# so the probes below keep the shim on.
 _CHOICE_PROBE = (
     "MSH|^~\\&|SND|SND|RCV|RCV|20260101120000||ORM^O01|PROBE|P|2.5.1\r"
     "PID|1||1^^^HOSP^MR||DOE^JOHN\r"
@@ -76,7 +78,8 @@ _TWO_ALTERNATIVES_PROBE = _CHOICE_PROBE + "\rRXO|RX1^Drug|1||MG"
 # RCP), an invoice (IVC with optional PYE, CTD and more), a payment header (PMT then PYE), a
 # device record (SDD then optional SCDs). An "exactly one of" rule would reject every valid
 # message of these structures, and unaided hl7apy already validates them correctly as sequences,
-# so the shim leaves them alone. PR 152 as written would apply the rule to them too.
+# so the shim leaves them alone. PR 152 as merged relabels all sixteen as sequences in hl7apy's
+# own tables; its first draft applied the rule to them too.
 _SEQUENCES_LABELLED_CHOICE = frozenset(
     {
         "EHC_E01_INVOICE_INFORMATION",
@@ -114,7 +117,7 @@ def _choice_fix_needed() -> bool:
     switches itself off on the first release that validates choice groups correctly, and stays
     on under an unpinned install of a newer release that does not. It also stays on for a
     release that accepts the valid probe only by no longer checking choice groups at all, and
-    for one that merges PR 152 as written and so rejects the labelled-choice probe.
+    for one that ships PR 152's first draft and so rejects the labelled-choice probe.
     ``tests/test_validate_choice_groups.py`` goes red on a fixed release, so the shim gets deleted.
     Keep :func:`is_choice_group` and ``_SEQUENCES_LABELLED_CHOICE`` when it is: the generator
     uses them.
