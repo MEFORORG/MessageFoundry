@@ -429,7 +429,7 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     ``default``, which is where OpenSSL files them.
 
     An ``.include`` or ``.pragma`` (any name that starts with either), a ``section::name``
-    assignment, or a ``$ENV::`` variable raises :class:`ProbeUnavailable`, wherever it is in the
+    assignment, or a variable from the ``ENV`` section raises :class:`ProbeUnavailable`, wherever it is in the
     file: each can add to, or change how OpenSSL reads, the section this check reads, so a reading
     taken without it could PASS on lines OpenSSL does not apply. These are the constructs known
     here, not all of them.
@@ -437,21 +437,29 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     So does a line OpenSSL may refuse, because measured on OpenSSL 3.5.7, one such line anywhere
     made it apply none of the file (BACKLOG #3803 T5). That is a line that is none of blank,
     comment, section header and ``name = value`` as OpenSSL spells them, and a ``$`` variable no
-    earlier line defines. A line holding a backslash, a NUL or a non-ASCII character is refused
-    too, rather than read: OpenSSL reads the file as bytes, and a backslash escapes or continues
-    what follows it."""
+    earlier line defines. Some characters are refused too, rather than read, because OpenSSL reads
+    the file as bytes. That is a NUL or a carriage return inside any line, and a backslash at the
+    end of one, which continues it. Outside a comment line, any backslash, since it escapes what
+    follows, and any non-ASCII character. A comment line may hold the last two, as OpenSSL ignores
+    it (measured)."""
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
     current_name, current = "default", sections["default"]
-    # OpenSSL ends a line only at a newline; splitlines() would also break at a form feed, a lone
-    # carriage return and other separators, showing this reader a line OpenSSL never sees.
+    # OpenSSL ends a line at a newline; splitlines() would also break at a form feed, a lone
+    # carriage return and other separators, showing this reader a line OpenSSL never sees. OpenSSL
+    # also ends one at a carriage return that falls at the end of a read chunk, so any carriage
+    # return but a CRLF's is refused.
     for number, line in enumerate(text.split("\n"), start=1):
         stripped = line.lstrip(_WS)
         if directive := _DIRECTIVE.match(stripped):
             raise _not_followed(directive[0])
-        if "\\" in line or "\0" in line or not line.isascii():
-            raise _not_followed(f"a backslash, a NUL or a non-ASCII character on line {number}")
+        if "\0" in line or "\r" in line.removesuffix("\r") or line.rstrip(_WS).endswith("\\"):
+            raise _not_followed(
+                f"a NUL, a carriage return or a line-end backslash on line {number}"
+            )
         if not stripped or stripped.startswith("#"):
             continue
+        if "\\" in line or not line.isascii():
+            raise _not_followed(f"a backslash or a non-ASCII character on line {number}")
         if header := _SECTION_HEADER.match(stripped):
             current_name = header[1]
             current = sections.setdefault(current_name, [])
@@ -459,6 +467,9 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
             if "::" in assignment[1]:
                 raise _not_followed("a section::name assignment")
             for reference in _references(assignment[2]):
+                if reference and (current_name if reference[0] is None else reference[0]) == "ENV":
+                    # OpenSSL falls back to the environment there, which this reader does not see.
+                    raise _not_followed("a variable from the ENV section")
                 if not _defined(reference, sections, current_name):
                     raise _refused(number)
             current.append((assignment[1], _config_value(assignment[2])))
@@ -480,14 +491,15 @@ def _defined(
     current: str,
 ) -> bool:
     """Whether OpenSSL can expand ``reference`` from the lines read so far: in the section it
-    names, else the current one, and failing that the default section, as OpenSSL looks it up. A
-    variable defined only on a later line is not (measured on OpenSSL 3.5.7)."""
+    names, or the current one where it names none, and failing that the default section, as
+    OpenSSL looks it up. ``$::name`` names the section ``""``, not the current one. A variable
+    defined only on a later line is not (each measured on OpenSSL 3.5.7)."""
     if reference is None:
         return False
     section, name = reference
-    if section == "ENV":  # the environment the probe gets, which this reader does not model
-        raise _not_followed("a $ENV:: variable")
-    names = {line_name for line_name, _ in sections.get(section or current, [])}
+    names = {
+        line_name for line_name, _ in sections.get(current if section is None else section, [])
+    }
     return name in names or name in {line_name for line_name, _ in sections["default"]}
 
 

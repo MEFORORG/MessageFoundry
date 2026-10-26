@@ -675,7 +675,7 @@ _CHAIN = (
 
 
 def _point_openssl_conf_at(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> None:
-    cnf.write_text(text, encoding="utf-8")
+    cnf.write_bytes(text.encode("utf-8"))  # as given: write_text would add a CR on Windows
     monkeypatch.setenv("OPENSSL_CONF", str(cnf))
 
 
@@ -836,10 +836,13 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
         (_CHAIN + _HEALTHY_SECTION + ".include /etc/ssl/more.cnf\n", ".include"),
         (".include = /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
         (".pragma dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
-        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a backslash"),
+        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line-end backslash"),
         (_CHAIN + "[system_default_s\\ect]\n" + _HEALTHY_SECTION[21:], "a backslash"),
         (_CHAIN + _HEALTHY_SECTION + "x = y # z\0\n", "a NUL"),
-        (_CHAIN + _HEALTHY_SECTION + "home = $ENV::HOME\n", "a $ENV:: variable"),
+        (_CHAIN + _HEALTHY_SECTION + "home = $ENV::HOME\n", "a variable from the ENV section"),
+        (_CHAIN + _HEALTHY_SECTION + "[ENV]\nhome = $HOME\n", "a variable from the ENV section"),
+        ("# a comment \\\n" + _CHAIN + _HEALTHY_SECTION, "a line-end backslash"),
+        (_CHAIN + _HEALTHY_SECTION + "x = 1 \r y = 2\n", "a carriage return"),
         ("floor = TLSv1\n" + _CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable"),
         (
             "name = ssl_sect\n" + _CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION,
@@ -879,7 +882,7 @@ def test_a_dollar_outside_the_read_lines_is_not_refused(
         + _CHAIN
         + _HEALTHY_SECTION
         + "[CA_default]\ndir = ./demoCA\ncerts = $dir/certs\nkey = ${dir}/k\nhome = $(HOME)\n"
-        + "[other]\nca = $CA_default::dir\n"
+        + "[other]\nca = $CA_default::dir\nsuites = $::tls13\n"
     )
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
     # Ciphersuites is evidence only, so a $ there does not stop the verdict.
@@ -895,6 +898,7 @@ def test_a_dollar_outside_the_read_lines_is_not_refused(
         "[CA_default]\ndir = ./demoCA\ncerts = ${dir/certs\n",  # an unclosed brace
         "[CA_default]\ndir = ./demoCA\n[other]\nca = $nowhere::dir\n",
         "[CA_default]\ncerts = $/certs\n",  # no name at all
+        "[CA_default]\ndir = ./demoCA\ncerts = $::dir\n",  # names section "", not this one
     ],
 )
 def test_a_variable_openssl_cannot_expand_is_manual(
@@ -914,18 +918,27 @@ def test_a_quoted_dollar_is_not_expanded(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text).status is Status.PASS
 
 
-def test_a_lone_carriage_return_does_not_end_a_line(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Measured on OpenSSL 3.5.7: after ``# x`` and a lone CR, the rest of the line is comment, so
-    a policy line there is not applied. Read as text, the CR became a line end, and the row read
-    the floor and PASSed (code-review round 1)."""
+def test_a_lone_carriage_return_is_manual(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: after ``# x`` and a lone CR in a short line, the rest of the line
+    is comment, so a policy line there is not applied. Read as text, the CR became a line end, and
+    the row read the floor and PASSed (code-review round 1). OpenSSL also ends a line at a CR that
+    falls at the end of a read chunk, so where the CR falls decides; the row does not guess
+    (code-review round 2)."""
     text = (
         _CHAIN + "[system_default_sect]\nCipherString = ECDHE+AESGCM # x\rMinProtocol = TLSv1.2\n"
     )
     r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
-    assert r.status is Status.FAIL, r.detail
-    assert "no MinProtocol line" in r.detail
+    assert r.status is Status.MANUAL, r.detail
+    assert "a carriage return or a line-end backslash on line 7" in r.detail
+
+
+def test_a_comment_line_may_hold_what_a_setting_may_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Measured on OpenSSL 3.5.7: a comment line with a non-ASCII character or a backslash inside
+    it left the file applied, so the row reads it (code-review round 2)."""
+    text = "# Maintainer: Jos\u00e9 Mu\u00f1oz\n# see C:\\certs here\n" + _CHAIN + _HEALTHY_SECTION
+    assert _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text).status is Status.PASS
 
 
 def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
@@ -1091,8 +1104,22 @@ def test_no_openssl_for_the_directory_reading_is_manual(monkeypatch: pytest.Monk
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="no openssl on PATH")
 def test_the_openssl_directory_command_runs_on_this_host() -> None:
-    """A real ``openssl version -d`` prints the one line the row reads its file from."""
-    assert cipher_policy._openssl_default_file().name == "openssl.cnf"
+    """A real ``openssl version -d`` prints the one line the row reads its file from, and the row
+    takes the folder that line names. The folder is read here a second way, by splitting on the
+    quotes, so a wrong capture group cannot pass (code-review round 2)."""
+    from messagefoundry.childenv import system_tool_environment
+
+    printed = subprocess.run(
+        ["openssl", "version", "-d"],
+        env=system_tool_environment(extra_names=cipher_policy._OPENSSL_ENV),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout
+    folder = printed.split('"')[1]
+    assert folder
+    assert cipher_policy._openssl_default_file() == Path(folder) / "openssl.cnf"
 
 
 def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

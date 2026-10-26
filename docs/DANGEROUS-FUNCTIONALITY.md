@@ -424,9 +424,9 @@ setting or message reaches it, and it calls `Get-TlsCipherSuite` through the sys
 imported by its path, never by name. No command it runs is looked up by a bare name, so a
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
-Each start the module makes, `powershell.exe` on Windows and the two `openssl` runs on Linux, is
-bounded at 30 s (`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and that
-reading is an ERROR. The Linux row can so take up to 60 s.
+The module makes one start on Windows, `powershell.exe`, and two on Linux, both `openssl`. Each
+is bounded at 30 s (`_PROBE_TIMEOUT_S`). `subprocess.run` kills a probe that runs longer, and that
+reading is an ERROR. The Linux row can so take twice that bound.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,

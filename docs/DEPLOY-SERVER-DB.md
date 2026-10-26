@@ -860,12 +860,14 @@ It runs the commands of this step. It differs from them in at least the ways nam
   `#` comment outside quotes. As in OpenSSL, it ends a line only at a newline, and only a space, a
   tab or a carriage return counts as space. Any `openssl ciphers` output line not shaped like a
   suite line makes the row ERROR, as on Windows. It does not follow at least these: an `.include`
-  or `.pragma` line, a `section::name` assignment, a `$ENV::name` value, and a backslash, a NUL
-  or a non-ASCII character. OpenSSL reads any name that starts with `.include` as that line, such
-  as `.include_x`, so the row does too. A file with any of these anywhere reads MANUAL. So does a
-  file with `$` in a `CipherString` or `MinProtocol` value or in the section chain. A file with a
-  line the row cannot read as OpenSSL does reads MANUAL as well. Two such lines are one with no
-  `=`, and one using a `$name` that no earlier line defines. With the OpenSSL 3.5.7 that Git for
+  or `.pragma` line, a `section::name` assignment, a variable from the `ENV` section, and a NUL, a
+  lone carriage return or a backslash at the end of a line. Outside a comment line, it does not
+  follow any backslash or non-ASCII character either. OpenSSL reads any name that starts with
+  `.include` as that line, such as `.include_x`, so the row does too. A file with any of these
+  anywhere reads MANUAL. So does a file with `$` in a `CipherString` or `MinProtocol` value or in
+  the section chain. A file with a line the row cannot read as OpenSSL does reads MANUAL as well.
+  Such lines include at least one with no `=`, and one using a `$name` that no earlier line
+  defines. With the OpenSSL 3.5.7 that Git for
   Windows ships, one such line anywhere made OpenSSL apply none of the file (measured
   2026-10-26). An `OPENSSL_CONF` that is set but empty reads MANUAL too. Where no file is at the
   path read, OpenSSL applies no policy, so the row reads FAIL. A PASS still rests on
