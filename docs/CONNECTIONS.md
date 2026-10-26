@@ -1744,7 +1744,7 @@ runs when the connection is built, not at each connect, so a file replaced after
 checked. At least these cases are left to the driver unchecked: a file that does not exist, a
 directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
 read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
-`PRIVATE KEY` after its first `-----BEGIN` is refused the same way (BACKLOG #3745), since a CA
+`PRIVATE KEY` after its first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA
 file is public trust material. An `SSLCERT` file is not checked this way.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
@@ -3313,7 +3313,7 @@ checks.
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
 | Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
 | A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. |
-| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission and path checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
+| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission, path and private-key checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
 
 | What the check finds | What happens |
 |---|---|

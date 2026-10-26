@@ -145,10 +145,10 @@ def test_every_marked_refusal_is_built_from_fixed_text() -> None:
     tree = parse_source(_HOME.read_text(encoding="utf-8"))
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)
-    # 13 marked refusals when this floor was last set (BACKLOG #3090). A scan that sees few of
+    # 14 marked refusals when this floor was last set (BACKLOG #3745). A scan that sees few of
     # them, or none, leaves the rest unchecked. Lower the floor only if refusals were really merged
     # or removed, and raise it when one is added.
-    assert len(sites) >= 13, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
+    assert len(sites) >= 14, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
     loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
     # The constants the sites use today are found, so the lookup is not passing on an empty set.
