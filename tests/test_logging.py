@@ -26,7 +26,6 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry import __main__, logging_setup, secretscrub
-from messagefoundry.api.app import _read_log_tail
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
@@ -47,6 +46,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.redaction import clamp_untrusted, redact
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
 from messagefoundry.support import redact as support_redact
+from tests._cpu_clock import cpu_seconds
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -2288,7 +2288,14 @@ async def _emit_beside_ticker(target: str) -> tuple[float, float]:
     Between two of its wake-ups the loop ran only the other ready callbacks, here the emitter's.
 
     The emitter yields once before it emits, so the ticker has taken its first reading by then and
-    the interval spanning the emit is one the ticker measures."""
+    the interval spanning the emit is one the ticker measures.
+
+    WHAT IT DOES NOT SEE: the ticker stops once the emit call returns, so it measures only the stall
+    the emit itself causes. A stall the emit hands off, to a queue handler, a ``call_soon`` callback
+    or another thread holding the GIL, falls outside every interval it measures. And with nothing
+    else scheduled, the gap is the emit plus a few microseconds of loop overhead, so beyond the
+    premise check it adds little detection the emit time lacks; it is kept because it is the
+    reading the row names."""
     stop = asyncio.Event()
     largest_gap = 0.0
 
@@ -2322,7 +2329,13 @@ def _alternating_growth[T](
     Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long samples
     alternate so load that comes and goes lands on both endpoints rather than on one block. The
     ratio divides the same work at two lengths, so a box that runs everything k times slower
-    multiplies both endpoints by k, and k cancels."""
+    multiplies both endpoints by k, and k cancels. Load that is not uniform does not cancel.
+
+    A KNOWN LIMIT, LEFT ON PURPOSE: this is the simpler sampler the access arm already used.
+    ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py`` adds equal windows, a random
+    order per round and a sampling-time floor, after measuring reds this form can show under a
+    co-tenant on a 0.07 ms subject. They are not ported: the samples here cost 0.5 ms and up, and
+    every reading recorded for these arms sat well inside the bound."""
     samples = [(sample(short), sample(long)) for _ in range(rounds)]
     best_short = [
         min(column) for column in zip(*(on_short for on_short, _ in samples), strict=True)
@@ -2337,12 +2350,13 @@ def _access_growth(rounds: int) -> tuple[float, float]:
     Every sample runs on one running event loop, the way uvicorn's own emit does. A ``logging``
     emit is synchronous, so every handler filter runs on the loop thread and nothing else on that loop
     runs until it returns: its duration should BE the stall a waiting coroutine sees, and the loop gap
-    of :func:`_emit_beside_ticker` measures that stall directly rather than inferring it. The two
-    readings should agree to within the microseconds a loop iteration costs.
+    of :func:`_emit_beside_ticker` measures the stall the emit causes rather than inferring it. The
+    two readings should agree to within the microseconds a loop iteration costs.
 
-    A loop gap is wall-clock time by definition, since what a waiting client pays is wall time, so it
-    is not moved to a CPU-time clock the way some redaction cost arms were; the growth ratio is what
-    keeps it sound on a loaded runner, as :func:`_alternating_growth` says.
+    WALL CLOCK, ON PURPOSE, where the read-back arm below moved to CPU time. A loop gap is the time
+    a waiting coroutine spends not running, and that is wall time by definition: a CPU clock stops
+    while the runner is away, which is exactly the delay a waiting client still pays. The growth
+    ratio is what keeps it sound on a loaded runner, as :func:`_alternating_growth` says.
     """
     with asyncio.Runner() as runner:
         emit_growth, gap_growth = _alternating_growth(
@@ -2546,9 +2560,9 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     emit_seconds, gap_seconds = asyncio.run(_emit_beside_ticker(_request_target(longest)))
     assert gap_seconds >= emit_seconds, (
         f"the ticker's longest wait was {gap_seconds * 1e3:.3f} ms, shorter than the "
-        f"{emit_seconds * 1e3:.3f} ms emit. Either the ticker took its first reading after the emit "
-        "began, or the emit no longer runs on the loop thread. Either way the loop-gap readings below "
-        "are not measuring the stall; check _emit_beside_ticker's ordering and where the emit runs."
+        f"{emit_seconds * 1e3:.3f} ms emit, so the ticker took its first reading after the emit "
+        "began and the loop-gap readings below do not span the emit. Check the task ordering in "
+        "_emit_beside_ticker."
     )
 
     with monkeypatch.context() as m:
@@ -2594,22 +2608,38 @@ def _read_back(log_dir: Path) -> list[str]:
     """One ``GET /logs/tail`` page of ``log_dir``, redaction included. ``_read_log_tail`` never
     raises and answers an unreadable file with an empty page, so that is refused here rather than
     read as a log with nothing in it."""
+    # Imported here, not at module level, so collecting the rest of this file does not depend on
+    # the API module importing cleanly.
+    from messagefoundry.api.app import _read_log_tail
+
     lines, _, available = _read_log_tail(str(log_dir), limit=50, offset=0)
     assert available and lines, f"the log read-back of {log_dir.name} came back empty"
     return lines
 
 
 def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
-    """Redaction time of the stored ``long_dir`` log over that of ``short_dir``, as
+    """CPU time redacting the stored ``long_dir`` log over that for ``short_dir``, as
     :func:`_alternating_growth` takes it.
 
     Each file is read and split once, OUTSIDE the clock, and each sample times
-    ``redact_log_record`` over its lines, which is the whole of what ``_read_log_tail`` does per line.
-    The directory walk, the stat and the file read are a near-constant cost added to both endpoints,
+    ``redact_log_record`` over its lines, the per-line redaction ``_read_log_tail`` applies. The
+    directory walk, the stat and the file read are a near-constant cost added to both endpoints,
     and an added constant does not cancel in a ratio: timed with them, the read-back read about 6x
     where the redaction alone read about 9x on a dev box, so a super-linear pass would have needed
     to grow far past the bound before this arm saw it. The count arm in the test proves
-    ``_read_log_tail`` reaches the twin on the same stored line."""
+    ``_read_log_tail`` reaches the twin on the same stored line.
+
+    CPU TIME, NOT WALL TIME. What is timed here is a pure CPU cost, and a wall-clock ratio of that
+    kind went red on loaded shared runners (BACKLOG #2958); :func:`tests._cpu_clock.cpu_seconds`
+    records why and is the clock used.
+
+    KNOWN LIMITS, LEFT ON PURPOSE. It times this copy of the reader's per-line loop rather than
+    ``_read_log_tail`` itself, so a super-linear step added to the reader outside
+    ``redact_log_record`` would not show here. Nor is this all of the reader's per-line work: with
+    ``audit_copies=False``, the route's mode for a reader without ``users:manage``, it also runs
+    ``is_audit_copy_line`` on every line, and neither arm drives that mode. And the linear shared PHI
+    pass dominates the timed cost, so only a severe twin regression crosses the bound here; the
+    bare-pattern growth arm in ``tests/test_log_redaction_secret_domain.py`` is the sensitive one."""
     stored = {
         log_dir: support_redact.split_log_lines(
             (log_dir / "engine.log").read_text(encoding="utf-8", errors="replace")
@@ -2617,12 +2647,12 @@ def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
         for log_dir in (short_dir, long_dir)
     }
 
-    def timed(log_dir: Path) -> tuple[float]:
-        lines = stored[log_dir]
-        start = time.perf_counter()
+    def redact_all(lines: list[str]) -> None:
         for line in lines:
             support_redact.redact_log_record(line)
-        return (time.perf_counter() - start,)
+
+    def timed(log_dir: Path) -> tuple[float]:
+        return (cpu_seconds(partial(redact_all, stored[log_dir]), reps=1),)
 
     (growth,) = _alternating_growth(timed, short_dir, long_dir, rounds)
     return growth
@@ -2644,10 +2674,11 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     together, as the reader runs them. :func:`_read_back_growth` says why the clock covers the
     per-line redaction and not the file read.
 
-    The cost is planted by an unauthenticated request and paid when an authenticated reader pulls
-    the log. The route hands the read to ``asyncio.to_thread``, but a regex scan holds the GIL for
-    its whole run, so on the default build a super-linear read-back would stall the event loop too,
-    not only a worker. Like the arm above, this one bounds GROWTH across the same two lengths.
+    On first deployment that cost would be planted by an unauthenticated request and paid when an
+    authenticated reader pulls the log. The route hands the read to ``asyncio.to_thread``, but a
+    regex scan holds the GIL for its whole run, so on the default build a super-linear read-back
+    would stall the event loop too, not only a worker. Like the arm above, this one bounds GROWTH
+    across the same two lengths, on a CPU-time clock for the reason :func:`_read_back_growth` gives.
 
     THE POSITIVE CONTROL swaps the pre-#1547 pattern into ``support.redact._DSN_PASSWORD`` ONLY. The
     fixed ``secretscrub`` copy still runs as the second layer, so the swap isolates the twin, and the
@@ -2696,7 +2727,9 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
         )
 
     # A DSN password behind the hostile run, in a stored line the write-time chain never saw (an
-    # older line, or one another tool wrote), is still hidden when it is read back.
+    # older line, or one another tool wrote), is still hidden when it is read back -- by the twin
+    # alone. The secretscrub second layer would hide it too, so it is switched off for the reading;
+    # with the twin also switched off the password must then show, or the reading proves nothing.
     sentinel = "not-a-real-pw-1547"
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -2705,9 +2738,22 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
         f'{_hostile_run(long_len)}postgres://svc:{sentinel}@db.invalid:5432/mefor HTTP/1.1" 401\n',
         encoding="utf-8",
     )
+    hidden = f"postgres://svc:{support_redact.REDACTION_PLACEHOLDER}@db.invalid"
     (raw_line,) = _read_back(raw_dir)
-    assert sentinel not in raw_line
-    assert f"postgres://svc:{support_redact.REDACTION_PLACEHOLDER}@db.invalid" in raw_line
+    assert sentinel not in raw_line and hidden in raw_line, "the read-back printed the password"
+    with monkeypatch.context() as m:
+        m.setattr(support_redact, "scrub_credentials", lambda text, **_: text)
+        (twin_only,) = _read_back(raw_dir)
+        m.setattr(support_redact, "_DSN_PASSWORD", re.compile(r"(?!)"))
+        (neither,) = _read_back(raw_dir)
+    assert sentinel not in twin_only and hidden in twin_only, (
+        "with the secretscrub second layer off, the twin alone no longer hides a DSN password "
+        "stored behind the hostile run"
+    )
+    assert sentinel in neither, (
+        "with both the twin and the second layer off, another pass still hid the password, so the "
+        "twin-only reading above does not show that the twin did it"
+    )
 
     with monkeypatch.context() as m:
         m.setattr(support_redact, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
