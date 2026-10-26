@@ -118,6 +118,7 @@ from messagefoundry.config.tls_policy import (
     revocation_hop_disposition,
     tls_revocation_attested,
 )
+from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_cert_chain_key
 from messagefoundry.transports.ambient_proxy import (
     UNREADABLE_PROXY_LABEL,
     proxy_label,
@@ -270,6 +271,7 @@ def _narrowed_pool_classes(
                     "refusing to connect"
                 )
             self._refuse_encrypted_ca_text()
+            self._refuse_an_unchecked_client_key()
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
             self.ssl_context = factory()
             super().connect()
@@ -332,6 +334,39 @@ def _narrowed_pool_classes(
                     "an encrypted block can make the TLS library wait for a password; refusing to "
                     "load it (BACKLOG #3090)"
                 )
+
+        def _refuse_an_unchecked_client_key(self) -> None:
+            """Check the client key urllib3 is about to load, before it loads it (BACKLOG #3458).
+
+            hvac reads ``VAULT_CLIENT_CERT`` and ``VAULT_CLIENT_KEY`` at import and hands them to
+            requests, which sets them here as ``cert_file`` and ``key_file``. urllib3 then calls
+            ``load_cert_chain(cert_file, key_file)`` on the Vault leg. It checks for an encrypted
+            key only when ``key_file`` is set. With none, OpenSSL reads the key out of the
+            certificate file, and an encrypted one makes it ask for a passphrase. Measured on
+            Windows: it wrote the prompt and was still waiting when killed, 30 s later.
+
+            So the key goes through ``keywrap.refuse_weak_cert_chain_key`` first, the check every
+            engine-owned TLS key load runs. requests never sets ``key_password``, so any encrypted
+            key is refused. The refusal is a :class:`VaultHopRefused` with fixed text, for the
+            reason :meth:`_refuse_encrypted_ca_text` gives; the chained ``KeyWrapRefused`` would
+            lose its text at :func:`vault_failure_text`.
+
+            **A file swapped between this read and urllib3's load is not caught.** urllib3 passes
+            no password callback, so a swapped-in encrypted key in a combined file still prompts.
+            With ``key_file`` set, urllib3's own check covers that swap."""
+            if not self.cert_file:
+                return
+            try:
+                refuse_weak_cert_chain_key(
+                    self.cert_file,
+                    self.key_file,
+                    cert_setting="VAULT_CLIENT_CERT",
+                    key_setting="VAULT_CLIENT_KEY",
+                    unlock_setting=None,
+                    passphrase_given=self.key_password is not None,
+                )
+            except KeyWrapRefused as exc:
+                raise VaultHopRefused(f"{connector}: {_UNCHECKED_CLIENT_KEY}") from exc
 
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
             """Give the TLS leg to an https proxy its own context, or ``None`` if it has none.
@@ -733,6 +768,17 @@ def _unverifiable_proxy_leg(connector: str) -> str:
 _ENCRYPTED_CA_TEXT = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
+)
+
+
+#: What the client key refusal says (BACKLOG #3458). It names the hvac settings, never a path or
+#: the ``KeyWrapRefused`` text it replaces.
+_UNCHECKED_CLIENT_KEY = (
+    "the private key for this hop's client certificate (in the VAULT_CLIENT_CERT file, or in "
+    "VAULT_CLIENT_KEY when that is set) is encrypted, uses a refused wrap, or could not be read "
+    "to check it. hvac gives the TLS library no passphrase, and an encrypted key with none can "
+    "make it wait for one. Supply the key unencrypted and protect the file with its permissions; "
+    "refusing to connect (BACKLOG #3458)"
 )
 
 
