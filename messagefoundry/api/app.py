@@ -11098,19 +11098,29 @@ def create_managed_app(
             if smtp_ca is not None and smtp_ca in trust_anchor_specs
             else None
         )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
+        notifier_alerts = alerts_settings
+        if smtp_anchor_refusal is not None and alerts_settings is not None:
+            # Keep the webhook: drop only the email transport, which would load the refused CA.
+            notifier_alerts = alerts_settings.model_copy(update={"email_to": []})
+        try:
+            notifier = (
+                notifier_from_settings(
+                    notifier_alerts,
+                    secret_provider=secret_provider,
+                    # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
+                    # hop too, so an estate on a private CA needs no per-alert CA path.
+                    trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    # #329: clamp the webhook sink's cleartext-http escape to the derived posture.
+                    posture=_hop_posture,
+                )
+                if notifier_alerts is not None
+                else None
             )
-            if alerts_settings is not None and smtp_anchor_refusal is None
-            else None
-        )
+        except ValueError:
+            if smtp_anchor_refusal is None:
+                raise
+            # A rule names the email transport dropped above. The start is refused below anyway.
+            notifier = None
         # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
         # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
         # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
@@ -11220,8 +11230,8 @@ def create_managed_app(
                 )
                 if smtp_anchor_refusal is not None:
                     # The CA passed here after it was refused above: it changed, or a read
-                    # failed once. The engine has no notifier, so it does not start, and the
-                    # rows above record a pass this refusal is not behind.
+                    # failed once. The notifier sends no email, so the engine does not start.
+                    # No row records this refusal.
                     smtp_anchor_refusal.unaudited = True
                     raise smtp_anchor_refusal
             except BaseException:

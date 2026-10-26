@@ -2926,29 +2926,35 @@ def _smtp_app(
     *,
     start_checked: bool = True,
     email: bool = True,
-) -> tuple[Any, list[object]]:
-    """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the notifier factory's
-    calls. The factory raises :class:`_NotifierBuilt`, so a lifespan that reaches it stops there.
-    ``start_checked=False`` gives the app no anchor specs, as an embedding that checks none.
-    ``email=False`` names no alert recipient, so only the security notices read the CA."""
+) -> tuple[Any, list[AlertsSettings]]:
+    """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the ``[alerts]`` each
+    notifier factory call was given. A call with the operator's own settings raises
+    :class:`_NotifierBuilt`, so a lifespan that reaches it stops there; a call with any other
+    settings builds no notifier. ``start_checked=False`` gives the app no anchor specs, as an
+    embedding that checks none. ``email=False`` names no alert recipient, so only the security
+    notices read the CA. Each app also has a webhook."""
     from messagefoundry.api.app import create_managed_app
 
-    built: list[object] = []
+    built: list[AlertsSettings] = []
+    ca = str(_pem(tmp_path))
+    smtp = _SMTP if email else {**_SMTP, "email_to": []}
+    operator = AlertsSettings(
+        email_tls_ca_file=ca, webhook_url="https://hooks.example.org/mefor", **smtp
+    )
 
-    def _factory(*args: object, **kwargs: object) -> None:
-        built.append(args)
-        raise _NotifierBuilt
+    def _factory(alerts: AlertsSettings, **kwargs: object) -> None:
+        built.append(alerts)
+        if alerts is operator:
+            raise _NotifierBuilt
 
     monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _factory)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    ca = str(_pem(tmp_path))
-    smtp = _SMTP if email else {**_SMTP, "email_to": []}
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
     app = create_managed_app(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
-        alerts_settings=AlertsSettings(email_tls_ca_file=ca, **smtp),
+        alerts_settings=operator,
         trust_anchor_specs=_dialling_specs(ca, alerts=smtp) if start_checked else (),
         trust_anchors_enforcing=True,
         allow_no_auth=True,
@@ -2957,23 +2963,46 @@ def _smtp_app(
     return app, built
 
 
-async def test_a_refused_alerts_ca_builds_no_notifier_and_still_writes_its_row(
+def _webhook_only(built: list[AlertsSettings]) -> bool:
+    """Whether the notifier was built once, with the webhook kept and the email transport dropped."""
+    return [(a.webhook_url, a.email_to) for a in built] == [("https://hooks.example.org/mefor", [])]
+
+
+async def test_a_refused_alerts_ca_builds_no_email_transport_and_still_writes_its_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The lifespan checks the SMTP hop's CA before it builds the notifier, which sends before the
-    audited start check runs. Red before the fix: the notifier was built first. The refusal still
-    comes from the audited check, so its row is written."""
+    audited start check runs. Red before the fix: the notifier was built with email first. The
+    webhook is kept, so it still pages. The refusal still comes from the audited check, so its
+    row is written."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
     app, built = _smtp_app(tmp_path, monkeypatch)
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
         async with app.router.lifespan_context(app):
             pass
-    assert built == []
+    assert _webhook_only(built)
     reopened = await MessageStore.open(tmp_path / "m.db")
     try:
         assert "acl_insecure" in [r["event"] for r in await _rows(reopened, "alerts_email_ca")]
     finally:
         await reopened.close()
+
+
+async def test_a_rule_naming_the_dropped_email_transport_leaves_the_anchor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rule that routes to email refuses a notifier built without it, with ``ValueError``. The
+    start is still refused by the audited check, not by that config error."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, _built = _smtp_app(tmp_path, monkeypatch)
+
+    def _rule_needs_email(*args: object, **kwargs: object) -> None:
+        raise ValueError("a rule routes to 'email', which is not configured")
+
+    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _rule_needs_email)
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
 
 
 async def test_a_clean_alerts_ca_builds_the_notifier(
@@ -3004,16 +3033,16 @@ async def test_the_notifier_check_adds_no_check_the_start_does_not_make(
 async def test_an_alerts_ca_refused_before_the_notifier_refuses_the_start_if_it_then_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The file changed between the two checks, or a read failed once. The engine has no notifier
-    by then, so the first refusal stops the start even though the audited check passed. It is
-    marked ``unaudited``, since the row the audited check wrote records a pass."""
+    """The file changed between the two checks, or a read failed once. The notifier sends no
+    email by then, so the first refusal stops the start even though the audited check passed. It
+    is marked ``unaudited``: no row records it."""
     verdicts = iter([False, True])
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
     app, built = _smtp_app(tmp_path, monkeypatch)
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file") as err:
         async with app.router.lifespan_context(app):
             pass
-    assert built == [] and err.value.unaudited
+    assert _webhook_only(built) and err.value.unaudited
 
 
 async def test_a_notifier_with_no_email_transport_is_not_held_back_by_the_ca(
@@ -3067,7 +3096,7 @@ def test_the_offline_notifier_drops_the_notice_for_a_refused_relay_ca(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
     assert _offline_security_notifier(settings) is None
     err = capsys.readouterr().err
-    assert setting in err and "No security notice is sent" in err
+    assert setting in err and "This command goes on, but it sends no security notice" in err
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     assert isinstance(_offline_security_notifier(settings), SecurityEventNotifier)
 

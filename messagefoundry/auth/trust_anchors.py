@@ -129,10 +129,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       written. ``supervise`` runs no other anchor check.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
       notifier with an email transport. It checks only a CA this preflight is given. A refusal
-      builds no notifier, webhook included, so the alerts sent before this preflight go to the
-      log. This preflight then refuses the start, with its rows when the file can be read. If it
-      passes instead, the file changed or a read failed once. The first refusal is raised then,
-      marked ``unaudited``, since the rows record a pass.
+      builds the notifier without its email transport, so the webhook still pages the alerts sent
+      before this preflight. This preflight then refuses the start, with its rows when the file
+      can be read. If it passes instead, the file changed or a read failed once. The first
+      refusal is raised then, marked ``unaudited``: no row records it.
     * The offline security notifier of the recovery commands checks the same CA. A refusal drops
       the notice with a WARNING and never refuses the recovery.
 
@@ -144,10 +144,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **Declined** (BACKLOG #3470). The internal CA is checked under ``augment`` or ``pinned`` even
     when every hop is loopback or names its own ``tls_ca_file``, and so never reads it. This
-    preflight runs before any graph is loaded, and a reload can add a hop that reads the CA, so it
-    cannot tell; it errs toward refusing. And each spec builder restates its hop's enable
-    conditions rather than sharing one predicate with the hop's builder. One predicate would be
-    threaded through the alert sinks, the security notifier and the forwarder builder, a refactor
+    preflight runs before any graph is loaded, so it cannot tell. A reload can also add a hop that
+    reads the CA. It errs toward refusing. And each spec builder restates its hop's enable
+    conditions rather than sharing one predicate with the hop's builder. One predicate would run
+    through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each
     builder's conditions, not their agreement with the hop.
 """
@@ -216,8 +216,10 @@ class TrustAnchorError(Exception):
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
 
-    ``unaudited`` is True when the preflight refused the anchor while the store refused one of its
-    ``auth.trust_anchor`` rows (BACKLOG #3091), so the refusal may have no row behind it."""
+    ``unaudited`` is True when the refusal may have no row behind it. That is when the preflight
+    refused the anchor while the store refused one of its ``auth.trust_anchor`` rows (BACKLOG
+    #3091). It is also when a check before the store opened refused an anchor that the preflight
+    then passed (BACKLOG #3470, module item 10)."""
 
     unaudited: bool = False
 

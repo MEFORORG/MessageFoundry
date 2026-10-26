@@ -6463,7 +6463,7 @@ are covered:
 |---|---|---|
 | The `serve` syslog forwarder | Before the forwarder is built | Refuses the start on stderr, with no audit row: no store is open yet |
 | The `supervise` syslog forwarder | Before the forwarder is built | The same; `supervise` runs no other anchor check |
-| The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds no notifier, webhook included, so startup alerts go to the log. The audited check then refuses the start. It writes its rows when it can read the file |
+| The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds the notifier without email, so the webhook still pages startup alerts. The audited check then refuses the start. It writes its rows when it can read the file |
 | The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |
 
 Under `warn`, each warns and goes on, as the start check does. A file that cannot be read refuses
@@ -6473,7 +6473,7 @@ holds the detail.
 
 Two gaps stay open by decision. The internal CA is checked under `augment` or `pinned` even when
 no hop reads it, because every hop is loopback or names its own `tls_ca_file`. The check runs
-before any graph is loaded, and a reload can add a hop that reads the CA, so it cannot tell; it
+before any graph is loaded, so it cannot tell. A reload can also add a hop that reads the CA. It
 errs toward refusing. And each check restates its hop's enable conditions rather than sharing one
 predicate with the hop's builder, so the two could drift apart. Tests pin each check's conditions,
 not the agreement.

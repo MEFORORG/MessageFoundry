@@ -2322,13 +2322,14 @@ def _start_logging(
     # sent; `supervise` runs none. trust_anchors module item 10 says what a refusal does.
     from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
 
-    _forward_ca = log_forward_anchor_spec(settings.logging) if log_forward is not None else None
+    _forward_ca = log_forward_anchor_spec(settings.logging)
     if _forward_ca is not None and (
         _ca_refusal := anchor_refusal(_forward_ca, enforcing=enforcing)
     ):
+        # Scrubbed: the refusal quotes a configured path, and a newline in it must not forge a line.
         print(
-            f"error: {_ca_refusal}\nThe start is refused before the log forwarder is built, so "
-            "no record reached the collector.",
+            f"error: {scrub_control_chars(str(_ca_refusal))}\nThe start is refused before the log "
+            "forwarder is built, so no record reached the collector.",
             file=sys.stderr,
         )
         return 2
@@ -7604,12 +7605,15 @@ def _offline_security_notifier(
         # drops the notice, as any other failure here does; the recovery itself goes on.
         from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
         from messagefoundry.config.settings import SecurityEnforcement
+        from messagefoundry.controlchars import scrub_control_chars
 
         relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
         enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
         if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+            # The refusal's text is written for a start. This command does not stop on it.
             print(
-                f"WARNING: {refusal}\nNo security notice is sent from this command.",
+                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+                "sends no security notice over that relay.",
                 file=sys.stderr,
             )
             return None
