@@ -237,9 +237,11 @@ class HandshakeFailures:
         self.note_soon(None, cause)
 
     def open(self) -> None:
-        """At a listener's start(): count again. A failure still held, because the stop() before
-        it never flushed, gets its trailing timer back, so it is not stranded until the next
-        failure. That needs the running loop, which start() has."""
+        """At a listener's start(): count again. When the same instance restarts after a stop()
+        that never flushed, a failure still held gets its trailing timer back, so it is not
+        stranded until the next failure. The engine's runner builds a new instance to restart a
+        listener, so today this covers only a same-instance restart (see :meth:`flush`). It needs
+        the running loop, which start() has."""
         self._closed = False
         if self.count > self._reported and self._reported_at is not None:
             self._arm(self._reported_at, time.monotonic())
@@ -289,13 +291,15 @@ class HandshakeFailures:
         fail a stop().
 
         It does nothing once :meth:`open` has run again, since the failures from then on are the
-        restarted listener's to report. That needs a restart while an earlier stop() still runs,
-        which the engine's runner never does: it joins an abandoned stop() before it starts the
-        listener again (``_settle_pending_source_stops`` in ``pipeline/wiring_runner.py``). The
-        check is kept anyway (vault BACKLOG #3785 item 5). It costs one flag test, and without it
-        this class would depend on its caller's ordering. It is checked again after the wait,
-        since :meth:`open` can run during it. Called without :meth:`close` first, it sends
-        nothing, for the same reason."""
+        restarted listener's to report. That needs the SAME listener instance started again while
+        an earlier stop() still runs. The engine's runner does not do that today: a restart builds
+        a new instance (``build_source`` in ``pipeline/wiring_runner.py``), so this check, and the
+        re-arm in :meth:`open`, cover only a same-instance restart. A stop() that is cancelled or
+        abandoned before it reaches this method leaves its held failures on an instance the runner
+        discards, and they are not reported. The check is kept (vault BACKLOG #3785 item 5): it
+        costs one flag test, and without it this class would depend on its caller's ordering. It
+        is checked again after the wait, since :meth:`open` can run during it. Called without
+        :meth:`close` first, it sends nothing, for the same reason."""
         if not self._closed:
             return
         if self._tasks:

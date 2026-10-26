@@ -330,8 +330,10 @@ async def test_a_closed_counter_counts_nothing_and_flushes_only_while_closed() -
 
 
 async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
-    """``flush`` waits for a report in flight before it sends what was held. A restart reached in
-    that wait makes the held failure the restarted listener's, so the flush sends nothing more."""
+    """``flush`` waits for a report in flight before it sends what was held. A same-instance
+    restart reached in that wait makes the held failure the restarted listener's, so the flush
+    sends nothing more. The engine's runner does not restart an instance today; it builds a new
+    one."""
     sent: list[str] = []
     gate = asyncio.Event()
 
@@ -358,9 +360,11 @@ async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
 async def test_a_failure_held_across_an_unflushed_stop_is_reported_after_the_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stop() that closes the counter and never flushes, such as one the runner cancels, leaves
-    a failure held with its timer disarmed. open() arms the timer again, so the restarted
-    listener reports it once the window ends rather than with some later failure."""
+    """A stop() that closes the counter and never flushes leaves a failure held with its timer
+    disarmed. If the SAME instance starts again, open() arms the timer again, so it reports the
+    failure once the window ends rather than with some later failure. The engine's runner builds a
+    new instance to restart a listener, so today this covers only a same-instance restart; a
+    cancelled stop's held failures on a discarded instance are not reported."""
     monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.2)
     sent: list[str] = []
     failures = HandshakeFailures(lambda _peer, reason: sent.append(reason))
