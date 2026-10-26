@@ -47,7 +47,9 @@
     computed by the same functions decision.ps1 -Gate calls. THE ATTIC: every refs/attic ref on this clone with its age, as a Class C prune question
     (plan 6.3). This script prunes nothing.
 
-    An unread vault or spool file is said aloud: the digest is marked INCOMPLETE and the script exits 4.
+    An incomplete read is said aloud: the digest is marked INCOMPLETE and the script exits 4. A
+    vault read that fails is one, and _decisionlog.ps1 Read-DecisionSpool says what makes a spool
+    read one.
 #>
 param(
     [string]$Day = '',
@@ -113,8 +115,9 @@ if ($Rate) {
     $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days @($rday)
     $rec = @($res.Records | Where-Object { [string]$_.id -eq $Rate -and $_.kind -eq 'decision' }) | Select-Object -First 1
     # Found or not, a part of the log that could not be read is said aloud.
-    if ($rec) { foreach ($e in $res.Errors) { [Console]::Error.WriteLine("digest.ps1: WARNING, the log was not fully read: $e") } }
-    if (-not $rec) {
+    if ($rec) {
+        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("digest.ps1: WARNING, the log was not fully read: $e") }
+    } else {
         $why = if ($res.Complete) { 'is not in the log' } else { 'could not be read: ' + ($res.Errors -join '; ') }
         [Console]::Error.WriteLine("digest.ps1: decision $Rate $why. Nothing was recorded.")
         exit $(if ($res.Complete) { 2 } else { 4 })

@@ -15,15 +15,16 @@
 
     -List reads records by day (-Day, default today UTC, and -Days for a range ending there), and
     filters them by -Seat or -Item. It reads the vault and the local spool, and marks a record that
-    is still only spooled. A vault, or a spool file of a day read, that cannot be read is said
-    aloud and exits 4: an empty answer
+    is still only spooled. An incomplete read (a vault read that fails, or a spool read
+    _decisionlog.ps1 Read-DecisionSpool calls incomplete) is said aloud and exits 4: an empty answer
     from an unread log would look like a quiet day.
 
-    -Flush posts whatever is spooled, except a record whose -Log is still waiting on its gate (gate
-    PENDING, minted under ten minutes ago), which it leaves for the next -Log or -Flush. It prints
-    `FLUSHED posted=N failed=N held=N skipped=N`: held is that wait, and skipped is a file it could
-    not claim, such as one another process holds open, each named on stderr. A failed or skipped
-    record exits 4.
+    -Flush posts whatever is spooled, except a record another worker holds the lock of, such as a
+    -Log whose gate is still running, which it leaves for the next -Log or -Flush. It prints
+    `FLUSHED posted=N failed=N held=N skipped=N`: held is that wait, failed a record it could not
+    read or post, and skipped a record whose lock it could not make; each is named on stderr. A
+    failed or skipped record exits 4; a held one does not, since its holder is still at work.
+    _decisionlog.ps1 says how the spool's lock and posted mark work (The spool).
 
     -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>] answers which path a Class B act may take
     (docs/AUTONOMY-PLAN.md R4 and 4.5-4.7). It prints one word as its only stdout line, the reasons
@@ -51,10 +52,11 @@
     unsampled Class B decisions on the item logged in the trailing 24 hours, because -BuildsOn is
     self-reported. More than two goes to review. A linked id the log does not hold fails closed.
 
-    -LOG ENFORCES IT. A `decision` record of Class B with -Reviewed no is spooled first with `gate`
+    -LOG ENFORCES IT. A `decision` record of Class B with -Reviewed no is locked, spooled with `gate`
     PENDING, then the gate runs, skipping that record, and its answer replaces PENDING in the spooled
-    copy. So a gate that crashes or hangs loses no record; one left PENDING counts toward the chain
-    floor. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
+    copy before the lock is given up. So a gate that crashes or hangs loses no record; one left
+    PENDING counts toward the chain floor. No flusher posts the record while this -Log runs, and
+    once it has exited, the lock is stale and the record is posted as it stands. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
     `GATE <word>` and why, and exits with the gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
     LOGGED line still says whether the record was posted or is still spooled. Under -NoPost the gate
     reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. -Log stops an act only
@@ -103,8 +105,7 @@ param(
     [string]$ThresholdsFile = '',
     # How long the cost rung waits on the usage reader before it reads UNKNOWN. A test that holds
     # the reader open names a longer wait, so its checks do not race the default. Capped at five
-    # minutes, half the ten a flusher leaves a PENDING record to its gate. That bounds this one
-    # wait only: the gate's gh reads have no timeout of their own.
+    # minutes. No flusher posts the record while its -Log runs, however long the gate waits.
     [ValidateRange(1, 300)][int]$UsageTimeoutSeconds = 30,
     [ValidateSet('decision', 'tripwire', 'rating', 'outcome')][string]$Kind = 'decision',
     [string]$Item = '',
@@ -305,6 +306,7 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
 
 function Write-Flushed($Result) {
     foreach ($e in @($Result.Errors) + @($Result.Skipped)) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
+    foreach ($e in $Result.Held) { [Console]::Error.WriteLine("decision.ps1: HELD, still spooled: $e") }
     foreach ($e in $Result.Warnings) { [Console]::Error.WriteLine("decision.ps1: WARNING: $e") }
 }
 
@@ -443,7 +445,7 @@ if ($Gate) {
 if ($Flush) {
     $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
     Write-Flushed $r
-    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count) held=$($r.Held) skipped=$($r.Skipped.Count)"
+    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count) held=$($r.Held.Count) skipped=$($r.Skipped.Count)"
     exit ($(if ($r.Errors.Count -or $r.Skipped.Count) { 4 } else { 0 }))
 }
 
@@ -548,29 +550,32 @@ function Complete-Log([string]$How, [int]$Code) {
 }
 
 # EVERY RECORD IS SPOOLED BEFORE ANYTHING ELSE RUNS, the gate included, so a gate that crashes or
-# hangs cannot lose it. The gate then skips this record's own id, and its answer is written into
-# the spooled copy. A flusher leaves a fresh PENDING record alone, so it is not posted before then.
-Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
+# hangs cannot lose it. A gated record is locked first and stays locked until the gate's answer is
+# written into it, so no flusher posts it PENDING while this -Log runs. The gate skips its own id.
 if ($gated) {
-    $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
-        -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
-    $record.gate = $gateAnswer.Result
-    # The gate has answered, so a failure to write the answer down must not hide it: the record
-    # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.
-    $why = 'a flusher had taken it to post, or it stayed locked'
-    $rewritten = $false
-    try { $rewritten = Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record) }
-    catch { $why = "its new copy could not be written: $($_.Exception.Message)" }
-    if (-not $rewritten) {
-        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten ($why), so the record says gate PENDING.")
+    if (-not (Lock-DecisionSpool -CoordRoot $coord -Id $record.id)) { throw "the lock of the new record $($record.id) is already held" }
+    try {
+        Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
+        $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
+            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
+        $record.gate = $gateAnswer.Result
+        # The gate has answered, so a failure to write the answer down must not hide it: the record
+        # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.
+        try { Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record) }
+        catch {
+            [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten (its new copy could not be written: $($_.Exception.Message)), so the record says gate PENDING.")
+        }
+    } finally {
+        Unlock-DecisionSpool -CoordRoot $coord -Id $record.id
     }
+} else {
+    Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
 }
 if ($NoPost) { Complete-Log 'spooled' 0 }
 $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
 Write-Flushed $r
-# Still spooled is <id>.json, or a <id>.json.<pid>.posting claim another flusher holds.
-$spool = Get-DecisionSpoolDir $coord
-if ([System.IO.Directory]::Exists($spool) -and @([System.IO.Directory]::EnumerateFiles($spool, "$($record.id).json*") | Where-Object { Test-DecisionSpoolName $_ }).Count) {
+# Posted is this flush's post, or an earlier one's: the posted mark, or no spool file left.
+if ($r.PostedIds -notcontains $record.id -and (Test-DecisionSpooled -CoordRoot $coord -Id $record.id)) {
     Complete-Log 'spooled' 4
 }
 Complete-Log 'posted' 0

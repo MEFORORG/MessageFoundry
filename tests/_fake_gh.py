@@ -9,7 +9,11 @@ State knobs: ``fail`` (every call exits 1, a network failure), ``fail_post`` (on
 ``fail_match`` (a call with an argument containing that text fails), ``hang`` (sleep that many
 seconds before answering), ``after_match`` (once a call with an argument containing its
 ``match`` has answered, post its ``record`` to the vault and delete the file ``remove``: a
-concurrent flusher posting a spooled record).
+concurrent flusher posting a spooled record), ``snapshot_spool`` (a directory whose file names
+each comment POST appends to ``snapshots``, as the spool stood while the post was in flight) and
+``hold_spool`` (``{"dir", "stop"}``: on a comment POST, every ``*.json`` file in ``dir`` is made
+undeletable until the test writes ``stop``; Windows holds each open without delete sharing,
+elsewhere the directory is made read-only and the test restores it).
 
 ``Sandbox`` puts a ``gh.ps1`` shim first on PATH. PowerShell resolves a ``.ps1`` on PATH itself and
 passes argv through untouched, so the scripts under test call it exactly as they call the real gh.
@@ -216,6 +220,32 @@ def _answer(state: dict[str, Any], argv: list[str]) -> tuple[int, str, str]:
     return 1, "", "gh: Not Found (HTTP 404)"
 
 
+def _hold_spool(hold: dict[str, str]) -> None:
+    folder, stop = Path(hold["dir"]), Path(hold["stop"])
+    if sys.platform != "win32":
+        folder.chmod(0o555)
+        return
+    ready = stop.with_name(stop.name + ".ready")
+    holder = (
+        "import sys, time, pathlib\n"
+        "d, stop, ready = (pathlib.Path(a) for a in sys.argv[1:4])\n"
+        "held = [p.open('rb') for p in d.glob('*.json')]\n"
+        "ready.write_text('ready')\n"
+        "end = time.monotonic() + 120\n"
+        "while not stop.exists() and time.monotonic() < end:\n"
+        "    time.sleep(0.05)\n"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", holder, str(folder), str(stop), str(ready)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    end = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < end:
+        time.sleep(0.05)
+
+
 def main(argv: list[str]) -> int:
     state_path = Path(os.environ["FAKE_GH_STATE"])
     state: dict[str, Any] = (
@@ -223,6 +253,11 @@ def main(argv: list[str]) -> int:
     )
     state.setdefault("calls", []).append(argv)
     code, out, err = _answer(state, argv)
+    posts_comment = "POST" in argv and any(a.endswith("/comments") for a in argv)
+    if posts_comment and state.get("snapshot_spool"):
+        state.setdefault("snapshots", []).append(sorted(os.listdir(state["snapshot_spool"])))
+    if posts_comment and state.get("hold_spool"):
+        _hold_spool(state.pop("hold_spool"))
     hook = state.get("after_match")
     if hook and any(hook["match"] in a for a in argv):
         # A concurrent flusher, once this call has answered: it posts the spooled record and only

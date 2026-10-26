@@ -40,9 +40,11 @@ Constraints that bound the choice:
 private vault repository's issue titled `decision-log <yyyy-MM-dd>`, labelled `decision-log`. The
 script creates the day's issue on first use. A posted record leaves the spool. A record that
 cannot be posted stays there, and the script says so and exits 4; the next `-Log` or `-Flush`
-posts it. A flush holds back only a `PENDING` record whose id is under ten minutes old, since its
+posts it. A flush leaves alone a record whose lock another worker holds, such as a `-Log` whose
 gate is still running (*Where it is enforced* below); `-Flush` counts it as `held`, and a later
-`-Log` or `-Flush` posts it. `-NoPost` spools with no network at all, which the tripwire hook needs.
+`-Log` or `-Flush` posts it. No worker renames a record, and a record already posted is never
+posted again; `scripts/coord/_decisionlog.ps1`, *The spool*, says how the lock and the posted mark
+do that. `-NoPost` spools with no network at all, which the tripwire hook needs.
 
 A day's issue number never changes, so it is cached in `decisions/issues.json` and the listing
 is asked only on a miss; a record then costs one REST request. A cached number that answers 404
@@ -186,9 +188,9 @@ fewer. After a breach, any trailing 60 with more than 3, the class stays on the 
 breach above 5 percent. A rating older than the window is not read.
 
 **An unread vault is said aloud.** The digest is marked INCOMPLETE and exits 4, and `decision.ps1
--List` does the same, because an empty answer from an unread log looks like a quiet day. A local
-spool file of a day read that cannot be read counts the same way, and the gate then answers
-REVIEW.
+-List` does the same, because an empty answer from an unread log looks like a quiet day. An
+incomplete read of the local spool counts the same way, and the gate then answers REVIEW;
+`_decisionlog.ps1` Read-DecisionSpool says what makes a spool read incomplete.
 
 ### 6. Cloud sessions
 
@@ -368,11 +370,12 @@ roster alias of the Lander.
 
 ### Where it is enforced, and where it is not
 
-**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is spooled
-first with `gate` `PENDING`, so the log keeps its rule that every record is spooled locally first.
-The gate then runs, skipping that record's own id, and its answer replaces `PENDING` in the
-spooled copy; a flusher leaves a `PENDING` record younger than ten minutes alone, so it is not
-posted first. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
+**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is locked,
+then spooled with `gate` `PENDING`, so the log keeps its rule that every record is spooled locally
+first. The gate then runs, skipping that record's own id, and its answer replaces `PENDING` in the
+spooled copy before the lock is given up, so no flusher posts it first. The lock stands while the
+`-Log` process that took it runs, whatever the clock reads; once that process has exited, the
+record is posted as it stands. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
 toward the chain floor. The record is posted whatever the answer. When the answer is not
 NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
 `LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,

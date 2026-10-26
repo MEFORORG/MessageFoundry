@@ -37,6 +37,9 @@ $script:DecisionTitlePrefix = 'decision-log '
 # Read at load time: inside a function $PSScriptRoot would name the caller's script.
 $script:DecisionHere = $PSScriptRoot
 
+# The spool's retry (Invoke-DecisionSpoolIo) is coord-root.ps1's.
+. (Join-Path $PSScriptRoot 'coord-root.ps1')
+
 function Get-DecisionCoordRoot {
     # Anchored on where the scripts live, not on the cwd, as alloc.ps1 and claim.ps1 are: run from
     # inside another checkout, a cwd lookup would spool records into that repository unseen.
@@ -249,62 +252,89 @@ function Read-DecisionIssue {
     return $out.ToArray()
 }
 
-function Test-DecisionSpoolName([string]$Path) {
-    # A spooled record is <id>.json, or <id>.json.<pid>.posting while a flusher posts it; it is
-    # unposted until the claim goes. <id>.json.<pid>.tmp is a part file no reader takes.
-    return ($Path.EndsWith('.json') -or $Path.EndsWith('.posting'))
-}
+# --- The spool ------------------------------------------------------------------------------------
+#
+# A RECORD IS <id>.json AND THAT NAME NEVER CHANGES until a flusher deletes it, after its post is
+# answered. Nothing renames a record, so a reader that lists *.json cannot miss one by listing it
+# mid-rename. Beside it a spool may hold:
+#   <id>.lock    a worker's exclusive use of the record, made with CreateNew, so only one worker
+#                holds it. -Log holds it from before the record is spooled until its gate has
+#                answered and the answer is written in; a flusher holds it while it posts.
+#   <id>.posted  the record is in the vault. A flusher writes it as soon as a post is answered and
+#                before it deletes <id>.json, so a delete that fails can never post the record again.
+#   <id>.json.<pid>.tmp  a part file, which no reader or flusher takes.
+# A reader takes <id>.json names only. The rest are the workers' own.
 
 function Get-DecisionSpoolId([string]$Name) {
     # The record id a spool file name starts with, or '' for a name that is not one.
-    $at = $Name.IndexOf('.json')
+    $at = $Name.IndexOf('.')
     if ($at -lt 1) { return '' }
     return $Name.Substring(0, $at)
 }
 
-function Read-DecisionSpoolFile([string]$Dir, [string]$Path) {
+function Invoke-DecisionSpoolIo([scriptblock]$Action) {
     <#
-      One spooled record, $null when it has left the spool, and a throw when it cannot be read. A
-      flusher renames a file as it claims it, renames it back when a post fails, and deletes it only
-      once the post is answered. So a file that vanishes is looked for again under its id: a
-      record still spooled under another name is read there, and one with no name left was posted
-      before this looked, so the vault read that follows holds it.
+      THE ONE RETRY THE SPOOL USES, around every read, rename and delete of a spool file. It is
+      coord-root.ps1's Invoke-CoordIoRetry with -AllowAccessDenied: a sharing violation and an
+      access denied are retried with a short bounded backoff, and anything else, a missing file
+      included, is rethrown at once as the .NET exception. Access denied is retried because Windows
+      raises it for a file another process holds open while this one renames or deletes it, and
+      for a file that is deleted but not yet gone (delete pending).
     #>
-    $id = Get-DecisionSpoolId ([System.IO.Path]::GetFileName($Path))
-    $tries = @($Path)
-    for ($round = 1; $round -le 5; $round++) {
-        foreach ($t in $tries) {
-            try { $text = Read-DecisionSpoolText $t }
-            catch [System.IO.FileNotFoundException] { continue }
-            $rec = $text | ConvertFrom-Json -ErrorAction Stop
-            if ($rec -isnot [System.Management.Automation.PSCustomObject]) { throw 'it holds no JSON object' }
-            return $rec
-        }
-        $tries = @([System.IO.Directory]::GetFiles($Dir, "$id.json*") | Where-Object { Test-DecisionSpoolName $_ })
-        if (-not $tries.Count) { return $null }
-    }
-    throw "it moved each time it was read"
+    return (Invoke-CoordIoRetry -AllowAccessDenied -Action $Action)
+}
+
+function Read-DecisionSpoolText([string]$Path) {
+    # Shares read, write and delete, so a reader never blocks a flusher's delete or -Log's rewrite.
+    $full = $Path
+    return (Invoke-DecisionSpoolIo {
+            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+            $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            try {
+                $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true)
+                try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally { $stream.Dispose() }
+        })
+}
+
+function Read-DecisionSpoolFile([string]$Path) {
+    <#
+      One spooled record, $null when it has left the spool, and a throw when it cannot be read or
+      holds no record. A record leaves the spool only once a flusher has posted it, so $null means
+      the vault holds it. A file deleted but still pending deletion on Windows refuses to open
+      with access denied; the retry outlasts that, and then the file is gone.
+    #>
+    try { $text = Read-DecisionSpoolText $Path }
+    catch [System.IO.FileNotFoundException] { return $null }
+    if (-not $text) { throw 'it is empty' }
+    $rec = $text | ConvertFrom-Json -ErrorAction Stop
+    if ($rec -isnot [System.Management.Automation.PSCustomObject]) { throw 'it holds no JSON object' }
+    return $rec
 }
 
 function Read-DecisionSpool([string]$CoordRoot, [string[]]$Days = @()) {
     <#
-      Every spooled record, and an error per file that could not be read. A caller counts an error
-      as an incomplete read: the file may hold a record the gate must count. With -Days, a file
-      whose name dates it to another day is not read, so a bad file fails only the reads of its day.
+      Every spooled record, and an error per file that could not be read. AN UNREADABLE SPOOL
+      FILE MAKES THE READ INCOMPLETE: the file may hold a record the gate must count, so a caller
+      counts each error as it counts a failed vault read. This is the one place that says so. With
+      -Days, a file whose name dates it to another day is not read, so a bad file fails only the
+      reads of its day.
     #>
+    $days = @($Days | Where-Object { $_ })
     $out = [System.Collections.Generic.List[object]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
     $files = @()
     if ([System.IO.Directory]::Exists($dir)) {
-        try { $files = [System.IO.Directory]::GetFiles($dir) }
+        try { $files = [System.IO.Directory]::GetFiles($dir, '*.json') }
         catch { $errors.Add("the spool $dir could not be listed: $($_.Exception.Message)") }
     }
-    foreach ($f in @($files | Where-Object { Test-DecisionSpoolName $_ })) {
+    # GetFiles' pattern also matches a longer extension on Windows, so the name is checked again.
+    foreach ($f in @($files | Where-Object { $_.EndsWith('.json') })) {
         $day = Get-DecisionIdDay (Get-DecisionSpoolId ([System.IO.Path]::GetFileName($f)))
-        if ($Days.Count -and $day -and $Days -notcontains $day) { continue }
+        if ($days.Count -and $day -and $days -notcontains $day) { continue }
         try {
-            $raw = Read-DecisionSpoolFile $dir $f
+            $raw = Read-DecisionSpoolFile $f
             if ($null -eq $raw) { continue }
             $rec = Complete-DecisionRecord $raw
             $rec | Add-Member -NotePropertyName posted -NotePropertyValue $false -Force
@@ -316,21 +346,12 @@ function Read-DecisionSpool([string]$CoordRoot, [string[]]$Days = @()) {
     return [pscustomobject]@{ Records = $out.ToArray(); Errors = $errors }
 }
 
-function Read-DecisionSpoolText([string]$Path) {
-    # A spool file being rewritten (Update-DecisionSpool) is locked for a moment, and a gate that
-    # skipped it would count one record fewer, so a sharing violation is retried briefly.
-    for ($try = 1; ; $try++) {
-        try { return [System.IO.File]::ReadAllText($Path) }
-        catch [System.IO.FileNotFoundException] { throw }
-        catch [System.IO.IOException] { if ($try -ge 5) { throw }; Start-Sleep -Milliseconds 50 }
-    }
-}
-
 function Get-DecisionSpoolPaths([string]$CoordRoot, [string]$Id) {
-    # A record's spool name, <id>.json, and its part file <id>.json.<pid>.tmp beside it, which no
-    # reader or flusher takes.
-    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$Id.json"
-    return [pscustomobject]@{ Part = "$final.$PID.tmp"; Final = $final }
+    $dir = Get-DecisionSpoolDir $CoordRoot
+    $final = Join-Path $dir "$Id.json"
+    return [pscustomobject]@{
+        Part = "$final.$PID.tmp"; Final = $final; Lock = (Join-Path $dir "$Id.lock"); Posted = (Join-Path $dir "$Id.posted")
+    }
 }
 
 function Write-DecisionSpoolPart($Paths, $Record) {
@@ -338,6 +359,8 @@ function Write-DecisionSpoolPart($Paths, $Record) {
 }
 
 function Write-DecisionSpool([string]$CoordRoot, $Record) {
+    # A new record. The rename is atomic and refuses an existing name, so a reader sees the whole
+    # record or none of it.
     $null = [System.IO.Directory]::CreateDirectory((Get-DecisionSpoolDir $CoordRoot))
     $f = Get-DecisionSpoolPaths $CoordRoot ([string]$Record.id)
     Write-DecisionSpoolPart $f $Record
@@ -346,106 +369,164 @@ function Write-DecisionSpool([string]$CoordRoot, $Record) {
 
 function Update-DecisionSpool([string]$CoordRoot, $Record) {
     <#
-      Rewrites a record still spooled as <id>.json, and returns whether it did. A flusher that has
-      claimed the file (renamed it to post) leaves nothing to replace: on Windows File.Replace then
-      refuses rather than spool a second copy. On Linux and macOS it checks and then renames, so a
-      claim between the two would spool the record twice, which a reader dedups by id; a flusher
-      does not claim a fresh PENDING record (Send-DecisionSpool), which keeps that window shut in
-      practice. A lock from a reader is retried briefly. It throws when the part file cannot be
-      written; the caller reports that, since the gate has answered by then.
+      Rewrites a spooled record in one atomic rename over it. ONLY THE HOLDER OF ITS LOCK CALLS
+      THIS (-Log, between its gate's answer and its unlock), so no flusher can post or delete the
+      record meanwhile. It throws when the part file cannot be written or the rename fails past the
+      retry; the caller reports that, since the gate has answered by then.
     #>
     $f = Get-DecisionSpoolPaths $CoordRoot ([string]$Record.id)
     try {
         Write-DecisionSpoolPart $f $Record
-        for ($try = 1; $try -le 5; $try++) {
-            if (-not [System.IO.File]::Exists($f.Final)) { return $false }
-            try {
-                # [NullString], since PowerShell passes $null to a string parameter as ''.
-                [System.IO.File]::Replace($f.Part, $f.Final, [NullString]::Value)
-                return $true
-            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
-                Start-Sleep -Milliseconds 100
-            }
-        }
-        return $false
+        $part = $f.Part; $final = $f.Final
+        Invoke-DecisionSpoolIo { [System.IO.File]::Move($part, $final, $true) }
     } finally {
         # A part file that cannot be deleted is left: no reader or flusher takes a .tmp name.
         try { if ([System.IO.File]::Exists($f.Part)) { [System.IO.File]::Delete($f.Part) } } catch { $null = $_ }
     }
 }
 
-# How long a flusher leaves a PENDING record to its gate, and a claim to the flusher that took it.
+function Get-DecisionProcessStamp([int]$ProcessId) {
+    # A process's start time in ticks, which tells a live holder from a later process that reused
+    # its pid; '?' for a process whose start time cannot be read, and $null when none has that pid.
+    try { $p = Get-Process -Id $ProcessId -ErrorAction Stop } catch { return $null }
+    try { return [string]$p.StartTime.ToUniversalTime().Ticks } catch { return '?' }
+}
+
+function Lock-DecisionSpool([string]$CoordRoot, [string]$Id) {
+    <#
+      Takes <id>.lock and returns $true, or returns $false when another worker holds it. It throws
+      when the lock cannot be made for another reason (the caller reports that). The lock names
+      this host, pid and the pid's start time, so a reader can tell whether its holder still runs.
+    #>
+    $f = Get-DecisionSpoolPaths $CoordRoot $Id
+    $null = [System.IO.Directory]::CreateDirectory((Get-DecisionSpoolDir $CoordRoot))
+    $body = ConvertTo-Json -Compress -InputObject ([ordered]@{
+            host = [Environment]::MachineName; pid = $PID; started = (Get-DecisionProcessStamp $PID)
+        })
+    try {
+        # A lock its holder has just deleted can refuse a new one with access denied on Windows
+        # until it is gone, which the retry outlasts. An existing lock is no transient error.
+        $lockPath = $f.Lock
+        $stream = Invoke-DecisionSpoolIo { [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read) }
+    } catch [System.IO.IOException] {
+        if ([System.IO.File]::Exists($f.Lock)) { return $false }
+        throw
+    }
+    try {
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally { $stream.Dispose() }
+    return $true
+}
+
+function Unlock-DecisionSpool([string]$CoordRoot, [string]$Id) {
+    # Gives up <id>.lock; a missing lock is already given up. A lock left behind reads as stale
+    # once its holder exits, so a failure here costs a delay, never a record.
+    $lock = (Get-DecisionSpoolPaths $CoordRoot $Id).Lock
+    try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($lock) } } catch { $null = $_ }
+}
+
+# How long a lock whose holder this host cannot check (another host's, or one not yet written)
+# stands before a flusher takes it, and how long a live holder may keep one before -Flush says so.
 $script:DecisionHoldMinutes = 10
 
-function Test-DecisionSpoolPending([System.IO.FileInfo]$File) {
+function Get-DecisionLockState([string]$LockPath) {
     <#
-      A record whose -Log is still waiting on its gate: PENDING, and minted in the last ten minutes.
-      Posting it now would post PENDING for good. Older, its gate crashed or hung, and it is posted
-      as it stands. The age is the id's own instant, never the file's write time, which a claim
-      stamps and a failed post carries back. An id dated past the hold ahead of now came from a
-      clock since corrected, and is not held. A fresh file this cannot read is held, since it may
-      be a PENDING record a moment from its answer; once its id is old, the claim takes it and the
-      claim or the post reports it.
+      'live' while the lock's holder may still be working, 'stale' once it cannot be, and 'gone'
+      when there is no lock. A lock written on this host is live exactly while its pid runs with
+      the same start time, which reads no clock: a clock stepped back or forward cannot make a
+      running gate's record look abandoned. A lock this host cannot check (another host's, or one
+      still being written) is live until its file is $script:DecisionHoldMinutes old.
     #>
-    $at = Get-DecisionInstant (Get-DecisionSpoolId $File.Name)
-    $now = [DateTime]::UtcNow
-    if ($null -eq $at -or $at -lt $now.AddMinutes(-$script:DecisionHoldMinutes) -or $at -gt $now.AddMinutes($script:DecisionHoldMinutes)) { return $false }
-    try { return [string](Read-DecisionSpoolText $File.FullName | ConvertFrom-Json -ErrorAction Stop).gate -eq 'PENDING' }
-    catch { return $true }
+    $text = $null
+    try { $text = Read-DecisionSpoolText $LockPath } catch [System.IO.FileNotFoundException] { return 'gone' } catch { $text = $null }
+    $lock = $null
+    if ($text) { try { $lock = $text | ConvertFrom-Json -ErrorAction Stop } catch { $lock = $null } }
+    $lockHost = [string](Get-DecisionJsonValue $lock 'host')
+    if ($lock -and $lockHost -eq [Environment]::MachineName) {
+        $stamp = Get-DecisionProcessStamp ([int](Get-DecisionJsonValue $lock 'pid'))
+        $started = [string](Get-DecisionJsonValue $lock 'started')
+        if ($null -ne $stamp -and ($stamp -eq $started -or '?' -in @($stamp, $started))) { return 'live' }
+        return 'stale'
+    }
+    try { $age = [DateTime]::UtcNow - [System.IO.File]::GetLastWriteTimeUtc($LockPath) } catch { return 'live' }
+    if ($age.TotalMinutes -ge $script:DecisionHoldMinutes) { return 'stale' }
+    return 'live'
+}
+
+function Remove-DecisionSpoolPosted($Paths) {
+    # The record is in the vault: delete it, then its posted mark. A delete that fails leaves the
+    # mark, so no flusher posts it again, and the next flush tries the delete again.
+    $final = $Paths.Final; $posted = $Paths.Posted
+    try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($final) } }
+    catch { return "posted, but $final could not be removed: $($_.Exception.Message)" }
+    try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($posted) } } catch { $null = $_ }
+    return $null
 }
 
 function Send-DecisionSpool {
     <#
-      Posts every spooled record to its day's issue, oldest first. Returns the count Posted, an
-      error per record left (Errors), the count Held, still waiting on its gate
-      (Test-DecisionSpoolPending) for the next -Log or -Flush to post, and an entry per file Skipped
-      because it could not be claimed, such as one another process holds open. Warnings names a
-      record posted whose claim could not be removed. A file another flusher claimed first is
-      that flusher's to post, and is none of these.
+      Posts every spooled record to its day's issue, oldest first, each under its lock. Returns
+      Posted (the count this call posted), PostedIds (those, and any found posted earlier and
+      cleared now), Errors (a record that
+      could not be read or posted, each named), Held (a record whose lock another worker holds,
+      such as a -Log still waiting on its gate, each named), Skipped (a lock that could not be
+      made, each named), and Warnings (a record posted whose spool file could not be removed).
+      A record posted earlier, with its posted mark, is never posted again.
     #>
     param([string]$Repo, [string]$CoordRoot)
-    $posted = 0; $held = 0
+    $posts = 0
+    $postedIds = [System.Collections.Generic.List[string]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
+    $held = [System.Collections.Generic.List[string]]::new()
     $skipped = [System.Collections.Generic.List[string]]::new()
     $warnings = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
-    $stale = [DateTime]::UtcNow.AddMinutes(-$script:DecisionHoldMinutes)
-    $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    $ids = @()
     if ([System.IO.Directory]::Exists($dir)) {
-        foreach ($f in [System.IO.DirectoryInfo]::new($dir).GetFiles()) {
-            if ($f.Name.EndsWith('.json')) {
-                if (Test-DecisionSpoolPending $f) { $held++ } else { $files.Add($f) }
-            } elseif ($f.Name.EndsWith('.posting') -and $f.LastWriteTimeUtc -lt $stale) {
-                $files.Add($f)
+        $names = @([System.IO.Directory]::GetFiles($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+        $ids = @($names | Where-Object { $_.EndsWith('.json') } | ForEach-Object { Get-DecisionSpoolId $_ } | Where-Object { $_ } | Sort-Object -Unique)
+        # A lock or posted mark with no record beside it is what a worker that died left. A lock
+        # is removed once stale; a posted mark at once, since its record has gone.
+        foreach ($n in $names) {
+            $id = Get-DecisionSpoolId $n
+            if (-not $id -or $ids -contains $id) { continue }
+            $p = Join-Path $dir $n
+            if ($n -eq "$id.posted" -or ($n -eq "$id.lock" -and (Get-DecisionLockState $p) -eq 'stale')) {
+                try { Invoke-DecisionSpoolIo { [System.IO.File]::Delete($p) } } catch { $null = $_ }
             }
         }
     }
     $issues = @{}
     $dayFailed = @{}
-    foreach ($f in @($files | Sort-Object Name)) {
-        # Claim the file by renaming it, so two flushers do not both post it. A claim left by a
-        # flusher that died is retaken after ten minutes; a double post then reads once by id.
-        $id = Get-DecisionSpoolId $f.Name
-        $claim = Join-Path $dir "$id.json.$PID.posting"
-        # A reader holding the file for a moment blocks the rename on Windows, so a refusal is
-        # retried briefly; one that outlasts the retries is a lasting lock, reported as Skipped.
-        $taken = $false; $gone = $false; $why = $null
-        for ($try = 1; -not $taken -and -not $gone -and $null -eq $why; $try++) {
-            try { [System.IO.File]::Move($f.FullName, $claim); $taken = $true }
-            catch [System.IO.FileNotFoundException] { $gone = $true }
-            catch [System.IO.IOException] {
-                if ($try -ge 5) { $why = [string]$_.Exception.Message } else { Start-Sleep -Milliseconds 100 }
-            } catch { $why = [string]$_.Exception.Message }
+    foreach ($id in $ids) {
+        $f = Get-DecisionSpoolPaths $CoordRoot $id
+        try { $locked = Lock-DecisionSpool $CoordRoot $id }
+        catch { $skipped.Add("${id}: its lock could not be made: $($_.Exception.Message)"); continue }
+        if (-not $locked) {
+            $state = Get-DecisionLockState $f.Lock
+            if ($state -eq 'stale') {
+                # Its holder has exited. Two flushers that retake one stale lock together can both
+                # post the record; a reader reads it once, by id.
+                Unlock-DecisionSpool $CoordRoot $id
+                try { $locked = Lock-DecisionSpool $CoordRoot $id } catch { $locked = $false }
+            } elseif ($state -eq 'gone') {
+                try { $locked = Lock-DecisionSpool $CoordRoot $id } catch { $locked = $false }
+            }
+            if (-not $locked) { $held.Add("${id}: another worker holds $($f.Lock), such as a -Log whose gate is still running"); continue }
         }
-        if ($gone) { continue }
-        if (-not $taken) { $skipped.Add("$($f.Name): could not be claimed to post: $why"); continue }
-        # A rename keeps the old write time; stamp the claim's own, or a record spooled long ago
-        # would look like an abandoned claim the moment it is taken.
-        try { [System.IO.File]::SetLastWriteTimeUtc($claim, [DateTime]::UtcNow) } catch { $null = $_ }
         try {
-            $rec = [System.IO.File]::ReadAllText($claim) | ConvertFrom-Json -ErrorAction Stop
-            $day = Get-DecisionIdDay ([string]$rec.id)
-            if (-not $day) { throw "spool file $($f.Name) holds no valid id" }
+            if ([System.IO.File]::Exists($f.Posted)) {
+                # Posted by an earlier flush whose delete failed: finish the delete, never re-post.
+                $w = Remove-DecisionSpoolPosted $f
+                if ($w) { $warnings.Add("${id}: $w") } else { $postedIds.Add($id) }
+                continue
+            }
+            $rec = Read-DecisionSpoolFile $f.Final
+            if ($null -eq $rec) { continue }
+            if ([string]$rec.id -ne $id) { throw "spool file $($f.Final) holds id '$($rec.id)', not its own" }
+            $day = Get-DecisionIdDay $id
+            if (-not $day) { throw "spool file $($f.Final) holds no valid id" }
             # A day whose issue could not be found or made fails once per flush, not once per
             # record: each try costs a listing and two POSTs from the shared REST budget.
             if ($dayFailed.ContainsKey($day)) { throw $dayFailed[$day] }
@@ -465,32 +546,40 @@ function Send-DecisionSpool {
                 }
                 throw "post failed: $($r.Err)"
             }
-            $posted++
-            # Posted: a claim that cannot be removed now is left as it is, never renamed back, or
-            # the next flush would post the record again at once. A retaken stale claim reads once.
-            try { [System.IO.File]::Delete($claim) }
-            catch { $warnings.Add("$id`: posted, but its claim $claim could not be removed: $($_.Exception.Message)") }
+            $posts++
+            $postedIds.Add($id)
+            try { [System.IO.File]::WriteAllText($f.Posted, $id) }
+            catch { $warnings.Add("${id}: posted, but its posted mark could not be written, so a failed delete would post it again: $($_.Exception.Message)") }
+            $w = Remove-DecisionSpoolPosted $f
+            if ($w) { $warnings.Add("${id}: $w") }
         } catch {
-            $errors.Add("$id`: $($_.Exception.Message)")
-            try { [System.IO.File]::Move($claim, (Join-Path $dir "$id.json")) } catch { $null = $_ }
+            $errors.Add("${id}: $($_.Exception.Message)")
+        } finally {
+            Unlock-DecisionSpool $CoordRoot $id
         }
     }
-    return [pscustomobject]@{ Posted = $posted; Errors = $errors; Held = $held; Skipped = $skipped; Warnings = $warnings }
+    return [pscustomobject]@{
+        Posted = $posts; PostedIds = $postedIds; Errors = $errors; Held = $held; Skipped = $skipped; Warnings = $warnings
+    }
+}
+
+function Test-DecisionSpooled([string]$CoordRoot, [string]$Id) {
+    # Whether a record is still only spooled: its <id>.json is there with no posted mark beside it.
+    $f = Get-DecisionSpoolPaths $CoordRoot $Id
+    return ([System.IO.File]::Exists($f.Final) -and -not [System.IO.File]::Exists($f.Posted))
 }
 
 function Read-DecisionLog {
     <#
       Every record on the given days, from the local spool and the vault, deduplicated by id; the
       vault's copy wins. THE SPOOL IS READ FIRST. A flusher deletes a spooled record only after its
-      post is answered, so a record that leaves the spool after this read is in the vault before
-      the vault read starts. Read the other way round, a record posted between the two reads
-      would be in neither, and the gate would count one record too few. A spool file that cannot
-      be read makes the read incomplete, as a vault read that fails does. ONE WINDOW STAYS OPEN: a
-      directory listing is no snapshot, so a file renamed (claimed, or put back after a failed
-      post) while the spool is being listed can be listed under neither name. Closing it needs a
-      claim that does not rename the record; that is not built.
+      post is answered, and nothing renames one, so a record that leaves the spool after this
+      listing is in the vault before the vault read starts. Read the other way round, a record
+      posted between the two reads would be in neither. What makes a spool read incomplete is
+      Read-DecisionSpool's to say.
     #>
-    param([string]$Repo, [string]$CoordRoot, [string[]]$Days)
+    param([string]$Repo, [string]$CoordRoot, [string[]]$Days = @())
+    $Days = @($Days | Where-Object { $_ })
     $byId = [ordered]@{}
     $spooled = Read-DecisionSpool $CoordRoot -Days $Days
     $errors = [System.Collections.Generic.List[string]]::new()

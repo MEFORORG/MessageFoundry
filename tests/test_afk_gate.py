@@ -673,6 +673,7 @@ def test_a_gate_that_hangs_leaves_the_record_spooled(sb: Sandbox, tmp_path: Path
             flush.stderr,
         )
         assert flush.returncode == 0, flush.stderr
+        assert f"HELD, still spooled: {row['id']}" in flush.stderr, flush.stderr
         assert [r["id"] for r in _spooled(sb)] == [row["id"]]
         assert proc.poll() is None, "the gate stopped waiting while the test was still checking"
     finally:
@@ -694,16 +695,21 @@ def _halt_after(sb: Sandbox, action: str) -> None:
     )
 
 
-def test_a_record_claimed_before_the_gate_answers_stays_pending(sb: Sandbox) -> None:
-    """A flusher claims the record while the gate runs: the answer cannot be written into it, so
-    it keeps gate PENDING, which counts toward the floor, and -Log says so."""
-    _halt_after(sb, "Rename-Item -LiteralPath $f.FullName -NewName ($f.Name + '.99999.posting')")
+def test_the_gate_holds_its_record_locked_until_the_answer_is_written(sb: Sandbox) -> None:
+    """While the gate runs, the record sits under its one name with its lock beside it, so no
+    flusher posts it PENDING. Once the answer is in, the lock is gone and the record is posted."""
+    seen = sb.state_path.parent / "seen.txt"
+    _halt_after(
+        sb,
+        f"Set-Content -LiteralPath '{seen}' -Value "
+        "(Test-Path -LiteralPath ($f.FullName -replace '\\.json$', '.lock'))",
+    )
     proc = _log(sb)
     assert proc.returncode == HALT, (proc.stdout, proc.stderr)
-    assert "could not be rewritten" in proc.stderr and "says gate PENDING" in proc.stderr
-    (claim,) = sb.spool()
-    assert claim.name.endswith(".json.99999.posting"), sb.spool()
-    assert json.loads(claim.read_text(encoding="utf-8"))["gate"] == "PENDING"
+    assert seen.read_text(encoding="utf-8").strip() == "True"
+    assert proc.stdout.split("\n")[0].endswith(" posted"), proc.stdout
+    assert [r["gate"] for r in _logged(sb)] == ["HALT"]
+    assert sb.spool() == [], sb.spool()
 
 
 def test_a_gate_answer_that_cannot_be_written_down_is_still_reported(sb: Sandbox) -> None:
@@ -721,7 +727,8 @@ def test_a_gate_answer_that_cannot_be_written_down_is_still_reported(sb: Sandbox
     assert lines[0].startswith("LOGGED ") and lines[1] == "GATE HALT", proc.stdout
     assert "its new copy could not be written" in proc.stderr, proc.stderr
     assert "says gate PENDING" in proc.stderr
-    (row,) = _spooled(sb)
+    # The lock is given up whatever the rewrite did, so the record is posted as it stands.
+    (row,) = _logged(sb)
     assert row["gate"] == "PENDING"
 
 
@@ -762,9 +769,8 @@ def test_an_unreadable_spool_file_fails_the_gate_closed(sb: Sandbox) -> None:
 
 
 def test_a_pending_record_whose_post_failed_is_not_held_again(sb: Sandbox) -> None:
-    """Its gate died 15 minutes ago, so a flush takes it; the post fails, and the claim goes back
-    with the claim's fresh write time. The hold reads the id's age, not that stamp, so the next
-    flush posts it rather than hold it for another ten minutes."""
+    """Its gate died 15 minutes ago and left no lock, so a flush takes it; the post fails, and the
+    record stays where it was with no lock left behind, so the next flush posts it."""
     old = rec(at=ago(minutes=15), item="4242", gate="PENDING")
     path = _spool_write(sb, old)
     aged = ago(minutes=15).timestamp()
@@ -772,44 +778,190 @@ def test_a_pending_record_whose_post_failed_is_not_held_again(sb: Sandbox) -> No
     sb.set_state(fail_post=True)
     first = sb.run(DECISION, "-Flush")
     assert "FLUSHED posted=0 failed=1 held=0" in first.stdout, (first.stdout, first.stderr)
-    assert path.exists(), "a failed post left the spool"
+    assert [p.name for p in sb.spool()] == [path.name], sb.spool()
     sb.set_state(fail_post=False)
     second = sb.run(DECISION, "-Flush")
     assert "FLUSHED posted=1 failed=0 held=0" in second.stdout, (second.stdout, second.stderr)
 
 
-def test_the_hold_takes_a_fresh_unreadable_file_and_not_a_far_future_one(sb: Sandbox) -> None:
-    """A fresh file that cannot be read may be a PENDING record a moment from its answer, so it
-    is held. One whose id a clock a day fast minted is not held for a day."""
-    _spool_write(sb, rec(at=ago(minutes=1), item="4242")).write_text("{", encoding="utf-8")
+def test_an_unreadable_spool_file_is_named_and_fails_the_flush(sb: Sandbox) -> None:
+    """A file that cannot be read is never taken for a record waiting on its gate: -Flush names
+    it and exits 4. A record with no gate field, or one dated a day ahead with no lock, posts."""
+    bad = _spool_write(sb, rec(at=ago(minutes=1), item="4242"))
+    bad.write_text("{", encoding="utf-8")
+    bare = rec(at=ago(minutes=2), item="4242")
+    del bare["gate"]
+    _spool_write(sb, bare)
     _spool_write(sb, rec(at=ago(hours=-24), item="4242", gate="PENDING"))
     flush = sb.run(DECISION, "-Flush")
-    assert "FLUSHED posted=1 failed=0 held=1 skipped=0" in flush.stdout, (
+    assert "FLUSHED posted=2 failed=1 held=0 skipped=0" in flush.stdout, (
         flush.stdout,
         flush.stderr,
     )
+    assert flush.returncode == 4, flush.stderr
+    assert f"NOT POSTED, still spooled: {bad.stem}" in flush.stderr, flush.stderr
+    assert [p.name for p in sb.spool()] == [bad.name]
 
 
-def test_a_spool_file_that_cannot_be_claimed_is_reported(sb: Sandbox) -> None:
-    """On Windows another process holds it open; elsewhere the spool refuses the rename. Either
-    way it stays spooled, and -Flush names it and exits 4 rather than print a clean nothing."""
+def test_another_days_unreadable_spool_file_fails_only_that_days_reads(sb: Sandbox) -> None:
+    """A read of today is complete; a read that takes in its day is not, and -Flush names it."""
+    bad = _spool_write(sb, rec(at=ago(days=3), item="4242"))
+    bad.write_text("{not json", encoding="utf-8")
+    today = sb.run(DECISION, "-List", "-Json", "-Days", "1")
+    assert today.returncode == 0, today.stderr
+    wide = sb.run(DECISION, "-List", "-Json", "-Days", "5")
+    assert wide.returncode == 4 and "INCOMPLETE" in wide.stderr, wide.stderr
+    flush = sb.run(DECISION, "-Flush")
+    assert flush.returncode == 4 and bad.stem in flush.stderr, (flush.stdout, flush.stderr)
+
+
+def _posts(sb: Sandbox) -> int:
+    return sum(1 for c in sb.calls if "POST" in c and any(a.endswith("/comments") for a in c))
+
+
+def test_a_flusher_posts_a_record_under_its_one_name(sb: Sandbox) -> None:
+    """Nothing renames a record, so a reader listing the spool mid-post still finds it as
+    <id>.json, with the flusher's lock beside it."""
     path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
-    if sys.platform == "win32":
-        # Python opens without delete sharing, so the claim's rename meets a sharing violation.
-        with path.open("rb"):
-            flush = sb.run(DECISION, "-Flush")
-    else:
-        if os.geteuid() == 0:
-            pytest.skip("root renames in a read-only directory; nothing is shown")
-        path.parent.chmod(0o555)
-        try:
-            flush = sb.run(DECISION, "-Flush")
-        finally:
-            path.parent.chmod(0o755)
+    sb.set_state(snapshot_spool=str(sb.spool_dir))
+    flush = sb.run(DECISION, "-Flush")
+    assert flush.returncode == 0, (flush.stdout, flush.stderr)
+    (seen,) = sb.state["snapshots"]
+    assert seen == sorted([path.name, f"{path.stem}.lock"]), seen
+    assert sb.spool() == []
+
+
+def test_a_record_posted_earlier_is_never_posted_again(sb: Sandbox) -> None:
+    """Its posted mark says an earlier flush posted it and then failed to delete it. The next
+    flush finishes the delete and posts nothing."""
+    path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
+    (sb.spool_dir / f"{path.stem}.posted").write_text(path.stem, encoding="utf-8")
+    flush = sb.run(DECISION, "-Flush")
+    assert flush.returncode == 0, (flush.stdout, flush.stderr)
+    assert "FLUSHED posted=0 failed=0 held=0 skipped=0" in flush.stdout, flush.stdout
+    assert _posts(sb) == 0 and sb.spool() == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="an open file blocks a delete only on Windows")
+def test_a_post_whose_delete_fails_is_not_posted_again(sb: Sandbox) -> None:
+    """The record is posted, but a reader holds its spool file open, so the delete fails. The
+    flush warns and leaves the posted mark; the next flush clears it without a second post."""
+    path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
+    with path.open("rb"):
+        first = sb.run(DECISION, "-Flush")
+    assert "FLUSHED posted=1 failed=0 held=0 skipped=0" in first.stdout, first.stdout
+    assert first.returncode == 0 and "WARNING" in first.stderr, first.stderr
+    assert (sb.spool_dir / f"{path.stem}.posted").exists() and path.exists()
+    second = sb.run(DECISION, "-Flush")
+    assert "FLUSHED posted=0 failed=0 held=0 skipped=0" in second.stdout, second.stdout
+    assert _posts(sb) == 1 and sb.spool() == []
+
+
+def test_a_log_whose_spool_file_outlives_its_post_reports_posted(sb: Sandbox) -> None:
+    """The post is answered but the spool file cannot be removed. -Log reports the record posted
+    and exits 0, rather than say it is still spooled."""
+    stop = sb.state_path.parent / "hold-stop"
+    sb.set_state(hold_spool={"dir": str(sb.spool_dir), "stop": str(stop)})
+    try:
+        proc = _log(sb, klass="C")
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        if sys.platform != "win32":
+            sb.spool_dir.chmod(0o755)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert proc.stdout.split("\n")[0].endswith(" posted"), proc.stdout
+    assert "WARNING" in proc.stderr, proc.stderr
+
+
+def test_a_lock_that_cannot_be_made_is_skipped_and_named(sb: Sandbox) -> None:
+    """A directory holds the lock's name, as a spool it cannot write would refuse it."""
+    path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
+    (sb.spool_dir / f"{path.stem}.lock").mkdir()
+    flush = sb.run(DECISION, "-Flush")
     assert flush.returncode == 4, (flush.stdout, flush.stderr)
     assert "FLUSHED posted=0 failed=0 held=0 skipped=1" in flush.stdout, flush.stdout
-    assert f"{path.name}: could not be claimed to post" in flush.stderr, flush.stderr
+    assert f"{path.stem}: its lock could not be made" in flush.stderr, flush.stderr
     assert path.exists()
+
+
+def _this_process(pid: int) -> tuple[str, str]:
+    """This host's name and a process's start time, as _decisionlog.ps1 reads them."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"[Environment]::MachineName; (Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    host, ticks = proc.stdout.split()
+    return host, ticks
+
+
+@pytest.mark.parametrize("hours", [-24, 24], ids=["clock-stepped-back", "clock-stepped-forward"])
+@pytest.mark.parametrize("live", [True, False], ids=["holder-runs", "pid-reused"])
+def test_a_records_hold_is_its_lock_holder_never_the_clock(
+    sb: Sandbox, hours: int, live: bool
+) -> None:
+    """A -Log still running its gate holds its record however far its id is from the clock, so
+    a PENDING record is never posted for good while the gate runs. A lock whose pid now names a
+    later process (another start time) is stale, and the record is posted as it stands."""
+    path = _spool_write(sb, rec(at=ago(hours=hours), item="4242", gate="PENDING"))
+    host, ticks = _this_process(os.getpid())
+    lock = {"host": host, "pid": os.getpid(), "started": ticks if live else "1"}
+    (sb.spool_dir / f"{path.stem}.lock").write_text(json.dumps(lock), encoding="utf-8")
+    flush = sb.run(DECISION, "-Flush")
+    assert flush.returncode == 0, (flush.stdout, flush.stderr)
+    if live:
+        assert "FLUSHED posted=0 failed=0 held=1 skipped=0" in flush.stdout, flush.stdout
+        assert f"HELD, still spooled: {path.stem}" in flush.stderr, flush.stderr
+        assert path.exists()
+    else:
+        assert "FLUSHED posted=1 failed=0 held=0 skipped=0" in flush.stdout, flush.stdout
+        assert sb.spool() == []
+
+
+def _in_module(body: str) -> subprocess.CompletedProcess[str]:
+    script = f"Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; . '{COORD / '_decisionlog.ps1'}'; {body}"
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_a_spool_file_that_refuses_access_for_a_moment_is_retried(tmp_path: Path) -> None:
+    """Windows refuses to open a file deleted but still pending deletion with access denied, and
+    the file is gone a moment later: a posted record, which the vault holds. A directory under
+    the record's name refuses the same way until it is removed."""
+    target = tmp_path / "d20261026T000000000-abcdef.json"
+    target.mkdir()
+    proc = _in_module(
+        f"$j = Start-ThreadJob {{ Start-Sleep -Milliseconds 150; [IO.Directory]::Delete('{target}') }}; "
+        f"$r = Read-DecisionSpoolFile '{target}'; $null = Wait-Job $j; "
+        "if ($null -eq $r) { 'GONE' } else { 'READ' }"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "GONE", proc.stdout
+
+
+def test_a_spool_read_with_no_days_reads_every_day(tmp_path: Path) -> None:
+    """Read-DecisionLog passes -Days through even when its caller gave none: strict mode must
+    not throw on the null it carries."""
+    spool = tmp_path / "decisions" / "spool"
+    spool.mkdir(parents=True)
+    one = rec(at=ago(days=3))
+    (spool / f"{one['id']}.json").write_text(json.dumps(one), encoding="utf-8")
+    proc = _in_module(f"(Read-DecisionSpool '{tmp_path}' -Days $null).Records.Count")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "1", proc.stdout
 
 
 def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:
