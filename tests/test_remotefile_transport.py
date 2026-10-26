@@ -1604,19 +1604,20 @@ def test_sftp_password_refusal_is_the_last_policy_whatever_the_flags_say(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3533 item 8. __init__ never sets both flags, so this forces them. Even so,
-    the policy set last is the password refusal, not the escape's pinning policy."""
-
-    class _Paramiko(_FakeParamiko):
-        SSHClient = _FakeSSHClient
-
-    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
+    the password refusal is the policy in effect: the unknown key is refused before any password
+    crosses, and the escape's pinning policy is never set."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
+    monkeypatch.setattr(_PolicyCallingSSHClient, "authenticated", False)
+    monkeypatch.setattr(_PolicyCallingSSHClient, "last_policy", None)
     client = _SftpClient(
         {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "synthetic"}
     )
     client._accept_unknown = True
-    _FakeSSHClient.last_policy = None
-    client._connect()
-    assert isinstance(_FakeSSHClient.last_policy, remotefile._RefuseUnknownHostKey)
+    with pytest.raises(_RemoteError, match="with no escape"):
+        client._connect()
+    assert isinstance(_PolicyCallingSSHClient.last_policy, remotefile._RefuseUnknownHostKey)
+    assert _PolicyCallingSSHClient.authenticated is False
+    assert client._escape_key is None
 
 
 def _sftp_connect_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
