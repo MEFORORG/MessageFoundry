@@ -33,6 +33,7 @@ import time
 import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 from cryptography import x509
@@ -59,6 +60,7 @@ from messagefoundry.config.tls_policy import (
     build_verifying_client_context,
     crl_not_in_effect,
     harden_crl_check,
+    judge_crl_bytes,
 )
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.cert_expiry import MonitoredCert, _ca_file_crl_refusal
@@ -78,6 +80,7 @@ from messagefoundry.pipeline.crl_reload import (
 )
 from messagefoundry.pki import (
     CrlBlock,
+    _crl_attribute_key,
     crl_signature_refusal,
     judge_every_crl,
     read_soonest_crl_facts,
@@ -803,11 +806,19 @@ def _upper_cn(pki: _Pki, kind: _ASN1Type) -> x509.Name:
 def test_openssl_takes_an_ascii_case_change_for_the_same_issuer_only_in_a_text_type(
     pki: _Pki, kind: _ASN1Type, same: bool
 ) -> None:
-    """What ``_crl_issuer_key`` models, measured. A context holds the CA and one CRL, from the
-    CA's name upper-cased in ``kind``, that revokes the server. OpenSSL refuses the server as
-    revoked only when it takes that CRL for the CA's; otherwise it finds no CRL for the CA. The
-    engine's key must agree, which also pins the private ``cryptography`` attribute it reads."""
+    """What ``_crl_issuer_key`` models, measured, for an ASCII case change. The engine's key must
+    agree with OpenSSL. This is also the canary for the private ``cryptography`` attribute
+    ``NameAttribute._type`` that the key reads. If a release drops it, the key refuses every CRL
+    by name, and this test goes red with that refusal."""
     issuer = _upper_cn(pki, kind)
+    assert _openssl_takes_for_the_ca(pki, issuer) is same
+    assert (_block(issuer, 1, 1, b"").issuer_key == _block(pki.name, 1, 1, b"").issuer_key) is same
+
+
+def _openssl_takes_for_the_ca(pki: _Pki, issuer: x509.Name) -> bool:
+    """Whether OpenSSL takes a CRL from ``issuer`` for the CRL of ``pki``'s CA. A context holds the
+    CA and one CRL, from ``issuer``, that revokes the server. OpenSSL refuses the server as revoked
+    only when it takes that CRL for the CA's; otherwise it finds no CRL for the CA."""
     crl = pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=issuer)
     probe = pki.crl.with_name("probe-crl.pem")
     probe.write_bytes(crl)
@@ -817,8 +828,96 @@ def test_openssl_takes_an_ascii_case_change_for_the_same_issuer_only_in_a_text_t
     hop.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     with pytest.raises(ssl.SSLError) as refused:
         _handshake(hop, pki.server())
-    assert ("revoked" if same else "unable to get certificate CRL") in str(refused.value)
+    if "revoked" in str(refused.value):
+        return True
+    assert "unable to get certificate CRL" in str(refused.value), refused.value
+    return False
+
+
+# Vault BACKLOG #3755, third pass. ``cryptography`` decodes the bytes of a T61String or an
+# IA5String as UTF-8, while OpenSSL reads them as Latin-1, so the two see other text for one byte
+# string. Each case is a CA named in a UTF8String and a CRL from a name in another type. Measured on
+# OpenSSL 3.5.7 by this test; ``openssl crl -hash`` gives the same groups.
+_E = "mefor-3755-\u00e9"  # e with an acute accent, two bytes in UTF-8
+_ONE_BYTE_TEXT_CASES = [
+    pytest.param(_E, _E, _ASN1Type.T61String, False, id="t61-utf8-bytes-are-latin1"),
+    pytest.param("mefor-3755-\u00c3\u00a9", _E, _ASN1Type.T61String, True, id="t61-as-latin1"),
+    pytest.param(_E + "a", _E + "A", _ASN1Type.T61String, False, id="t61-latin1-then-case"),
+    pytest.param(_E, _E, _ASN1Type.IA5String, False, id="ia5-utf8-bytes-are-latin1"),
+    pytest.param("mefor-3755-a", "MEFOR-3755-A", _ASN1Type.T61String, True, id="t61-ascii-case"),
+    pytest.param(_E, _E, _ASN1Type.BMPString, True, id="bmp-control"),
+    pytest.param("3755", "3755", _ASN1Type.NumericString, False, id="numeric-control"),
+]
+
+
+@pytest.mark.parametrize(("ca_cn", "crl_cn", "kind", "same"), _ONE_BYTE_TEXT_CASES)
+def test_the_issuer_key_reads_a_one_byte_text_type_as_openssl_does(
+    tmp_path: Path, ca_cn: str, crl_cn: str, kind: _ASN1Type, same: bool
+) -> None:
+    """The first three and the IA5String case are red before the third pass. Then the key took
+    ``cryptography``'s text, so it grouped a T61String CRL with a CA OpenSSL keeps apart, and the
+    reverse. The rest are controls, green before and after."""
+    pki = _make_pki(tmp_path, ca_cn)
+    issuer = _cn(crl_cn, kind)
+    assert _openssl_takes_for_the_ca(pki, issuer) is same
     assert (_block(issuer, 1, 1, b"").issuer_key == _block(pki.name, 1, 1, b"").issuer_key) is same
+
+
+def test_a_reload_refuses_a_t61_replacement_openssl_takes_for_another_issuer(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #3755, third pass: the fail-open case. The replacement names the CA in a
+    T61String holding the same UTF-8 bytes. OpenSSL reads them as other text, so it keeps the held
+    CRL for the CA and lets the revoked peer through. Before the fix the reload recorded the file
+    as applied. Now it asks for a restart rather than report the hop as checking the new CRL."""
+    pki = _make_pki(tmp_path, _E)
+    hop = pki.outbound_hop()
+    issuer = _cn(_E, _ASN1Type.T61String)
+    pki.crl.write_bytes(pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=issuer))
+
+    outcome = _reload(pki)
+
+    assert outcome is not None, outcome
+    assert outcome.reloaded == 0 and outcome.refusal is not None, outcome
+    assert outcome.refusal.remedy == RESTART, outcome
+    assert _accepts(hop, pki.server())  # the hop still checks the CRL it held
+
+
+class _NoType:
+    """An attribute with an OID and a value but no ``_type``, as a ``cryptography`` release that
+    dropped the private attribute would hand the key."""
+
+    oid = NameOID.COMMON_NAME
+    value = "mefor-3755-ca"
+
+
+def test_the_issuer_key_refuses_by_name_when_the_string_type_is_missing() -> None:
+    """Vault BACKLOG #3755, third pass. Read as exact text instead, the key would reopen the
+    T61String gap above with no sign. So it refuses, naming the cause."""
+    with pytest.raises(ValueError, match="no longer exposes the string type"):
+        _crl_attribute_key(cast("x509.NameAttribute[str | bytes]", _NoType()))
+
+
+def test_a_crl_whose_issuer_type_cannot_be_read_cannot_be_judged(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same refusal, through the judgment a start and a reload share. It names the block and
+    the setting, as any block that cannot be judged does."""
+    pem = pki.crl.read_bytes()
+
+    def _gone(_self: object) -> None:
+        raise AttributeError("_type")
+
+    # A property hides the instance attribute, so ``cryptography``'s parse builds every name
+    # attribute with no readable ``_type``. The CRL was signed before, while it was there.
+    monkeypatch.setattr(
+        x509.NameAttribute, "_type", property(_gone, lambda _self, _v: None), raising=False
+    )
+    with pytest.raises(ValueError, match="no longer exposes the string type") as refused:
+        judge_crl_bytes(pem, label="[tls].crl_file", now=time.time())
+    assert str(refused.value).startswith("[tls].crl_file: CRL block 1 of 1 cannot be judged: "), (
+        refused.value
+    )
 
 
 @pytest.mark.parametrize(
