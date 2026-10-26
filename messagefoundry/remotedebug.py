@@ -128,7 +128,7 @@ REMOTE_DEBUG_ACCEPTANCE_LOOSENING: Final = (
 #: argument is the script's path.
 REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 
-#: Raised by :func:`_guard_answers` to ask whether the hook is in the interpreter's hook list.
+#: Raised by :func:`_probe` to ask whether the hook is in the interpreter's hook list.
 #: The interpreter has no call that lists audit hooks, and it drops a new hook without an error
 #: when one already installed objects, so asking is the only way to know.
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
@@ -149,7 +149,7 @@ _refused = 0
 _reporter_started = False
 #: Set once ``sys.addaudithook(_guard)`` has returned and another hook then cut the probe off, so
 #: the hook may be in without answering. :func:`install_remote_debug_guard` says why no later call
-#: adds it again.
+#: adds it again while the probe stays cut off.
 _probe_cut_off = False
 
 
@@ -303,23 +303,26 @@ def install_remote_debug_guard() -> None:
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
     through :func:`messagefoundry.childenv.python_child_argv`. The event cannot fire there.
 
-    Where the hook does not answer, an audit hook added earlier is in the way, in one of two ways
-    (vault BACKLOG #3463):
+    The probe after the add reads one of three ways (vault BACKLOG #3463), and the install acts on
+    what each one proves:
 
-    1. That hook raised on ``sys.addaudithook``, so the interpreter dropped the new hook without
-       an error. The probe passes every hook and reads False. The hook is not in, so the quiet
-       ``sys.unraisablehook`` is put back, no reporter starts, and the next call tries again.
-       Nothing can stack, because a hook the interpreter dropped is not in the list.
-    2. That hook raises on the probe event, which cuts the probe off: it reads None. The hook may
-       be in behind it, refusing. Each later call would then add another copy, so once
-       ``sys.addaudithook`` has returned into a cut-off probe, no call adds the hook again, and the
-       quiet wrapper and the reporter stay, so a refusal is logged and its full path is kept off
-       standard error. What this gives up is a retry where the same earlier hook also refused the
-       add. Against that same hook a retry was probably futile anyway, and the posture reads the
-       hook as missing either way.
+    - It answered: the hook is in. Later calls find it answering and add nothing.
+    - It passed every hook unanswered (False): the hook is not in the list, for example because
+      an audit hook added earlier raised on ``sys.addaudithook`` and the interpreter dropped the
+      new hook without an error. The quiet ``sys.unraisablehook`` is put back, no reporter starts,
+      and the next call tries again. Nothing can stack, because the hook is not in the list.
+    - An earlier hook raised on the probe event and cut it off (None). The hook may be in behind
+      it, refusing, or that hook may also have refused the add. Adding again could stack a copy on
+      each call, so no call adds the hook while the probe stays cut off. The quiet wrapper and
+      the reporter stay, so a refusal is logged and its full path is kept off standard error.
+      Should the probe later read False, the hook is not in, and the next call adds it. What this
+      gives up is a retry where the earlier hook keeps cutting the probe off but stops refusing
+      adds: the install cannot tell that apart from a hook that is in. The posture reads the hook
+      as missing throughout.
 
     Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
-    wrapper is put back and the next call tries again.
+    wrapper is put back and the next call tries again. Nothing is logged there: the command line
+    makes this call before logging is configured, and the posture reports the missing hook.
 
     One refusal is out of reach in any state. An audit hook added earlier that raises on
     ``cpython.remote_debugger_script`` refuses the script before the interpreter calls this
@@ -332,7 +335,10 @@ def install_remote_debug_guard() -> None:
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        if not _probe_cut_off and _probe() is not True:
+        answer = _probe()
+        # A cut-off probe after an add that returned may hide a hook that is in, so only a
+        # definite False, or a first attempt, adds.
+        if answer is False or (answer is None and not _probe_cut_off):
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
             quiet = sys.unraisablehook = _without_own_refusals(previous)

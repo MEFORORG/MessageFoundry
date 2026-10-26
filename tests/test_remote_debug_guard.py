@@ -76,7 +76,7 @@ _WAIT = 20.0
 
 #: The injection test's own watchdog, above the sum of its waits. The suite default is shorter
 #: than four child interpreters can need on a starved runner.
-_INJECTION_TEST_TIMEOUT = 300
+_INJECTION_TEST_TIMEOUT = 360
 
 # The target process. It idles in Python, so the interpreter reaches the point where it looks for
 # an injected script. It writes its OWN process id: on Windows a virtual environment's python.exe
@@ -670,6 +670,24 @@ def test_a_hook_behind_a_cut_off_probe_is_added_once_and_still_reported(
     assert installs.hooks == [remotedebug._guard]
     assert installs.reporters == 1
     assert quiet is not before and sys.unraisablehook is quiet
+
+
+def test_a_cut_off_probe_that_later_reads_false_is_added_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The earlier hook cut the probe off and also refused the add, then stopped doing both. The
+    probe now reads a definite False, so the hook is not in and an add cannot stack: the next
+    call adds it. While the probe stays cut off, no call adds."""
+    installs = _Installs(monkeypatch)
+    # Call 1: cut off before and after the add. Call 2: still cut off. Call 3: False, then added.
+    answers = iter([None, None, None, False, True])
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
+    install_remote_debug_guard()
+    install_remote_debug_guard()
+    assert installs.hooks == [remotedebug._guard]
+    install_remote_debug_guard()
+    assert installs.hooks == [remotedebug._guard, remotedebug._guard]
+    assert installs.reporters == 1
 
 
 def test_a_hook_the_interpreter_dropped_is_tried_again_and_gets_no_reporter(

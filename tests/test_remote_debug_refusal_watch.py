@@ -795,7 +795,11 @@ def test_only_serve_builds_what_runs_the_watch() -> None:
 # --- the state where the guard reads as missing --------------------------------------------------
 
 _SECOND_CAUSE = """\
-import asyncio, json, sys
+import asyncio, json, logging, sys
+
+# The guard's reporter thread runs in "probe" mode (vault BACKLOG #3463). Kept off standard
+# error, so a daemon thread still writing there cannot hold its lock at shutdown.
+logging.disable(logging.CRITICAL)
 
 from messagefoundry import remotedebug
 from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch

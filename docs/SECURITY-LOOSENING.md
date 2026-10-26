@@ -1834,17 +1834,20 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   something else added to the process first. In one, that hook refused the engine's, so the
   engine's hook is missing and an injected script runs. Nothing is refused, so there is no
   WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
-  ask whether its own hook is there. The engine's hook is then in place and refuses a script,
-  but the entry still reads as unguarded. A refusal in that state is logged as a WARNING and
+  ask whether its own hook is there. The engine's hook is then usually in place and refuses a
+  script, but the entry still reads as unguarded. Where that hook also refused the engine's, as
+  in the first case, the engine's hook is missing and nothing is refused, and the engine cannot
+  tell that from its hook being in. A refusal in the second case is logged as a WARNING and
   counted like any other, so under `serve` the `remote_debug_refused` audit row and alert come
   too (vault BACKLOG #3463). Once a refusal is counted, the entry as `GET /security/posture`
   reads it carries the count, which the first case cannot produce. The serve-time warning is
   read once, at start, so it carries a count only for a refusal before then. A count says
   the hook was in at some point, not that it still is, so read the entry as missing either way.
   In the first case a later install call tries again, and nothing stacks, because the
-  interpreter dropped the hook. In the second, no later call adds the hook again, so no copy
-  stacks there either. Without a count, the entry cannot tell the two cases apart, so read it
-  as the first, and look for what else in the process adds an audit hook.
+  interpreter dropped the hook. In the second, no later call adds the hook again while the
+  other hook keeps cutting the question off, so no copy stacks there either. Without a count,
+  the entry cannot tell the cases apart, so read it as the first, and look for what else in the
+  process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
   it raises on the interpreter's injection event, it refuses the script itself and the engine's
   hook is never asked, whichever entry the engine reports. The script does not run, but there is
