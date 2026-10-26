@@ -56,8 +56,10 @@ async def store(tmp_path: Path):
 
 @pytest.fixture(autouse=True)
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
+    """Each test starts with no consumer load recorded (BACKLOG #2185), and no open-time warning
+    (BACKLOG #3714), whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
+    monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -2991,3 +2993,43 @@ async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_relo
         await preflight()
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+
+
+async def test_a_start_at_warn_logs_the_pins_warning_once(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A serve start checks the pin twice: at store open, then in the lifespan preflight. At
+    ``warn`` it logs the warning once, and the preflight still writes its row. The control is the
+    reload after it, which warns again. Red under: the preflight ignoring the open's warning."""
+    import logging
+
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    from messagefoundry.config.settings import StoreBackend
+
+    settings = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="db.example",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(pin),
+    )
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+
+    def warnings_logged() -> int:
+        return sum("writable by a non-owner" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))  # the store open
+        await run_anchor_preflight(specs, store, enforcing=False)  # the lifespan
+        assert warnings_logged() == 1
+        assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+        await run_anchor_preflight(specs, store, enforcing=False)  # a reload
+        assert warnings_logged() == 2

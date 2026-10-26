@@ -136,9 +136,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
     checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
     and no fingerprint pin. A changed file is used by the next connect and audited by the next
-    reload, which writes ``changed`` and no ``restart_required``. A reload checks only what
-    items 1 to 4 check: the certificate checks of the store's own (one server certificate,
-    inside its validity period) run at the next store open, not at the reload.
+    reload, which writes ``changed`` and no ``restart_required``.
+
+    **A reload re-checks the ACL, the path and the change only**, items 1 to 4. The store's own
+    content checks run at the next store open, not at a reload: at least that the file is one
+    server certificate, that it is inside its validity period, and the encryption-header refusal
+    (BACKLOG #3090). So a reload can pass a swapped file the next store open refuses, while the
+    driver reads it at its next connect. At ``warn`` the start logs the pin's warning once: the
+    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
     **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
     at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
@@ -1099,8 +1104,16 @@ _REFUSED = "[security].enforcement=enforce refuses it"
 _WARNED = "[security].enforcement=warn, using it anyway"
 
 
-def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool) -> None:
+def _silent(*_args: object) -> None:
+    """A stand-in for ``log.warning`` that says nothing; see ``quiet`` below."""
+
+
+def _enforce_verdict(
+    spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool, quiet: bool = False
+) -> None:
     """Apply the owner fork to a verdict. Raises :class:`TrustAnchorError` on a fatal violation.
+    With ``quiet`` it logs none of its warnings and still raises every refusal: for a check whose
+    caller already logged the same warning (:data:`_WARNED_AT_OPEN`).
 
     * A pin mismatch always refuses.
     * A group/world-writable DACL, or a path another principal can replace the anchor through,
@@ -1111,23 +1124,24 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
       dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
       consumer reads the file again (``loads_verified_bytes`` False, the outbound CAs, vault
       BACKLOG #2371): there the pin matched bytes the consumer does not load."""
+    warn = _silent if quiet else log.warning
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
         if enforcing:
             raise TrustAnchorError(f"{_acl_message(spec)}\n{_REFUSED}")
-        log.warning("%s\n%s", _acl_message(spec), _WARNED)
+        warn("%s\n%s", _acl_message(spec), _WARNED)
     if verdict.path_ok is False:
         if enforcing:
             raise TrustAnchorError(f"{_path_message(spec, verdict)}\n{_REFUSED}")
-        log.warning("%s\n%s", _path_message(spec, verdict), _WARNED)
+        warn("%s\n%s", _path_message(spec, verdict), _WARNED)
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
     # pin stand in for a read the file system would not give.
     unknown = _indeterminate_message(spec, verdict)
     if verdict.pin_ok is True and spec.loads_verified_bytes:
-        log.warning(
+        warn(
             "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
             unknown,
             spec.pin_setting or "the configured SHA-256 pin",
@@ -1136,10 +1150,30 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
         raise TrustAnchorError(f"{unknown}\n{fix}\n{_REFUSED}")
-    log.warning("%s\n%s\n%s", unknown, fix, _WARNED)
+    warn("%s\n%s\n%s", unknown, fix, _WARNED)
 
 
-def enforced_anchor(spec: AnchorSpec, *, enforcing: bool) -> AnchorVerdict:
+def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
+    """What a warning :func:`_enforce_verdict` logged was about, or ``None`` when it logged none
+    (every verdict it passes with a warning has an ACL or path that is not plainly fine)."""
+    if verdict.acl_ok is True and verdict.path_ok is True:
+        return None
+    return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok)
+
+
+#: The open-time warnings the settings preflight need not repeat (vault BACKLOG #3714). The SQL
+#: Server store checks its pin when it opens, before the store that holds audit rows exists, and
+#: at ``warn`` that check logs its warning. ``serve``'s lifespan preflight then checks the same
+#: file moments later. So :func:`enforced_anchor` with ``remember_warning`` records the verdict
+#: it warned about, keyed by label and path, and the next preflight of that anchor writes its row
+#: but skips the warning when its verdict matches. It is used once: a reload warns again. A
+#: command that opens the store and runs no preflight still logs the warning at open.
+_WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
+
+
+def enforced_anchor(
+    spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
+) -> AnchorVerdict:
     """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
     verdict, whose ``data`` is the bytes it checked. It loads nothing. A consumer that loads the
     anchor into a context calls :func:`verified_anchor_cadata` instead and loads what that returns:
@@ -1148,6 +1182,8 @@ def enforced_anchor(spec: AnchorSpec, *, enforcing: bool) -> AnchorVerdict:
     once, as the SQL Server pin's validity check does (vault BACKLOG #3714)."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
+    if remember_warning and (state := _warned_state(verdict)) is not None:
+        _WARNED_AT_OPEN[(spec.label, spec.path)] = state
     return verdict
 
 
@@ -1891,8 +1927,11 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
         # even when its audit row failed, so a substituted anchor never reads as a store outage.
         # Only an anchor that passes raises the store fault.
         store_fault = exc
+    # A store open that just logged this warning (_WARNED_AT_OPEN) is not repeated; the row is.
+    warned = _WARNED_AT_OPEN.pop((spec.label, spec.path), None)
+    quiet = warned is not None and warned == _warned_state(verdict)
     try:
-        _enforce_verdict(spec, verdict, enforcing=enforcing)
+        _enforce_verdict(spec, verdict, enforcing=enforcing, quiet=quiet)
         if shape_error is not None:
             raise shape_error
     except TrustAnchorError as refusal:

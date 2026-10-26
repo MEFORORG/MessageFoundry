@@ -2726,8 +2726,9 @@ def check_pinned_certificate(
       still counts as valid, as RFC 5280 reads it.
 
     The file is read once, and the certificate checks read the bytes the anchor checks read
-    (BACKLOG #3714). It writes no audit row; the audited check is the settings preflight
-    (:mod:`messagefoundry.auth.trust_anchors`, module item 11).
+    (BACKLOG #3714). It writes no audit row. The audited check is the settings preflight
+    (:mod:`messagefoundry.auth.trust_anchors`, module item 11), which re-checks the ACL, the
+    path and the change only: the certificate checks here run at each store open, not at a reload.
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
     :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
@@ -2747,10 +2748,13 @@ def check_pinned_certificate(
     path = spec.path
     checked: bytes | str  # the bytes the anchor checks read, or the refusal
     try:
-        checked = enforced_anchor(spec, enforcing=posture is None or posture.enforcing).data
+        enforcing = posture is None or posture.enforcing
+        # remember_warning: serve's preflight checks this file again moments later, and need not
+        # log the same warning twice (BACKLOG #3714).
+        checked = enforced_anchor(spec, enforcing=enforcing, remember_warning=True).data
     except TrustAnchorError as exc:
         checked = str(exc)  # the anchor module's own message, which names the setting and the fix
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: a path open() refuses, such as a NUL in it
         checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
         raise ValueError(checked)

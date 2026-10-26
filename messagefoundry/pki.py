@@ -834,17 +834,19 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     try:
         with open(path, "rb") as fh:
             data = fh.read()
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:  # what open() raises for a bad path
         return unreadable_pin_reason(exc)
-    except Exception as exc:  # a path open() will not take, such as one holding a NUL
-        return f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"
     return pinned_server_certificate(data)
 
 
-def unreadable_pin_reason(exc: OSError) -> str:
-    """The phrase for a pin file the OS would not read, in the shape of
-    :func:`read_pinned_server_certificate`'s reasons: the ``strerror``, never the path's bytes."""
-    return f"could not be read: {exc.strerror or type(exc).__name__}"
+def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
+    """The phrase for a pin file that could not be opened, in the shape of
+    :func:`read_pinned_server_certificate`'s reasons. An ``OSError`` gives its ``strerror``; a
+    ``ValueError`` or ``TypeError`` is a path ``open()`` will not take, such as one holding a NUL.
+    Neither names the path's bytes."""
+    if isinstance(exc, OSError):
+        return f"could not be read: {exc.strerror or type(exc).__name__}"
+    return f"could not be read: the path is not usable ({type(exc).__name__})"
 
 
 def pinned_server_certificate(data: bytes) -> x509.Certificate | str:

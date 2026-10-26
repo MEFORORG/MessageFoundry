@@ -609,6 +609,21 @@ def test_the_escaped_posture_does_not_check_a_pin_it_never_sends(
     check_pinned_certificate(settings)
 
 
+def test_a_pin_path_open_refuses_is_refused_naming_the_setting() -> None:
+    """A path ``open()`` will not take, such as one holding a NUL, is refused with the setting's
+    name and a path reason, not a raw ``ValueError`` and not "not a certificate". Load refuses
+    such a path first, so the store's check sees one only past validation."""
+    from messagefoundry import pki
+
+    bad = "db\x00server.pem"
+    assert pki.read_pinned_server_certificate(bad) == (
+        "could not be read: the path is not usable (ValueError)"
+    )
+    settings = _ss().model_copy(update={"ssl_root_cert": bad})
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*the path is not usable"):
+        check_pinned_certificate(settings)
+
+
 def test_the_store_open_check_reads_the_pin_once(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
