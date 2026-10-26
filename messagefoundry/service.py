@@ -104,9 +104,8 @@ def _elevated_cmd_params(action: str, name: str) -> str:
 # into an ELEVATED PowerShell command line (ShellExecuteW "runas"). It also becomes a filename segment
 # (environments/<name>.toml), so constrain it to the same token charset the engine validates
 # ([ai].environment) and reject anything else — an unsafe value could break out of the quoted arg and
-# run as admin (cf. service_status.is_safe_service_name). Matched whole, with `fullmatch` and `\z`:
-# `$` with `.match` also accepted a trailing line feed (BACKLOG #1680). install-service.ps1 checks
-# -Environment against this same text, case-sensitively.
+# run as admin. Matched whole for the reason given at service_status._SAFE_SERVICE_NAME (BACKLOG
+# #1680); install-service.ps1 checks -Environment against this same text, case-sensitively.
 _SAFE_ENV_NAME = re.compile(r"^[A-Za-z0-9._-]+\z")
 
 
@@ -154,8 +153,8 @@ def control_service(action: str, name: str) -> bool:
     Uses ``net`` (synchronous) under an elevated, hidden ``cmd``. Output isn't captured;
     call :func:`service_state` afterwards to see the new state.
 
-    Raises :class:`ValueError` for a service name with shell metacharacters — it would be
-    interpolated into an elevated cmd.exe line (review low-16)."""
+    Raises :class:`ValueError` for a name :func:`~messagefoundry.service_status.is_safe_service_name`
+    refuses — it would be interpolated into an elevated cmd.exe line (review low-16)."""
     if not is_safe_service_name(name):
         raise ValueError(f"unsafe service name {name!r}")
     if sys.platform != "win32":
@@ -283,7 +282,7 @@ def control_service_ex(action: str, name: str) -> ServiceControlOutcome:
     absolute system-directory paths, so it never elevates user-writable code (:func:`_system_exe`).
     Returns :data:`UNSUPPORTED` off Windows.
 
-    Raises :class:`ValueError` for an unknown ``action`` or a service name with shell metacharacters
+    Raises :class:`ValueError` for an unknown ``action`` or a service name the one guard refuses
     (it is interpolated into an elevated ``cmd.exe`` line — review low-16), *before* the platform
     check so an unsafe input is refused on every OS.
     """

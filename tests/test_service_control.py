@@ -365,8 +365,8 @@ def test_installer_checks_the_environment_with_the_python_text() -> None:
 def test_environment_guard_matches_the_engine_charset() -> None:
     """service.py's environment pattern and settings' allowed set are one character set.
 
-    settings cannot import service.py (it would pull ctypes into config), so the two are pinned
-    here instead. Every BMP code point is asked, so a case-folding look-alike such as the Kelvin
+    config/settings.py does not import service.py, whose elevated-launch imports
+    tests/test_dependency_boundaries.py tracks, so the two are pinned here instead. Every BMP code point is asked, so a case-folding look-alike such as the Kelvin
     sign, or a character added to one side only, fails (BACKLOG #1680)."""
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
@@ -382,10 +382,13 @@ def test_service_uses_the_one_guard_from_service_status() -> None:
     """No second copy to drift: service.py imports the sibling's guard."""
     assert service_control.is_safe_service_name is service_status.is_safe_service_name
     assert not hasattr(service_control, "_is_safe_service_name")
+    assert not hasattr(service_control, "_SAFE_SERVICE_NAME")
 
 
 @pytest.mark.parametrize("bad", _EDGE_NAMES)
-def test_control_service_refuses_edge_names(bad: str) -> None:
+def test_control_service_refuses_edge_names(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    # Off Windows, so a guard regression returns False and fails here instead of elevating for real.
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
     with pytest.raises(ValueError, match="unsafe service name"):
         control_service("restart", bad)
 

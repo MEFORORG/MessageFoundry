@@ -39,8 +39,8 @@ ServiceState = str
 
 # A Windows service name needs only letters/digits/space/dot/underscore/hyphen. Even though this call
 # uses an argv list (no shell), keep the name strictly validated so a hostile/typo'd config value can
-# never reach the subprocess as anything but a plain service name (defense-in-depth; mirrors the
-# console's elevated-path guard). The name MUST start with an alphanumeric — so a leading '-'/space
+# never reach the subprocess as anything but a plain service name (defense-in-depth here; on the
+# elevated paths in messagefoundry.service it is the control). The name MUST start with an alphanumeric — so a leading '-'/space
 # (which `sc` could read as a token) or a whitespace-only name is rejected outright.
 #
 # This is the ONE service-name guard; messagefoundry.service imports it (BACKLOG #1680). It is
@@ -98,7 +98,8 @@ _NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def is_safe_service_name(name: str) -> bool:
-    """True iff ``name`` is a non-empty, plain Windows service name (no shell metacharacters)."""
+    """True iff ``name`` is a non-empty, plain Windows service name: no shell metacharacters, an
+    alphanumeric first character, and no trailing line feed."""
     # The isinstance keeps the documented never-raises contract of query_service_state for an
     # untyped caller: fullmatch raises TypeError on None.
     return isinstance(name, str) and _SAFE_SERVICE_NAME.fullmatch(name) is not None

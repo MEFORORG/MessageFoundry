@@ -76,7 +76,7 @@ $report = @{{}}
 
 # ParseFile parses; it never runs the file.
 $parse = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1')) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $errs = $null
   $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
@@ -284,7 +284,7 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
         assert isinstance(row, dict)
         assert row["pattern"] == expected, (
             f"{key} validates against {row['pattern']!r}, not messagefoundry/service_status.py's "
-            f"_SAFE_SERVICE_NAME ({expected!r}). Both scripts must take the same names: a helper "
+            f"_SAFE_SERVICE_NAME ({expected!r}). Every script must take the same names: a helper "
             "installed under a name one of them rejects cannot be removed by the other."
         )
         assert row["spaced"] is True, (
@@ -306,9 +306,11 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
         )
 
 
-@pytest.mark.parametrize("name", ["install-net-helper.ps1", "uninstall-net-helper.ps1"])
+@pytest.mark.parametrize(
+    "name", ["install-net-helper.ps1", "uninstall-net-helper.ps1", "install-service.ps1"]
+)
 def test_the_script_parses(ast_report: dict[str, object], name: str) -> None:
-    # No CI leg runs either script, so a syntax error would first show up on an operator's node
+    # No CI leg runs these scripts, so a syntax error would first show up on an operator's node
     # mid-install. Parsing is not running: ParseFile never executes the file.
     parse = ast_report["parse"]
     assert isinstance(parse, dict)
