@@ -84,6 +84,10 @@ class _Files:
         self.combined_legacy = self._write(root / "client-legacy.pem", cert + legacy)
         self.cert_only = self._write(root / "client-cert.pem", cert)
         self.key_pkcs8 = self._write(root / "client-key-pkcs8.pem", pkcs8)
+        self.key_plain = self._write(root / "client-key-plain.pem", plain)
+        #: A key path the check cannot read as a file: a directory.
+        self.unreadable = root / "client-key-dir"
+        self.unreadable.mkdir()
         #: Every file holding an encrypted key, as urllib3 is handed it. The spy fails on any.
         self.encrypted = {
             str(p) for p in (self.combined_pkcs8, self.combined_legacy, self.key_pkcs8)
@@ -123,20 +127,21 @@ def _client_cert(monkeypatch: pytest.MonkeyPatch, cert: Path, key: Path | None) 
 
 
 @contextlib.contextmanager
-def _tls_loads(refused: set[str]) -> Iterator[list[tuple[Any, Any]]]:
-    """Record the client certificate and key urllib3 hands the TLS library on each new socket.
+def _tls_loads(refused: set[str]) -> Iterator[list[tuple[Any, Any, Any]]]:
+    """Record the client certificate, key and key password urllib3 hands the TLS library on each
+    new socket.
 
     A file in ``refused`` fails the test instead of reaching OpenSSL, so nothing here loads one.
     """
     import urllib3.connection
     from urllib3.util.ssl_ import ssl_wrap_socket as real
 
-    seen: list[tuple[Any, Any]] = []
+    seen: list[tuple[Any, Any, Any]] = []
 
     def spy(*args: Any, **kwargs: Any) -> Any:
         assert "certfile" in kwargs, "urllib3 no longer passes certfile by keyword"
         pair = (kwargs.get("certfile"), kwargs.get("keyfile"))
-        seen.append(pair)
+        seen.append((*pair, kwargs.get("key_password")))
         if refused.intersection(str(name) for name in pair if name):
             raise AssertionError(
                 f"an encrypted client key reached the TLS library unchecked: {pair}"
@@ -155,8 +160,9 @@ def _tls_loads(refused: set[str]) -> Iterator[list[tuple[Any, Any]]]:
         ("combined_pkcs8", None),
         ("combined_legacy", None),
         ("cert_only", "key_pkcs8"),
+        ("cert_only", "unreadable"),
     ],
-    ids=["combined-pkcs8", "combined-legacy-pem", "separate-key"],
+    ids=["combined-pkcs8", "combined-legacy-pem", "separate-key", "unreadable-key"],
 )
 def test_an_encrypted_client_key_is_refused_before_the_tls_library_reads_it(
     build: Any,
@@ -166,7 +172,8 @@ def test_an_encrypted_client_key_is_refused_before_the_tls_library_reads_it(
     vault: _TlsVault,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The red test. Unfixed, the combined shapes reach the spy with no key file set."""
+    """The red test. Unfixed, the encrypted shapes reach the spy, and the unreadable key reaches
+    the TLS library, which raises its own error."""
     from messagefoundry.transports.strict_requests import VaultHopRefused, vault_failure_text
 
     cert_path = getattr(files, cert)
@@ -188,14 +195,27 @@ def test_an_encrypted_client_key_is_refused_before_the_tls_library_reads_it(
 
 
 @pytest.mark.parametrize("build", [_kv_client, _transit_client], ids=["kv", "transit"])
-def test_an_unencrypted_combined_client_pem_still_connects(
-    build: Any, files: _Files, vault: _TlsVault, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("cert", "key"),
+    [("combined_plain", None), ("cert_only", "key_plain")],
+    ids=["combined", "separate-key"],
+)
+def test_an_unencrypted_client_key_still_connects(
+    build: Any,
+    cert: str,
+    key: str | None,
+    files: _Files,
+    vault: _TlsVault,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control. The same route with a plain key loads it and reaches Vault, and the spy shows
-    the patched ``hvac.v1`` value was the file handed to the TLS library, with no key file."""
-    _client_cert(monkeypatch, files.combined_plain, None)
+    """The control. The same route with a plain key loads it and reaches Vault. The spy shows the
+    patched ``hvac.v1`` values were the files handed to the TLS library, and that the key password
+    was the empty one that keeps a swapped-in encrypted key off a prompt, not ``None``."""
+    cert_path = getattr(files, cert)
+    key_path = None if key is None else getattr(files, key)
+    _client_cert(monkeypatch, cert_path, key_path)
     client = build(vault.url)
     with _tls_loads(files.encrypted) as seen:
         assert client.adapter.get(_PATH) == _REPLY
-    assert seen == [(str(files.combined_plain), None)]
+    assert seen == [(str(cert_path), None if key_path is None else str(key_path), "")]
     assert vault.negotiated, "the listener saw no completed handshake"
