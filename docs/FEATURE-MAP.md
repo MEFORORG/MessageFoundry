@@ -13,6 +13,7 @@ maintainer-internal document; this is the **capability** view.
 | 🔨 | **v0.1** — planned for the `0.1.0` release |
 | ⏭️ | **0.2+** — deferred (see the plan's *Out of scope*) |
 | 🧭 | **Later** — on the long-term vision, not yet scheduled |
+| Shipped | **Shipped**, written as a word: the same status as the first mark |
 | Declined | **Declined-by-design** — ruled out; not scheduled, not deferred. Build around it |
 
 **Core model (shipped):** a code-first message graph wired *by name* — an inbound **Connection**
@@ -157,7 +158,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 | Control-char scrub filter | ✅ | Targeted, not a general redactor |
 | **Full PHI log redaction** (chained-exception traceback scrubbing + proof test) | ✅ | **Gate #1** — safe to run above DEBUG with PHI |
 | `serve` prod-DEBUG guard | ✅ | Gate #1 |
-| JSON logs / off-box (SIEM) forwarding | Shipped | JSON lines via `[logging].format = "json"`; off-box forwarding to a syslog/SIEM collector via `[logging].forward_host` ([CONFIGURATION.md](CONFIGURATION.md#logging)). Logging is stdlib: structlog is **not** adopted, and Gate #1 closed without it |
+| JSON logs / off-box (SIEM) forwarding | Shipped | JSON lines via `[logging].format = "json"`; off-box forwarding to a syslog/SIEM collector via `[logging].forward_host`, listed in `[egress].allowed_syslog` while egress denies by default ([CONFIGURATION.md](CONFIGURATION.md#logging)). Logging is stdlib: structlog is **not** adopted, and Gate #1 closed without it |
 | De-identification framework (test harness + tee) | ✅ | ADR 0030 (#440) — `messagefoundry/anon/`, vendored to `tee/anon/` (only some files are byte-identical: `tests/test_anon_parity.py` is the record of which, and it checks that both copies give the same output on its test corpora); deterministic **secret-per-dataset** pseudonymization (width/shape-preserving), **field-anchored** site-code scrub, **fail-closed** leak-check (a body it refuses is never written); `tee anonymize-captures` + opt-in harness hooks build de-identified test datasets from real traffic. De-identified is not PHI-free: [PHI.md §9](PHI.md#9-de-identification) lists what the leak-check refuses and what it lets through. Pure stdlib. Rules centralized — no inline ad-hoc de-id |
 
 ## 9. Observability & Alerting

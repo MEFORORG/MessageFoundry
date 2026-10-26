@@ -84,7 +84,7 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 | `MEFOR_STORE_PASSWORD` | `[store].password` | *(secret)* | **env/secret only** — never the config file |
 | `MEFOR_STORE_POOL_SIZE` | `[store].pool_size` | `40` | default 40, the inverted-U optimum — don't set higher ([ADR 0062](adr/0062-default-store-pool-size.md)); `>= 2` under `[cluster]`. **Budget:** `engines × pool_size` hit one managed-PG `max_connections` (~2 engines at 40/100) — raise it, add a pooler, or size down; never split the store ([DEPLOY-SERVER-DB.md](DEPLOY-SERVER-DB.md) §3) |
 | `MEFOR_CLUSTER_ENABLED` | `[cluster].enabled` | `true` | turns on the leader lease + graph gating |
-| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | `true` | a keyless start is already refused by default; this keeps that refusal past the audited opt-out (`[security].allow_unencrypted_phi`), per [PHI.md](PHI.md#3-encryption-at-rest) §3. It encrypts nothing: set the key below too |
+| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | `true` | keeps the default keyless refusal past the audited opt-out ([PHI.md](PHI.md#3-encryption-at-rest) §3). It encrypts nothing: set the key below too |
 | `MEFOR_STORE_ENCRYPTION_KEY` | `[store].encryption_key` | *(secret)* | base64 32 bytes — `messagefoundry gen-key` |
 
 `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false**, so the DB

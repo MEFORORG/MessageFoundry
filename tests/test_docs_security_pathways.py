@@ -3251,8 +3251,8 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         == settings_module.KEYLESS_REFUSED_BY_NO_STRICT_ACK
     ), "the opt-out alone lifts the keyless refusal under `enforce` now; restate docs/PHI.md §3."
     assert settings_module.keyless_opt_out_refusal(opted_out, acknowledged) is None, (
-        "the audited opt-out no longer lifts the keyless refusal; restate the guide's and "
-        "docs/CONTAINER-EXPOSURE-EVALUATION.md's `require_encryption` sentences."
+        "the audited opt-out no longer lifts the keyless refusal; restate the `require_encryption` "
+        "sentences in every doc test_no_doc_credits_require_encryption_with_the_keyless_refusal reads."
     )
     assert (
         settings_module.keyless_opt_out_refusal(
@@ -3383,8 +3383,7 @@ _SIGN_IN_LEGS = (
 
 #: Sign-in described as something that can be off: "auth disabled", "sign-in is optional",
 #: "authentication may be switched off", "auth is not required", "auth is enabled by default",
-#: "disable auth", "turn off auth", "without auth", "with no auth", "no-auth", and "requires
-#: authentication by default", which makes it a default that can be changed. Only the words
+#: "disable auth", "turn off auth", "without auth", "with no auth", "no-auth". Only the words
 #: listed may stand between the subject and its state, so a denial there ("sign-in cannot be
 #: turned off") does not match at all. "off-loopback" and "off-box" are not the state.
 _NOT_ONE_LEG = "".join(rf"(?<!\b{leg} )" for leg in _SIGN_IN_LEGS)
@@ -3394,10 +3393,25 @@ _SIGN_IN_OFF = re.compile(
     r"(?:disabled|optional|opt-in|off(?![-\w])|not (?:required|needed)|(?:enabled|on) by default)"
     rf"|\b(?:disabl\w+|turn\w* off|switch\w* off) (?:the |any )?{_SIGN_IN}\b"
     rf"|\b(?:without|with no) {_SIGN_IN}\b"
-    rf"|\brequires? {_SIGN_IN} by default\b"
     r"|\bno-auth\b",
     re.IGNORECASE,
 )
+
+#: Sign-in REQUIRED only by default, in either word order: "requires authentication by default",
+#: "authentication is required by default", "by default the API requires sign-in". Calling it a
+#: default says a setting can change it, which no setting can (vault BACKLOG #3477). A denial makes
+#: it worse, not true ("does not require auth by default"), so no denial clears this pattern.
+_SIGN_IN_DEFAULT = re.compile(
+    rf"\b{_NOT_ONE_LEG}(?:an? )?{_SIGN_IN}\b(?: (?:is|are|be))? required,? by default\b"
+    rf"|\brequire[sd]? (?:an? )?{_SIGN_IN}\b,? by default\b"
+    # One subject between: "binds 127.0.0.1 by default and requires auth" ties the default to the bind.
+    rf"|\bby default,? (?:the |an? )?(?!(?:and|or|but)\b)\w+ requires? (?:an? )?{_SIGN_IN}\b",
+    re.IGNORECASE,
+)
+
+#: A leg's or another system's name, anywhere in the stretch that holds a default match: "the SMTP
+#: relay requires authentication by default" is about the relay, not the engine's sign-in.
+_ONE_LEG = re.compile(r"\b(?:" + "|".join(_SIGN_IN_LEGS) + r")\b", re.IGNORECASE)
 
 #: A denial just ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
 _DENIED_BEFORE = re.compile(r"\b(?:no|not|never|cannot|nothing)\b|n't\b", re.IGNORECASE)
@@ -3415,14 +3429,22 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     comma, colon, dash or bracket. So a return of the claim behind a "no" or "not" in that stretch
     still passes, and so does one joined on by "and". A true sentence can trip it, at least "that
     account's sign-in is disabled" and "a request without authentication is answered 401": that is
-    loud, and rewording clears it."""
+    loud, and rewording clears it.
+
+    ``_SIGN_IN_DEFAULT`` is read apart: no denial clears it, and a leg or system named in its
+    stretch does. So a true sentence about the engine that also names one ("the local API requires
+    sign-in by default") passes, and so would the claim written that way."""
+
+    def stretch(c: str, m: re.Match[str]) -> str:
+        return re.split(r"[,:(—–]", c[: m.start()])[-1]
+
     return [
         c
         for c in clauses
         if _AUTH_DISABLED.search(c)
+        or any(not _DENIED_BEFORE.search(stretch(c, m)) for m in _SIGN_IN_OFF.finditer(c))
         or any(
-            not _DENIED_BEFORE.search(re.split(r"[,:(—–]", c[: m.start()])[-1])
-            for m in _SIGN_IN_OFF.finditer(c)
+            not _ONE_LEG.search(stretch(c, m) + m.group(0)) for m in _SIGN_IN_DEFAULT.finditer(c)
         )
     ]
 
@@ -3476,6 +3498,15 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "The console prompts for sign-in (authentication is on by default).",
         # docs/USER-GUIDE.md's network paragraph, as engine PR 2303 left it (vault BACKLOG #3477).
         "The API binds 127.0.0.1:8765, serves HTTPS, and requires authentication by default.",
+        # Its rewordings, in either word order, and with a denial, which only makes it worse.
+        "Authentication is required by default.",
+        "sign-in is required by default",
+        "By default the API requires authentication.",
+        "The API requires auth, by default.",
+        "The engine requires a sign-in by default.",
+        "The API does not require authentication by default.",
+        "The engine no longer requires sign-in by default.",
+        "The API doesn't require auth by default.",
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
@@ -3499,6 +3530,9 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Two-factor authentication is on by default.",
         "The API serves HTTPS, and always requires sign-in: no setting turns it off.",
         "The API binds 127.0.0.1:8765 by default and requires auth.",
+        "The SMTP relay requires authentication by default.",
+        "By default the LDAP server requires authentication.",
+        "Two-factor authentication is required by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3584,14 +3618,17 @@ def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, f
 def test_these_docs_do_not_say_sign_in_can_be_off(name: str, floor: int) -> None:
     """docs/USER-GUIDE.md said the API requires authentication "by default" and that it is "on by
     default", and no guard read that file for it (vault BACKLOG #3477). `serve` always requires
-    sign-in: the load refuses both keys that once turned it off (the second-round probe above). The
-    two cloud guides are read too, since they restate the API posture. docs/CONFIGURATION.md is left
-    out: it holds a true sentence the scan reds, the limit ``_says_sign_in_can_be_off`` states. Each
-    floor sits below the file's clause count on 2026-10-26."""
-    clauses = _clauses(_doc(name))
+    sign-in: the load refuses both keys that once turned it off (the second-round probe above).
+
+    The two cloud guides state no sign-in posture today, so for them this is a floor against a
+    claim arriving, not a reading of one; a table row is read whole, so a claim split across cells
+    still shows. docs/CONFIGURATION.md is left out: it holds at least one true sentence the scan
+    reds, and a stale "required by default" in its `[auth]` section, both outside what vault BACKLOG
+    #3477 was briefed to edit. Each floor sits below the file's count on 2026-10-26."""
+    clauses = _clauses_and_rows(_doc(name))
     assert len(clauses) >= floor, (
-        f"{name} cut into {len(clauses)} clause(s), floor {floor}: the sign-in scan reads too little "
-        "to clear it."
+        f"{name} cut into {len(clauses)} clause(s) and row(s), floor {floor}: the sign-in scan reads "
+        "too little to clear it."
     )
     disabled = _says_sign_in_can_be_off(clauses)
     assert not disabled, (
@@ -3622,11 +3659,26 @@ def test_phi_egress_and_the_feature_map_forwarding_row_state_what_the_code_does(
     assert "(CONFIGURATION.md#egress)" in egress[0], (
         "docs/PHI.md's egress paragraph must link to CONFIGURATION.md#egress, which states the rule"
     )
-    opt_in = [c for c in clauses if re.search(r"\bopt-in\b|\bunrestricted\b", c, re.IGNORECASE)]
+    assert any(re.search(r"\bdeny-by-default\b", c, re.IGNORECASE) for c in clauses), (
+        "docs/PHI.md's egress paragraph no longer says the allowlist is deny-by-default"
+    )
+    # At least the words the retired claim used, and its plainest rewordings. Others pass.
+    open_words = re.compile(
+        r"\bopt-in\b|\bunrestricted\b|\boptional\b|\ballow(?:s|ed)? (?:any|all|every)\b"
+        r"|\ballow-(?:any|all)\b",
+        re.IGNORECASE,
+    )
+    opt_in = [c for c in clauses if open_words.search(c)]
     assert not opt_in, f"docs/PHI.md section 4 calls the egress allowlist opt-in again: {opt_in}"
 
+    # The row names `[logging].format` and `[logging].forward_host`, and says serve forwards.
     assert settings_module.LogFormat("json") is settings_module.LogFormat.JSON
-    assert inspect.isclass(SyslogForward)
+    assert {"format", "forward_host"} <= set(settings_module.LoggingSettings.model_fields)
+    main_tree = ast.parse((_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8"))
+    assert inspect.isclass(SyslogForward) and _called(main_tree, "SyslogForward"), (
+        "serve no longer builds the SyslogForward handler; docs/FEATURE-MAP.md section 8 says "
+        "off-box forwarding is built."
+    )
     section = _doc_section("docs/FEATURE-MAP.md", "## 8. PHI / Compliance")
     rows = [
         [cell.strip() for cell in line.strip().strip("|").split("|")]

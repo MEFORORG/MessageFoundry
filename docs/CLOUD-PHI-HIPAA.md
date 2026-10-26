@@ -61,15 +61,13 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
    revoke. *(NPRM-anticipated: encryption at rest becomes mandatory rather than "addressable.")*
 2. **Application layer (the engine):** MessageFoundry **also** encrypts PHI columns with **AES-256-GCM** in
    the store, independent of the DB's at-rest encryption, so a DB-file or backup exposure does not yield
-   cleartext PHI. It is **fail-closed by default**: running with no key is refused unless the audited
-   opt-out is taken ([PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule).
+   cleartext PHI. It is **fail-closed by default**; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the
+   keyless refusal and its audited opt-out.
    - Supply the key via **`MEFOR_STORE_ENCRYPTION_KEY`** (base64 of 32 random bytes —
      `messagefoundry gen-key`), sourced from the secret store (§4); **or** via
      `[store].encryption_key_file` (a path, e.g. a mounted secret file).
    - Also set `[store].require_encryption = true` (env `MEFOR_STORE_REQUIRE_ENCRYPTION=true`), so the
-     audited opt-out (`[security].allow_unencrypted_phi`) cannot lift the refusal either. It does
-     **not** encrypt anything on its own, and it does not create the refusal, which is already the
-     default: you must **also** supply the key.
+     audited opt-out cannot lift that refusal. It encrypts nothing on its own: supply the key too.
    - Rotate the engine key with `messagefoundry rotate-key` (retired keys via `encryption_keys_retired`).
 
 ---
@@ -177,8 +175,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 - [ ] **BAA signed** with the CSP; every PHI-path service is on the provider's **HIPAA-eligible list**.
 - [ ] **KMS CMEK** on the managed DB, block storage, backups/snapshots, and the secret store.
 - [ ] Engine at-rest key: `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`) supplied from
-      the secret manager, **and** `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so the audited opt-out
-      (`[security].allow_unencrypted_phi`) cannot start the engine keyless.
+      the secret manager, **and** `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so the audited opt-out cannot
+      start the engine keyless ([PHI.md](PHI.md#3-encryption-at-rest) §3).
 - [ ] **TLS in transit** everywhere: API TLS, MLLP-over-TLS (or edge-relay), DB `encrypt=true` /
       `trust_server_certificate=false`; **`MEFOR_ALLOW_INSECURE_TLS` is NOT set**.
 - [ ] raw-TCP/X12 are loopback/segmented (the gate refuses a public bind) — none published publicly.
