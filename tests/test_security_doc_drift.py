@@ -3914,13 +3914,22 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
 
 def test_the_changelog_records_the_re_bind_role_test() -> None:
     """BACKLOG #3822: the released 0.5.2 notes said the password re-bind does not compare roles,
-    and had no entry for the #3081 refusal. RED when that sentence returns or the entry is lost.
-    The code it describes is pinned above, in
-    ``test_the_password_re_bind_role_test_is_documented_and_built``."""
+    and had no entry for the #3081 refusal. RED when that sentence returns, or when the entry
+    leaves the 0.5.2 section or drops a fact below. A text check only: the behaviour is pinned by
+    ``tests/test_reauth_directory_demotion.py``."""
     changelog = " ".join((_ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split())
     assert "do not compare roles yet" not in changelog, (
         "CHANGELOG.md still says the password re-bind does not compare roles."
     )
-    assert "**The password re-bind step-up refuses a directory account demoted" in changelog, (
-        "CHANGELOG.md lost the #3081 entry for the re-bind's demotion refusal."
-    )
+    release = changelog.split("## [0.5.2]", 1)[1].split("## [0.5.1]", 1)[0]
+    marker = "**The password re-bind step-up refuses a directory account demoted"
+    assert marker in release, "CHANGELOG.md [0.5.2] lost the #3081 re-bind demotion entry."
+    entry = release.split(marker, 1)[1].split(" - **", 1)[0]
+    for fact in (
+        "reason=directory_roles_demoted",
+        "reason=directory_identity_conflict",
+        "reason=directory_role_map_unsealed",
+        "none of them is charged to the lockout or to the session's re-proof budget",
+        "**403** on `POST /me/reauth`",
+    ):
+        assert fact in entry, f"the #3081 changelog entry no longer says: {fact}"
