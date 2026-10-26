@@ -1620,6 +1620,22 @@ class _RefuseUnknownHostKey:
         )
 
 
+class _PinEscapeHostKey:
+    """The missing-host-key policy for a key-only SFTP login under the escape (vault BACKLOG #3533
+    item 8).
+
+    It accepts an unknown key, as ``AutoAddPolicy`` does, but never saves it to a file. A saved key
+    would be trusted by a password login naming the same ``known_hosts``, which never takes the
+    escape. paramiko calls it only for a key no loaded file knows, before authentication, with the
+    host name it looks keys up by. It hands that name and key to ``pin``."""
+
+    def __init__(self, pin: Callable[[str, Any], None]) -> None:
+        self._pin = pin
+
+    def missing_host_key(self, client: object, hostname: str, key: object) -> None:
+        self._pin(hostname, key)
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -1627,7 +1643,11 @@ class _SftpClient(_RemoteClient):
     ``[security].enforcement = warn`` and the posture is known, in which case ``AutoAddPolicy`` is
     used and a warning is logged. A login that sends a ``password`` never takes the escape (vault
     BACKLOG #3230): its unknown host key is refused by :class:`_RefuseUnknownHostKey`, whatever the
-    posture."""
+    posture.
+
+    Unlike its siblings, it holds one piece of state across calls: the host key the escape accepted,
+    pinned for this object's later logins (:class:`_PinEscapeHostKey`). It is never written to a
+    file, and a ``known_hosts`` entry for the same host wins over it."""
 
     def __init__(self, settings: dict[str, Any], *, name: str = "") -> None:
         self._name = name
@@ -1639,10 +1659,8 @@ class _SftpClient(_RemoteClient):
         # Read only to refuse it: a key_password never reaches paramiko (BACKLOG #2423).
         _refuse_sftp_key_wrap(self._private_key, settings.get("key_password"))
         self._known_hosts = settings.get("known_hosts")
-        # The host key the escape accepted on this connection's first login, as the
-        # (name, key type, key) that HostKeys.add takes. It pins the later logins in memory only
-        # (vault BACKLOG #3533 item 8); see _dial.
-        self._escape_key: tuple[str, str, Any] | None = None
+        # The (host name, key) the escape accepted first, pinned for later logins; see _dial.
+        self._escape_key: tuple[str, Any] | None = None
         self._timeout = float_setting(
             settings.get("connect_timeout", 30.0),
             knob="connect_timeout",
@@ -1743,15 +1761,15 @@ class _SftpClient(_RemoteClient):
         client.load_system_host_keys()
         host_keys = client.get_host_keys()
         if self._known_hosts:
-            # Read the named file without making it the client's save target. load_host_keys would
-            # make it one, and AutoAddPolicy saves each key it accepts into that target. A password
-            # login naming the same file would then trust that server (vault BACKLOG #3533 item 8).
-            # So the engine never writes the file.
+            # Read the file without making it a save target, as load_host_keys would: the engine
+            # never writes known_hosts (vault BACKLOG #3533 item 8).
             host_keys.load(str(self._known_hosts))
         if self._escape_key is not None:
-            # The escape's key stays pinned for this connection's later logins, in memory only,
-            # so a server whose key changes mid-run is still refused. It never reaches the file.
-            host_keys.add(*self._escape_key)
+            name, key = self._escape_key
+            # Pinned only where the file names no key for the host, so an operator's edit wins.
+            # A changed key on a host the file does not name is then refused, not re-accepted.
+            if host_keys.lookup(name) is None:
+                host_keys.add(name, key.get_name(), key)
         # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Only
         # fall back to AutoAddPolicy behind the explicit insecure escape (set in __init__, logged).
         client.set_missing_host_key_policy(
@@ -1763,6 +1781,10 @@ class _SftpClient(_RemoteClient):
             # and the fix (vault BACKLOG #3230). Kept apart from the call above so that call reads
             # as it did before, which CodeQL's dismissed alert 13 is matched against.
             client.set_missing_host_key_policy(_RefuseUnknownHostKey(paramiko, name=self._name))
+        if self._accept_unknown:
+            # Replaces the AutoAddPolicy above, which saves an accepted key into any save target.
+            # This one pins it in memory only. Kept apart for the CodeQL reason given above.
+            client.set_missing_host_key_policy(_PinEscapeHostKey(self._pin_escape_key))
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
         # its own approved set. Both are passed on every connect, not behind a setting: a control an
@@ -1797,11 +1819,12 @@ class _SftpClient(_RemoteClient):
             allow_agent=False,
             look_for_keys=False,
         )
-        if self._accept_unknown and self._escape_key is None:
-            key = client.get_transport().get_remote_server_key()
-            # The name paramiko's connect looks the key up by.
-            name = self._host if self._port == 22 else f"[{self._host}]:{self._port}"
-            self._escape_key = (name, key.get_name(), key)
+
+    def _pin_escape_key(self, hostname: str, key: Any) -> None:
+        """Keep the first key the escape accepts. Two first logins racing in worker threads keep
+        whichever key exchange ends first; the escape accepted both keys alike."""
+        if self._escape_key is None:
+            self._escape_key = (hostname, key)
 
     def _load_key(self, paramiko: Any) -> Any:
         if not self._private_key:

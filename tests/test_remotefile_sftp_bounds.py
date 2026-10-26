@@ -134,7 +134,9 @@ class _UnconnectedSshClient:
         return None
 
     def get_host_keys(self) -> Any:
-        return SimpleNamespace(load=lambda path: None, add=lambda *entry: None)
+        return SimpleNamespace(
+            load=lambda path: None, add=lambda *entry: None, lookup=lambda name: None
+        )
 
     def set_missing_host_key_policy(self, policy: Any) -> None:
         return None

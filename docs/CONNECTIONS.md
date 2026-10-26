@@ -1304,9 +1304,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   instance. A login with a `password` never takes the escape: its unknown host key is refused in
   every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
   The connector only reads the `known_hosts` file; it never writes a key into it (vault BACKLOG
-  #3533). A key the escape accepts is pinned in memory for that connection's later logins. A
-  password login that names the same file does not inherit it. After a restart, the escape accepts
-  the server's key again.
+  #3533). A key the escape accepts is pinned in memory for that connector's later logins, and a
+  changed key is then refused. A `known_hosts` entry for the host wins over the pin, so a key you
+  add there is used at the next login. A password login that names the same file never inherits
+  the pin. A new connector starts with no pin: at least a restart, a lane start and a reload that
+  changes the connection build one.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).

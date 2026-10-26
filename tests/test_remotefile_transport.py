@@ -1386,7 +1386,9 @@ class _FakeSSHClient:
         pass
 
     def get_host_keys(self) -> Any:
-        return SimpleNamespace(load=lambda path: None, add=lambda *entry: None)
+        return SimpleNamespace(
+            load=lambda path: None, add=lambda *entry: None, lookup=lambda name: None
+        )
 
     def set_missing_host_key_policy(self, policy: Any) -> None:
         self.policy = policy
@@ -1821,11 +1823,11 @@ def _loopback_sftp_server(
     logins: int = 1,
     ciphers: tuple[str, ...] | None = None,
     macs: tuple[str, ...] | None = None,
-    rekey: bool = False,
+    later_key: Any = None,
 ) -> tuple[int, Any, list[str], Any]:
     """Start a loopback SSH server that takes ``logins`` connections in turn and accepts any public
     key or password. It offers only ``ciphers`` and ``macs`` when given, else paramiko's defaults.
-    With ``rekey``, each connection after the first shows a new host key.
+    Given ``later_key``, each connection after the first shows that host key instead.
 
     Returns its port, its first host key (in no known_hosts file, so a client meets an unknown
     server unless the caller pins it), a list it appends ``"publickey"`` or ``"password:<value>"``
@@ -1862,8 +1864,8 @@ def _loopback_sftp_server(
                 except OSError:
                     return
                 with paramiko.Transport(conn) as transport:
-                    rekeyed = rekey and login > 0
-                    transport.add_server_key(paramiko.ECDSAKey.generate() if rekeyed else host_key)
+                    rekeyed = later_key is not None and login > 0
+                    transport.add_server_key(later_key if rekeyed else host_key)
                     if ciphers is not None:
                         transport.get_security_options().ciphers = ciphers
                     if macs is not None:
@@ -2019,9 +2021,9 @@ def test_sftp_key_only_escape_login_does_not_teach_a_shared_known_hosts_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3533 item 8. Under the escape, a key-only login accepts an unknown host key.
-    paramiko's ``AutoAddPolicy`` also saves that key into the file ``load_host_keys`` named. A
-    password login naming the same file then trusted the server and sent it the password. Yet a
-    password login never takes the escape (BACKLOG #3230). Now the connector only reads the file."""
+    paramiko's ``AutoAddPolicy`` would also save it into the file ``load_host_keys`` named. A
+    password login naming the same file would then trust the server and send it the password.
+    Yet a password login never takes the escape (BACKLOG #3230). Now nothing writes the file."""
     paramiko = _real_paramiko()
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
     known_hosts = tmp_path / "known_hosts"
@@ -2067,7 +2069,9 @@ def test_sftp_escape_key_stays_pinned_in_memory_for_the_connections_later_logins
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
     known_hosts = tmp_path / "known_hosts"
     known_hosts.write_text("", encoding="ascii")
-    port, _host_key, accepted, thread = _loopback_sftp_server(paramiko, logins=2, rekey=True)
+    port, _host_key, accepted, thread = _loopback_sftp_server(
+        paramiko, logins=2, later_key=paramiko.ECDSAKey.generate()
+    )
     client = _SftpClient(
         {
             "host": "127.0.0.1",
@@ -2092,6 +2096,45 @@ def test_sftp_escape_key_stays_pinned_in_memory_for_the_connections_later_logins
     assert refused.value.permanent is True
     assert accepted == ["publickey"]
     assert known_hosts.read_text(encoding="ascii") == ""
+    assert not thread.is_alive(), "the loopback SSH server did not shut down"
+
+
+def test_sftp_escape_pin_yields_to_a_key_the_operator_adds_to_known_hosts(
+    escape_at_warn: None,
+    isolated_ssh_home: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3533 item 8. The in-memory pin never overrides the file. After the server's
+    key changes, an operator who writes the new key into known_hosts is not refused until a
+    restart: the next login on the same connection trusts the file."""
+    paramiko = _real_paramiko()
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("", encoding="ascii")
+    new_key = paramiko.ECDSAKey.generate()
+    port, _host_key, accepted, thread = _loopback_sftp_server(paramiko, logins=2, later_key=new_key)
+    client = _SftpClient(
+        {
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "svc",
+            "private_key": _rsa_private_key_pem(),
+            "known_hosts": str(known_hosts),
+            "connect_timeout": 10,
+        },
+        name="OB_KEY",
+    )
+    try:
+        client._connect().close()  # pins the first key, which the file does not name
+        assert client._escape_key is not None
+        known_hosts.write_text(
+            f"[127.0.0.1]:{port} {new_key.get_name()} {new_key.get_base64()}\n", encoding="ascii"
+        )
+        client._connect().close()
+    finally:
+        thread.join(10)
+    assert accepted == ["publickey", "publickey"]
     assert not thread.is_alive(), "the loopback SSH server did not shut down"
 
 
