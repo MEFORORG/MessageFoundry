@@ -11190,8 +11190,8 @@ def create_managed_app(
                 await store.close()
                 raise
         # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
-        # api-mTLS client CA), and the settings CAs a hop dials with (vault BACKLOG #3188;
-        # trust_anchors module item 10), BEFORE any listener binds — a group/world-writable anchor refuses (at
+        # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
+        # trust_anchors module item 10) and the SQL Server store pin (item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at
         # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
         # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
         # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.

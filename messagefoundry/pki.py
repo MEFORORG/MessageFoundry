@@ -57,7 +57,9 @@ __all__ = [
     "key_to_pem",
     "load_pinned_server_certificate",
     "PinRefused",
+    "pinned_server_certificate",
     "read_pinned_server_certificate",
+    "unreadable_pin_reason",
     "load_pkcs12",
     "make_self_signed",
     "read_cert_facts",
@@ -834,6 +836,8 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
             data = fh.read()
     except OSError as exc:
         return unreadable_pin_reason(exc)
+    except Exception as exc:  # a path open() will not take, such as one holding a NUL
+        return f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"
     return pinned_server_certificate(data)
 
 

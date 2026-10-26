@@ -51,8 +51,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    Before this, a file swapped between the check and the load was trusted unchecked. The AD anchor
    joined in BACKLOG #2034: ``ldap3`` used to read it by path on every bind, and now gets the checked
    bytes as ``ca_certs_data``. **Not covered:** the audit row of the central preflight, which records
-   its own read rather than the consumer's, and the dialling CAs of items 9 and 10, which still
-   load by path.
+   its own read rather than the consumer's, and the anchors of items 9 to 11, which still load
+   by path.
 6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
    slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
@@ -131,12 +131,18 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
     items 1 to 4 at start and at every reload. The store checks it too at each open, before any
-    connect, with no audit row, because the store that holds the rows is not open yet. A
-    PostgreSQL ``ssl_root_cert`` is a CA bundle its driver checks itself, and is not added.
+    connect, with no audit row, because the store that holds the rows is not open yet. So at
+    ``enforce`` a pin the store refuses stops the start with no row.
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
     checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
     and no fingerprint pin. A changed file is used by the next connect and audited by the next
-    reload, which writes ``changed`` and no ``restart_required``.
+    reload, which writes ``changed`` and no ``restart_required``. A reload checks only what
+    items 1 to 4 check: the certificate checks of the store's own (one server certificate,
+    inside its validity period) run at the next store open, not at the reload.
+
+    **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
+    at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
+    This change covers the SQL Server pin only; that gap is unfiled.
 """
 
 from __future__ import annotations
@@ -236,8 +242,8 @@ class AnchorSpec:
     for an unreadable ACL or path, and why the anchor takes the PEM shape checks of
     :func:`anchor_cadata`. **A consumer that reads the file again by path must not reuse a spec
     with this True**: the pin would vouch for bytes it never loaded. The AD anchor did exactly that
-    until BACKLOG #2034. The dialling CAs of module items 9 and 10 still read by path, so their
-    specs carry ``False``."""
+    until BACKLOG #2034. The anchors of module items 9 to 11 still read by path, so their specs
+    carry ``False``."""
 
     label: str
     setting: str
@@ -1928,8 +1934,8 @@ async def _report_restart_required(
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
     loaded (:func:`loaded_fingerprint`), and return those anchors' setting names, in spec order
     and once each, for the reload's response (BACKLOG #3015). An anchor no consumer loaded is
-    skipped: a restart would apply nothing there. The dialling settings CAs of module item 10 are
-    always skipped, since their hops load by path and record no fingerprint.
+    skipped: a restart would apply nothing there. The settings anchors of module items 10 and
+    11 are always skipped, since their hops load by path and record no fingerprint.
 
     A name is returned whether or not its audit row was written: the row is advisory, and the
     restart is needed either way.
@@ -1987,8 +1993,8 @@ def make_settings_anchor_preflight(
     differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
     names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
     repeats on every reload until a restart. The specs are frozen here, pins included, so a
-    reload re-reads the paths and pins the engine started with. The report skips the dialling
-    settings CAs of module item 10."""
+    reload re-reads the paths and pins the engine started with. The report skips the settings
+    anchors of module items 10 and 11."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError

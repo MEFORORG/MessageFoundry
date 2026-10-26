@@ -1169,8 +1169,8 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
-        sqlserver = self.backend is StoreBackend.SQLSERVER
-        if self.ssl_root_cert and sqlserver and self.sqlserver_pin_path() is None:
+        pin = self.sqlserver_pin_path()
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and pin is None:
             # Vault BACKLOG #3714 item 9: the store sends the pin only on the verifying posture, so
             # beside a weakened one it would be dropped with nothing said. Refuse rather than ignore,
             # as _ssl_crl_file_reachable does for its own setting.
@@ -1179,7 +1179,7 @@ class StoreSettings(_Section):
                 "trust_server_certificate=false); with verification off the store sends no pin, "
                 "so the pinned certificate would NOT be checked."
             )
-        if pin := self.sqlserver_pin_path():
+        if pin:
             # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
             # certificate would refuse every connect. Say so at load, naming the setting. The file
             # holds only a public certificate, and no part of it goes into the message.
@@ -1283,8 +1283,9 @@ class StoreSettings(_Section):
         or ``None`` (vault BACKLOG #2223). Only SQL Server sends one, and only on the verifying
         posture: ``encrypt`` on and ``trust_server_certificate`` off.
 
-        The load check, the store and the trust-anchor preflight all ask here, so they cannot
-        disagree on whether a pin is sent (BACKLOG #3714). Load refuses a pin beside a weakened
+        The load check, the store and the trust-anchor preflight ask here, so those three cannot
+        disagree on whether a pin is sent (BACKLOG #3714). The certificate-expiry monitor
+        (``pipeline/cert_expiry.py``) still writes the same test out itself. Load refuses a pin beside a weakened
         posture, so on loaded settings the posture arm is a second guard for settings built
         without validation."""
         if self.backend is not StoreBackend.SQLSERVER:

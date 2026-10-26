@@ -590,8 +590,8 @@ def test_a_sqlserver_pin_beside_a_weakened_posture_is_refused_at_load(
 ) -> None:
     """Vault BACKLOG #3714 item 9: the store sends no pin on a weakened posture, so the pin would be
     dropped with nothing said. Load refuses it, as ``ssl_crl_file`` refuses its own silent no-op.
-    The controls: the same pin loads on the verifying posture, and PostgreSQL, whose refusal this
-    is not, still loads the weakened shape."""
+    The controls: the same pin loads on the verifying posture, and PostgreSQL still loads the
+    weakened shape, since this refusal is SQL Server's alone."""
     pin = _leaf_file(tmp_path)
     assert _ss(ssl_root_cert=pin).ssl_root_cert == pin
     with pytest.raises(ValidationError, match=r"ssl_root_cert requires a verifying SQL Server hop"):

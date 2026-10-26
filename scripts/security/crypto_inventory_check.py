@@ -1527,7 +1527,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
             # validity period, since Encrypt=strict leaves that check to the engine.
             "key_cert:via messagefoundry.pki",
-            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforce_anchor), which
+            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforced_anchor), which
             # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
             "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.trust_anchors",

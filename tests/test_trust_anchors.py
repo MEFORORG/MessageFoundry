@@ -2953,9 +2953,10 @@ def test_the_sqlserver_store_pin_is_a_settings_anchor(tmp_path: Path) -> None:
 
 
 def test_a_postgres_ssl_root_cert_is_not_a_settings_anchor(tmp_path: Path) -> None:
-    """The control for the case above: PostgreSQL reads ``ssl_root_cert`` as a CA bundle the driver
-    validates itself, so the same file there is not collected, and neither is a SQL Server store
-    with no pin. Red under: the backend arm dropped from the store's pin predicate."""
+    """The control for the case above: the same file as a PostgreSQL ``ssl_root_cert`` is not
+    collected, since this check covers the SQL Server pin only (module item 11), and neither is a
+    SQL Server store with no pin. Red under: the backend arm dropped from the store's pin
+    predicate."""
     pin = str(_sqlserver_pin(tmp_path))
     assert _store_specs(backend="postgres", ssl_root_cert=pin) == []
     assert _store_specs(backend="sqlserver") == []
