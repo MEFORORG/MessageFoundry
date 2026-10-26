@@ -2324,15 +2324,17 @@ def _alternating_growth[T](
     ratio divides the same work at two lengths, so a box that runs everything k times slower
     multiplies both endpoints by k, and k cancels."""
     samples = [(sample(short), sample(long)) for _ in range(rounds)]
-    best_short = map(min, *(on_short for on_short, _ in samples))
-    best_long = map(min, *(on_long for _, on_long in samples))
+    best_short = [
+        min(column) for column in zip(*(on_short for on_short, _ in samples), strict=True)
+    ]
+    best_long = [min(column) for column in zip(*(on_long for _, on_long in samples), strict=True)]
     return tuple(lg / sh for sh, lg in zip(best_short, best_long, strict=True))
 
 
 def _access_growth(rounds: int) -> tuple[float, float]:
     """The growth of the emit time and of the loop gap, long target over short, both with the marker.
 
-    Each sample runs on its own running event loop, the way uvicorn's own emit does. A ``logging``
+    Every sample runs on one running event loop, the way uvicorn's own emit does. A ``logging``
     emit is synchronous, so every handler filter runs on the loop thread and nothing else on that loop
     runs until it returns: its duration should BE the stall a waiting coroutine sees, and the loop gap
     of :func:`_emit_beside_ticker` measures that stall directly rather than inferring it. The two
@@ -2342,12 +2344,13 @@ def _access_growth(rounds: int) -> tuple[float, float]:
     is not moved to a CPU-time clock the way some redaction cost arms were; the growth ratio is what
     keeps it sound on a loaded runner, as :func:`_alternating_growth` says.
     """
-    emit_growth, gap_growth = _alternating_growth(
-        lambda target: asyncio.run(_emit_beside_ticker(target)),
-        _request_target(_ACCESS_GROWTH_LENGTHS[0]),
-        _request_target(_ACCESS_GROWTH_LENGTHS[1]),
-        rounds,
-    )
+    with asyncio.Runner() as runner:
+        emit_growth, gap_growth = _alternating_growth(
+            lambda target: runner.run(_emit_beside_ticker(target)),
+            _request_target(_ACCESS_GROWTH_LENGTHS[0]),
+            _request_target(_ACCESS_GROWTH_LENGTHS[1]),
+            rounds,
+        )
     return emit_growth, gap_growth
 
 
@@ -2447,7 +2450,7 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     One measurement covers both halves of the item. The emit runs from its own task on a running
     event loop, beside a ticker task, and returns two readings: how long the emit took, and the
     longest the ticker waited between two wake-ups, which is the loop stall itself. The arm checks
-    that the wait spans the emit, then bounds the wait's GROWTH across lengths, which is the growth
+    that the wait spans the emit, then bounds the GROWTH of both across lengths, which is the growth
     of the stall a client could cause without authenticating, on first deployment. It bounds growth
     and not the stall's size: an absolute budget is a reading about the runner as much as the code,
     and a cost-share arm built that way went red on a hosted Windows runner and was deleted.
@@ -2543,8 +2546,9 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     emit_seconds, gap_seconds = asyncio.run(_emit_beside_ticker(_request_target(longest)))
     assert gap_seconds >= emit_seconds, (
         f"the ticker's longest wait was {gap_seconds * 1e3:.3f} ms, shorter than the "
-        f"{emit_seconds * 1e3:.3f} ms emit, so the ticker ran during the emit. The loop-gap readings "
-        "below are not measuring the stall; check _emit_beside_ticker's ordering."
+        f"{emit_seconds * 1e3:.3f} ms emit. Either the ticker took its first reading after the emit "
+        "began, or the emit no longer runs on the loop thread. Either way the loop-gap readings below "
+        "are not measuring the stall; check _emit_beside_ticker's ordering and where the emit runs."
     )
 
     with monkeypatch.context() as m:
@@ -2554,18 +2558,18 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         # 0.6 s at one. Each endpoint keeps the minimum of three samples, so one slow short emit under
         # load is discarded rather than pulling the reading under the bound and redding a sound harness.
         before_emit, before_gap = _access_growth(rounds=3)
-    # The bound is on the loop gap, the reading the row asks for. The emit time contains no signal
-    # the gap lacks, since the gap spans it, so it rides along in the messages rather than in a
-    # second assertion that would double the chance of a timing red.
-    assert before_gap > _ACCESS_MAX_GROWTH, (
+    # Each gap is its emit plus a few microseconds of loop overhead, so the gap's growth reads a
+    # little LOWER than the emit's. The control therefore needs the lower of the two over the bound,
+    # and the bound holds the higher of the two under it: one assertion each.
+    assert min(before_gap, before_emit) > _ACCESS_MAX_GROWTH, (
         f"with the pre-#1547 pattern swapped in, the access chain's loop gap grew only "
-        f"{before_gap:.1f}x (emit time {before_emit:.1f}x) across {_ACCESS_GROWTH_LENGTHS}, under "
-        f"the {_ACCESS_MAX_GROWTH}x bound. This harness is not exercising the scan, so the assertion "
-        "below cannot fail. Fix the harness, not the bound."
+        f"{before_gap:.1f}x and its emit time {before_emit:.1f}x across {_ACCESS_GROWTH_LENGTHS}, "
+        f"not both over the {_ACCESS_MAX_GROWTH}x bound. This harness is not exercising the scan, so "
+        "the assertion below cannot fail. Fix the harness, not the bound."
     )
 
     emit_growth, gap_growth = _access_growth(rounds=5)
-    assert gap_growth <= _ACCESS_MAX_GROWTH, (
+    assert max(gap_growth, emit_growth) <= _ACCESS_MAX_GROWTH, (
         f"one access record held the event loop {gap_growth:.1f}x longer (emit time "
         f"{emit_growth:.1f}x) for 8x the request-target length, over the {_ACCESS_MAX_GROWTH}x bound; "
         f"the pre-#1547 pattern measured {before_gap:.0f}x in this run. Something in the installed "
@@ -2587,18 +2591,37 @@ def _store_access_log(sink: io.StringIO, target: str, log_dir: Path) -> Path:
 
 
 def _read_back(log_dir: Path) -> list[str]:
-    """One ``GET /logs/tail`` page of ``log_dir``, redaction included."""
-    lines, _, _ = _read_log_tail(str(log_dir), limit=50, offset=0)
+    """One ``GET /logs/tail`` page of ``log_dir``, redaction included. ``_read_log_tail`` never
+    raises and answers an unreadable file with an empty page, so that is refused here rather than
+    read as a log with nothing in it."""
+    lines, _, available = _read_log_tail(str(log_dir), limit=50, offset=0)
+    assert available and lines, f"the log read-back of {log_dir.name} came back empty"
     return lines
 
 
 def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
-    """Read-back time of ``long_dir`` over that of ``short_dir``, as :func:`_alternating_growth`
-    takes it."""
+    """Redaction time of the stored ``long_dir`` log over that of ``short_dir``, as
+    :func:`_alternating_growth` takes it.
+
+    Each file is read and split once, OUTSIDE the clock, and each sample times
+    ``redact_log_record`` over its lines, which is the whole of what ``_read_log_tail`` does per line.
+    The directory walk, the stat and the file read are a near-constant cost added to both endpoints,
+    and an added constant does not cancel in a ratio: timed with them, the read-back read about 6x
+    where the redaction alone read about 9x on a dev box, so a super-linear pass would have needed
+    to grow far past the bound before this arm saw it. The count arm in the test proves
+    ``_read_log_tail`` reaches the twin on the same stored line."""
+    stored = {
+        log_dir: support_redact.split_log_lines(
+            (log_dir / "engine.log").read_text(encoding="utf-8", errors="replace")
+        )
+        for log_dir in (short_dir, long_dir)
+    }
 
     def timed(log_dir: Path) -> tuple[float]:
+        lines = stored[log_dir]
         start = time.perf_counter()
-        _read_back(log_dir)
+        for line in lines:
+            support_redact.redact_log_record(line)
         return (time.perf_counter() - start,)
 
     (growth,) = _alternating_growth(timed, short_dir, long_dir, rounds)
@@ -2610,17 +2633,21 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
 ) -> None:
     """BACKLOG #1547's ``support/redact.py`` twin, driven end to end through the log read-back path.
 
-    No logging handler applies the twin. ``redact_log_line`` applies it when stored log text is read
-    back: ``GET /logs/tail`` through ``api.app._read_log_tail``, and the support bundle through
-    ``support.bundle._log_tail``, both one ``redact_log_record`` per line. So the hostile target is
-    emitted through the chain production installs, exactly as the arm above does, the stdout it
-    produced is stored as the newest log file, and ``_read_log_tail`` reads it back. Since BACKLOG
-    #2694 that read runs BOTH patterns: the twin first, then ``secretscrub.scrub_credentials`` as a
-    second layer, and this arm times the two together, as the reader runs them.
+    No logging handler applies the twin. ``redact_log_line`` applies it to text that has left the
+    write-time chain, at least when stored log text is read back (``GET /logs/tail`` through
+    ``api.app._read_log_tail``, and the support bundle through ``support.bundle._log_tail``, both one
+    ``redact_log_record`` per line) and to store exception text. The read-back is the path an access
+    line takes, so the hostile target is emitted through the chain production installs, exactly as
+    the arm above does, the stdout it produced is stored as the newest log file, and
+    ``_read_log_tail`` reads it back. Since BACKLOG #2694 that read runs BOTH patterns: the twin
+    first, then ``secretscrub.scrub_credentials`` as a second layer, and this arm times the two
+    together, as the reader runs them. :func:`_read_back_growth` says why the clock covers the
+    per-line redaction and not the file read.
 
-    The read runs in a worker thread, off the event loop (the route hands it to
-    ``asyncio.to_thread``), so this arm bounds the cost a client can make one request's worker pay,
-    not a loop stall. Like the arm above, it bounds GROWTH across the same two lengths.
+    The cost is planted by an unauthenticated request and paid when an authenticated reader pulls
+    the log. The route hands the read to ``asyncio.to_thread``, but a regex scan holds the GIL for
+    its whole run, so on the default build a super-linear read-back would stall the event loop too,
+    not only a worker. Like the arm above, this one bounds GROWTH across the same two lengths.
 
     THE POSITIVE CONTROL swaps the pre-#1547 pattern into ``support.redact._DSN_PASSWORD`` ONLY. The
     fixed ``secretscrub`` copy still runs as the second layer, so the swap isolates the twin, and the
