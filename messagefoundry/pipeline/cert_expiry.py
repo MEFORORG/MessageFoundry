@@ -590,10 +590,11 @@ def held_crl_label(path: str) -> str:
 
 
 def _ca_file_crl_refusal(
-    pem: bytes, now: float, file_facts: CrlFacts | None
+    pem: bytes, now: float, file_facts: CrlFacts | None, *, ca_file_only: bool
 ) -> tuple[str, str] | None:
-    """Why a restart into this CA file would refuse peers, as ``(why, remedy)``, or ``None`` when
-    its CRLs pass the checks below, or it holds none (BACKLOG #3176).
+    """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy)``, or
+    ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
+    signature the engine could not confirm (BACKLOG #3512).
 
     Nothing judges a CA file's CRL at start, so a restart loads it whatever it is. The checks are a
     CRL setting's start rules (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
@@ -601,7 +602,9 @@ def _ca_file_crl_refusal(
     loading exactly the CRLs judged, then the signature check a start and the reload make
     (:func:`~messagefoundry.pki.judge_crl_signatures`): each CRL signed by the CA OpenSSL loads
     from this file for its issuer. Only a signature proven bad says handshakes fail;
-    one the engine could not confirm asks for a check (BACKLOG #3512). A CRL
+    one the engine could not confirm asks for a check (BACKLOG #3512). That check is followed by a
+    restart only where ``ca_file_only``: where a hop also loads the file as its CRL setting, the
+    reload judges it first, and a start can refuse it there. A CRL
     whose issuer this file does not hold is not refused: the issuer can be an intermediate the peer
     sends, which the reload treats the same way. ``file_facts`` is the lenient reading, which tells
     an expired CRL from one that cannot be judged. Each remedy leads, because the alert instance
@@ -671,11 +674,17 @@ def _ca_file_crl_refusal(
     if states & {"unproven", "uncheckable"}:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
         # So the remedy asks for a check and claims no failure.
+        unconfirmed = (
+            "the engine could not confirm its signature with the CA the file lists for its issuer"
+        )
+        check = "Check that the CRL in the CA file is one its CA signed"
         return (
             "whose CA file now holds a CRL whose signature the engine could not confirm",
-            "Check that the CRL in the CA file is one its CA signed, then restart the engine to "
-            "apply the CA file: the engine could not confirm its signature with the CA the file "
-            "lists for its issuer",
+            # Only a restart applies a CA file. Where a CRL setting names the file too, the
+            # restart waits for the reload's verdict, as #3176 orders it (BACKLOG #3512).
+            f"{check}, then restart the engine to apply the CA file: {unconfirmed}"
+            if ca_file_only
+            else f"{check} before restarting: {unconfirmed}",
         )
     return None
 
@@ -741,14 +750,20 @@ def _judge_crl(
                     f"Restore a readable {what} before restarting: the engine refuses to "
                     "start on one it cannot read",
                 )
-            elif some_bundle and (unsafe := _ca_file_crl_refusal(pem, now, file_facts)) is not None:
+            elif (
+                some_bundle
+                and (unsafe := _ca_file_crl_refusal(pem, now, file_facts, ca_file_only=bundle_only))
+                is not None
+            ):
                 # BACKLOG #3176: nothing judges a CA file's CRL at start, so a restart would load
-                # this one and refuse peers under its issuer. Fix it first.
+                # this one, which refuses peers under its issuer or, unconfirmed, might (#3512).
+                # Fix or check it first.
                 why, remedy = unsafe
                 if refused is not None:
-                    # BACKLOG #3512: the CA-file fix still leads, since a refusal's remedy can be a
-                    # restart, but the reload's own remedy is kept after it. Not its reason, which
-                    # quotes CRL issuers and dates: the reload's ERROR line holds that (#2904).
+                    # BACKLOG #3512: the CA-file step leads and orders no restart here, since the
+                    # file is a CRL setting too. The reload's own remedy follows, so it alone says
+                    # whether to fix, wait or restart. Not its reason, which quotes CRL issuers
+                    # and dates: the reload's ERROR line holds that (#2904).
                     remedy += (
                         ". Do that first. The reload also refused the file for a hop that loaded "
                         f"it as its CRL setting: {refused.remedy}"

@@ -50,6 +50,7 @@ from messagefoundry.config.tls_policy import (
     build_verifying_client_context,
 )
 from messagefoundry.logging_setup import SyslogForward, _build_tls_context
+from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import HELD_COPY_NOTE, LoggingAlertSink, crl_expiry_detail
 from messagefoundry.pipeline.cert_expiry import (
@@ -859,6 +860,62 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     assert ". Do that first. The reload also refused the file for a hop that loaded it" in detail
     assert f": {remedy}. Held by: " in detail
     assert reason not in detail
+
+
+@pytest.mark.parametrize(
+    "remedy",
+    [
+        None,
+        crl_reload.FIX,
+        crl_reload.WAIT,
+        crl_reload.LAPSES_FIRST,
+        crl_reload.RESTART,
+        crl_reload.BAD_SIGNATURE,
+        crl_reload.NO_ISSUER,
+        crl_reload.RETRY,
+    ],
+    ids=[
+        "no-refusal",
+        "fix",
+        "wait",
+        "lapses-first",
+        "restart",
+        "bad-signature",
+        "no-issuer",
+        "retry",
+    ],
+)
+def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_orders_no_restart_first(
+    ca: _Ca, tmp_path: Path, remedy: str | None
+) -> None:
+    # BACKLOG #3512: hop A loads the file as its CRL setting and hop B as its CA file, and the new
+    # CRL's signature is unconfirmed (no key identifier, another key). A restart before the reload
+    # has judged the file can stop the engine, since a start judges hop A's CRL setting. So the
+    # CA-file step orders no restart, and a refused reload's own remedy alone says whether to fix,
+    # wait or restart, once. Before the fix the lead said "then restart the engine".
+    hops, both = _shared_as_crl_and_ca_file(
+        ca, tmp_path, ca.crl(days=80, number=3, key=_another_ca().key)
+    )
+    if remedy is not None:
+        fp = crl_fingerprint(both.read_bytes())
+        record_reload_refusal(both, ReloadRefusal(fp, "synthetic reason", remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert detail.startswith(
+        "Check that the CRL in the CA file is one its CA signed before restarting: "
+    ), detail
+    lead, _, rest = detail.partition(" The reload also refused the file")
+    assert "restart the engine" not in lead.lower(), detail
+    if remedy is None:
+        assert not rest, detail
+    else:
+        assert f": {remedy}. Held by: " in rest, detail
+    expected = 0 if remedy is None else remedy.lower().count("restart the engine")
+    assert detail.lower().count("restart the engine") == expected, detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
@@ -892,6 +949,8 @@ def test_a_failure_grouping_the_crl_rows_costs_only_the_shared_rows_note(
     assert sink.crl_notes == [(False, "", ())]
     errors = [r for r in caplog.records if "could not group the CRL rows" in r.getMessage()]
     assert len(errors) == 1
+    # Its own failure, not a TypeError from a stub that took the wrong arguments (BACKLOG #3512).
+    assert errors[0].exc_info is not None and errors[0].exc_info[0] is RuntimeError
 
 
 def test_a_failure_keying_a_crl_path_costs_only_the_shared_rows_note(
