@@ -2,16 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The lane tooling carries no item ceiling (owner ruling 2026-10-26).
 
-``scripts/coord/lane.ps1`` defaulted ``-Capacity`` to 4 and wrote it into every lane record, and
-``scripts/hooks/lane-level.ps1`` read a lane stating no free items as AT CAPACITY. The owner retired
-the four-item lane ceiling, the start-throttle by burn, and any WIP limit on briefing: Builders and
-Managers work at full speed, and usage is governed only by the Steward's holds and the korus
-Workflow gate.
+The ruling is stated once, in the header of ``scripts/coord/lane.ps1``. That script defaulted
+``-Capacity`` to 4 and wrote it into every lane record, and ``scripts/hooks/lane-level.ps1`` read a
+lane stating no free items as AT CAPACITY.
 
 These tests fail if a default cap of 4 comes back in either script:
 
-1. a statement records no ``capacity`` and prints no ceiling, and one carried on an old record is
-   dropped on the next write;
+1. a statement records ``capacity`` as null, with no upper bound on its counts, and prints no
+   ceiling; a 4 carried on an old record is replaced with null on the next write. The key stays,
+   because an older lane.ps1 on another branch assigns it and throws under StrictMode without it;
 2. ``-Capacity`` is not a parameter any more, so a caller cannot reintroduce a cap by passing one;
 3. the dispatcher arm of the hook reports a lane that states 0 free and 4 in flight, on a record
    still naming capacity 4, with its counts and with no capacity verdict. Against the scripts before
@@ -94,17 +93,26 @@ def _lane_record(repo: Path) -> Path:
 
 def test_a_statement_records_no_capacity_and_prints_no_ceiling(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path / "repo")
-    proc = _ps(LANE, repo, "-Free", "0", "-InFlight", "9", "-Note", "n")
+    # 150 is past the old ValidateRange(0, 99) on both counts: no upper bound may come back either.
+    proc = _ps(LANE, repo, "-Free", "150", "-InFlight", "150", "-Note", "n")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rec = json.loads(_lane_record(repo).read_text(encoding="utf-8"))
-    assert "capacity" not in rec, rec
-    # The control: the statement itself was recorded, nine in flight and all.
-    assert rec["statedFree"] == 0 and rec["statedInFlight"] == 9, rec
-    assert "0 free / 9 in flight," in proc.stdout, proc.stdout
+    assert "capacity" in rec and rec["capacity"] is None, rec
+    # The control: the statement itself was recorded, counts and all.
+    assert rec["statedFree"] == 150 and rec["statedInFlight"] == 150, rec
+    assert "150 free / 150 in flight," in proc.stdout, proc.stdout
     assert " of " not in proc.stdout.split("stated")[0], proc.stdout
 
 
-def test_a_capacity_left_on_an_old_record_is_dropped_on_the_next_write(tmp_path: Path) -> None:
+def test_a_negative_count_is_still_refused(tmp_path: Path) -> None:
+    """The control for the unbounded range: the lower bound still holds."""
+    repo = _git_repo(tmp_path / "repo")
+    proc = _ps(LANE, repo, "-Free", "-1", "-InFlight", "0")
+    assert proc.returncode != 0, proc.stdout
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists(), "a refused call wrote a lane"
+
+
+def test_a_capacity_left_on_an_old_record_is_nulled_on_the_next_write(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path / "repo")
     assert _ps(LANE, repo, "-Free", "1", "-InFlight", "1").returncode == 0
     record = _lane_record(repo)
@@ -120,7 +128,8 @@ def test_a_capacity_left_on_an_old_record_is_dropped_on_the_next_write(tmp_path:
         record.write_text(json.dumps(old), encoding="utf-8")
         proc = _ps(LANE, repo, *args)
         assert proc.returncode == 0, (args, proc.stdout + proc.stderr)
-        assert "capacity" not in json.loads(record.read_text(encoding="utf-8")), args
+        new = json.loads(record.read_text(encoding="utf-8"))
+        assert "capacity" in new and new["capacity"] is None, (args, new)
 
 
 def test_capacity_is_no_longer_a_parameter(tmp_path: Path) -> None:

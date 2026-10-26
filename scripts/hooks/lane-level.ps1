@@ -6,12 +6,11 @@
     it reports each lane's stated counts, and it never calls a lane full.
 
 .DESCRIPTION
-    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). This hook used to call a lane AT CAPACITY
-    when it stated no free items, against a four-item ceiling, and went quiet when both lanes said
-    so. The ceiling, the start-throttle by burn and any WIP limit on briefing are retired: Builders
-    and Managers work at full speed, and usage is governed only by the Steward's holds and the korus
-    Workflow gate. So no count this hook reads ever becomes a verdict that a lane is full or that
-    briefing should stop, and it adds no usage throttle of its own.
+    THERE IS NO ITEM CEILING. The owner ruling of 2026-10-26 is stated once, in the header of
+    scripts/coord/lane.ps1. This hook used to call a lane AT CAPACITY when it stated no free items,
+    against a four-item ceiling, and went quiet when both lanes said so. Now no count it reads
+    becomes a verdict that a lane is full or that briefing should stop, and it adds no usage
+    throttle of its own. The one count-driven word left is IDLE, for a lane with nothing in flight.
 
     EVERY NUMBER IS A LANE'S OWN QUOTE. A missing file, an unreadable file, a stale number, a
     superseded number, a roster shortfall -- each is said aloud, never turned into a count.
@@ -84,9 +83,9 @@ function Test-Has($rec, [string]$name) {
 }
 
 function Get-LaneVerdict($rec, [string]$boxKey) {
-    # One state word and one confidence word, or a single non-answer word. STATED is the only state
-    # a readable level gets, whatever its numbers: no count makes a lane full. A `capacity` field on
-    # an old record is not read, for the same reason.
+    # One state word and one confidence word, or a single non-answer word. A readable level is IDLE
+    # when nothing is in flight and STATED otherwise, whatever its numbers: no count makes a lane
+    # full. A `capacity` field on an old record is not read, for the same reason.
     $o = [ordered]@{ box = $boxKey; occ = ''; conf = ''; free = $null; inflight = $null
                      ageMin = $null; turns = $null; note = '' }
 
@@ -109,7 +108,7 @@ function Get-LaneVerdict($rec, [string]$boxKey) {
 
     $o.free = [int]$free
     $o.inflight = [int]$inf
-    $o.occ = 'STATED'
+    $o.occ = if ($o.inflight -eq 0) { 'IDLE' } else { 'STATED' }
 
     $tipMoved = (Test-Has $rec 'tipNow') -and (Test-Has $rec 'tipAtStated') -and
                 $rec.tipNow -and $rec.tipAtStated -and ($rec.tipNow -ne $rec.tipAtStated)
@@ -164,8 +163,11 @@ if ($SelfTest) {
     $v = Get-LaneVerdict (New-Rec 2 $null 'x' 'x' 0) 'b7'
     if ($v.occ -ne 'UNREADABLE') { $fail += "a level with no in-flight count must be UNREADABLE, got $($v.occ)" }
 
+    $v = Get-LaneVerdict (New-Rec 0 0 'x' 'x' 0) 'b8'
+    if ($v.occ -ne 'IDLE') { $fail += "0 in flight must be IDLE, got $($v.occ)" }
+
     if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; exit 1 }
-    Write-Host 'lane-level self-test: 7 cases pass, and none of them can read a lane as full.'
+    Write-Host 'lane-level self-test: 8 cases pass, and none of them can read a lane as full.'
     exit 0
 }
 
@@ -248,7 +250,8 @@ if ($leaf -match '^builder') {
         Say '[lane] Your lane level is unstated or stale. State it now, it takes five seconds:'
         Say '  pwsh -NoProfile -File scripts\coord\lane.ps1 -Free <n> -InFlight <n> -Note "<what is moving>"'
         Say '  FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE.'
-        Say '  Parked on a condition is FREE. Nobody else can write this number for you.'
+        Say '  Parked on a condition is FREE. There is no item ceiling, so count no empty slots.'
+        Say '  Nobody else can write this number for you.'
     }
     Emit
 }
@@ -378,8 +381,10 @@ foreach ($v in ($verdicts | Sort-Object box)) {
         Say ('  {0,-28} {1,-20} cannot say this lane is alive. An unevaluated fence is not a' -f '', '')
         Say ('  {0,-28} {1,-20} passed one, and any level above may be from a session that is gone.' -f '', '') }
 }
-Say "  coverage: $discovered lanes discovered, $EXPECTED_LANES expected, $unknownLive with liveness unknown."
-if ($discovered -ne $EXPECTED_LANES) {
+Say "  coverage: $discovered lanes discovered, at least $EXPECTED_LANES expected, $unknownLive with liveness unknown."
+# A FLOOR, NOT A CAP. A shortfall is what a lane invisible to discovery looks like. More lanes than
+# that is ordinary at full speed and says nothing about a missing one.
+if ($discovered -lt $EXPECTED_LANES) {
     Say '  ROSTER DRIFT: a lane with every hook off writes no seat record and no level, so it is'
     Say "  invisible to discovery too. Do not read '$discovered of $discovered' as healthy."
 }

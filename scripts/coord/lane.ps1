@@ -10,11 +10,13 @@
     Nothing else in the fleet may write those numbers -- not a Manager, not a hook, not an inference
     from claims.
 
-    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). The four-item lane ceiling, and the
-    -Capacity parameter that defaulted to it, are retired: Builders and Managers work at full speed,
-    and usage is governed only by the Steward's holds and the korus Workflow gate. Nothing this
-    script records is a cap, a slot count or a reason to stop briefing or building. Do not add a
-    capacity back, and do not add a usage throttle here; usage is the Steward's.
+    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). This is the one place the tooling states
+    it; lane-level.ps1 and tests/test_coord_lane_no_ceiling.py point here. The four-item lane
+    ceiling, the start-throttle by burn, any WIP limit on briefing, and the -Capacity parameter
+    that defaulted to 4 are retired. Builders and Managers work at full speed; usage is governed by
+    the Steward's holds and the korus Workflow gate, never by this script. Nothing it records is a
+    cap, a slot count or a reason to stop briefing or building. Do not add a capacity back, and do
+    not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
     derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
@@ -25,7 +27,8 @@
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
     condition is FREE. A claim you are not currently able to progress is FREE work wearing an
     occupied label, and that mislabelling is the outage. With no ceiling there are no empty slots,
-    so -Free counts exactly those held items and nothing else.
+    so -Free counts those held items and nothing else. A level stated before 2026-10-26 may also
+    count empty slots under the retired ceiling; the hook asks for a fresh level within 15 minutes.
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
@@ -33,8 +36,9 @@ param(
     # set without both, and a Mandatory prompt there hangs a caller with stdin open
     # (tests/_no_prompt.py, vault BACKLOG #3627). The refusal follows this param block, after the
     # cloud refusal.
-    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$Free,
-    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$InFlight,
+    # Non-negative and unbounded above: an upper bound here would be a ceiling by another name.
+    [Parameter(ParameterSetName = 'State')][ValidateRange('NonNegative')][int]$Free,
+    [Parameter(ParameterSetName = 'State')][ValidateRange('NonNegative')][int]$InFlight,
     [Parameter(ParameterSetName = 'State')][string]$Note = '',
     # Stamp that a dispatcher asked. Carries NO number.
     [Parameter(ParameterSetName = 'Asked', Mandatory)][switch]$Asked,
@@ -148,7 +152,7 @@ if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
-        v = 1; boxKey = $boxKey; worktree = $worktree
+        v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $null
         statedFree = $null; statedInFlight = $null; statedUtc = $null
         statedBySessionId = $null; statedNote = ''
         tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -183,7 +187,7 @@ if ($Show) {
         # between the two reads would print a stated level beside an `absent` reason. The fields
         # match the blank record above; fold the two together once that read keeps its reason.
         $shown = [pscustomobject]@{
-            v = 1; boxKey = $boxKey; worktree = $worktree
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $null
             statedFree = $null; statedInFlight = $null; statedUtc = $null
             statedBySessionId = $null; statedNote = ''
             tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -245,9 +249,13 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
-# A record written before the ceiling was retired carries `capacity`, 4 by default. Drop it on the
-# next write, so no stored lane level still names a cap for a reader to apply.
-$rec.PSObject.Properties.Remove('capacity')
+# `capacity` IS WRITTEN AS NULL, NEVER DROPPED. An older lane.ps1, run from another worktree's branch,
+# assigns $rec.capacity on every statement, and under StrictMode that throws when the property is
+# missing, so that lane could not restate. Null is a value that names no cap; a record written before
+# the ceiling was retired holds 4 there until this next write replaces it. This branch's
+# lane-level.ps1 reads none of it. An older copy of that hook falls back to 4 whatever this field
+# holds, so only replacing that reader retires the ceiling there.
+$rec | Add-Member -NotePropertyName capacity -NotePropertyValue $null -Force
 # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
 $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
