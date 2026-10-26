@@ -51,7 +51,7 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -79,7 +79,7 @@ MIRRORED_CONNECTION_SETTING = "connection_name"
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from messagefoundry.pki import CrlBlock, CrlFacts
+    from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -800,9 +800,9 @@ def crl_not_in_effect(
     """The CRL that decides when every issuer in ``blocks`` has one in effect, or ``None`` when each
     does at ``now``. For each issuer with none in effect, its earliest CRL counts; of those, the
     latest decides, since the file is whole only once that one takes effect. An issuer is its
-    ``issuer_key``, as OpenSSL compares names (vault BACKLOG #3755)."""
+    ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`, vault BACKLOG #3755)."""
     in_effect = {block.issuer_key for block in blocks if crl_in_effect(block, now=now, skew=skew)}
-    earliest: dict[Hashable, CrlBlock] = {}
+    earliest: dict[CrlIssuerKey, CrlBlock] = {}
     for block in blocks:
         key = block.issuer_key
         if key in in_effect:

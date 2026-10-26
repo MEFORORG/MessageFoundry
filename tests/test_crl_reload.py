@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import functools
 import gc
 import logging
 import re
@@ -40,6 +39,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.types import CertificateIssuerPrivateKeyTypes
+from cryptography.x509.name import _ASN1Type
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config import loaded_crls
@@ -496,13 +496,14 @@ def test_a_refusal_clears_once_the_file_is_fixed(pki: _Pki) -> None:
 # --- the superseding rule, alone --------------------------------------------------------------------
 
 
-@functools.cache
-def _judged(issuer: str) -> CrlBlock:
+def _judged(issuer: x509.Name) -> CrlBlock:
     """The block :func:`judge_every_crl` makes of a CRL from ``issuer`` with no extensions, so a
-    test block groups by the issuer key the engine computes, not one this file guesses."""
+    test block groups by the issuer key the engine computes, not one this file guesses. Not
+    cached: ``x509.Name`` equality ignores the string type, so a cache would hand a NumericString
+    name the block of a UTF8String one."""
     crl = (
         x509.CertificateRevocationListBuilder()
-        .issuer_name(x509.Name.from_rfc4514_string(issuer))
+        .issuer_name(issuer)
         .last_update(_NOW - _DAY)
         .next_update(_NOW + _DAY)
         .sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
@@ -511,9 +512,12 @@ def _judged(issuer: str) -> CrlBlock:
     return block
 
 
-def _block(issuer: str, issued_days_ago: float, lasts_days: float, tag: bytes) -> CrlBlock:
+def _block(
+    issuer: str | x509.Name, issued_days_ago: float, lasts_days: float, tag: bytes
+) -> CrlBlock:
+    name = x509.Name.from_rfc4514_string(issuer) if isinstance(issuer, str) else issuer
     return replace(
-        _judged(issuer),
+        _judged(name),
         this_update=_NOW - issued_days_ago * _DAY,
         next_update=_NOW + lasts_days * _DAY,
         fingerprint=tag,
@@ -544,19 +548,43 @@ def test_the_superseding_rule() -> None:
     assert late is not None and late[1] == LAPSES_FIRST
 
 
+def _cn(value: str, kind: _ASN1Type) -> x509.Name:
+    """A name of one common name, in the ASN.1 string type ``kind``."""
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, value, kind)])
+
+
 # Vault BACKLOG #3755. OpenSSL takes two issuer names that differ only in the case of ASCII letters
-# for one issuer, and no other case change (``_issuer_name_key`` in ``pki.py`` says why).
+# in a text type for one issuer, and no other case change (``_crl_issuer_key`` in ``pki.py`` says
+# why). The handshake test below measures OpenSSL on the same kinds of change.
 _ASCII_CASE = ("CN=Partner CA", "CN=PARTNER CA")
 _ISSUER_PAIRS = [
     pytest.param(*_ASCII_CASE, True, id="ascii-case"),
+    pytest.param(
+        _cn("Partner CA", _ASN1Type.UTF8String),
+        _cn("PARTNER CA", _ASN1Type.PrintableString),
+        True,
+        id="text-types-and-ascii-case",
+    ),
     pytest.param("CN=\u00e9tude CA", "CN=\u00c9tude CA", False, id="non-ascii-case"),
+    pytest.param(
+        _cn("1234 ab", _ASN1Type.NumericString),
+        _cn("1234 AB", _ASN1Type.NumericString),
+        False,
+        id="numeric-string-case",
+    ),
+    pytest.param(
+        _cn("1234", _ASN1Type.UTF8String),
+        _cn("1234", _ASN1Type.NumericString),
+        False,
+        id="text-and-numeric-string",
+    ),
     pytest.param("CN=Partner CA", "CN=Partner CB", False, id="other-name"),
 ]
 
 
 @pytest.mark.parametrize(("held", "issuer", "same"), _ISSUER_PAIRS)
 def test_a_replacement_supersedes_only_from_the_same_issuer(
-    held: str, issuer: str, same: bool
+    held: str | x509.Name, issuer: str | x509.Name, same: bool
 ) -> None:
     now = _NOW.timestamp()
     verdict = supersede_refusal(
@@ -568,7 +596,7 @@ def test_a_replacement_supersedes_only_from_the_same_issuer(
 
 @pytest.mark.parametrize(("current", "future", "same"), _ISSUER_PAIRS)
 def test_a_current_crl_covers_a_future_one_only_from_the_same_issuer(
-    current: str, future: str, same: bool
+    current: str | x509.Name, future: str | x509.Name, same: bool
 ) -> None:
     now = _NOW.timestamp()
     later = _block(future, -1, 30, b"later")
@@ -756,19 +784,68 @@ def test_control_a_start_refuses_a_future_crl_beside_one_from_another_name(pki: 
         pki.outbound_hop()
 
 
-def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(pki: _Pki) -> None:
-    """Vault BACKLOG #3755: the replacement supersedes, with no restart, and the SAME context then
-    refuses the revoked peer, so OpenSSL took it for the held CRL's issuer too. Red before the fix,
-    which refused it RESTART."""
+def _upper_cn(pki: _Pki, kind: _ASN1Type) -> x509.Name:
+    """The CA's own name, upper-cased, in the ASN.1 string type ``kind``."""
+    (cn,) = _in_other_case(pki).get_attributes_for_oid(NameOID.COMMON_NAME)
+    assert isinstance(cn.value, str)
+    return _cn(cn.value, kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "same"),
+    [
+        (_ASN1Type.UTF8String, True),
+        (_ASN1Type.PrintableString, True),
+        (_ASN1Type.NumericString, False),
+    ],
+    ids=["utf8", "printable", "numeric"],
+)
+def test_openssl_takes_an_ascii_case_change_for_the_same_issuer_only_in_a_text_type(
+    pki: _Pki, kind: _ASN1Type, same: bool
+) -> None:
+    """What ``_crl_issuer_key`` models, measured. A context holds the CA and one CRL, from the
+    CA's name upper-cased in ``kind``, that revokes the server. OpenSSL refuses the server as
+    revoked only when it takes that CRL for the CA's; otherwise it finds no CRL for the CA. The
+    engine's key must agree, which also pins the private ``cryptography`` attribute it reads."""
+    issuer = _upper_cn(pki, kind)
+    crl = pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=issuer)
+    probe = pki.crl.with_name("probe-crl.pem")
+    probe.write_bytes(crl)
+    hop = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    hop.load_verify_locations(cadata=pki.ca_pem.decode("ascii"))
+    hop.load_verify_locations(cafile=str(probe))  # cadata takes certificates only
+    hop.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    with pytest.raises(ssl.SSLError) as refused:
+        _handshake(hop, pki.server())
+    assert ("revoked" if same else "unable to get certificate CRL") in str(refused.value)
+    assert (_block(issuer, 1, 1, b"").issuer_key == _block(pki.name, 1, 1, b"").issuer_key) is same
+
+
+@pytest.mark.parametrize(
+    ("kind", "applies"),
+    [(_ASN1Type.UTF8String, True), (_ASN1Type.NumericString, False)],
+    ids=["utf8", "numeric"],
+)
+def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
+    pki: _Pki, kind: _ASN1Type, applies: bool
+) -> None:
+    """Vault BACKLOG #3755: in a text type the replacement supersedes, with no restart, and the
+    SAME context then refuses the revoked peer, so OpenSSL took it for the held CRL's issuer too.
+    Red before the fix, which refused it RESTART. In a NumericString OpenSSL keeps the issuers
+    apart, so it is refused and the hop keeps checking the CRL it holds."""
     hop = pki.outbound_hop()
-    pki.crl.write_bytes(
-        pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=_in_other_case(pki))
-    )
+    issuer = _upper_cn(pki, kind)
+    pki.crl.write_bytes(pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, issuer=issuer))
 
     outcome = _reload(pki)
 
-    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None), outcome
-    assert not _accepts(hop, pki.server())
+    assert outcome is not None, outcome
+    if applies:
+        assert (outcome.reloaded, outcome.refusal) == (1, None), outcome
+    else:
+        assert outcome.reloaded == 0 and outcome.refusal is not None, outcome
+        assert outcome.refusal.remedy == RESTART, outcome
+    assert _accepts(hop, pki.server()) is not applies
 
 
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(

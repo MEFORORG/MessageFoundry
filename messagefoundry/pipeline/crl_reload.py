@@ -105,7 +105,7 @@ import os
 import ssl
 import threading
 import time
-from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
@@ -134,7 +134,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
-from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
+from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
@@ -300,8 +300,10 @@ def _first_lapse(held: Sequence[CrlBlock]) -> CrlBlock | None:
     uses the latest ``thisUpdate``. So each such group lapses with its latest CRL. An older CRL in
     the group that lapses sooner changes nothing, and one that lapses later would only stand in
     without the newer revocations. The soonest of those latest CRLs decides. An issuer is its
-    ``issuer_key``, as OpenSSL compares names (vault BACKLOG #3755)."""
-    latest: dict[tuple[Hashable, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock] = {}
+    ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`, vault BACKLOG #3755)."""
+    latest: dict[
+        tuple[CrlIssuerKey, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock
+    ] = {}
     for block in held:
         group = (block.issuer_key, block.selection)
         if group not in latest or block.this_update > latest[group].this_update:
@@ -360,7 +362,7 @@ def supersede_refusal(
 
 def _successors(old: CrlBlock, new: Sequence[CrlBlock]) -> list[CrlBlock]:
     """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect. The issuers
-    match by ``issuer_key``, so a change of ASCII letter case alone still supersedes."""
+    match by ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`)."""
     return [
         block
         for block in new
