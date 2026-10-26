@@ -356,6 +356,28 @@ async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
     assert len(sent) == 2 and sent[1].endswith("SSLError B")
 
 
+async def test_a_cancelled_flush_does_not_cancel_a_report_in_flight() -> None:
+    """A report in flight is already marked as sent. Cancelling the stop() that waits on it in
+    ``flush`` must not cancel it too, or it is lost for good (vault BACKLOG #3785)."""
+    finished: list[str] = []
+    gate = asyncio.Event()
+
+    async def emit(_peer_host: str | None, reason: str) -> None:
+        await gate.wait()
+        finished.append(reason)
+
+    failures = HandshakeFailures(emit)
+    failures.note_soon(None, "SSLError")  # due now: a report in flight, parked on the gate
+    failures.close()
+    flushing = asyncio.ensure_future(failures.flush())
+    await asyncio.sleep(0)  # the flush is in its wait
+    flushing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flushing
+    gate.set()
+    await _until(lambda: len(finished) == 1, "the report in flight was cancelled with the flush")
+
+
 async def test_a_failure_held_across_an_unflushed_stop_is_reported_after_the_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

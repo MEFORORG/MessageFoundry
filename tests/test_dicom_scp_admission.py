@@ -695,6 +695,39 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
         await scp.stop()
 
 
+async def test_a_failing_shutdown_still_clears_the_server_and_logs_what_was_held(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the pynetdicom shutdown raises, stop() still drops the server and logs the failure the
+    trailing line held, rather than skipping both (vault BACKLOG #3784)."""
+    captured: list[bytes] = []
+    scp = _build_scp(captured, **_tls_settings(tmp_path))
+
+    async def handler(data: bytes) -> str | None:
+        captured.append(data)
+        return "mid-1"
+
+    with caplog.at_level(logging.DEBUG, logger=_LOG):
+        await scp.start(handler)
+        server = scp._server
+        assert server is not None
+        real_shutdown = server.shutdown
+
+        def shutdown_then_fail() -> None:
+            real_shutdown()  # the threads are joined, so nothing leaks past the test
+            raise RuntimeError("synthetic shutdown fault")
+
+        server.shutdown = shutdown_then_fail
+        await _plaintext_peer(scp.sockport)
+        await _plaintext_peer(scp.sockport)  # inside the window: held
+        await _until(lambda: scp.tls_handshake_failures == 2)
+        assert len(_handshake_lines(caplog)) == 1
+        with pytest.raises(RuntimeError, match="synthetic"):
+            await scp.stop()
+    assert scp._server is None
+    assert len(_handshake_lines(caplog)) == 2
+
+
 async def test_the_scp_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
     """The SCP counts what the MLLP listener counts when it runs its own handshake: a peer that
     sends close_notify after its ClientHello is counted. A bare connect and close, the health

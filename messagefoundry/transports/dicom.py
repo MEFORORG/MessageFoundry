@@ -1252,12 +1252,16 @@ class DicomScpSource(SourceConnector):
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
         # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
         server = self._server
-        if server is not None:
-            await asyncio.to_thread(server.shutdown)
+        try:
+            if server is not None:
+                await asyncio.to_thread(server.shutdown)
+        finally:
+            # Even when the shutdown raises or is cancelled: drop the server, so a later stop()
+            # does not shut it down again, and report the handshake failures the trailing line
+            # still held (vault BACKLOG #3784).
             self._server = None
-        self._ae = None
-        # Report the handshake failures the trailing line still held (vault BACKLOG #3784).
-        await self._tls_failures.flush()
+            self._ae = None
+            await self._tls_failures.flush()
 
 
 def _client_ssl_context(

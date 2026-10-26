@@ -288,7 +288,7 @@ class HandshakeFailures:
 
     async def flush(self) -> None:
         """At the end of a listener's stop(), after :meth:`close`: wait for any report in flight,
-        then send what the trailing timer still held. The emitters are fail-soft, so this cannot
+        without cancelling it if stop() is cancelled, then send what the trailing timer still held. The emitters are fail-soft, so this cannot
         fail a stop().
 
         It does nothing once :meth:`open` has run again, since the failures from then on are the
@@ -304,7 +304,9 @@ class HandshakeFailures:
         if not self._closed:
             return
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # asyncio.wait, not gather: a cancelled stop() must not cancel a report already in
+            # flight, which take_held() has marked as sent, so it would be lost for good.
+            await asyncio.wait(set(self._tasks))
         if self._closed:
             await self.report()
 
