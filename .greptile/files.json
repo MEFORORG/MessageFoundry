@@ -11,27 +11,33 @@
     {
       "path": "messagefoundry/CLAUDE.md",
       "description": "HL7 conventions: tolerant parsing, payload-agnostic ingress, ACK/NAK timing, binary carriage.",
-      "scope": ["messagefoundry/**", "tee/**"]
-    },
-    {
-      "path": "docs/PHI.md",
-      "description": "PHI threat model, data-at-rest inventory, logging inventory and redaction rules.",
-      "scope": ["messagefoundry/**", "messagefoundry_webconsole/**", "tee/**", "tests/**", "samples/**"]
+      "scope": [
+        "messagefoundry/**",
+        "tee/**"
+      ]
     },
     {
       "path": "docs/API-INPUT-VALIDATION.md",
       "description": "What the operator API accepts for each kind of input: ids, names, time bounds, search terms.",
-      "scope": ["messagefoundry/api/**", "messagefoundry_webconsole/**"]
+      "scope": [
+        "messagefoundry/api/**",
+        "messagefoundry_webconsole/**"
+      ]
     },
     {
       "path": "docs/INPUT-SURFACES.md",
       "description": "Input surfaces outside the operator API, and the rules for what each input must look like.",
-      "scope": ["messagefoundry/**", "messagefoundry_webconsole/**"]
+      "scope": [
+        "messagefoundry/**",
+        "messagefoundry_webconsole/**"
+      ]
     },
     {
       "path": "docs/Code_Quality_Standards.md",
       "description": "Code quality rubric the project holds Python changes to.",
-      "scope": ["**/*.py"]
+      "scope": [
+        "**/*.py"
+      ]
     }
   ]
 }

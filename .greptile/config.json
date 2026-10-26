@@ -1,61 +1,103 @@
 {
   "strictness": 2,
-  "commentTypes": ["logic", "syntax"],
-  "autoReview": ["open", "push"],
+  "commentTypes": [
+    "logic",
+    "syntax"
+  ],
+  "autoReview": [
+    "open",
+    "push"
+  ],
+  "shouldUpdateDescription": false,
+  "fixWithAI": false,
   "ignorePatterns": "uv.lock\nrequirements.lock\nconstraints.lock\n**/locks/*.lock\n**/package-lock.json\n.github/actions/cla-assistant-lite/upstream-package-lock.json\n.github/actions/cla-assistant-lite/dist/**\nmessagefoundry/_vendor/**\ntee/anon/_hl7data.py\ntee/anon/keying.py\ntee/anon/rules.py\ntee/anon/surrogates.py\ntests/golden/**\npackaging/messagefoundry-webconsole/tests/golden/**\ndocs/benchmarks/results/**\n**/*.ico",
   "rules": [
     {
       "id": "phi-out-of-logs-and-audit",
       "rule": "No full message body, raw segment, field value or payload-carrying exception may reach a log call at INFO or above, an audit row, an alert, or an HTTP error body. Text from a directory, IdP or remote peer stays out of audit rows and refusal text too. Masking goes through messagefoundry/anon or messagefoundry/redaction.py, never a new ad hoc masker. `raise ... from None` is not redaction: raise outside the except block instead.",
-      "scope": ["messagefoundry/**/*.py", "messagefoundry_webconsole/**/*.py", "tee/**/*.py"],
+      "scope": [
+        "messagefoundry/**/*.py",
+        "messagefoundry_webconsole/**/*.py",
+        "tee/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "sql-parameterized",
       "rule": "SQL values are always bound parameters. Flag any f-string, % or .format() that puts a variable into SQL text unless the variable is an identifier or fragment chosen from a fixed in-code allowlist, and say which allowlist. A change to one store backend (sqlite, postgres, sqlserver) that alters a query's meaning must make the same change in the other backends.",
-      "scope": ["messagefoundry/store/**/*.py", "messagefoundry/transports/**/*.py", "messagefoundry/pipeline/**/*.py"],
+      "scope": [
+        "messagefoundry/**/*.py",
+        "tee/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "route-auth-and-channel-scope",
-      "rule": "Every new or changed HTTP or WebSocket route is gated in one of the sanctioned ways: a gate dependency (the require* factories in messagefoundry/api/security.py, or the require_ui* factories in messagefoundry_webconsole/_auth.py); @public_route(reason) for an endpoint anonymous by design, such as sign-in; or, on a WebSocket only, @authorizes_in_body(reason) with a call to authorize_ws before any data is read or sent. Do not flag those forms as missing a gate. Flag a route with none of them, a public_route on an endpoint that returns or changes operator or message data, or an authorizes_in_body WebSocket that sends data before authorize_ws succeeds. A route that returns or changes channel data filters by the caller's channel scope, and a list response must not reveal withheld items beyond a count. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection.",
-      "scope": ["messagefoundry/api/**/*.py", "messagefoundry_webconsole/routes/**/*.py"],
+      "rule": "Every new or changed HTTP or WebSocket route is gated in one of the sanctioned ways: a gate dependency (the require* factories in messagefoundry/api/security.py, or the require_ui* factories in messagefoundry_webconsole/_auth.py); @public_route(reason); or, on a WebSocket only, @authorizes_in_body(reason) with the caller authorized in the handler before the socket is accepted. Do not flag those forms as missing a gate, and do not flag an existing public_route. Flag a route with none of them; a new public_route whose reason is not a step before a session exists or is verified (sign-in, sign-out, second factor, re-authentication, liveness, a browser report); and an authorizes_in_body WebSocket that accepts the socket or sends data before its authorization check succeeds. A route that returns or changes channel data filters by the caller's channel scope. A list response must not reveal withheld items, not even how many: follow the route family's existing withheld flag. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection.",
+      "scope": [
+        "messagefoundry/api/**/*.py",
+        "messagefoundry_webconsole/routes/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "fail-closed-classification",
       "rule": "A security decision fails closed. An exception, timeout, busy pool, unreachable directory or unexpected reply is an outage or fault, never 'no such user', 'wrong password', 'not revoked' or success. An unknown scheme tag, digest marker or enum value is refused, not defaulted. Flag any branch where an error path lets a request through or reports a negative answer.",
-      "scope": ["messagefoundry/auth/**/*.py", "messagefoundry/api/**/*.py", "messagefoundry/store/**/*.py", "messagefoundry/pipeline/**/*.py", "messagefoundry/*.py"],
+      "scope": [
+        "messagefoundry/**/*.py",
+        "messagefoundry_webconsole/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "reread-before-security-write",
       "rule": "A write that grants, revokes or changes an account, factor, session or role re-reads the current record (or uses a guarded conditional write) in the same transaction. Flag check-then-write on state another request or process can change in between.",
-      "scope": ["messagefoundry/auth/**/*.py", "messagefoundry/store/**/*.py", "messagefoundry/api/**/*.py"],
+      "scope": [
+        "messagefoundry/auth/**/*.py",
+        "messagefoundry/store/**/*.py",
+        "messagefoundry/api/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "tls-verify-before-credentials",
-      "rule": "No connection sends a credential, token or PHI to a peer whose certificate was not verified. Flag verify=False, CERT_NONE, check_hostname=False or a disabled CRL check unless it sits behind the existing named insecure-TLS escape and logs at WARNING. An explicit None means the TLS library default, not 'off'.",
-      "scope": ["messagefoundry/**/*.py", "messagefoundry_webconsole/**/*.py", "tee/**/*.py"],
+      "rule": "No connection sends a credential, token or PHI to a peer whose certificate was not verified. Flag verify=False, CERT_NONE, check_hostname=False or a disabled CRL check unless it is reached only through an opt-out that already exists, is off by default and logs at WARNING. Flag a new opt-out, or a change that turns one on by default. An explicit None means the TLS library default, not 'off'.",
+      "scope": [
+        "messagefoundry/**/*.py",
+        "messagefoundry_webconsole/**/*.py",
+        "tee/**/*.py"
+      ],
       "severity": "high"
     },
     {
       "id": "message-disposition",
       "rule": "Every received message ends with a recorded disposition. A bad message goes to the error or dead-letter path; it never ends the listener or worker, and it is never accepted and dropped. Parse with the built-in tolerant parser or the codec, read separators from MSH, and never edit raw HL7 by slicing, split('|') or replace before sending it on.",
-      "scope": ["messagefoundry/transports/**/*.py", "messagefoundry/pipeline/**/*.py", "messagefoundry/parsing/**/*.py", "messagefoundry/mllpcodec.py"],
+      "scope": [
+        "messagefoundry/transports/**/*.py",
+        "messagefoundry/pipeline/**/*.py",
+        "messagefoundry/parsing/**/*.py",
+        "messagefoundry/mllpcodec.py"
+      ],
       "severity": "high"
     },
     {
       "id": "security-event-audited",
       "rule": "A security-relevant decision (sign-in, sign-out, refusal, revoke, role or factor change, PHI read, config write, approval) writes an audit row with the acting user. A failed audit write is handled explicitly and does not abort unrelated work or pass silently.",
-      "scope": ["messagefoundry/auth/**/*.py", "messagefoundry/api/**/*.py", "messagefoundry_webconsole/routes/**/*.py", "messagefoundry/audit_write.py"],
+      "scope": [
+        "messagefoundry/auth/**/*.py",
+        "messagefoundry/api/**/*.py",
+        "messagefoundry_webconsole/routes/**/*.py",
+        "messagefoundry/audit_write.py"
+      ],
       "severity": "medium"
     },
     {
       "id": "bounded-by-default",
       "rule": "Anything that grows from outside input has a cap or deadline: caches, dedupe sets, rate-limiter buckets, paged directory searches, read loops on sockets or files, and retry loops. Flag a new collection or loop with no size cap, eviction or overall deadline.",
-      "scope": ["messagefoundry/**/*.py", "messagefoundry_webconsole/**/*.py"],
+      "scope": [
+        "messagefoundry/**/*.py",
+        "messagefoundry_webconsole/**/*.py"
+      ],
       "severity": "medium"
     }
   ]
