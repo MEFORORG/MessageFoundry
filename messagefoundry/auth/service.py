@@ -3267,6 +3267,10 @@ class AuthService:
         #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
         #: #2538). `_mark_reconcile_clears` states the test that reads it.
         self._reconcile_referred: set[str] = set()
+        #: user_ids whose probe was referred, faulted or refused for its configuration and that no
+        #: pass has read with an answer since (BACKLOG #3844). Their answer on record may predate
+        #: that probe. `_mark_reconcile_clears` states the test that reads it.
+        self._reconcile_unanswered: set[str] = set()
         #: Whether THIS process may resolve the referral's durable ``ad_reconcile_aborted``
         #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`).
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
@@ -7813,6 +7817,9 @@ class AuthService:
         self._forfeit_clears_on_attrition(users)
         for episode in self._reconcile_episodes.values():
             episode.intersection_update(users)  # an account that left ends its part (#3083)
+        # BACKLOG #3844. Leaving ends an account's part and forfeits nothing;
+        # `_mark_reconcile_clears` says why.
+        self._reconcile_unanswered.intersection_update(users)
         announced = (self._forfeited_reconcile_standings() - forfeited) & open_before
         reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
@@ -7908,6 +7915,12 @@ class AuthService:
         # The outcome record merges the same way, for the same reason (ADR 0195 rule item 4).
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
+        # BACKLOG #3844. Beside the outcome record it qualifies, and before any return below, so a
+        # pass that judged nothing still marks what it asked and could not read. An answer on this
+        # pass ends an account's part; a referral, a fault or a refusal starts one. One probe per
+        # account per pass, so no account is in both. `_mark_reconcile_clears` states the test.
+        self._reconcile_unanswered.difference_update(plan.outcomes)
+        self._reconcile_unanswered.update(plan.referred, plan.faulted, plan.misconfigured)
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
         plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
@@ -8088,10 +8101,21 @@ class AuthService:
           breaker's and the hold's instances open after their own causes are gone: a missed
           clear, never a false one (BACKLOG #3100 item 7). A pass with a probe fault, or with a
           probe refused for its configuration (BACKLOG #3010), marks none either, for the same
-          reason. For these two clears none is carried to later passes: a later pass whose
-          sample misses the referred, faulting or refused account reads its older answer on
-          record and can still mark one (left open under BACKLOG #3100). Only the referral's own
-          clear below carries its accounts across passes.
+          reason.
+        * **That carries across passes (BACKLOG #3844).** An account whose probe was referred,
+          faulted or refused stays unanswered (``_reconcile_unanswered``) until a later pass reads
+          it with an answer, and no pass marks any of the three while an unanswered account is
+          signed in. Without it, a later sample that missed the account would read its older
+          answer as current. Any answer ends its part, not only PRESENT: this test asks only
+          whether the answer on record postdates the probe that went unanswered, and every test
+          below then judges that answer as it judges any other. The referral's own clear asks
+          more, below. An unanswered account that leaves takes its part with it and forfeits
+          nothing. An unjudged probe changes neither the outcome and strike records nor
+          ``_reconcile_unconfirmed``, so an account behind a trip or a hold is still behind it on
+          those, and its leaving forfeits on their rule (`_forfeit_clears_on_attrition`). A clear
+          rests only on the accounts still signed in, each with an answer from after its last
+          unanswered probe. A restart empties this set with the outcome record it qualifies, so
+          the first test asks every account for a fresh answer again.
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -8153,13 +8177,15 @@ class AuthService:
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
         # A faulted or refused account, like a referred one, keeps an older answer that may predate
-        # the fault or the refusal (BACKLOG #3100, #3010), so a pass with any of them marks no clear.
+        # the fault or the refusal (BACKLOG #3100, #3010), so a pass with any of them marks no clear,
+        # and nor does a later one while that account is signed in and unanswered (BACKLOG #3844).
         covered = (
             bool(ids)
             and None not in outcomes
             and not plan.referred
             and not plan.faulted
             and not plan.misconfigured
+            and self._reconcile_unanswered.isdisjoint(ids)
         )
         settled = covered and undetermined not in outcomes
         # Called only on a pass that judged something, so a pass that judged nothing never gets

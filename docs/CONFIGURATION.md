@@ -847,10 +847,14 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts. None is
-  carried to later passes for the breaker's and the hold's alerts: a later pass whose probe sample
-  leaves out the referred, faulting or refused account reads its older answer, and can resolve one of
-  those two (BACKLOG #3100, left open).
+  resolves none of these alerts.
+- That carries across passes (BACKLOG #3844). An account whose probe was referred, faulted or
+  refused resolves none of these alerts while it is signed in, until a later pass reads it with an
+  answer. A later pass whose probe sample leaves the account out does not read its older answer as
+  current. Any answer counts here, an absent or held one too, and the rules above then judge it. An
+  account that signs out still unanswered stops counting. Its leaving gives up no resolve on this
+  rule, though the give-up rules above still apply to it. A restart forgets these accounts, along
+  with every answer the engine would have judged them on.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
