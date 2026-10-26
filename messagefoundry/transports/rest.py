@@ -99,6 +99,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     is_never_proxied_host,
     is_proxy_credential_header_name,
+    proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -1912,14 +1913,17 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value. The key is read by the function the send-time rule uses, so
-    the two cannot differ on which spellings are this header."""
+    Names the key, never its value, and never text a key holds after the plain name and the
+    characters around it, which may be a credential typed into the key (vault BACKLOG #3457).
+    The key is read by the function the send-time rule uses, so the two cannot differ on which
+    spellings are this header."""
     if not isinstance(headers, Mapping):
         return
     for key in headers:
         if is_proxy_credential_header_name(str(key)):
             raise ValueError(
-                f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
+                f"headers sets {proxy_credential_header_name_shown(str(key))} and the connection "
+                "also sets proxy_user and "
                 "proxy_password. Remove the static header: the proxy credential comes from "
                 "proxy_user, proxy_password and proxy_auth_type only (vault BACKLOG #3443)"
             )

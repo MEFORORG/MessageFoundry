@@ -448,6 +448,16 @@ socket.socket().close()
 control = sorted(set(seen))
 seen.clear()
 
+import http.client
+put = []
+original_putheader = http.client.HTTPConnection.putheader
+def counting_putheader(self, header, *values):
+    text = header if isinstance(header, str) else header.decode("latin-1")
+    if "proxy-authorization" in text.lower():
+        put.append(text)
+    return original_putheader(self, header, *values)
+http.client.HTTPConnection.putheader = counting_putheader
+
 plain = "Proxy-Authorization"
 value = "made up"
 def ask(name, value):
@@ -462,14 +472,15 @@ answers = {
     "trailing space": ask(plain + chr(32), value),
     "bytes name": ask(plain.encode() + bytes([32]), value),
 }
-print(json.dumps({"control": control, "seen": seen, "answers": answers}))
+print(json.dumps({"control": control, "seen": seen, "answers": answers, "put": len(put)}))
 """
 
 
 def test_asking_http_client_about_a_header_opens_no_socket_and_resolves_no_name() -> None:
     """The check runs on every request that holds an odd spelling, so it must cost no network.
     It names ``localhost`` and never resolves it. The control shows the hook fires for a socket
-    and for a lookup, and the answers show the check really ran."""
+    and for a lookup, and a count of the questions put to ``http.client`` shows the check
+    really ran."""
     done = subprocess.run(  # noqa: S603 - this interpreter, a fixed script, no input from a test
         [sys.executable, "-c", _AUDIT_SCRIPT],
         cwd=Path(__file__).resolve().parents[1],
@@ -482,10 +493,12 @@ def test_asking_http_client_about_a_header_opens_no_socket_and_resolves_no_name(
     assert "socket.getaddrinfo" in report["control"]
     assert "socket.__new__" in report["control"]
     # Which answer each gets is CPython's private rule, which the measured tables above pin.
-    # This test is about sockets, so it reads only that each question was put and answered.
+    # This test is about sockets, so it reads that each question reached http.client and got an
+    # answer of a kind the opener reads, and not which answer.
     answers = report["answers"]
     assert len(answers) == 6
     assert set(answers.values()) <= {"ValueError", "TypeError", None}
+    assert report["put"] == 6
     assert report["seen"] == []
 
 
@@ -1551,13 +1564,14 @@ def test_a_rest_send_with_the_plain_name_then_more_text_is_refused(suffix: str) 
 @pytest.mark.parametrize("suffix", list(_SUFFIXED.values()), ids=list(_SUFFIXED))
 def test_the_plain_name_then_more_text_beside_proxy_user_is_refused_at_build(suffix: str) -> None:
     """The REST build-time caller reads the key through the same function, so it refuses the
-    same names. Before the fix this connection built."""
-    name = _NAME + suffix
+    same names. Before the fix this connection built. The text after the plain name may be a
+    credential typed into the key, so the error shows the key only up to it."""
+    name = _NAME + suffix[0] + "S3cretTail"
     with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
         _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
     text = str(raised.value)
-    assert repr(name) in text
-    for part in ("u5er", "pa55w0rd", _VALUE):
+    assert repr(_NAME + suffix[0]) + " followed by more text, not shown" in text
+    for part in ("S3cretTail", "u5er", "pa55w0rd", _VALUE):
         assert part not in text, part
     assert proxy.connections == 0
 
@@ -1598,14 +1612,17 @@ def test_the_unsendable_text_does_not_blame_the_name_alone() -> None:
     assert proxy.connections == 0
 
 
-def test_a_verdict_does_not_print_the_value() -> None:
-    """The value is the credential, and a verdict is kept on the request, where a ``repr`` of
-    the request's attributes would show it."""
-    for name in (_NAME, _NAME + " "):
+def test_a_verdict_prints_neither_the_name_nor_the_value() -> None:
+    """The value is the credential, and a name may hold a credential typed after the plain name.
+    A verdict is kept on the request, where a ``repr`` of the request's attributes would show
+    either."""
+    for name in (_NAME, _NAME + " ", _NAME + " S3cretTail"):
         verdict = bounded_read._verdict_on(name, _VALUE)
+        assert verdict.name is name
         assert verdict.value is _VALUE
         assert _VALUE not in repr(verdict)
-        assert repr(name) in repr(verdict)
+        assert "S3cretTail" not in repr(verdict)
+        assert "plain=" in repr(verdict)
 
 
 def test_the_proxy_handler_refuses_a_misspelled_header_by_itself() -> None:
@@ -1696,3 +1713,22 @@ def test_control_a_plain_header_with_a_sendable_value_still_crosses(leg: str) ->
         opener, url = _on_leg(leg, peer, admitted=True)
         _attempt(opener, _held(_NAME, _VALUE, url))
     assert peer.connections == 1
+
+
+@pytest.mark.parametrize("leg", _LEGS_A_PLAIN_HEADER_CROSSES)
+def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_refused(
+    leg: str, asked: list[tuple[Any, Any]]
+) -> None:
+    """The question about a plain header's value goes through the one function every question
+    to ``http.client`` goes through, so the spy sees it. A printable ASCII ``str`` is never
+    asked about, and any other value is asked about once in an open."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        _attempt(opener, _held(_NAME, _VALUE, url))
+    assert asked == []
+    odd = _VALUE + "\u4e0a"
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        _attempt(opener, _held(_NAME, odd, url))
+    assert peer.connections == 0
+    assert asked == [(_NAME, odd)]
