@@ -12952,6 +12952,7 @@ class SqlServerStore:
         *,
         approver: str,
         decided_at: float,
+        seal_read: object,
         audits: Sequence[AuditAppend] = (),
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
@@ -12973,13 +12974,14 @@ class SqlServerStore:
                         moved = (
                             bool(found)
                             and str(found[0]["status"]) == "pending"
+                            and found[0]["seal"] == seal_read
                             and approval_fails_seal(self._row_sealer, found[0])
                             and await self._tombstone_approval(
                                 cur,
                                 approval_id,
                                 approver=approver,
                                 decided_at=decided_at,
-                                seal_read=str(found[0]["seal"]),
+                                seal_read=seal_read,
                             )
                         )
                         appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
@@ -12993,7 +12995,7 @@ class SqlServerStore:
         return moved
 
     async def _tombstone_approval(
-        self, cur: Any, approval_id: str, *, approver: str, decided_at: float, seal_read: str
+        self, cur: Any, approval_id: str, *, approver: str, decided_at: float, seal_read: object
     ) -> bool:
         """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE` (BACKLOG #3638); store.py's
         ``MessageStore._tombstone_approval`` states the contract."""

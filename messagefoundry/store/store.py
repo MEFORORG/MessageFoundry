@@ -14923,6 +14923,7 @@ class MessageStore:
         *,
         approver: str,
         decided_at: float,
+        seal_read: object,
         audits: Sequence[AuditAppend] = (),
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
@@ -14935,12 +14936,13 @@ class MessageStore:
             moved = (
                 found is not None
                 and str(found["status"]) == "pending"
+                and found["seal"] == seal_read
                 and approval_fails_seal(self._row_sealer, found)
                 and await self._tombstone_approval(
                     approval_id,
                     approver=approver,
                     decided_at=decided_at,
-                    seal_read=str(found["seal"]),
+                    seal_read=seal_read,
                 )
             )
             appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
@@ -14950,7 +14952,7 @@ class MessageStore:
         return moved
 
     async def _tombstone_approval(
-        self, approval_id: str, *, approver: str, decided_at: float, seal_read: str
+        self, approval_id: str, *, approver: str, decided_at: float, seal_read: object
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE` (BACKLOG #3638). Call it inside an
         open write, on a row :func:`approval_fails_seal` refused, with the seal it read. Writes the

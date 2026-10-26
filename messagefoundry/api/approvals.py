@@ -2301,19 +2301,22 @@ class ApprovalGate:
         rejection that rolled back. The write and the alert run as one shielded unit, so a
         cancelled caller cannot leave a committed rejection without its alert.
 
-        The expiry is not tested, because ``expires_at`` is one of the unverified values; the
-        store still moves only a row it reads ``pending`` and failing, carrying the seal it read.
-        The tombstone overwrites the row's ``approver``, ``decided_at`` and seal, so the
-        ``integrity.authority_seal_failed`` row keeps them as this read found them, under
-        ``prior``, for whoever investigates; the params are left in the row as found and are
-        never copied. ``approval.rejected`` holds only the id. The answer names the stored
-        operation and requester, unverified, for the caller's page.
+        The expiry is not tested, because ``expires_at`` is one of the unverified values. The
+        store moves only a row it reads ``pending`` and failing that still carries the seal this
+        read found, so the row it tombstones is the row read here. The tombstone overwrites the
+        row's ``approver``, ``decided_at`` and seal, so the ``integrity.authority_seal_failed``
+        row keeps them as read, under ``prior``, for whoever investigates; the params are left in
+        the row as found and are never copied. ``approval.rejected`` holds the id and
+        ``seal_failed`` only. The answer names the stored operation and requester, unverified,
+        for the caller's page.
 
-        A row that moved or was settled since the read answers 409 and reports nothing: the call
-        that moved it reported it, or it no longer fails. A store fault answers 503, pages the
-        lost audit rows and still reports the seal failure, throttled, as any read of it does. A
-        defect in the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is not answered as
-        an outage to retry."""
+        A row that moved, was settled or changed since the read answers 409 and reports nothing:
+        the call that moved it reported it, or the next read of it will. A store fault answers
+        503, logs and pages ``audit_write_failed`` for ``approval.rejected`` as any decision's
+        fault does (:meth:`_store_fault`), and still reports the seal failure, throttled. That
+        runs inside the shielded unit too, so a cancelled caller cannot skip the page. A defect in
+        the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is not answered as an
+        outage to retry."""
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and was rejected"
             f" (approval {scrub_log_argument(approval_id)})"
@@ -2342,28 +2345,32 @@ class ApprovalGate:
         )
 
         async def _write_then_alert() -> bool:
-            moved = await self._store.reject_seal_failed_approval(
-                approval_id, approver=approver, decided_at=self._clock(), audits=audits
-            )
+            try:
+                moved = await self._store.reject_seal_failed_approval(
+                    approval_id,
+                    approver=approver,
+                    decided_at=self._clock(),
+                    seal_read=found["seal"],
+                    audits=audits,
+                )
+            except _READ_DEFECTS:
+                raise  # a defect in the write path, not an outage
+            except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+                await self._approval_seal_failed(approval_id)
+                raise self._store_fault(
+                    approval_id,
+                    exc,
+                    what="rejection",
+                    action="approval.rejected",
+                    retry="If the request still reads pending, reject it again once the store "
+                    "accepts writes",
+                ) from exc
             if moved:
                 log.warning("%s", reason)
                 authority_seal_alert(self._alert_sink)(reason)
             return moved
 
-        try:
-            moved = await self._shielded(_write_then_alert(), approval_id)
-        except _READ_DEFECTS:
-            raise  # a defect in the write path, not an outage
-        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
-            await self._approval_seal_failed(approval_id)
-            raise self._store_fault(
-                approval_id,
-                exc,
-                what="rejection",
-                action="approval.rejected",
-                retry="If the request still reads pending, reject it again once the store "
-                "accepts writes",
-            ) from exc
+        moved = await self._shielded(_write_then_alert(), approval_id)
         if not moved:
             raise ApprovalError(409, "request was already decided, or changed since it was read")
         return {

@@ -2735,8 +2735,9 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
 
 - `GET /approvals` and the Approvals page list a failing `pending` request after the sound ones,
   with `release_blocked` set to `seal_failed`. Its `params` are always withheld, never decoded or
-  sent. Its other values are shown as stored and are unverified. The page offers Reject and no
-  Approve. RBAC is unchanged: the queue and the reject still need `approvals:approve`.
+  sent. Its other values are shown as stored and are unverified; a time no page can render is
+  shown as the epoch, or as no expiry. The page offers Reject and no Approve. RBAC is unchanged:
+  the queue and the reject still need `approvals:approve`.
 - The reject is a narrow store write on SQLite, SQL Server and PostgreSQL. It reads the row in the
   write and moves it only while it reads `pending` and fails its seal. Its SQL writes the status
   `rejected` as a literal, guarded on `status = 'pending'` and on the seal it read, so it cannot
@@ -2758,6 +2759,9 @@ At least these limits remain:
 - a row no honest write leaves can be listed flagged and still not be rejectable: one whose id the
   routes refuse (not 32 lowercase hex), or, on SQL Server, one whose status matches `pending` only
   under the column's case-insensitive collation. Its reject answers 422 or 409;
+- the queue reads only requests unexpired by their own stored `expires_at`, an unverified value.
+  A failing row whose stored expiry has passed is not listed, and the queue does not report it.
+  A reject by its id still closes it;
 - a failing `interrupted` release is still left out of its list, and its resolve answers 409.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact

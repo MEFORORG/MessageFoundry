@@ -539,7 +539,8 @@ class PendingApprovalInfo(BaseModel):
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
-    means the stored row could not be read as a JSON object.
+    means the stored row could not be read as a JSON object, or, on a ``seal_failed`` row (below),
+    that they are withheld.
 
     ``caller_is_requester`` is True when the caller raised this request, compared on the immutable
     user id as the self-approval refusal is (BACKLOG #2460, #1540). The engine refuses that caller's

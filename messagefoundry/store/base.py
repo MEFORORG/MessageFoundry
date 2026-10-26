@@ -1981,6 +1981,7 @@ class AuditStore(Protocol):
         *,
         approver: str,
         decided_at: float,
+        seal_read: object,
         audits: Sequence[AuditAppend] = (),
     ) -> bool:
         """Move a ``pending`` request whose row FAILS its integrity seal to ``rejected`` (BACKLOG
@@ -1989,10 +1990,12 @@ class AuditStore(Protocol):
         The narrow exception to :meth:`decide_pending_approval`'s rule that a failing row is never
         written. Without it such a request could not be closed at all, and with
         ``[approvals].expiry_hours = 0`` it never expires. It reads the row in the write and moves
-        it only while it reads ``pending`` and fails its seal; a sound row, a missing one or one in
-        any other status is left alone and ``False`` returned. The UPDATE writes the status
-        ``rejected`` as a literal, guarded in the SQL on ``status = 'pending'``, so it can never
-        move a row to ``executing`` or ``approved``, and it is parameterized. It sets ``approver``,
+        it only while it reads ``pending``, still carries ``seal_read`` (the seal value the caller
+        read, exactly as read) and fails its seal; a sound row, a missing one, one changed since
+        the caller's read or one in any other status is left alone and ``False`` returned. The
+        UPDATE writes the status ``rejected`` as a literal, guarded in the SQL on
+        ``status = 'pending'`` and on ``seal_read``, so it can never move a row to ``executing`` or
+        ``approved``, and it is parameterized. It sets ``approver``,
         ``decided_at`` and a tombstone seal (``store.approval_tombstone``), which covers only the
         id, the status, the approver and the decision time, under a kind of its own: it never
         vouches for the params or the requester, and the row keeps failing its approval seal.

@@ -363,7 +363,7 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     # --- control: a sound request is rejected the ordinary way, with its operation named ------
     sound = await h.request()
     assert not await store.reject_seal_failed_approval(  # the narrow write leaves it alone
-        sound, approver=_APPROVER, decided_at=time.time()
+        sound, approver=_APPROVER, decided_at=time.time(), seal_read=(await h.row(sound)).seal
     )
     assert (await h.row(sound)).status == "pending" and approval_seal_ok(sealer, await h.row(sound))
     await h.gate.reject(sound, approver=_APPROVER)
@@ -427,8 +427,41 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
         )
     await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"x": 1}', cut))
     assert not await store.reject_seal_failed_approval(
-        cut, approver=_APPROVER, decided_at=time.time()
+        cut, approver=_APPROVER, decided_at=time.time(), seal_read=(await h.row(cut)).seal
     )
+
+    # --- a seal changed again after the gate's read: the narrow write moves nothing ------------
+    moved_on = await h.request()
+    await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"y": 1}', moved_on))
+    seen = (await h.row(moved_on)).seal
+    await raw("UPDATE pending_approvals SET seal=? WHERE id=?", ("", moved_on))
+    assert not await store.reject_seal_failed_approval(
+        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=seen
+    )
+    assert (await h.row(moved_on)).status == "pending"
+    assert await store.reject_seal_failed_approval(  # control: the seal it now carries
+        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=""
+    )
+
+    # --- every other shape the main contract plants is rejectable too --------------------------
+    for shape, column, value in (
+        ("requester id", "requester_user_id", "someone-else-id"),
+        ("blank seal", "seal", ""),
+        ("another key", "seal", f"mfseal:v1:not-this-key:{'0' * 64}"),
+    ):
+        planted = await h.request()
+        await raw(f"UPDATE pending_approvals SET {column}=? WHERE id=?", (value, planted))
+        assert (await h.gate.reject(planted, approver=_APPROVER))["rejected_by"] == _APPROVER
+        assert (await h.row(planted)).status == "rejected", shape
+    inserted = uuid4().hex
+    await raw(
+        "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+        " requested_at, status) VALUES (?,?,?,?,?,?,?)",
+        (inserted, _OP, "{}", _REQUESTER, _REQUESTER_ID, time.time(), "pending"),
+    )
+    assert await h.flagged(inserted) is not None
+    assert (await h.gate.reject(inserted, approver=_APPROVER))["rejected_by"] == _APPROVER
+    assert (await h.row(inserted)).status == "rejected" and h.runs == []
     with pytest.raises(ApprovalError) as not_pending:
         await h.gate.reject(cut, approver=_APPROVER)
     assert not_pending.value.status == 409 and "already interrupted" in not_pending.value.detail

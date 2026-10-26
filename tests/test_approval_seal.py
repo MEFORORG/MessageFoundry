@@ -325,8 +325,8 @@ async def test_a_seal_failed_time_no_page_can_render_does_not_break_the_queue(
 ) -> None:
     """BACKLOG #3639: a failing row's times are shown as stored only when a page can render them.
     NaN and infinity would fail the JSON reply, and a negative or far-future time fails the
-    console's time conversion on Windows, so each is shown as no time at all. The control is the
-    sound request beside it, whose time is its own."""
+    console's time conversion on Windows. Each is replaced: the request time by the epoch, the
+    expiry by none. The control is the sound request beside it, whose time is its own."""
     from messagefoundry.api.models import PendingApprovalInfo
 
     store, path = keyed
