@@ -5,9 +5,8 @@
 Two parts, shared by the MLLP listener, the HTTP intake listener and the API:
 
 * :class:`HandshakeFailures` is the counter and the throttle, one per listener. It was the MLLP
-  listener's own until #3302 lifted it here. The first failure is reported at once. Later ones
-  inside :data:`EVENT_SECONDS` are held, and one trailing report at the window's end says how many,
-  so a peer that fails handshakes as fast as it connects writes one row a minute, not one per try.
+  listener's own until #3302 lifted it here. What it throttles, and how, is stated once, in
+  ``docs/PHI.md`` section 7, row 7 (vault BACKLOG #3785 item 2).
 * :func:`watch_loop_handshakes` sees a failure the EVENT LOOP had, where no listener code runs.
 
 **Why the second part exists.** Where the loop runs the handshake, through
@@ -30,13 +29,15 @@ protocol class is replaced.
 
 * **The peer's address.** A TLS object holds two memory buffers and no socket, so these reports
   name no peer. A trailing report for several failures names none anyway.
-* **A handshake past its bound.** The loop aborts the transport and never calls ``do_handshake``
-  again, so nothing raises. Where the MLLP listener runs its own handshakes, the stdlib loop, it
-  still counts that case itself. Elsewhere a peer that opens sockets and stays silent is not
-  counted. A wrong certificate, a missing client certificate, a protocol downgrade and plaintext on
-  a TLS port all raise, so all are counted.
-* **A peer that hangs up mid-handshake.** Not counted, deliberately, as on MLLP since #2613: that is
-  what a load balancer's TCP health check does.
+* **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
+  2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
+  ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
+  counted there. Where the MLLP listener runs its own handshakes, the stdlib loop, it still counts
+  that case itself. A wrong certificate, a missing client certificate, a protocol downgrade and
+  plaintext on a TLS port all raise, so all are counted.
+* **A peer that hangs up mid-handshake. A known limit, declined by owner ruling 2026-10-26 (vault
+  BACKLOG #3785 item 8).** Not counted on any surface, as on MLLP since #2613: that is what a load
+  balancer's TCP health check does.
 * **A failure outside ``do_handshake``**, such as one in ``wrap_bio`` itself, and any context driven
   through ``wrap_socket`` rather than by an event loop, which is how the DICOM SCP runs its
   handshakes.
@@ -47,10 +48,12 @@ Stdlib only, so the API can import it without pulling in a transport.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import ssl
 import time
+import weakref
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -69,8 +72,30 @@ _recorder_fault_logged = False
 
 #: Seconds between two reports from one listener. Per listener, not per peer: the peer's address
 #: is the caller's choice, so a per-peer window would let one host rotating addresses write a row
-#: per address.
+#: per address. Read when a :class:`HandshakeFailures` is built, so a test shortens it for every
+#: surface by patching it here (vault BACKLOG #3785 item 4).
 EVENT_SECONDS = 60.0
+
+
+def _weakly[**P, R](fn: Callable[P, R]) -> Callable[P, R | None]:
+    """``fn``, held weakly when it is a bound method, so a context or a counter it is handed to does
+    not keep the method's object alive (vault BACKLOG #3785 item 1).
+
+    Without it, a listener and its context made a reference cycle (context, its hooked class, the
+    bound method, the listener, the context), and so did a listener and its counter. Only the
+    cyclic collector freed either. A plain function owns no object, and ``weakref.WeakMethod``
+    refuses one, so it is held as it is. Once the object is gone the call does nothing and returns
+    ``None``, so a stale hook never raises into the loop's handshake."""
+    if not inspect.ismethod(fn):
+        return fn
+    ref = weakref.WeakMethod(fn)
+
+    def call(*args: P.args, **kwargs: P.kwargs) -> R | None:
+        method = ref()
+        return None if method is None else method(*args, **kwargs)
+
+    return call
+
 
 #: What both event loops treat as "call do_handshake again" rather than as a failed handshake. The
 #: same tuple as CPython's ``asyncio.sslproto.SSLAgainErrors`` and uvloop's ``ssl_SSLAgainErrors``.
@@ -96,24 +121,25 @@ def handshake_cause(exc: BaseException) -> str:
 
 
 class HandshakeFailures:
-    """One listener's failed-handshake counter and its throttled report.
+    """One listener's failed-handshake counter and its throttled report. The throttle, and what a
+    report names, are stated once, in ``docs/PHI.md`` section 7, row 7.
 
     ``emit(peer_host, reason)`` sends one report: a coroutine function for a connection event, or a
     plain function for a log line, which then runs at once rather than on a task a closing loop
-    could cancel. A report for one failure names its peer; a report for several names none, since
-    they may come from many peers. The reason is a count and a cause from :func:`handshake_cause`,
-    never the peer's bytes.
+    could cancel. It is held weakly when it is a bound method (see :func:`_weakly`). The reason is
+    a count and a cause from :func:`handshake_cause`, never the peer's bytes.
+
+    Every method runs on the listener's event loop. A caller on another thread hands a failure
+    over with ``loop.call_soon_threadsafe``.
     """
 
-    def __init__(
-        self,
-        emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None],
-        *,
-        window: float = EVENT_SECONDS,
-    ) -> None:
-        self._emit = emit
-        self._window = window
-        #: Failed handshakes seen since this object was built.
+    def __init__(self, emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None]) -> None:
+        self._emit = _weakly(emit)
+        self._window = EVENT_SECONDS
+        # Between close() and open(): a listener's stop(). Nothing is counted then, so no report
+        # outlives stop() (vault BACKLOG #3785 item 5: this guard lived in each listener).
+        self._closed = False
+        #: Failed handshakes seen since this object was built, outside its listener's stop()s.
         self.count = 0
         # The count already reported, and when that report went.
         self._reported = 0
@@ -152,21 +178,42 @@ class HandshakeFailures:
         self._reported = self.count
         self._reported_at = time.monotonic()
         peer_host, cause = self._last
+        # "report", not "event": the API and the DICOM SCP write this as a log line, and no event
+        # carries it there (vault BACKLOG #3785 item 3).
         return (
             peer_host if since == 1 else None,
-            f"{since} failed handshake(s) since the last event; last cause {cause}",
+            f"{since} failed handshake(s) since the last report; last cause {cause}",
         )
 
     async def note(self, peer_host: str | None, cause: str) -> None:
         """Count one failure from a coroutine, reporting it before returning if a report is due."""
-        if self._count(peer_host, cause):
+        if not self._closed and self._count(peer_host, cause):
             await self.report()
 
     def note_soon(self, peer_host: str | None, cause: str) -> None:
         """Count one failure from a plain callback on the loop, such as inside a handshake. The
         report, if one is due, goes on a tracked task."""
-        if self._count(peer_host, cause):
+        if not self._closed and self._count(peer_host, cause):
             self._report_soon()
+
+    def watch(self, ctx: ssl.SSLContext) -> None:
+        """Count each handshake the event loop fails on ``ctx``. The peer is not known there. The
+        hook holds this object weakly, so ``ctx`` does not keep it alive."""
+        watch_loop_handshakes(ctx, self._note_loop_failure)
+
+    def _note_loop_failure(self, cause: str) -> None:
+        self.note_soon(None, cause)
+
+    def open(self) -> None:
+        """At a listener's start(): count again."""
+        self._closed = False
+
+    def close(self) -> None:
+        """First thing in a listener's stop(): count nothing more, so stop() aborting a handshake is
+        no failure and no report outlives stop(), and disarm the trailing timer. What that timer
+        held stays held for :meth:`flush`. Nothing can arm a new one until :meth:`open`."""
+        self._closed = True
+        self.cancel()
 
     def _on_timer(self) -> None:
         """The trailing report's timer."""
@@ -200,9 +247,18 @@ class HandshakeFailures:
             self._timer = None
 
     async def flush(self) -> None:
-        """At a listener's stop, once no handshake can add to the count: wait for any report in
-        flight, then send what the trailing timer still held. The emitters are fail-soft, so this
-        cannot fail a stop()."""
+        """At the end of a listener's stop(), after :meth:`close`: wait for any report in flight,
+        then send what the trailing timer still held. The emitters are fail-soft, so this cannot
+        fail a stop().
+
+        It does nothing once :meth:`open` has run again, since the failures from then on are the
+        restarted listener's to report. That needs a restart while an earlier stop() still runs,
+        which the engine's runner never does: it joins an abandoned stop() before it starts the
+        listener again (``_settle_pending_source_stops`` in ``pipeline/wiring_runner.py``). The
+        check is kept anyway (vault BACKLOG #3785 item 5). It costs one flag test, and without it
+        this class would depend on its caller's ordering."""
+        if not self._closed:
+            return
         self.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -214,17 +270,20 @@ def watch_loop_handshakes(ctx: ssl.SSLContext, on_failure: Callable[[str], None]
 
     ``ctx`` must be a server context this caller owns, since it is changed in place. A second call
     replaces the first callback. ``on_failure`` runs inside the loop's handshake, so it must not
-    block; a fault in it is logged and never changes the handshake's outcome.
+    block; a fault in it is logged and never changes the handshake's outcome. A bound method is
+    held weakly (see :func:`_weakly`), so the caller keeps its object alive itself.
     """
     ctx.sslobject_class = type(
-        "_WatchedSSLObject", (_WatchedSSLObject,), {"_on_failure": staticmethod(on_failure)}
+        "_WatchedSSLObject",
+        (_WatchedSSLObject,),
+        {"_on_failure": staticmethod(_weakly(on_failure))},
     )
 
 
 class _WatchedSSLObject(ssl.SSLObject):
     """An ``SSLObject`` that reports a failed handshake before the loop sees it."""
 
-    _on_failure: Callable[[str], None]
+    _on_failure: Callable[[str], object]
 
     def do_handshake(self) -> None:
         try:

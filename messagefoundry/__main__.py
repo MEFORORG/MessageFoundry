@@ -4771,6 +4771,8 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
+        # This name keeps the record alive until the `finally` below, since the hook on `ctx`
+        # holds it weakly (#3785).
         api_handshakes = ApiHandshakeRecord(ctx)
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches

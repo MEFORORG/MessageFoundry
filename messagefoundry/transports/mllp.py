@@ -86,7 +86,6 @@ from messagefoundry.parsing.message import emit_raw_separators, reencode_with_se
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
-    EVENT_SECONDS,
     HandshakeFailures,
     handshake_cause,
     watch_loop_handshakes,
@@ -312,13 +311,6 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
 # for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
-
-# Seconds between two `tls_handshake_failed` connection events from one listener (vault BACKLOG
-# #2613). Failed handshakes are logged at DEBUG only, so before #2613 nothing an operator reads
-# showed them. One event per window, carrying the count since the last one, records a flood without
-# letting a peer that fails handshakes as fast as it connects fill the connection_event table.
-# The shared value since #3302, whose `tls_handshake_failures` module says why it is per listener.
-_TLS_FAILURE_EVENT_SECONDS = EVENT_SECONDS
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
@@ -1890,9 +1882,7 @@ class MLLPSource(SourceConnector):
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
         # #2613), on every loop since #3302: `_start_tls` counts where this listener runs the
         # handshake, and the context's hook (`_note_loop_tls_failure`) where the loop does.
-        self._tls_failures = HandshakeFailures(
-            self._emit_tls_failure, window=_TLS_FAILURE_EVENT_SECONDS
-        )
+        self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
         # gave back cannot shrink the restarted listener's budget. Each holder releases the
@@ -1919,6 +1909,7 @@ class MLLPSource(SourceConnector):
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
+        self._tls_failures.open()
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
@@ -2028,11 +2019,12 @@ class MLLPSource(SourceConnector):
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
-            # Not counted: stop() aborting a handshake, and a peer that hung up before finishing
-            # one, which is what a load balancer's TCP health check does. A reset is how the
-            # Windows Proactor reports that hang-up. A TLS error and the handshake bound count.
+            # Not counted: a peer that hung up before finishing one, which is what a load
+            # balancer's TCP health check does. A reset is how the Windows Proactor reports that
+            # hang-up. Nor is stop() aborting a handshake: `HandshakeFailures.close` covers that.
+            # A TLS error and the handshake bound count.
             hung_up = isinstance(exc, ConnectionResetError | BrokenPipeError)
-            if not self._stopping and not hung_up:
+            if not hung_up:
                 await self._tls_failures.note(_peer_host(writer), handshake_cause(exc))
             return False
         except AttributeError:
@@ -2059,8 +2051,8 @@ class MLLPSource(SourceConnector):
     def _note_loop_tls_failure(self, cause: str) -> None:
         """A handshake the LOOP ran failed (vault BACKLOG #3302, #2613 item 3). The peer is not
         known there. Ignored where this listener runs handshakes itself, which `_start_tls` already
-        counts, and once stop() has begun, so no report outlives stop()."""
-        if not self._upgrade_tls and not self._stopping:
+        counts: the loop's TLS object on this context still sees that handshake."""
+        if not self._upgrade_tls:
             self._tls_failures.note_soon(None, cause)
 
     async def _emit_tls_failure(self, peer_host: str | None, reason: str) -> None:
@@ -2093,8 +2085,10 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
-        # First, so a connection that reaches `_on_client` from here on is refused there unread.
+        # First, so a connection that reaches `_on_client` from here on is refused there unread,
+        # and no handshake failure from here on is counted.
         self._stopping = True
+        self._tls_failures.close()
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -2152,16 +2146,11 @@ class MLLPSource(SourceConnector):
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
             self._client_tasks.clear()
-            # Vault BACKLOG #2613: report the handshake failures a trailing event still held, once
-            # no handshake can add to them. `_emit_event` is fail-soft, so this cannot fail stop().
-            # Not once a restart has begun (an abandoned stop() resuming late), whose failures are
-            # its own to report.
-            if self._stopping:
-                await self._tls_failures.flush()
+            # Vault BACKLOG #2613: report the handshake failures a trailing event still held.
+            # `_emit_event` is fail-soft, so this cannot fail stop(). `flush` says why it does
+            # nothing once a restart has begun.
+            await self._tls_failures.flush()
         finally:
-            # Again here, so a stop() cancelled above leaves no timer to fire after it.
-            if self._stopping:
-                self._tls_failures.cancel()
             # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
             # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
             # listeners already did. A client task the runner ABANDONS when a stop() overruns
