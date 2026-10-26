@@ -17,6 +17,17 @@
       ]
     },
     {
+      "path": "docs/PHI.md",
+      "description": "PHI threat model, logging inventory and redaction rules. Review standards R5 and R7 cite it.",
+      "scope": [
+        "tests/**",
+        "samples/**",
+        "harness/**",
+        "messagefoundry/anon/**",
+        "tee/**"
+      ]
+    },
+    {
       "path": "docs/API-INPUT-VALIDATION.md",
       "description": "What the operator API accepts for each kind of input: ids, names, time bounds, search terms.",
       "scope": [
