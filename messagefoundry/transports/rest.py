@@ -1180,7 +1180,8 @@ def refuse_verify_off(
         removal = (
             f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
             "credential, which its own posture and levers may still refuse. Moving a secret into "
-            "the url or a dynamic header is not a fix: this refusal cannot see those."
+            "the url path, a query parameter with a neutral name or a dynamic header is not a "
+            "fix: this refusal cannot see a secret there."
             if not secrets
             else ""
         )

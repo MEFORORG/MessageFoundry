@@ -92,8 +92,8 @@ engine has not verified, when the lever named beside each is set:
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
-  like a credential. It also covers any secret in the path. A path secret cannot be told
-  apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
+  like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
+  told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
   that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
 - a secret that is not credential-shaped under an allowlisted header name, such as an opaque token

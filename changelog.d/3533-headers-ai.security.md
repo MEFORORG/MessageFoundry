@@ -3,9 +3,9 @@
   Until now a secret under a neutral name, such as `X-Session`, crossed that hop, because the
   refusal read only names that look like a credential. The REST, SOAP, FHIR, DICOMweb and
   `FhirLookup` hops all apply it, and a credential-shaped value under an allowed name is still
-  refused. A secret in the URL still crosses where the refusal cannot see it. That covers at
-  least the path, which the engine cannot tell apart from a legitimate path. It also covers a
-  query parameter with a neutral name, such as `?sid=`. See
+  refused. A secret in the URL still crosses where the refusal cannot see it. A secret in the
+  path crosses, because the engine cannot tell it apart from a legitimate path. A secret in a
+  query parameter with a neutral name, such as `?sid=`, crosses too. See
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
   (`BACKLOG #3533`)
 - **The AI broker refuses a plain `http` endpoint in every case.** Every call sends
