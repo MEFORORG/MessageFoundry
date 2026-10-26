@@ -274,3 +274,105 @@ trips nothing, because it runs inside the dispatcher's process.
   This change edits `shell-guard-dispatch.ps1`, and an account's own shell entry stands down only
   for the dispatcher copy the installer pinned, so until the re-install the worktree gate runs
   twice on every shell call (`install-gate.ps1 -Status` reports it as NOT CURRENT).
+
+## Amendment 2026-10-26: gate, reversal budget, chain limit, cost rung
+
+Builds plan section 4 items 5 to 7, with R4's bar for acting without review. Plan section 10
+puts the no-review path itself in wave 5, as calibration passes; this builds the check that path
+must pass, so it exists before anything depends on it. The design is this build's inside the
+owner's 2026-10-21 approval of the plan, and the owner may overrule it at review.
+
+### The gate
+
+`scripts/coord/decision.ps1 -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>]` answers which path
+a Class B act may take, as one word: **NO-REVIEW** (exit 10), **REVIEW** (exit 11) or **HALT**
+(exit 12). None is 0 or 4, so a crash (1), a usage error (2), the cloud refusal (3) or "spooled"
+(4) never reads as permission. The script's header lists the conditions; in short, NO-REVIEW
+needs all of them:
+
+- the kill switch reads exactly OFF;
+- the seat's Class B is calibrated, by the digest's own arithmetic, which now lives in one shared
+  function (`Get-DecisionCalibration` in `_decisionlog.ps1`) that both scripts call;
+- no decision on the item was reversed, among the records the gate reads (60 days, the digest's
+  default window);
+- the reversal budget is open;
+- the chain is no deeper than two;
+- the cost rung is not hit.
+
+**It fails closed.** A log that is not fully read, a seat that cannot be named, a decision a link
+or a reversal names that the log does not hold, an unreadable thresholds file, and any error inside
+the gate all answer REVIEW. It checks the cost rung first and the kill switch second, and stops at
+the first that closes the no-review path, so a REVIEW for the kill switch reads no log.
+
+**Today it answers REVIEW (or HALT) for every seat**, because no seat has 60 rated samples.
+`tests/test_afk_gate.py` pins that, and pins NO-REVIEW for a calibrated seat with nothing against
+it, which every other test starts from.
+
+### Reversal budget (4.5)
+
+An `outcome` record with outcome `reversed` is one reversal, deduplicated by its ref, dated by the
+earliest such record. It is charged to the seat of the **decision** it refers to, joined through
+the ref, never to the seat that logged the outcome. Three inside any 24 hours close the no-review
+path for every seat, and two of one seat's decisions close it for that seat, in each case for 24
+hours from the reversal that reached the limit. A reversal of a decision the log does not hold has
+no seat; it counts against every seat's budget, and for the item rule it closes the path for any
+item, since its item cannot be told.
+
+### Chain limit (4.6)
+
+`-Log` takes `-BuildsOn <id>`, split at newlines like `-Predicate`, and the record schema gains
+two fields, still version 1: `buildsOn`, the ids, and `gate`, the gate's answer on an unreviewed
+Class B record (empty otherwise). A reader fills both for an older record. Depth is the unsampled
+(never rated) Class B decisions on the same item reachable through `buildsOn` links, and never
+less than the unsampled Class B decisions on that item logged in the trailing 24 hours. The floor
+exists because `-BuildsOn` is self-reported: a session that names nothing still meets it. More
+than two goes to review.
+
+### Cost rung (4.7)
+
+The gate reads `scripts/coord/usage.ps1 -Json` in a child pwsh, for the 5-hour window only: a
+weekly rung names a severity and stops nobody (korus `roles/STEWARD.md` 3a). The start-nothing
+rung is HOLD NEW WORK, STEWARD.md section 3's 20 minutes to cutoff and 80 percent, unless the
+Steward's `thresholds.json` beside its `watch.py` overrides them as `watch.py` reads it. That file
+names the window `5-hour`, not `five_hour`.
+
+**The burn rate governs, which the brief for this build did not say.** STEWARD.md 9.6a records an
+owner ruling of 2026-08-14 that a level fires the protect half and does not stop new work when the
+rate says there is room. So with a rate, the rung is hit when the window is projected to run out
+within 20 minutes and before it resets. Only with no rate is 80 percent the backstop.
+
+At the rung the answer is HALT. A reading `usage.ps1` calls UNKNOWN answers REVIEW, not HALT:
+UNKNOWN is common, because a Desktop session runs no statusLine, and halting on it would shut the
+gate for good. The Steward's `status.json` fallback, which `usage-headroom-inject.ps1` prints for
+such a session, is **not read**. Reading it would mean a third copy of `watch.py`'s pool rules. So
+a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lander is exempt from
+HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
+roster alias of the Lander.
+
+### Where it is enforced, and where it is not
+
+**`-Log` is the one caller.** A `decision` record of Class B with `-Reviewed no` runs the gate
+before it is written. The record is spooled and posted whatever the answer. When the answer is not
+NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
+`LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,
+so it can answer HALT or REVIEW but never NO-REVIEW. A reviewed record is not gated, because its
+review has already run; a session that wants the rung before spending a review runs `-Gate` first.
+
+**Nothing else calls `-Gate`.** The spawn hooks, `wait-pr.ps1`, and the driver and empower skills
+do not halt on the cost rung, so plan 4.7's *"spawning, polling ... halt"* is **designed, not
+built**. The gate also enforces nothing against a session that does not log, or that logs
+`-Reviewed yes` without a review: like the rest of this ADR, it is a check a cooperating session
+meets, not a boundary.
+
+### The digest
+
+`digest.ps1` gains two sections. **Gate state**: the fleet budget, the cost rung on the account the
+digest ran on (today's digest only, since it is a live reading), each seat's budget and whether its Class B is calibrated, and each item past the
+chain floor, all from the gate's own functions. **The attic**: every `refs/attic` ref on this clone
+with its age, as a Class C prune question (plan 6.3). The digest deletes nothing.
+
+### Cost
+
+A gate that reaches the log reads about one REST request per UTC day in the 60-day window that
+has an issue, plus the listing: the digest's read, once per unreviewed Class B record. It is not
+cached; the cache that Consequences names for the digest would cut both.
