@@ -234,9 +234,8 @@ def test_ai_broker_cleartext_is_refused_in_every_posture_even_with_escape(
     assert INSECURE_TLS_ESCAPE_ENV not in str(info.value)
 
 
-def test_ai_broker_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Negative control: an https endpoint is never refused on the cleartext arm, whatever the posture.
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+def test_ai_broker_https_secure_path_unaffected() -> None:
+    # Negative control: an https endpoint builds through the factory and the constructor alike.
     ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT), posture=PROD_PHI)
     AiBroker(endpoint=_HTTPS_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
 
@@ -262,37 +261,31 @@ def _client(app: object) -> httpx.AsyncClient:
 
 @pytest.fixture
 def stub_chat(monkeypatch: pytest.MonkeyPatch) -> None:
-    # If (and only if) the broker BUILDS, a canned reply keeps the route off the network — so a route
-    # that fails to thread the posture returns 200, not a network 502. That makes the 503-vs-not signal
-    # crisp for the falsification below.
+    # If (and only if) the broker BUILDS, a canned reply keeps the route off the network, so a route
+    # that built it returns 200, not a network 502. That makes the 503-vs-not signal crisp.
     def fake_chat(self: AiBroker, prompt: str) -> str:
         return "def handle(msg): return Send('OB', msg)"
 
     monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
 
 
-async def test_ai_chat_route_refuses_cleartext_under_enforcing_phi(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, stub_chat: None
+@pytest.mark.parametrize(
+    "enforcement", [SecurityEnforcement.ENFORCE, SecurityEnforcement.WARN], ids=["enforce", "warn"]
+)
+async def test_ai_chat_route_refuses_cleartext_with_the_escape_set(
+    enforcement: SecurityEnforcement,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_chat: None,
 ) -> None:
-    # Through the REAL route, an enforcing instance with the escape set refuses to build the broker
-    # over a cleartext-http endpoint, so the route answers 503 and the stubbed chat never runs.
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    app = create_app(engine, ai_settings=_managed_ai(endpoint=_HTTP_ENDPOINT), allow_no_auth=True)
-    async with _client(app) as c:
-        r = await c.post("/ai/chat", json={"prompt": "hi"})
-    assert r.status_code == 503
-
-
-async def test_ai_chat_route_refuses_cleartext_with_the_escape_at_warn(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, stub_chat: None
-) -> None:
-    # Vault BACKLOG #3533 item 5: the escape at warn released the api_key over http until then, and
-    # this route answered 200. Every call sends the key, so no posture releases it now.
+    # Through the REAL route, the broker is never built over a cleartext-http endpoint, so the route
+    # answers 503 and the stubbed chat never runs. Vault BACKLOG #3533 item 5: at warn the escape
+    # released the api_key over http until then, and this route answered 200.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     app = create_app(
         engine,
         ai_settings=_managed_ai(endpoint=_HTTP_ENDPOINT),
-        security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+        security_settings=SecuritySettings(enforcement=enforcement),
         allow_no_auth=True,
     )
     async with _client(app) as c:
@@ -300,11 +293,11 @@ async def test_ai_chat_route_refuses_cleartext_with_the_escape_at_warn(
     assert r.status_code == 503
 
 
-async def test_ai_chat_route_allows_https_under_enforcing_phi(
+async def test_ai_chat_route_allows_https(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, stub_chat: None
 ) -> None:
-    # Companion control: the SAME enforcing-PHI + escape setup over an HTTPS endpoint is NOT 503 — so the
-    # 503 above is the cleartext clamp, not a blanket refusal of the route.
+    # Companion control: the same setup over an HTTPS endpoint is NOT 503, so the 503 above is the
+    # cleartext refusal, not a blanket refusal of the route.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     app = create_app(engine, ai_settings=_managed_ai(endpoint=_HTTPS_ENDPOINT), allow_no_auth=True)
     async with _client(app) as c:

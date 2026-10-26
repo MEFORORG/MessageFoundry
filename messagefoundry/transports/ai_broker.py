@@ -47,7 +47,6 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
 
@@ -62,6 +61,7 @@ from messagefoundry.transports.rest import (
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
     from messagefoundry.config.settings import AiSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 __all__ = [
     "AiBroker",

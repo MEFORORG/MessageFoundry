@@ -1099,9 +1099,10 @@ def http_credentials_sent(
     static = settings.get("headers")
     if isinstance(static, Mapping):
         for name, value in static.items():
-            if _is_secret_header(str(name), value):
+            key = str(name)
+            if _is_secret_header(key, value):
                 sent.append(f"{name} header")
-            elif str(name).strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+            elif key.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
                 sent.append(f"{name} header, which is not on the verify-off header allowlist")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):

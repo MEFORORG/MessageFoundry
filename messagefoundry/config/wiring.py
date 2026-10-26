@@ -1648,7 +1648,9 @@ def _is_secret_header(name: str, value: object = None) -> bool:
 
     **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
     reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
-    #3230), so narrowing it narrows that no-escape refusal too.
+    #3230). Since vault BACKLOG #3533 that refusal also takes any name off its own allowlist, so
+    narrowing the NAME arm here changes only how a refused header is labelled; narrowing the VALUE
+    arm narrows the refusal for the allowlisted names.
     """
     if _looks_like_a_credential_value(value):
         return True
