@@ -137,9 +137,10 @@ class ApiHandshakeRecord:
     this object. Serve keeps this object so it can call :meth:`close` once uvicorn returns, and
     what the trailing line still held is logged rather than lost with the loop.
 
-    A client refusing the engine's own auto-minted certificate (ADR 0172), such as a browser before
-    the operator trusts it, is counted and logged at WARNING too. Kept at WARNING by owner ruling
-    2026-10-26 (vault BACKLOG #3785 item 6): the throttle bounds it.
+    A client refusing the engine's own auto-minted certificate (ADR 0172) with a TLS alert, such as
+    a browser before the operator trusts it, is counted and logged at WARNING too. Kept at WARNING
+    by owner ruling 2026-10-26 (vault BACKLOG #3785 item 6): the throttle bounds it. A client that
+    refuses by closing the socket with no alert looks like a hang-up and is not counted.
     """
 
     def __init__(self, ctx: ssl.SSLContext) -> None:

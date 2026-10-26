@@ -672,6 +672,25 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
     assert captured == []
 
 
+async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -> None:
+    """stop() closes the SCP's counter, so the next start() must open it again or count nothing."""
+    captured: list[bytes] = []
+    scp = _build_scp(captured, **_tls_settings(tmp_path))
+
+    async def handler(data: bytes) -> str | None:
+        captured.append(data)
+        return "mid-1"
+
+    await scp.start(handler)
+    await scp.stop()
+    await scp.start(handler)
+    try:
+        await _plaintext_peer(scp.sockport)
+        await _until(lambda: scp.tls_handshake_failures == 1)
+    finally:
+        await scp.stop()
+
+
 # --- The pins ------------------------------------------------------------------------------------
 
 

@@ -34,9 +34,10 @@ protocol class is replaced.
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
   counted there. Where a listener runs its own handshakes, it still counts that case itself: the
-  MLLP listener on the stdlib loop, and the DICOM SCP always. A wrong certificate, a missing
-  client certificate, a protocol downgrade and plaintext on a TLS port all raise, so all are
-  counted.
+  MLLP listener on the stdlib loop, and the DICOM SCP always. A certificate the client refuses
+  with a TLS alert, a missing client certificate, a protocol downgrade and plaintext on a TLS
+  port all raise, so all are counted. A client that refuses a certificate by closing the socket
+  with no alert, as asyncio's own client does, looks like a hang-up and is not counted.
 * **A peer that hangs up mid-handshake. A known limit, declined by owner ruling 2026-10-26 (vault
   BACKLOG #3785 item 8).** Not counted on any surface, as on MLLP since #2613: that is what a load
   balancer's TCP health check does.
@@ -151,10 +152,10 @@ class HandshakeFailures:
     listener keeps its counter alive and not the other way round. The reason is
     a count and a cause from :func:`handshake_cause`, never the peer's bytes.
 
-    Each method that counts or reports runs on the listener's event loop, and a caller on another
-    thread hands a failure over with ``loop.call_soon_threadsafe``. :meth:`open`, :meth:`close`
-    and :meth:`take_held` need no running loop, so the API can log what was held after uvicorn's
-    loop is gone.
+    Each method that counts or reports runs on the listener's event loop, as does :meth:`open`.
+    A caller on another thread hands a failure over with ``loop.call_soon_threadsafe``.
+    :meth:`close` and :meth:`take_held` need no running loop, so the API can log what was held
+    after uvicorn's loop is gone.
     """
 
     def __init__(self, emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None]) -> None:
@@ -185,11 +186,15 @@ class HandshakeFailures:
         if last is None or now - last >= EVENT_SECONDS:
             self._disarm()
             return True
+        self._arm(last, now)
+        return False
+
+    def _arm(self, last: float, now: float) -> None:
+        """Arm the trailing timer for the window that started at ``last``, unless it is armed."""
         if self._timer is None:
             self._timer = asyncio.get_running_loop().call_later(
-                last + EVENT_SECONDS - now, self._on_timer
+                max(0.0, last + EVENT_SECONDS - now), self._on_timer
             )
-        return False
 
     def take_held(self) -> tuple[str | None, str] | None:
         """Mark the failures not yet reported as reported, and return the report for them.
@@ -235,8 +240,12 @@ class HandshakeFailures:
         self.note_soon(None, cause)
 
     def open(self) -> None:
-        """At a listener's start(): count again."""
+        """At a listener's start(): count again. A failure still held, because the stop() before
+        it never flushed, gets its trailing timer back, so it is not stranded until the next
+        failure. That needs the running loop, which start() has."""
         self._closed = False
+        if self.count > self._reported and self._reported_at is not None:
+            self._arm(self._reported_at, time.monotonic())
 
     def close(self) -> None:
         """First thing in a listener's stop(): count nothing more, so stop() aborting a handshake is

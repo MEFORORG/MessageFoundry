@@ -242,7 +242,7 @@ async def test_note_soon_throttles_as_note_does() -> None:
 async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
     """A failure that arrives once the window has passed, before the trailing timer has fired (an
     I/O callback runs before a due timer in one loop iteration), reports everything held. The old
-    timer must not fire a second report inside the new window, and cancel() must reach the next."""
+    timer must not fire a second report inside the new window, and close() must reach the next."""
     sent: list[tuple[str | None, str]] = []
 
     async def emit(peer_host: str | None, reason: str) -> None:
@@ -255,7 +255,8 @@ async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
     stale = failures._timer
     assert stale is not None
     assert failures._reported_at is not None
-    failures._reported_at -= 61.0  # the window has passed, and the timer has not run yet
+    # The window has passed, and the timer has not run yet.
+    failures._reported_at -= tls_handshake_failures.EVENT_SECONDS + 1
     failures.note_soon(None, "SSLError")
     assert stale.cancelled()
     await _until(lambda: len(sent) == 2, "the due report was not sent")
@@ -325,6 +326,23 @@ async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
     failures.close()
     await failures.flush()
     assert len(sent) == 2 and sent[1].endswith("SSLError B")
+
+
+async def test_a_failure_held_across_an_unflushed_stop_is_reported_after_the_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop() that closes the counter and never flushes, such as one the runner cancels, leaves
+    a failure held with its timer disarmed. open() arms the timer again, so the restarted
+    listener reports it once the window ends rather than with some later failure."""
+    monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.2)
+    sent: list[str] = []
+    failures = HandshakeFailures(lambda _peer, reason: sent.append(reason))
+    failures.note_soon(None, "SSLError A")  # reported at once
+    failures.note_soon(None, "SSLError B")  # held
+    failures.close()  # the stop() that never reached flush()
+    failures.open()
+    await _until(lambda: len(sent) == 2, "the held failure was stranded")
+    assert sent[1].endswith("SSLError B")
 
 
 # --- a listener is freed by refcounting (vault BACKLOG #3785 item 1) ---------------------------
