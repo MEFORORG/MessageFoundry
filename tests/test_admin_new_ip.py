@@ -39,9 +39,11 @@ from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
     _NEW_IP_PER_SESSION_MAX,
+    _NEW_IP_TEXT_MAX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
+    _bounded_address_text,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -473,6 +475,98 @@ async def test_a_failed_audit_write_does_not_mark_the_address_reported(
         monkeypatch.setattr(service, "_audit", real_audit)
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         assert await _new_ip_rows(store) == ["10.2.2.2"]
+    finally:
+        await store.close()
+
+
+#: The longest text :func:`_bounded_address_text` returns: a 24-character prefix, ``...sha256:``
+#: and a 64-hex digest. Pinned here rather than derived, so a change to the form is seen.
+_BOUNDED_TEXT_CEILING = 98
+
+
+def _long_address(n: int) -> str:
+    """Caller-supplied text that does not parse as an address. Every one shares a prefix far past the
+    bound and differs only at the end, so a naive truncation would fold them all into one key."""
+    return "x" * 200 + f"-{n}"
+
+
+def test_bounded_address_text_keeps_addresses_and_bounds_the_rest() -> None:
+    """RED when: a valid address is rewritten, two long strings sharing a prefix collide, or long
+    text comes back unbounded (BACKLOG #3772)."""
+    longest_ipv6 = "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255"
+    assert len(longest_ipv6) == 45
+    for address in ("10.2.2.2", "::1", "2001:db8::1", longest_ipv6, "", "not-an-address"):
+        assert _bounded_address_text(address) == address
+    at_bound = "y" * _NEW_IP_TEXT_MAX
+    assert _bounded_address_text(at_bound) == at_bound
+    bounded = [_bounded_address_text(_long_address(n)) for n in range(3)]
+    assert len(set(bounded)) == 3
+    assert all(_NEW_IP_TEXT_MAX < len(b) <= _BOUNDED_TEXT_CEILING for b in bounded)
+    assert _bounded_address_text(_long_address(0)) == bounded[0]
+    # A lone surrogate, which plain UTF-8 refuses, still bounds.
+    assert len(_bounded_address_text("\ud800" * 500)) <= _BOUNDED_TEXT_CEILING
+    # An IPv6 zone id is unbounded text inside a valid address, so it is bounded too.
+    assert len(_bounded_address_text("fe80::1%" + "z" * 500)) <= _BOUNDED_TEXT_CEILING
+
+
+async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: ``_new_ip_seen`` holds the raw caller text, or the past-cap row, its client column
+    or the past-cap log line carries it unbounded (BACKLOG #3772). The texts share a long prefix, so
+    the test also fails if the bound folds distinct texts into one key."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        texts = [_long_address(n) for n in range(_NEW_IP_PER_SESSION_MAX + 2)]
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for seen in texts:
+                assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        keys = service._new_ip_seen[hash_token(token)]
+        assert len(keys) == _NEW_IP_PER_SESSION_MAX + 1
+        assert all(len(k) <= _BOUNDED_TEXT_CEILING for k in keys)
+        rows = await store.list_audit(action="auth.new_address_reverify_required", limit=100)
+        assert len(rows) == _NEW_IP_PER_SESSION_MAX + 1
+        seen_ips = {json.loads(str(r["detail"]))["seen_ip"] for r in rows}
+        assert seen_ips == {_bounded_address_text(t) for t in texts[: _NEW_IP_PER_SESSION_MAX + 1]}
+        capped = [r for r in rows if "cap_reached" in json.loads(str(r["detail"]))]
+        assert len(capped) == 1
+        assert json.loads(str(capped[0]["detail"]))["seen_ip"] == _bounded_address_text(
+            texts[_NEW_IP_PER_SESSION_MAX]
+        )
+        assert all(len(str(r["client"])) <= _BOUNDED_TEXT_CEILING for r in rows)
+        over = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
+        ]
+        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
+            _bounded_address_text(texts[-1])
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_failed_audit_write_discards_the_bounded_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the key the ``finally`` discards is not the bounded key the dedupe added, so a long
+    address whose row failed stays marked as reported (BACKLOG #3772, #2159)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+
+        async def failing_audit(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("transient store fault")
+
+        monkeypatch.setattr(service, "_audit", failing_audit)
+        with pytest.raises(RuntimeError):
+            await service.flag_new_client_ip(token, _long_address(0), path="/users")
+        assert service._new_ip_seen[hash_token(token)] == set()
     finally:
         await store.close()
 

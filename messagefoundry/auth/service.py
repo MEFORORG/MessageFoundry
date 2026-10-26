@@ -125,6 +125,7 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     credential_id_hash_scheme,
+    hash_bytes,
     hash_token,
     mint_token,
 )
@@ -475,6 +476,16 @@ _NEW_IP_DEDUP_MAX = 4096
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
 
+# BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
+# keys, its audit row and its past-cap log line. Every IPv4 or IPv6 address without a zone id fits,
+# the longest being 45 characters; only text that does not parse, or an IPv6 address with a long zone
+# id, is longer. That text is caller-supplied on a proxied hop, and without a bound each session could
+# hold nine copies of it. Longer text keeps a short prefix and gains the SHA-256 of the whole, so two
+# long strings that share the prefix stay distinct. The replacement is longer than this bound, so it
+# can never equal text kept as it is.
+_NEW_IP_TEXT_MAX = 64
+_NEW_IP_TEXT_PREFIX = 24
+
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
 # one primary-key lookup. An address last seen before this window reads as NEW -- the signal answers
@@ -546,6 +557,21 @@ def _host_key(address: str) -> str:
     if parsed.is_loopback:
         return "::1"
     return str(parsed)
+
+
+def _bounded_address_text(address: str) -> str:
+    """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
+    and the SHA-256 of the whole (BACKLOG #3772).
+
+    The same input always gives the same output, so it serves as a dedupe key. Only the new-address
+    signal uses it; :func:`_host_key` stays unbounded, because the persisted known-address record
+    and :meth:`AuthService._same_host` compare by it."""
+    if len(address) <= _NEW_IP_TEXT_MAX:
+        return address
+    # surrogatepass: an ASGI client string may carry a lone surrogate, which plain UTF-8 refuses.
+    # The encoding is injective, so distinct text still gives distinct digests.
+    digest = hash_bytes(address.encode("utf-8", "surrogatepass"))
+    return f"{address[:_NEW_IP_TEXT_PREFIX]}...sha256:{digest}"
 
 
 #: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
@@ -12182,7 +12208,12 @@ class AuthService:
             return False
         if self._same_host(client_ip, session.client):
             return False
-        seen_key = _host_key(client_ip)
+        # Bounded at intake (BACKLOG #3772), so the dedupe sets hold bounded text. The same value is
+        # added below and discarded in the ``finally``.
+        seen_key = _bounded_address_text(_host_key(client_ip))
+        # What the row and the past-cap log line carry: a valid address unchanged, so a search by
+        # address still finds the row (vault BACKLOG #3197), and anything longer bounded.
+        seen_text = _bounded_address_text(client_ip)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
         # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
@@ -12203,13 +12234,13 @@ class AuthService:
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
                 _NEW_IP_PER_SESSION_MAX,
                 path,
-                scrub_log_argument(client_ip),
+                scrub_log_argument(seen_text),
             )
             return True
         detail: dict[str, object] = {
             "path": path,
             "known_ip": session.client,
-            "seen_ip": client_ip,
+            "seen_ip": seen_text,
         }
         if flag == "audit_cap_reached":
             # The last row before the session re-verifies, so it says why the next new address
@@ -12225,7 +12256,7 @@ class AuthService:
                 "auth.new_address_reverify_required",
                 actor=username,
                 detail=_json(detail),
-                client=client_ip,
+                client=seen_text,
             )
             written = True
         finally:
