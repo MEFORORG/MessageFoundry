@@ -436,12 +436,11 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     assert "static header outside the verify-off allowlist (X-Session)" in message
     assert "its credentials (" not in message  # a header refused for its name is not a credential
     assert "Or remove the header" in message  # the one listed item that removal can clear
-    # It names places the refusal cannot see, never the whole url: it does see a credential-named
-    # parameter in the url's &-joined query.
-    assert "Moving the secret is not a fix." in message
+    # It names the places the refusal cannot see, never the whole url: it does see a
+    # credential-named query parameter.
     assert (
-        "cannot see at least a secret in the url path, under a neutral query name, under an "
-        "allowed header name or in a dynamic header" in message
+        "Moving a secret into the url path, a query parameter with a neutral name or a dynamic "
+        "header is not a fix" in message
     )
     _assert_credential_refusal(exc)
 

@@ -1094,8 +1094,7 @@ def http_credentials_sent(
     CONNECT, not across this hop.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here, nor a secret in the path of ``url`` or under a neutral query name, nor an opaque
-    secret under an allowlisted header name. docs/SECURITY-LOOSENING.md lists at least those among
+    not seen here, nor a secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists both among
     the hops the rule does not reach."""
     # Lazy: both import config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
@@ -1180,9 +1179,9 @@ def refuse_verify_off(
         # engine judges the hop again as a credential-less verify-off hop, which may still refuse.
         removal = (
             f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
-            "credential, which its own posture and levers may still refuse. Moving the secret is "
-            "not a fix. This refusal cannot see at least a secret in the url path, under a "
-            "neutral query name, under an allowed header name or in a dynamic header."
+            "credential, which its own posture and levers may still refuse. Moving a secret into "
+            "the url path, a query parameter with a neutral name or a dynamic header is not a "
+            "fix: this refusal cannot see a secret there."
             if not secrets
             else ""
         )
