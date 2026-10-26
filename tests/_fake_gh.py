@@ -7,7 +7,9 @@ Run as a script, it answers the few REST routes the scripts use from a JSON stat
 comments. Every call is appended to the state's ``calls``, so a test can prove a path made none.
 State knobs: ``fail`` (every call exits 1, a network failure), ``fail_post`` (only POSTs fail),
 ``fail_match`` (a call with an argument containing that text fails), ``hang`` (sleep that many
-seconds before answering).
+seconds before answering), ``after_match`` (once a call with an argument containing its
+``match`` has answered, post its ``record`` to the vault and delete the file ``remove``: a
+concurrent flusher posting a spooled record).
 
 ``Sandbox`` puts a ``gh.ps1`` shim first on PATH. PowerShell resolves a ``.ps1`` on PATH itself and
 passes argv through untouched, so the scripts under test call it exactly as they call the real gh.
@@ -91,6 +93,11 @@ DECISION_MARKER = "<!-- mefor-decision v1 -->"
 def seed_vault(sb: Sandbox, records: list[dict[str, Any]]) -> None:
     """Post records straight into the fake vault, as decision.ps1 would: one issue per UTC day."""
     state = sb.state
+    _post_records(state, records)
+    sb.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _post_records(state: dict[str, Any], records: list[dict[str, Any]]) -> None:
     store = state.setdefault("repos", {}).setdefault(VAULT, {"issues": [], "labels": []})
     for r in records:
         title = f"decision-log {id_day(r['id'])}"
@@ -105,7 +112,6 @@ def seed_vault(sb: Sandbox, records: list[dict[str, Any]]) -> None:
             store["issues"].append(issue)
         body = f"{DECISION_MARKER}\nheader\n\n```json\n{json.dumps(r, indent=2)}\n```"
         issue["comments"].append({"id": len(issue["comments"]) + 1, "body": body})
-    sb.state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 def no_host_usage(sb: Sandbox, args: tuple[str, ...]) -> tuple[str, ...]:
@@ -117,15 +123,18 @@ def no_host_usage(sb: Sandbox, args: tuple[str, ...]) -> tuple[str, ...]:
     return with_default(args, "-ThresholdsFile", str(folder / "thresholds.json"))
 
 
-def write_fake_usage(path: Path, doc: dict[str, Any] | str, code: int = 0) -> Path:
+def write_fake_usage(
+    path: Path, doc: dict[str, Any] | str, code: int = 0, prelude: str = ""
+) -> Path:
     """A stand-in for usage.ps1 that prints ``doc`` as its -Json answer and exits ``code``.
 
     decision.ps1 and digest.ps1 take it as -UsageScript, so a test never reads the host account's
-    real usage files, and the cost rung answers what the test wrote.
+    real usage files, and the cost rung answers what the test wrote. ``prelude`` is PowerShell run
+    first, for a test that acts while the gate waits on the reader.
     """
     text = doc if isinstance(doc, str) else json.dumps(doc)
     # A literal here-string, so nothing in the JSON is expanded.
-    path.write_text(f"Write-Output @'\n{text}\n'@\nexit {code}\n", encoding="utf-8")
+    path.write_text(f"{prelude}Write-Output @'\n{text}\n'@\nexit {code}\n", encoding="utf-8")
     return path
 
 
@@ -214,6 +223,13 @@ def main(argv: list[str]) -> int:
     )
     state.setdefault("calls", []).append(argv)
     code, out, err = _answer(state, argv)
+    hook = state.get("after_match")
+    if hook and any(hook["match"] in a for a in argv):
+        # A concurrent flusher, once this call has answered: it posts the spooled record and only
+        # then deletes its spool file, as Send-DecisionSpool does. It fires once.
+        del state["after_match"]
+        _post_records(state, [hook["record"]])
+        Path(hook["remove"]).unlink()
     state_path.write_text(json.dumps(state), encoding="utf-8")
     sys.stdout.write(out)
     sys.stderr.write(err)
@@ -253,8 +269,13 @@ class Sandbox:
     def coord(self) -> Path:
         return self.repo / ".git" / "mefor-coord"
 
+    @property
+    def spool_dir(self) -> Path:
+        """_decisionlog.ps1's Get-DecisionSpoolDir in the sandbox."""
+        return self.coord / "decisions" / "spool"
+
     def spool(self) -> list[Path]:
-        d = self.coord / "decisions" / "spool"
+        d = self.spool_dir
         return sorted(d.iterdir()) if d.is_dir() else []
 
     def env(self, **extra: str) -> dict[str, str]:

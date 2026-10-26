@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -638,15 +639,20 @@ def test_a_gate_that_hangs_leaves_the_record_spooled(sb: Sandbox, tmp_path: Path
     """The usage reader never answers. While the gate waits on it, the record is already spooled,
     and a flusher leaves it there rather than post its PENDING gate for good."""
     started, stop = tmp_path / "usage-started", tmp_path / "usage-stop"
+    # The reader blocks until the test releases it, and the gate is told to wait far longer than
+    # the test takes, so no check races the default 30-second wait however slow the runner. The
+    # reader's own cap only stops an orphan if the test process dies.
     _usage_path(sb).write_text(
         f"Set-Content -LiteralPath '{started}' -Value started\n"
-        "$until = (Get-Date).AddSeconds(120)\n"
+        "$until = (Get-Date).AddSeconds(1800)\n"
         f"while (-not (Test-Path -LiteralPath '{stop}') -and (Get-Date) -lt $until) "
         "{ Start-Sleep -Milliseconds 200 }\n",
         encoding="utf-8",
     )
     proc = subprocess.Popen(
-        sb.argv(DECISION, *no_host_usage(sb, (*LOG_B, "-Class", "B"))),
+        sb.argv(
+            DECISION, *no_host_usage(sb, (*LOG_B, "-Class", "B", "-UsageTimeoutSeconds", "300"))
+        ),
         cwd=str(sb.repo),
         env=sb.env(),
         stdout=subprocess.DEVNULL,
@@ -661,30 +667,137 @@ def test_a_gate_that_hangs_leaves_the_record_spooled(sb: Sandbox, tmp_path: Path
         (row,) = _spooled(sb)
         assert (row["kind"], row["item"], row["gate"]) == ("decision", "4242", "PENDING")
         flush = sb.run(DECISION, "-Flush")
-        assert "FLUSHED posted=0 failed=0" in flush.stdout, (flush.stdout, flush.stderr)
+        # Held, and said so: a flush that posts nothing must not read as one with nothing to post.
+        assert "FLUSHED posted=0 failed=0 held=1 skipped=0" in flush.stdout, (
+            flush.stdout,
+            flush.stderr,
+        )
+        assert flush.returncode == 0, flush.stderr
         assert [r["id"] for r in _spooled(sb)] == [row["id"]]
+        assert proc.poll() is None, "the gate stopped waiting while the test was still checking"
     finally:
         stop.write_text("stop", encoding="utf-8")
         proc.kill()
         proc.wait(timeout=30)
 
 
+def _halt_after(sb: Sandbox, action: str) -> None:
+    """A usage reader that runs ``action`` on the spooled record ``$f`` while the gate waits on
+    it, then reads HALT."""
+    write_fake_usage(
+        _usage_path(sb),
+        usage(95.0, state="WARN"),
+        prelude=(
+            f"$f = Get-ChildItem -LiteralPath '{sb.spool_dir}' -Filter '*.json' "
+            f"| Select-Object -First 1\n{action}\n"
+        ),
+    )
+
+
 def test_a_record_claimed_before_the_gate_answers_stays_pending(sb: Sandbox) -> None:
     """A flusher claims the record while the gate runs: the answer cannot be written into it, so
     it keeps gate PENDING, which counts toward the floor, and -Log says so."""
-    spool = sb.coord / "decisions" / "spool"
-    _usage_path(sb).write_text(
-        f"$f = Get-ChildItem -LiteralPath '{spool}' -Filter '*.json' | Select-Object -First 1\n"
-        "Rename-Item -LiteralPath $f.FullName -NewName ($f.Name + '.99999.posting')\n"
-        f"Write-Output @'\n{json.dumps(usage(95.0, state='WARN'))}\n'@\n",
-        encoding="utf-8",
-    )
+    _halt_after(sb, "Rename-Item -LiteralPath $f.FullName -NewName ($f.Name + '.99999.posting')")
     proc = _log(sb)
     assert proc.returncode == HALT, (proc.stdout, proc.stderr)
     assert "could not be rewritten" in proc.stderr and "says gate PENDING" in proc.stderr
     (claim,) = sb.spool()
     assert claim.name.endswith(".json.99999.posting"), sb.spool()
     assert json.loads(claim.read_text(encoding="utf-8"))["gate"] == "PENDING"
+
+
+def test_a_gate_answer_that_cannot_be_written_down_is_still_reported(sb: Sandbox) -> None:
+    """The rewrite's part file cannot be written (a directory holds its name, as a full disk or
+    an AV lock would refuse it). The gate has answered, so -Log reports HALT rather than throw,
+    and the record keeps gate PENDING."""
+    _halt_after(
+        sb,
+        "$owner = (Get-Process -Id $PID).Parent.Id\n"
+        "$null = New-Item -ItemType Directory -Path ($f.FullName + '.' + $owner + '.tmp')",
+    )
+    proc = _log(sb)
+    assert proc.returncode == HALT, (proc.stdout, proc.stderr)
+    lines = proc.stdout.split("\n")
+    assert lines[0].startswith("LOGGED ") and lines[1] == "GATE HALT", proc.stdout
+    assert "its new copy could not be written" in proc.stderr, proc.stderr
+    assert "says gate PENDING" in proc.stderr
+    (row,) = _spooled(sb)
+    assert row["gate"] == "PENDING"
+
+
+def _spool_write(sb: Sandbox, record: dict[str, Any]) -> Path:
+    """A record spooled as decision.ps1 spools it, <id>.json."""
+    sb.spool_dir.mkdir(parents=True, exist_ok=True)
+    path = sb.spool_dir / f"{record['id']}.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_a_record_a_flusher_posts_during_the_read_still_counts(sb: Sandbox) -> None:
+    """Three unsampled Class B decisions on the item are spooled. A concurrent flusher posts the
+    third once the gate has listed the vault's issues, then deletes its spool file. Its day had no
+    issue at the listing, so the vault read misses it; the spool, read first, still holds it."""
+    seed_vault(sb, calibrated("manager"))
+    recent = [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(3)]
+    paths = [_spool_write(sb, r) for r in recent]
+    sb.set_state(
+        after_match={"match": "labels=decision-log", "record": recent[2], "remove": str(paths[2])}
+    )
+    code, doc = gate(sb)
+    assert "after_match" not in sb.state, "the stand-in flusher never ran"
+    assert not paths[2].exists()
+    assert code == REVIEW and "chain: depth 3" in why(doc), why(doc)
+
+
+def test_an_unreadable_spool_file_fails_the_gate_closed(sb: Sandbox) -> None:
+    """It may hold a record the gate must count, so the read is incomplete, as a failed vault
+    read is, rather than a quiet drop."""
+    seed_vault(sb, calibrated("manager"))
+    _spool_write(sb, rec(at=ago(minutes=5), item="4242")).write_text("{not json", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "not fully read" in why(doc), why(doc)
+    assert "unreadable spool file" in why(doc)
+    listed = sb.run(DECISION, "-List", "-Json")
+    assert listed.returncode == 4 and "INCOMPLETE" in listed.stderr, listed.stderr
+
+
+def test_a_pending_record_whose_post_failed_is_not_held_again(sb: Sandbox) -> None:
+    """Its gate died 15 minutes ago, so a flush takes it; the post fails, and the claim goes back
+    with the claim's fresh write time. The hold reads the id's age, not that stamp, so the next
+    flush posts it rather than hold it for another ten minutes."""
+    old = rec(at=ago(minutes=15), item="4242", gate="PENDING")
+    path = _spool_write(sb, old)
+    aged = ago(minutes=15).timestamp()
+    os.utime(path, (aged, aged))
+    sb.set_state(fail_post=True)
+    first = sb.run(DECISION, "-Flush")
+    assert "FLUSHED posted=0 failed=1 held=0" in first.stdout, (first.stdout, first.stderr)
+    assert path.exists(), "a failed post left the spool"
+    sb.set_state(fail_post=False)
+    second = sb.run(DECISION, "-Flush")
+    assert "FLUSHED posted=1 failed=0 held=0" in second.stdout, (second.stdout, second.stderr)
+
+
+def test_a_spool_file_that_cannot_be_claimed_is_reported(sb: Sandbox) -> None:
+    """On Windows another process holds it open; elsewhere the spool refuses the rename. Either
+    way it stays spooled, and -Flush names it and exits 4 rather than print a clean nothing."""
+    path = _spool_write(sb, rec(at=ago(minutes=30), item="4242"))
+    if sys.platform == "win32":
+        # Python opens without delete sharing, so the claim's rename meets a sharing violation.
+        with path.open("rb"):
+            flush = sb.run(DECISION, "-Flush")
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root renames in a read-only directory; nothing is shown")
+        path.parent.chmod(0o555)
+        try:
+            flush = sb.run(DECISION, "-Flush")
+        finally:
+            path.parent.chmod(0o755)
+    assert flush.returncode == 4, (flush.stdout, flush.stderr)
+    assert "FLUSHED posted=0 failed=0 held=0 skipped=1" in flush.stdout, flush.stdout
+    assert f"{path.name}: could not be claimed to post" in flush.stderr, flush.stderr
+    assert path.exists()
 
 
 def test_ids_and_days_are_gregorian_under_a_thai_culture() -> None:

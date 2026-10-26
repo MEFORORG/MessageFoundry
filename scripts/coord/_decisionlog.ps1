@@ -249,22 +249,68 @@ function Read-DecisionIssue {
     return $out.ToArray()
 }
 
+function Test-DecisionSpoolName([string]$Path) {
+    # A spooled record is <id>.json, or <id>.json.<pid>.posting while a flusher posts it; it is
+    # unposted until the claim goes. <id>.json.<pid>.tmp is a part file no reader takes.
+    return ($Path.EndsWith('.json') -or $Path.EndsWith('.posting'))
+}
+
+function Get-DecisionSpoolId([string]$Name) {
+    # The record id a spool file name starts with, or '' for a name that is not one.
+    $at = $Name.IndexOf('.json')
+    if ($at -lt 1) { return '' }
+    return $Name.Substring(0, $at)
+}
+
+function Read-DecisionSpoolFile([string]$Dir, [string]$Path) {
+    <#
+      One spooled record, $null when it has left the spool, and a throw when it cannot be read. A
+      flusher renames a file as it claims it, renames it back when a post fails, and deletes it only
+      once the post is answered. So a file that vanishes is looked for again under its id: a
+      record still spooled under another name is read there, and one with no name left was posted
+      before this looked, so the vault read that follows holds it.
+    #>
+    $id = Get-DecisionSpoolId ([System.IO.Path]::GetFileName($Path))
+    $tries = @($Path)
+    for ($round = 1; $round -le 5; $round++) {
+        foreach ($t in $tries) {
+            try { $text = Read-DecisionSpoolText $t }
+            catch [System.IO.FileNotFoundException] { continue }
+            $rec = $text | ConvertFrom-Json -ErrorAction Stop
+            if ($rec -isnot [System.Management.Automation.PSCustomObject]) { throw 'it holds no JSON object' }
+            return $rec
+        }
+        $tries = @([System.IO.Directory]::GetFiles($Dir, "$id.json*") | Where-Object { Test-DecisionSpoolName $_ })
+        if (-not $tries.Count) { return $null }
+    }
+    throw "it moved each time it was read"
+}
+
 function Read-DecisionSpool([string]$CoordRoot) {
+    <#
+      Every spooled record, and an error per file that could not be read. A caller counts an error
+      as an incomplete read: the file may hold a record the gate must count.
+    #>
     $out = [System.Collections.Generic.List[object]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
-    if (-not [System.IO.Directory]::Exists($dir)) { return }
-    foreach ($f in [System.IO.Directory]::EnumerateFiles($dir)) {
-        # A file being posted right now is <id>.json.<pid>.posting; it is still unposted until it goes.
-        if (-not ($f.EndsWith('.json') -or $f.EndsWith('.posting'))) { continue }
+    $files = @()
+    if ([System.IO.Directory]::Exists($dir)) {
+        try { $files = [System.IO.Directory]::GetFiles($dir) }
+        catch { $errors.Add("the spool $dir could not be listed: $($_.Exception.Message)") }
+    }
+    foreach ($f in @($files | Where-Object { Test-DecisionSpoolName $_ })) {
         try {
-            $rec = Complete-DecisionRecord (Read-DecisionSpoolText $f | ConvertFrom-Json -ErrorAction Stop)
+            $raw = Read-DecisionSpoolFile $dir $f
+            if ($null -eq $raw) { continue }
+            $rec = Complete-DecisionRecord $raw
             $rec | Add-Member -NotePropertyName posted -NotePropertyValue $false -Force
             $out.Add($rec)
         } catch {
-            [Console]::Error.WriteLine("decision log: unreadable spool file ${f}: $($_.Exception.Message)")
+            $errors.Add("unreadable spool file ${f}: $($_.Exception.Message)")
         }
     }
-    return $out.ToArray()
+    return [pscustomobject]@{ Records = $out.ToArray(); Errors = $errors }
 }
 
 function Read-DecisionSpoolText([string]$Path) {
@@ -277,17 +323,21 @@ function Read-DecisionSpoolText([string]$Path) {
     }
 }
 
-function Write-DecisionSpoolPart([string]$CoordRoot, $Record) {
-    # The record as <id>.json.<pid>.tmp beside its final name, which no reader or flusher takes.
-    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$($Record.id).json"
-    $part = "$final.$PID.tmp"
-    [System.IO.File]::WriteAllText($part, ($Record | ConvertTo-Json -Depth 8 -Compress), [System.Text.UTF8Encoding]::new($false))
-    return [pscustomobject]@{ Part = $part; Final = $final }
+function Get-DecisionSpoolPaths([string]$CoordRoot, [string]$Id) {
+    # A record's spool name, <id>.json, and its part file <id>.json.<pid>.tmp beside it, which no
+    # reader or flusher takes.
+    $final = Join-Path (Get-DecisionSpoolDir $CoordRoot) "$Id.json"
+    return [pscustomobject]@{ Part = "$final.$PID.tmp"; Final = $final }
+}
+
+function Write-DecisionSpoolPart($Paths, $Record) {
+    [System.IO.File]::WriteAllText($Paths.Part, ($Record | ConvertTo-Json -Depth 8 -Compress), [System.Text.UTF8Encoding]::new($false))
 }
 
 function Write-DecisionSpool([string]$CoordRoot, $Record) {
     $null = [System.IO.Directory]::CreateDirectory((Get-DecisionSpoolDir $CoordRoot))
-    $f = Write-DecisionSpoolPart $CoordRoot $Record
+    $f = Get-DecisionSpoolPaths $CoordRoot ([string]$Record.id)
+    Write-DecisionSpoolPart $f $Record
     [System.IO.File]::Move($f.Part, $f.Final)
 }
 
@@ -298,10 +348,12 @@ function Update-DecisionSpool([string]$CoordRoot, $Record) {
       refuses rather than spool a second copy. On Linux and macOS it checks and then renames, so a
       claim between the two would spool the record twice, which a reader dedups by id; a flusher
       does not claim a fresh PENDING record (Send-DecisionSpool), which keeps that window shut in
-      practice. A lock from a reader is retried briefly.
+      practice. A lock from a reader is retried briefly. It throws when the part file cannot be
+      written; the caller reports that, since the gate has answered by then.
     #>
-    $f = Write-DecisionSpoolPart $CoordRoot $Record
+    $f = Get-DecisionSpoolPaths $CoordRoot ([string]$Record.id)
     try {
+        Write-DecisionSpoolPart $f $Record
         for ($try = 1; $try -le 5; $try++) {
             if (-not [System.IO.File]::Exists($f.Final)) { return $false }
             try {
@@ -314,40 +366,69 @@ function Update-DecisionSpool([string]$CoordRoot, $Record) {
         }
         return $false
     } finally {
-        if ([System.IO.File]::Exists($f.Part)) { [System.IO.File]::Delete($f.Part) }
+        # A part file that cannot be deleted is left: no reader or flusher takes a .tmp name.
+        try { if ([System.IO.File]::Exists($f.Part)) { [System.IO.File]::Delete($f.Part) } } catch { $null = $_ }
     }
 }
 
+# How long a flusher leaves a PENDING record to its gate, and a claim to the flusher that took it.
+$script:DecisionHoldMinutes = 10
+
 function Test-DecisionSpoolPending([System.IO.FileInfo]$File) {
-    # A record whose -Log is still waiting on its gate: PENDING, and written in the last ten
-    # minutes. Posting it now would post PENDING for good. Older, its gate crashed or hung, and it
-    # is posted as it stands. An unreadable file is left to the claim, which reports it.
-    if ($File.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)) { return $false }
+    <#
+      A record whose -Log is still waiting on its gate: PENDING, and minted in the last ten minutes.
+      Posting it now would post PENDING for good. Older, its gate crashed or hung, and it is posted
+      as it stands. The age is the id's own instant, never the file's write time, which a claim
+      stamps and a failed post carries back. A file this cannot read is not held: the claim takes
+      it, and the claim or the post reports it if it still cannot be read.
+    #>
+    $at = Get-DecisionInstant (Get-DecisionSpoolId $File.Name)
+    if ($null -eq $at -or $at -lt [DateTime]::UtcNow.AddMinutes(-$script:DecisionHoldMinutes)) { return $false }
     try { return [string](Read-DecisionSpoolText $File.FullName | ConvertFrom-Json -ErrorAction Stop).gate -eq 'PENDING' }
     catch { return $false }
 }
 
 function Send-DecisionSpool {
     <#
-      Posts every spooled record to its day's issue, oldest first, except one still waiting on its
-      gate (Test-DecisionSpoolPending). Returns the count posted and an error per record left.
+      Posts every spooled record to its day's issue, oldest first. Returns the count Posted, an
+      error per record left (Errors), the count Held, still waiting on its gate
+      (Test-DecisionSpoolPending) for the next -Log or -Flush to post, and an entry per file Skipped
+      because it could not be claimed, such as one another process holds open. A file another
+      flusher claimed first is that flusher's to post, and is none of these.
     #>
     param([string]$Repo, [string]$CoordRoot)
-    $posted = 0; $errors = [System.Collections.Generic.List[string]]::new()
+    $posted = 0; $held = 0
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $skipped = [System.Collections.Generic.List[string]]::new()
     $dir = Get-DecisionSpoolDir $CoordRoot
-    if (-not [System.IO.Directory]::Exists($dir)) { return [pscustomobject]@{ Posted = 0; Errors = $errors } }
-    $stale = [DateTime]::UtcNow.AddMinutes(-10)
-    $files = [System.IO.DirectoryInfo]::new($dir).GetFiles() | Where-Object {
-        ($_.Name.EndsWith('.json') -and -not (Test-DecisionSpoolPending $_)) -or ($_.Name.EndsWith('.posting') -and $_.LastWriteTimeUtc -lt $stale)
-    } | Sort-Object Name
+    $stale = [DateTime]::UtcNow.AddMinutes(-$script:DecisionHoldMinutes)
+    $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    if ([System.IO.Directory]::Exists($dir)) {
+        foreach ($f in [System.IO.DirectoryInfo]::new($dir).GetFiles()) {
+            if ($f.Name.EndsWith('.json')) {
+                if (Test-DecisionSpoolPending $f) { $held++ } else { $files.Add($f) }
+            } elseif ($f.Name.EndsWith('.posting') -and $f.LastWriteTimeUtc -lt $stale) {
+                $files.Add($f)
+            }
+        }
+    }
     $issues = @{}
     $dayFailed = @{}
-    foreach ($f in $files) {
+    foreach ($f in @($files | Sort-Object Name)) {
         # Claim the file by renaming it, so two flushers do not both post it. A claim left by a
         # flusher that died is retaken after ten minutes; a double post then reads once by id.
-        $id = $f.Name.Substring(0, $f.Name.IndexOf('.json'))
+        $id = Get-DecisionSpoolId $f.Name
         $claim = Join-Path $dir "$id.json.$PID.posting"
-        try { [System.IO.File]::Move($f.FullName, $claim) } catch { continue }
+        # A reader holding the file for a moment blocks the rename on Windows, so a refusal is
+        # retried briefly; one that outlasts the retries is a lasting lock, reported as Skipped.
+        $taken = $false; $gone = $false; $why = ''
+        for ($try = 1; $try -le 5 -and -not $taken -and -not $gone; $try++) {
+            try { [System.IO.File]::Move($f.FullName, $claim); $taken = $true }
+            catch [System.IO.FileNotFoundException] { $gone = $true }
+            catch { $why = $_.Exception.Message; Start-Sleep -Milliseconds 100 }
+        }
+        if ($gone) { continue }
+        if (-not $taken) { $skipped.Add("$($f.Name): could not be claimed to post: $why"); continue }
         # A rename keeps the old write time; stamp the claim's own, or a record spooled long ago
         # would look like an abandoned claim the moment it is taken.
         try { [System.IO.File]::SetLastWriteTimeUtc($claim, [DateTime]::UtcNow) } catch { $null = $_ }
@@ -381,14 +462,23 @@ function Send-DecisionSpool {
             try { [System.IO.File]::Move($claim, (Join-Path $dir "$id.json")) } catch { $null = $_ }
         }
     }
-    return [pscustomobject]@{ Posted = $posted; Errors = $errors }
+    return [pscustomobject]@{ Posted = $posted; Errors = $errors; Held = $held; Skipped = $skipped }
 }
 
 function Read-DecisionLog {
-    <# Every record on the given days, from the vault and the local spool, deduplicated by id. #>
+    <#
+      Every record on the given days, from the local spool and the vault, deduplicated by id; the
+      vault's copy wins. THE SPOOL IS READ FIRST. A flusher deletes a spooled record only after its
+      post is answered, so a record that leaves the spool after this read is in the vault before
+      the vault read starts. Read the other way round, a record posted between the two reads
+      would be in neither, and the gate would count one record too few. A spool file that cannot
+      be read makes the read incomplete, as a vault read that fails does.
+    #>
     param([string]$Repo, [string]$CoordRoot, [string[]]$Days)
     $byId = [ordered]@{}
+    $spooled = Read-DecisionSpool $CoordRoot
     $errors = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in $spooled.Errors) { $errors.Add($e) }
     try {
         $map = Get-DecisionDayIssues -Repo $Repo
         foreach ($d in $Days) {
@@ -404,7 +494,7 @@ function Read-DecisionLog {
     } catch {
         $errors.Add($_.Exception.Message)
     }
-    foreach ($rec in (Read-DecisionSpool $CoordRoot)) {
+    foreach ($rec in $spooled.Records) {
         $id = [string]$rec.id
         if ($Days -contains (Get-DecisionIdDay $id) -and -not $byId.Contains($id)) { $byId[$id] = $rec }
     }

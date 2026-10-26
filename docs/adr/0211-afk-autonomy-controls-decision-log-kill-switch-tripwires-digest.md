@@ -40,7 +40,9 @@ Constraints that bound the choice:
 private vault repository's issue titled `decision-log <yyyy-MM-dd>`, labelled `decision-log`. The
 script creates the day's issue on first use. A posted record leaves the spool. A record that
 cannot be posted stays there, and the script says so and exits 4; the next `-Log` or `-Flush`
-posts it. `-NoPost` spools with no network at all, which the tripwire hook needs.
+posts it. A flush holds back only a `PENDING` record whose id is under ten minutes old, since its
+gate is still running (*Where it is enforced* below); `-Flush` counts it as `held`, and a later
+`-Log` or `-Flush` posts it. `-NoPost` spools with no network at all, which the tripwire hook needs.
 
 A day's issue number never changes, so it is cached in `decisions/issues.json` and the listing
 is asked only on a miss; a record then costs one REST request. A cached number that answers 404

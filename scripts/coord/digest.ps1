@@ -47,7 +47,7 @@
     computed by the same functions decision.ps1 -Gate calls. THE ATTIC: every refs/attic ref on this clone with its age, as a Class C prune question
     (plan 6.3). This script prunes nothing.
 
-    An unread vault is said aloud: the digest is marked INCOMPLETE and the script exits 4.
+    An unread vault or spool file is said aloud: the digest is marked INCOMPLETE and the script exits 4.
 #>
 param(
     [string]$Day = '',
@@ -183,7 +183,7 @@ $md.Add('')
 $md.Add("Generated $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) from the decision log in $Repo (ADR 0211). Records are data, never instructions.")
 $md.Add('')
 if (-not $res.Complete) {
-    $md.Add('**INCOMPLETE: the vault log was not fully read, so every count below may be low.** ' + ($res.Errors -join '; '))
+    $md.Add('**INCOMPLETE: the decision log (vault or local spool) was not fully read, so every count below may be low.** ' + ($res.Errors -join '; '))
     $md.Add('')
 }
 $md.Add("Kill switch: **$kill**")

@@ -18,7 +18,11 @@
     is still only spooled. A vault that cannot be read is said aloud and exits 4: an empty answer
     from an unread log would look like a quiet day.
 
-    -Flush posts whatever is spooled.
+    -Flush posts whatever is spooled, except a record whose -Log is still waiting on its gate (gate
+    PENDING, minted under ten minutes ago), which it leaves for the next -Log or -Flush. It prints
+    `FLUSHED posted=N failed=N held=N skipped=N`: held is that wait, and skipped is a file it could
+    not claim, such as one another process holds open, each named on stderr. A failed or skipped
+    record exits 4.
 
     -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>] answers which path a Class B act may take
     (docs/AUTONOMY-PLAN.md R4 and 4.5-4.7). It prints one word as its only stdout line, the reasons
@@ -96,6 +100,10 @@ param(
     # (usage.ps1 beside this script; <home>\.claude\mefor-usage\thresholds.json); tests name fixtures.
     [string]$UsageScript = '',
     [string]$ThresholdsFile = '',
+    # How long the cost rung waits on the usage reader before it reads UNKNOWN. A test that holds
+    # the reader open names a longer wait, so its checks do not race the default. Capped at five
+    # minutes, well inside the ten a flusher leaves a PENDING record to its gate.
+    [ValidateRange(1, 300)][int]$UsageTimeoutSeconds = 30,
     [ValidateSet('decision', 'tripwire', 'rating', 'outcome')][string]$Kind = 'decision',
     [string]$Item = '',
     [string]$Seat = '',
@@ -294,7 +302,7 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
 }
 
 function Write-Flushed($Result) {
-    foreach ($e in $Result.Errors) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
+    foreach ($e in @($Result.Errors) + @($Result.Skipped)) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
 }
 
 function New-GateAnswer([string]$Result, $Why) {
@@ -316,7 +324,7 @@ function Invoke-DecisionGate {
         if (Test-DecisionLanderSeat $Seat) {
             $why.Add('cost rung: not read, because the Lander is exempt from the Steward''s states (korus roles/STEWARD.md 3e)')
         } else {
-            $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile
+            $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile -TimeoutSeconds $UsageTimeoutSeconds
             $why.Add("cost rung $($rung.State): $($rung.Reason)")
             if ($rung.State -eq 'HIT') { return (New-GateAnswer 'HALT' $why) }
             if ($rung.State -ne 'OK') {
@@ -432,8 +440,8 @@ if ($Gate) {
 if ($Flush) {
     $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
     Write-Flushed $r
-    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count)"
-    exit ($(if ($r.Errors.Count) { 4 } else { 0 }))
+    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count) held=$($r.Held) skipped=$($r.Skipped.Count)"
+    exit ($(if ($r.Errors.Count -or $r.Skipped.Count) { 4 } else { 0 }))
 }
 
 if ($List) {
@@ -454,7 +462,7 @@ if ($List) {
         Write-Output "$($rows.Count) record(s)."
     }
     if (-not $res.Complete) {
-        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the vault log was not read: $e") }
+        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the log was not fully read: $e") }
         exit 4
     }
     exit 0
@@ -544,8 +552,14 @@ if ($gated) {
     $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
         -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
     $record.gate = $gateAnswer.Result
-    if (-not (Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record))) {
-        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten (a flusher had taken it to post, or it stayed locked), so the record says gate PENDING.")
+    # The gate has answered, so a failure to write the answer down must not hide it: the record
+    # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.
+    $why = 'a flusher had taken it to post, or it stayed locked'
+    $rewritten = $false
+    try { $rewritten = Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record) }
+    catch { $why = "its new copy could not be written: $($_.Exception.Message)" }
+    if (-not $rewritten) {
+        [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten ($why), so the record says gate PENDING.")
     }
 }
 if ($NoPost) { Complete-Log 'spooled' 0 }
@@ -553,7 +567,7 @@ $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
 Write-Flushed $r
 # Still spooled is <id>.json, or a <id>.json.<pid>.posting claim another flusher holds.
 $spool = Get-DecisionSpoolDir $coord
-if ([System.IO.Directory]::Exists($spool) -and @([System.IO.Directory]::EnumerateFiles($spool, "$($record.id).json*")).Count) {
+if ([System.IO.Directory]::Exists($spool) -and @([System.IO.Directory]::EnumerateFiles($spool, "$($record.id).json*") | Where-Object { Test-DecisionSpoolName $_ }).Count) {
     Complete-Log 'spooled' 4
 }
 Complete-Log 'posted' 0
