@@ -15,10 +15,55 @@
 
     -List reads records by day (-Day, default today UTC, and -Days for a range ending there), and
     filters them by -Seat or -Item. It reads the vault and the local spool, and marks a record that
-    is still only spooled. A vault that cannot be read is said aloud and exits 4: an empty answer
+    is still only spooled. An incomplete read (a vault read that fails, or a spool read
+    _decisionlog.ps1 Read-DecisionSpool calls incomplete) is said aloud and exits 4: an empty answer
     from an unread log would look like a quiet day.
 
-    -Flush posts whatever is spooled.
+    -Flush posts whatever is spooled, except a record another worker holds the lock of, such as a
+    -Log whose gate is still running, which it leaves for the next -Log or -Flush. It prints
+    `FLUSHED posted=N failed=N held=N skipped=N`: held is that wait, failed a record it could not
+    read or post, and skipped a record whose lock it could not make; each is named on stderr. A
+    failed or skipped record exits 4; a held one does not, since its holder is still at work.
+    _decisionlog.ps1 says how the spool's lock and posted mark work (The spool).
+
+    -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>] answers which path a Class B act may take
+    (docs/AUTONOMY-PLAN.md R4 and 4.5-4.7). It prints one word as its only stdout line, the reasons
+    on stderr, or an object under -Json:
+        NO-REVIEW  exit 10  the gate's conditions hold. NECESSARY, NOT SUFFICIENT: plan R4 also
+                            needs a single revert or PR close to undo the act, no Class C path
+                            touched, and live state read this turn, which the gate cannot see.
+                            The session checks those itself before acting without review.
+        REVIEW     exit 11  take the adversarial-review path first.
+        HALT       exit 12  do not act; defer. The cost rung is hit.
+    NO-REVIEW needs all of: the kill switch reads exactly OFF (afk-kill.ps1 -Status); the seat's
+    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration);
+    no decision on the item was reversed in the 60 days read; the reversal budget is open (plan 4.5:
+    3 reversals fleet-wide or 2 of the seat's own decisions inside 24 hours close it for 24 hours);
+    the chain is no deeper than two (plan 4.6, below); and the cost rung is not hit (plan 4.7).
+    IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
+    else reads as no permission. A read that fails, a seat that cannot be named, and a cost reading
+    that is UNKNOWN all answer REVIEW. HALT comes from the cost rung only, and is checked first; the
+    Lander is exempt from it (korus roles/STEWARD.md 3e). The gate stops at the first condition that
+    closes the no-review path before the log is read, so a REVIEW for a kill switch reads no log.
+    Today no seat is calibrated, so it answers REVIEW (or HALT) for everyone. That is correct.
+
+    THE CHAIN. -BuildsOn names the decisions this one builds on. Depth is the unsampled (unrated)
+    Class B decisions on the same item reachable through those links, and never less than the
+    unsampled Class B decisions on the item logged in the trailing 24 hours, because -BuildsOn is
+    self-reported. More than two goes to review. A linked id the log does not hold fails closed.
+
+    -LOG ENFORCES IT. A `decision` record of Class B with -Reviewed no is locked, spooled with `gate`
+    PENDING, then the gate runs, skipping that record, and its answer replaces PENDING in the spooled
+    copy before the lock is given up. So a gate that crashes or hangs loses no record; one left
+    PENDING counts toward the chain floor. No flusher posts the record while this -Log runs, and
+    once it has exited, however it exits, the operating system lets the lock go and the record is
+    posted as it stands. The record is posted whatever the answer. When the answer is not NO-REVIEW, -Log prints
+    `GATE <word>` and why, and exits with the gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
+    LOGGED line still says whether the record was posted or is still spooled. Under -NoPost the gate
+    reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. -Log stops an act only
+    when a session logs BEFORE it acts; the empower skill, as read on 2026-10-26, says to log each
+    decision and not when, so a session following it should run -Gate first. At least these do not call -Gate: the spawn
+    hooks, wait-pr.ps1 and the driver and empower skills, so none of them stops on the cost rung.
 
     KINDS. `decision` is one Class A to D decision. `tripwire` is a tripwire hit. `rating` is the
     owner's blind-sample verdict on a decision (-Ref, -Rating). `outcome` updates a decision's
@@ -45,11 +90,24 @@
 
 .EXAMPLE
     decision.ps1 -List -Day 2026-10-21 -Seat manager
+
+.EXAMPLE
+    decision.ps1 -Gate -Item 3905 -BuildsOn d20261026T101500123-a1b2c3
 #>
 param(
     [switch]$Log,
     [switch]$List,
     [switch]$Flush,
+    [switch]$Gate,
+    [string[]]$BuildsOn = @(),
+    # The usage reader and the Steward's thresholds file the cost rung reads. Defaulted in the body
+    # (usage.ps1 beside this script; <home>\.claude\mefor-usage\thresholds.json); tests name fixtures.
+    [string]$UsageScript = '',
+    [string]$ThresholdsFile = '',
+    # How long the cost rung waits on the usage reader before it reads UNKNOWN. A test that holds
+    # the reader open names a longer wait, so its checks do not race the default. Capped at five
+    # minutes. No flusher posts the record while its -Log runs, however long the gate waits.
+    [ValidateRange(1, 300)][int]$UsageTimeoutSeconds = 30,
     [ValidateSet('decision', 'tripwire', 'rating', 'outcome')][string]$Kind = 'decision',
     [string]$Item = '',
     [string]$Seat = '',
@@ -85,9 +143,9 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
     exit 3
 }
 
-$modes = @($Log, $List, $Flush | Where-Object { $_ })
+$modes = @($Log, $List, $Flush, $Gate | Where-Object { $_ })
 if ($modes.Count -ne 1) {
-    [Console]::Error.WriteLine('decision.ps1: give exactly one of -Log, -List or -Flush.')
+    [Console]::Error.WriteLine('decision.ps1: give exactly one of -Log, -List, -Flush or -Gate.')
     exit 2
 }
 
@@ -96,6 +154,11 @@ if ($modes.Count -ne 1) {
 . (Join-Path $PSScriptRoot 'coord-root.ps1')
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 $coord = Get-DecisionCoordRoot
+if (-not $UsageScript) { $UsageScript = Get-DecisionUsageScript }
+if (-not $ThresholdsFile) { $ThresholdsFile = Get-DecisionThresholdsFile }
+
+# The gate's exit codes. None is 0 or 4, so no other answer of this script reads as NO-REVIEW.
+$GateCodes = @{ 'NO-REVIEW' = 10; 'REVIEW' = 11; 'HALT' = 12 }
 
 function ConvertTo-SeatRecordInstant($Value) {
     # A record's asOf as a UTC instant, or MinValue when it is absent or will not parse. A bad sort
@@ -243,14 +306,148 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
 }
 
 function Write-Flushed($Result) {
-    foreach ($e in $Result.Errors) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
+    foreach ($e in @($Result.Errors) + @($Result.Skipped)) { [Console]::Error.WriteLine("decision.ps1: NOT POSTED, still spooled: $e") }
+    foreach ($e in $Result.Held) { [Console]::Error.WriteLine("decision.ps1: HELD, still spooled: $e") }
+    foreach ($e in $Result.Warnings) { [Console]::Error.WriteLine("decision.ps1: WARNING: $e") }
+}
+
+function New-GateAnswer([string]$Result, $Why) {
+    return [pscustomobject]@{ Result = $Result; Reasons = @($Why) }
+}
+
+function Invoke-DecisionGate {
+    <#
+      The class B gate's answer, NO-REVIEW, REVIEW or HALT, with its reasons. The header lists the
+      conditions. Checked cheapest first, and it stops at the first that closes the no-review path
+      until the log is read; from there every condition is checked and every failure is named. Any
+      throw inside is REVIEW. -ExcludeId is the record -Log spooled before asking, which must not
+      count against itself.
+    #>
+    param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline,
+        [string]$ExcludeId = '')
+    $why = [System.Collections.Generic.List[string]]::new()
+    try {
+        if (Test-DecisionLanderSeat $Seat) {
+            $why.Add('cost rung: not read, because the Lander is exempt from the Steward''s states (korus roles/STEWARD.md 3e)')
+        } else {
+            $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile -TimeoutSeconds $UsageTimeoutSeconds
+            $why.Add("cost rung $($rung.State): $($rung.Reason)")
+            if ($rung.State -eq 'HIT') { return (New-GateAnswer 'HALT' $why) }
+            if ($rung.State -ne 'OK') {
+                # UNKNOWN is common (a Desktop session runs no statusLine), so it must not halt: that
+                # would shut the gate for good. It cannot show the rung is clear either.
+                $why.Add('an UNKNOWN cost reading cannot show the rung is clear, so this goes to review, not to a halt')
+                return (New-GateAnswer 'REVIEW' $why)
+            }
+        }
+        if (-not $Seat) {
+            $why.Add('no seat was given or found in the seat registry, so its calibration and its reversal budget cannot be read')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        if ($Offline) {
+            $why.Add('-NoPost reads no network, so the kill switch and the log were not read')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $kill = Get-DecisionKillSwitch
+        if ($kill -ne 'OFF') {
+            $why.Add("kill switch reads '$kill', so every class is in ask-mode (ADR 0211)")
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $now = [DateTime]::UtcNow
+        $today = $now.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        # The digest's default window, plus the days the -BuildsOn ids name, plus tomorrow, where a
+        # clock running ahead files a record near midnight: the budget and the chain floor count a
+        # future-dated record as now. Read-DecisionLogForGate adds the days of reversed decisions
+        # older than all of them.
+        $window = @(Get-DecisionDayRange $today 60)
+        $tomorrow = $now.AddDays(1).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $days = @(@($window) + $tomorrow + @($BuildsOn | ForEach-Object { Get-DecisionIdDay $_ }) | Select-Object -Unique)
+        $res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days $days
+        if (-not $res.Complete) {
+            $why.Add("the decision log was not fully read, so no condition on it can be shown: $($res.Errors -join '; ')")
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $all = @($res.Records | Where-Object { [string]$_.id -ne $ExcludeId })
+        $ratings = Get-DecisionLatest $all 'rating'
+        $outcomes = Get-DecisionLatest $all 'outcome'
+        $reversals = @(Get-DecisionReversals $all)
+        $closed = $false
+
+        # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
+        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
+                $_.kind -eq 'decision' -and [string]$_.seat -eq $Seat -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+            })
+        if (-not $cal.Calibrated) {
+            $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")
+            $closed = $true
+        }
+        foreach ($r in $reversals) {
+            if ([string]$r.Item -eq $Item) {
+                $why.Add("item: decision $($r.Ref) on item $Item was reversed")
+                $closed = $true
+            } elseif (-not $r.Item) {
+                $why.Add("item: the reversal of $($r.Ref) refers to a decision the log does not hold and names no item, so it may be this item's")
+                $closed = $true
+            }
+        }
+        $fleet = Get-DecisionBudget -Reversals $reversals -Now $now
+        if ($fleet.ClosedUntil) {
+            $why.Add("reversal budget: three reversals fleet-wide inside 24 hours close the no-review path for everyone until $(Format-DecisionInstant $fleet.ClosedUntil)")
+            $closed = $true
+        }
+        $own = Get-DecisionBudget -Reversals $reversals -Now $now -Seat $Seat
+        if ($own.ClosedUntil) {
+            $why.Add("reversal budget: two reversals of $Seat's decisions inside 24 hours close its no-review path until $(Format-DecisionInstant $own.ClosedUntil)")
+            $closed = $true
+        }
+        $ch = Get-DecisionChain -Records $all -Item $Item -BuildsOn $BuildsOn -Now $now -Ratings $ratings
+        if ($ch.Missing.Count) {
+            $why.Add("chain: it builds on $($ch.Missing -join ', '), which the log read does not hold, so the depth cannot be counted")
+            $closed = $true
+        }
+        if ($ch.Depth -gt 2) {
+            $why.Add("chain: depth $($ch.Depth) on item $Item ($($ch.Walked) through -BuildsOn, $($ch.Floor) in the trailing 24 hours), and more than two goes to review")
+            $closed = $true
+        }
+        if ($closed) { return (New-GateAnswer 'REVIEW' $why) }
+        $why.Add("every condition holds: kill switch OFF, calibrated, no reversal on the item, budgets open, chain depth $($ch.Depth)")
+        return (New-GateAnswer 'NO-REVIEW' $why)
+    } catch {
+        $why.Add("the gate failed, so it fails closed: $($_.Exception.Message)")
+        return (New-GateAnswer 'REVIEW' $why)
+    }
+}
+
+# -BuildsOn is split at newlines like -Predicate, and refused before anything is read or written.
+$BuildsOn = @($BuildsOn | ForEach-Object { $_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+foreach ($b in $BuildsOn) {
+    if (-not (Get-DecisionIdDay $b)) {
+        [Console]::Error.WriteLine("decision.ps1: -BuildsOn '$b' is not a decision id. Nothing was written.")
+        exit 2
+    }
+}
+
+if ($Gate) {
+    if (-not $Item) { [Console]::Error.WriteLine('decision.ps1: -Gate needs -Item, the item the act is on.'); exit 2 }
+    if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
+    if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session }
+    $g = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile
+    if ($Json) {
+        Write-Output (ConvertTo-Json -Depth 4 -InputObject ([ordered]@{
+                    result = $g.Result; exit = $GateCodes[$g.Result]; item = $Item; seat = $Seat; buildsOn = @($BuildsOn); reasons = @($g.Reasons)
+                }))
+    } else {
+        foreach ($r in $g.Reasons) { [Console]::Error.WriteLine("decision.ps1: gate: $r") }
+        Write-Output $g.Result
+    }
+    exit $GateCodes[$g.Result]
 }
 
 if ($Flush) {
     $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
     Write-Flushed $r
-    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count)"
-    exit ($(if ($r.Errors.Count) { 4 } else { 0 }))
+    Write-Output "FLUSHED posted=$($r.Posted) failed=$($r.Errors.Count) held=$($r.Held.Count) skipped=$($r.Skipped.Count)"
+    exit ($(if ($r.Errors.Count -or $r.Skipped.Count) { 4 } else { 0 }))
 }
 
 if ($List) {
@@ -271,7 +468,7 @@ if ($List) {
         Write-Output "$($rows.Count) record(s)."
     }
     if (-not $res.Complete) {
-        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the vault log was not read: $e") }
+        foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the log was not fully read: $e") }
         exit 4
     }
     exit 0
@@ -306,11 +503,16 @@ $preds = foreach ($p in $Predicate) {
     if ($at -lt 1) { [Console]::Error.WriteLine("decision.ps1: -Predicate '$p' is not name=evidence. Nothing was written."); exit 2 }
     [ordered]@{ name = $p.Substring(0, $at).Trim(); evidence = $p.Substring($at + 1).Trim() }
 }
+# Where the gate is enforced (plan 4.5-4.7): empower requires every Class B decision to be logged,
+# so an unreviewed one meets the gate here. That stops the act only when the log comes before it
+# (the header says so). The record is written whatever the answer.
+$gated = $Kind -eq 'decision' -and $Class -eq 'B' -and $Reviewed -eq 'no'
+$gateAnswer = $null
 $cfg = [string]$env:CLAUDE_CONFIG_DIR
 $record = [ordered]@{
     v              = 1
     id             = New-DecisionId
-    ts             = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    ts             = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
     kind           = $Kind
     item           = $Item
     seat           = $Seat
@@ -329,19 +531,54 @@ $record = [ordered]@{
     ref            = $Ref
     rating         = $Rating
     note           = $Note
+    buildsOn       = @($BuildsOn)
+    # PENDING until the gate answers, below. A record left PENDING (the gate crashed or hung, or a
+    # flusher posted it first) counts toward the chain floor like any unsampled Class B decision.
+    gate           = $(if ($gated) { 'PENDING' } else { '' })
 }
-Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
-if ($NoPost) {
-    Write-Output "LOGGED $($record.id) spooled"
-    exit 0
+
+function Complete-Log([string]$How, [int]$Code) {
+    # The LOGGED line always; then the gate's word and, when it is not NO-REVIEW, why and its code.
+    Write-Output "LOGGED $($record.id) $How"
+    if ($gateAnswer) {
+        Write-Output "GATE $($gateAnswer.Result)"
+        if ($gateAnswer.Result -ne 'NO-REVIEW') {
+            foreach ($w in $gateAnswer.Reasons) { [Console]::Error.WriteLine("decision.ps1: gate: $w") }
+            exit $GateCodes[$gateAnswer.Result]
+        }
+    }
+    exit $Code
 }
+
+# EVERY RECORD IS SPOOLED BEFORE ANYTHING ELSE RUNS, the gate included, so a gate that crashes or
+# hangs cannot lose it. A gated record is locked first and stays locked until the gate's answer is
+# written into it, so no flusher posts it PENDING while this -Log runs; if this process dies, the
+# operating system lets the lock go and the record is posted as it stands. The gate skips its own id.
+if ($gated) {
+    $lock = Lock-DecisionSpool -CoordRoot $coord -Id $record.id
+    if ($null -eq $lock) { throw "the lock of the new record $($record.id) is already held" }
+    try {
+        Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
+        $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
+            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id
+        $record.gate = $gateAnswer.Result
+        # The gate has answered, so a failure to write the answer down must not hide it: the record
+        # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.
+        try { Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record) }
+        catch {
+            [Console]::Error.WriteLine("decision.ps1: the gate answered $($gateAnswer.Result), but $($record.id) could not be rewritten (its new copy could not be written: $($_.Exception.Message)), so the record says gate PENDING.")
+        }
+    } finally {
+        Unlock-DecisionSpool $lock $coord $record.id
+    }
+} else {
+    Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
+}
+if ($NoPost) { Complete-Log 'spooled' 0 }
 $r = Send-DecisionSpool -Repo $Repo -CoordRoot $coord
 Write-Flushed $r
-# Still spooled is <id>.json, or a <id>.json.<pid>.posting claim another flusher holds.
-$spool = Get-DecisionSpoolDir $coord
-if ([System.IO.Directory]::Exists($spool) -and @([System.IO.Directory]::EnumerateFiles($spool, "$($record.id).json*")).Count) {
-    Write-Output "LOGGED $($record.id) spooled"
-    exit 4
+# Posted is this flush's post, or an earlier one's: the posted mark, or no spool file left.
+if ($r.PostedIds -notcontains $record.id -and (Test-DecisionSpooled -CoordRoot $coord -Id $record.id)) {
+    Complete-Log 'spooled' 4
 }
-Write-Output "LOGGED $($record.id) posted"
-exit 0
+Complete-Log 'posted' 0

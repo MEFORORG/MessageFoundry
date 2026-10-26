@@ -49,13 +49,15 @@ PRESENCE_TAIL = (
     " list no other session, so nothing was read."
 )
 SEAT_DECLARE = ("-Declare", "-Seat", "builder", "-Goal", "cloud refusal test")
-# Spooled only, so the control outside the cloud needs no gh.
+# Spooled only, so the control outside the cloud needs no gh. Class C, so -Log's class B gate does
+# not run: an unreviewed class B record exits with the gate's answer, 11 or 12, not 0, and its cost
+# rung reads the host account's usage files.
 DECISION_LOG = (
     "-Log",
     "-Item",
     "1",
     "-Class",
-    "B",
+    "C",
     "-Seat",
     "builder",
     "-Recommendation",
@@ -175,6 +177,7 @@ def _run(
         pytest.param("worktree/hygiene-report.ps1", HYGIENE_OFFLINE, id="hygiene-report"),
         pytest.param("coord/decision.ps1", DECISION_LOG, id="decision-log"),
         pytest.param("coord/decision.ps1", ("-List",), id="decision-list"),
+        pytest.param("coord/decision.ps1", ("-Gate", "-Item", "1"), id="decision-gate"),
         pytest.param("coord/digest.ps1", (), id="digest"),
         pytest.param("coord/wiki-query.ps1", ("-KorusCheckout", "no-korus"), id="wiki-query"),
         *(pytest.param(s, a, id=_stem(s)) for s, a, _ in READERS),
@@ -368,6 +371,20 @@ def test_each_writer_writes_outside_the_cloud(
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     out = _coord_dir(repo) / written
     assert out.is_dir() and any(out.iterdir()), f"{script} wrote nothing under {written}/"
+
+
+@needs_pwsh
+@needs_windows
+def test_the_gate_takes_its_normal_path_outside_the_cloud(repo: Path, tmp_path: Path) -> None:
+    """The control for the gate: with a usage reader that does not exist, its cost rung is UNKNOWN,
+    so it answers REVIEW (11) before any network read. Its full path is held by
+    tests/test_afk_gate.py."""
+    missing = str(tmp_path / "no-usage.ps1")
+    args = ("-Gate", "-Item", "1", "-Seat", "builder", "-UsageScript", missing)
+    proc = _run(repo, "coord/decision.ps1", *args, cloud=False)
+    assert proc.returncode == 11, (proc.stdout, proc.stderr)
+    assert proc.stdout.strip() == "REVIEW"
+    assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
 
 
 @needs_pwsh
