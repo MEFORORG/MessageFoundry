@@ -18,7 +18,7 @@
     },
     {
       "id": "route-auth-and-channel-scope",
-      "rule": "Every new or changed HTTP or WebSocket route declares an auth gate dependency (the require* factories in messagefoundry/api/security.py). A route that returns or changes channel data filters by the caller's channel scope, and a list response must not reveal withheld items beyond a count. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection.",
+      "rule": "Every new or changed HTTP or WebSocket route is gated in one of the sanctioned ways: a gate dependency (the require* factories in messagefoundry/api/security.py, or the require_ui* factories in messagefoundry_webconsole/_auth.py); @public_route(reason) for an endpoint anonymous by design, such as sign-in; or, on a WebSocket only, @authorizes_in_body(reason) with a call to authorize_ws before any data is read or sent. Do not flag those forms as missing a gate. Flag a route with none of them, a public_route on an endpoint that returns or changes operator or message data, or an authorizes_in_body WebSocket that sends data before authorize_ws succeeds. A route that returns or changes channel data filters by the caller's channel scope, and a list response must not reveal withheld items beyond a count. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection.",
       "scope": ["messagefoundry/api/**/*.py", "messagefoundry_webconsole/routes/**/*.py"],
       "severity": "high"
     },
