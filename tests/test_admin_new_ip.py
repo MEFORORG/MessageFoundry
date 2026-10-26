@@ -503,8 +503,10 @@ def test_bounded_address_text_keeps_addresses_and_bounds_the_rest() -> None:
     assert len(set(bounded)) == 3
     assert all(_NEW_IP_TEXT_MAX < len(b) <= _BOUNDED_TEXT_CEILING for b in bounded)
     assert _bounded_address_text(_long_address(0)) == bounded[0]
-    # A lone surrogate, which plain UTF-8 refuses, still bounds.
-    assert len(_bounded_address_text("\ud800" * 500)) <= _BOUNDED_TEXT_CEILING
+    # A lone surrogate, which plain UTF-8 refuses, still bounds, to text UTF-8 can encode.
+    surrogates = _bounded_address_text("\ud800" * 500)
+    assert len(surrogates) <= _BOUNDED_TEXT_CEILING
+    surrogates.encode("utf-8")
     # An IPv6 zone id is unbounded text inside a valid address, so it is bounded too.
     assert len(_bounded_address_text("fe80::1%" + "z" * 500)) <= _BOUNDED_TEXT_CEILING
 
@@ -541,7 +543,7 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
         assert json.loads(str(capped[0]["detail"]))["seen_ip"] == _bounded_address_text(
             texts[_NEW_IP_PER_SESSION_MAX]
         )
-        assert all(len(str(r["client"])) <= _BOUNDED_TEXT_CEILING for r in rows)
+        assert {r["client"] for r in rows} == seen_ips
         assert {json.loads(str(r["detail"]))["known_ip"] for r in rows} == {
             _bounded_address_text(anchor)
         }

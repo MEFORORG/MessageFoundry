@@ -564,15 +564,18 @@ def _bounded_address_text(address: str) -> str:
     """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
     and the SHA-256 of the whole (BACKLOG #3772).
 
-    The same input always gives the same output, so it serves as a dedupe key. Only the new-address
-    signal uses it; :func:`_host_key` stays unbounded, because the persisted known-address record
-    and :meth:`AuthService._same_host` compare by it."""
+    The same input always gives the same output, so it serves as a dedupe key. At least the
+    new-address signal uses it; :func:`_host_key` stays unbounded, because the persisted
+    known-address record and :meth:`AuthService._same_host` compare by it."""
     if len(address) <= _NEW_IP_TEXT_MAX:
         return address
     # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
     # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
     digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
-    return f"{address[:_NEW_IP_TEXT_PREFIX]}...sha256:{digest}"
+    # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
+    # and the result can be stored. Text within the bound is returned as it is, as on main.
+    prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
+    return f"{prefix}...sha256:{digest}"
 
 
 #: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
@@ -3193,7 +3196,7 @@ class AuthService:
             else None
         )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
-        # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
+        # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
         # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
         self._new_ip_seen: dict[str, set[str]] = {}
@@ -12211,7 +12214,8 @@ class AuthService:
             return False
         # Bounded at intake (BACKLOG #3772), so the dedupe sets hold bounded text. The same value is
         # added below and discarded in the ``finally``.
-        seen_key = _bounded_address_text(_host_key(client_ip))
+        host_key = _host_key(client_ip)
+        seen_key = _bounded_address_text(host_key)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
         # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
@@ -12226,8 +12230,10 @@ class AuthService:
             return True
         # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
         # which is every address without a long zone id, is unchanged, so a search by address still
-        # finds the row (vault BACKLOG #3197); longer text is bounded.
-        seen_text = _bounded_address_text(client_ip)
+        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
+        # differs from the raw text other rows of the request carry. Text that does not parse is its
+        # own host key, so its bounded form is reused rather than hashed twice.
+        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop.
@@ -12254,7 +12260,8 @@ class AuthService:
             user = await self._load_user(session.user_id)
             username = user.username if user is not None else session.user_id
             # The client column too (vault BACKLOG #3197), so a search or export by address finds
-            # this row. `seen_ip` stays in the detail beside `known_ip`, which it is compared with.
+            # this row; over-long text is bounded (BACKLOG #3772). `seen_ip` stays in the detail
+            # beside `known_ip`, which it is compared with.
             await self._audit(
                 "auth.new_address_reverify_required",
                 actor=username,
