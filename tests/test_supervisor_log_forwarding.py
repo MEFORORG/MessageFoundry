@@ -140,6 +140,45 @@ def test_the_supervisor_spool_is_its_own_directory_beside_the_shards(
     assert spool == (tmp_path / "log-spool" / "supervisor").resolve()
 
 
+def _collector_ca_judged(monkeypatch: pytest.MonkeyPatch, *, owner_only: bool) -> None:
+    """The trust-anchor checks judge the collector's CA as ``owner_only`` says, with a path that
+    passes, so the host's temp directory does not decide the test."""
+    from messagefoundry.auth import trust_anchors as ta
+    from messagefoundry.auth.anchor_path import PathVerdict
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: owner_only)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_an_exposed_collector_ca_refuses_the_start_before_the_forwarder_is_built(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #3470: the forwarder loads ``[logging].forward_tls_ca_file``, so the CA takes the
+    trust-anchor checks first. ``serve`` checked it only in the API lifespan, after the forwarder
+    had sent, and ``supervise`` never did. Red before the fix: both started and built it."""
+    _collector_ca_judged(monkeypatch, owner_only=False)
+    rc, recorder = _run(command, tmp_path, monkeypatch, verified_forwarding=True)
+    err = capsys.readouterr().err
+    assert rc == 2 and recorder.forwards == [] and recorder.spawned == 0
+    (error,) = _errors(err)
+    assert "[logging].forward_tls_ca_file" in error
+    assert "before the log forwarder is built" in err
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_an_owner_only_collector_ca_installs_the_forwarder(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the case above."""
+    _collector_ca_judged(monkeypatch, owner_only=True)
+    rc, recorder = _run(command, tmp_path, monkeypatch, verified_forwarding=True)
+    assert rc == 0 and len(recorder.forwards) == 1
+
+
 def test_no_shard_can_be_given_the_supervisor_spool_directory(tmp_path: Path) -> None:
     from messagefoundry.__main__ import _forward_spool_dir, _supervisor_forward_spool_dir
     from messagefoundry.config.settings import LoggingSettings, ServiceSettings, StoreSettings

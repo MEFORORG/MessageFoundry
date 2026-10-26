@@ -1030,6 +1030,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #3470: anchor_refusal checks the forwarder's and the SMTP relay's CA before
+            # those hops are built: evaluate_anchor's SHA-256 fingerprint and its pin compare.
+            "compare:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.auth.trust_anchors",
             # BACKLOG #1352: cert import opens a PKCS#12 bundle's encrypted parts through pki.
             "cipher:via messagefoundry.pki",
             "csprng:via messagefoundry.auth.totp",

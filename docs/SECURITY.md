@@ -6456,12 +6456,25 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 response's `restart_required` field lists none of these dialling CAs, so an empty list there does
 not mean a changed one is applied (BACKLOG #3015).
 
-At least four readers sit before or outside the check. At start, the syslog forwarder and the alert
-notifier are built before the check runs, so an alert sent during startup, or the first forwarded
-records, would use a CA not yet checked. The `supervise` process builds its own forwarder and runs
-no check. The offline recovery commands send security notices over an SMTP hop with no check. The
-internal CA is checked under `augment` or `pinned` even when no hop reads it, because every hop is
-loopback or names its own `tls_ca_file`.
+**The hops built before that check take the same checks first (BACKLOG #3470).** At least four
+are covered:
+
+| Hop | When its CA is checked | What a refusal does |
+|---|---|---|
+| The `serve` syslog forwarder | Before the forwarder is built | Refuses the start on stderr, with no audit row: no store is open yet |
+| The `supervise` syslog forwarder | Before the forwarder is built | The same; `supervise` runs no other anchor check |
+| The `serve` alert notifier | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds no notifier, so startup alerts go to the log. The audited check then refuses the start and writes its rows |
+| The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |
+
+Under `warn`, each warns and goes on, as the start check does. A file that cannot be read refuses
+at either setting.
+
+Two gaps stay open by decision. The internal CA is checked under `augment` or `pinned` even when
+no hop reads it, because every hop is loopback or names its own `tls_ca_file`. The check runs
+before any graph is loaded, and a reload can add a hop that reads the CA, so it cannot tell; it
+errs toward refusing. And each check restates its hop's enable conditions rather than sharing one
+predicate with the hop's builder, so the two could drift apart. Tests pin each check's conditions,
+not the agreement.
 
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
 

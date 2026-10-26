@@ -121,11 +121,31 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     ``restart_required``. The internal CA is checked under ``augment`` or ``pinned`` even when every
     hop is loopback or names its own ``tls_ca_file``, and so never reads it.
 
-    At least four readers come before or outside this check. At start, ``serve`` builds the log
-    forwarder, and the API lifespan starts the alert notifier, before the lifespan runs this
-    preflight, so an alert sent during startup, or the forwarder's first records, use a CA not yet
-    checked. ``supervise`` builds its own forwarder and runs no preflight. The offline security
-    notifier of the recovery commands builds an SMTP hop with no check.
+    **The hops built before this preflight take the checks first** (BACKLOG #3470), through
+    :func:`anchor_refusal`, which writes no audit row. At least four are covered:
+
+    * ``serve`` and ``supervise`` check ``[logging].forward_tls_ca_file`` before they build the
+      log forwarder, and a refusal stops the start on stderr. No store is open there, so it has
+      no row. ``supervise`` runs no other anchor check.
+    * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds the alert
+      notifier, when that CA is one of the specs this preflight is given. A refusal builds no
+      notifier, so the alerts sent before this preflight take the logging sink, and this
+      preflight then refuses the start with its rows. If it passes, the file changed in between,
+      and the first refusal is raised.
+    * The offline security notifier of the recovery commands checks the same CA. A refusal drops
+      the notice with a WARNING and never refuses the recovery.
+
+    **Accepted:** these checks keep the check-then-load gap above, since each hop still loads the
+    file by path after its check. A reload adds no second check; this preflight is the reload's.
+
+    **Declined** (BACKLOG #3470). The internal CA is checked under ``augment`` or ``pinned`` even
+    when every hop is loopback or names its own ``tls_ca_file``, and so never reads it. This
+    preflight runs before any graph is loaded, and a reload can add a hop that reads the CA, so it
+    cannot tell; it errs toward refusing. And each spec builder restates its hop's enable
+    conditions rather than sharing one predicate with the hop's builder. One predicate would be
+    threaded through the alert sinks, the security notifier and the forwarder builder, a refactor
+    of three modules for a drift no finding has shown. The read and unread tests pin each
+    builder's conditions, not their agreement with the hop.
 """
 
 from __future__ import annotations
@@ -1130,6 +1150,22 @@ def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
     return verdict.fingerprint
 
 
+def anchor_refusal(spec: AnchorSpec, *, enforcing: bool) -> TrustAnchorError | None:
+    """:func:`enforce_anchor`, returning its refusal rather than raising it, or ``None`` when the
+    anchor passes. A file that cannot be read is a refusal that names its setting, as it is in the
+    audited preflight. It writes no audit row: it serves a hop built before the store is open
+    (BACKLOG #3470), and the audited preflight still runs once the store is."""
+    try:
+        enforce_anchor(spec, enforcing=enforcing)
+    except TrustAnchorError as exc:
+        return exc
+    except (OSError, ValueError) as exc:
+        refusal = _unreadable_anchor(spec, exc)
+        refusal.__cause__ = exc
+        return refusal
+    return None
+
+
 def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     """Evaluate and enforce one anchor as :func:`enforce_anchor` does, then return the bytes it
     checked as ``cadata=`` text (:func:`anchor_cadata`).
@@ -1526,11 +1562,7 @@ def alerts_email_anchor_spec(alerts: AlertsSettings, auth: AuthSettings) -> Anch
     and ``email_tls_verify`` on: ``email_tls_verify=false`` loads it into a context that verifies
     nothing. The hop loads it with ``cafile=``, so the spec carries ``loads_verified_bytes=False``
     and no pin."""
-    if not (alerts.email_tls_ca_file and alerts.email_use_tls and alerts.email_tls_verify):
-        return None
-    if not (alerts.email_smtp_host and alerts.email_from):
-        return None
-    if not (alerts.email_to or auth.notify_security_events):
+    if not (alerts.email_tls_ca_file and _smtp_hop_verifies(alerts, auth)):
         return None
     return AnchorSpec(
         "alerts_email_ca",
@@ -1538,6 +1570,31 @@ def alerts_email_anchor_spec(alerts: AlertsSettings, auth: AuthSettings) -> Anch
         alerts.email_tls_ca_file,
         loads_verified_bytes=False,
     )
+
+
+def _smtp_hop_verifies(alerts: AlertsSettings, auth: AuthSettings) -> bool:
+    """Whether a sender is built on the ``[alerts]`` SMTP hop and verifies its relay: the sender
+    conditions of :func:`alerts_email_anchor_spec`."""
+    return bool(
+        alerts.email_use_tls
+        and alerts.email_tls_verify
+        and alerts.email_smtp_host
+        and alerts.email_from
+        and (alerts.email_to or auth.notify_security_events)
+    )
+
+
+def smtp_hop_anchor_spec(
+    alerts: AlertsSettings, auth: AuthSettings, tls: TlsSettings
+) -> AnchorSpec | None:
+    """The settings CA an ``[alerts]`` SMTP hop verifies its relay with, for a check before the
+    hop is built (BACKLOG #3470), or ``None`` when it reads none. That is
+    ``[alerts].email_tls_ca_file`` when it is set. With none set, the hop falls back to the
+    internal CA (:func:`internal_ca_anchor_spec`), which is checked even for a loopback relay that
+    ignores it."""
+    if not alerts.email_tls_ca_file and _smtp_hop_verifies(alerts, auth):
+        return internal_ca_anchor_spec(tls)
+    return alerts_email_anchor_spec(alerts, auth)
 
 
 def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:

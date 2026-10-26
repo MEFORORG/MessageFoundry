@@ -2908,3 +2908,211 @@ async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
         await preflight()
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert "[auth].ad_tls_ca_cert_file" in str(err.value)
+
+
+# --- BACKLOG #3470: the hops built before the audited start check -----------------------------------
+#
+# The forwarder's own checks are in tests/test_supervisor_log_forwarding.py, which runs `serve` and
+# `supervise` with every other gate cleared.
+
+
+class _NotifierBuilt(Exception):
+    """Raised by the stand-in notifier factory, so a test sees the lifespan reach it."""
+
+
+def _smtp_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, start_checked: bool = True
+) -> tuple[Any, list[object]]:
+    """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the notifier factory's
+    calls. The factory raises :class:`_NotifierBuilt`, so a lifespan that reaches it stops there.
+    ``start_checked=False`` gives the app no anchor specs, as an embedding that checks none."""
+    from messagefoundry.api.app import create_managed_app
+
+    built: list[object] = []
+
+    def _factory(*args: object, **kwargs: object) -> None:
+        built.append(args)
+        raise _NotifierBuilt
+
+    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _factory)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = str(_pem(tmp_path))
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        alerts_settings=AlertsSettings(email_tls_ca_file=ca, **_SMTP),
+        trust_anchor_specs=_dialling_specs(ca, alerts=_SMTP) if start_checked else (),
+        trust_anchors_enforcing=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    return app, built
+
+
+async def test_a_refused_alerts_ca_builds_no_notifier_and_still_writes_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lifespan checks the SMTP hop's CA before it builds the notifier, which sends before the
+    audited start check runs. Red before the fix: the notifier was built first. The refusal still
+    comes from the audited check, so its row is written."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert built == []
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        assert "acl_insecure" in [r["event"] for r in await _rows(reopened, "alerts_email_ca")]
+    finally:
+        await reopened.close()
+
+
+async def test_a_clean_alerts_ca_builds_the_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the case above: the same app with an owner-only CA reaches the factory."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
+
+
+async def test_the_notifier_check_adds_no_check_the_start_does_not_make(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An app given no anchor specs checks none, so the early check only moves a refusal the
+    audited check would make. Red under: the early check reading the settings alone."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch, start_checked=False)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
+
+
+async def test_an_alerts_ca_refused_before_the_notifier_refuses_the_start_if_it_then_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file changed between the two checks. The engine has no notifier by then, so the first
+    refusal stops the start even though the audited check passed."""
+    verdicts = iter([False, True])
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert built == []
+
+
+def _offline_settings(ca: str, *, tls: dict[str, Any] | None = None) -> Any:
+    """Service settings whose offline security notifier dials a verified relay, with ``ca`` as
+    ``[alerts].email_tls_ca_file``, or as the internal CA when ``tls`` is given."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    smtp = {k: v for k, v in _SMTP.items() if k != "email_to"}
+    if tls is None:
+        return ServiceSettings(alerts=AlertsSettings(email_tls_ca_file=ca, **smtp))
+    return ServiceSettings(
+        alerts=AlertsSettings(**smtp), tls=TlsSettings(internal_ca_file=ca, **tls)
+    )
+
+
+@pytest.mark.parametrize(
+    ("tls", "setting"),
+    [
+        pytest.param(None, "[alerts].email_tls_ca_file", id="own-ca"),
+        pytest.param({"trust_anchor_mode": "pinned"}, "[tls].internal_ca_file", id="internal-ca"),
+    ],
+)
+def test_the_offline_notifier_drops_the_notice_for_a_refused_relay_ca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tls: dict[str, Any] | None,
+    setting: str,
+) -> None:
+    """The recovery commands' notifier checks the relay's CA as ``serve`` does. A refusal warns
+    and yields no channel, so the recovery goes on. Red before the fix: the channel was built.
+    The control is the same CA with an owner-only ACL."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    settings = _offline_settings(str(_pem(tmp_path)), tls=tls)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    assert _offline_security_notifier(settings) is None
+    err = capsys.readouterr().err
+    assert setting in err and "No security notice is sent" in err
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    assert isinstance(_offline_security_notifier(settings), SecurityEventNotifier)
+
+
+def test_the_offline_notifier_warns_and_sends_under_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``warn`` loads an exposed CA with a warning, as the start check does."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import SecurityEnforcement, SecuritySettings
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    settings = _offline_settings(str(_pem(tmp_path))).model_copy(
+        update={"security": SecuritySettings(enforcement=SecurityEnforcement.WARN)}
+    )
+    with caplog.at_level("WARNING"):
+        assert isinstance(_offline_security_notifier(settings), SecurityEventNotifier)
+    assert "enforcement=warn" in caplog.text
+
+
+def test_an_unreadable_anchor_is_a_refusal_naming_its_setting(tmp_path: Path) -> None:
+    """:func:`anchor_refusal` turns an unreadable file into the refusal the audited check makes,
+    at either dial."""
+    spec = AnchorSpec("logging_forward_ca", "[logging].forward_tls_ca_file", str(tmp_path / "x"))
+    refusal = ta.anchor_refusal(spec, enforcing=False)
+    assert isinstance(refusal, TrustAnchorError)
+    assert str(refusal).startswith("[logging].forward_tls_ca_file: could not read")
+
+
+@pytest.mark.parametrize(
+    ("alerts", "tls", "label"),
+    [
+        pytest.param({"email_tls_ca_file": "ca.pem"}, {}, "alerts_email_ca", id="own-ca"),
+        pytest.param({}, {"trust_anchor_mode": "augment"}, "tls_internal_ca", id="internal"),
+        pytest.param({}, {}, None, id="internal-system"),
+        pytest.param(
+            {"email_tls_ca_file": "ca.pem"},
+            {"trust_anchor_mode": "pinned"},
+            "alerts_email_ca",
+            id="own-ca-wins",
+        ),
+        pytest.param(
+            {"email_tls_verify": False}, {"trust_anchor_mode": "pinned"}, None, id="no-verify"
+        ),
+        pytest.param(
+            {"email_smtp_host": None}, {"trust_anchor_mode": "pinned"}, None, id="no-host"
+        ),
+        pytest.param(
+            {"email_tls_ca_file": "ca.pem", "email_use_tls": False},
+            {"trust_anchor_mode": "pinned"},
+            None,
+            id="own-ca-cleartext",
+        ),
+    ],
+)
+def test_the_smtp_hop_spec_names_the_ca_the_hop_reads(
+    alerts: dict[str, Any], tls: dict[str, Any], label: str | None
+) -> None:
+    """The relay's own CA wins; with none set the hop falls back to the internal CA, which the
+    ``system`` mode ignores. A hop that verifies nothing, or has no sender, reads neither."""
+    spec = ta.smtp_hop_anchor_spec(
+        AlertsSettings(**{**_SMTP, **alerts}),
+        AuthSettings(),
+        TlsSettings(internal_ca_file="internal.pem", **tls),
+    )
+    assert (spec and spec.label) == label

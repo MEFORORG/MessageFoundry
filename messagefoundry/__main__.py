@@ -2168,7 +2168,7 @@ def _start_logging(
     refusal. It does not hold every gate that guards the collector: at least the static-credential
     and open-egress gates run in each caller before it, so a new one must be given to both.
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
-    locks it.
+    locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470).
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2316,6 +2316,23 @@ def _start_logging(
                 file=sys.stderr,
             )
             return 2
+
+    # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
+    # it. The audited settings preflight checks it too, but in `serve` that runs in the API
+    # lifespan, after the forwarder has sent its first records, and `supervise` runs none. No store
+    # is open here, so a refusal writes no audit row; it goes to stderr with the other gates'.
+    from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
+
+    _forward_ca = log_forward_anchor_spec(settings.logging) if log_forward is not None else None
+    if _forward_ca is not None and (
+        _ca_refusal := anchor_refusal(_forward_ca, enforcing=enforcing)
+    ):
+        print(
+            f"error: {_ca_refusal}\nThe start is refused before the log forwarder is built, so "
+            "no record reached the collector.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         forwarder_live = configure(log_forward)
@@ -7557,7 +7574,8 @@ def _offline_security_notifier(
     **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
     serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
     build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired.
+    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
+    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -7583,6 +7601,19 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
     try:
+        # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
+        # drops the notice, as any other failure here does; the recovery itself goes on.
+        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+        from messagefoundry.config.settings import SecurityEnforcement
+
+        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
+        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+            print(
+                f"WARNING: {refusal}\nNo security notice is sent from this command.",
+                file=sys.stderr,
+            )
+            return None
         return security_notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),

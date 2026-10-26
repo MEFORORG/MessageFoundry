@@ -310,10 +310,12 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     AnchorStoreUnavailable,
     TrustAnchorError,
+    anchor_refusal,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
+    smtp_hop_anchor_spec,
 )
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -11080,6 +11082,24 @@ def create_managed_app(
             if secrets_settings is not None
             else None
         )
+        # BACKLOG #3470: the CA the notifier's SMTP hop reads is checked before it is built. At
+        # least three things send through it before the start check below runs: the store open's
+        # failure path, the cipher refusal hook and the startup attestation. A refusal here builds
+        # no notifier, so those alerts take the logging sink. The audited check below then refuses
+        # the start with its rows, and this refusal is raised if that check passes. Only a CA that
+        # check is given is checked here, so this moves a refusal earlier and adds none.
+        smtp_ca = (
+            smtp_hop_anchor_spec(
+                alerts_settings, auth_settings or AuthSettings(), tls_settings or TlsSettings()
+            )
+            if alerts_settings is not None
+            else None
+        )
+        smtp_anchor_refusal = (
+            await asyncio.to_thread(anchor_refusal, smtp_ca, enforcing=trust_anchors_enforcing)
+            if smtp_ca is not None and smtp_ca in trust_anchor_specs
+            else None
+        )
         notifier = (
             notifier_from_settings(
                 alerts_settings,
@@ -11090,7 +11110,7 @@ def create_managed_app(
                 # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
                 posture=_hop_posture,
             )
-            if alerts_settings is not None
+            if alerts_settings is not None and smtp_anchor_refusal is None
             else None
         )
         # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
@@ -11200,6 +11220,10 @@ def create_managed_app(
                 await run_anchor_preflight(
                     trust_anchor_specs, store, enforcing=trust_anchors_enforcing
                 )
+                if smtp_anchor_refusal is not None:
+                    # The CA passed here after it was refused above, so it changed in between.
+                    # The engine has no notifier, so it does not start.
+                    raise smtp_anchor_refusal
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
