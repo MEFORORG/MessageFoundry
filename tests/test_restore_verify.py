@@ -23,6 +23,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import (
@@ -30,9 +32,15 @@ from messagefoundry.pipeline.dr_backup import (
     _verify_archive_blocking,
     run_restore_verify,
 )
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    CipherError,
+    UnauthenticatedCipherError,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.store import Stage
 
 
@@ -335,6 +343,8 @@ async def test_full_verify_fails_on_a_corrupted_aead_cell(tmp_path) -> None:
     res = await run_restore_verify(result.archive_path, store_settings=ss, full=True)
     assert res.status == "FAIL"
     assert "messages.raw" in (res.reason or "") and "did not decrypt" in (res.reason or "")
+    # The per-cell decrypt arm carries the CipherError token too (BACKLOG #3605).
+    assert "CipherError" in (res.reason or ""), res.reason
 
 
 def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> None:
@@ -381,6 +391,7 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     )
     assert wrong.status == "FAIL"
     assert "did not decrypt" in (wrong.reason or ""), wrong.reason
+    assert "CipherError" in (wrong.reason or ""), wrong.reason  # the token, BACKLOG #3605
 
     # And with no settings at all the full verify refuses rather than falling back to a keyless open.
     absent = _verify_archive_blocking(
@@ -517,6 +528,35 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
     reason = without_a.reason or ""
     assert reason.startswith("full restore-verify:") and "CipherError" in reason, reason
     assert not live.exists()
+
+
+def test_a_decrypt_miss_renders_the_cipher_error_token_restore_verify_reads() -> None:
+    """The token rule, pinned directly (BACKLOG #3605). Where a full verify fails on a cipher error,
+    at the open or at a cell's decrypt, its reason is ``safe_exc`` of that error, so it names the
+    exception's CLASS, and an operator would match the ``CipherError`` token in it, as the
+    since-retired-key test above does. BACKLOG #2593 gave the decrypt miss its own subclass, and the
+    first name it took dropped the token. Nothing failed except that end-to-end match.
+
+    Both errors are read off a real raise of the cell-bound (v4, AAD) cipher the store writes with:
+    the miss a wrong key raises, and the plain ``CipherError`` of a too-short value (a corrupt-row
+    arm). Not every subclass keeps the token; ``UnauthenticatedCipherError``'s docstring in
+    ``store/crypto.py`` says so, and this test says nothing about the others."""
+    aad = b"synthetic-cell"
+    sealed = make_cipher(generate_key(), write_v2=True).encrypt("PID|1||SYNTH-0001", aad=aad)
+    reader = make_cipher(generate_key(), write_v2=True)
+    with pytest.raises(CipherError) as miss:
+        reader.decrypt(sealed, aad=aad)
+    # The class the miss raises today, so the token below is read off the real raise.
+    assert type(miss.value) is UnauthenticatedCipherError
+    with pytest.raises(CipherError) as corrupt:
+        reader.decrypt(sealed.rsplit(":", 1)[0] + ":AAAA", aad=aad)
+    assert type(corrupt.value) is CipherError
+    for err in (miss.value, corrupt.value):
+        name = type(err).__name__
+        rendered = safe_exc(err)
+        assert rendered.startswith(f"{name}: "), rendered
+        # The class name, not the message: a message that happened to say CipherError proves nothing.
+        assert "CipherError" in name, rendered
 
 
 def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(
@@ -719,8 +759,6 @@ def test_an_exception_after_extraction_with_a_held_handle_leaves_no_plaintext(
 ) -> None:
     """Limb 2 of #1721 on the exception path: the error that escapes is the verify's own, never the
     teardown's, and the plaintext is gone either way. Bites on Windows, like the test above."""
-    import pytest
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.01,))
@@ -858,8 +896,6 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
 def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, monkeypatch) -> None:
     """``KeyboardInterrupt`` is not an ``Exception``: the teardown must run for it too, and it must
     reach the caller unchanged."""
-    import pytest
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
 
@@ -880,8 +916,6 @@ def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, mon
 def test_an_exception_carries_the_directory_it_could_not_clear(tmp_path, monkeypatch) -> None:
     """An exception escaping the verify keeps its own type, and a staging directory that still holds
     decrypted bytes is named on it as a note, not only in the log."""
-    import pytest
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
