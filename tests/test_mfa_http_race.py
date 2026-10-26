@@ -11,11 +11,13 @@ client such as the IDE or the harness. The web console's ``/ui/account/mfa/*`` r
 same service calls through their own cookie, CSRF and step-up gates, which these tests do not run.
 
 The invariant both tests check: the factor that ends enabled is only ever a secret a successful
-confirm verified, and a confirm that loses the race fails closed. It hands back no recovery codes,
-enables nothing, and leaves no session of the account MFA-satisfied.
+confirm verified, and a confirm that loses the race fails closed. It answers a refusal, which
+carries no recovery codes, enables nothing, and leaves no session of the account MFA-satisfied.
 
-Both hooks sit on ``store.enable_totp``, the compare-and-set itself, so they open the window
-exactly between the confirm's code check and the write the fix made conditional.
+Both hooks wrap ``store.enable_totp`` and act before calling it. So they hold open the tail of the
+window, after the confirm's code check, recovery-code hashing and session rotation, right before
+the compare-and-set write the fix made conditional. A begin that lands earlier in the window, after
+the code check, meets the same write.
 """
 
 from __future__ import annotations
@@ -23,20 +25,24 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from _totp_clock import pin_totp_clock
 
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_CONFIRM,
+    STEP_UP_ACTION_MFA_ENROLL,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._bound_proof import prove
+from tests._totp_clock import pin_totp_clock
 from tests.test_api_auth import PW, _add, _auth, _client
 from tests.test_api_auth import _login as _api_login
 from tests.test_api_auth import _service as _api_service
@@ -95,31 +101,50 @@ async def _two_sessions_one_staged(c: httpx.AsyncClient) -> tuple[str, str, str]
     second holds an enroll grant. Returns ``(confirmer, beginner, staged_secret)``."""
     confirmer = await _login(c)
     beginner = await _login(c)
-    confirmer = await prove(c, confirmer, PW, "mfa_enroll")
+    confirmer = await prove(c, confirmer, PW, STEP_UP_ACTION_MFA_ENROLL)
     r = await c.post("/me/mfa/enroll", headers=_auth(confirmer))
     assert r.status_code == 200, r.text
     staged = r.json()["secret"]
     assert isinstance(staged, str)
-    confirmer = await prove(c, confirmer, PW, "mfa_confirm")
-    beginner = await prove(c, beginner, PW, "mfa_enroll")
+    confirmer = await prove(c, confirmer, PW, STEP_UP_ACTION_MFA_CONFIRM)
+    beginner = await prove(c, beginner, PW, STEP_UP_ACTION_MFA_ENROLL)
     return confirmer, beginner, staged
 
 
+async def _race(
+    confirm: Coroutine[Any, Any, httpx.Response], begin: Coroutine[Any, Any, httpx.Response]
+) -> tuple[httpx.Response, httpx.Response]:
+    """Run both requests at once, the confirm's task first. A TaskGroup, not ``gather``, so a side
+    that raises cancels the other rather than leaving it running past the test on the shared loop."""
+    async with asyncio.TaskGroup() as tg:
+        confirmed = tg.create_task(confirm)
+        begun = tg.create_task(begin)
+    return confirmed.result(), begun.result()
+
+
 async def _assert_failed_closed(
-    engine: Engine, service: AuthService, user_id: str, confirmed: httpx.Response
+    engine: Engine,
+    service: AuthService,
+    user_id: str,
+    confirmed: httpx.Response,
+    *,
+    sessions_left: set[str],
 ) -> None:
-    """A confirm that lost: no codes handed back, nothing enabled, no session MFA-satisfied."""
-    assert "recovery_codes" not in confirmed.json()
+    """A confirm that lost. A refusal status is what proves no recovery codes were handed back:
+    only the 200 reply carries them. Nothing is enabled, exactly ``sessions_left`` (token hashes)
+    survive, and none of them is MFA-satisfied."""
+    assert confirmed.status_code in (400, 401), confirmed.text
     user = await engine.store.get_user(user_id)
     assert user is not None and user.totp_enabled is False
     assert await engine.store.get_recovery_code_hashes(user_id) == []
     sessions = await service.list_sessions(user_id)
+    assert {s.token_hash for s in sessions} == sessions_left
     assert all(s.mfa_verified_at is None for s in sessions), (
         "a confirm that lost the race left a session MFA-satisfied"
     )
 
 
-async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
+async def test_a_begin_request_inside_the_confirm_requests_window_cannot_choose_the_enabled_secret(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: a begin request from a second session, landing after the confirm request checked
@@ -132,9 +157,11 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
     request is sent only once the confirm request is parked. **How we know the requests
     overlapped:** the timeline the hooks record must read confirm parked, begin answered, confirm
     resumed, confirm answered. So the whole begin request, route dependencies and all, ran start to
-    finish while the confirm request was in flight inside its window. A ten-second bound on each
-    wait turns a request that never arrives into a ``TimeoutError`` rather than a hang, and the
-    begin releases the park however it ends, so a failing begin never leaves the confirm parked.
+    finish while the confirm request was in flight inside its window.
+
+    Each side releases the other however it ends: a confirm answered without parking lets the begin
+    go, so the timeline assertion shows the confirm's reply rather than a timeout, and a failing
+    begin lets the confirm resume. A ten-second bound on each wait is the backstop against a hang.
 
     Without the fix the confirm enables the begin's secret, which it never verified, and answers
     200 with recovery codes. With it the confirm answers 401, enables nothing and ends its own
@@ -161,9 +188,12 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
         monkeypatch.setattr(engine.store, "enable_totp", park_then_enable)
 
         async def confirm() -> httpx.Response:
-            r = await _confirm(c, confirmer, first, _T0)
-            timeline.append("confirm answered")
-            return r
+            try:
+                r = await _confirm(c, confirmer, first, _T0)
+                timeline.append("confirm answered")
+                return r
+            finally:
+                parked.set()
 
         async def begin() -> httpx.Response:
             try:
@@ -174,13 +204,13 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
             finally:
                 answered.set()
 
-        confirmed, begun = await asyncio.gather(confirm(), begin())
+        confirmed, begun = await _race(confirm(), begin())
         assert timeline == [
             "confirm parked",
             "begin answered",
             "confirm resumed",
             "confirm answered",
-        ], timeline
+        ], (timeline, confirmed.status_code, confirmed.text)
 
         assert begun.status_code == 200, begun.text
         second = begun.json()["secret"]
@@ -191,12 +221,11 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
             confirmed.status_code,
         )
         assert confirmed.json() == {"detail": "session ended; sign in again"}
-        await _assert_failed_closed(engine, service, user_id, confirmed)
-        assert await engine.store.get_totp_secret(user_id) == totp.new_enrolment(second)
         # The confirmer's rotated session is ended, not handed back; only the beginner's remains.
-        assert {s.token_hash for s in await service.list_sessions(user_id)} == {
-            hash_token(beginner)
-        }
+        await _assert_failed_closed(
+            engine, service, user_id, confirmed, sessions_left={hash_token(beginner)}
+        )
+        assert await engine.store.get_totp_secret(user_id) == totp.new_enrolment(second)
         rows = await engine.store.list_audit(actor="op", action="auth.mfa_enroll_refused", limit=10)
         assert len(rows) == 1
         assert json.loads(str(rows[0]["detail"]))["reason"] == "secret_replaced"
@@ -204,7 +233,7 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
         # Control: the replacing secret confirms through its own ceremony, at a later step, since
         # the refused confirm spent the step it matched. What ends enabled is that secret. The
         # hook has parked once and passes every later call through.
-        beginner = await prove(c, beginner, PW, "mfa_confirm")
+        beginner = await prove(c, beginner, PW, STEP_UP_ACTION_MFA_CONFIRM)
         t1 = _T0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
         r = await _confirm(c, beginner, second, t1)
@@ -218,9 +247,11 @@ async def test_a_begin_request_inside_the_confirm_requests_window_is_refused(
 #: The unordered test's widening, in seconds: before the enable, and after it.
 _BEFORE_ENABLE = 0.3
 _AFTER_ENABLE = 0.5
+#: The delay aimed past the enable and before the confirm's answer: the middle of the after-window.
+_AFTER_THE_ENABLE = _BEFORE_ENABLE + _AFTER_ENABLE / 2
 
 
-@pytest.mark.parametrize("delay", [0.0, 0.01, 0.05, 0.2, 0.6])
+@pytest.mark.parametrize("delay", [0.0, 0.01, 0.05, 0.2, _AFTER_THE_ENABLE])
 async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_unverified_secret(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, delay: float
 ) -> None:
@@ -228,25 +259,30 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
 
     The confirm request and a begin request from a second session are sent concurrently; the begin
     is sent ``delay`` seconds after the confirm. A hook on ``enable_totp`` sleeps before the write,
-    widening the window between the code check and the enable, and after it, widening the time
-    between the enable and the confirm's answer. It chooses nothing about what lands where, and the
-    test asserts it ran on exactly the outcomes that reach the enable, so the widening cannot
-    silently stop.
+    widening the window between the code check and the enable. For the one delay aimed past the
+    enable it sleeps after the write too, widening the time between the enable and the confirm's
+    answer. It chooses nothing about what lands where, and the test asserts it ran on exactly the
+    outcomes that reach the enable, so the widening cannot silently stop.
 
     Each delay aims at one outcome, but the run asserts the invariant rather than the outcome, so a
-    slow runner that moves a begin into a neighbouring outcome is still checked. Measured over three
-    runs on one Windows workstation (2026-10-26): at 0.0 the begin either staged before the confirm
-    read the row, so the code was wrong (400, one run), or landed inside the window (401, two runs);
-    at 0.01, 0.05 and 0.2 it landed inside the window and the compare-and-set refused (401); at 0.6
-    it landed after the enable, so the confirm won (200) and the route's gate refused the begin
-    (403). Only a run that lands inside the window goes red without the fix.
+    slow runner that moves a begin into a neighbouring outcome is still checked. **Nothing asserts
+    that each outcome is reached**, so on a slow runner a delay can drift into its neighbour's
+    outcome and the sweep still passes. Measured over six runs on one Windows workstation
+    (2026-10-26): at 0.0 the begin either staged before the confirm read the row, so the code was
+    wrong (400), or landed inside the window (401), and both happened; at 0.01, 0.05 and 0.2 it
+    landed inside the window and the compare-and-set refused (401); at the last delay it landed
+    after the enable, so the confirm won (200) and the route's gate refused the begin (403). Only a
+    run that lands inside the window goes red without the fix. The forced test above is the one
+    that always does.
 
-    **How we know the requests overlapped:** the test reads the monotonic clock as each request is
-    sent and answered, and asserts each was sent before the other was answered, so both were in
-    flight through the app at once."""
+    **How we know the requests overlapped:** the confirm's task is created first and is sent
+    before the begin by construction; the test reads the monotonic clock as the begin is sent and
+    as the confirm is answered, and asserts the begin was sent first, so both were in flight
+    through the app at once."""
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
     pin_totp_clock(monkeypatch, _T0)
+    after_enable = _AFTER_ENABLE if delay > _BEFORE_ENABLE else 0.0
     async with _client(engine, service) as c:
         confirmer, beginner, first = await _two_sessions_one_staged(c)
 
@@ -257,14 +293,13 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
             await asyncio.sleep(_BEFORE_ENABLE)
             written = await real_enable(*args, **kwargs)
             enables.append(written)
-            await asyncio.sleep(_AFTER_ENABLE)
+            await asyncio.sleep(after_enable)
             return written
 
         monkeypatch.setattr(engine.store, "enable_totp", widened_enable)
         clock: dict[str, float] = {}
 
         async def confirm() -> httpx.Response:
-            clock["confirm sent"] = time.monotonic()
             r = await _confirm(c, confirmer, first, _T0)
             clock["confirm answered"] = time.monotonic()
             return r
@@ -272,13 +307,10 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
         async def begin() -> httpx.Response:
             await asyncio.sleep(delay)
             clock["begin sent"] = time.monotonic()
-            r = await c.post("/me/mfa/enroll", headers=_auth(beginner))
-            clock["begin answered"] = time.monotonic()
-            return r
+            return await c.post("/me/mfa/enroll", headers=_auth(beginner))
 
-        confirmed, begun = await asyncio.gather(confirm(), begin())
+        confirmed, begun = await _race(confirm(), begin())
         assert clock["begin sent"] < clock["confirm answered"], clock
-        assert clock["confirm sent"] < clock["begin answered"], clock
 
         user = await engine.store.get_user(user_id)
         assert user is not None
@@ -293,22 +325,34 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
             # inside the window makes the enable refuse, so a 200 leaves the begin only refusing:
             # 400 from the service where it read TOTP off first, or 403 from the route's gate,
             # which refuses an enroll on an MFA-pending session once the account holds a factor.
-            assert begun.status_code in (400, 403), begun.text
+            if begun.status_code == 403:
+                assert begun.headers.get("X-MFA-Required") == "1", begun.text
+            else:
+                assert begun.status_code == 400 and "already enabled" in begun.text, begun.text
         elif confirmed.status_code == 401:
-            # The begin staged inside the window and the compare-and-set refused.
+            # The begin staged inside the window and the compare-and-set refused, ending the
+            # confirmer's rotated session.
             assert enables == [False]
             assert begun.status_code == 200, begun.text
             assert await engine.store.get_totp_secret(user_id) == totp.new_enrolment(
                 begun.json()["secret"]
             )
-            await _assert_failed_closed(engine, service, user_id, confirmed)
+            await _assert_failed_closed(
+                engine, service, user_id, confirmed, sessions_left={hash_token(beginner)}
+            )
         else:
             # The begin staged before the confirm read the row, so the code was checked against
-            # the begin's secret and failed; no enable ran.
+            # the begin's secret and failed; no enable ran and no session was rotated.
             assert confirmed.status_code == 400, confirmed.text
             assert enables == []
             assert begun.status_code == 200, begun.text
             assert await engine.store.get_totp_secret(user_id) == totp.new_enrolment(
                 begun.json()["secret"]
             )
-            await _assert_failed_closed(engine, service, user_id, confirmed)
+            await _assert_failed_closed(
+                engine,
+                service,
+                user_id,
+                confirmed,
+                sessions_left={hash_token(confirmer), hash_token(beginner)},
+            )
