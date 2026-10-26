@@ -507,13 +507,11 @@ class _HeldCopyLog:
     alert, with its own ``detail`` and ``shared_with`` (vault BACKLOG #2319), and a sink that logs
     its alerts still logs one for each row."""
 
-    def __init__(
-        self, sharing: Mapping[str, tuple[str, ...]], keys: Mapping[str, str] | None = None
-    ) -> None:
+    def __init__(self, sharing: Mapping[str, tuple[str, ...]], keys: Mapping[str, str]) -> None:
         self._sharing = sharing
         # Each CRL row's path in key form, worked out once inside the grouping's guard, so the
         # lookups below never key a path themselves (BACKLOG #3512).
-        self._keys = keys or {}
+        self._keys = keys
         self._logged: set[tuple[str, _HeldCopyAccount]] = set()
 
     @classmethod
@@ -526,7 +524,7 @@ class _HeldCopyLog:
             return cls(_rows_by_crl_file(rows), keys)
         except Exception:
             log.error("cert_expiry: could not group the CRL rows by file", exc_info=True)
-            return cls({})
+            return cls({}, {})
 
     def others(self, row: MonitoredCert | CertCheck) -> tuple[str, ...]:
         """The other rows naming ``row``'s file: the alert's ``shared_with``, and the rows a
@@ -636,9 +634,8 @@ def _ca_file_crl_refusal(
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
         with staged_crl(pem) as copy:
             scratch = crl_scratch_context(str(copy), blocks, label="the CA file")
-        # One state per CRL, read as a start reads them (tls_policy._check_crl_signatures). The
-        # reload's crl_signature_refusal flag is True for three of them, and only ``bad`` proves
-        # that handshakes fail (BACKLOG #3512).
+        # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for
+        # three of them, and only ``bad`` proves a failure (BACKLOG #3512).
         states = {
             sig.state for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True))
         }
@@ -660,19 +657,20 @@ def _ca_file_crl_refusal(
             f"({type(exc).__name__}), and tries again each pass",
         )
     if "bad" in states:
+        # A start's own words for the proven case (tls_policy._check_crl_signatures).
         return (
             "whose CA file now holds a CRL its issuer's key does not verify",
-            "Replace the CRL in the CA file with one its CA signed before restarting: every "
-            "handshake it judges would fail",
+            "Replace the CRL in the CA file with one its CA signed, or remove it if a good one "
+            "from that issuer is already in the file, before restarting: every handshake it "
+            "judges would fail",
         )
     if states & {"unproven", "uncheckable"}:
-        # Not proven either way. A CA that renewed its key reads ``unproven`` while handshakes can
-        # still pass, so the remedy asks for a check and claims no failure.
+        # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
+        # So the remedy asks for a check and claims no failure.
         return (
             "whose CA file now holds a CRL whose signature the engine could not confirm",
             "Check that the CRL in the CA file is one its CA signed before restarting: the engine "
-            "could not confirm it with the key of the CA the file lists, and where that key did "
-            "not sign it, every handshake it judges would fail",
+            "could not confirm its signature with the CA the file lists for its issuer",
         )
     return None
 
@@ -747,8 +745,8 @@ def _judge_crl(
                     # BACKLOG #3512: the CA-file fix still leads, since a refusal's remedy can be a
                     # restart, but the reload's own remedy and reason are kept after it.
                     remedy += (
-                        ". The reload refused the file for a hop that loaded it as its CRL "
-                        f"setting: {reload_says}"
+                        ". Do that first. The reload also refused the file for a hop that loaded "
+                        f"it as its CRL setting: {reload_says}"
                     )
             elif bundle_only:
                 # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
