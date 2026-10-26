@@ -26,6 +26,7 @@ tests/test_adr0071_crossing_count.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py
+tests/test_afk_gate.py
 tests/test_afk_kill_switch.py
 tests/test_afk_tripwire.py
 tests/test_ai_provenance_claims.py
