@@ -466,15 +466,18 @@ class CertExpiryRunner:
         )
 
 
-def _rows_by_crl_file(rows: Sequence[MonitoredCert]) -> dict[str, tuple[str, ...]]:
+def _rows_by_crl_file(
+    rows: Sequence[MonitoredCert], keys: Mapping[str, str]
+) -> dict[str, tuple[str, ...]]:
     """The labels of the CRL rows naming each file, keyed as held copies are (vault BACKLOG #2319).
+    ``keys`` holds each CRL row's path in that form.
 
     Several settings or connections can name one CRL file, and each gets its own row, since each
     hop depends on it. A held copy is matched by its file, so each of those rows reports it."""
     by_file: dict[str, list[str]] = {}
     for row in rows:
         if row.kind == "crl":
-            labels = by_file.setdefault(crl_path_key(row.path), [])
+            labels = by_file.setdefault(keys[row.path], [])
             if row.label not in labels:
                 labels.append(row.label)
     return {key: tuple(labels) for key, labels in by_file.items()}
@@ -521,7 +524,7 @@ class _HeldCopyLog:
         That holds when ``crl_path_key`` itself raises, too (BACKLOG #3512)."""
         try:
             keys = {row.path: crl_path_key(row.path) for row in rows if row.kind == "crl"}
-            return cls(_rows_by_crl_file(rows), keys)
+            return cls(_rows_by_crl_file(rows, keys), keys)
         except Exception:
             log.error("cert_expiry: could not group the CRL rows by file", exc_info=True)
             return cls({}, {})
@@ -530,8 +533,8 @@ class _HeldCopyLog:
         """The other rows naming ``row``'s file: the alert's ``shared_with``, and the rows a
         folded line names. Never raises: its call sits inside the guard around the alert sink,
         where a raise would cost the row its alert under a "sink failed" line (BACKLOG #3512)."""
-        key = self._keys.get(row.path)
-        labels = self._sharing.get(key, ()) if key is not None else ()
+        # "" keys no file, so a row the grouping does not hold shares with none.
+        labels = self._sharing.get(self._keys.get(row.path, ""), ())
         return tuple(label for label in labels if label != row.label)
 
     def warn(self, cert: MonitoredCert, account: _HeldCopyAccount) -> None:
@@ -546,8 +549,8 @@ class _HeldCopyLog:
         the row no date and no alert (vault BACKLOG #3548). An account counts as logged only once
         its line is, so a failure leaves the next row sharing the file to log it."""
         try:
-            key = self._keys.get(cert.path)
-            fold_key = key if key is not None and key in self._sharing else None
+            key = self._keys.get(cert.path, "")
+            fold_key = key if key in self._sharing else None
             if fold_key is not None and (fold_key, account) in self._logged:
                 return
             # The alert's own words for the rows sharing a file, without its clause that each of
@@ -657,20 +660,22 @@ def _ca_file_crl_refusal(
             f"({type(exc).__name__}), and tries again each pass",
         )
     if "bad" in states:
-        # A start's own words for the proven case (tls_policy._check_crl_signatures).
+        # The claim and the fix a start gives a CRL setting in the proven case
+        # (tls_policy._check_crl_signatures). OpenSSL can prefer a newer good CRL from the issuer.
         return (
             "whose CA file now holds a CRL its issuer's key does not verify",
             "Replace the CRL in the CA file with one its CA signed, or remove it if a good one "
-            "from that issuer is already in the file, before restarting: every handshake it "
-            "judges would fail",
+            "from that issuer is already in the file, before restarting: a handshake OpenSSL "
+            "judges by it fails",
         )
     if states & {"unproven", "uncheckable"}:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
         # So the remedy asks for a check and claims no failure.
         return (
             "whose CA file now holds a CRL whose signature the engine could not confirm",
-            "Check that the CRL in the CA file is one its CA signed before restarting: the engine "
-            "could not confirm its signature with the CA the file lists for its issuer",
+            "Check that the CRL in the CA file is one its CA signed, then restart the engine to "
+            "apply the CA file: the engine could not confirm its signature with the CA the file "
+            "lists for its issuer",
         )
     return None
 
@@ -729,7 +734,6 @@ def _judge_crl(
                 if fingerprint is not None and not bundle_only
                 else None
             )
-            reload_says = "" if refused is None else f"{refused.remedy}. Reason: {refused.reason}"
             if pem is None:
                 what = "CA file" if bundle_only else "CRL file"
                 why, remedy = (
@@ -743,10 +747,11 @@ def _judge_crl(
                 why, remedy = unsafe
                 if refused is not None:
                     # BACKLOG #3512: the CA-file fix still leads, since a refusal's remedy can be a
-                    # restart, but the reload's own remedy and reason are kept after it.
+                    # restart, but the reload's own remedy is kept after it. Not its reason, which
+                    # quotes CRL issuers and dates: the reload's ERROR line holds that (#2904).
                     remedy += (
                         ". Do that first. The reload also refused the file for a hop that loaded "
-                        f"it as its CRL setting: {reload_says}"
+                        f"it as its CRL setting: {refused.remedy}"
                     )
             elif bundle_only:
                 # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
@@ -765,7 +770,7 @@ def _judge_crl(
             elif refused is not None:
                 why = "that differs from the file, which the engine refused to apply to it"
                 # The remedy leads: the alert instance keeps only the start of it (#2319).
-                remedy = reload_says
+                remedy = f"{refused.remedy}. Reason: {refused.reason}"
                 if some_bundle and "Restart the engine" not in refused.remedy:
                     # BACKLOG #3176: after the remedy, not instead of it, and never "either way":
                     # a refused reload can say to wait before any restart.

@@ -642,7 +642,7 @@ def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Replace the CRL in the CA file with one its CA signed")
-    assert "every handshake it judges would fail" in detail
+    assert "a handshake OpenSSL judges by it fails" in detail
     assert "Restart the engine" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -661,8 +661,8 @@ def test_a_ca_file_crl_from_a_renewed_ca_key_is_unconfirmed_not_failing(
 
     assert detail.startswith("Check that the CRL in the CA file is one its CA signed")
     assert "could not confirm its signature" in detail
+    assert "then restart the engine to apply the CA file" in detail
     assert "handshake" not in detail
-    assert "Restart the engine" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -690,7 +690,7 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith(lead), detail
-    assert ("every handshake it judges would fail" in detail) == ("bad" in states), detail
+    assert ("a handshake OpenSSL judges by it fails" in detail) == ("bad" in states), detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -773,7 +773,7 @@ def _shared_as_crl_and_ca_file(
     crl = tmp_path / "crl.pem"
     crl.write_bytes(ca.crl(days=90, number=2))
     hops = [_hop(ca_file, both), _hop(both, crl)]
-    both.write_bytes(ca.pem + (new_crl or ca.crl(days=80, number=3)))
+    both.write_bytes(ca.pem + (ca.crl(days=80, number=3) if new_crl is None else new_crl))
     return hops, both
 
 
@@ -839,10 +839,11 @@ def test_a_refusal_that_already_says_restart_gets_no_second_restart(
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
-def test_a_refused_reload_keeps_its_reason_beside_a_ca_file_fix(ca: _Ca, tmp_path: Path) -> None:
-    # BACKLOG #3512: the CA-file arm outranked a recorded refusal and dropped the reload's remedy
-    # and reason. The CA-file fix still leads, because a refusal's remedy can be a restart, which
-    # would load this CRL into the CA-file hop unjudged.
+def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_path: Path) -> None:
+    # BACKLOG #3512: the CA-file arm outranked a recorded refusal and dropped the reload's remedy,
+    # which changelog.d/3176.fixed.md promised. The CA-file fix still leads, because a refusal's
+    # remedy can be a restart, which would load this CRL into the CA-file hop unjudged. The reason
+    # stays out: it quotes CRL issuers, and the reload's ERROR line holds it (vault BACKLOG #2904).
     hops, both = _shared_as_crl_and_ca_file(
         ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2)
     )
@@ -856,7 +857,8 @@ def test_a_refused_reload_keeps_its_reason_beside_a_ca_file_fix(ca: _Ca, tmp_pat
 
     assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
     assert ". Do that first. The reload also refused the file for a hop that loaded it" in detail
-    assert f": {remedy}. Reason: {reason}. Held by: " in detail
+    assert f": {remedy}. Held by: " in detail
+    assert reason not in detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
@@ -873,7 +875,7 @@ def test_a_failure_grouping_the_crl_rows_costs_only_the_shared_rows_note(
     cert = tmp_path / "cert.pem"
     cert.write_bytes(ca.pem)
 
-    def _broken(rows: object) -> dict[str, tuple[str, ...]]:
+    def _broken(*args: object) -> dict[str, tuple[str, ...]]:
         raise RuntimeError("synthetic grouping failure")
 
     monkeypatch.setattr("messagefoundry.pipeline.cert_expiry._rows_by_crl_file", _broken)

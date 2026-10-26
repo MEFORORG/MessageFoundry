@@ -430,8 +430,9 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     order, one at a time (vault BACKLOG #2905).
 
     OpenSSL checks a CRL's signature at the handshake, not when it loads the file. This is the
-    engine's own check, for a start (``harden_crl_check``) and for the running-hop reload
-    (:func:`crl_signature_refusal`). A CA that ``cryptography`` cannot read is ignored
+    engine's own check, for at least a start (``harden_crl_check``), the running-hop reload
+    (:func:`crl_signature_refusal`) and the expiry scan's check of a CRL in a CA file (BACKLOG
+    #3512). A CA that ``cryptography`` cannot read is ignored
     (:data:`_UNREADABLE_CA`): it cannot be shown to be an issuer, and a trust store may hold one
     that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
