@@ -343,6 +343,8 @@ async def test_full_verify_fails_on_a_corrupted_aead_cell(tmp_path) -> None:
     res = await run_restore_verify(result.archive_path, store_settings=ss, full=True)
     assert res.status == "FAIL"
     assert "messages.raw" in (res.reason or "") and "did not decrypt" in (res.reason or "")
+    # The per-cell decrypt arm carries the CipherError token too (BACKLOG #3605).
+    assert "CipherError" in (res.reason or ""), res.reason
 
 
 def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> None:
@@ -389,6 +391,7 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     )
     assert wrong.status == "FAIL"
     assert "did not decrypt" in (wrong.reason or ""), wrong.reason
+    assert "CipherError" in (wrong.reason or ""), wrong.reason  # the token, BACKLOG #3605
 
     # And with no settings at all the full verify refuses rather than falling back to a keyless open.
     absent = _verify_archive_blocking(
@@ -528,17 +531,16 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
 
 
 def test_a_decrypt_miss_renders_the_cipher_error_token_restore_verify_reads() -> None:
-    """The token rule, pinned directly (BACKLOG #3605). A full verify's reason is ``safe_exc`` of
-    the error that stopped it, so it names the exception's CLASS, and an operator would match the
-    ``CipherError`` token in it, as the since-retired-key test above does. BACKLOG #2593 gave the
-    decrypt miss its own subclass, and the first name it took dropped the token. Nothing failed
-    except that end-to-end match.
+    """The token rule, pinned directly (BACKLOG #3605). Where a full verify fails on a cipher error,
+    at the open or at a cell's decrypt, its reason is ``safe_exc`` of that error, so it names the
+    exception's CLASS, and an operator would match the ``CipherError`` token in it, as the
+    since-retired-key test above does. BACKLOG #2593 gave the decrypt miss its own subclass, and the
+    first name it took dropped the token. Nothing failed except that end-to-end match.
 
     Both errors are read off a real raise of the cell-bound (v4, AAD) cipher the store writes with:
     the miss a wrong key raises, and the plain ``CipherError`` of a too-short value (a corrupt-row
-    arm). NOT every subclass: at least ``CellTagError``, ``QueueTagError`` and
-    ``AuditKeyVersionRefusedError`` deliberately lack the token, and this test says nothing about
-    them."""
+    arm). Not every subclass keeps the token; ``UnauthenticatedCipherError``'s docstring in
+    ``store/crypto.py`` says so, and this test says nothing about the others."""
     aad = b"synthetic-cell"
     sealed = make_cipher(generate_key(), write_v2=True).encrypt("PID|1||SYNTH-0001", aad=aad)
     reader = make_cipher(generate_key(), write_v2=True)
@@ -757,7 +759,6 @@ def test_an_exception_after_extraction_with_a_held_handle_leaves_no_plaintext(
 ) -> None:
     """Limb 2 of #1721 on the exception path: the error that escapes is the verify's own, never the
     teardown's, and the plaintext is gone either way. Bites on Windows, like the test above."""
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.01,))
@@ -895,7 +896,6 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
 def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, monkeypatch) -> None:
     """``KeyboardInterrupt`` is not an ``Exception``: the teardown must run for it too, and it must
     reach the caller unchanged."""
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
 
@@ -916,7 +916,6 @@ def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, mon
 def test_an_exception_carries_the_directory_it_could_not_clear(tmp_path, monkeypatch) -> None:
     """An exception escaping the verify keeps its own type, and a staging directory that still holds
     decrypted bytes is named on it as a note, not only in the log."""
-
     archive, key_b64 = _keyed_archive(tmp_path)
     iso = _isolate_tempdir(tmp_path, monkeypatch)
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
