@@ -1600,33 +1600,24 @@ def test_sftp_key_only_login_keeps_the_escape(escape_at_warn: None) -> None:
     assert client._accept_unknown is True
 
 
-def test_sftp_password_login_never_sets_the_escape_pinning_policy(
+def test_sftp_password_refusal_is_the_last_policy_whatever_the_flags_say(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Vault BACKLOG #3533 item 8. __init__ never sets both flags, so this forces them. No policy
-    passed to ``set_missing_host_key_policy`` is a ``_PinEscapeHostKey``, the unknown key is
-    refused, and authentication is never reached."""
-    policies: list[Any] = []
-
-    class _RecordingClient(_PolicyCallingSSHClient):
-        def set_missing_host_key_policy(self, policy: Any) -> None:
-            policies.append(policy)
-            super().set_missing_host_key_policy(policy)
-
-    class _Paramiko(_PolicyCallingParamiko):
-        SSHClient = _RecordingClient
-
-    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
+    """Vault BACKLOG #3533 item 8. __init__ never sets both flags, so this forces them. Even so,
+    the password refusal is the policy in effect: the unknown key is refused before any password
+    crosses, and the escape's pinning policy is never set."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
     monkeypatch.setattr(_PolicyCallingSSHClient, "authenticated", False)
+    monkeypatch.setattr(_PolicyCallingSSHClient, "last_policy", None)
     client = _SftpClient(
         {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "synthetic"}
     )
     client._accept_unknown = True
     with pytest.raises(_RemoteError, match="with no escape"):
         client._connect()
-    assert policies  # CONTROL: the recorder saw the policy calls
-    assert not any(isinstance(p, remotefile._PinEscapeHostKey) for p in policies)
-    assert _RecordingClient.authenticated is False
+    assert isinstance(_PolicyCallingSSHClient.last_policy, remotefile._RefuseUnknownHostKey)
+    assert _PolicyCallingSSHClient.authenticated is False
+    assert client._escape_key is None
 
 
 def _sftp_connect_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:

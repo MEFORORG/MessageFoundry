@@ -1640,9 +1640,8 @@ class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
     dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
-    ``[security].enforcement = warn`` and the posture is known. Then an unknown key is accepted and
-    pinned in memory for this connector, nothing is written to ``known_hosts``, and a warning is
-    logged. A login that sends a ``password`` never takes the escape (vault
+    ``[security].enforcement = warn`` and the posture is known, in which case ``AutoAddPolicy`` is
+    used and a warning is logged. A login that sends a ``password`` never takes the escape (vault
     BACKLOG #3230): its unknown host key is refused by :class:`_RefuseUnknownHostKey`, whatever the
     posture.
 
@@ -1693,9 +1692,9 @@ class _SftpClient(_RemoteClient):
             )
         if self._accept_unknown:
             logger.warning(
-                "REMOTEFILE sftp %s accepts an UNKNOWN host key and pins it in memory for this "
-                "connector, writing nothing to known_hosts, because %s is set on an instance at "
-                "[security].enforcement = warn — MITM-able; for a trusted-network dev/test bind only",
+                "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
+                "on an instance at [security].enforcement = warn — MITM-able; for a trusted-network "
+                "dev/test bind only",
                 self._host,
                 INSECURE_TLS_ESCAPE_ENV,
             )
@@ -1771,9 +1770,8 @@ class _SftpClient(_RemoteClient):
             # A changed key on a host the file does not name is then refused, not re-accepted.
             if host_keys.lookup(name) is None:
                 host_keys.add(name, key.get_name(), key)
-        # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Behind
-        # the explicit insecure escape (set in __init__, logged), _PinEscapeHostKey below replaces
-        # this AutoAddPolicy before connect, so the key is pinned in memory and never saved.
+        # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Only
+        # fall back to AutoAddPolicy behind the explicit insecure escape (set in __init__, logged).
         client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
         )
@@ -1784,9 +1782,9 @@ class _SftpClient(_RemoteClient):
             # as it did before, which CodeQL's dismissed alert 13 is matched against.
             client.set_missing_host_key_policy(_RefuseUnknownHostKey(paramiko, name=self._name))
         if self._accept_unknown and not self._password:
-            # Replaces the AutoAddPolicy above. Each _connect builds a fresh SSHClient, so only
-            # this pin carries the accepted key to the connector's later logins (vault BACKLOG
-            # #3533 item 8). Never for a password login, so the refusal above stays in effect.
+            # Replaces the AutoAddPolicy above, which saves an accepted key into any save target.
+            # This one pins it in memory only (vault BACKLOG #3533 item 8). Never for a password
+            # login, whatever the flags say, so the refusal above stays the policy in effect.
             client.set_missing_host_key_policy(_PinEscapeHostKey(self._pin_escape_key))
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to

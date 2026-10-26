@@ -1310,8 +1310,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   the pin. The pin lasts as long as the connector does, and a new connector starts with none. An
   outbound keeps its connector across a lane stop and restart, so its pin holds there. At least an
   engine restart, a reload that changes the connection, and a rebuild of a failed lane build a new
-  outbound connector. An inbound poller builds a new connector each time it starts. At least a lane
-  restart and a reload that goes through start it.
+  outbound connector. An inbound poller builds a new connector every time it starts, which at least
+  a lane restart and any reload do.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
