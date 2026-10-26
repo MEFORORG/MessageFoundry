@@ -2174,10 +2174,12 @@ yet in effect it may say to wait instead. For a proven bad signature it says wha
 a CRL setting: a handshake OpenSSL judges by that CRL fails. The engine may still be unable to
 confirm the signature, short of that proof. Then `detail` asks you to check the CRL, and claims no
 failure. The start's WARNING cases above say why (BACKLOG #3512). Where only CA files load it,
-`detail` then says to restart. A CRL setting may name the file too. Then the restart waits for
-the reload's verdict, since a start judges that setting. So after the CA-file step, `detail` says
-to restart once the reload has applied the file. Or it gives a refused reload's remedy, and then
-the CA-file hop's restart unless that remedy is a restart. Put a CRL in
+`detail` then says to restart. Where a CRL setting names it too, as `[store].ssl_crl_file` can,
+the check comes before the restart, since a start judges that setting. A hop may still hold a
+stale copy through a CRL setting. Only then does the restart wait for the reload's verdict. So
+after the CA-file step, `detail` says to restart once the reload has applied the file. Or it gives
+a refused reload's remedy, and then the CA-file hop's restart unless the reload counts that remedy
+as a restart. Put a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.

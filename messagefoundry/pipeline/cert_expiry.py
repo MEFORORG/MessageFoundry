@@ -48,7 +48,10 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_expiry_detail
-from messagefoundry.pipeline.crl_reload import RELOAD_INTERVAL_SECONDS
+
+# _SAYS_RESTART is private to crl_reload, and no public form exists: one list of the remedies
+# that are a restart keeps the two modules from disagreeing (BACKLOG #3512).
+from messagefoundry.pipeline.crl_reload import _SAYS_RESTART, RELOAD_INTERVAL_SECONDS
 from messagefoundry.pki import (
     CertFacts,
     CrlFacts,
@@ -711,12 +714,17 @@ def _after_the_reload(refused: ReloadRefusal | None) -> str:
             f"{RELOAD_INTERVAL_SECONDS:g} seconds: only a restart applies it to a hop that loaded "
             "it as its CA file. If the reload refuses it, this alert says why"
         )
-    said = (
+    return (
         f"The reload refused the file for a hop that loads it as its CRL setting: {refused.remedy}"
+        f"{_ca_file_hop_restart(refused)}"
     )
-    if "Restart the engine" in refused.remedy:
-        return said
-    return f"{said}. {_CA_FILE_HOP_RESTARTS}"
+
+
+def _ca_file_hop_restart(refused: ReloadRefusal) -> str:
+    """The CA-file hop's restart after a refused reload's remedy, or ``""`` when that remedy is a
+    restart already. The reload's own list decides (``crl_reload._SAYS_RESTART``), so a sticky
+    refusal such as ``_NOT_PROVABLE`` is not told to wait for an apply (BACKLOG #3512)."""
+    return "" if refused.remedy in _SAYS_RESTART else f". {_CA_FILE_HOP_RESTARTS}"
 
 
 def _judge_crl(
@@ -747,13 +755,13 @@ def _judge_crl(
     account: _HeldCopyAccount | None = None
     try:
         copies = held.copies(cert.path)
-        # BACKLOG #3512: whether a CRL setting names this file, so a restart must wait for the
-        # reload's verdict. Any row but a held-crl one is a CRL setting, and so is a held copy
-        # from one, stale or not. The stale copies alone cannot tell: a store hop records none.
-        crl_setting_too = (
-            cert.label != held_crl_label(cert.path)
-            or bool(said.others(cert))
-            or any(not c.ca_bundle for c in copies)
+        # BACKLOG #3512: whether a CRL setting names this file, for the wording alone: a start
+        # judges that setting, so the CA-file step says "before restarting" rather than ordering a
+        # restart. Any row but a held-crl one is a CRL setting, and so is a held copy from one,
+        # stale or not: a store hop records none. Whether a restart waits for the reload is a
+        # different question, answered below by a stale non-bundle copy alone.
+        crl_setting_too = cert.label != held_crl_label(cert.path) or any(
+            not c.ca_bundle for c in copies
         )
         fingerprint = crl_fingerprint(pem) if copies and pem is not None else None
         # Vault BACKLOG #2319: a CA-bundle copy is a copy of the file's CRLs alone, so it is
@@ -801,10 +809,11 @@ def _judge_crl(
                 # this one, which refuses peers under its issuer or, unconfirmed, might (#3512).
                 # Fix or check it first.
                 why, remedy = unsafe
-                if crl_setting_too:
-                    # BACKLOG #3512: the CA-file step leads and orders no restart, then the steps
-                    # the arms below give a file a CRL setting names: the reload's remedy and the
-                    # CA-file hop's restart after it, or the restart after the reload's verdict.
+                if not bundle_only:
+                    # BACKLOG #3512: a stale copy from a CRL setting is what the reload judges
+                    # (crl_reload._held_by_path skips CA-file copies), so only then does a restart
+                    # wait for its verdict. The CA-file step leads, then the reload's remedy and
+                    # the CA-file hop's restart after it, or the restart after the verdict.
                     remedy += f". Do that first. {_after_the_reload(refused)}"
             elif bundle_only:
                 # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
@@ -824,8 +833,8 @@ def _judge_crl(
                 why = "that differs from the file, which the engine refused to apply to it"
                 # The remedy leads: the alert instance keeps only the start of it (#2319).
                 remedy = f"{refused.remedy}. Reason: {refused.reason}"
-                if some_bundle and "Restart the engine" not in refused.remedy:
-                    remedy += f". {_CA_FILE_HOP_RESTARTS}"
+                if some_bundle:
+                    remedy += _ca_file_hop_restart(refused)
             elif some_bundle:
                 why, remedy = (
                     "that differs from the file, which a hop loaded as its CA file",
