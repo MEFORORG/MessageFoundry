@@ -550,10 +550,11 @@ def test_the_pinned_path_keeps_a_plant_from_answering_a_bare_name(
 
 def _applications_named(names: tuple[str, ...], env: dict[str, str]) -> list[str]:
     """The programs and scripts Windows PowerShell finds on ``PATH`` for ``names``, started with
-    ``env``, the probe's own, so laying it over the start-up names changes nothing. Module
-    autoloading is off: ``Get-Command`` otherwise imports each module exporting a name it is
-    asked about, which is the walk this lookup exists to avoid, and that module's warnings would
-    reach stdout."""
+    ``env`` laid over the start-up names. ``env`` holds every name that overlay sets, under the
+    same spelling, so the child gets ``env`` as given. Module autoloading is off: ``Get-Command``
+    otherwise imports modules, at least those exporting a name it is asked about (measured:
+    Management, Utility and TLS), which is the walk this lookup exists to avoid, and their
+    warnings would reach stdout."""
     quoted = ",".join(f"'{name}'" for name in names)
     done = _run_powershell(
         "$PSModuleAutoLoadingPreference = 'None'; "
@@ -777,6 +778,22 @@ def test_policy_lines_come_from_the_section_openssl_applies(
     )
     assert section == "tls_policy"
     assert settings == [("MinProtocol", "TLSv1")]
+
+
+def test_a_section_name_keeps_its_inner_whitespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The header's name is what sits between the brackets with only the outer whitespace
+    stripped, as the nested pattern this replaced captured it, so a chain link spelled with the
+    same inner whitespace reaches it."""
+    _, section, settings = _read_cnf(
+        monkeypatch,
+        tmp_path / "openssl.cnf",
+        "openssl_conf = init\n[init]\nssl_conf = ssl\n[ssl]\nsystem_default = tls \t policy\n"
+        "[ \ttls \t policy\t ]\nMinProtocol = TLSv1.2\n",
+    )
+    assert section == "tls \t policy"
+    assert settings == [("MinProtocol", "TLSv1.2")]
 
 
 def test_a_file_with_no_chain_has_no_policy_section(
