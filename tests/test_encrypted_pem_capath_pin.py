@@ -11,8 +11,8 @@ file pins the reading that decision rests on, on every platform CI runs.
 
 **If this goes red, do not loosen it.** A handshake that prompts or waits means a CA directory can
 hang a Vault connection on a file with an encrypted block, and BACKLOG #3090 re-opens for the
-directory. Whether the engine should then refuse a CA directory, which it accepts today, is a
-question of scope for the owner, not a repair to make here.
+directory. The engine accepts a CA directory today. Whether it should then refuse one is a
+question of scope, and the owner decides it.
 
 Measured 2026-10-12 with ``tests/_encrypted_pem_probe.py``. Each client is a fresh child process
 that loads the directory and then verifies a loopback TLS server, itself a child process, whose
@@ -65,11 +65,14 @@ program. For the probe's CA it is ``cd3a2265``. ``openssl x509 -subject_hash`` (
 pyOpenSSL's ``subject_name_hash`` printed the same value on the day. The binding proof is the
 control: the plain CA verifies the server under that name, and does not under another.
 
-No handshake runs in the pytest process. The server and every client are child processes, each
-killed on a deadline, so a regression fails a test and does not hang the suite. The server writes
-a line for each handshake. A trial whose client verified the server must match a server line that
-finished the handshake, and one whose client refused it with a verification error must match one
-that did not. A trial with any other outcome is left to its own assertion.
+No handshake runs in the pytest process. The server and every client are child processes. Each
+client is killed on a deadline, so a regression fails a test and does not hang the suite. The
+server is killed when the module's tests end.
+
+The server writes a line for each handshake, and ``Trial.server_agrees`` checks it. When the client
+verified the server, the server must have finished the handshake. When the client refused it, the
+server must not have. That second check shows the handshake broke off, but not why. Any other
+outcome is left to its own assertion.
 """
 
 from __future__ import annotations
@@ -264,4 +267,5 @@ def test_the_file_name_is_what_makes_a_directory_answer(
     # The reason the encrypted directory gives too: OpenSSL found no CA under the hash name.
     assert refused and "local issuer" in wrong_name.detail, wrong_name
     no_crl = _handshake(shapes, server, condition, CAPATH_PLAIN, "capath-crl")
-    assert no_crl.outcome == "RAISED" and "CRL" in no_crl.detail, no_crl
+    refused = no_crl.outcome == "RAISED" and _REFUSED_THE_PEER in no_crl.detail
+    assert refused and "CRL" in no_crl.detail, no_crl

@@ -215,7 +215,7 @@ sys.stdout.flush()
 # failed:" and the error. It ends when its stdin closes. The caller holds the other end, so the
 # server ends with the caller, even one that dies before it can kill the server.
 _SERVER = r"""
-import os, socket, ssl, sys, threading
+import os, socket, ssl, sys, threading, traceback
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(sys.argv[1])
 # No session tickets. A TLS 1.3 server writes them after the client's Finished, and a client that
@@ -224,8 +224,11 @@ ctx.num_tickets = 0
 def watch_the_caller():
     try:
         sys.stdin.buffer.read()
-    finally:
-        os._exit(0)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+    os._exit(0)
 threading.Thread(target=watch_the_caller, daemon=True).start()
 sys.stdout.reconfigure(errors="backslashreplace")
 lock = threading.Lock()
@@ -328,9 +331,9 @@ class Trial:
     prompted: bool
     #: The local port a ``capath`` trial's client connected from, or ``None`` if it never did.
     client_port: int | None = None
-    #: The loopback server's line for that connection, with the port left off: ``handshake ok``,
-    #: or ``handshake failed:`` and the error. ``None`` if no line came. Only
-    #: :meth:`ProbeTlsServer.handshake` sets it.
+    #: What :meth:`ProbeTlsServer.handshake` found: the server's line for that connection with the
+    #: port left off (``handshake ok``, or ``handshake failed:`` and the error), or a note that
+    #: no line or no client port came. ``None`` if nothing asked the server.
     server: str | None = None
 
     @property
@@ -339,17 +342,22 @@ class Trial:
         return self.outcome == "WAITING" or self.prompted
 
     @property
+    def client_answered(self) -> bool:
+        """The client verified the server, or refused it with a verification error."""
+        refused = self.outcome == "RAISED" and "SSLCertVerificationError" in self.detail
+        return self.outcome == "VERIFIED" or refused
+
+    @property
     def server_agrees(self) -> bool | None:
-        """Whether the server's line matches the client's answer: a verified server finished the
-        handshake, and a server the client refused with a verification error did not. ``None``
-        where the client gave neither answer, or never connected, so there is nothing to match."""
-        if self.client_port is None:
+        """Whether the server's line fits the client's answer. A verified server must have
+        finished the handshake. A refused one must not have, which shows only that the handshake
+        broke off, not why. ``None`` where the client gave neither answer, or nothing asked the
+        server. A missing line, or a client that printed no port, is ``False``."""
+        if self.server is None or not self.client_answered:
             return None
         if self.outcome == "VERIFIED":
             return self.server == "handshake ok"
-        if self.outcome == "RAISED" and "SSLCertVerificationError" in self.detail:
-            return self.server is not None and self.server.startswith("handshake failed")
-        return None
+        return self.server.startswith("handshake failed")
 
 
 def _child_python() -> str:
@@ -364,15 +372,15 @@ def _trial_from(text: str, *, waited: bool) -> Trial:
     if "READY" not in lines:
         return Trial("BROKEN", " | ".join(lines), prompted)
     after = lines[lines.index("READY") + 1 :]
+    # A capath child prints "CLIENT <port>" once it has connected, even if it then hangs.
+    ports = [line.split()[1] for line in after if line.startswith("CLIENT ")]
+    client = int(ports[0]) if ports and ports[0].isdigit() else None
     # A result line means the load returned, even if the child was slow to exit and was killed.
     done = ("RAISED", "LOADED", "VERIFIED")
     result = next((line for line in after if line.startswith(done)), None)
     if result is not None:
-        # A capath child prints "CLIENT <port>" once it has connected.
-        ports = [line.split()[1] for line in after if line.startswith("CLIENT ")]
-        client = int(ports[0]) if ports and ports[0].isdigit() else None
         return Trial(result.split(" ", 1)[0], result, prompted, client_port=client)
-    return Trial("WAITING" if waited else "BROKEN", " | ".join(after), prompted)
+    return Trial("WAITING" if waited else "BROKEN", " | ".join(after), prompted, client_port=client)
 
 
 def _run_in_a_pty(mode: str, path: str, wait: float, extra: tuple[str, ...]) -> Trial:
@@ -506,13 +514,16 @@ class ProbeTlsServer:
     def handshake(
         self, mode: str, path: str | os.PathLike[str], condition: str, *, wait: float
     ) -> Trial:
-        """:func:`run_trial` for a ``capath`` mode against this server. Where the client connected,
-        the result carries the server's own line for that connection as :attr:`Trial.server`."""
+        """:func:`run_trial` for a ``capath`` mode against this server, with what the server said
+        about the connection as :attr:`Trial.server`. It waits for that line only where
+        :attr:`Trial.client_answered`, the only case :attr:`Trial.server_agrees` judges."""
         before = len(self._lines())
         trial = run_trial(mode, path, condition, wait=wait, port=self.port)
         if trial.client_port is None:
-            return trial
-        return replace(trial, server=self._line_for(trial.client_port, skip=before))
+            return replace(trial, server="no CLIENT line") if trial.client_answered else trial
+        within = _SERVER_LINE_WAIT if trial.client_answered else 0.0
+        line = self._line_for(trial.client_port, skip=before, within=within)
+        return replace(trial, server=line or "no line from the server")
 
     def errors(self) -> str:
         """What the server wrote to stderr, which is empty unless it crashed."""
@@ -520,14 +531,13 @@ class ProbeTlsServer:
 
     def _lines(self) -> list[str]:
         # One line per connection, oldest first, leaving out the PORT line and a line still being
-        # written. The child's stdout is in text mode, so on Windows each line ends in CR LF.
-        text = self._out_path.read_text("ascii", "replace")
-        return [line.rstrip("\r") for line in text.split("\n")[1:-1]]
+        # written. read_text turns the child's CR LF into LF.
+        return self._out_path.read_text("ascii", "replace").split("\n")[1:-1]
 
-    def _line_for(self, client: int, *, skip: int) -> str | None:
-        # Only lines after the first `skip` count, so an earlier connection from a reused port is
-        # never read as this one.
-        deadline = time.monotonic() + _SERVER_LINE_WAIT
+    def _line_for(self, client: int, *, skip: int, within: float) -> str | None:
+        # Only lines after the first `skip` count. That keeps out an earlier connection from a
+        # reused port, unless its line came late, after a client killed on the deadline.
+        deadline = time.monotonic() + within
         while True:
             seen = [line for line in self._lines()[skip:] if line.startswith(f"{client} ")]
             if seen:
@@ -543,7 +553,9 @@ def tls_server(directory: str | os.PathLike[str]) -> Iterator[ProbeTlsServer]:
 
     The server presents ``server.pem`` from ``directory``, which :func:`write_shapes` signed with
     the probe's CA. It is killed when the block ends. Its stdin is a pipe this process holds, and
-    it ends itself when that closes, so it cannot outlive a caller that died first. The server
+    it ends itself when that closes. So it ends with a caller that died first, as long as no other
+    process holds the pipe: ``subprocess`` hands it to no other child, but a bare fork would. The
+    server
     loads only its own plain certificate and key, so it cannot be the process that waits for a
     password."""
     flags = 0
@@ -743,7 +755,7 @@ def _print_table(directory: Path, wait: float) -> None:
             for shape, mode in capath_rows:
                 trial = server.handshake(mode, directory / shape, condition, wait=handshake_wait)
                 _print_row(shape, mode, trial)
-                if trial.client_port is not None:
+                if trial.server is not None:
                     flag = " (DISAGREES with the client)" if trial.server_agrees is False else ""
                     print(f"{'':47} server: {trial.server}{flag}")
 
