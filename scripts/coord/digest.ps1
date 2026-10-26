@@ -140,8 +140,12 @@ if ($Rate) {
 
 try { $Day = Resolve-DecisionDay $Day } catch { [Console]::Error.WriteLine("digest.ps1: $($_.Exception.Message)"); exit 2 }
 
-$res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Window)
-$all = @($res.Records)
+$res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Window)
+# The reversed decisions older than the window are read only to charge their reversals to the
+# right seat and item, as the gate does; every other section reads the window alone.
+$windowDays = @(Get-DecisionDayRange $Day $Window)
+$joined = @($res.Records)
+$all = @($joined | Where-Object { $windowDays -contains (Get-DecisionIdDay ([string]$_.id)) })
 $decisions = @($all | Where-Object { $_.kind -eq 'decision' })
 $today = @($all | Where-Object { (Get-DecisionIdDay ([string]$_.id)) -eq $Day })
 $todayDecisions = @($today | Where-Object { $_.kind -eq 'decision' })
@@ -293,7 +297,7 @@ function Format-Budget($Budget) {
     $open = if ($Budget.ClosedUntil) { "CLOSED to the no-review path until $(Format-DecisionInstant $Budget.ClosedUntil)" } else { 'open' }
     return "$($Budget.Count) of $($Budget.Limit) in the trailing 24 hours; $open"
 }
-$reversals = @(Get-DecisionReversals $all)
+$reversals = @(Get-DecisionReversals $joined)
 $md.Add("As of $(Format-DecisionInstant $asOf). ``decision.ps1 -Gate`` answers NO-REVIEW only when every condition holds, one of which is that the seat's Class B is calibrated.")
 $md.Add('')
 $md.Add("- Reversal budget, fleet-wide: $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf)).")

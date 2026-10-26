@@ -375,6 +375,20 @@ def test_each_writer_writes_outside_the_cloud(
 
 @needs_pwsh
 @needs_windows
+def test_the_gate_takes_its_normal_path_outside_the_cloud(repo: Path, tmp_path: Path) -> None:
+    """The control for the gate: with a usage reader that does not exist, its cost rung is UNKNOWN,
+    so it answers REVIEW (11) before any network read. Its full path is held by
+    tests/test_afk_gate.py."""
+    missing = str(tmp_path / "no-usage.ps1")
+    args = ("-Gate", "-Item", "1", "-Seat", "builder", "-UsageScript", missing)
+    proc = _run(repo, "coord/decision.ps1", *args, cloud=False)
+    assert proc.returncode == 11, (proc.stdout, proc.stderr)
+    assert proc.stdout.strip() == "REVIEW"
+    assert "refused in a Claude Code cloud session" not in proc.stdout + proc.stderr
+
+
+@needs_pwsh
+@needs_windows
 def test_the_digest_takes_its_normal_path_outside_the_cloud(repo: Path) -> None:
     """The control for the digest: a malformed -Rate is refused by its own check, which runs only
     past the cloud refusal and needs no gh. Its full path is held by tests/test_afk_digest.py."""

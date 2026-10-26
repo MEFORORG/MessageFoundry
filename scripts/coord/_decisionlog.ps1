@@ -82,7 +82,8 @@ function Get-DecisionIdDay([string]$Id) {
     # The id carries its UTC day, so a rating can find its decision by reading one day.
     $at = Get-DecisionInstant $Id
     if ($null -eq $at) { return $null }
-    return $at.ToString('yyyy-MM-dd')
+    # Invariant, or a Thai culture writes a Buddhist-era year and reads another day's issue.
+    return $at.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Invoke-DecisionGh {
@@ -427,16 +428,20 @@ function Get-DecisionCalibration {
 function Get-DecisionReversals($Records) {
     <#
       Each reversed decision once: an `outcome` record with outcome `reversed`, deduplicated by its
-      ref, and the earliest such record is when it was reversed. Seat and Item are the DECISION's,
-      joined through the ref, never the seat that logged the outcome. A ref the records do not hold
-      has no Seat, and its Item is the outcome record's own, which may be empty.
+      ref, and the earliest such record is when it was reversed. A decision whose LATEST outcome is
+      something else (a mistaken `reversed`, corrected) is not one, as the calibration reads it.
+      Seat and Item are the DECISION's, joined through the ref, never the seat that logged the
+      outcome. A ref the records do not hold has no Seat, and its Item is the outcome record's own,
+      which may be empty.
     #>
     $byId = @{}
     foreach ($r in @($Records | Where-Object { $_.kind -eq 'decision' })) { $byId[[string]$r.id] = $r }
+    $latest = Get-DecisionLatest $Records 'outcome'
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $out = [System.Collections.Generic.List[object]]::new()
     foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and [string]$_.outcome -eq 'reversed' -and $_.ref } | Sort-Object { [string]$_.id })) {
         $ref = [string]$o.ref
+        if ([string]$latest[$ref].outcome -ne 'reversed') { continue }
         if (-not $seen.Add($ref)) { continue }
         $d = if ($byId.ContainsKey($ref)) { $byId[$ref] } else { $null }
         $out.Add([pscustomobject]@{
@@ -447,6 +452,24 @@ function Get-DecisionReversals($Records) {
             })
     }
     return $out.ToArray()
+}
+
+function Read-DecisionLogForGate {
+    <#
+      Read-DecisionLog over -Days, then over the day of each reversed decision older than them, so
+      every reversal read is charged to its decision's seat and item rather than to none. The gate
+      and the digest both read through this. The older days' records are added for that join only:
+      a caller that needs the window itself (calibration) filters by day.
+    #>
+    param([string]$Repo, [string]$CoordRoot, [string[]]$Days)
+    $res = Read-DecisionLog -Repo $Repo -CoordRoot $CoordRoot -Days $Days
+    $older = @(Get-DecisionReversals @($res.Records) | Where-Object { $null -eq $_.Seat } | ForEach-Object { Get-DecisionIdDay $_.Ref } |
+            Where-Object { $_ -and $Days -notcontains $_ } | Select-Object -Unique)
+    if (-not $res.Complete -or -not $older.Count) { return $res }
+    $more = Read-DecisionLog -Repo $Repo -CoordRoot $CoordRoot -Days $older
+    return [pscustomobject]@{
+        Records = @(@($res.Records) + @($more.Records)); Complete = $more.Complete; Errors = @($res.Errors) + @($more.Errors)
+    }
 }
 
 function Get-DecisionBudget {
@@ -474,11 +497,13 @@ function Get-DecisionBudget {
     return [pscustomobject]@{ Limit = $Limit; Count = @($times | Where-Object { $_ -gt $Now - $day }).Count; ClosedUntil = $closedUntil }
 }
 
-function Format-DecisionInstant([datetime]$At) { return $At.ToString('yyyy-MM-ddTHH:mm:ssZ') }
+function Format-DecisionInstant([datetime]$At) { return $At.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
 
 function Test-DecisionUnsampledB($Record, [hashtable]$Ratings) {
-    # A Class B decision the owner has not rated. Plan 4.6 counts these, whoever logged them.
-    return ($Record.kind -eq 'decision' -and [string]$Record.class -eq 'B' -and -not $Ratings.ContainsKey([string]$Record.id))
+    # A Class B decision the owner has not rated. Plan 4.6 counts these, whoever logged them. One the
+    # gate answered HALT for was deferred, not acted on, so nothing builds on it.
+    return ($Record.kind -eq 'decision' -and [string]$Record.class -eq 'B' -and [string]$Record.gate -ne 'HALT' -and
+        -not $Ratings.ContainsKey([string]$Record.id))
 }
 
 function Get-DecisionChain {
@@ -488,6 +513,10 @@ function Get-DecisionChain {
       unsampled Class B decisions on -Item logged in the 24 hours before -Now (Floor). The floor is
       there because buildsOn is self-reported: a session that names nothing still meets it. Missing
       lists each linked id the records do not hold; a caller fails closed on it.
+
+      The walk stops at a decision the owner rated, which ends the unsampled chain, and once it has
+      counted three, which already goes to review: so a chain that reaches past the days read fails
+      closed only while it is still unsampled and short.
     #>
     param($Records, [string]$Item, [string[]]$BuildsOn, [datetime]$Now, [hashtable]$Ratings)
     $byId = @{}
@@ -499,9 +528,11 @@ function Get-DecisionChain {
     $missing = [System.Collections.Generic.List[string]]::new()
     while ($queue.Count) {
         $id = $queue.Dequeue()
+        if ($walked -gt 2) { break }
         if (-not $seen.Add($id)) { continue }
         if (-not $byId.ContainsKey($id)) { $missing.Add($id); continue }
         $r = $byId[$id]
+        if ($Ratings.ContainsKey($id)) { continue }
         if ([string]$r.item -eq $Item -and (Test-DecisionUnsampledB $r $Ratings)) { $walked++ }
         foreach ($p in @($r.buildsOn | Where-Object { $_ })) { $queue.Enqueue([string]$p) }
     }
@@ -605,24 +636,44 @@ function Get-DecisionCostRung {
       rate, the rung is hit when the window is projected to run out within HoldMin minutes and
       before it resets, whatever the level. Only with no rate is the level the backstop.
 
+      A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
+      calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
+
       UNKNOWN when the reading is missing, stale, refused, or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
-      5-hour state does not). A Desktop session that runs no statusLine reads UNKNOWN here; the
-      Steward's status.json fallback that usage-headroom-inject.ps1 prints is not read, because it
-      would be a third copy of watch.py's pool rules.
+      5-hour state does not). usage.ps1 skips that refusal when it reads CRITICAL overall, so a
+      CRITICAL reading that this grades below the rung is UNKNOWN too: it may be another root's. A
+      reader that does not finish within -TimeoutSeconds is UNKNOWN. A Desktop session that runs no
+      statusLine reads UNKNOWN here; the Steward's status.json fallback that
+      usage-headroom-inject.ps1 prints is not read, because it would be a third copy of watch.py's
+      pool rules.
     #>
-    param([string]$UsageScript, [string]$ThresholdsFile)
+    param([string]$UsageScript, [string]$ThresholdsFile, [int]$TimeoutSeconds = 30)
     function New-DecisionRung([string]$State, [string]$Reason) { [pscustomobject]@{ State = $State; Reason = $Reason } }
     try { $lv = Get-DecisionRungLevels $ThresholdsFile }
     catch { return (New-DecisionRung 'UNKNOWN' "the rung levels could not be read: $($_.Exception.Message)") }
     if (-not [System.IO.File]::Exists($UsageScript)) {
         return (New-DecisionRung 'UNKNOWN' "the usage reader $UsageScript does not exist")
     }
+    $p = $null
     try {
-        $text = (@(& ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $UsageScript -Json 2>$null) -join "`n").Trim()
-        $j = $text | ConvertFrom-Json -ErrorAction Stop
+        $psi = [System.Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath)
+        foreach ($a in @('-NoProfile', '-NonInteractive', '-File', $UsageScript, '-Json')) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $null = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $p.Kill($true) } catch { $null = $_ }
+            return (New-DecisionRung 'UNKNOWN' "usage.ps1 -Json did not finish within $TimeoutSeconds s")
+        }
+        $j = $out.GetAwaiter().GetResult().Trim() | ConvertFrom-Json -ErrorAction Stop
     } catch {
         return (New-DecisionRung 'UNKNOWN' "usage.ps1 -Json gave no reading: $($_.Exception.Message)")
+    } finally {
+        if ($p) { $p.Dispose() }
     }
     $overall = [string](Get-DecisionJsonValue $j 'state')
     if ($overall -eq 'UNAVAILABLE') {
@@ -644,15 +695,22 @@ function Get-DecisionCostRung {
     $toEmpty = Get-DecisionJsonValue $five 'minutes_to_empty'
     $toReset = Get-DecisionJsonValue $five 'minutes_to_reset'
     $at = "5-hour at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
-    if ($null -ne $rate) {
+    $rung = if ($pct -ge 98) {
+        New-DecisionRung 'HIT' "$at. At the ceiling (98 percent, usage.ps1's own CRITICAL band), whatever the rate"
+    } elseif ($null -ne $rate) {
         $cut = [double]$rate -gt 0 -and $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
         if ($cut -and [double]$toEmpty -le $lv.HoldMin) {
-            return (New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets")
+            New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets"
+        } else {
+            New-DecisionRung 'OK' "$at. The burn rate governs, and it does not reach the rung"
         }
-        return (New-DecisionRung 'OK' "$at. The burn rate governs, and it does not reach the rung")
+    } elseif ($pct -ge $lv.HoldAt) {
+        New-DecisionRung 'HIT' "$at. No burn rate, so the level is the backstop, and it is reached"
+    } else {
+        New-DecisionRung 'OK' "$at. No burn rate; below the level backstop"
     }
-    if ($pct -ge $lv.HoldAt) {
-        return (New-DecisionRung 'HIT' "$at. No burn rate, so the level is the backstop, and it is reached")
+    if ($overall -eq 'CRITICAL' -and $rung.State -ne 'HIT') {
+        return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 reads CRITICAL overall, which skips its statusLine trust check, so this reading may be another root's")
     }
-    return (New-DecisionRung 'OK' "$at. No burn rate; below the level backstop")
+    return $rung
 }

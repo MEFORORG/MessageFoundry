@@ -40,12 +40,13 @@ NO_REVIEW, REVIEW, HALT = 10, 11, 12
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
 
-NOW = datetime.now(UTC)
 _SEQ = itertools.count(1)
 
 
 def ago(**delta: float) -> datetime:
-    return NOW - timedelta(**delta)
+    # Read per call, not at import: the gate reads the wall clock, and a long suite would
+    # otherwise age every record by however long it ran before this test.
+    return datetime.now(UTC) - timedelta(**delta)
 
 
 def rec(kind: str = "decision", at: datetime | None = None, **fields: Any) -> dict[str, Any]:
@@ -255,6 +256,27 @@ def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
     assert code == NO_REVIEW, why(doc)
 
 
+def test_a_window_at_the_ceiling_halts_whatever_the_rate(sb: Sandbox) -> None:
+    """A flat rate at 100 percent leaves usage.ps1 no minutes_to_empty; it is no room, not room."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(100.0, state="CRITICAL", rate_pct_per_hr=0.0, minutes_to_empty=None),
+    )
+    code, doc = gate(sb)
+    assert code == HALT and "At the ceiling" in why(doc)
+
+
+def test_a_critical_reading_below_the_rung_is_unknown(sb: Sandbox) -> None:
+    """usage.ps1 skips its statusLine trust check at CRITICAL overall, here from the weekly window."""
+    seed_vault(sb, calibrated("manager"))
+    doc = usage(40.0)
+    doc.update(state="CRITICAL", statusline_state="WIRED_ELSEWHERE")
+    write_fake_usage(_usage_path(sb), doc, code=11)
+    code, out = gate(sb)
+    assert code == REVIEW and "may be another root's" in why(out)
+
+
 def test_an_unknown_cost_reading_reviews_rather_than_halts(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), {"state": "UNKNOWN", "reason": "no statusLine"}, code=20)
@@ -324,8 +346,8 @@ def test_the_real_usage_reader_feeds_the_rung(
     payload = {
         "session_id": "fixture",
         "rate_limits": {
-            "five_hour": {"used_percentage": pct, "resets_at": int(NOW.timestamp()) + 4800},
-            "seven_day": {"used_percentage": 10, "resets_at": int(NOW.timestamp()) + 200000},
+            "five_hour": {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 4800},
+            "seven_day": {"used_percentage": 10, "resets_at": int(ago().timestamp()) + 200000},
         },
     }
     collect = sb.run(
@@ -389,6 +411,16 @@ def test_a_breach_older_than_24_hours_has_reopened(sb: Sandbox) -> None:
     assert code == NO_REVIEW, why(doc)
 
 
+def test_a_reversal_corrected_by_a_later_outcome_is_not_one(sb: Sandbox) -> None:
+    mine = [rec(at=ago(days=20), seat="manager", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    fixed = rec("outcome", at=ago(hours=1), seat="lander", ref=mine[0]["id"], outcome="kept")
+    seed_vault(sb, [fixed])
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+
+
 def test_an_earlier_reversal_on_the_same_item_reviews(sb: Sandbox) -> None:
     """Any seat's decision on the item, reversed days ago, outside the 24-hour budget."""
     theirs = rec(at=ago(days=6), seat="builder", item="4242")
@@ -420,6 +452,14 @@ def test_the_item_floor_counts_unsampled_class_b_in_24_hours(
     assert code == expected, why(doc)
 
 
+def test_a_halted_decision_does_not_count_toward_the_floor(sb: Sandbox) -> None:
+    """The gate answered HALT for it, so it was deferred, not acted on."""
+    recent = [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(2)]
+    halted = rec(at=ago(minutes=30), seat="builder", item="4242", gate="HALT")
+    seed_vault(sb, [*calibrated("manager"), *recent, halted])
+    assert gate(sb)[0] == NO_REVIEW
+
+
 def test_a_rated_decision_does_not_count_toward_the_floor(sb: Sandbox) -> None:
     recent = [rec(at=ago(hours=1 + i), seat="builder", item="4242") for i in range(3)]
     rating = rec("rating", at=ago(minutes=5), seat="owner", ref=recent[0]["id"], rating="agree")
@@ -444,6 +484,18 @@ def test_builds_on_walks_the_unsampled_ancestors_on_the_item(
     seed_vault(sb, records)
     code, doc = gate(sb, "-BuildsOn", c["id"])
     assert code == expected, why(doc)
+
+
+def test_a_builds_on_day_outside_the_window_does_not_widen_calibration(sb: Sandbox) -> None:
+    """Calibration reads the 60-day window alone, as the digest does, whatever else is read."""
+    old = [rec(at=ago(days=80, minutes=i), seat="manager", item="calib") for i in range(60)]
+    rated = [
+        rec("rating", at=ago(days=80, minutes=-1 - i), seat="owner", ref=d["id"], rating="agree")
+        for i, d in enumerate(old)
+    ]
+    seed_vault(sb, old + rated)
+    code, doc = gate(sb, "-BuildsOn", old[0]["id"])
+    assert code == REVIEW and "review path, 0/60 samples" in why(doc)
 
 
 def test_builds_on_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> None:
@@ -529,7 +581,7 @@ def test_a_reviewed_or_other_class_record_is_not_gated(
 
 def _git(repo: Path, *args: str, stdin: str = "") -> str:
     # The attic snapshot's commit date is its age in the digest; 3 days 2 hours, plus a margin.
-    stamp = f"{int((NOW - timedelta(days=3, hours=2, minutes=5)).timestamp())} +0000"
+    stamp = f"{int(ago(days=3, hours=2, minutes=5).timestamp())} +0000"
     env = {
         "GIT_AUTHOR_NAME": "t",
         "GIT_AUTHOR_EMAIL": "t@example.invalid",

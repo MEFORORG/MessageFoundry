@@ -287,8 +287,10 @@ owner's 2026-10-21 approval of the plan, and the owner may overrule it at review
 `scripts/coord/decision.ps1 -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>]` answers which path
 a Class B act may take, as one word: **NO-REVIEW** (exit 10), **REVIEW** (exit 11) or **HALT**
 (exit 12). None is 0 or 4, so a crash (1), a usage error (2), the cloud refusal (3) or "spooled"
-(4) never reads as permission. The script's header lists the conditions; in short, NO-REVIEW
-needs all of them:
+(4) never reads as permission. NO-REVIEW is necessary, not sufficient: plan R4 also needs a single
+revert or PR close to undo the act, no Class C path touched, and live state read this turn, which
+the gate cannot see, so the session still checks those. The script's header lists the gate's own
+conditions; in short, NO-REVIEW needs all of them:
 
 - the kill switch reads exactly OFF;
 - the seat's Class B is calibrated, by the digest's own arithmetic, which now lives in one shared
@@ -311,7 +313,8 @@ it, which every other test starts from.
 ### Reversal budget (4.5)
 
 An `outcome` record with outcome `reversed` is one reversal, deduplicated by its ref, dated by the
-earliest such record. It is charged to the seat of the **decision** it refers to, joined through
+earliest such record; a decision whose latest outcome is something else is not one, as the
+calibration reads it. It is charged to the seat of the **decision** it refers to, joined through
 the ref, never to the seat that logged the outcome. Three inside any 24 hours close the no-review
 path for every seat, and two of one seat's decisions close it for that seat, in each case for 24
 hours from the reversal that reached the limit. A reversal of a decision the log does not hold has
@@ -326,7 +329,8 @@ Class B record (empty otherwise). A reader fills both for an older record. Depth
 (never rated) Class B decisions on the same item reachable through `buildsOn` links, and never
 less than the unsampled Class B decisions on that item logged in the trailing 24 hours. The floor
 exists because `-BuildsOn` is self-reported: a session that names nothing still meets it. More
-than two goes to review.
+than two goes to review. The walk stops at a decision the owner rated, which ends the unsampled
+chain. A record the gate answered HALT for was deferred, not acted on, so it does not count.
 
 ### Cost rung (4.7)
 
@@ -339,7 +343,11 @@ names the window `5-hour`, not `five_hour`.
 **The burn rate governs, which the brief for this build did not say.** STEWARD.md 9.6a records an
 owner ruling of 2026-08-14 that a level fires the protect half and does not stop new work when the
 rate says there is room. So with a rate, the rung is hit when the window is projected to run out
-within 20 minutes and before it resets. Only with no rate is 80 percent the backstop.
+within 20 minutes and before it resets. Only with no rate is 80 percent the backstop. A window at
+98 percent or more, `usage.ps1`'s own "at the ceiling" band, is hit whatever the rate: a flat rate
+there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
+CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOWN. A reader that
+does not finish within 30 seconds is UNKNOWN.
 
 At the rung the answer is HALT. A reading `usage.ps1` calls UNKNOWN answers REVIEW, not HALT:
 UNKNOWN is common, because a Desktop session runs no statusLine, and halting on it would shut the
@@ -351,16 +359,19 @@ roster alias of the Lander.
 
 ### Where it is enforced, and where it is not
 
-**`-Log` is the one caller.** A `decision` record of Class B with `-Reviewed no` runs the gate
+**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` runs the gate
 before it is written. The record is spooled and posted whatever the answer. When the answer is not
 NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
 `LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,
 so it can answer HALT or REVIEW but never NO-REVIEW. A reviewed record is not gated, because its
 review has already run; a session that wants the rung before spending a review runs `-Gate` first.
+**`-Log` stops an act only when the log comes before it.** The empower skill, as read on
+2026-10-26, says to log each decision and not when, so a session following it should run `-Gate`
+before it acts. Making the skill say so is a skill edit, outside this change.
 
-**Nothing else calls `-Gate`.** The spawn hooks, `wait-pr.ps1`, and the driver and empower skills
-do not halt on the cost rung, so plan 4.7's *"spawning, polling ... halt"* is **designed, not
-built**. The gate also enforces nothing against a session that does not log, or that logs
+**At least these do not call `-Gate`:** the spawn hooks, `wait-pr.ps1`, and the driver and empower
+skills. None of them halts on the cost rung, so plan 4.7's *"spawning, polling ... halt"* is
+**designed, not built**. The gate also enforces nothing against a session that does not log, or that logs
 `-Reviewed yes` without a review: like the rest of this ADR, it is a check a cooperating session
 meets, not a boundary.
 

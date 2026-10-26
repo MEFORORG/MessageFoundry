@@ -23,7 +23,10 @@
     -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>] answers which path a Class B act may take
     (docs/AUTONOMY-PLAN.md R4 and 4.5-4.7). It prints one word as its only stdout line, the reasons
     on stderr, or an object under -Json:
-        NO-REVIEW  exit 10  act without review. Only when EVERY condition below holds.
+        NO-REVIEW  exit 10  the gate's conditions hold. NECESSARY, NOT SUFFICIENT: plan R4 also
+                            needs a single revert or PR close to undo the act, no Class C path
+                            touched, and live state read this turn, which the gate cannot see.
+                            The session checks those itself before acting without review.
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     NO-REVIEW needs all of: the kill switch reads exactly OFF (afk-kill.ps1 -Status); the seat's
@@ -48,8 +51,10 @@
     field. When the answer is not NO-REVIEW, -Log prints `GATE <word>` and why, and exits with the
     gate's code, 11 or 12, in place of 0 or 4: the act must not go ahead without review, and the
     LOGGED line still says whether the record was posted or is still spooled. Under -NoPost the gate
-    reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. Nothing else calls -Gate:
-    the spawn hooks, wait-pr.ps1 and the driver and empower skills do not stop on the cost rung.
+    reads no network, so it can answer HALT or REVIEW but never NO-REVIEW. -Log stops an act only
+    when a session logs BEFORE it acts; the empower skill, as read on 2026-10-26, says to log each
+    decision and not when, so a session following it should run -Gate first. At least these do not call -Gate: the spawn
+    hooks, wait-pr.ps1 and the driver and empower skills, so none of them stops on the cost rung.
 
     KINDS. `decision` is one Class A to D decision. `tripwire` is a tripwire hit. `rating` is the
     owner's blind-sample verdict on a decision (-Ref, -Rating). `outcome` updates a decision's
@@ -332,31 +337,26 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         $now = [DateTime]::UtcNow
-        $today = $now.ToString('yyyy-MM-dd')
-        # The digest's default window, so calibration here is the digest's; plus the days the
-        # -BuildsOn ids name.
-        $days = @(@(Get-DecisionDayRange $today 60) + @($BuildsOn | ForEach-Object { Get-DecisionIdDay $_ }) | Select-Object -Unique)
-        $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days $days
-        $all = @($res.Records)
-        # A reversal read in the window whose decision is older than it: read that day too, so the
-        # reversal is charged to the right seat and item rather than to none.
-        $older = @(Get-DecisionReversals $all | Where-Object { $null -eq $_.Seat } | ForEach-Object { Get-DecisionIdDay $_.Ref } |
-                Where-Object { $_ -and $days -notcontains $_ } | Select-Object -Unique)
-        if ($res.Complete -and $older.Count) {
-            $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days $older
-            $all = @($all + @($res.Records))
-        }
+        $today = $now.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        # The digest's default window, plus the days the -BuildsOn ids name; Read-DecisionLogForGate
+        # adds the days of reversed decisions older than both.
+        $window = @(Get-DecisionDayRange $today 60)
+        $days = @(@($window) + @($BuildsOn | ForEach-Object { Get-DecisionIdDay $_ }) | Select-Object -Unique)
+        $res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days $days
         if (-not $res.Complete) {
             $why.Add("the decision log was not fully read, so no condition on it can be shown: $($res.Errors -join '; ')")
             return (New-GateAnswer 'REVIEW' $why)
         }
+        $all = @($res.Records)
         $ratings = Get-DecisionLatest $all 'rating'
         $outcomes = Get-DecisionLatest $all 'outcome'
         $reversals = @(Get-DecisionReversals $all)
         $closed = $false
 
-        $cal = Get-DecisionCalibration -Decisions @($all | Where-Object { $_.kind -eq 'decision' -and [string]$_.seat -eq $Seat -and $_.class -eq 'B' }) `
-            -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14)
+        # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
+        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
+                $_.kind -eq 'decision' -and [string]$_.seat -eq $Seat -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+            })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")
             $closed = $true
@@ -483,8 +483,9 @@ $preds = foreach ($p in $Predicate) {
     if ($at -lt 1) { [Console]::Error.WriteLine("decision.ps1: -Predicate '$p' is not name=evidence. Nothing was written."); exit 2 }
     [ordered]@{ name = $p.Substring(0, $at).Trim(); evidence = $p.Substring($at + 1).Trim() }
 }
-# THE ENFORCEMENT POINT (plan 4.5-4.7): empower already requires every Class B decision to be
-# logged, so an unreviewed one meets the gate here. Its record is written whatever the answer.
+# Where the gate is enforced (plan 4.5-4.7): empower requires every Class B decision to be logged,
+# so an unreviewed one meets the gate here. That stops the act only when the log comes before it
+# (the header says so). The record is written whatever the answer.
 $gateAnswer = $null
 if ($Kind -eq 'decision' -and $Class -eq 'B' -and $Reviewed -eq 'no') {
     $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
