@@ -208,11 +208,12 @@ def test_the_dispatcher_report_has_no_capacity_verdict(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     text = str(json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"])
 
-    # The control: the lane was discovered and its counts read.
-    assert "1 LANES" in text, text
-    assert "4 in flight, 0 free by work" in text, text
+    # The control: the lane was discovered and its record read, before and after this change alike.
+    assert 'Note: "four in flight"' in text, text
+    # The ceiling checks come first, so against the old scripts they are what fails.
     assert "capacity" not in text.lower(), text
     assert "of 4" not in text, text
+    assert "4 in flight, 0 free by work" in text, text
 
 
 def test_the_hook_self_test_passes(tmp_path: Path) -> None:
