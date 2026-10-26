@@ -171,6 +171,7 @@ from messagefoundry.store.queue_tag import (
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
     APPROVAL_KIND,
+    APPROVAL_TOMBSTONE_KIND,
     PASSKEYS_LABEL,
     ROLE_KIND,
     SEAL_PREFIX,
@@ -3825,14 +3826,56 @@ def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> A
     return None
 
 
+def approval_fails_seal(sealer: RowSealer | None, found: ByName) -> bool:
+    """Whether the ``pending_approvals`` row ``found`` fails its integrity seal, either because no
+    reader can type it (:meth:`ApprovalRow.from_mapping` raises) or because its seal does not
+    verify (BACKLOG #3638). The test the seal-failed reject runs on the row it read."""
+    try:
+        row = ApprovalRow.from_mapping(found)
+    except RowSealError:
+        return True
+    return not approval_seal_ok(sealer, row)
+
+
+def approval_tombstone_fields(
+    approval_id: str, *, approver: str, decided_at: float
+) -> tuple[tuple[str, object], ...]:
+    """What a rejected request's tombstone seal covers (BACKLOG #3638): the request's id, the
+    status ``rejected``, the rejecting approver and the decision time, in that order. Nothing
+    else, so the tombstone says only that this store rejected this request, and never vouches for
+    its params, requester or any other column a writer changed outside the store."""
+    return (
+        ("id", approval_id),
+        ("status", "rejected"),
+        ("approver", approver),
+        ("decided_at", float(decided_at)),
+    )
+
+
+def approval_tombstone(
+    sealer: RowSealer | None, approval_id: str, *, approver: str, decided_at: float
+) -> str:
+    """The tombstone seal a seal-failed reject writes (BACKLOG #3638), or ``""`` with no sealer.
+    Sealed under :data:`~messagefoundry.store.row_seal.APPROVAL_TOMBSTONE_KIND` over
+    :func:`approval_tombstone_fields`, so it never verifies as the row's approval seal: the row
+    keeps failing :func:`approval_seal_ok`, and nothing can turn it back into a request that holds."""
+    if sealer is None:
+        return ""
+    return sealer.seal(
+        APPROVAL_TOMBSTONE_KIND,
+        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
+    )
+
+
 def report_unsealed_approvals(count: int) -> None:
     """Name, at a keyed open, the open dual-control requests that carry no integrity seal (BACKLOG
-    #2592). Each can no longer be released, rejected or settled, since nothing re-seals a row that
-    fails; it expires, and the operation is requested again."""
+    #2592). Each can no longer be released or settled, since nothing re-seals a row that fails. A
+    pending one can still be rejected (BACKLOG #3638); none expires when ``[approvals].expiry_hours``
+    is 0, so rejecting it is what closes it."""
     if count:
         log.warning(
             "%d open dual-control approval request(s) carry no integrity seal and can no longer be"
-            " released or rejected (BACKLOG #2592); request each operation again",
+            " released (BACKLOG #2592); reject each pending one, and request the operation again",
             count,
         )
 
@@ -6372,6 +6415,14 @@ _SQLITE_APPROVAL_INSERT_UNLESS_OPEN = (
 _SQLITE_APPROVAL_UPDATE = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
     " seal = ? WHERE id = ? AND status = ? AND seal = ?"
+)
+#: The seal-failed reject (BACKLOG #3638): a ``pending`` row that fails its seal, moved to
+#: ``rejected`` with a tombstone seal. The target status is a literal and the guard is
+#: ``status = 'pending'`` in the SQL itself, so this statement can move no row to ``executing`` or
+#: ``approved`` and touches no row already decided. Binds approver, decided_at, tombstone, id.
+_SQLITE_APPROVAL_TOMBSTONE = (
+    "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
+    " WHERE id = ? AND status = 'pending'"
 )
 
 
@@ -14863,6 +14914,55 @@ class MessageStore:
             await self._commit()
         tee_audits(audits, appended, ts=now)
         return moved
+
+    async def reject_seal_failed_approval(
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        decided_at: float,
+        audits: Sequence[AuditAppend] = (),
+    ) -> bool:
+        """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
+        #3638). The Store protocol states the contract: the row is read and checked in the write,
+        a sound row or one not ``pending`` is left alone, and ``audits`` commit with the move."""
+        now = time.time()
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(_SQLITE_APPROVAL_SELECT + " WHERE id = ?", (approval_id,))
+            found = await cur.fetchone()
+            moved = (
+                found is not None
+                and str(found["status"]) == "pending"
+                and approval_fails_seal(self._row_sealer, found)
+                and await self._tombstone_approval(
+                    approval_id, approver=approver, decided_at=decided_at
+                )
+            )
+            appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
+            appended = await self._append_audits(appended_audits, now=now)
+            await self._commit()
+        tee_audits(appended_audits, appended, ts=now)
+        return moved
+
+    async def _tombstone_approval(
+        self, approval_id: str, *, approver: str, decided_at: float
+    ) -> bool:
+        """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE` (BACKLOG #3638). Call it inside an
+        open write, on a row :func:`approval_fails_seal` refused. Writes the tombstone of
+        :func:`approval_tombstone`, never an approval seal, so the row's other columns stay as
+        unverified as they were."""
+        cur = await self._db.execute(
+            _SQLITE_APPROVAL_TOMBSTONE,
+            (
+                approver,
+                float(decided_at),
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+            ),
+        )
+        return cur.rowcount > 0
 
     async def list_executing_approvals(
         self, *, claim_owner: str | None = None, limit: int = 1000

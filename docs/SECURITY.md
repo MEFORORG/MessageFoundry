@@ -2726,6 +2726,31 @@ The provenance check flags rather than refuses on purpose. A refusal would stop 
 route, and it would also refuse an honest directory approver whose engine row is created at first
 sign-in.
 
+**A request whose row fails its integrity seal can only be rejected, and the queue lists it
+flagged (BACKLOG #3638, #3639; owner ruling 2026-10-26).** On a store that holds a key, each
+request row carries a seal over every column (vault BACKLOG #2592). A row changed outside the
+store fails it, and is never released or resolved. The failure writes an
+`integrity.authority_seal_failed` audit row and raises `integrity_drift`. Nothing expires such a
+request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
+
+- `GET /approvals` and the Approvals page list a failing `pending` request after the sound ones,
+  with `release_blocked` set to `seal_failed`. Its `params` are always withheld, never decoded or
+  sent. Its other values are shown as stored and are unverified. The page offers Reject and no
+  Approve. RBAC is unchanged: the queue and the reject still need `approvals:approve`.
+- The reject is a narrow store write on SQLite, SQL Server and PostgreSQL. It reads the row in the
+  write and moves it only while it reads `pending` and fails its seal. Its SQL writes the status
+  `rejected` as a literal, guarded on `status = 'pending'`, so it cannot move a row to `executing`
+  or `approved`. It writes a tombstone seal, under a kind of its own, over the id, the status, the
+  approver and the decision time. It never seals the changed values in, so the row keeps failing
+  its approval seal.
+- The move, an unthrottled `integrity.authority_seal_failed` row and an `approval.rejected` row
+  holding only the id and `seal_failed` commit in one transaction. The `integrity_drift` alert is
+  raised after the commit, because an alert sink cannot join a transaction.
+- `rotate-key`'s re-seal pass counts a tombstone sealed under the old key as a row that failed and
+  leaves it as it is. It acts on nothing.
+
+A failing `interrupted` release is still left out of its list, and its resolve answers 409.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
 either out is named as a security loosening (vault BACKLOG #3123);

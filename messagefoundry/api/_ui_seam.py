@@ -696,12 +696,19 @@ from typing import Any
 #: ea0b48d0bf69ec09; this branch at d3f76a351d8328bd). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both.
 #:
+#: BACKLOG #3638 and #3639 (owner ruling 2026-10-26): ``ReleaseBlocked`` gained ``seal_failed``,
+#: a pending request whose row failed its integrity seal, which the queue now lists flagged with
+#: its params withheld, and which the reject now closes. The Approvals page keys a note on every
+#: value and renders "withheld" for this one, so an older console on this engine is refused at
+#: mount rather than meeting a value it has no note for. Re-derived with ``--write`` from
+#: ``abc94c8c0254d1ff``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "abc94c8c0254d1ff"
+ENGINE_UI_SEAM: str = "9dffd6dc9d2a0b5d"
 
 
 @dataclass(frozen=True, slots=True)

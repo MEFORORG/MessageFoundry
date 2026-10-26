@@ -263,6 +263,8 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    approval_fails_seal,
+    approval_tombstone,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -835,6 +837,12 @@ _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
     " seal = ? OUTPUT inserted.id"
     " WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+)
+#: store.py's ``_SQLITE_APPROVAL_TOMBSTONE`` (BACKLOG #3638), which states the contract, with an
+#: ``OUTPUT`` so the caller learns whether it landed. Used only by `_tombstone_approval`.
+_MSSQL_APPROVAL_TOMBSTONE: Final = (
+    "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
+    " OUTPUT inserted.id WHERE id = ? AND status = 'pending'"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -12936,6 +12944,66 @@ class SqlServerStore:
                     raise
         tee_audits(audits, appended, ts=now)
         return moved
+
+    async def reject_seal_failed_approval(
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        decided_at: float,
+        audits: Sequence[AuditAppend] = (),
+    ) -> bool:
+        """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
+        #3638); the Store protocol states the contract. Locks as :meth:`decide_pending_approval`
+        does: the audit applock first, then the row under ``UPDLOCK``."""
+        now = time.time()
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await self._open_under_audit_applock(cur)
+                        await cur.execute(
+                            "SELECT "
+                            + _MSSQL_APPROVAL_COLUMNS
+                            + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                            (approval_id,),
+                        )
+                        found = await self._fetch_dicts(cur)
+                        moved = (
+                            bool(found)
+                            and str(found[0]["status"]) == "pending"
+                            and approval_fails_seal(self._row_sealer, found[0])
+                            and await self._tombstone_approval(
+                                cur, approval_id, approver=approver, decided_at=decided_at
+                            )
+                        )
+                        appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
+                        appended = await self._append_audits(cur, appended_audits, now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(appended_audits, appended, ts=now)
+        return moved
+
+    async def _tombstone_approval(
+        self, cur: Any, approval_id: str, *, approver: str, decided_at: float
+    ) -> bool:
+        """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE` (BACKLOG #3638); store.py's
+        ``MessageStore._tombstone_approval`` states the contract."""
+        await cur.execute(
+            _MSSQL_APPROVAL_TOMBSTONE,
+            (
+                approver,
+                float(decided_at),
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+            ),
+        )
+        return bool(await cur.fetchall())
 
     async def list_executing_approvals(
         self, *, claim_owner: str | None = None, limit: int = 1000

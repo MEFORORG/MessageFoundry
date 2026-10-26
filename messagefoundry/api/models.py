@@ -528,6 +528,7 @@ ReleaseBlocked = Literal[
     "params_unreadable",
     "params_no_requester",
     "requester_not_authorized",
+    "seal_failed",
 ]
 
 
@@ -565,7 +566,13 @@ class PendingApprovalInfo(BaseModel):
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
     standing the listing could not read, the row's seal and the operation's own refusals, such as a
     held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
-    an ``interrupted`` row."""
+    an ``interrupted`` row.
+
+    ``seal_failed`` (BACKLOG #3639; owner ruling 2026-10-26) marks a ``pending`` row that failed
+    its integrity seal: it was changed outside the engine. It is never released, and the reject
+    closes it (BACKLOG #3638). Its ``params`` are ALWAYS ``None``, withheld rather than
+    unreadable, and its other values are shown as stored, unverified; ``caller_is_requester`` is
+    False on it. ``ApprovalGate._seal_failed_entry`` is the source of record."""
 
     id: str
     operation: str

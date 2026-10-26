@@ -31,8 +31,13 @@ from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.pipeline.alerts import AUTHORITY_SEAL_SUBJECT, LoggingAlertSink
-from messagefoundry.store.row_seal import SEAL_PREFIX, RowSealError
-from messagefoundry.store.store import ApprovalRow, approval_seal_ok
+from messagefoundry.store.row_seal import APPROVAL_TOMBSTONE_KIND, SEAL_PREFIX, RowSealError
+from messagefoundry.store.store import (
+    ApprovalRow,
+    approval_seal_ok,
+    approval_tombstone,
+    approval_tombstone_fields,
+)
 from tests._pending_approval_store_contract import _resolve, _StandingStore
 from tests._session_seal_contract import RawSql
 
@@ -117,17 +122,25 @@ class _Harness:
         return sum(approval_id in str(r["detail"]) for r in rows)
 
     async def listed(self, approval_id: str) -> bool:
-        return approval_id in {e["id"] for e in await self.gate.list_pending()}
+        """Whether the queue lists ``approval_id`` as a sound request, one a release could act on."""
+        return approval_id in {
+            e["id"] for e in await self.gate.list_pending() if e["release_blocked"] != "seal_failed"
+        }
+
+    async def flagged(self, approval_id: str) -> dict[str, Any] | None:
+        """The queue's entry for ``approval_id`` when it lists it flagged as failing its seal
+        (BACKLOG #3639), or ``None``."""
+        for entry in await self.gate.list_pending():
+            if entry["id"] == approval_id and entry["release_blocked"] == "seal_failed":
+                return entry
+        return None
 
     async def refused(self, approval_id: str) -> None:
-        """Approve and reject both refuse the pending ``approval_id`` with the seal refusal."""
-        for attempt in (
-            self.approve(approval_id),
-            self.gate.reject(approval_id, approver=_APPROVER),
-        ):
-            with pytest.raises(ApprovalError) as refusal:
-                await attempt
-            assert refusal.value.status == 409 and "integrity" in refusal.value.detail
+        """Approve refuses the pending ``approval_id`` with the seal refusal. Reject closes it
+        instead (BACKLOG #3638), which :func:`assert_seal_failed_reject_contract` drives."""
+        with pytest.raises(ApprovalError) as refusal:
+            await self.approve(approval_id)
+        assert refusal.value.status == 409 and "integrity" in refusal.value.detail
 
     async def load(self, approval_id: str) -> ApprovalRow:
         return await self.gate._load(approval_id, status="pending", wrong=str)
@@ -158,6 +171,8 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
     )
     planted = await h.row(widened)
     assert not await h.listed(widened)
+    shown = await h.flagged(widened)  # BACKLOG #3639: listed flagged, its params withheld
+    assert shown is not None and shown["params"] is None and "IB_ALL" not in json.dumps(shown)
     await h.refused(widened)
     assert h.runs == [h.runs[0]]  # nothing new ran
     assert await h.row(widened) == planted  # every refusal wrote nothing: no status, no new seal
@@ -331,6 +346,92 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
     await raw("UPDATE pending_approvals SET seal='' WHERE id=?", (blank,))
     assert await store.count_unsealed_approvals() == unsealed_before + 1
     await h.refused(blank)
+
+    await assert_seal_failed_reject_contract(store, raw)
+
+
+async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
+    """A ``pending`` request that fails its seal can be rejected (BACKLOG #3638; owner ruling
+    2026-10-26). The reject moves it to ``rejected`` under a tombstone seal, never to
+    ``executing`` or ``approved``, and commits ``integrity.authority_seal_failed`` and
+    ``approval.rejected`` with the move; the alert follows. Each step has its control: a sound
+    request is rejected the ordinary way, and the narrow store write leaves a sound row alone."""
+    sealer = store.row_sealer()
+    assert sealer is not None, "the contract needs a store opened with a store key"
+    h = _Harness(store, raw)
+
+    # --- control: a sound request is rejected the ordinary way, with its operation named ------
+    sound = await h.request()
+    assert not await store.reject_seal_failed_approval(  # the narrow write leaves it alone
+        sound, approver=_APPROVER, decided_at=time.time()
+    )
+    assert (await h.row(sound)).status == "pending" and approval_seal_ok(sealer, await h.row(sound))
+    await h.gate.reject(sound, approver=_APPROVER)
+    assert approval_seal_ok(sealer, await h.row(sound))  # an ordinary reject re-seals
+    assert h.alerted(sound) == 0 and await h.seal_failures(sound) == 0
+
+    # --- a request whose params were changed outside the store is listed flagged, and rejected -
+    failing = await h.request(channel_id="IB_A")
+    await raw(
+        "UPDATE pending_approvals SET params=? WHERE id=?",
+        (json.dumps({"channel_id": "IB_TAMPERED"}), failing),
+    )
+    entry = await h.flagged(failing)
+    assert entry is not None and entry["params"] is None and "IB_TAMPERED" not in json.dumps(entry)
+    reported, alerted = await h.seal_failures(failing), h.alerted(failing)
+    rejected = await h.gate.reject(failing, approver=_APPROVER)
+    assert rejected["rejected_by"] == _APPROVER and rejected["operation"] == _OP
+    after = await h.row(failing)
+    assert after.status == "rejected" and after.approver == _APPROVER
+    assert after.decided_at is not None
+    # The tombstone covers only the id, status, approver and time, under its own kind, so the row
+    # keeps failing its approval seal and the tampered params are never sealed in.
+    assert not approval_seal_ok(sealer, after)
+    assert after.seal == approval_tombstone(
+        sealer, failing, approver=_APPROVER, decided_at=after.decided_at
+    )
+    assert sealer.verify(
+        APPROVAL_TOMBSTONE_KIND,
+        approval_tombstone_fields(failing, approver=_APPROVER, decided_at=after.decided_at),
+        after.seal,
+    )
+    assert json.loads(after.params) == {"channel_id": "IB_TAMPERED"}  # left as it was found
+    assert await h.seal_failures(failing) == reported + 1  # unthrottled, in the reject's write
+    assert h.alerted(failing) == alerted + 1
+    rows = await store.list_audit(action="approval.rejected", limit=500)
+    mine = [json.loads(str(r["detail"])) for r in rows if failing in str(r["detail"])]
+    assert mine == [{"approval_id": failing, "seal_failed": True}]
+    assert await h.flagged(failing) is None and not await h.listed(failing)
+    assert h.runs == []  # nothing ran
+    # A second reject and an approve both answer "already rejected", and raise no new alarm.
+    for attempt in (h.gate.reject(failing, approver=_APPROVER), h.approve(failing)):
+        with pytest.raises(ApprovalError) as stale:
+            await attempt
+        assert stale.value.status == 409 and "already rejected" in stale.value.detail
+    assert await h.seal_failures(failing) == reported + 1 and h.alerted(failing) == alerted + 1
+
+    # --- the narrow write moves only a 'pending' row: one tampered to 'interrupted' stays ------
+    cut = await h.request()
+    for to, frm in (("executing", "pending"), ("interrupted", "executing")):
+        assert await store.decide_pending_approval(
+            cut, status=to, approver=_APPROVER, decided_at=time.time(), from_status=frm
+        )
+    await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"x": 1}', cut))
+    assert not await store.reject_seal_failed_approval(
+        cut, approver=_APPROVER, decided_at=time.time()
+    )
+    with pytest.raises(ApprovalError) as not_pending:
+        await h.gate.reject(cut, approver=_APPROVER)
+    assert not_pending.value.status == 409 and "already interrupted" in not_pending.value.detail
+    assert (await h.row(cut)).status == "interrupted"
+
+    # --- a status written outside the store to 'pending' on a decided row is still tombstoned --
+    # (it fails its seal, so nothing may release it; the reject is the only way out of 'pending').
+    reopened = await h.request()
+    await h.gate.reject(reopened, approver=_APPROVER)
+    await raw("UPDATE pending_approvals SET status=? WHERE id=?", ("pending", reopened))
+    assert (await h.gate.reject(reopened, approver=_APPROVER))["rejected_by"] == _APPROVER
+    assert (await h.row(reopened)).status == "rejected"
 
 
 class _Hooked:

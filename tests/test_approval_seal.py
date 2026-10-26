@@ -246,7 +246,12 @@ async def test_a_value_no_honest_write_leaves_is_a_failed_seal_not_a_crash(
     await _raw_for(path)(
         "UPDATE pending_approvals SET requested_at=? WHERE id=?", ("not-a-time", broken)
     )
-    assert [e["id"] for e in await gate.list_pending()] == [sound]
+    listing = await gate.list_pending()
+    assert [(e["id"], e["release_blocked"]) for e in listing] == [
+        (sound, None),
+        (broken, "seal_failed"),  # BACKLOG #3639: listed flagged, not failing the page
+    ]
+    assert listing[1]["params"] is None and listing[1]["requested_at"] == 0.0
     with pytest.raises(ApprovalError) as refusal:
         await gate.approve(broken, approver="a", approver_user_id="a-id")
     assert refusal.value.status == 409
@@ -257,6 +262,11 @@ async def test_a_value_no_honest_write_leaves_is_a_failed_seal_not_a_crash(
         )
     released = await gate.approve(sound, approver="a", approver_user_id="a-id")  # control
     assert released["operation"] == "dead_letter_replay"
+    # BACKLOG #3638: the reject still closes it, leaving the value no reader can type as it was.
+    assert (await gate.reject(broken, approver="a"))["rejected_by"] == "a"
+    found = await store.get_pending_approval(broken)
+    assert found is not None and found["status"] == "rejected"
+    assert found["requested_at"] == "not-a-time"
 
 
 class _PagingSink(_Sink):
@@ -307,6 +317,54 @@ async def test_a_cancelled_claim_the_store_refuses_on_its_seal_is_reported_not_p
         assert sink.lost == [] and len(sink.reasons) == 1
     else:
         assert sink.lost == ["approval.release_attempted"] and sink.reasons == []
+
+
+async def test_a_seal_failed_reject_whose_audit_append_fails_moves_nothing(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3638: the move and its two audit rows are one transaction. With the
+    ``approval.rejected`` append refused the reject answers 503, pages the lost row, raises no
+    rejection alert and leaves the request pending and unchanged. The control is the same reject
+    once the append works, which moves it."""
+    store, path = keyed
+    sink = _PagingSink()
+    gate = ApprovalGate(
+        _StandingStore(store),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, "rollback")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 1}', approval_id)
+    )
+    before = await store.get_pending_approval(approval_id)
+    real = store._append_audits
+
+    async def refuse(audits: Any, *, now: float) -> Any:
+        if any(a.action == "approval.rejected" for a in audits):
+            raise sqlite3.OperationalError("audit append refused")
+        return await real(audits, now=now)
+
+    monkeypatch.setattr(store, "_append_audits", refuse)
+    with pytest.raises(ApprovalError) as fault:
+        await gate.reject(approval_id, approver="a")
+    assert fault.value.status == 503 and sink.lost == ["approval.rejected"]
+    monkeypatch.undo()
+    after = await store.get_pending_approval(approval_id)
+    assert before is not None and after is not None and dict(after) == dict(before)
+    assert not any("rejected" in r for r in sink.reasons)
+    rejected = await store.list_audit(action="approval.rejected")
+    assert all(approval_id not in str(r["detail"]) for r in rejected)
+    assert (await gate.reject(approval_id, approver="a"))["rejected_by"] == "a"  # control
+    assert [
+        approval_id in str(r["detail"]) for r in await store.list_audit(action="approval.rejected")
+    ] == [True]
 
 
 # --- static guards --------------------------------------------------------------------------
@@ -379,20 +437,23 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
 
 
 #: Where each backend may write ``pending_approvals``: each module-level statement and the one
-#: function that may use it. Every other INSERT, UPDATE, MERGE or DELETE of the table is a problem.
+#: function that may use it. The tombstone is the seal-failed reject's narrow write (BACKLOG #3638). Every other INSERT, UPDATE, MERGE or DELETE of the table is a problem.
 _SEALING: dict[str, dict[str, frozenset[str]]] = {
     "store.py": {
         "_SQLITE_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_INSERT_UNLESS_OPEN": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_SQLITE_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
     },
     "postgres.py": {
         "_PG_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_PG_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_PG_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
     },
     "sqlserver.py": {
         "_MSSQL_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_MSSQL_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_MSSQL_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
     },
 }
 
