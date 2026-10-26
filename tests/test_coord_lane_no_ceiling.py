@@ -9,8 +9,9 @@ lane stating no free items as AT CAPACITY.
 These tests fail if a default cap of 4 comes back in either script:
 
 1. a statement records ``capacity`` as null, with no upper bound on its counts, and prints no
-   ceiling; a 4 carried on an old record is replaced with null on the next write. The key stays,
-   because an older lane.ps1 on another branch assigns it, and that throws when the key is missing;
+   ceiling; a 4 carried on an old record is replaced with null by the next statement, and kept by
+   ``-Asked``, which writes no counts. The key stays, because an older lane.ps1 on another branch
+   assigns it, and that throws when the key is missing;
 2. ``-Capacity`` is not a parameter any more, so a caller cannot reintroduce a cap by passing one;
 3. the dispatcher arm of the hook reports a lane that states 0 free and 4 in flight, on a record
    still naming capacity 4, with its in-flight count and with no capacity verdict. Against the
@@ -19,9 +20,8 @@ These tests fail if a default cap of 4 comes back in either script:
    includes empty slots. The hook labels it OLD-WRITER, withholds that free count rather than show
    it as held items, and asks the lane to restate; the same counts with ``capacity`` null are shown;
 5. the hook's own self-test passes;
-6. a builder lane whose level is 45 minutes old is asked to restate. Its age is how a level stated
-   under the old ceiling ages out, and the hook read every stamp hours in the future on a machine
-   west of UTC until this change.
+6. a builder lane whose level is 45 minutes old is asked to restate. The hook read every stamp
+   hours in the future on a machine west of UTC until this change, so no level aged out there.
 """
 
 from __future__ import annotations
@@ -118,7 +118,8 @@ def test_a_negative_count_is_still_refused(tmp_path: Path) -> None:
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists(), "a refused call wrote a lane"
 
 
-def test_a_capacity_left_on_an_old_record_is_nulled_on_the_next_write(tmp_path: Path) -> None:
+def test_a_capacity_left_on_an_old_record_is_nulled_only_by_a_statement(tmp_path: Path) -> None:
+    """``-Asked`` writes no counts, so it keeps the marker of who stated the counts there."""
     repo = _git_repo(tmp_path / "repo")
     assert _ps(LANE, repo, "-Free", "1", "-InFlight", "1").returncode == 0
     record = _lane_record(repo)
@@ -130,12 +131,32 @@ def test_a_capacity_left_on_an_old_record_is_nulled_on_the_next_write(tmp_path: 
     assert show.returncode == 0, show.stderr
     assert json.loads(show.stdout)["capacity"] == 4
 
-    for args in (("-Asked",), ("-Free", "0", "-InFlight", "5")):
+    for args, kept in ((("-Asked",), 4), (("-Free", "0", "-InFlight", "5"), None)):
         record.write_text(json.dumps(old), encoding="utf-8")
         proc = _ps(LANE, repo, *args)
         assert proc.returncode == 0, (args, proc.stdout + proc.stderr)
         new = json.loads(record.read_text(encoding="utf-8"))
-        assert "capacity" in new and new["capacity"] is None, (args, new)
+        assert "capacity" in new and new["capacity"] == kept, (args, new)
+        # The control: both calls wrote. -Asked stamps its time and leaves the counts; a statement
+        # writes its counts.
+        if kept is None:
+            assert new["statedInFlight"] == 5, (args, new)
+        else:
+            assert new["askedByDispatcherUtc"] and new["statedInFlight"] == 1, (args, new)
+
+
+def test_asked_adds_a_missing_capacity_key_as_null(tmp_path: Path) -> None:
+    """An older lane.ps1 assigns ``capacity`` and throws when the key is missing, so -Asked adds it."""
+    repo = _git_repo(tmp_path / "repo")
+    assert _ps(LANE, repo, "-Free", "1", "-InFlight", "1").returncode == 0
+    record = _lane_record(repo)
+    rec: dict[str, Any] = json.loads(record.read_text(encoding="utf-8"))
+    del rec["capacity"]
+    record.write_text(json.dumps(rec), encoding="utf-8")
+    assert _ps(LANE, repo, "-Asked").returncode == 0
+    new = json.loads(record.read_text(encoding="utf-8"))
+    assert "capacity" in new and new["capacity"] is None, new
+    assert new["askedByDispatcherUtc"], new
 
 
 def test_capacity_is_no_longer_a_parameter(tmp_path: Path) -> None:

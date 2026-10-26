@@ -14,14 +14,12 @@
 
     AN OLDER lane.ps1 MEANS SOMETHING ELSE BY FREE. Its free count includes the empty slots under
     the retired ceiling, so read as held items it overstates them. The current lane.ps1 writes
-    `capacity` as null on every write, and the older one writes a number there on every statement,
-    so a record whose `capacity` is a number has a level an older lane.ps1 stated. This hook shows
-    that level's in-flight count, withholds its free count, labels it OLD-WRITER and asks the lane
-    to restate with the current script. The number is read as a marker of who wrote the record,
-    never as a cap. A record whose `capacity` is null or absent is read as stated. A null does not
-    prove the current script stated the counts: its -Asked nulls `capacity` and leaves an older
-    statement's counts in place, so a level an older lane.ps1 stated can still read as held items
-    until the lane restates.
+    `capacity` as null on every statement and keeps whatever it finds on -Asked, which writes no
+    counts; the older one writes a number there on every statement. So a record whose `capacity` is
+    a number has a level an older lane.ps1 stated. This hook shows that level's in-flight count,
+    withholds its free count, labels it OLD-WRITER and asks the lane to restate with the current
+    script. The number is read as a marker of who stated the counts, never as a cap. A record whose
+    `capacity` is null or absent is read as stated.
 
     EVERY NUMBER IS A LANE'S OWN QUOTE. A missing file, an unreadable file, a stale number, a
     superseded number, a roster shortfall -- each is said aloud, never turned into a count.
@@ -435,7 +433,7 @@ foreach ($v in ($verdicts | Sort-Object box)) {
             Say ('  {0,-28} {1,-20} WRITTEN BY AN OLDER lane.ps1: its free count includes empty' -f '', '')
             Say ('  {0,-28} {1,-20} slots, so it is not shown as held items. Ask the lane to' -f '', '')
             Say ('  {0,-28} {1,-20} restate with a current lane.ps1; its own worktree may hold' -f '', '')
-            Say ('  {0,-28} {1,-20} the older copy, and its own nag names a current one.' -f '', '') }
+            Say ('  {0,-28} {1,-20} the older copy. Its own hook asks only in a builder* worktree.' -f '', '') }
         default {
             $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
             Say "  $pad $($v.inflight) in flight, $($v.free) free by work, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n" }
