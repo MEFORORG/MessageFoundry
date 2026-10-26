@@ -36,10 +36,10 @@ from cryptography.hazmat.primitives import serialization
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests.test_vault_tls_narrowing import (
     _CA_ENV,
-    _ENV_THAT_MOVES_THE_HOP,
     _PATH,
     _REPLY,
     _ca,
+    _hop_environment,  # noqa: F401  # autouse: clears the proxy and hvac.v1 values for each test
     _kv_client,
     _leaf,
     _TlsVault,
@@ -84,8 +84,10 @@ class _Files:
         self.combined_legacy = self._write(root / "client-legacy.pem", cert + legacy)
         self.cert_only = self._write(root / "client-cert.pem", cert)
         self.key_pkcs8 = self._write(root / "client-key-pkcs8.pem", pkcs8)
-        #: Every file holding an encrypted key. The spy fails the test on any of them.
-        self.encrypted = {self.combined_pkcs8, self.combined_legacy, self.key_pkcs8}
+        #: Every file holding an encrypted key, as urllib3 is handed it. The spy fails on any.
+        self.encrypted = {
+            str(p) for p in (self.combined_pkcs8, self.combined_legacy, self.key_pkcs8)
+        }
 
     @staticmethod
     def _write(path: Path, data: bytes) -> Path:
@@ -105,40 +107,30 @@ def vault(files: _Files) -> Iterator[_TlsVault]:
 
 
 @pytest.fixture(autouse=True)
-def _hop_environment(files: _Files, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only the CA and client certificate a test names apply, as ``test_vault_tls_narrowing``."""
-    for name in _ENV_THAT_MOVES_THE_HOP:
-        monkeypatch.delenv(name, raising=False)
+def _ca_env(request: pytest.FixtureRequest, files: _Files, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The server's CA, set after ``test_vault_tls_narrowing``'s fixture has cleared the hop."""
+    request.getfixturevalue("_hop_environment")
     monkeypatch.setenv(_CA_ENV, str(files.ca))
     monkeypatch.setenv("MEFOR_STORE_VAULT_CA_FILE", str(files.ca))
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
-    monkeypatch.setattr(urllib.request, "getproxies_macosx_sysconf", dict, raising=False)
-    import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
-
-    for name in ("VAULT_CACERT", "VAULT_CAPATH", "VAULT_CLIENT_CERT", "VAULT_CLIENT_KEY"):
-        monkeypatch.setattr(hvac.v1, name, None, raising=False)
 
 
 def _client_cert(monkeypatch: pytest.MonkeyPatch, cert: Path, key: Path | None) -> None:
     """What hvac would have read from ``VAULT_CLIENT_CERT`` and ``VAULT_CLIENT_KEY`` at import."""
-    import hvac.v1
+    import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
 
     monkeypatch.setattr(hvac.v1, "VAULT_CLIENT_CERT", str(cert))
     monkeypatch.setattr(hvac.v1, "VAULT_CLIENT_KEY", None if key is None else str(key))
 
 
 @contextlib.contextmanager
-def _tls_loads(encrypted: set[Path]) -> Iterator[list[tuple[Any, Any]]]:
+def _tls_loads(refused: set[str]) -> Iterator[list[tuple[Any, Any]]]:
     """Record the client certificate and key urllib3 hands the TLS library on each new socket.
 
-    A file in ``encrypted`` fails the test instead of reaching OpenSSL, so nothing here loads one.
+    A file in ``refused`` fails the test instead of reaching OpenSSL, so nothing here loads one.
     """
     import urllib3.connection
     from urllib3.util.ssl_ import ssl_wrap_socket as real
 
-    refused = {str(path) for path in encrypted}
     seen: list[tuple[Any, Any]] = []
 
     def spy(*args: Any, **kwargs: Any) -> Any:
