@@ -2738,13 +2738,20 @@ def check_pinned_certificate(
         enforced_anchor,
         store_pin_anchor_spec,
     )
-    from messagefoundry.pki import pinned_server_certificate, unreadable_pin_reason
+    from messagefoundry.pki import (
+        oversized_pin_reason,
+        pinned_server_certificate,
+        unreadable_pin_reason,
+    )
     from messagefoundry.redaction import log_timestamp
 
     spec = store_pin_anchor_spec(settings)
     if spec is None:
         return
     path = spec.path
+    # The anchor checks read the whole file, so a file too large for a pin is refused first.
+    if (too_large := oversized_pin_reason(path)) is not None:
+        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
     checked: bytes | str  # the bytes the anchor checks read, or the refusal
     try:
         enforcing = posture is None or posture.enforcing
@@ -2755,6 +2762,8 @@ def check_pinned_certificate(
         checked = str(exc)  # the anchor module's own message, which names the setting and the fix
     except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
         checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
+    except MemoryError:  # a file with no size on disk, such as a device, that never ends
+        checked = f"[store].ssl_root_cert {path!r} could not be read: it is too large to read"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
         raise ValueError(checked)
     cert = pinned_server_certificate(checked)

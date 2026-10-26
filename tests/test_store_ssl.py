@@ -624,6 +624,42 @@ def test_a_pin_path_open_refuses_is_refused_naming_the_setting() -> None:
         check_pinned_certificate(settings)
 
 
+def test_a_pin_file_too_large_is_refused_at_load_and_at_open(tmp_path: object) -> None:
+    """BACKLOG #3714: the pin is read with a size cap, so a huge file is refused naming the
+    setting, at load and at the store open, rather than read whole. The control: a file at the
+    cap is read and refused only for what it holds."""
+    from messagefoundry import pki
+
+    big = tmp_path / "big.pem"  # type: ignore[operator]
+    big.write_bytes(b"x" * (pki.PIN_FILE_MAX_BYTES + 1))
+    at_cap = tmp_path / "at-cap.pem"  # type: ignore[operator]
+    at_cap.write_bytes(b"x" * pki.PIN_FILE_MAX_BYTES)
+    assert "larger than" in str(pki.read_pinned_server_certificate(str(big)))
+    assert "not a certificate" in str(pki.read_pinned_server_certificate(str(at_cap)))
+    with pytest.raises(ValidationError, match=r"ssl_root_cert .*larger than \d+ bytes"):
+        _ss(ssl_root_cert=str(big))
+    settings = _ss().model_copy(update={"ssl_root_cert": str(big)})
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*larger than \d+ bytes"):
+        check_pinned_certificate(settings)
+
+
+def test_a_pin_read_that_runs_out_of_memory_is_refused_naming_the_setting(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file with no size on disk, such as a device, passes the size check, and the anchor
+    checks read it whole. A ``MemoryError`` there is refused naming the setting, not raised raw."""
+    from messagefoundry.auth import trust_anchors
+
+    settings = _ss(ssl_root_cert=_leaf_file(tmp_path))
+
+    def endless(_spec: object) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(trust_anchors, "evaluate_anchor", endless)
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*too large to read"):
+        check_pinned_certificate(settings)
+
+
 def test_the_store_open_check_reads_the_pin_once(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

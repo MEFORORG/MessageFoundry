@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import os
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -56,7 +57,9 @@ __all__ = [
     "cert_to_pem",
     "key_to_pem",
     "load_pinned_server_certificate",
+    "PIN_FILE_MAX_BYTES",
     "PinRefused",
+    "oversized_pin_reason",
     "pinned_server_certificate",
     "read_pinned_server_certificate",
     "unreadable_pin_reason",
@@ -830,13 +833,38 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 
     A reason string rather than an exception, so a caller raises its own refusal outside any
     handler. The phrase holds an OS error's ``strerror``, a :class:`PinRefused` reason, or the
-    type name of a parser error, never the parser's text or the file's bytes."""
+    type name of a parser error, never the parser's text or the file's bytes.
+
+    It reads at most :data:`PIN_FILE_MAX_BYTES` and one byte more, so a huge or endless file is
+    refused as too large rather than read whole (BACKLOG #3714)."""
     try:
         with open(path, "rb") as fh:
-            data = fh.read()
+            data = fh.read(PIN_FILE_MAX_BYTES + 1)
     except (OSError, ValueError, TypeError) as exc:  # what open() raises for a bad path
         return unreadable_pin_reason(exc)
+    if len(data) > PIN_FILE_MAX_BYTES:
+        return _TOO_LARGE
     return pinned_server_certificate(data)
+
+
+#: The largest SQL Server pin file the engine reads (BACKLOG #3714). A pin is one certificate, a
+#: few KiB, so this leaves a wide margin and still stops a huge or endless file before it is
+#: read whole.
+PIN_FILE_MAX_BYTES = 1 << 20
+
+_TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"
+
+
+def oversized_pin_reason(path: str) -> str | None:
+    """The reason a pin file is too large to read, from its size on disk, or ``None``. For a
+    caller whose read is not bounded, such as the trust-anchor checks, to call first. A file
+    that cannot be stat'ed gives ``None``: the read that follows reports it. A file whose size
+    the OS does not report, such as a device, passes here, so that caller still guards its read."""
+    try:
+        size = os.stat(path).st_size
+    except (OSError, ValueError, TypeError):
+        return None
+    return _TOO_LARGE if size > PIN_FILE_MAX_BYTES else None
 
 
 def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
