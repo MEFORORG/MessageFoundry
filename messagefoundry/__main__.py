@@ -2172,7 +2172,7 @@ def _start_logging(
     locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
     that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
     logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
-    the start with its row.
+    the start, with a row when it can read the file.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2327,9 +2327,17 @@ def _start_logging(
     from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
 
     _forward_ca = log_forward_anchor_spec(settings.logging)
+    # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
+    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
+    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    _ca_notes: list[str] = []
     _ca_refusal = (
-        anchor_refusal(_forward_ca, enforcing=enforcing) if _forward_ca is not None else None
+        anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
+        if _forward_ca is not None
+        else None
     )
+    for _ca_note in _ca_notes:
+        print(f"warning: {scrub_control_chars(_ca_note)}", file=sys.stderr)
     if _ca_refusal is not None:
         if deferred_ca_refusals is None:
             # `supervise`: its process has no audited preflight, so it refuses here, before any
@@ -2382,10 +2390,16 @@ def _start_logging(
     # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
+    if deferred_ca_refusals is None:
+        # `supervise` only: its forwarder is up now, so the collector gets the record that this
+        # CA was trusted under `warn`. `serve`'s audited preflight logs the same warning again.
+        for _ca_note in _ca_notes:
+            logging.getLogger(__name__).warning("%s", _ca_note)
     if _ca_refusal is not None:
         logging.getLogger(__name__).warning(
             "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
-            "refuses the start once the store is open, and writes its audit row then.",
+            "refuses the start once the store is open. trust_anchors module item 10 says when "
+            "that refusal has an audit row.",
             _ca_refusal,
         )
     if forwarder_live and log_forward is not None:

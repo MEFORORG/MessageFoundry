@@ -34,10 +34,12 @@ from messagefoundry.auth.trust_anchors import (
     run_anchor_preflight,
 )
 from messagefoundry.config.settings import (
+    AlertRule,
     AlertsSettings,
     ApiSettings,
     AuthSettings,
     EgressSettings,
+    EscalationTier,
     LoggingSettings,
     TlsSettings,
 )
@@ -2926,6 +2928,7 @@ def _smtp_app(
     *,
     start_checked: bool = True,
     email: bool = True,
+    rules: tuple[AlertRule, ...] = (),
 ) -> tuple[Any, list[AlertsSettings]]:
     """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the ``[alerts]`` each
     notifier factory call was given. A call with the operator's own settings raises
@@ -2939,7 +2942,10 @@ def _smtp_app(
     ca = str(_pem(tmp_path))
     smtp = _SMTP if email else {**_SMTP, "email_to": []}
     operator = AlertsSettings(
-        email_tls_ca_file=ca, webhook_url="https://hooks.example.org/mefor", **smtp
+        email_tls_ca_file=ca,
+        webhook_url="https://hooks.example.org/mefor",
+        rules=list(rules),
+        **smtp,
     )
 
     def _factory(alerts: AlertsSettings, **kwargs: object) -> None:
@@ -2988,21 +2994,48 @@ async def test_a_refused_alerts_ca_builds_no_email_transport_and_still_writes_it
         await reopened.close()
 
 
-async def test_a_rule_naming_the_dropped_email_transport_leaves_the_anchor_refusal(
+async def test_a_refused_alerts_ca_drops_email_from_every_rule_and_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rule that routes to email refuses a notifier built without it, with ``ValueError``. The
-    start is still refused by the audited check, not by that config error."""
+    """The notifier refuses a rule or tier that routes to a transport it lacks, so a rule naming
+    email would drop the webhook with it. Red before the fix: the rules reached the factory with
+    email still named."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
-    app, _built = _smtp_app(tmp_path, monkeypatch)
-
-    def _rule_needs_email(*args: object, **kwargs: object) -> None:
-        raise ValueError("a rule routes to 'email', which is not configured")
-
-    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _rule_needs_email)
+    rule = AlertRule(
+        transports=["email", "webhook"],
+        escalate=[EscalationTier(after_count=2, transports=["email"])],
+    )
+    app, built = _smtp_app(tmp_path, monkeypatch, rules=(rule, AlertRule()))
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
         async with app.router.lifespan_context(app):
             pass
+    assert _webhook_only(built)
+    assert [(r.transports, [t.transports for t in r.escalate]) for r in built[0].rules] == [
+        (["webhook"], [[]]),
+        (None, []),
+    ]
+
+
+async def test_a_notifier_refusal_behind_a_refused_alerts_ca_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second refusal from the notifier, such as a cleartext webhook, does not stop the start,
+    since the audited check refuses it for the CA anyway. It is logged, so it does not wait a
+    restart to be seen. Red before the fix: it was dropped without a line."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, _built = _smtp_app(tmp_path, monkeypatch)
+
+    def _webhook_refused(*args: object, **kwargs: object) -> None:
+        raise ValueError("the webhook hop is cleartext")
+
+    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _webhook_refused)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.api.app"),
+        pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"),
+    ):
+        async with app.router.lifespan_context(app):
+            pass
+    assert any("the webhook hop is cleartext" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_clean_alerts_ca_builds_the_notifier(

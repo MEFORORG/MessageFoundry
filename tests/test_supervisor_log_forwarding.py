@@ -197,6 +197,30 @@ def test_serve_hands_an_exposed_collector_ca_to_the_audited_start_check(
     assert "off-box log forwarding enabled" not in caplog.text
 
 
+def test_supervise_under_warn_prints_the_collector_ca_warning_and_logs_it_after_the_forwarder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Under ``warn`` an exposed collector CA warns and the forwarder is built. The warning comes
+    before any log handler, so it is printed to stderr scrubbed onto one line, and logged again
+    once the forwarder is up, so the collector gets the record. Red before the fix: the warning was
+    logged once, before the forwarder, with its newline intact."""
+    _collector_ca_judged(monkeypatch, owner_only=False)
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    with caplog.at_level("WARNING"):
+        rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
+    err = capsys.readouterr().err
+    assert rc == 0 and len(recorder.forwards) == 1 and recorder.spawned == 1
+    assert any(
+        line.startswith("warning:") and "forward_tls_ca_file" in line and "starting anyway" in line
+        for line in err.splitlines()
+    ), err
+    noted = [r.name for r in caplog.records if "starting anyway" in r.getMessage()]
+    assert noted == ["messagefoundry.__main__"], noted
+
+
 @pytest.mark.parametrize("command", ["serve", "supervise"])
 def test_an_owner_only_collector_ca_installs_the_forwarder(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

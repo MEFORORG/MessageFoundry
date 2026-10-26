@@ -10908,6 +10908,30 @@ def _chain_registry_preflights(
     return chained
 
 
+def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
+    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
+    (BACKLOG #3470). Each rule and escalation tier stops naming ``email`` too, since the notifier
+    refuses a rule that routes to a transport it does not have, and the webhook would go with it. A
+    rule that named only email then names none, so it pages nobody, as email could not."""
+
+    def _no_email(transports: list[str] | None) -> list[str] | None:
+        return None if transports is None else [t for t in transports if t != "email"]
+
+    rules = [
+        rule.model_copy(
+            update={
+                "transports": _no_email(rule.transports),
+                "escalate": [
+                    tier.model_copy(update={"transports": _no_email(tier.transports)})
+                    for tier in rule.escalate
+                ],
+            }
+        )
+        for rule in alerts.rules
+    ]
+    return alerts.model_copy(update={"email_to": [], "rules": rules})
+
+
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -11024,6 +11048,10 @@ def create_managed_app(
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
+    ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
+    (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
+    start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
+    marked ``unaudited``.
     """
     if store_settings is None:
         if db_path is None:
@@ -11102,7 +11130,11 @@ def create_managed_app(
         notifier_alerts = alerts_settings
         if smtp_anchor_refusal is not None and alerts_settings is not None:
             # Keep the webhook: drop only the email transport, which would load the refused CA.
-            notifier_alerts = alerts_settings.model_copy(update={"email_to": []})
+            notifier_alerts = _alerts_without_email(alerts_settings)
+            _log.warning(
+                "alert email is off: the CA it reads was refused. The start check below refuses "
+                "the start; until then any webhook still pages."
+            )
         try:
             notifier = (
                 notifier_from_settings(
@@ -11117,10 +11149,15 @@ def create_managed_app(
                 if notifier_alerts is not None
                 else None
             )
-        except ValueError:
+        except ValueError as exc:
             if smtp_anchor_refusal is None:
                 raise
-            # A rule names the email transport dropped above. The start is refused below anyway.
+            # The start is refused below for the CA anyway, so this refusal must not hide behind
+            # it: it is logged, and the operator meets it now rather than at the next start.
+            _log.error(
+                "the alert notifier was not built either, so startup alerts reach only the log: %s",
+                scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+            )
             notifier = None
         # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
         # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
