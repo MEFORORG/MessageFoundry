@@ -366,8 +366,9 @@ def test_environment_guard_matches_the_engine_charset() -> None:
     """service.py's environment pattern and settings' allowed set are one character set.
 
     config/settings.py does not import service.py, whose elevated-launch imports
-    tests/test_dependency_boundaries.py tracks, so the two are pinned here instead. Every BMP code point is asked, so a case-folding look-alike such as the Kelvin
-    sign, or a character added to one side only, fails (BACKLOG #1680)."""
+    tests/test_dependency_boundaries.py tracks, so the two are pinned here instead. Every BMP code
+    point is asked, so a case-folding look-alike such as the Kelvin sign, or a character added to
+    one side only, fails (BACKLOG #1680)."""
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
     differ = [

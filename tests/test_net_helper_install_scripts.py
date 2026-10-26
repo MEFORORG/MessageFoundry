@@ -253,8 +253,9 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
 
     ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and literal copies
     of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680),
-    so the engine installer cannot register a name the helper scripts, the tray or the CLI refuse. The copies cannot be dot-sourced away: a PowerShell attribute argument
-    must be a compile-time constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
+    so the engine installer cannot register a name the helper scripts, the tray or the CLI refuse.
+    The copies cannot be dot-sourced away: a PowerShell attribute argument must be a compile-time
+    constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
     *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
     instead, which is what makes them one definition rather than four.
 

@@ -40,8 +40,9 @@ ServiceState = str
 # A Windows service name needs only letters/digits/space/dot/underscore/hyphen. Even though this call
 # uses an argv list (no shell), keep the name strictly validated so a hostile/typo'd config value can
 # never reach the subprocess as anything but a plain service name (defense-in-depth here; on the
-# elevated paths in messagefoundry.service it is the control). The name MUST start with an alphanumeric — so a leading '-'/space
-# (which `sc` could read as a token) or a whitespace-only name is rejected outright.
+# elevated paths in messagefoundry.service it is the control). The name MUST start with an
+# alphanumeric — so a leading '-'/space (which `sc` could read as a token) or a whitespace-only name
+# is rejected outright.
 #
 # This is the ONE service-name guard; messagefoundry.service imports it (BACKLOG #1680). It is
 # applied with `fullmatch` and ends in `\z`, never `$`, which also matches before a trailing line
